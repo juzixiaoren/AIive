@@ -1,0 +1,56 @@
+# ============================
+# AIive Project .gitignore
+# ============================
+
+# === 环境与密钥 ===
+.env
+.env.*
+!.env.example
+
+# === Node.js ===
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# === 构建产物 ===
+dist/
+build/
+*.tsbuildinfo
+
+# === POC 验证产物 ===
+poc/node_modules/
+poc/results/
+poc/package-lock.json
+
+# === IDE & 编辑器 ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# === 日志 ===
+logs/
+*.log
+
+# === 系统文件 ===
+.DS_Store
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+
+# === 临时文件 ===
+tmp/
+temp/
+*.tmp
+*.bak
+
+# === Memory 运行时数据（短期记忆 jsonl）===
+memory/short-term/*.jsonl
+
+# === Session 运行时数据 ===
+sessions/
