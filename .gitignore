@@ -54,3 +54,6 @@ memory/short-term/*.jsonl
 
 # === Session 运行时数据 ===
 sessions/
+
+# === 会话记忆运行时数据 ===
+runtime/
