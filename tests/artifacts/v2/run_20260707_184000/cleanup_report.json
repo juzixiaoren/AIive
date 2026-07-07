@@ -1,0 +1,6 @@
+{
+  "phase": "V2",
+  "cleanup_required": false,
+  "reason": "Unit tests use monkeypatched FakeLLMClient - no external calls. Smoke script calls real API but only reads, no writes. Frontend build artifacts in dist/ are outside tests/artifacts.",
+  "artifacts_dir": "tests/artifacts/v2/run_20260707_184000"
+}

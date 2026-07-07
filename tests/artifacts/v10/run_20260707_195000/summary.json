@@ -1,0 +1,22 @@
+{
+  "phase": "V10",
+  "status": "completed",
+  "timestamp": "2026-07-07T19:50:00",
+  "tests": {
+    "v10_unit": {"total": 15, "passed": 15},
+    "regression": {"total": 119, "passed": 119},
+    "total": 134
+  },
+  "migration": {
+    "status": "applied",
+    "revision": "a6575579d492",
+    "new_tables": ["capabilities", "capability_versions", "mcp_install_records"]
+  },
+  "states": ["candidate", "sandbox", "active", "needs_review"],
+  "compliance": {
+    "no_high_risk_install": true,
+    "no_secret_access": true,
+    "no_file_delete": true,
+    "no_activation_without_smoke": true
+  }
+}

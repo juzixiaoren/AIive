@@ -1,0 +1,8 @@
+# V4 Test Commands
+
+## Unit Tests
+python3 -m pytest tests/unit/backend/test_context_builder.py tests/unit/backend/test_context_snapshot.py -q
+
+## Smoke
+python3 scripts/smoke/smoke_chat_api.py
+# Then: curl http://127.0.0.1:8000/api/debug/traces/{trace_id}

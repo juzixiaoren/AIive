@@ -1,0 +1,7 @@
+# V5 Test Commands
+
+## Unit Tests
+python3 -m pytest tests/unit/backend/test_memory_store.py tests/unit/backend/test_memory_extractor.py tests/unit/backend/test_memory_gate.py -q
+
+## Smoke (manual)
+python3 scripts/smoke/smoke_memory_extraction.py

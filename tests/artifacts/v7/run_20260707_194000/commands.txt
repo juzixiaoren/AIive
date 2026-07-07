@@ -1,0 +1,4 @@
+# V7 Test Commands
+
+## Unit Tests
+python3 -m pytest tests/unit/backend/test_tool_registry.py tests/unit/backend/test_permission_manager.py -q
