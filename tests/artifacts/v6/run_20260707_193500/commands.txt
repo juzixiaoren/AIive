@@ -1,0 +1,4 @@
+# V6 Test Commands
+
+## Unit Tests
+python3 -m pytest tests/unit/backend/test_memory_types.py tests/unit/backend/test_steward_signal_extractor.py tests/unit/backend/test_memory_gate.py -q

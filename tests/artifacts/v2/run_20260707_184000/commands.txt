@@ -1,0 +1,10 @@
+# V2 Test Commands
+
+## Unit Tests
+python3 -m pytest tests/unit/backend/test_chat_api.py -q
+
+## Smoke (requires running backend)
+python3 scripts/smoke/smoke_chat_api.py
+
+## Frontend
+cd frontend && npx tsc --noEmit && npx vite build

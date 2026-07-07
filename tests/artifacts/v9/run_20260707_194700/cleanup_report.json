@@ -1,0 +1,6 @@
+{
+  "phase": "V9",
+  "cleanup_required": false,
+  "reason": "All tests are in-memory against built-in catalog. No external side effects, no MCP server started.",
+  "artifacts_dir": "tests/artifacts/v9/run_20260707_194700"
+}

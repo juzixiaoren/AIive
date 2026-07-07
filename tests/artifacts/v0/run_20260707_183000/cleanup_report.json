@@ -1,0 +1,11 @@
+{
+  "phase": "V0",
+  "cleanup_required": false,
+  "reason": "Health tests use FastAPI TestClient - no files, no database writes. No side effects to clean.",
+  "artifacts_dir": "tests/artifacts/v0/run_20260707_183000",
+  "artifacts_files": [
+    "summary.json",
+    "commands.txt",
+    "cleanup_report.json"
+  ]
+}

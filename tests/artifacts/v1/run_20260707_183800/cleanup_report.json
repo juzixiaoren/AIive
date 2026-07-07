@@ -1,0 +1,11 @@
+{
+  "phase": "V1",
+  "cleanup_required": false,
+  "reason": "Unit tests use FakeLLMClient - no external API calls. Smoke script only calls LLM API, no local file/database writes.",
+  "artifacts_dir": "tests/artifacts/v1/run_20260707_183800",
+  "artifacts_files": [
+    "summary.json",
+    "commands.txt",
+    "cleanup_report.json"
+  ]
+}

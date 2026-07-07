@@ -1,0 +1,4 @@
+# V11 Test Commands
+
+## Unit Tests
+python3 -m pytest tests/unit/backend/test_slot_manager.py tests/unit/backend/test_supervisor_health.py -q
