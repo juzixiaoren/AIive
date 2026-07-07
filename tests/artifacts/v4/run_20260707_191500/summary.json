@@ -1,0 +1,34 @@
+{
+  "phase": "V4",
+  "status": "completed",
+  "timestamp": "2026-07-07T19:15:00",
+  "tests": {
+    "v4_unit": {
+      "context_builder": {"total": 9, "passed": 9},
+      "context_snapshot": {"total": 5, "passed": 5}
+    },
+    "regression": {"total": 33, "passed": 33},
+    "total": 47
+  },
+  "smoke": {
+    "ok": true,
+    "chat": "reply=OK",
+    "trace_snapshot": {
+      "stable_prefix_hash": "36c21eb1ac3f8837",
+      "context_items": 3,
+      "total_tokens": 152,
+      "events_count": 3
+    }
+  },
+  "migration": {
+    "status": "applied",
+    "revision": "ef95c415d0ab",
+    "new_table": "context_snapshots"
+  },
+  "compliance": {
+    "no_memory_retrieval": true,
+    "no_qdrant": true,
+    "no_summary_compression": true,
+    "no_task_profiles": true
+  }
+}

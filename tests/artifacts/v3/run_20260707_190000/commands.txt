@@ -1,0 +1,11 @@
+# V3 Test Commands
+
+## Unit Tests
+python3 -m pytest tests/unit/backend/test_event_logger.py tests/unit/backend/test_thread_state.py tests/unit/backend/test_chat_api.py -q
+
+## Database
+docker compose up -d postgres
+python3 -m alembic upgrade head
+
+## Smoke
+python3 scripts/smoke/smoke_chat_api.py

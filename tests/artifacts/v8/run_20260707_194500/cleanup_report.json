@@ -1,0 +1,6 @@
+{
+  "phase": "V8",
+  "cleanup_required": false,
+  "reason": "All tests use pytest tmp_path for file operations, auto-cleaned by pytest. trash/quarantine dirs created inside tmp_path, cleaned automatically.",
+  "artifacts_dir": "tests/artifacts/v8/run_20260707_194500"
+}

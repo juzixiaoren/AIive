@@ -1,0 +1,4 @@
+# V10 Test Commands
+
+## Unit Tests
+python3 -m pytest tests/unit/backend/test_mcp_installer.py tests/unit/backend/test_mcp_runtime_client.py -q

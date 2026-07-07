@@ -1,0 +1,6 @@
+{
+  "phase": "V6",
+  "cleanup_required": false,
+  "reason": "Unit tests use transaction rollback with temp SQLite. No persistent test data.",
+  "artifacts_dir": "tests/artifacts/v6/run_20260707_193500"
+}

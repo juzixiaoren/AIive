@@ -1,0 +1,6 @@
+{
+  "phase": "V4",
+  "cleanup_required": false,
+  "reason": "Unit tests use transaction rollback with temp SQLite, auto-cleaned via fixture teardown. ContextSnapshot test records cleaned by rollback.",
+  "artifacts_dir": "tests/artifacts/v4/run_20260707_191500"
+}
