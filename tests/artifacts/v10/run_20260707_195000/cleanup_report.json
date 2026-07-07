@@ -1,0 +1,6 @@
+{
+  "phase": "V10",
+  "cleanup_required": false,
+  "reason": "Unit tests use transaction rollback with temp SQLite, auto-cleaned. No real MCP server spawned.",
+  "artifacts_dir": "tests/artifacts/v10/run_20260707_195000"
+}

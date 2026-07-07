@@ -1,59 +1,41 @@
-# ============================
-# AIive Project .gitignore
-# ============================
+# AIive .gitignore
 
-# === 环境与密钥 ===
+# Environment
 .env
-.env.*
-!.env.example
 
-# === Node.js ===
-node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-
-# === 构建产物 ===
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
 dist/
 build/
-*.tsbuildinfo
 
-# === POC 验证产物 ===
-poc/node_modules/
-poc/results/
-poc/package-lock.json
+# Tests
+.pytest_cache/
+tests/artifacts/v*/
+!tests/artifacts/.gitkeep
 
-# === IDE & 编辑器 ===
-.vscode/
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# A/B Slots runtime
+slots/
+runtime/
+
+# Docker volumes
+pgdata/
+
+# IDE
 .idea/
+.vscode/
 *.swp
 *.swo
-*~
+
+# macOS
 .DS_Store
-Thumbs.db
 
-# === 日志 ===
-logs/
-*.log
-
-# === 系统文件 ===
-.DS_Store
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-
-# === 临时文件 ===
-tmp/
-temp/
-*.tmp
-*.bak
-
-# === Memory 运行时数据（短期记忆 jsonl）===
-memory/short-term/*.jsonl
-
-# === Session 运行时数据 ===
-sessions/
-
-# === 会话记忆运行时数据 ===
-runtime/
+# Virtualenv
+venv/
+.venv/

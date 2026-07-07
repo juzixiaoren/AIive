@@ -1,0 +1,4 @@
+# V9 Test Commands
+
+## Unit Tests
+python3 -m pytest tests/unit/backend/test_mcp_discovery.py -q

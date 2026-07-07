@@ -1,0 +1,18 @@
+{
+  "phase": "V8",
+  "status": "completed",
+  "timestamp": "2026-07-07T19:45:00",
+  "tests": {
+    "v8_unit": {"total": 15, "passed": 15},
+    "regression": {"total": 94, "passed": 94},
+    "total": 109
+  },
+  "scopes": ["test_sandbox", "test_artifacts", "inactive_slot_placeholder"],
+  "modes": ["trash", "quarantine", "hard_delete_for_test_only"],
+  "denied_paths": ["/", "~", "repo_root", "scope外", "symlink", "未解析"],
+  "compliance": {
+    "no_bypass_rm": true,
+    "no_user_dir_delete": true,
+    "no_memory_gc": true
+  }
+}

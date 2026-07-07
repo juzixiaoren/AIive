@@ -1,0 +1,7 @@
+# V0 Test Commands
+
+## Unit Tests
+python3 -m pytest tests/unit/backend/test_health.py -q
+
+## Smoke (Manual)
+curl -s http://127.0.0.1:8000/health | python3 -m json.tool

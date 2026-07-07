@@ -1,0 +1,35 @@
+{
+  "phase": "V1",
+  "status": "completed",
+  "timestamp": "2026-07-07T18:38:00",
+  "tests": {
+    "unit": {
+      "total": 12,
+      "passed": 12,
+      "failed": 0
+    },
+    "v0_regression": {
+      "total": 2,
+      "passed": 2,
+      "failed": 0
+    }
+  },
+  "smoke": {
+    "ok": true,
+    "model": "deepseek-v4-flash",
+    "latency_ms": 1109.98,
+    "trace_id": "84aa89a0-c95d-426f-9c19-9be48a9dc802",
+    "reply_preview": "AIive smoke test OK."
+  },
+  "files_created": [
+    "backend/aiive/core/__init__.py",
+    "backend/aiive/core/llm_client.py",
+    "tests/unit/backend/test_llm_client.py",
+    "scripts/smoke/smoke_llm_ping.py"
+  ],
+  "files_modified": [
+    ".env",
+    ".env.example",
+    "backend/aiive/config.py"
+  ]
+}

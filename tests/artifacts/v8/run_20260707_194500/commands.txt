@@ -1,0 +1,4 @@
+# V8 Test Commands
+
+## Unit Tests
+python3 -m pytest tests/unit/backend/test_safe_delete.py -q

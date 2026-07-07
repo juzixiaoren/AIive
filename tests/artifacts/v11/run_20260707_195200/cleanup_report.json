@@ -1,0 +1,6 @@
+{
+  "phase": "V11",
+  "cleanup_required": false,
+  "reason": "All slot tests use tmp_path, auto-cleaned by pytest. No real slots created.",
+  "artifacts_dir": "tests/artifacts/v11/run_20260707_195200"
+}

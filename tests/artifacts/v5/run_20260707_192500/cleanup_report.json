@@ -1,0 +1,6 @@
+{
+  "phase": "V5",
+  "cleanup_required": false,
+  "reason": "Unit tests use transaction rollback with temp SQLite, auto-cleaned via fixture. Memory records created in tests are rolled back.",
+  "artifacts_dir": "tests/artifacts/v5/run_20260707_192500"
+}
