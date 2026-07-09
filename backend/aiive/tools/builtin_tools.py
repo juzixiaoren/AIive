@@ -1,9 +1,26 @@
-"""Built-in tools registered in ToolRegistry. Each tool maps to a real service."""
+"""
+内置工具注册模块：定义所有系统内置工具的处理函数并将其注册到 ToolRegistry。
+每个工具映射到一个真实的服务或操作，涵盖提醒、记忆、文件、知识库、MCP、自进化等功能。
 
+工具分类：
+- 基础工具：echo
+- 提醒/任务：schedule_reminder, remind_alert, confirm_reminder, snooze_reminder, list_tasks, cancel_task, show_notifications
+- 记忆管理：remember_or_update, forget_memory, run_memory_maintenance, search_memory, list_memories
+- 文件操作：safe_delete, read_text_file
+- 知识库：ingest_document, search_knowledge
+- MCP 集成：search_mcp, install_mcp_sandbox
+- 自进化：create_selfdev_plan, apply_patch_to_inactive_slot, promote_slot, rollback_slot
+- 节奏/注意力：query_rhythm, query_attention
+"""
+
+import logging
 import os
+import uuid as _uuid
 from datetime import datetime, timedelta, timezone
 
 from aiive.db.base import SessionLocal
+
+logger = logging.getLogger(__name__)
 from aiive.tools.registry import (
     CapabilitySafetySchema,
     ToolRegistration,
@@ -13,6 +30,17 @@ from aiive.tools.registry import (
 
 
 def _build_safety(capability_id: str, **overrides) -> CapabilitySafetySchema:
+    """构建工具的安全配置 schema。
+
+    使用默认安全配置作为基础，允许通过 overrides 覆盖特定字段。
+
+    参数:
+        capability_id: 工具能力标识符
+        **overrides: 需要覆盖的安全字段（如 risk_level、writes_external_world 等）
+
+    返回:
+        构建好的 CapabilitySafetySchema 实例
+    """
     base = dict(
         capability_id=capability_id,
         definition_source="local_builtin",
@@ -30,39 +58,61 @@ def _build_safety(capability_id: str, **overrides) -> CapabilitySafetySchema:
 
 
 # ═══════════════════════════════════════════════════════════════
-# Handler functions
+# 处理函数
 # ═══════════════════════════════════════════════════════════════
 
 def _db_handler(fn):
-    """Decorator: open/close DB session for handlers that need it."""
+    """装饰器：为需要数据库会话的处理函数自动管理会话生命周期（开启/提交/关闭）。"""
     def wrapper(**params):
         db = SessionLocal()
         try:
             result = fn(db, **params)
             db.commit()
             return result
+        except Exception:
+            logger.exception("数据库处理函数执行失败: fn=%s", fn.__name__)
+            db.rollback()
+            raise
         finally:
             db.close()
     return wrapper
 
 
-# ── Echo ──
+# ── Echo（回显）──
 def _handle_echo(message: str = "") -> str:
+    """回显工具：原样返回输入消息。"""
     return message
 
 
-# ── Reminder / Task ──
-# Module-level context for passing thread_id from agent loop to tool handlers.
+# ── Reminder / Task（提醒与任务）──
+# 模块级上下文：用于从 agent loop 向工具处理函数传递当前线程 ID。
 _current_thread_id: str | None = None
 
 
 def set_thread_context(thread_id: str | None) -> None:
+    """设置当前线程上下文，使工具处理函数能关联到正确的对话线程。
+
+    参数:
+        thread_id: 线程 ID，传 None 则清除上下文
+    """
     global _current_thread_id
     _current_thread_id = thread_id
 
 
 @_db_handler
 def _handle_schedule_reminder(db, content: str, delay_minutes: int = 1):
+    """创建定时提醒，只负责写入 Task 记录。
+
+    Event（reminder_created）由 AgentLoop._finalize() 在主 DB 会话中统一写入，
+    避免工具独立会话与主会话之间的 FK 约束冲突。
+
+    参数:
+        content: 提醒内容
+        delay_minutes: 延迟分钟数，默认 1 分钟
+
+    返回:
+        包含 reminder_set、task_id、content、delay_minutes 等字段的字典
+    """
     from aiive.runtime.task_manager import TaskManager
     next_check = datetime.now(timezone.utc) + timedelta(minutes=delay_minutes)
     task = TaskManager(db).create(
@@ -73,37 +123,273 @@ def _handle_schedule_reminder(db, content: str, delay_minutes: int = 1):
     )
     task.thread_id = _current_thread_id
     db.flush()
-    return {"reminder_set": True, "task_id": task.id, "content": content, "delay_minutes": delay_minutes}
+    return {
+        "reminder_set": True,
+        "task_id": task.id,
+        "content": content,
+        "delay_minutes": delay_minutes,
+    }
 
 
 @_db_handler
-def _handle_list_tasks(db, status: str = ""):
+def _handle_remind_alert(db, reminder_id: str):
+    """LLM 在提醒到期时调用此工具，激活提醒警报。
+
+    将事件状态标记为 alerting，返回操作信息供前端显示确认/延期按钮。
+
+    参数:
+        reminder_id: reminder_created 事件 ID
+
+    返回:
+        包含 ok、reminder_id、content、status 的字典
+    """
+    from aiive.db.models import Event
+    event = db.get(Event, reminder_id)
+    if not event:
+        return {"ok": False, "error": "Reminder not found"}
+    if event.event_type != "reminder_created":
+        return {"ok": False, "error": f"Not a reminder event (type={event.event_type})"}
+
+    payload = dict(event.payload or {})
+    payload["status"] = "alerting"
+    event.payload = payload
+    db.flush()
+
+    return {
+        "ok": True,
+        "reminder_id": reminder_id,
+        "content": payload.get("content", ""),
+        "status": "alerting",
+    }
+
+
+@_db_handler
+def _handle_confirm_reminder(db, reminder_id: str):
+    """用户确认提醒完成，将状态标记为 confirmed。
+
+    参数:
+        reminder_id: reminder_created 事件 ID
+
+    返回:
+        包含 ok、reminder_id、content、status 的字典
+    """
+    from aiive.db.models import Event
+    event = db.get(Event, reminder_id)
+    if not event:
+        return {"ok": False, "error": "Reminder not found"}
+
+    payload = dict(event.payload or {})
+    payload["status"] = "confirmed"
+    event.payload = payload
+    db.flush()
+    return {"ok": True, "reminder_id": reminder_id, "content": payload.get("content", ""), "status": "confirmed"}
+
+
+@_db_handler
+def _handle_snooze_reminder(db, reminder_id: str, delay_minutes: int = 5):
+    """用户延迟提醒，创建新的延时任务和事件。
+
+    流程:
+    1. 将当前提醒标记为 snoozed
+    2. 创建新的 Task（延迟 delay_minutes 分钟后检查）
+    3. 创建新的 reminder_created 事件
+
+    参数:
+        reminder_id: 要延期的提醒事件 ID
+        delay_minutes: 延期分钟数，默认 5 分钟
+
+    返回:
+        包含 snoozed_reminder_id、new_reminder_id、content、delay_minutes 的字典
+    """
+    from aiive.db.models import Event, Task
+    event = db.get(Event, reminder_id)
+    if not event:
+        return {"ok": False, "error": "Reminder not found"}
+
+    payload = dict(event.payload or {})
+    content = payload.get("content", "提醒")
+
+    # 将当前事件标记为已延期
+    payload["status"] = "snoozed"
+    event.payload = payload
+    db.flush()
+
+    # 创建新的延时任务
+    next_check = datetime.now(timezone.utc) + timedelta(minutes=delay_minutes)
+    task = Task(
+        id=str(_uuid.uuid4()),
+        task_type="reminder",
+        title=content,
+        status="pending",
+        description=f"延时{delay_minutes}分钟 (原提醒: {reminder_id[:8]})",
+        next_check_at=next_check,
+        thread_id=event.thread_id,
+    )
+    db.add(task)
+    db.flush()
+
+    # 创建新的 pending 事件
+    new_event = Event(
+        id=str(_uuid.uuid4()),
+        trace_id=task.id,
+        thread_id=event.thread_id,
+        event_type="reminder_created",
+        payload={
+            "task_id": task.id,
+            "status": "pending",
+            "content": content,
+            "delay_minutes": delay_minutes,
+            "snoozed_from": reminder_id,
+        },
+    )
+    db.add(new_event)
+    db.flush()
+
+    return {
+        "ok": True,
+        "snoozed_reminder_id": reminder_id,
+        "new_reminder_id": new_event.id,
+        "content": content,
+        "delay_minutes": delay_minutes,
+    }
+
+
+@_db_handler
+def _handle_list_tasks(db, status: str = "", thread_id: str = ""):
+    """列出所有任务/提醒。
+
+    参数:
+        status: 状态筛选，支持空/"all"/"全部"（不筛选）、"pending"、"completed"
+        thread_id: 线程 ID，默认使用当前线程上下文
+
+    返回:
+        任务字典列表，每项包含 id、task_type、title、status、next_check_at
+    """
     from aiive.runtime.task_manager import TaskManager
-    tasks = TaskManager(db).list_all(status or None)
-    return [{"id": t.id, "task_type": t.task_type, "title": t.title, "status": t.status} for t in tasks]
+    # "all" / 空 / "全部" → 不施加状态过滤
+    normalized = status.strip().lower() if status else ""
+    effective = normalized if normalized not in ("", "all", "全部") else None
+    # 默认限定为当前线程，确保用户只看到自己的提醒
+    tid = thread_id or _current_thread_id
+    tasks = TaskManager(db).list_all(effective, tid or None)
+    return [{"id": t.id, "task_type": t.task_type, "title": t.title, "status": t.status, "next_check_at": t.next_check_at.isoformat() if t.next_check_at else None} for t in tasks]
 
 
 @_db_handler
 def _handle_cancel_task(db, task_id: str):
-    from aiive.db.models import Task
+    """按 ID 取消一个任务，同时将关联的 reminder_created 事件标记为 cancelled。
+
+    参数:
+        task_id: 要取消的任务 ID
+
+    返回:
+        包含 cancelled 标志的字典
+    """
+    from aiive.db.models import Event, Task
     task = db.get(Task, task_id)
-    if task:
-        task.status = "canceled"
-        return {"canceled": True, "task_id": task_id}
-    return {"canceled": False, "error": "not found"}
+    if not task:
+        return {"cancelled": False, "error": "not found"}
+
+    task.status = "cancelled"
+
+    # 同步取消关联的 reminder_created 事件（通知也会消失）
+    related_events = (
+        db.query(Event)
+        .filter(Event.event_type == "reminder_created")
+        .order_by(Event.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    for e in related_events:
+        if (e.payload or {}).get("task_id") == task_id:
+            p = dict(e.payload or {})
+            p["status"] = "cancelled"
+            e.payload = p
+
+    return {"cancelled": True, "task_id": task_id, "events_updated": True}
+
+
+@_db_handler
+def _handle_dismiss_notifications(db):
+    """清除未执行的通知：将待提醒/提醒中/已延时的通知标记为 cancelled。
+
+    已确认（confirmed）和已取消（cancelled）的通知不受影响，
+    它们已属于"已执行"类别。
+
+    返回:
+        包含 dismissed_count 的字典
+    """
+    from aiive.db.models import Event
+    pending_statuses = ["pending", "alerting", "snoozed"]
+    events = (
+        db.query(Event)
+        .filter(Event.event_type.in_(["notification_created", "reminder_created"]))
+        .order_by(Event.created_at.desc())
+        .limit(200)
+        .all()
+    )
+    count = 0
+    for e in events:
+        status = (e.payload or {}).get("status", "")
+        if status in pending_statuses:
+            p = dict(e.payload or {})
+            p["status"] = "cancelled"
+            e.payload = p
+            count += 1
+
+    return {"ok": True, "dismissed_count": count}
 
 
 @_db_handler
 def _handle_show_notifications(db):
+    """显示已触发的通知（notification_created 和 reminder_created 事件）。
+
+    返回:
+        最近 20 条通知的列表，每项包含 id、event_type、title、message、status、created_at
+    """
     from aiive.db.models import Event
-    notifs = db.query(Event).filter(Event.event_type == "notification_created").order_by(Event.created_at.desc()).limit(20).all()
-    return [{"id": e.id, "title": e.payload.get("title", ""), "message": e.payload.get("message", ""), "created_at": e.created_at.isoformat()} for e in notifs]
+    notifs = (
+        db.query(Event)
+        .filter(Event.event_type.in_(["notification_created", "reminder_created"]))
+        .order_by(Event.created_at.desc())
+        .limit(20)
+        .all()
+    )
+    result = []
+    for e in notifs:
+        try:
+            p = e.payload or {}
+            result.append({
+                "id": e.id, "event_type": e.event_type,
+                "title": p.get("title", p.get("content", "")),
+                "message": p.get("message", p.get("content", "")),
+                "status": p.get("status", ""),
+                "created_at": e.created_at.isoformat() if e.created_at else "",
+            })
+        except Exception:
+            logger.warning("解析通知条目失败: event_id=%s", e.id, exc_info=True)
+            continue
+    return result
 
 
-# ── Memory ──
+# ── Memory（记忆管理）──
 @_db_handler
 def _handle_remember_or_update(db, content: str, memory_type: str = "fact", memory_key: str = ""):
-    """Create or update memory through MemoryGate + MemoryWriteService."""
+    """创建或更新记忆，通过 MemoryGate + MemoryWriteService 写入。
+
+    流程:
+    1. 如果提供了 memory_key，查找已有的同 key 记忆
+    2. 通过 MemoryGate 决策（接受/拒绝/更新）
+    3. 使用 MemoryWriteService 写入
+
+    参数:
+        content: 记忆内容
+        memory_type: 记忆类型（fact / preference / steward_signal 等）
+        memory_key: 记忆键（如 "user.name"），同 key 自动覆盖旧记忆
+
+    返回:
+        包含 ok、memory_id、content、memory_type、state 的字典
+    """
     from aiive.memory.memory_gate import MemoryGate, MemoryGateInput
     from aiive.memory.memory_store import MemoryStore
     from aiive.memory.memory_write_service import MemoryWriteService
@@ -112,7 +398,7 @@ def _handle_remember_or_update(db, content: str, memory_type: str = "fact", memo
     gate = MemoryGate()
     writer = MemoryWriteService(db)
 
-    # Look up existing memory for the same key
+    # 查找同 key 的已有记忆（用于更新而非重复创建）
     existing = None
     if memory_key:
         for old in store.get_active():
@@ -120,7 +406,7 @@ def _handle_remember_or_update(db, content: str, memory_type: str = "fact", memo
                 existing = {"id": old.id, "content": old.content, "memory_type": old.memory_type}
                 break
 
-    # Gate the write
+    # 通过 Gate 决策
     gate_input = MemoryGateInput(
         content=content,
         user_message=content,
@@ -139,8 +425,8 @@ def _handle_remember_or_update(db, content: str, memory_type: str = "fact", memo
     if decision.decision == "reject":
         return {"ok": False, "error": f"Memory gate rejected: {decision.reason}"}
 
-    # Write through service
-    result = writer.write(decision, content)
+    # 通过 write service 写入
+    result = writer.write(decision, content, thread_id=_current_thread_id or "")
     db.flush()
     return {
         "ok": True,
@@ -153,35 +439,162 @@ def _handle_remember_or_update(db, content: str, memory_type: str = "fact", memo
 
 
 @_db_handler
-def _handle_forget_memory(db, memory_id: str = "", reason: str = ""):
+def _handle_forget_memory(db, memory_id: str = "", reason: str = "", scope: str = "memory_id", target: str = ""):
+    """遗忘/删除存储的记忆。
+
+    支持四种操作模式（由 scope 参数决定）:
+    - memory_id（默认）: 按 ID 删除单条记录（使用 memory_id 参数）
+    - memory_key: 删除所有匹配 memory_key 的活跃记录（使用 target 参数）
+    - topic: 搜索并删除内容中包含 target 文本的记录
+    - all: 清空所有活跃记忆（需要显式确认）
+
+    参数:
+        memory_id: 单条记忆 ID（scope=memory_id 时使用）
+        reason: 删除原因
+        scope: 操作范围（memory_id / memory_key / topic / all）
+        target: 目标关键词（scope=memory_key 或 topic 时使用）
+
+    返回:
+        包含 ok、deleted_count、deleted_ids 等字段的字典
+    """
     from aiive.memory.memory_maintenance import MemoryMaintenance
+    from aiive.memory.memory_store import MemoryStore
+
     maint = MemoryMaintenance(db)
+    store = MemoryStore(db)
+    deleted: list[str] = []
+
+    if scope == "all":
+        # 清空所有活跃记忆
+        records = [r for r in store.get_active()]
+        for r in records:
+            maint.forget(r.id, reason)
+            deleted.append(r.id)
+        return {
+            "ok": True,
+            "deleted_count": len(deleted),
+            "deleted_ids": deleted,
+            "scope": "all",
+            "reason": reason,
+        }
+
+    if scope == "memory_key":
+        # 按 memory_key 删除
+        if not target:
+            return {"ok": False, "error": "target is required for scope=memory_key"}
+        records = [r for r in store.get_active() if r.memory_key == target]
+        for r in records:
+            maint.forget(r.id, reason)
+            deleted.append(r.id)
+        return {
+            "ok": True,
+            "deleted_count": len(deleted),
+            "deleted_ids": deleted,
+            "scope": "memory_key",
+            "target": target,
+        }
+
+    if scope == "topic":
+        # 按主题内容搜索删除
+        if not target:
+            return {"ok": False, "error": "target is required for scope=topic"}
+        records = [r for r in store.get_active() if target.lower() in r.content.lower()]
+        for r in records:
+            maint.forget(r.id, reason)
+            deleted.append(r.id)
+        return {
+            "ok": True,
+            "deleted_count": len(deleted),
+            "deleted_ids": deleted,
+            "scope": "topic",
+            "target": target,
+        }
+
+    # 默认：按 memory_id 删除
     if not memory_id:
-        return {"ok": False, "error": "memory_id is required. LLM should provide the exact memory_id from previous search_memory results."}
+        return {"ok": False, "error": "memory_id is required for scope=memory_id (or use scope=all/topic/memory_key)"}
     return maint.forget(memory_id, reason)
 
 
 @_db_handler
 def _handle_run_memory_maintenance(db):
+    """运行记忆维护扫描，检查并报告记忆健康状况。"""
     from aiive.memory.memory_maintenance import MemoryMaintenance
     return MemoryMaintenance(db).scan()
 
 
 @_db_handler
 def _handle_search_memory(db, query: str = ""):
+    """按内容文本搜索记忆。
+
+    空查询返回空结果；使用 list_memories 可列出全部。
+
+    参数:
+        query: 搜索关键词（大小写不敏感）
+
+    返回:
+        包含 results 和 total 的字典，results 最多 20 条
+    """
     from aiive.memory.memory_store import MemoryStore
-    records = MemoryStore(db).resolve_for_context() if not query else MemoryStore(db).list_all()
-    return [{"id": r.id, "content": r.content, "memory_type": r.memory_type, "lifecycle_state": r.lifecycle_state} for r in records[:20]]
+    if not query or not query.strip():
+        return {"ok": True, "results": [], "hint": "Empty query. Use list_memories to list all active memories."}
+    # 搜索内容包含 query 的活跃记录（大小写不敏感）
+    all_active = MemoryStore(db).get_active()
+    q = query.lower()
+    matched = [r for r in all_active if q in r.content.lower()]
+    return {
+        "ok": True,
+        "results": [{"id": r.id, "content": r.content, "memory_type": r.memory_type, "lifecycle_state": r.lifecycle_state} for r in matched[:20]],
+        "total": len(matched),
+        "query": query,
+    }
 
 
-# ── File / Safe Delete ──
+@_db_handler
+def _handle_list_memories(db):
+    """列出所有活跃记忆（无搜索过滤）。
+
+    返回:
+        包含 results（最多 50 条）和 total 的字典
+    """
+    from aiive.memory.memory_store import MemoryStore
+    records = MemoryStore(db).get_active()
+    return {
+        "ok": True,
+        "results": [{"id": r.id, "content": r.content, "memory_type": r.memory_type, "lifecycle_state": r.lifecycle_state} for r in records[:50]],
+        "total": len(records),
+    }
+
+
+# ── File / Safe Delete（文件与安全删除）──
 def _handle_safe_delete(path: str, scope_id: str = "test_artifacts", mode: str = "trash"):
+    """安全删除文件，仅允许删除已注册 scope 内的文件。
+
+    参数:
+        path: 要删除的文件路径
+        scope_id: 范围标识符，默认 "test_artifacts"
+        mode: 删除模式（trash / quarantine / hard_delete_for_test_only）
+
+    返回:
+        包含 allowed、reason、resolved_path 的字典
+    """
     from aiive.tools.safe_delete import safe_delete as do_safe_delete
     decision = do_safe_delete(path, scope_id, mode)
     return {"allowed": decision.allowed, "reason": decision.reason, "resolved_path": decision.resolved_path}
 
 
 def _handle_read_text_file(path: str, max_lines: int = 50):
+    """读取 ~/Documents 目录下的文本文件（最多 max_lines 行）。
+
+    只允许读取 ~/Documents 范围内的文件，拒绝其他路径。
+
+    参数:
+        path: 文件路径
+        max_lines: 最大读取行数，默认 50
+
+    返回:
+        包含 lines 和 total_read 的字典，或包含 error 的错误字典
+    """
     allowed_dir = os.path.expanduser("~/Documents")
     real_path = os.path.realpath(path)
     if not real_path.startswith(allowed_dir):
@@ -193,34 +606,59 @@ def _handle_read_text_file(path: str, max_lines: int = 50):
             lines = [line.rstrip("\n") for i, line in enumerate(f) if i < max_lines]
         return {"lines": lines, "total_read": len(lines)}
     except Exception as e:
+        logger.warning("读取文本文件失败: path=%s, error=%s", real_path, e)
         return {"error": str(e)}
 
 
-# ── Knowledge ──
+# ── Knowledge（知识库）──
 @_db_handler
 def _handle_ingest_document(db, file_path: str):
+    """将文档导入知识库，同时将原始内容保存到对象存储。
+
+    参数:
+        file_path: 文档文件路径
+
+    返回:
+        KnowledgeIngestor 的导入结果字典
+    """
     from aiive.knowledge.ingestor import KnowledgeIngestor
     from aiive.storage.object_store import put_text
     result = KnowledgeIngestor(db).ingest(file_path)
-    # Save raw document to object store
+    # 将原始文档保存到对象存储供后续检索
     if result.get("ok") and not result.get("duplicate"):
         try:
-            import os
             content = open(file_path).read()
             put_text("raw-documents", os.path.basename(file_path), content)
         except Exception:
-            pass
+            logger.warning("对象存储写入失败: file_path=%s", file_path, exc_info=True)
     return result
 
 
 @_db_handler
 def _handle_search_knowledge(db, query: str, limit: int = 5):
+    """搜索已导入的文档知识。
+
+    参数:
+        query: 搜索查询
+        limit: 返回结果数量上限，默认 5
+
+    返回:
+        search_chunks 的搜索结果
+    """
     from aiive.knowledge.ingestor import search_chunks
     return search_chunks(db, query, limit)
 
 
-# ── MCP ──
+# ── MCP 集成 ──
 def _handle_search_mcp(goal: str = ""):
+    """根据目标搜索匹配的 MCP 候选服务器。
+
+    参数:
+        goal: 用户目标描述文本
+
+    返回:
+        MCP 候选服务器信息列表，每项包含 name、source、version、description 等
+    """
     from aiive.mcp.discovery import search_mcp_candidates
     candidates = search_mcp_candidates(goal)
     return [{"name": c.name, "source": c.source, "version": c.version, "description": c.description, "risk_notes": c.risk_notes, "declared_tools": c.declared_tools} for c in candidates]
@@ -228,6 +666,18 @@ def _handle_search_mcp(goal: str = ""):
 
 @_db_handler
 def _handle_install_mcp_sandbox(db, candidate_name: str):
+    """将 MCP 候选服务器安装到沙箱环境。
+
+    流程:
+    1. 搜索匹配的候选
+    2. 调用 install_sandbox 安装到数据库
+
+    参数:
+        candidate_name: 候选服务器名称
+
+    返回:
+        安装结果字典
+    """
     from aiive.mcp.discovery import search_mcp_candidates
     from aiive.mcp.installer import install_sandbox
     candidates = search_mcp_candidates(candidate_name)
@@ -237,26 +687,39 @@ def _handle_install_mcp_sandbox(db, candidate_name: str):
     return install_sandbox(db, c.name, c.package_ref, c.version, c.transport, c.declared_tools, {"name": c.name, "description": c.description})
 
 
-# ── Self-Dev ──
+# ── Self-Dev（自进化）──
 def _handle_create_selfdev_plan(goal: str = ""):
-    from aiive.config import settings
-    from aiive.core.llm_client import LLMClient
+    """生成自进化补丁计划。
+
+    参数:
+        goal: 改进目标描述
+
+    返回:
+        SelfDevPlanner 的计划结果
+    """
+    from aiive.core.llm_client import default_llm_client
     from aiive.selfdev.planner import SelfDevPlanner
-    llm = LLMClient(base_url=settings.aiive_llm_base_url, api_key=settings.aiive_llm_api_key, default_model=settings.aiive_llm_model, timeout_seconds=settings.aiive_llm_timeout_seconds)
+    llm = default_llm_client()
     return SelfDevPlanner(llm).plan(goal)
 
 
 def _handle_apply_patch_to_inactive_slot():
+    """将补丁应用到非活跃槽位（不影响当前运行版本）。"""
     from aiive.selfdev.patch_executor import PatchExecutor
     return PatchExecutor().apply_to_inactive([])
 
 
 def _handle_promote_slot():
+    """健康检查通过后将非活跃槽位提升为活跃版本。"""
     from aiive.selfdev.promote_rollback import PromoteRollback
     return PromoteRollback().promote()
 
 
 def _handle_rollback_slot():
+    """回滚到上一个活跃槽位版本。
+
+    自动检测当前活跃槽位（A/B），回退到另一个槽位。
+    """
     from aiive.selfdev.promote_rollback import PromoteRollback
     pr = PromoteRollback()
     active = pr._manager.get_active_slot()
@@ -264,55 +727,68 @@ def _handle_rollback_slot():
     return pr.rollback(previous)
 
 
-# ── Rhythm / Attention ──
+# ── Rhythm / Attention（节奏/注意力）──
 @_db_handler
 def _handle_query_rhythm(db):
+    """获取每日节奏摘要。"""
     from aiive.runtime.rhythm_manager import RhythmManager
     return RhythmManager(db).daily_summary()
 
 
 @_db_handler
 def _handle_query_attention(db, thread_id: str = ""):
+    """获取当前注意力状态。"""
     from aiive.runtime.attention_manager import AttentionManager
     return AttentionManager(db).recompute(thread_id, "query")
 
 
 # ═══════════════════════════════════════════════════════════════
-# Registration
+# 注册
 # ═══════════════════════════════════════════════════════════════
 
 def register_builtin_tools(registry: ToolRegistry) -> None:
-    # Tuple format: (cap_id, handler, description, params, risk_level, writes_external_world, can_delete)
+    """将所有内置工具注册到 ToolRegistry。
+
+    工具元组格式: (cap_id, handler, description, params, risk_level, writes_external_world, can_delete)
+
+    参数:
+        registry: 目标 ToolRegistry 实例
+    """
     tools = [
-        # Basic
-        ("echo", _handle_echo, "Echo back the input message", {"message": "str"}, "low", False, False),
-        # Reminder / Task
-        ("schedule_reminder", _handle_schedule_reminder, "Create a timed reminder. Worker polls DB and fires real notification.", {"content": "str", "delay_minutes": "int"}, "low", True, False),
-        ("list_tasks", _handle_list_tasks, "List all tasks/reminders", {"status": "str"}, "low", False, False),
-        ("cancel_task", _handle_cancel_task, "Cancel a task by ID", {"task_id": "str"}, "low", True, False),
-        ("show_notifications", _handle_show_notifications, "Show triggered notifications", {}, "low", False, False),
-        # Memory
-        ("remember_or_update", _handle_remember_or_update, "Remember or update user info. Use consistent memory_key (e.g. 'user.name', 'user.pref'). Same key auto-supersedes old.", {"content": "str", "memory_type": "str", "memory_key": "str"}, "low", True, False),
-        ("forget_memory", _handle_forget_memory, "Forget a memory by ID or content keyword", {"memory_id": "str", "reason": "str"}, "low", True, False),
-        ("run_memory_maintenance", _handle_run_memory_maintenance, "Scan and report memory health", {}, "low", False, False),
-        ("search_memory", _handle_search_memory, "Search current memories", {"query": "str"}, "low", False, False),
-        # File
-        ("safe_delete", _handle_safe_delete, "Safely delete a file within allowed scopes", {"path": "str", "scope_id": "str", "mode": "str"}, "high", True, True),
-        ("read_text_file", _handle_read_text_file, "Read a text file within ~/Documents (max 50 lines)", {"path": "str", "max_lines": "int"}, "low", False, False),
-        # Knowledge
-        ("ingest_document", _handle_ingest_document, "Ingest a document into knowledge base", {"file_path": "str"}, "low", True, False),
-        ("search_knowledge", _handle_search_knowledge, "Search ingested documents", {"query": "str", "limit": "int"}, "low", False, False),
-        # MCP
-        ("search_mcp", _handle_search_mcp, "Search MCP candidates by goal", {"goal": "str"}, "low", False, False),
-        ("install_mcp_sandbox", _handle_install_mcp_sandbox, "Install MCP to sandbox", {"candidate_name": "str"}, "medium", True, False),
-        # Self-Dev
-        ("create_selfdev_plan", _handle_create_selfdev_plan, "Generate a self-dev patch plan", {"goal": "str"}, "low", False, False),
-        ("apply_patch_to_inactive_slot", _handle_apply_patch_to_inactive_slot, "Apply patch to inactive slot only", {}, "high", True, False),
-        ("promote_slot", _handle_promote_slot, "Promote inactive slot to active after health check", {}, "high", True, False),
-        ("rollback_slot", _handle_rollback_slot, "Rollback to previous active slot", {}, "high", True, False),
-        # Rhythm
-        ("query_rhythm", _handle_query_rhythm, "Get daily rhythm summary", {}, "low", False, False),
-        ("query_attention", _handle_query_attention, "Get current attention state", {"thread_id": "str"}, "low", False, False),
+        # 基础工具
+        ("echo", _handle_echo, "回显输入消息", {"message": "str"}, "low", False, False),
+        # 提醒 / 任务
+        ("schedule_reminder", _handle_schedule_reminder, "创建定时提醒，立即写入 events 表", {"content": "str", "delay_minutes": "int"}, "low", True, False),
+        ("remind_alert", _handle_remind_alert, "激活到期提醒警报，前端显示确认/延期操作按钮", {"reminder_id": "str"}, "low", False, False),
+        ("confirm_reminder", _handle_confirm_reminder, "确认提醒已完成", {"reminder_id": "str"}, "low", True, False),
+        ("snooze_reminder", _handle_snooze_reminder, "延迟提醒 N 分钟，创建新的延时任务", {"reminder_id": "str", "delay_minutes": "int"}, "low", True, False),
+        ("list_tasks", _handle_list_tasks, "列出所有任务/提醒，status='all'/'pending'/'completed'", {"status": "str"}, "low", False, False),
+        ("cancel_task", _handle_cancel_task, "按 ID 取消任务", {"task_id": "str"}, "low", True, False),
+        ("dismiss_notifications", _handle_dismiss_notifications, "清除未执行的通知（待提醒/提醒中/已延时），将其标记为已取消。已确认和已取消的不受影响", {}, "low", True, False),
+        ("show_notifications", _handle_show_notifications, "显示已触发的通知", {}, "low", False, False),
+        # 记忆管理
+        ("remember_or_update", _handle_remember_or_update, "记住或更新用户信息。使用一致的 memory_key（如 'user.name'、'user.pref'），同 key 自动覆盖旧记忆", {"content": "str", "memory_type": "str", "memory_key": "str"}, "low", True, False),
+        ("forget_memory", _handle_forget_memory, "遗忘/删除记忆：按 ID、memory_key、主题，或使用 scope=all 清空全部", {"memory_id": "str", "reason": "str", "scope": "str", "target": "str"}, "medium", True, False),
+        ("run_memory_maintenance", _handle_run_memory_maintenance, "扫描并报告记忆健康状况", {}, "low", False, False),
+        ("search_memory", _handle_search_memory, "按内容文本搜索记忆，需要非空查询词", {"query": "str"}, "low", False, False),
+        ("list_memories", _handle_list_memories, "列出所有活跃记忆（无过滤）", {}, "low", False, False),
+        # 文件操作
+        ("safe_delete", _handle_safe_delete, "在允许范围内安全删除文件", {"path": "str", "scope_id": "str", "mode": "str"}, "high", True, True),
+        ("read_text_file", _handle_read_text_file, "读取 ~/Documents 下的文本文件（最多 50 行）", {"path": "str", "max_lines": "int"}, "low", False, False),
+        # 知识库
+        ("ingest_document", _handle_ingest_document, "导入文档到知识库", {"file_path": "str"}, "low", True, False),
+        ("search_knowledge", _handle_search_knowledge, "搜索已导入的文档", {"query": "str", "limit": "int"}, "low", False, False),
+        # MCP 集成
+        ("search_mcp", _handle_search_mcp, "按目标搜索 MCP 候选服务器", {"goal": "str"}, "low", False, False),
+        ("install_mcp_sandbox", _handle_install_mcp_sandbox, "将 MCP 安装到沙箱", {"candidate_name": "str"}, "medium", True, False),
+        # 自进化
+        ("create_selfdev_plan", _handle_create_selfdev_plan, "生成自进化补丁计划", {"goal": "str"}, "low", False, False),
+        ("apply_patch_to_inactive_slot", _handle_apply_patch_to_inactive_slot, "仅将补丁应用到非活跃槽位", {}, "high", True, False),
+        ("promote_slot", _handle_promote_slot, "健康检查通过后提升非活跃槽位为活跃", {}, "high", True, False),
+        ("rollback_slot", _handle_rollback_slot, "回滚到上一个活跃槽位", {}, "high", True, False),
+        # 节奏 / 注意力
+        ("query_rhythm", _handle_query_rhythm, "获取每日节奏摘要", {}, "low", False, False),
+        ("query_attention", _handle_query_attention, "获取当前注意力状态", {"thread_id": "str"}, "low", False, False),
     ]
 
     for cap_id, handler, desc, params, risk, writes_ext, can_del in tools:

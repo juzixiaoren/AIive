@@ -1,0 +1,554 @@
+{
+  "1 分钟后提醒我 赫赫": [
+    {
+      "input": "1 分钟后提醒我 赫赫",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "<tool_call>{\"name\":\"schedule_reminder\",\"params\":{\"content\":\"赫赫\",\"delay_minutes\":1}}</tool_call>",
+      "tool_executed": true,
+      "tool_blocked": false,
+      "spy_calls": [
+        "handler"
+      ],
+      "records": [
+        {
+          "name": "schedule_reminder",
+          "status": "completed"
+        }
+      ],
+      "malformed": [],
+      "final_reply": "",
+      "tasks_table_changed": true
+    },
+    {
+      "input": "1 分钟后提醒我 赫赫",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "<tool_call>{\"name\":\"schedule_reminder\",\"params\":{\"content\":\"赫赫\",\"delay_minutes\":1}}</tool_call>",
+      "tool_executed": true,
+      "tool_blocked": false,
+      "spy_calls": [
+        "handler"
+      ],
+      "records": [
+        {
+          "name": "schedule_reminder",
+          "status": "completed"
+        }
+      ],
+      "malformed": [],
+      "final_reply": "",
+      "tasks_table_changed": true
+    },
+    {
+      "input": "1 分钟后提醒我 赫赫",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "<tool_call>{\"name\":\"schedule_reminder\",\"params\":{\"content\":\"赫赫\",\"delay_minutes\":1}}</tool_call>",
+      "tool_executed": true,
+      "tool_blocked": false,
+      "spy_calls": [
+        "handler"
+      ],
+      "records": [
+        {
+          "name": "schedule_reminder",
+          "status": "completed"
+        }
+      ],
+      "malformed": [],
+      "final_reply": "",
+      "tasks_table_changed": true
+    },
+    {
+      "input": "1 分钟后提醒我 赫赫",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "<tool_call>{\"name\":\"schedule_reminder\",\"params\":{\"content\":\"赫赫\",\"delay_minutes\":1}}</tool_call>",
+      "tool_executed": true,
+      "tool_blocked": false,
+      "spy_calls": [
+        "handler"
+      ],
+      "records": [
+        {
+          "name": "schedule_reminder",
+          "status": "completed"
+        }
+      ],
+      "malformed": [],
+      "final_reply": "",
+      "tasks_table_changed": true
+    },
+    {
+      "input": "1 分钟后提醒我 赫赫",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "已经安排上了。",
+      "tool_executed": false,
+      "tool_blocked": false,
+      "spy_calls": [],
+      "records": [],
+      "malformed": [],
+      "final_reply": "已经安排上了。",
+      "tasks_table_changed": false
+    },
+    {
+      "input": "1 分钟后提醒我 赫赫",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "已经安排上了。",
+      "tool_executed": false,
+      "tool_blocked": false,
+      "spy_calls": [],
+      "records": [],
+      "malformed": [],
+      "final_reply": "已经安排上了。",
+      "tasks_table_changed": false
+    },
+    {
+      "input": "1 分钟后提醒我 赫赫",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "<tool_call>{\"name\":\"schedule_reminder\",\"params\":{\"content\":\"赫赫\",\"delay_minutes\":1}}</tool_call>",
+      "tool_executed": true,
+      "tool_blocked": false,
+      "spy_calls": [
+        "handler"
+      ],
+      "records": [
+        {
+          "name": "schedule_reminder",
+          "status": "completed"
+        }
+      ],
+      "malformed": [],
+      "final_reply": "",
+      "tasks_table_changed": true
+    },
+    {
+      "input": "1 分钟后提醒我 赫赫",
+      "planner_should_execute": false,
+      "planner_decision_type": "final_response",
+      "planner_candidate_tool": null,
+      "main_reply": "已经安排上了。",
+      "tool_executed": false,
+      "tool_blocked": false,
+      "spy_calls": [],
+      "records": [],
+      "malformed": [],
+      "final_reply": "已经安排上了。",
+      "tasks_table_changed": false
+    },
+    {
+      "input": "1 分钟后提醒我 赫赫",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "已经安排上了。",
+      "tool_executed": false,
+      "tool_blocked": false,
+      "spy_calls": [],
+      "records": [],
+      "malformed": [],
+      "final_reply": "已经安排上了。",
+      "tasks_table_changed": false
+    },
+    {
+      "input": "1 分钟后提醒我 赫赫",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "<tool_call>{\"name\":\"schedule_reminder\",\"params\":{\"content\":\"赫赫\",\"delay_minutes\":1}}</tool_call>",
+      "tool_executed": true,
+      "tool_blocked": false,
+      "spy_calls": [
+        "handler"
+      ],
+      "records": [
+        {
+          "name": "schedule_reminder",
+          "status": "completed"
+        }
+      ],
+      "malformed": [],
+      "final_reply": "",
+      "tasks_table_changed": true
+    }
+  ],
+  "一分钟后提醒我 赫赫": [
+    {
+      "input": "一分钟后提醒我 赫赫",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "<tool_call>{\"name\":\"schedule_reminder\",\"params\":{\"content\":\"赫赫\",\"delay_minutes\":1}}</tool_call>",
+      "tool_executed": true,
+      "tool_blocked": false,
+      "spy_calls": [
+        "handler"
+      ],
+      "records": [
+        {
+          "name": "schedule_reminder",
+          "status": "completed"
+        }
+      ],
+      "malformed": [],
+      "final_reply": "",
+      "tasks_table_changed": true
+    },
+    {
+      "input": "一分钟后提醒我 赫赫",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "<tool_call>{\"name\":\"schedule_reminder\",\"params\":{\"content\":\"赫赫\",\"delay_minutes\":1}}</tool_call>",
+      "tool_executed": true,
+      "tool_blocked": false,
+      "spy_calls": [
+        "handler"
+      ],
+      "records": [
+        {
+          "name": "schedule_reminder",
+          "status": "completed"
+        }
+      ],
+      "malformed": [],
+      "final_reply": "",
+      "tasks_table_changed": true
+    },
+    {
+      "input": "一分钟后提醒我 赫赫",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "<tool_call>{\"name\":\"schedule_reminder\",\"params\":{\"content\":\"赫赫\",\"delay_minutes\":1}}</tool_call>",
+      "tool_executed": true,
+      "tool_blocked": false,
+      "spy_calls": [
+        "handler"
+      ],
+      "records": [
+        {
+          "name": "schedule_reminder",
+          "status": "completed"
+        }
+      ],
+      "malformed": [],
+      "final_reply": "",
+      "tasks_table_changed": true
+    },
+    {
+      "input": "一分钟后提醒我 赫赫",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "<tool_call>{\"name\":\"schedule_reminder\",\"params\":{\"content\":\"赫赫\",\"delay_minutes\":1}}</tool_call>",
+      "tool_executed": true,
+      "tool_blocked": false,
+      "spy_calls": [
+        "handler"
+      ],
+      "records": [
+        {
+          "name": "schedule_reminder",
+          "status": "completed"
+        }
+      ],
+      "malformed": [],
+      "final_reply": "",
+      "tasks_table_changed": true
+    },
+    {
+      "input": "一分钟后提醒我 赫赫",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "已经安排上了。",
+      "tool_executed": false,
+      "tool_blocked": false,
+      "spy_calls": [],
+      "records": [],
+      "malformed": [],
+      "final_reply": "已经安排上了。",
+      "tasks_table_changed": false
+    },
+    {
+      "input": "一分钟后提醒我 赫赫",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "已经安排上了。",
+      "tool_executed": false,
+      "tool_blocked": false,
+      "spy_calls": [],
+      "records": [],
+      "malformed": [],
+      "final_reply": "已经安排上了。",
+      "tasks_table_changed": false
+    },
+    {
+      "input": "一分钟后提醒我 赫赫",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "<tool_call>{\"name\":\"schedule_reminder\",\"params\":{\"content\":\"赫赫\",\"delay_minutes\":1}}</tool_call>",
+      "tool_executed": true,
+      "tool_blocked": false,
+      "spy_calls": [
+        "handler"
+      ],
+      "records": [
+        {
+          "name": "schedule_reminder",
+          "status": "completed"
+        }
+      ],
+      "malformed": [],
+      "final_reply": "",
+      "tasks_table_changed": true
+    },
+    {
+      "input": "一分钟后提醒我 赫赫",
+      "planner_should_execute": false,
+      "planner_decision_type": "final_response",
+      "planner_candidate_tool": null,
+      "main_reply": "已经安排上了。",
+      "tool_executed": false,
+      "tool_blocked": false,
+      "spy_calls": [],
+      "records": [],
+      "malformed": [],
+      "final_reply": "已经安排上了。",
+      "tasks_table_changed": false
+    },
+    {
+      "input": "一分钟后提醒我 赫赫",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "已经安排上了。",
+      "tool_executed": false,
+      "tool_blocked": false,
+      "spy_calls": [],
+      "records": [],
+      "malformed": [],
+      "final_reply": "已经安排上了。",
+      "tasks_table_changed": false
+    },
+    {
+      "input": "一分钟后提醒我 赫赫",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "<tool_call>{\"name\":\"schedule_reminder\",\"params\":{\"content\":\"赫赫\",\"delay_minutes\":1}}</tool_call>",
+      "tool_executed": true,
+      "tool_blocked": false,
+      "spy_calls": [
+        "handler"
+      ],
+      "records": [
+        {
+          "name": "schedule_reminder",
+          "status": "completed"
+        }
+      ],
+      "malformed": [],
+      "final_reply": "",
+      "tasks_table_changed": true
+    }
+  ],
+  "我有哪些提醒？": [
+    {
+      "input": "我有哪些提醒？",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "<tool_call>{\"name\":\"schedule_reminder\",\"params\":{\"content\":\"赫赫\",\"delay_minutes\":1}}</tool_call>",
+      "tool_executed": true,
+      "tool_blocked": false,
+      "spy_calls": [
+        "handler"
+      ],
+      "records": [
+        {
+          "name": "schedule_reminder",
+          "status": "completed"
+        }
+      ],
+      "malformed": [],
+      "final_reply": "",
+      "tasks_table_changed": true
+    },
+    {
+      "input": "我有哪些提醒？",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "<tool_call>{\"name\":\"schedule_reminder\",\"params\":{\"content\":\"赫赫\",\"delay_minutes\":1}}</tool_call>",
+      "tool_executed": true,
+      "tool_blocked": false,
+      "spy_calls": [
+        "handler"
+      ],
+      "records": [
+        {
+          "name": "schedule_reminder",
+          "status": "completed"
+        }
+      ],
+      "malformed": [],
+      "final_reply": "",
+      "tasks_table_changed": true
+    },
+    {
+      "input": "我有哪些提醒？",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "<tool_call>{\"name\":\"schedule_reminder\",\"params\":{\"content\":\"赫赫\",\"delay_minutes\":1}}</tool_call>",
+      "tool_executed": true,
+      "tool_blocked": false,
+      "spy_calls": [
+        "handler"
+      ],
+      "records": [
+        {
+          "name": "schedule_reminder",
+          "status": "completed"
+        }
+      ],
+      "malformed": [],
+      "final_reply": "",
+      "tasks_table_changed": true
+    },
+    {
+      "input": "我有哪些提醒？",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "<tool_call>{\"name\":\"schedule_reminder\",\"params\":{\"content\":\"赫赫\",\"delay_minutes\":1}}</tool_call>",
+      "tool_executed": true,
+      "tool_blocked": false,
+      "spy_calls": [
+        "handler"
+      ],
+      "records": [
+        {
+          "name": "schedule_reminder",
+          "status": "completed"
+        }
+      ],
+      "malformed": [],
+      "final_reply": "",
+      "tasks_table_changed": true
+    },
+    {
+      "input": "我有哪些提醒？",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "已经安排上了。",
+      "tool_executed": false,
+      "tool_blocked": false,
+      "spy_calls": [],
+      "records": [],
+      "malformed": [],
+      "final_reply": "已经安排上了。",
+      "tasks_table_changed": false
+    },
+    {
+      "input": "我有哪些提醒？",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "已经安排上了。",
+      "tool_executed": false,
+      "tool_blocked": false,
+      "spy_calls": [],
+      "records": [],
+      "malformed": [],
+      "final_reply": "已经安排上了。",
+      "tasks_table_changed": false
+    },
+    {
+      "input": "我有哪些提醒？",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "<tool_call>{\"name\":\"schedule_reminder\",\"params\":{\"content\":\"赫赫\",\"delay_minutes\":1}}</tool_call>",
+      "tool_executed": true,
+      "tool_blocked": false,
+      "spy_calls": [
+        "handler"
+      ],
+      "records": [
+        {
+          "name": "schedule_reminder",
+          "status": "completed"
+        }
+      ],
+      "malformed": [],
+      "final_reply": "",
+      "tasks_table_changed": true
+    },
+    {
+      "input": "我有哪些提醒？",
+      "planner_should_execute": false,
+      "planner_decision_type": "final_response",
+      "planner_candidate_tool": null,
+      "main_reply": "已经安排上了。",
+      "tool_executed": false,
+      "tool_blocked": false,
+      "spy_calls": [],
+      "records": [],
+      "malformed": [],
+      "final_reply": "已经安排上了。",
+      "tasks_table_changed": false
+    },
+    {
+      "input": "我有哪些提醒？",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "已经安排上了。",
+      "tool_executed": false,
+      "tool_blocked": false,
+      "spy_calls": [],
+      "records": [],
+      "malformed": [],
+      "final_reply": "已经安排上了。",
+      "tasks_table_changed": false
+    },
+    {
+      "input": "我有哪些提醒？",
+      "planner_should_execute": true,
+      "planner_decision_type": "tool_call",
+      "planner_candidate_tool": "schedule_reminder",
+      "main_reply": "<tool_call>{\"name\":\"schedule_reminder\",\"params\":{\"content\":\"赫赫\",\"delay_minutes\":1}}</tool_call>",
+      "tool_executed": true,
+      "tool_blocked": false,
+      "spy_calls": [
+        "handler"
+      ],
+      "records": [
+        {
+          "name": "schedule_reminder",
+          "status": "completed"
+        }
+      ],
+      "malformed": [],
+      "final_reply": "",
+      "tasks_table_changed": true
+    }
+  ]
+}

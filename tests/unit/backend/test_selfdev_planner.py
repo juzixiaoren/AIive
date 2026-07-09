@@ -1,3 +1,8 @@
+"""测试 SelfDevPlanner（自进化规划器）模块。
+
+覆盖规划生成、操作标记、核心文件保护、JSON 解析容错及数据库持久化。
+"""
+
 import json
 
 from aiive.core.llm_client import FakeLLMClient
@@ -5,7 +10,10 @@ from aiive.selfdev.planner import SelfDevPlanner
 
 
 class TestSelfDevPlanner:
+    """测试 SelfDevPlanner 的规划生成和操作验证功能。"""
+
     def test_plan_generates_valid_structure(self):
+        """规划器应生成有效的操作结构。"""
         fake = FakeLLMClient(fixed_content=json.dumps({
             "goal_summary": "Add a weather tool",
             "operations": [
@@ -27,9 +35,10 @@ class TestSelfDevPlanner:
 
         assert plan["goal_summary"] == "Add a weather tool"
         assert len(plan["operations"]) == 1
-        assert plan["operations"][0]["not_allowed_yet"] is True  # V12 marks all as not_allowed_yet
+        assert plan["operations"][0]["not_allowed_yet"] is True  # V12 将所有操作标记为 not_allowed_yet
 
     def test_plan_marks_all_ops_not_allowed_yet(self):
+        """所有操作应被标记为 not_allowed_yet。"""
         fake = FakeLLMClient(fixed_content=json.dumps({
             "goal_summary": "Change frontend",
             "operations": [
@@ -49,6 +58,7 @@ class TestSelfDevPlanner:
             assert op["not_allowed_yet"] is True
 
     def test_core_files_blocked(self):
+        """核心文件应被保护并标记 CORE_FILE_PROTECTED。"""
         fake = FakeLLMClient(fixed_content=json.dumps({
             "goal_summary": "Modify main.py",
             "operations": [
@@ -69,6 +79,7 @@ class TestSelfDevPlanner:
             assert "CORE_FILE_PROTECTED" in op.get("risk_notes", "")
 
     def test_handles_invalid_json(self):
+        """无效 JSON 应被优雅处理，返回失败占位结果。"""
         fake = FakeLLMClient(fixed_content="not json at all")
         planner = SelfDevPlanner(fake)
         plan = planner.plan("test")
@@ -76,6 +87,7 @@ class TestSelfDevPlanner:
         assert plan["operations"] == []
 
     def test_plan_includes_test_plan(self):
+        """规划结果应包含测试计划字段。"""
         fake = FakeLLMClient(fixed_content=json.dumps({
             "goal_summary": "Add feature",
             "operations": [],
@@ -87,6 +99,7 @@ class TestSelfDevPlanner:
         assert plan["test_plan"] == "Run pytest"
 
     def test_handles_markdown_json_block(self):
+        """Markdown 代码块中的 JSON 应被正确解析。"""
         fake = FakeLLMClient(fixed_content="```json\n" + json.dumps({
             "goal_summary": "Add X",
             "operations": [],
@@ -98,6 +111,7 @@ class TestSelfDevPlanner:
         assert plan["goal_summary"] == "Add X"
 
     def test_missing_fields_get_defaults(self):
+        """缺失字段应使用默认值填充。"""
         fake = FakeLLMClient(fixed_content=json.dumps({
             "operations": [{"target_file": "x.py"}],
         }))
@@ -107,6 +121,7 @@ class TestSelfDevPlanner:
         assert plan["test_plan"] == ""
 
     def test_db_persistence(self, db_session):
+        """SelfDevRequest 和 PatchOperation 应能正确持久化到数据库。"""
         from aiive.db.models import SelfDevRequest, PatchOperation
 
         req = SelfDevRequest(

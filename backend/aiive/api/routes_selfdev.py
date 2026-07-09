@@ -1,3 +1,9 @@
+"""
+API路由模块：自进化开发（Self-Dev）
+- 提供代码槽位（Slots）状态查询和健康检查
+- 提供自进化计划（Plan）的创建和查询
+- 提供补丁应用、升级和回滚操作的接口
+"""
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -14,27 +20,49 @@ router = APIRouter(prefix="/api/selfdev")
 
 
 class PlanRequest(BaseModel):
+    """自进化计划请求体"""
     goal: str = Field(..., min_length=1)
 
 
-# ===================== V11: Slots =====================
+# ===================== V11: 槽位管理 =====================
 
 @router.get("/slots")
 def list_slots():
+    """获取当前代码槽位状态
+
+    Returns:
+        各槽位的激活状态和相关信息
+    """
     launcher = Launcher()
     return launcher.get_status()
 
 
 @router.post("/slots/health-check")
 def health_check():
+    """对当前槽位进行健康检查
+
+    Returns:
+        健康检查结果
+    """
     launcher = Launcher()
     return launcher.health_check()
 
 
-# ===================== V12: Self-Dev Plan =====================
+# ===================== V12: 自进化计划 =====================
 
 @router.post("/plan")
 def create_plan(request: PlanRequest, db: Session = Depends(get_db)):
+    """创建自进化开发计划
+
+    根据目标描述，通过 LLM 生成开发计划并存入数据库。
+
+    Args:
+        request: 包含 goal 的计划请求
+        db: 数据库会话
+
+    Returns:
+        创建的计划信息，包含 request_id、trace_id、status 和 plan 详情
+    """
     client = LLMClient(
         base_url=settings.aiive_llm_base_url,
         api_key=settings.aiive_llm_api_key,
@@ -79,6 +107,15 @@ def create_plan(request: PlanRequest, db: Session = Depends(get_db)):
 
 @router.get("/requests/{request_id}")
 def get_request(request_id: str, db: Session = Depends(get_db)):
+    """获取自进化请求的详细信息
+
+    Args:
+        request_id: 请求ID
+        db: 数据库会话
+
+    Returns:
+        请求详情，包含计划、操作列表等；未找到则返回错误
+    """
     req = db.get(SelfDevRequest, request_id)
     if not req:
         return {"error": "not found"}
@@ -110,14 +147,25 @@ def get_request(request_id: str, db: Session = Depends(get_db)):
     }
 
 
-# ===================== V13: Apply / Promote / Rollback =====================
+# ===================== V13: 应用 / 升级 / 回滚 =====================
 
 class ApplyRequest(BaseModel):
+    """补丁应用请求体"""
     operations: list[dict] = Field(default_factory=list)
 
 
 @router.post("/{request_id}/apply-inactive")
 def apply_inactive(request_id: str, req: ApplyRequest, db: Session = Depends(get_db)):
+    """将补丁应用到非激活槽位
+
+    Args:
+        request_id: 请求ID
+        req: 包含 operations 的应用请求
+        db: 数据库会话
+
+    Returns:
+        应用结果
+    """
     sreq = db.get(SelfDevRequest, request_id)
     if not sreq:
         return {"ok": False, "error": "Request not found"}
@@ -134,11 +182,22 @@ def apply_inactive(request_id: str, req: ApplyRequest, db: Session = Depends(get
 
 
 class PromoteRequest(BaseModel):
+    """升级请求体"""
     run_health_check: bool = True
 
 
 @router.post("/{request_id}/promote")
 def promote(request_id: str, req: PromoteRequest, db: Session = Depends(get_db)):
+    """将非激活槽位的变更升级为激活状态
+
+    Args:
+        request_id: 请求ID
+        req: 升级请求，可指定是否运行健康检查
+        db: 数据库会话
+
+    Returns:
+        升级结果
+    """
     sreq = db.get(SelfDevRequest, request_id)
     if not sreq:
         return {"ok": False, "error": "Request not found"}
@@ -156,6 +215,15 @@ def promote(request_id: str, req: PromoteRequest, db: Session = Depends(get_db))
 
 @router.post("/{request_id}/rollback")
 def rollback(request_id: str, db: Session = Depends(get_db)):
+    """回滚当前激活槽位到上一个版本
+
+    Args:
+        request_id: 请求ID
+        db: 数据库会话
+
+    Returns:
+        回滚结果
+    """
     sreq = db.get(SelfDevRequest, request_id)
     if not sreq:
         return {"ok": False, "error": "Request not found"}

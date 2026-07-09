@@ -1,8 +1,12 @@
+"""测试 MCP 服务发现——搜索候选服务器及其元数据。"""
 from aiive.mcp.discovery import MCPServerCandidate, search_mcp_candidates
 
 
 class TestMCPServerCandidate:
+    """测试 MCPServerCandidate 数据模型的所有字段。"""
+
     def test_all_fields(self):
+        """验证 MCPServerCandidate 各字段赋值和读取正确。"""
         c = MCPServerCandidate(
             name="test-mcp",
             source="official_registry",
@@ -23,49 +27,60 @@ class TestMCPServerCandidate:
 
 
 class TestSearchMCP:
+    """测试 MCP 候选服务器的搜索和结果质量。"""
+
     def test_search_returns_results_for_goal(self):
+        """验证按目标搜索能返回相关结果。"""
         results = search_mcp_candidates("github")
         assert len(results) > 0
         names = [r.name for r in results]
         assert any("github" in n.lower() for n in names)
 
     def test_search_returns_results_for_file(self):
+        """验证按文件类型搜索能返回结果。"""
         results = search_mcp_candidates("read files")
         assert len(results) > 0
 
     def test_search_returns_results_for_database(self):
+        """验证按数据库类型搜索能返回结果。"""
         results = search_mcp_candidates("database query")
         assert len(results) > 0
 
     def test_results_have_descriptor_hash(self):
+        """验证搜索结果都包含描述符哈希。"""
         results = search_mcp_candidates("search")
         for r in results:
             assert r.descriptor_hash
             assert len(r.descriptor_hash) == 16
 
     def test_results_have_trust_level(self):
+        """验证搜索结果都包含可信等级。"""
         results = search_mcp_candidates("filesystem")
         for r in results:
             assert r.definition_trust_level in ("semi_trusted", "untrusted")
 
     def test_results_have_risk_notes(self):
+        """验证搜索结果都包含风险说明。"""
         results = search_mcp_candidates("github")
         for r in results:
             assert r.risk_notes
 
     def test_official_registry_is_semi_trusted(self):
+        """验证官方注册源的结果可信等级为 semi_trusted。"""
         results = search_mcp_candidates("filesystem")
         official = [r for r in results if r.source == "official_registry"]
         for r in official:
             assert r.definition_trust_level == "semi_trusted"
 
     def test_community_source_is_untrusted(self):
+        """验证社区来源的结果可信等级为 untrusted。"""
         results = search_mcp_candidates("memory")
         community = [r for r in results if r.source == "community"]
         for r in community:
             assert r.definition_trust_level == "untrusted"
 
     def test_results_are_mcpservercandidate_instances(self):
+        """验证搜索结果均为 MCPServerCandidate 实例。"""
         results = search_mcp_candidates("filesystem")
         for r in results:
             assert isinstance(r, MCPServerCandidate)

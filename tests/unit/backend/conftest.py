@@ -1,3 +1,4 @@
+"""pytest 公共 fixtures - 提供测试用的数据库会话等共享资源。"""
 import tempfile
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from aiive.db.models import Base
 
 @pytest.fixture
 def db_session():
+    """创建临时 SQLite 数据库会话 fixture，测试结束后自动清理。"""
     tmpdir = tempfile.mkdtemp()
     db_path = Path(tmpdir) / "test.db"
 

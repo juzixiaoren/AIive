@@ -1,3 +1,8 @@
+"""测试 ToolRegistry（工具注册表）模块。
+
+覆盖工具注册、查询、权限执行及描述符哈希计算。
+"""
+
 from aiive.tools.registry import (
     CapabilitySafetySchema,
     ToolRegistration,
@@ -8,7 +13,10 @@ from aiive.tools.registry import (
 
 
 class TestCapabilitySafetySchema:
+    """测试 CapabilitySafetySchema 的属性和防御性默认值。"""
+
     def test_all_fields(self):
+        """验证所有字段的正确赋值。"""
         schema = CapabilitySafetySchema(
             capability_id="test_tool",
             definition_source="local_builtin",
@@ -24,18 +32,22 @@ class TestCapabilitySafetySchema:
         assert schema.tool_description_is_instruction is False
 
     def test_defensive_defaults(self):
+        """不信任来源的工具应有防御性默认值。"""
         schema = CapabilitySafetySchema(
             capability_id="x",
             definition_source="remote_mcp",
             definition_trust_level="untrusted",
             risk_level="high",
         )
-        assert schema.requires_confirmation is False  # not auto-enforced
+        assert schema.requires_confirmation is False  # 不自动执行
         assert schema.allowed_instruction_sources == ["trusted_user_command"]
 
 
 class TestToolRegistry:
+    """测试 ToolRegistry 的注册、查询和执行功能。"""
+
     def test_register_and_get(self):
+        """注册后应能正确获取工具。"""
         registry = ToolRegistry()
 
         def handler(**kwargs):
@@ -53,6 +65,7 @@ class TestToolRegistry:
         assert reg.safety.capability_id == "echo"
 
     def test_list_all(self):
+        """list_all 应返回所有已注册工具。"""
         registry = ToolRegistry()
 
         def h(**kw):
@@ -71,11 +84,13 @@ class TestToolRegistry:
         assert {t["capability_id"] for t in tools} == {"t1", "t2"}
 
     def test_execute_unknown_tool(self):
+        """执行未注册的工具应返回失败。"""
         registry = ToolRegistry()
         result = registry.execute("nonexistent", {}, "trusted_user_command")
         assert result["ok"] is False
 
     def test_execute_untrusted_source_blocked(self):
+        """不可信来源应被拦截。"""
         registry = ToolRegistry()
 
         def handler(**kw):
@@ -90,6 +105,7 @@ class TestToolRegistry:
         assert "not authorized" in result["error"].lower()
 
     def test_execute_requires_confirmation(self):
+        """需要确认的工具应返回 approval_required。"""
         registry = ToolRegistry()
 
         def handler(**kw):
@@ -107,6 +123,7 @@ class TestToolRegistry:
         assert result["approval_required"] is True
 
     def test_execute_succeeds_for_safe_tool(self):
+        """安全工具应能正常执行。"""
         registry = ToolRegistry()
 
         def handler(message: str = "") -> str:
@@ -122,7 +139,10 @@ class TestToolRegistry:
 
 
 class TestBuiltinTools:
+    """测试内置工具的注册状态和执行。"""
+
     def test_registry_has_echo_and_read_file(self):
+        """注册表应包含 echo 和 read_text_file_limited 工具。"""
         registry = get_tool_registry()
         tools = registry.list_all()
         ids = {t["capability_id"] for t in tools}
@@ -130,12 +150,14 @@ class TestBuiltinTools:
         assert "read_text_file_limited" in ids
 
     def test_echo_executes(self):
+        """echo 工具应正确执行并返回结果。"""
         registry = get_tool_registry()
         result = registry.execute("echo", {"message": "hello world"}, "trusted_user_command")
         assert result["ok"] is True
         assert result["result"] == "hello world"
 
     def test_read_file_requires_confirmation(self):
+        """read_text_file_limited 应要求确认且风险等级为 medium。"""
         registry = get_tool_registry()
         tool = [t for t in registry.list_all() if t["capability_id"] == "read_text_file_limited"][0]
         assert tool["requires_confirmation"] is True
@@ -143,10 +165,14 @@ class TestBuiltinTools:
 
 
 class TestDescriptorHash:
+    """测试工具描述符哈希的计算。"""
+
     def test_hash_stable_for_same_input(self):
+        """相同输入应产生相同哈希。"""
         schema1 = {"capability_id": "x", "risk_level": "low"}
         schema2 = {"capability_id": "x", "risk_level": "low"}
         assert compute_descriptor_hash(schema1) == compute_descriptor_hash(schema2)
 
     def test_hash_differs_for_different_input(self):
+        """不同输入应产生不同哈希。"""
         assert compute_descriptor_hash({"a": 1}) != compute_descriptor_hash({"a": 2})

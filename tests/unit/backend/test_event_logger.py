@@ -1,8 +1,12 @@
+"""测试 EventLogger 事件日志记录功能。"""
 from aiive.runtime.event_logger import EventLogger
 
 
 class TestEventLogger:
+    """测试 EventLogger 的记录、查询和 LLM 调用日志功能。"""
+
     def test_log_event_creates_record(self, db_session):
+        """验证记录事件后数据库中存在对应记录。"""
         logger = EventLogger(db_session)
         event = logger.log_event(
             trace_id="trace-1",
@@ -20,6 +24,7 @@ class TestEventLogger:
         assert event.created_at is not None
 
     def test_log_multiple_events(self, db_session):
+        """验证多条事件可正确记录并按顺序查询。"""
         logger = EventLogger(db_session)
         logger.log_event("trace-1", "thread-1", "user_message", {"content": "A"})
         logger.log_event("trace-1", "thread-1", "llm_response", {"content": "B"})
@@ -38,6 +43,7 @@ class TestEventLogger:
         assert events[1].event_type == "llm_response"
 
     def test_log_llm_call_creates_record(self, db_session):
+        """验证 LLM 调用日志包含模型、延迟、输入输出预览等字段。"""
         logger = EventLogger(db_session)
         call = logger.log_llm_call(
             trace_id="trace-1",
@@ -57,6 +63,7 @@ class TestEventLogger:
         assert call.output_preview == "out"
 
     def test_log_event_default_payload(self, db_session):
+        """验证未提供 payload 时默认为空字典。"""
         logger = EventLogger(db_session)
         event = logger.log_event("trace-1", "thread-1", "chat_started")
         db_session.flush()

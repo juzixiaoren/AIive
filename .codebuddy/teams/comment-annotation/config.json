@@ -1,0 +1,63 @@
+{
+  "name": "comment-annotation",
+  "leadAgentId": "746b8f70df3c45768856799968e6e4dc",
+  "workspacePath": "/Users/donkluo/Documents/UGit/AIive",
+  "createdAt": "2026-07-09T07:00:44.733Z",
+  "options": {
+    "workspacePath": "/Users/donkluo/Documents/UGit/AIive",
+    "isAutoTeam": false
+  },
+  "members": [
+    {
+      "memberId": "team-lead@comment-annotation",
+      "name": "team-lead",
+      "role": "Team Lead - coordinates the team and interacts with the user"
+    },
+    {
+      "memberId": "backend-core-db@comment-annotation",
+      "name": "backend-core-db",
+      "role": "注释 core/db/config/main"
+    },
+    {
+      "memberId": "backend-api@comment-annotation",
+      "name": "backend-api",
+      "role": "注释 api/ 路由层"
+    },
+    {
+      "memberId": "backend-memory@comment-annotation",
+      "name": "backend-memory",
+      "role": "注释 memory/ 记忆系统"
+    },
+    {
+      "memberId": "backend-runtime@comment-annotation",
+      "name": "backend-runtime",
+      "role": "注释 runtime/ 运行时"
+    },
+    {
+      "memberId": "backend-tools-mcp-worker@comment-annotation",
+      "name": "backend-tools-mcp-worker",
+      "role": "注释 tools/mcp/worker"
+    },
+    {
+      "memberId": "backend-misc@comment-annotation",
+      "name": "backend-misc",
+      "role": "注释 knowledge/selfdev/storage/supervisor"
+    },
+    {
+      "memberId": "tests-group1@comment-annotation",
+      "name": "tests-group1",
+      "role": "注释 tests/ 第一组"
+    },
+    {
+      "memberId": "tests-group2@comment-annotation",
+      "name": "tests-group2",
+      "role": "注释 tests/ 第二组"
+    },
+    {
+      "memberId": "frontend@comment-annotation",
+      "name": "frontend",
+      "role": "注释 frontend/src/"
+    }
+  ],
+  "isAutoTeam": false
+}

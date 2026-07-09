@@ -47,18 +47,35 @@ TRUST_REQUIRED_MEMORY_TYPES = frozenset({
 
 
 # ---------------------------------------------------------------------------
-# Structured I/O
+# 结构化输入/输出数据类
 # ---------------------------------------------------------------------------
 
 @dataclass
 class MemoryGateInput:
+    """记忆准入决策的输入数据结构。
+
+    Attributes:
+        content: 记忆内容文本。
+        user_message: 用户原始消息。
+        source: 来源标识（auto_extraction | tool_call | steward）。
+        intent_type: 意图分类结果。
+        execution_mode: 执行模式（explain_only | execute）。
+        should_execute: 是否允许执行。
+        evidence_source: 证据来源（trusted_user_message | untrusted_external_content | tool_result）。
+        extracted_memory_type: 从提取器中获得的记忆类型。
+        extracted_memory_key: 从提取器中获得的记忆键。
+        confidence: 置信度。
+        existing_memory: 已存在的同名记忆记录（用于替代决策）。
+        trace_id: 追踪 ID。
+        source_event_id: 源事件 ID。
+    """
     content: str
     user_message: str
-    source: str = "auto_extraction"  # "auto_extraction" | "tool_call" | "steward"
+    source: str = "auto_extraction"  # 来源：auto_extraction | tool_call | steward
     intent_type: str = "unknown"
     execution_mode: str = "explain_only"
     should_execute: bool = False
-    evidence_source: str = "trusted_user_message"  # trusted_user_message | untrusted_external_content | tool_result
+    evidence_source: str = "trusted_user_message"  # 证据来源：trusted_user_message | untrusted_external_content | tool_result
     extracted_memory_type: str | None = None
     extracted_memory_key: str | None = None
     confidence: float = 0.5
@@ -69,6 +86,21 @@ class MemoryGateInput:
 
 @dataclass
 class MemoryGateDecision:
+    """记忆准入决策的输出数据结构。
+
+    Attributes:
+        decision: 决策结果（active 直接写入 | candidate 候选队列 | reject 拒绝）。
+        memory_type: 最终确定的记忆类型。
+        memory_key: 最终确定的记忆键。
+        update_mode: 更新模式（create 新建 | upsert 更新插入 | supersede 替代旧记录 | ignore 忽略）。
+        confidence: 最终置信度。
+        reason: 决策原因说明。
+        blocked_reason: 阻止原因代码。
+        supersede_memory_ids: 需要被替代的旧记忆 ID 列表。
+        requires_user_confirmation: 是否需要用户确认。
+        source_event_id: 源事件 ID。
+        trace_id: 追踪 ID。
+    """
     decision: str  # "active" | "candidate" | "reject"
     memory_type: str | None = None
     memory_key: str | None = None
@@ -83,22 +115,35 @@ class MemoryGateDecision:
 
 
 # ---------------------------------------------------------------------------
-# MemoryKeyResolver (deterministic, no NLP)
+# MemoryKeyResolver - 记忆键解析器（确定性逻辑，无 NLP）
 # ---------------------------------------------------------------------------
 
 class MemoryKeyResolver:
-    """Resolves stable memory_key from structured ExtractedMemory hints."""
+    """从结构化的 ExtractedMemory 提示中解析出稳定的 memory_key。
+
+    完全基于确定性规则，不涉及任何 NLP 或关键词匹配。
+    """
 
     @staticmethod
     def resolve(memory_type_hint: str | None, memory_key_hint: str | None,
                 content: str) -> str | None:
-        # Explicit hint from IntentClassifier takes precedence
+        """根据记忆类型提示和键提示解析出最终的 memory_key。
+
+        Args:
+            memory_type_hint: 记忆类型提示。
+            memory_key_hint: 记忆键提示（来自 IntentClassifier 的显式提示优先）。
+            content: 记忆内容文本。
+
+        Returns:
+            解析出的稳定键，无法确定时返回 None。
+        """
+        # IntentClassifier 的显式提示优先级最高
         if memory_key_hint and memory_key_hint in KNOWN_KEY_PREFIXES:
             return memory_key_hint
         if memory_key_hint:
             return memory_key_hint
 
-        # Fallback: derive from memory_type if possible
+        # 回退逻辑：尝试从 memory_type 推导
         if memory_type_hint == "user_profile":
             return "user.display_name"
         if memory_type_hint == "agent_self":
@@ -110,20 +155,30 @@ class MemoryKeyResolver:
 
 
 # ---------------------------------------------------------------------------
-# MemoryGate
+# MemoryGate - 记忆准入控制器
 # ---------------------------------------------------------------------------
 
 class MemoryGate:
-    """Admission policy: decides on STRUCTURED INPUT only. No NLP, no keywords."""
+    """记忆准入策略：仅基于结构化输入做决策，不使用 NLP 或关键词。"""
 
     def __init__(self):
         self._key_resolver = MemoryKeyResolver()
 
     # pylint: disable=too-many-return-statements,too-many-branches
     def decide(self, inp: MemoryGateInput) -> MemoryGateDecision:
-        """Pure admission decision based on structured fields."""
+        """基于结构化字段执行纯准入决策。
 
-        # ---- Rule 1: execution_mode gate ----
+        依次检查执行模式、权限、信任边界、意图类型、记忆键完整性、
+        置信度阈值、已存在记录和单键唯一性等规则。
+
+        Args:
+            inp: 记忆准入输入数据。
+
+        Returns:
+            MemoryGateDecision 决策结果。
+        """
+
+        # ---- 规则 1：执行模式检查 ----
         if inp.execution_mode != "execute":
             return MemoryGateDecision(
                 decision="reject",
@@ -132,7 +187,7 @@ class MemoryGate:
                 trace_id=inp.trace_id,
             )
 
-        # ---- Rule 2: should_execute gate ----
+        # ---- 规则 2：执行权限检查 ----
         if not inp.should_execute:
             return MemoryGateDecision(
                 decision="reject",
@@ -141,7 +196,8 @@ class MemoryGate:
                 trace_id=inp.trace_id,
             )
 
-        # ---- Rule 3: trust boundary ----
+        # ---- 规则 3：信任边界检查 ----
+        # 敏感记忆类型（个人信息、偏好等）必须来自可信用户消息
         if (inp.evidence_source != "trusted_user_message" and
             inp.extracted_memory_type in TRUST_REQUIRED_MEMORY_TYPES):
             return MemoryGateDecision(
@@ -151,9 +207,10 @@ class MemoryGate:
                 trace_id=inp.trace_id,
             )
 
-        # ---- Rule 4: intent_type not eligible ----
+        # ---- 规则 4：意图类型准入检查 ----
         if inp.intent_type not in MEMORY_ELIGIBLE:
             if inp.intent_type in SCHEDULER_INTENTS:
+                # 调度相关意图应路由到 Scheduler
                 return MemoryGateDecision(
                     decision="reject",
                     reason=f"intent '{inp.intent_type}' should be routed to Scheduler, not MemoryGate",
@@ -167,7 +224,8 @@ class MemoryGate:
                 trace_id=inp.trace_id,
             )
 
-        # ---- Rule 5: memory_key required for active ----
+        # ---- 规则 5：记忆键完整性检查 ----
+        # 没有稳定键的记忆不能直接激活，先放入候选队列
         memory_key = inp.extracted_memory_key
         if not memory_key or not memory_key.strip():
             return MemoryGateDecision(
@@ -178,7 +236,8 @@ class MemoryGate:
                 trace_id=inp.trace_id,
             )
 
-        # ---- Rule 6: confidence threshold ----
+        # ---- 规则 6：置信度阈值检查 ----
+        # 置信度低于 0.7 的记忆先放入候选队列等待人工确认
         if inp.confidence < 0.7:
             return MemoryGateDecision(
                 decision="candidate",
@@ -189,7 +248,8 @@ class MemoryGate:
                 trace_id=inp.trace_id,
             )
 
-        # ---- Rule 7: supersede existing ----
+        # ---- 规则 7：替代已存在记录 ----
+        # 如果存在相同键的旧记忆，标记为替代模式
         if inp.existing_memory and inp.existing_memory.get("id"):
             return MemoryGateDecision(
                 decision="active",
@@ -203,9 +263,9 @@ class MemoryGate:
                 trace_id=inp.trace_id,
             )
 
-        # ---- Rule 8: single-key uniqueness ----
+        # ---- 规则 8：单键唯一性检查 ----
+        # 单键记忆标记为 upsert（写入服务会确保只有一条活跃记录）
         if memory_key in SINGLE_KEY_KEYS:
-            # Single-key: mark as upsert (write service will enforce one active)
             return MemoryGateDecision(
                 decision="active",
                 memory_type=inp.extracted_memory_type,
@@ -217,7 +277,8 @@ class MemoryGate:
                 trace_id=inp.trace_id,
             )
 
-        # ---- Rule 9: default active ----
+        # ---- 规则 9：默认通过 ----
+        # 所有检查通过，正常创建活跃记忆
         return MemoryGateDecision(
             decision="active",
             memory_type=inp.extracted_memory_type,
@@ -230,12 +291,20 @@ class MemoryGate:
         )
 
     # ------------------------------------------------------------------
-    # Backward-compatible wrapper (deprecated — production must use decide())
+    # 向后兼容的包装方法（已弃用——生产环境必须使用 decide()）
     # ------------------------------------------------------------------
 
     def decide_str(self, content: str, user_message: str) -> str:
-        """DEPRECATED: Use decide(MemoryGateInput) instead.
-        Returns 'active', 'candidate', or 'reject' for backward compat only.
+        """已弃用：请使用 decide(MemoryGateInput) 代替。
+
+        仅用于向后兼容，返回 'active'、'candidate' 或 'reject'。
+
+        Args:
+            content: 记忆内容。
+            user_message: 用户消息。
+
+        Returns:
+            决策结果字符串。
         """
         result = self.decide(MemoryGateInput(
             content=content, user_message=user_message,
