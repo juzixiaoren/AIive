@@ -81,6 +81,7 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
   const items = (snapshots[0]?.context_items as ContextItem[]) || [];
   const meta = (snapshots[0]?.meta || {}) as Record<string, unknown>;
   const injected = (meta.injected_memory_ids as string[]) || [];
+  const llm_calls = (data.llm_calls || []) as Array<Record<string, unknown>>;
 
   return (
     <div>
@@ -101,6 +102,41 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
           </div>
         ))}
       </div>
+
+      {/* LLM 调用（完整输入/输出） */}
+      {llm_calls.length > 0 && (
+        <div className="mb-5">
+          <h3 className="text-sm font-medium text-slate-600 mb-3">
+            LLM 调用 ({llm_calls.length})
+            <span className="text-xs text-slate-400 ml-2 font-normal">如实记录每次模型输入与输出</span>
+          </h3>
+          <div className="flex flex-col gap-3">
+            {llm_calls.map((c, i) => (
+              <div key={i} className="border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+                <div className="px-4 py-2 bg-slate-50 flex items-center gap-3">
+                  <span className="text-xs font-medium px-2 py-0.5 rounded-full bg-slate-200 text-slate-700">#{i + 1}</span>
+                  <code className="text-xs text-slate-600 font-mono">{String(c.model || "-")}</code>
+                  <span className="text-[11px] text-slate-400">{c.latency_ms} ms</span>
+                </div>
+                <div className="px-4 py-3 grid grid-cols-1 gap-3">
+                  <div>
+                    <div className="text-[10px] text-slate-400 uppercase mb-1">输入（完整消息）</div>
+                    <pre className="text-[11px] text-slate-600 bg-slate-50 rounded-lg px-3 py-2 whitespace-pre-wrap break-all font-mono leading-relaxed max-h-60 overflow-auto">
+                      {String(c.input_preview || "(空)")}
+                    </pre>
+                  </div>
+                  <div>
+                    <div className="text-[10px] text-slate-400 uppercase mb-1">输出（内容 + 工具调用）</div>
+                    <pre className="text-[11px] text-slate-600 bg-slate-50 rounded-lg px-3 py-2 whitespace-pre-wrap break-all font-mono leading-relaxed max-h-60 overflow-auto">
+                      {String(c.output_preview || "(空)")}
+                    </pre>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* 注入的记忆 ID 列表 */}
       {injected.length > 0 && (

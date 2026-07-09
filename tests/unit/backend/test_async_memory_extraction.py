@@ -3,7 +3,7 @@ from langchain_core.messages import AIMessage
 
 from aiive.core.llm_client import FakeLLMClient
 from aiive.db.models import OutboxJob
-from aiive.runtime.agent_loop import AgentLoop
+from aiive.runtime.agent_graph import AgentGraph
 
 
 class DeterministicLLM:
@@ -22,13 +22,13 @@ class DeterministicLLM:
 class TestAsyncMemoryExtraction:
     def test_chat_enqueues_memory_jobs(self, db_session, monkeypatch):
         monkeypatch.setattr(
-            "aiive.runtime.agent_loop.AgentLoop._build_langchain_llm",
+            "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
             lambda self: DeterministicLLM(content="Hello!"),
         )
 
         llm = FakeLLMClient(fixed_content="Hello!")
-        loop = AgentLoop(llm, db_session)
-        result = loop.run(message="Hi")
+        graph = AgentGraph(llm, db_session)
+        result = graph.run(message="Hi")
 
         jobs = (
             db_session.query(OutboxJob)
@@ -44,13 +44,13 @@ class TestAsyncMemoryExtraction:
 
     def test_memory_and_steward_both_enqueued(self, db_session, monkeypatch):
         monkeypatch.setattr(
-            "aiive.runtime.agent_loop.AgentLoop._build_langchain_llm",
+            "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
             lambda self: DeterministicLLM(content="Reply"),
         )
 
         llm = FakeLLMClient(fixed_content="Reply")
-        loop = AgentLoop(llm, db_session)
-        result = loop.run(message="我叫小明")
+        graph = AgentGraph(llm, db_session)
+        result = graph.run(message="我叫小明")
 
         memory_job = (
             db_session.query(OutboxJob)
@@ -73,13 +73,13 @@ class TestAsyncMemoryExtraction:
 
     def test_jobs_have_correct_payload(self, db_session, monkeypatch):
         monkeypatch.setattr(
-            "aiive.runtime.agent_loop.AgentLoop._build_langchain_llm",
+            "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
             lambda self: DeterministicLLM(content="OK"),
         )
 
         llm = FakeLLMClient(fixed_content="OK")
-        loop = AgentLoop(llm, db_session)
-        loop.run(message="Test message")
+        graph = AgentGraph(llm, db_session)
+        graph.run(message="Test message")
 
         job = db_session.query(OutboxJob).first()
         assert job.payload["user_message"] == "Test message"

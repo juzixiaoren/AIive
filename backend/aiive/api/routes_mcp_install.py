@@ -4,6 +4,8 @@ API路由模块：MCP 安装与冒烟测试
 - 提供能力冒烟测试接口
 - 提供已安装能力列表查询接口
 """
+from __future__ import annotations
+
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session

@@ -3,7 +3,7 @@
 
 使用 LLM 根据用户需求生成结构化的补丁计划（patch plan）。
 计划包含操作列表、测试方案等，最终由 PatchExecutor 在各槽位中执行。
-当前策略（V12）：所有操作均标记为 not_allowed_yet，仅生成计划不执行。
+仅对 FORBIDDEN_PATHS 中的核心文件操作标记 not_allowed_yet，其余操作可执行。
 """
 
 import json
@@ -134,7 +134,7 @@ class SelfDevPlanner:
         - 为缺失字段设置默认值
         - 修正非法操作类型
         - 标记禁止修改的核心文件
-        - 按策略将所有操作标记为 not_allowed_yet
+        - 对 FORBIDDEN_PATHS 中的核心文件标记 not_allowed_yet
 
         参数:
             plan: 待验证的计划字典。
@@ -162,9 +162,6 @@ class SelfDevPlanner:
                     op["not_allowed_yet"] = True
                     op["risk_notes"] = (op.get("risk_notes", "") +
                         " CORE_FILE_PROTECTED: cannot modify core infrastructure in this phase.")
-
-            # V12 策略：所有操作均标记为不可执行（仅生成计划，不自动执行）
-            op["not_allowed_yet"] = True
 
         plan.setdefault("test_plan", "")
         plan.setdefault("goal_summary", plan.get("goal_summary", ""))

@@ -3,7 +3,7 @@ from langchain_core.messages import AIMessage
 
 from aiive.core.llm_client import FakeLLMClient
 from aiive.db.models import ContextSnapshot
-from aiive.runtime.agent_loop import AgentLoop
+from aiive.runtime.agent_graph import AgentGraph
 
 
 class DeterministicLLM:
@@ -19,12 +19,12 @@ class DeterministicLLM:
 class TestContextSnapshot:
     def test_snapshot_saved_on_chat(self, db_session, monkeypatch):
         monkeypatch.setattr(
-            "aiive.runtime.agent_loop.AgentLoop._build_langchain_llm",
+            "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
             lambda self: DeterministicLLM(content="Hello!"),
         )
         llm = FakeLLMClient(fixed_content="Hello!")
-        loop = AgentLoop(llm, db_session)
-        result = loop.run(message="Hi")
+        graph = AgentGraph(llm, db_session)
+        result = graph.run(message="Hi")
         trace_id = result["trace_id"]
 
         snapshots = (
@@ -40,12 +40,12 @@ class TestContextSnapshot:
 
     def test_snapshot_items_include_stable_prefix(self, db_session, monkeypatch):
         monkeypatch.setattr(
-            "aiive.runtime.agent_loop.AgentLoop._build_langchain_llm",
+            "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
             lambda self: DeterministicLLM(content="Hi!"),
         )
         llm = FakeLLMClient(fixed_content="Hi!")
-        loop = AgentLoop(llm, db_session)
-        result = loop.run(message="Hello")
+        graph = AgentGraph(llm, db_session)
+        result = graph.run(message="Hello")
 
         snapshot = (
             db_session.query(ContextSnapshot)
@@ -58,14 +58,14 @@ class TestContextSnapshot:
 
     def test_multiple_calls_create_multiple_snapshots(self, db_session, monkeypatch):
         monkeypatch.setattr(
-            "aiive.runtime.agent_loop.AgentLoop._build_langchain_llm",
+            "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
             lambda self: DeterministicLLM(content="Reply"),
         )
         llm = FakeLLMClient(fixed_content="Reply")
-        loop = AgentLoop(llm, db_session)
+        graph = AgentGraph(llm, db_session)
 
-        r1 = loop.run(message="First")
-        r2 = loop.run(message="Second", thread_id=r1["thread_id"])
+        r1 = graph.run(message="First")
+        r2 = graph.run(message="Second", thread_id=r1["thread_id"])
 
         s1 = (
             db_session.query(ContextSnapshot)
@@ -83,12 +83,12 @@ class TestContextSnapshot:
 
     def test_snapshot_meta_has_total_tokens(self, db_session, monkeypatch):
         monkeypatch.setattr(
-            "aiive.runtime.agent_loop.AgentLoop._build_langchain_llm",
+            "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
             lambda self: DeterministicLLM(content="Reply"),
         )
         llm = FakeLLMClient(fixed_content="Reply")
-        loop = AgentLoop(llm, db_session)
-        result = loop.run(message="Test")
+        graph = AgentGraph(llm, db_session)
+        result = graph.run(message="Test")
 
         snapshot = (
             db_session.query(ContextSnapshot)
@@ -99,12 +99,12 @@ class TestContextSnapshot:
 
     def test_snapshot_has_stable_prefix_hash(self, db_session, monkeypatch):
         monkeypatch.setattr(
-            "aiive.runtime.agent_loop.AgentLoop._build_langchain_llm",
+            "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
             lambda self: DeterministicLLM(content="Reply"),
         )
         llm = FakeLLMClient(fixed_content="Reply")
-        loop = AgentLoop(llm, db_session)
-        result = loop.run(message="Test")
+        graph = AgentGraph(llm, db_session)
+        result = graph.run(message="Test")
 
         snapshot = (
             db_session.query(ContextSnapshot)

@@ -5,6 +5,7 @@
 import logging
 
 from aiive.config import settings
+from aiive.context.run_context import RunContext
 from aiive.core.llm_client import LLMClient
 from aiive.memory.memory_extractor import MemoryExtractor
 from aiive.memory.memory_gate import MemoryGate, MemoryGateInput
@@ -88,7 +89,8 @@ def handle_memory_extraction(db, payload: dict, trace_id: str | None) -> None:
                 continue
 
             thread_id = payload.get("thread_id", "")
-            writer.write(decision, content, thread_id=thread_id)
+            run_ctx = RunContext(thread_id=thread_id, trace_id=trace_id or "", source="outbox_worker")
+            writer.write(decision, content, run_context=run_ctx)
             db.flush()
     except Exception:
         logger.exception("记忆提取处理失败: trace_id=%s", trace_id)
@@ -153,7 +155,8 @@ def handle_steward_extraction(db, payload: dict, trace_id: str | None) -> None:
                 continue
 
             thread_id = payload.get("thread_id", "")
-            writer.write(decision, content, thread_id=thread_id)
+            run_ctx = RunContext(thread_id=thread_id, trace_id=trace_id or "", source="outbox_worker")
+            writer.write(decision, content, run_context=run_ctx)
             db.flush()
     except Exception:
         logger.exception("管家信号提取处理失败: trace_id=%s", trace_id)

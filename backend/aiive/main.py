@@ -40,33 +40,26 @@ logger = logging.getLogger(__name__)
 
 
 def _ensure_system_thread():
-    """确保系统线程存在，以便记录系统级事件。"""
-    from aiive.db.base import SessionLocal
-    from aiive.db.models import Thread as ThreadModel
-    from datetime import datetime, timezone
+    """确保系统线程存在，委托给 ThreadBootstrapService。"""
+    from aiive.runtime.thread_bootstrap import ThreadBootstrapService
 
-    db = SessionLocal()
     try:
-        existing = db.get(ThreadModel, "system")
-        if existing is None:
-            system_thread = ThreadModel(
-                id="system",
-                title="System Events",
-                created_at=datetime.now(timezone.utc),
-                updated_at=datetime.now(timezone.utc),
-            )
-            db.add(system_thread)
-            db.commit()
-            logger.info("Created system thread")
+        ThreadBootstrapService.ensure_system_thread()
     except Exception:
-        db.rollback()
         logger.error("Failed to ensure system thread", exc_info=True)
-    finally:
-        db.close()
 
 
 def _ensure_schema():
-    """对已有数据库执行可能缺失的 schema 变更。"""
+    """确保数据库 schema 完整性：创建缺失的表，执行必要的增量变更。"""
+    from aiive.db.base import create_all
+
+    try:
+        create_all()
+    except Exception:
+        logger.exception("数据库表初始化失败")
+        raise
+
+    # 增量迁移：为已有数据库补齐缺失列
     from aiive.db.base import engine
     from sqlalchemy import text
     with engine.connect() as conn:
@@ -91,7 +84,11 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         """应用生命周期管理：启动时执行初始化，关闭时执行清理。"""
+        import asyncio
         from aiive.worker.scheduler_daemon import start_daemon
+        from aiive.api.ws_manager import ws_manager
+        # 绑定主事件循环，供后台线程安全推送 WebSocket
+        ws_manager.set_main_loop(asyncio.get_running_loop())
         try:
             _ensure_schema()
         except Exception:

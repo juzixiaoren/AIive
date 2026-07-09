@@ -1,4 +1,4 @@
-"""测试聊天 API 和 AgentLoop 的请求-响应流程。"""
+"""测试聊天 API 和 AgentGraph 的请求-响应流程。"""
 import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import patch, MagicMock
@@ -7,7 +7,7 @@ from langchain_core.messages import AIMessage
 
 from aiive.db.base import get_db
 from aiive.main import create_app
-from aiive.runtime.agent_loop import AgentLoop
+from aiive.runtime.agent_graph import AgentGraph
 
 
 class DeterministicLLM:
@@ -26,22 +26,22 @@ class DeterministicLLM:
         return AIMessage(content=self._content)
 
 
-class TestAgentLoop:
-    """测试 AgentLoop.run 的回复、线程 ID 和 trace_id。"""
+class TestAgentGraph:
+    """测试 AgentGraph.run 的回复、线程 ID 和 trace_id。"""
 
     def test_returns_reply_and_thread_id(self, db_session, monkeypatch):
-        """AgentLoop.run 应返回 reply、thread_id 和 trace_id。"""
+        """AgentGraph.run 应返回 reply、thread_id 和 trace_id。"""
         mock_llm = DeterministicLLM(content="Hello, user!")
 
-        # Patch AgentLoop._build_langchain_llm 返回我们的 mock
+        # Patch AgentGraph._build_langchain_llm 返回我们的 mock
         monkeypatch.setattr(
-            "aiive.runtime.agent_loop.AgentLoop._build_langchain_llm",
+            "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
             lambda self: mock_llm,
         )
 
         from aiive.core.llm_client import FakeLLMClient
-        loop = AgentLoop(FakeLLMClient(), db_session)
-        result = loop.run(message="Hi")
+        graph = AgentGraph(FakeLLMClient(), db_session)
+        result = graph.run(message="Hi")
         assert result["reply"] == "Hello, user!"
         assert result["thread_id"]
         assert result["trace_id"]
@@ -56,41 +56,41 @@ class TestAgentLoop:
 
         mock_llm = DeterministicLLM(content="OK")
         monkeypatch.setattr(
-            "aiive.runtime.agent_loop.AgentLoop._build_langchain_llm",
+            "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
             lambda self: mock_llm,
         )
 
         from aiive.core.llm_client import FakeLLMClient
-        loop = AgentLoop(FakeLLMClient(), db_session)
-        result = loop.run(message="Hi", thread_id="thread-42")
+        graph = AgentGraph(FakeLLMClient(), db_session)
+        result = graph.run(message="Hi", thread_id="thread-42")
         assert result["thread_id"] == "thread-42"
 
     def test_generates_thread_id_when_not_provided(self, db_session, monkeypatch):
         """未提供 thread_id 时，每次应生成新的。"""
         mock_llm = DeterministicLLM(content="OK")
         monkeypatch.setattr(
-            "aiive.runtime.agent_loop.AgentLoop._build_langchain_llm",
+            "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
             lambda self: mock_llm,
         )
 
         from aiive.core.llm_client import FakeLLMClient
-        loop = AgentLoop(FakeLLMClient(), db_session)
-        r1 = loop.run(message="A")
-        r2 = loop.run(message="B")
+        graph = AgentGraph(FakeLLMClient(), db_session)
+        r1 = graph.run(message="A")
+        r2 = graph.run(message="B")
         assert r1["thread_id"] != r2["thread_id"]
 
     def test_continues_existing_thread(self, db_session, monkeypatch):
         """提供 thread_id 时应继续同一线程。"""
         mock_llm = DeterministicLLM(content="Reply")
         monkeypatch.setattr(
-            "aiive.runtime.agent_loop.AgentLoop._build_langchain_llm",
+            "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
             lambda self: mock_llm,
         )
 
         from aiive.core.llm_client import FakeLLMClient
-        loop = AgentLoop(FakeLLMClient(), db_session)
-        r1 = loop.run(message="First")
-        r2 = loop.run(message="Second", thread_id=r1["thread_id"])
+        graph = AgentGraph(FakeLLMClient(), db_session)
+        r1 = graph.run(message="First")
+        r2 = graph.run(message="Second", thread_id=r1["thread_id"])
         assert r2["thread_id"] == r1["thread_id"]
         assert r2["reply"] == "Reply"
 
@@ -103,7 +103,7 @@ class TestChatAPI:
         """创建测试用的 HTTP 客户端，注入 mock LLM 和 DB。"""
         mock_llm = DeterministicLLM(content="API reply")
         monkeypatch.setattr(
-            "aiive.runtime.agent_loop.AgentLoop._build_langchain_llm",
+            "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
             lambda self: mock_llm,
         )
 

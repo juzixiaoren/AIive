@@ -22,10 +22,16 @@ class TestChatTaskBridge:
         """验证 schedule_reminder 工具可正常执行。"""
         from aiive.tools.registry import get_tool_registry
         registry = get_tool_registry()
+        from aiive.context.run_context import RunContext
+        from aiive.runtime.thread_bootstrap import ThreadBootstrapService
+
+        # 确保测试线程已 committed，避免 FK 违规
+        tid = ThreadBootstrapService.ensure_committed_thread(None)
         result = registry.execute(
             "schedule_reminder",
-            {"content": "hi", "delay_minutes": 1},
+            {"content": "test-reminder", "delay_minutes": 60},
             "trusted_user_command",
+            run_context=RunContext(thread_id=tid, trace_id="test-trace", source="test"),
         )
         assert result["ok"] is True
         assert result["result"]["reminder_set"] is True

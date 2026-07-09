@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from aiive.db.base import SessionLocal
 from aiive.runtime.event_logger import EventLogger
 from aiive.runtime.task_manager import TaskManager
+from aiive.runtime.thread_bootstrap import ThreadBootstrapService
 
 logger = logging.getLogger(__name__)
 
@@ -52,8 +53,26 @@ class TaskWorker:
             result = mgr.check_now(task.id)
 
             if result.get("action") == "notify":
-                # 选择目标线程：优先使用任务关联的线程，否则使用 system
-                target_thread_id = task.thread_id or "system"
+                # 选择目标线程：优先使用任务关联的线程
+                # 历史数据 task.thread_id 可能为 NULL，迁移期临时 fallback 到 system
+                if task.thread_id:
+                    target_thread_id = task.thread_id
+                else:
+                    logger.warning(
+                        "task.thread_id 为空，fallback 到 system 线程: task_id=%s title=%s",
+                        task.id, task.title,
+                    )
+                    target_thread_id = "system"
+
+                # 确保目标 thread 已 committed，避免 FK 违规
+                try:
+                    ThreadBootstrapService.ensure_committed_thread(target_thread_id)
+                except ValueError:
+                    logger.warning(
+                        "目标线程不存在，跳过提醒: task_id=%s target_thread=%s",
+                        task.id, target_thread_id,
+                    )
+                    continue
 
                 logger = EventLogger(self._db)
                 logger.log_event(
@@ -84,7 +103,7 @@ class TaskWorker:
         """调用 Agent Loop 处理提醒，让 Agent 在对话线程中主动回复。
 
         构造系统提示词，要求 Agent 先调用 remind_alert 工具激活提醒，
-        再以自然语言告知用户。成功后通过 WebSocket 推送到前端。
+        再以自然语言告知用户。成功后写入 notification_created 事件供前端通知页展示。
 
         参数:
             task: 到期任务对象
@@ -92,8 +111,11 @@ class TaskWorker:
         """
         try:
             from aiive.core.llm_client import default_llm_client
-            from aiive.runtime.agent_loop import AgentLoop
+            from aiive.runtime.agent_graph import AgentGraph
+            from aiive.runtime.thread_bootstrap import ThreadBootstrapService
             from aiive.db.models import Event
+            # 确保目标 thread 已 committed，使 AgentGraph 内工具 handler 可通过 FK 校验
+            ThreadBootstrapService.ensure_committed_thread(target_thread_id)
             client = default_llm_client()
             recent_reminders = (
                 self._db.query(Event)
@@ -108,7 +130,7 @@ class TaskWorker:
             )
             reminder_id = reminder_event.id if reminder_event else ""
 
-            loop = AgentLoop(client, self._db)
+            graph = AgentGraph(client, self._db)
             prompt = (
                 f"[System Reminder — You MUST call the remind_alert tool with the reminder_id below. "
                 f"Do NOT just say '好的' or confirm receipt. "
@@ -118,31 +140,25 @@ class TaskWorker:
                 f"First call remind_alert(reminder_id=\"{reminder_id}\") to activate the alert, "
                 f"then inform the user naturally."
             )
-            result = loop.run(message=prompt, thread_id=target_thread_id)
+            result = graph.run(message=prompt, thread_id=target_thread_id)
+            reply_text = result.get("reply", "")
             logger.info(
                 "提醒 Agent 唤醒成功: task_id=%s title=%s thread_id=%s",
                 task.id, task.title, target_thread_id,
             )
 
-            # 通过 WebSocket 推送 LLM 回复 + action_cards 到前端
-            import asyncio
+            # 通过主事件循环安全推送 LLM 回复到前端聊天页
             from aiive.api.ws_manager import ws_manager
-            try:
-                asyncio.run(ws_manager.broadcast_to_thread(
-                    target_thread_id,
-                    "new_message",
-                    {
-                        "reply": result.get("reply", ""),
-                        "thread_id": result.get("thread_id", target_thread_id),
-                        "trace_id": result.get("trace_id", ""),
-                        "action_cards": result.get("action_cards", []),
-                    },
-                ))
-            except Exception:
-                logger.exception(
-                    "提醒 WebSocket 推送失败: task_id=%s thread_id=%s",
-                    task.id, target_thread_id,
-                )
+            ws_manager.broadcast_to_thread_sync(
+                target_thread_id,
+                "new_message",
+                {
+                    "reply": reply_text,
+                    "thread_id": result.get("thread_id", target_thread_id),
+                    "trace_id": result.get("trace_id", ""),
+                    "action_cards": result.get("action_cards", []),
+                },
+            )
         except Exception:
             logger.exception(
                 "提醒 Agent 唤醒失败，回退为 notification_created: task_id=%s title=%s",
@@ -158,26 +174,9 @@ class TaskWorker:
                     "task_type": task.task_type,
                     "title": task.title,
                     "message": f"提醒: {task.title}",
+                    "status": "alerting",
                 },
             )
-            # 回退情况下也推送到 WebSocket
-            try:
-                import asyncio
-                from aiive.api.ws_manager import ws_manager
-                asyncio.run(ws_manager.broadcast_to_thread(
-                    target_thread_id,
-                    "new_message",
-                    {
-                        "reply": f"⏰ 提醒: {task.title}（通知已记录，请在通知页查看）",
-                        "thread_id": target_thread_id,
-                        "action_cards": [],
-                    },
-                ))
-            except Exception:
-                logger.exception(
-                    "提醒回退 WebSocket 推送也失败: task_id=%s thread_id=%s",
-                    task.id, target_thread_id,
-                )
 
 
 def run_once():

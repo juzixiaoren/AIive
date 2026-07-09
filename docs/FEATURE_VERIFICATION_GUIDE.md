@@ -232,15 +232,21 @@ curl http://127.0.0.1:8000/api/selfdev/slots
 ### 9.1 查看事件日志
 ```
 操作：切换"事件"Tab
-期望：显示事件时间线（用户消息、模型回复、记忆激活等）
-验证：事件按时间排列，有 type 标签
+期望：显示事件时间线，如实记录本次 Agent 运行的全部输入与输出
+包含类型：用户消息、系统注入(system_injection)、工具调用(tool_call)、工具结果(tool_result)、模型回复、对话结束等
+验证：
+  - 事件按时间排列，有 type 标签
+  - tool_call 事件可展开查看完整输入参数(params)，tool_result 可展开查看完整输出(result)与状态
+  - system_injection 事件可展开查看完整系统提示与注入的工具列表
 ```
 
 ### 9.2 查看上下文快照
 ```
 操作：在聊天中点 trace_id → 自动跳转 "上下文" Tab
-期望：显示 Stable Prefix、Working Set、注入的记忆、Token 数
-验证：injected_memory_ids 中有被注入的记忆 ID
+期望：显示 Stable Prefix、Working Set、注入的记忆、Token 数，以及本次运行的全部 LLM 调用
+验证：
+  - injected_memory_ids 中有被注入的记忆 ID
+  - "LLM 调用"区块列出每次模型调用，可展开查看完整输入消息与输出(内容 + 工具调用)
 ```
 
 ### 9.3 通知查看

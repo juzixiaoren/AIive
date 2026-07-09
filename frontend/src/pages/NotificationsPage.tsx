@@ -1,12 +1,11 @@
 /**
  * 通知页面
  * - 展示系统通知列表（提醒类通知为主）
- * - 支持对提醒类通知进行确认（confirm）和延时（snooze）操作
+ * - 支持删除通知（从数据库完整移除）
  * - 通知状态包括：待提醒、提醒中、已确认、已延时
  */
 
 import { useEffect, useState } from "react";
-import { confirmReminder, snoozeReminder } from "../api/chat";
 
 /** 通知数据结构 */
 interface Notif {
@@ -42,8 +41,6 @@ const STATUS_COLORS: Record<string, string> = {
 export default function NotificationsPage() {
   const [notifs, setNotifs] = useState<Notif[]>([]);
   const [busyId, setBusyId] = useState<string | null>(null);
-  const [snoozeMin, setSnoozeMin] = useState<number>(5);
-  const [status, setStatus] = useState<string>("");
   const [category, setCategory] = useState<"pending" | "done">("pending");
 
   /** 刷新通知列表 */
@@ -66,39 +63,19 @@ export default function NotificationsPage() {
     refresh(cat);
   };
 
-  /**
-   * 确认提醒
-   * @param n - 要确认的通知对象
-   */
-  const handleConfirm = async (n: Notif) => {
+  /** 删除通知：调后端 DELETE 接口从数据库完整移除 */
+  const handleDelete = async (n: Notif) => {
     setBusyId(n.id);
-    setStatus("");
     try {
-      const { reply } = await confirmReminder(n.id, n.thread_id || undefined);
-      setStatus(reply || "已确认提醒");
-    } catch (e) {
-      setStatus(`确认失败: ${e instanceof Error ? e.message : "未知错误"}`);
+      const res = await fetch(`/api/notifications/${n.id}`, { method: "DELETE" });
+      const data = await res.json();
+      if (data.ok) {
+        setNotifs((prev) => prev.filter((item) => item.id !== n.id));
+      }
+    } catch {
+      // 静默失败，保留通知不变动
     } finally {
       setBusyId(null);
-      refresh();
-    }
-  };
-
-  /**
-   * 延时提醒
-   * @param n - 要延时的通知对象
-   */
-  const handleSnooze = async (n: Notif) => {
-    setBusyId(n.id);
-    setStatus("");
-    try {
-      const { reply } = await snoozeReminder(n.id, snoozeMin, n.thread_id || undefined);
-      setStatus(reply || `已延时 ${snoozeMin} 分钟`);
-    } catch (e) {
-      setStatus(`延时失败: ${e instanceof Error ? e.message : "未知错误"}`);
-    } finally {
-      setBusyId(null);
-      refresh();
     }
   };
 
@@ -130,12 +107,6 @@ export default function NotificationsPage() {
           </button>
         </div>
       </div>
-      {/* 操作状态提示 */}
-      {status && (
-        <div className="mb-3 text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
-          {status}
-        </div>
-      )}
       {notifs.length === 0 && (
         <div className="text-center text-slate-400 text-sm py-12">暂无通知</div>
       )}
@@ -156,37 +127,17 @@ export default function NotificationsPage() {
             </div>
             {/* 通知内容 */}
             <div className="text-xs text-slate-500 mt-1">{n.message}</div>
-            {/* 创建时间 */}
-            <div className="text-[10px] text-slate-400 mt-1 font-mono">{n.created_at?.slice(11, 19)}</div>
-            {/* 提醒中的通知：显示确认和延时操作按钮 */}
-            {n.status === "alerting" && (
-              <div className="flex items-center gap-2 mt-2">
-                <button
-                  disabled={busyId === n.id}
-                  onClick={() => handleConfirm(n)}
-                  className="text-xs px-2.5 py-1 rounded bg-green-600 text-white disabled:opacity-50 hover:bg-green-700"
-                >
-                  {busyId === n.id ? "处理中…" : "确认"}
-                </button>
-                {/* 延时分钟数输入 */}
-                <input
-                  type="number"
-                  min={1}
-                  max={120}
-                  value={snoozeMin}
-                  onChange={(e) => setSnoozeMin(Math.max(1, Math.min(120, Number(e.target.value) || 1)))}
-                  className="w-16 text-xs px-1.5 py-1 rounded border border-slate-300"
-                />
-                <span className="text-xs text-slate-500">分钟</span>
-                <button
-                  disabled={busyId === n.id}
-                  onClick={() => handleSnooze(n)}
-                  className="text-xs px-2.5 py-1 rounded bg-slate-600 text-white disabled:opacity-50 hover:bg-slate-700"
-                >
-                  延时
-                </button>
-              </div>
-            )}
+            {/* 创建时间和删除按钮 */}
+            <div className="flex items-center justify-between mt-2">
+              <div className="text-[10px] text-slate-400 font-mono">{n.created_at?.slice(11, 19)}</div>
+              <button
+                disabled={busyId === n.id}
+                onClick={() => handleDelete(n)}
+                className="text-xs px-2.5 py-1 rounded bg-red-500 text-white disabled:opacity-50 hover:bg-red-600 transition-colors"
+              >
+                {busyId === n.id ? "…" : "删除"}
+              </button>
+            </div>
           </div>
         ))}
       </div>

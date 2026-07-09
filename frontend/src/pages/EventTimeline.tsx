@@ -15,16 +15,50 @@ interface EventItem {
 /** 事件类型中文标签映射 */
 const TYPE_LABELS: Record<string, string> = {
   chat_started: "开始对话", user_message: "用户消息", llm_response: "模型回复",
-  memory_active: "记忆激活", memory_candidate: "记忆候选", steward_signal: "管家信号",
-  context_truncated: "上下文截断", delete_request: "删除请求",
+  chat_ended: "对话结束", system_injection: "系统注入", tool_call: "工具调用",
+  tool_result: "工具结果", memory_active: "记忆激活", memory_candidate: "记忆候选",
+  steward_signal: "管家信号", context_truncated: "上下文截断", delete_request: "删除请求",
 };
+
+/** 从事件 payload 生成可读摘要 */
+function describe(e: EventItem): string {
+  const p = e.payload || {};
+  switch (e.event_type) {
+    case "user_message":
+      return String(p.content ?? "");
+    case "llm_response":
+      return String(p.content ?? "");
+    case "system_injection": {
+      const tools = Array.isArray(p.injected_tools) ? p.injected_tools.join(", ") : "";
+      const mem = p.memory_count ?? 0;
+      const tasks = (p.active_task_count ?? 0) + (p.due_task_count ?? 0);
+      return `注入 ${tools ? tools.split(", ").length : 0} 个工具 · ${mem} 条记忆 · ${tasks} 个任务`;
+    }
+    case "tool_call": {
+      const params = JSON.stringify(p.params ?? {});
+      return `${p.name ?? ""}(${params.length > 200 ? params.slice(0, 200) + "…" : params})`;
+    }
+    case "tool_result": {
+      const ok = (p.status ?? "") === "completed";
+      return `${p.name ?? ""} → ${ok ? "成功" : "失败"}`;
+    }
+    case "chat_ended":
+      return `工具 ${p.tool_calls ?? 0} 次 · 成功 ${p.tool_succeeded ?? 0} · 失败 ${p.tool_failed ?? 0}`;
+    default:
+      return JSON.stringify(p);
+  }
+}
 
 /**
  * 事件时间线组件
  * @param traceId - 可选，传入时只显示该 trace 相关的事件
  */
+/** 需要可展开查看完整 payload 的事件类型 */
+const EXPANDABLE = new Set(["tool_call", "tool_result", "system_injection"]);
+
 export default function EventTimeline({ traceId }: { traceId?: string }) {
   const [events, setEvents] = useState<EventItem[]>([]);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
 
   // 根据是否有 traceId 决定请求参数，加载事件列表
   useEffect(() => {
@@ -42,18 +76,37 @@ export default function EventTimeline({ traceId }: { traceId?: string }) {
         <div className="text-center text-slate-400 text-sm py-12">暂无事件</div>
       )}
       <div className="flex flex-col gap-1">
-        {events.map(e => (
-          <div key={e.id} className="flex gap-3 items-start py-2 border-b border-slate-100 text-sm hover:bg-slate-50 px-2 rounded">
-            {/* 时间戳（仅显示 HH:MM:SS） */}
-            <span className="text-slate-400 w-16 shrink-0 font-mono text-xs pt-0.5">{e.created_at?.slice(11, 19)}</span>
-            {/* 事件类型标签 */}
-            <span className="bg-slate-100 px-2 py-0.5 rounded text-xs font-mono text-slate-600 shrink-0">
-              {TYPE_LABELS[e.event_type] || e.event_type}
-            </span>
-            {/* 事件负载预览（截取前 100 字符） */}
-            <span className="text-slate-500 truncate text-xs pt-0.5">{JSON.stringify(e.payload).slice(0, 100)}</span>
-          </div>
-        ))}
+        {events.map(e => {
+          const isOpen = expandedId === e.id;
+          const canExpand = EXPANDABLE.has(e.event_type);
+          return (
+            <div
+              key={e.id}
+              onClick={() => canExpand ? setExpandedId(isOpen ? null : e.id) : undefined}
+              className={`py-2 border-b border-slate-100 text-sm px-2 rounded ${canExpand ? "cursor-pointer hover:bg-slate-50" : ""}`}
+            >
+              <div className="flex gap-3 items-start">
+                {/* 时间戳（仅显示 HH:MM:SS） */}
+                <span className="text-slate-400 w-16 shrink-0 font-mono text-xs pt-0.5">{e.created_at?.slice(11, 19)}</span>
+                {/* 事件类型标签 */}
+                <span className="bg-slate-100 px-2 py-0.5 rounded text-xs font-mono text-slate-600 shrink-0">
+                  {TYPE_LABELS[e.event_type] || e.event_type}
+                </span>
+                {/* 事件可读摘要 */}
+                <span className="text-slate-500 truncate text-xs pt-0.5 flex-1 min-w-0">{describe(e)}</span>
+                {canExpand && (
+                  <span className="text-[11px] text-slate-400 shrink-0">{isOpen ? "收起" : "详情"}</span>
+                )}
+              </div>
+              {/* 展开后的完整 payload */}
+              {isOpen && canExpand && (
+                <pre className="mt-2 ml-20 text-[11px] text-slate-600 bg-slate-50 rounded-lg px-3 py-2 whitespace-pre-wrap break-all font-mono leading-relaxed max-h-80 overflow-auto">
+                  {JSON.stringify(e.payload, null, 2)}
+                </pre>
+              )}
+            </div>
+          );
+        })}
       </div>
     </div>
   );

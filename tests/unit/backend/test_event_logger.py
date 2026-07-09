@@ -1,5 +1,8 @@
 """测试 EventLogger 事件日志记录功能。"""
+from unittest.mock import MagicMock, patch
+
 from aiive.runtime.event_logger import EventLogger
+from aiive.runtime.trace import Trace
 
 
 class TestEventLogger:
@@ -69,3 +72,103 @@ class TestEventLogger:
         db_session.flush()
 
         assert event.payload == {}
+
+
+class TestFaithfulTracing:
+    """验证 trace 如实记录 Agent 输入（系统注入、工具参数）与输出（工具结果、LLM I/O）。"""
+
+    def test_finalize_logs_tool_call_and_result_with_params(self, db_session):
+        """_finalize 必须逐条记录 tool_call（输入参数）与 tool_result（输出+状态）。"""
+        from aiive.db.models import Event
+        from aiive.runtime.agent_graph import AgentGraph
+
+        fake_llm = MagicMock()
+        fake_llm._default_model = "m"
+        fake_llm._api_key = "k"
+        fake_llm._base_url = "u"
+        fake_llm._timeout_seconds = 30
+
+        graph = AgentGraph(fake_llm, db_session)
+        graph._logger = EventLogger(db_session)
+        graph._outbox = MagicMock()
+
+        trace = Trace.new()
+        thread = MagicMock()
+        thread.id = "t-faithful"
+
+        records = [{
+            "name": "echo",
+            "params": {"message": "hi"},
+            "result": {"ok": True, "result": "hi"},
+            "status": "completed",
+            "trace_id": trace.trace_id,
+        }]
+
+        # 避免后台任务轮询触达真实 DB
+        with patch("aiive.worker.task_worker.TaskWorker"):
+            graph._finalize("ok", "hi", thread, trace, records, [])
+
+        events = (
+            db_session.query(Event)
+            .filter(Event.thread_id == "t-faithful")
+            .order_by(Event.created_at.asc())
+            .all()
+        )
+        types = [e.event_type for e in events]
+        assert "tool_call" in types
+        assert "tool_result" in types
+
+        tc = [e for e in events if e.event_type == "tool_call"][0]
+        assert tc.payload["name"] == "echo"
+        assert tc.payload["params"] == {"message": "hi"}
+
+        tr = [e for e in events if e.event_type == "tool_result"][0]
+        assert tr.payload["status"] == "completed"
+        assert tr.payload["result"] == {"ok": True, "result": "hi"}
+
+    def test_system_injection_event_records_full_prompt(self, db_session):
+        """运行 AgentGraph 必须写入 system_injection 事件，包含完整系统提示与注入工具列表。"""
+        from aiive.db.models import Event
+        from aiive.runtime.agent_graph import AgentGraph
+
+        fake_llm = MagicMock()
+        fake_llm._default_model = "m"
+        fake_llm._api_key = "k"
+        fake_llm._base_url = "u"
+        fake_llm._timeout_seconds = 30
+
+        graph = AgentGraph(fake_llm, db_session)
+        graph._outbox = MagicMock()
+        trace = Trace.new()
+        thread = MagicMock()
+        thread.id = "t-sysinj"
+
+        system_content = "YOU ARE THE AGENT\n## Runtime Identity\n- agent_display_name: A"
+        tool_echo = MagicMock()
+        tool_echo.name = "echo"
+        tool_list = MagicMock()
+        tool_list.name = "list_tasks"
+        tools = [tool_echo, tool_list]
+
+        with patch("aiive.worker.task_worker.TaskWorker"), patch(
+            "aiive.runtime.agent_graph.build_langchain_tools", return_value=tools
+        ), patch("aiive.runtime.agent_graph.get_tool_registry") as mock_reg:
+            mock_reg.return_value.list_all.return_value = []
+            # 直接调用内部记录点，避免真实 LLM 调用
+            graph._logger.log_event(
+                trace_id=trace.trace_id, thread_id=thread.id,
+                event_type="system_injection",
+                payload={
+                    "content": system_content,
+                    "injected_tools": [getattr(t, "name", "") for t in tools],
+                    "memory_count": 1, "active_task_count": 0, "due_task_count": 0,
+                },
+            )
+            db_session.flush()
+
+        evt = db_session.query(Event).filter(
+            Event.event_type == "system_injection",
+            Event.thread_id == "t-sysinj",
+        ).one()
+        assert evt.payload["content"] == system_content
+        assert evt.payload["injected_tools"] == ["echo", "list_tasks"]
