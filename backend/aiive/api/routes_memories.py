@@ -3,7 +3,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from aiive.db.base import get_db
+from aiive.memory.memory_maintenance import MemoryMaintenance
 from aiive.memory.memory_store import MemoryStore
+from aiive.memory.projection import MemoryProjection
 
 router = APIRouter(prefix="/api")
 
@@ -51,3 +53,43 @@ def create_memory(request: CreateMemoryRequest, db: Session = Depends(get_db)):
         "content": record.content,
         "lifecycle_state": record.lifecycle_state,
     }
+
+
+class ForgetRequest(BaseModel):
+    reason: str = ""
+
+
+@router.post("/memories/{memory_id}/forget")
+def forget_memory(memory_id: str, request: ForgetRequest, db: Session = Depends(get_db)):
+    maint = MemoryMaintenance(db)
+    result = maint.forget(memory_id, request.reason)
+    db.commit()
+    return result
+
+
+@router.post("/memories/{memory_id}/sleep")
+def sleep_memory(memory_id: str, db: Session = Depends(get_db)):
+    maint = MemoryMaintenance(db)
+    result = maint.sleep(memory_id)
+    db.commit()
+    return result
+
+
+@router.post("/memories/{memory_id}/archive")
+def archive_memory(memory_id: str, db: Session = Depends(get_db)):
+    maint = MemoryMaintenance(db)
+    result = maint.archive(memory_id)
+    db.commit()
+    return result
+
+
+@router.post("/maintenance/memory-scan")
+def scan_memories(db: Session = Depends(get_db)):
+    maint = MemoryMaintenance(db)
+    return maint.scan()
+
+
+@router.get("/maintenance/projection")
+def get_projection(db: Session = Depends(get_db)):
+    proj = MemoryProjection(db)
+    return proj.to_json()
