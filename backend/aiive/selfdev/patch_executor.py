@@ -1,18 +1,47 @@
+"""
+补丁执行模块。
+
+负责将 SelfDevPlanner 生成的补丁计划应用到非活跃槽位（inactive slot）。
+支持三种操作：add_file（新增文件）、modify_file（修改文件）、delete_file（删除文件）。
+执行前会从活跃槽位复制 manifest 和 app 目录到非活跃槽位，确保变更隔离。
+"""
+
 import json
+import logging
 import shutil
 from pathlib import Path
 
 from aiive.supervisor.slot_manager import SlotManager
 
+logger = logging.getLogger(__name__)
+
 
 class PatchExecutor:
+    """补丁执行器，将操作列表应用到非活跃槽位。"""
+
     def __init__(self, manager: SlotManager | None = None):
+        """
+        初始化补丁执行器。
+
+        参数:
+            manager: 槽位管理器实例，默认自动创建。
+        """
         self._manager = manager or SlotManager()
 
     def apply_to_inactive(
         self, operations: list[dict], base_dir: Path | None = None
     ) -> dict:
-        """Copy active manifest to inactive, then apply operations."""
+        """
+        将活跃槽位的 manifest 和 app 目录复制到非活跃槽位，然后应用操作列表。
+
+        参数:
+            operations: 操作列表，每项包含 operation、target_file、content 等字段。
+            base_dir: 槽位基础目录，默认使用 SlotManager 的 _base_dir。
+
+        返回:
+            包含 active_slot、inactive_slot、operations_applied、
+            operations_failed 的结果字典。
+        """
         slots = self._manager.list_slots()
         active_name = self._manager.get_active_slot()
         inactive_name = "B" if active_name == "A" else "A"
@@ -24,22 +53,23 @@ class PatchExecutor:
 
         root = base_dir or self._manager._base_dir
 
-        # Copy manifest from active → inactive
+        # 第一步：从活跃槽位复制 manifest 到非活跃槽位
         src_manifest = active_slot.root / "version_manifest.json"
         dst_manifest = inactive_slot.root / "version_manifest.json"
         if src_manifest.exists():
             dst_manifest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src_manifest, dst_manifest)
 
-        # Copy app directory
+        # 第二步：复制 app 目录（仅在目标不存在时，避免覆盖已修改内容）
         src_app = active_slot.root / "app"
         dst_app = inactive_slot.root / "app"
         if src_app.exists() and not dst_app.exists():
             shutil.copytree(src_app, dst_app)
 
-        # Apply operations
+        # 第三步：逐一应用操作
         results = []
         for op in operations:
+            # 跳过标记为不可执行的操作
             if op.get("not_allowed_yet"):
                 results.append({"ok": False, "reason": "not_allowed_yet", "op": op})
                 continue
@@ -68,6 +98,7 @@ class PatchExecutor:
                 else:
                     results.append({"ok": False, "reason": f"Unknown op: {op_type}"})
             except Exception as e:
+                logger.error("补丁操作失败: target=%s op_type=%s", str(target), op_type, exc_info=True)
                 results.append({"ok": False, "file": str(target), "error": str(e)})
 
         return {

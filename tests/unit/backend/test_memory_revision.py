@@ -1,8 +1,16 @@
+"""测试记忆修订（MemoryRevision）功能。
+
+覆盖 supersede（覆盖旧记忆）、update_content（更新内容）、resolve_for_context（上下文解析）等操作。
+"""
+
 from aiive.memory.memory_store import MemoryStore
 
 
 class TestMemoryRevision:
+    """测试 MemoryStore 的记忆修订和覆盖功能。"""
+
     def test_supersede_moves_old_to_superseded(self, db_session):
+        """supersede 操作应将旧记忆标记为 superseded，新记忆为 active。"""
         store = MemoryStore(db_session)
         old = store.create(content="用户叫 A", memory_type="user_profile", lifecycle_state="active")
         db_session.flush()
@@ -17,6 +25,7 @@ class TestMemoryRevision:
         assert new_refetched.lifecycle_state == "active"
 
     def test_superseded_not_in_active(self, db_session):
+        """被 supersede 的旧记忆不应出现在 active 列表中。"""
         store = MemoryStore(db_session)
         old = store.create(content="用户叫 A", lifecycle_state="active")
         db_session.flush()
@@ -27,6 +36,7 @@ class TestMemoryRevision:
         assert all(r.id != old.id for r in active)
 
     def test_update_content(self, db_session):
+        """update_content 应正确更新记忆内容。"""
         store = MemoryStore(db_session)
         rec = store.create(content="old content", lifecycle_state="active")
         db_session.flush()
@@ -38,6 +48,7 @@ class TestMemoryRevision:
         assert refetched.content == "new content"
 
     def test_resolve_for_context_returns_active_only(self, db_session):
+        """resolve_for_context 应仅返回 active 状态的记忆。"""
         store = MemoryStore(db_session)
         store.create(content="active", lifecycle_state="active")
         store.create(content="superseded", lifecycle_state="superseded")

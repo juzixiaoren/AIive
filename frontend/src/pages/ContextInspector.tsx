@@ -1,5 +1,14 @@
+/**
+ * 上下文检查器页面
+ * - 根据 trace_id 查询并展示单次对话的完整上下文快照
+ * - 展示上下文项列表（系统前缀、工具列表、注入记忆、历史消息、当前消息等）
+ * - 支持展开/折叠每个上下文项查看详情
+ * - 支持弹窗查看完整内容
+ */
+
 import { useEffect, useState } from "react";
 
+/** 上下文项数据结构 */
 type ContextItem = {
   item_id: string;
   kind: string;
@@ -9,6 +18,7 @@ type ContextItem = {
   token_estimate: number;
 };
 
+/** 上下文类型的中文标签和样式映射 */
 const KIND_META: Record<string, { label: string; bg: string; text: string; border: string }> = {
   stable_prefix:   { label: "系统前缀",  bg: "bg-purple-50", text: "text-purple-700", border: "border-purple-200" },
   tool_schemas:    { label: "工具列表",  bg: "bg-teal-50",    text: "text-teal-700",    border: "border-teal-200" },
@@ -17,23 +27,30 @@ const KIND_META: Record<string, { label: string; bg: string; text: string; borde
   user_message:    { label: "当前消息",  bg: "bg-rose-50",    text: "text-rose-700",    border: "border-rose-200" },
 };
 
+/** 信任级别中文标签 */
 const TRUST_LABEL: Record<string, string> = {
   trusted: "可信",
   untrusted: "不可信",
 };
 
+/** 来源渠道中文标签 */
 const SOURCE_LABEL: Record<string, string> = {
   system: "系统",
   thread: "对话",
   memory_store: "记忆库",
 };
 
+/**
+ * 上下文检查器组件
+ * @param traceId - 要检查的 trace ID，由外部传入
+ */
 export default function ContextInspector({ traceId }: { traceId?: string }) {
   const [data, setData] = useState<Record<string, unknown> | null>(null);
   const [error, setError] = useState("");
   const [expanded, setExpanded] = useState<number | null>(null);
   const [modalItem, setModalItem] = useState<ContextItem | null>(null);
 
+  // 当 traceId 变化时，从后端加载上下文快照
   useEffect(() => {
     if (traceId) {
       setError("");
@@ -46,6 +63,7 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
     }
   }, [traceId]);
 
+  // 无 traceId 时显示引导提示
   if (!traceId) return (
     <div className="text-center text-slate-400 py-16">
       <p className="text-lg mb-2">🔍 上下文检查器</p>
@@ -69,7 +87,7 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
       <h2 className="text-lg font-semibold text-slate-800 mb-1">上下文快照</h2>
       <p className="text-xs text-slate-400 mb-4 font-mono break-all">trace_id: {traceId}</p>
 
-      {/* Stats */}
+      {/* 统计卡片区域 */}
       <div className="grid grid-cols-4 gap-3 mb-5">
         {[
           { label: "前缀哈希", value: String(snapshots[0]?.stable_prefix_hash || "-") },
@@ -84,7 +102,7 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
         ))}
       </div>
 
-      {/* Injected Memories */}
+      {/* 注入的记忆 ID 列表 */}
       {injected.length > 0 && (
         <div className="mb-4">
           <h3 className="text-sm font-medium text-slate-600 mb-2">注入的记忆</h3>
@@ -96,7 +114,7 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
         </div>
       )}
 
-      {/* Context Items */}
+      {/* 上下文项列表 */}
       <h3 className="text-sm font-medium text-slate-600 mb-3">
         上下文项 ({items.length})
         <span className="text-xs text-slate-400 ml-2 font-normal">点击卡片展开详情</span>
@@ -119,7 +137,7 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
                   ${isOpen ? "ring-2 ring-slate-300" : ""}
                 `}
               >
-                {/* Collapsed Header */}
+                {/* 折叠状态：摘要头部 */}
                 <div className="px-4 py-3 flex items-center gap-3 select-none">
                   <span className={`text-xs font-medium px-2.5 py-0.5 rounded-full ${kindMeta.text} ${kindMeta.bg} border ${kindMeta.border} shrink-0`}>
                     {kindMeta.label}
@@ -136,10 +154,10 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
                   </svg>
                 </div>
 
-                {/* Expanded Detail */}
+                {/* 展开状态：详细信息 */}
                 {isOpen && (
                   <div className="px-4 pb-4 border-t border-slate-200/60">
-                    {/* Metadata */}
+                    {/* 元数据网格 */}
                     <div className="grid grid-cols-4 gap-2 mt-3 mb-3">
                       {[
                         { label: "类型", value: kindMeta.label },
@@ -162,7 +180,7 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
                       </code>
                     </div>
 
-                    {/* Content Preview (2 lines) */}
+                    {/* 内容预览（限制 2 行） */}
                     <div className="mb-0.5">
                       <div className="text-[10px] text-slate-400 uppercase mb-1">内容预览</div>
                       <pre className="text-xs text-slate-600 bg-white/70 rounded-lg px-3 py-2 whitespace-pre-wrap break-all font-mono leading-relaxed line-clamp-2">
@@ -170,7 +188,7 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
                       </pre>
                     </div>
 
-                    {/* "查看更多" link */}
+                    {/* "查看更多" 链接 */}
                     <div
                       className="text-xs text-blue-500 hover:text-blue-600 cursor-pointer mt-1 select-none"
                       onClick={(e) => { e.stopPropagation(); setModalItem(item); }}
@@ -185,18 +203,18 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
         </div>
       )}
 
-      {/* Centered Full-Content Modal */}
+      {/* 居中全量内容弹窗 */}
       {modalItem && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-6">
-          {/* Backdrop */}
+          {/* 背景遮罩 */}
           <div
             className="absolute inset-0 bg-black/40 backdrop-blur-sm"
             onClick={() => setModalItem(null)}
           />
 
-          {/* Modal */}
+          {/* 弹窗主体 */}
           <div className="relative w-full max-w-3xl max-h-[70vh] bg-white rounded-2xl shadow-2xl flex flex-col animate-fade-in">
-            {/* Header */}
+            {/* 弹窗头部 */}
             <div className="shrink-0 px-5 py-3 border-b border-slate-100 flex items-center justify-between">
               <div className="flex items-center gap-2 min-w-0">
                 {(() => {
@@ -219,7 +237,7 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
               </button>
             </div>
 
-            {/* Metadata */}
+            {/* 弹窗元数据 */}
             <div className="shrink-0 px-5 py-3">
               <div className="grid grid-cols-4 gap-2">
                 {[
@@ -236,7 +254,7 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
               </div>
             </div>
 
-            {/* Scrollable Full Content */}
+            {/* 可滚动的完整内容区域 */}
             <div className="flex-1 overflow-y-auto px-5 pb-6">
               <pre className="text-xs text-slate-700 whitespace-pre-wrap break-all font-mono leading-relaxed">
                 {modalItem.content_preview || "(空)"}
@@ -246,7 +264,7 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
         </div>
       )}
 
-      {/* Animations */}
+      {/* 弹窗淡入动画样式 */}
       <style>{`
         @keyframes fade-in {
           from { opacity: 0; transform: scale(0.96); }

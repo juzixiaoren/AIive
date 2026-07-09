@@ -1,31 +1,66 @@
-from fastapi import APIRouter, Depends, Query
+"""
+API路由模块：通知管理
+- 提供统一的通知和提醒查询接口
+- 从事件表中获取最近的通知和提醒
+- 支持按类别筛选：未执行（pending/alerting/snoozed）和已执行（confirmed/cancelled）
+"""
+import logging
+
+from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from aiive.db.base import get_db
 from aiive.db.models import Event
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
+
+# 未执行状态：待提醒、提醒中、已延时
+PENDING_STATUSES = ["pending", "alerting", "snoozed"]
+# 已执行状态：已确认、已取消
+DONE_STATUSES = ["confirmed", "cancelled"]
 
 
 @router.get("/notifications")
 def list_notifications(
-    status: str | None = Query(None),
+    category: str = "all",
     db: Session = Depends(get_db),
 ):
-    q = (
+    """获取最近的通知和提醒（从事件表统一查询）
+
+    Args:
+        category: 筛选类别，默认 all 返回全部
+        db: 数据库会话
+
+    Returns:
+        通知和提醒列表，按创建时间降序排列，最多50条
+    """
+    events = (
         db.query(Event)
-        .filter(Event.event_type == "notification_created")
+        .filter(Event.event_type.in_(["notification_created", "reminder_created"]))
         .order_by(Event.created_at.desc())
         .limit(50)
+        .all()
     )
-    events = q.all()
-    return [
-        {
-            "id": e.id,
-            "task_id": e.payload.get("task_id"),
-            "title": e.payload.get("title", ""),
-            "message": e.payload.get("message", ""),
-            "created_at": e.created_at.isoformat(),
-        }
-        for e in events
-    ]
+
+    if category == "pending":
+        events = [e for e in events if (e.payload or {}).get("status") in PENDING_STATUSES]
+    elif category == "done":
+        events = [e for e in events if (e.payload or {}).get("status") in DONE_STATUSES]
+
+    result = []
+    for e in events:
+        try:
+            p = e.payload or {}
+            result.append({
+                "id": e.id,
+                "title": p.get("title", p.get("content", "")),
+                "message": p.get("message", p.get("content", "")),
+                "event_type": e.event_type,
+                "status": p.get("status", ""),
+                "thread_id": e.thread_id or "",
+                "created_at": e.created_at.isoformat() if e.created_at else "",
+            })
+        except Exception:
+            continue
+    return result

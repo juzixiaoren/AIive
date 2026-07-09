@@ -1,7 +1,17 @@
+"""
+模块功能说明：
+- LLM 客户端模块，封装与 OpenAI 兼容的大模型 API 的通信
+- 提供同步聊天（chat）和流式聊天（chat_stream）两种调用方式
+- 包含 LLMClient（生产客户端）、FakeLLMClient（测试替身）和 LLMResponse（响应模型）
+- 通过 default_llm_client() 工厂函数从项目配置创建统一的客户端实例
+"""
 import json
+import logging
 import time
 import uuid
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 from typing import Any, Optional, Sequence
 
 import httpx
@@ -9,6 +19,16 @@ import httpx
 
 @dataclass
 class LLMResponse:
+    """LLM 响应数据类，封装一次 API 调用的完整结果。
+
+    属性:
+        content: LLM 返回的文本内容
+        model: 实际使用的模型名称
+        latency_ms: 调用延迟（毫秒）
+        usage: token 用量信息（prompt_tokens, completion_tokens, total_tokens）
+        raw_preview: 原始响应的前 2000 字符预览
+        trace_id: 追踪 ID，用于日志关联
+    """
     content: str
     model: str
     latency_ms: float
@@ -18,6 +38,7 @@ class LLMResponse:
 
 
 class LLMClientError(Exception):
+    """LLM 客户端异常，携带 HTTP 状态码和追踪 ID 便于排查。"""
     def __init__(self, message: str, status_code: Optional[int] = None, trace_id: Optional[str] = None):
         super().__init__(message)
         self.status_code = status_code
@@ -25,6 +46,11 @@ class LLMClientError(Exception):
 
 
 class LLMClient:
+    """LLM API 客户端，封装与 OpenAI 兼容接口的 HTTP 通信。
+
+    支持同步聊天完成和流式聊天完成两种模式，内置超时和错误处理。
+    """
+
     def __init__(
         self,
         base_url: str,
@@ -32,6 +58,14 @@ class LLMClient:
         default_model: str,
         timeout_seconds: int = 30,
     ):
+        """初始化 LLM 客户端。
+
+        参数:
+            base_url: API 基础 URL（如 https://api.deepseek.com/v1）
+            api_key: API 密钥
+            default_model: 默认模型名称
+            timeout_seconds: 默认超时时间（秒）
+        """
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._default_model = default_model
@@ -45,6 +79,21 @@ class LLMClient:
         timeout: Optional[int] = None,
         trace_id: Optional[str] = None,
     ) -> LLMResponse:
+        """发送同步聊天完成请求，返回完整的 LLMResponse。
+
+        参数:
+            messages: 对话消息列表，每条消息包含 role 和 content
+            model: 指定模型名称，为 None 时使用默认模型
+            temperature: 生成温度参数，控制随机性
+            timeout: 超时时间（秒），为 None 时使用默认值
+            trace_id: 追踪 ID，为 None 时自动生成
+
+        返回值:
+            LLMResponse: 包含生成内容和元信息的响应对象
+
+        异常:
+            LLMClientError: API 返回非 200、请求超时或其他网络异常
+        """
         if trace_id is None:
             trace_id = str(uuid.uuid4())
 
@@ -75,6 +124,7 @@ class LLMClient:
             )
             elapsed = (time.monotonic() - start) * 1000
 
+            # 非正常响应：抛出 LLMClientError
             if response.status_code != 200:
                 raise LLMClientError(
                     message=f"LLM API error: {response.status_code} - {response.text[:500]}",
@@ -118,7 +168,6 @@ class LLMClient:
                 trace_id=trace_id,
             )
 
-
     def chat_stream(
         self,
         messages: Sequence[dict[str, Any]],
@@ -127,7 +176,21 @@ class LLMClient:
         timeout: Optional[int] = None,
         trace_id: Optional[str] = None,
     ):
-        """Stream chat completions. Yields text chunks."""
+        """流式聊天完成请求，逐块 yield 文本内容。
+
+        参数:
+            messages: 对话消息列表，每条消息包含 role 和 content
+            model: 指定模型名称，为 None 时使用默认模型
+            temperature: 生成温度参数
+            timeout: 超时时间（秒）
+            trace_id: 追踪 ID
+
+        Yields:
+            str: 每次 yield 一段文本增量
+
+        异常:
+            LLMClientError: API 错误、超时或网络异常
+        """
         if trace_id is None:
             trace_id = str(uuid.uuid4())
 
@@ -158,11 +221,13 @@ class LLMClient:
                 timeout=httpx.Timeout(timeout_s, connect=10.0),
             ) as response:
                 if response.status_code != 200:
+                    response.read()
                     raise LLMClientError(
                         message=f"LLM API error: {response.status_code} - {response.text[:500]}",
                         status_code=response.status_code,
                         trace_id=trace_id,
                     )
+                # 逐行解析 SSE 流
                 for line in response.iter_lines():
                     if line.startswith("data: "):
                         data_str = line[6:]
@@ -170,7 +235,8 @@ class LLMClient:
                             break
                         try:
                             data = json.loads(data_str)
-                        except Exception:
+                        except json.JSONDecodeError:
+                            logger.warning("流式响应 JSON 解析失败: trace_id=%s line=%s", trace_id, data_str[:200])
                             continue
                         choices = data.get("choices", [])
                         if choices:
@@ -194,7 +260,28 @@ class LLMClient:
             )
 
 
+def default_llm_client() -> "LLMClient":
+    """基于项目配置构架 LLMClient 实例的工厂函数。
+
+    统一工厂函数确保意图识别、工具调用、主对话等所有路径使用相同的端点
+    和温度默认值。在函数内部惰性导入 settings，避免模块加载时的循环导入。
+    """
+    from aiive.config import settings
+
+    return LLMClient(
+        base_url=settings.aiive_llm_base_url,
+        api_key=settings.aiive_llm_api_key,
+        default_model=settings.aiive_llm_model,
+        timeout_seconds=settings.aiive_llm_timeout_seconds,
+    )
+
+
 class FakeLLMClient(LLMClient):
+    """测试用假 LLM 客户端，不做真实 API 调用，返回预设的固定内容。
+
+    用于单元测试和集成测试，避免依赖外部 LLM 服务。每次调用 chat() 会记录调用历史，
+    便于测试断言。
+    """
     def __init__(
         self,
         fixed_content: str = "Hello from FakeLLM",
@@ -202,6 +289,14 @@ class FakeLLMClient(LLMClient):
         fixed_usage: Optional[dict[str, int]] = None,
         latency_ms: float = 10.0,
     ):
+        """初始化假 LLM 客户端。
+
+        参数:
+            fixed_content: 每次调用返回的固定文本内容
+            fixed_model: 模拟的模型名称
+            fixed_usage: 模拟的 token 用量
+            latency_ms: 模拟的调用延迟（毫秒）
+        """
         super().__init__(
             base_url="http://fake",
             api_key="fake-key",
@@ -226,6 +321,18 @@ class FakeLLMClient(LLMClient):
         timeout: Optional[int] = None,
         trace_id: Optional[str] = None,
     ) -> LLMResponse:
+        """模拟同步聊天完成，记录调用历史并返回固定的预设内容。
+
+        参数:
+            messages: 对话消息列表
+            model: 模型名称
+            temperature: 温度参数
+            timeout: 超时时间
+            trace_id: 追踪 ID
+
+        返回值:
+            LLMResponse: 包含预设内容和元信息的响应对象
+        """
         if trace_id is None:
             trace_id = str(uuid.uuid4())
 

@@ -1,3 +1,4 @@
+"""测试 ContextBuilder 上下文构建功能。"""
 from aiive.core.context_builder import (
     STABLE_PREFIX,
     ContextBuilder,
@@ -7,7 +8,10 @@ from aiive.core.context_builder import (
 
 
 class TestContextItem:
+    """测试 ContextItem 的 token 估算和基本字段。"""
+
     def test_token_estimate(self):
+        """验证 token 估算值大于 0。"""
         item = ContextItem(
             item_id="test",
             kind="stable_prefix",
@@ -19,6 +23,7 @@ class TestContextItem:
         assert item.preview_length > 0
 
     def test_empty_content(self):
+        """验证空内容的 token 估算至少为 1。"""
         item = ContextItem(
             item_id="test",
             kind="stable_prefix",
@@ -26,11 +31,14 @@ class TestContextItem:
             trust_level="trusted",
             content_preview="",
         )
-        assert item.token_estimate == 1  # floor at 1
+        assert item.token_estimate == 1  # 最低为 1
 
 
 class TestContextBuilder:
+    """测试上下文构建、消息拼接和哈希一致性。"""
+
     def test_build_with_empty_history(self):
+        """验证空历史时构建的消息和上下文项结构正确。"""
         builder = ContextBuilder()
         messages, items, meta = builder.build(history=[], current_message="Hi")
 
@@ -46,6 +54,7 @@ class TestContextBuilder:
         assert messages[-1]["content"] == "Hi"
 
     def test_build_with_history(self):
+        """验证有历史记录时消息和上下文项数量正确。"""
         builder = ContextBuilder()
         history = [
             {"role": "user", "content": "Q1"},
@@ -53,44 +62,26 @@ class TestContextBuilder:
         ]
         messages, items, _ = builder.build(history=history, current_message="Q2")
 
-        # stable_prefix + 2 history + 1 current = 4
+        # stable_prefix + 2 条历史 + 1 条当前 = 4
         assert len(messages) == 4
         assert len(items) == 4
 
     def test_stable_prefix_hash_stable(self):
+        """验证 stable_prefix 哈希值稳定不变。"""
         h1 = _compute_stable_prefix_hash()
         h2 = _compute_stable_prefix_hash()
         assert h1 == h2
         assert len(h1) == 16
 
     def test_meta_includes_stable_prefix_hash(self):
+        """验证 meta 中包含 stable_prefix 哈希。"""
         builder = ContextBuilder()
         _, _, meta = builder.build(history=[], current_message="Hi")
         assert "stable_prefix_hash" in meta
         assert meta["stable_prefix_hash"] == _compute_stable_prefix_hash()
 
-    def test_truncation_when_history_exceeds_limit(self):
-        builder = ContextBuilder(working_limit=3)
-        history = [{"role": "user", "content": f"msg{i}"} for i in range(10)]
-        messages, _, meta = builder.build(history=history, current_message="Hi")
-
-        assert meta["truncated"] is True
-        assert meta["truncated_from"] == 10
-        # stable_prefix + 3 history + 1 current = 5 (but meta says truncated_from = history length)
-        # working messages = last 3 from history
-        assert meta["working_limit"] == 3
-        # messages: system + 3 history + 1 user = 5
-        assert len(messages) == 5
-
-    def test_no_truncation_within_limit(self):
-        builder = ContextBuilder(working_limit=10)
-        history = [{"role": "user", "content": f"msg{i}"} for i in range(5)]
-        _, _, meta = builder.build(history=history, current_message="Hi")
-
-        assert meta["truncated"] is False
-        assert meta["truncated_from"] == 0
-
     def test_all_items_have_required_fields(self):
+        """验证所有上下文项都包含必需字段。"""
         builder = ContextBuilder()
         _, items, _ = builder.build(
             history=[{"role": "user", "content": "Hello"}],

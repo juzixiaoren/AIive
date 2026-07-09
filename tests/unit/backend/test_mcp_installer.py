@@ -1,9 +1,13 @@
+"""测试 MCP 安装器——沙箱安装、版本管理和冒烟测试。"""
 from aiive.db.models import Capability, CapabilityVersion, MCPInstallRecord
 from aiive.mcp.installer import install_sandbox, run_smoke
 
 
 class TestMCPInstaller:
+    """测试沙箱安装、重复安装和哈希变更检测。"""
+
     def test_install_sandbox_creates_capability(self, db_session):
+        """验证沙箱安装后创建 Capability 记录且状态为 sandbox。"""
         result = install_sandbox(
             db=db_session,
             candidate_name="test-server",
@@ -26,6 +30,7 @@ class TestMCPInstaller:
         assert cap.state == "sandbox"
 
     def test_install_creates_install_record(self, db_session):
+        """验证安装后创建 MCPInstallRecord 记录。"""
         install_sandbox(
             db=db_session,
             candidate_name="test2",
@@ -42,6 +47,7 @@ class TestMCPInstaller:
         assert records[0].server_name == "test2"
 
     def test_install_creates_version_record(self, db_session):
+        """验证安装后创建 CapabilityVersion 版本记录。"""
         install_sandbox(
             db=db_session,
             candidate_name="test3",
@@ -58,6 +64,7 @@ class TestMCPInstaller:
         assert versions[0].tool_list_hash is not None
 
     def test_reinstall_with_same_hash_no_state_change(self, db_session):
+        """验证相同哈希重新安装不改变状态。"""
         r1 = install_sandbox(db_session, "same", "npm:same", "1.0", "stdio", ["echo"], {})
         db_session.flush()
         r2 = install_sandbox(db_session, "same", "npm:same", "1.0", "stdio", ["echo"], {})
@@ -67,6 +74,7 @@ class TestMCPInstaller:
         assert cap.state == "sandbox"
 
     def test_hash_change_triggers_needs_review(self, db_session):
+        """验证哈希变更时触发 needs_review 状态。"""
         install_sandbox(db_session, "changed", "npm:changed", "1.0", "stdio", ["echo"], {"v": 1})
         db_session.flush()
         install_sandbox(db_session, "changed", "npm:changed", "2.0", "stdio", ["echo"], {"v": 2})
@@ -77,7 +85,10 @@ class TestMCPInstaller:
 
 
 class TestSmoke:
+    """测试冒烟测试的激活和失败处理。"""
+
     def test_smoke_passed_activates_capability(self, db_session):
+        """验证冒烟测试通过后能力状态变为 active。"""
         install_sandbox(db_session, "smoke-test", "npm:test", "1.0", "stdio", ["echo"], {})
         db_session.flush()
 
@@ -86,6 +97,7 @@ class TestSmoke:
         assert result["state"] == "active"
 
     def test_smoke_failed_sets_needs_review(self, db_session):
+        """验证冒烟测试失败后状态变为 needs_review。"""
         install_sandbox(db_session, "fail-test", "npm:test", "1.0", "stdio", ["echo"], {})
         db_session.flush()
 
@@ -94,15 +106,17 @@ class TestSmoke:
         assert result["state"] == "needs_review"
 
     def test_smoke_unknown_capability(self, db_session):
+        """验证对未知能力执行冒烟测试返回失败。"""
         result = run_smoke(db_session, "mcp:unknown", {"ok": True})
         assert result["ok"] is False
 
     def test_smoke_wrong_state(self, db_session):
+        """验证对已激活能力重复冒烟测试返回失败。"""
         install_sandbox(db_session, "active-one", "npm:test", "1.0", "stdio", ["echo"], {})
         db_session.flush()
         run_smoke(db_session, "mcp:active-one", {"ok": True})
         db_session.flush()
 
-        # Already active, can't smoke again
+        # 已激活，不能再次冒烟
         result = run_smoke(db_session, "mcp:active-one", {"ok": True})
         assert result["ok"] is False

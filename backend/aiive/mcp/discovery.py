@@ -1,3 +1,8 @@
+"""
+MCP 服务发现模块：管理和搜索 MCP（Model Context Protocol）服务器候选列表。
+提供内置的 MCP 服务目录，支持根据用户目标关键词进行匹配和搜索。
+"""
+
 import hashlib
 import json
 from dataclasses import dataclass, field
@@ -6,12 +11,26 @@ from typing import Optional
 
 @dataclass
 class MCPServerCandidate:
+    """MCP 服务器候选条目。
+
+    属性:
+        name: 服务器名称（如 @modelcontextprotocol/server-filesystem）
+        source: 来源（official_registry | community | user_config）
+        version: 版本号
+        description: 功能描述
+        transport: 通信传输方式（stdio | sse | streamable_http）
+        package_ref: 包引用（npm:xxx 或 pip:xxx）
+        declared_tools: 声明的工具列表
+        risk_notes: 风险提示
+        definition_trust_level: 信任等级（semi_trusted | untrusted）
+        descriptor_hash: 描述符哈希
+    """
     name: str
-    source: str  # official_registry | community | user_config
+    source: str  # 来源：official_registry | community | user_config
     version: str
     description: str
-    transport: str  # stdio | sse | streamable_http
-    package_ref: str  # npm package or pip package
+    transport: str  # 传输方式：stdio | sse | streamable_http
+    package_ref: str  # 包引用：npm package 或 pip package
     declared_tools: list[str] = field(default_factory=list)
     risk_notes: str = ""
     definition_trust_level: str = "untrusted"
@@ -19,11 +38,19 @@ class MCPServerCandidate:
 
 
 def _compute_hash(candidate: dict) -> str:
+    """计算候选条目的 SHA256 哈希（取前 16 位）。
+
+    参数:
+        candidate: 候选条目字典
+
+    返回:
+        16 位十六进制哈希字符串
+    """
     raw = json.dumps(candidate, sort_keys=True)
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-# Built-in MCP catalog (simulated registry)
+# 内置 MCP 目录（模拟注册表）
 _BUILTIN_CATALOG: list[dict] = [
     {
         "name": "@modelcontextprotocol/server-filesystem",
@@ -89,6 +116,19 @@ _BUILTIN_CATALOG: list[dict] = [
 
 
 def search_mcp_candidates(goal: str) -> list[MCPServerCandidate]:
+    """根据用户目标搜索匹配的 MCP 候选服务器。
+
+    使用简单的关键词匹配评分：
+    - 命中名称：+3 分
+    - 命中描述：+2 分
+    - 命中工具名：+1 分
+
+    参数:
+        goal: 用户目标描述文本
+
+    返回:
+        匹配的 MCPServerCandidate 列表
+    """
     goal_lower = goal.lower()
     results: list[MCPServerCandidate] = []
 
@@ -98,7 +138,7 @@ def search_mcp_candidates(goal: str) -> list[MCPServerCandidate]:
         tools_text = " ".join(entry["declared_tools"]).lower()
 
         score = 0
-        # Match keywords in goal
+        # 按关键词匹配评分
         keywords = goal_lower.split()
         for kw in keywords:
             if kw in name_lower:
@@ -108,10 +148,10 @@ def search_mcp_candidates(goal: str) -> list[MCPServerCandidate]:
             if kw in tools_text:
                 score += 1
 
-        # Always include if any keyword match
+        # 任一关键词匹配即包含
         if score > 0 or not keywords:
-            # Cap at all results but sort by score
             candidate_data = dict(entry)
+            # 根据来源确定信任等级
             candidate_data["definition_trust_level"] = (
                 "semi_trusted" if entry["source"] == "official_registry" else "untrusted"
             )
@@ -130,5 +170,4 @@ def search_mcp_candidates(goal: str) -> list[MCPServerCandidate]:
                 descriptor_hash=descriptor_hash,
             ))
 
-    # Sort by score (implicitly by order of addition) and de-duplicate
     return results

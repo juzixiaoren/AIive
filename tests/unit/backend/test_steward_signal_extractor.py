@@ -1,3 +1,8 @@
+"""测试 StewardSignalExtractor（管家信号提取器）模块。
+
+验证从用户对话中提取例行任务、偏好、用户资料等个人信号的功能。
+"""
+
 import json
 
 from aiive.core.llm_client import FakeLLMClient
@@ -5,7 +10,10 @@ from aiive.memory.steward_signal_extractor import StewardSignalExtractor
 
 
 class TestStewardSignalExtractor:
+    """测试 StewardSignalExtractor 的信号提取功能。"""
+
     def test_extract_routine_signal(self):
+        """应正确提取例行任务信号，包含 schedule_text。"""
         fake = FakeLLMClient(
             fixed_content=json.dumps([
                 {
@@ -23,6 +31,7 @@ class TestStewardSignalExtractor:
         assert results[0]["schedule_text"] == "daily at 7am"
 
     def test_extract_preference_signal(self):
+        """应正确提取偏好信号。"""
         fake = FakeLLMClient(
             fixed_content=json.dumps([
                 {
@@ -38,6 +47,7 @@ class TestStewardSignalExtractor:
         assert results[0]["signal_type"] == "preference"
 
     def test_extract_profile_signal(self):
+        """应正确提取用户资料信号。"""
         fake = FakeLLMClient(
             fixed_content=json.dumps([
                 {
@@ -53,6 +63,7 @@ class TestStewardSignalExtractor:
         assert results[0]["signal_type"] == "user_profile"
 
     def test_filters_invalid_signal_types(self):
+        """无效的信号类型应被过滤掉。"""
         fake = FakeLLMClient(
             fixed_content=json.dumps([
                 {"signal_type": "routine", "content": "valid", "confidence": 0.9},
@@ -65,12 +76,14 @@ class TestStewardSignalExtractor:
         assert results[0]["signal_type"] == "routine"
 
     def test_handles_invalid_json(self):
+        """无效 JSON 应返回空列表。"""
         fake = FakeLLMClient(fixed_content="not json")
         extractor = StewardSignalExtractor(fake)
         results = extractor.extract("hello", "hi")
         assert results == []
 
     def test_handles_empty_array(self):
+        """空数组应返回空列表。"""
         fake = FakeLLMClient(fixed_content="[]")
         extractor = StewardSignalExtractor(fake)
         results = extractor.extract("chat about weather", "sunny")

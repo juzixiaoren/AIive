@@ -1,14 +1,33 @@
-CHUNK_SIZE = 500  # characters
+"""
+文本分块模块。
+
+将长文本按行切分为固定大小的块（chunk），用于知识库的文档分割。
+采用按行累加的方式，确保每块不超过指定字符数，同时尽量保持行的完整性。
+"""
+
+CHUNK_SIZE = 500  # 每个块的默认字符数
 
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE) -> list[dict]:
+    """
+    将文本按行分割为多个块。
+
+    参数:
+        text: 待分割的原始文本。
+        chunk_size: 每个块的最大字符数，默认 500。
+
+    返回:
+        块列表，每项包含 content（块内容）、line_start（起始行号）、
+        line_end（结束行号）和 chunk_index（块索引）。
+    """
     lines = text.split("\n")
     chunks = []
-    current = ""
-    start_line = 0
-    chunk_idx = 0
+    current = ""  # 当前累积的文本
+    start_line = 0  # 当前块的起始行号
+    chunk_idx = 0  # 块索引计数器
 
     for i, line in enumerate(lines):
+        # 如果当前块已有内容，且加入下一行会超出限制，则保存当前块并开始新块
         if current and len(current) + len(line) > chunk_size:
             chunks.append({
                 "content": current.rstrip(),
@@ -22,6 +41,7 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE) -> list[dict]:
         else:
             current += line + "\n"
 
+    # 处理最后一个块（可能不满 chunk_size）
     if current.strip():
         chunks.append({
             "content": current.rstrip(),

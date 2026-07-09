@@ -1,3 +1,10 @@
+"""
+模块功能说明：
+- 数据库 ORM 模型定义模块，使用 SQLAlchemy 2.0 Declarative API
+- 定义所有数据表结构：Thread、Event、LLMCall、ContextSnapshot、MemoryRecord
+- 以及 Capability、Task、OutboxJob、Document 等支撑功能表
+- 每个模型通过 Mapped 和 mapped_column 声明字段类型和约束
+"""
 import uuid
 from datetime import datetime, timezone
 
@@ -6,18 +13,22 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 class Base(DeclarativeBase):
+    """SQLAlchemy 声明式基类，所有 ORM 模型均继承此类。"""
     pass
 
 
 def _utcnow() -> datetime:
+    """返回当前 UTC 时间，作为时间戳字段的默认值工厂函数。"""
     return datetime.now(timezone.utc)
 
 
 def _new_uuid() -> str:
+    """生成 UUID4 字符串，作为主键字段的默认值工厂函数。"""
     return str(uuid.uuid4())
 
 
 class Thread(Base):
+    """对话线程模型：代表一个完整的对话会话。"""
     __tablename__ = "threads"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
@@ -35,6 +46,7 @@ class Thread(Base):
 
 
 class Event(Base):
+    """事件模型：记录对话中的各类事件（用户消息、工具调用、系统事件等）。"""
     __tablename__ = "events"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
@@ -54,6 +66,7 @@ class Event(Base):
 
 
 class LLMCall(Base):
+    """LLM 调用记录模型：记录每次大模型 API 调用的元信息。"""
     __tablename__ = "llm_calls"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
@@ -71,6 +84,7 @@ class LLMCall(Base):
 
 
 class ContextSnapshot(Base):
+    """上下文快照模型：保存每次对话的上下文构建结果，用于调试和审计。"""
     __tablename__ = "context_snapshots"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
@@ -91,6 +105,7 @@ class ContextSnapshot(Base):
 
 
 class MemoryRecord(Base):
+    """记忆记录模型：持久化存储用户的各类记忆，支持生命周期管理和版本控制。"""
     __tablename__ = "memory_records"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
@@ -116,6 +131,7 @@ class MemoryRecord(Base):
 
 
 class Capability(Base):
+    """能力注册模型：记录 Agent 的各类能力及其状态。"""
     __tablename__ = "capabilities"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
@@ -135,6 +151,7 @@ class Capability(Base):
 
 
 class CapabilityVersion(Base):
+    """能力版本模型：记录每个能力的版本变更历史。"""
     __tablename__ = "capability_versions"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
@@ -149,6 +166,7 @@ class CapabilityVersion(Base):
 
 
 class MCPInstallRecord(Base):
+    """MCP 安装记录模型：记录 MCP 服务器的安装信息。"""
     __tablename__ = "mcp_install_records"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
@@ -165,6 +183,7 @@ class MCPInstallRecord(Base):
 
 
 class SelfDevRequest(Base):
+    """自进化请求模型：Agent 自行提出的代码修改请求。"""
     __tablename__ = "selfdev_requests"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
@@ -179,6 +198,7 @@ class SelfDevRequest(Base):
 
 
 class PatchOperation(Base):
+    """补丁操作模型：记录自进化请求对应的代码修改操作。"""
     __tablename__ = "patch_operations"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
@@ -196,6 +216,7 @@ class PatchOperation(Base):
 
 
 class OutboxJob(Base):
+    """发件箱任务模型：用于异步任务调度，支持重试和幂等。"""
     __tablename__ = "outbox_jobs"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
@@ -216,6 +237,7 @@ class OutboxJob(Base):
 
 
 class Document(Base):
+    """文档模型：记录已导入的知识文档元信息。"""
     __tablename__ = "documents"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
@@ -227,6 +249,7 @@ class Document(Base):
 
 
 class Chunk(Base):
+    """文档分块模型：存储文档的语义分块内容。"""
     __tablename__ = "chunks"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
@@ -240,6 +263,7 @@ class Chunk(Base):
 
 
 class RetrievalRun(Base):
+    """检索运行模型：记录每次知识检索的执行信息。"""
     __tablename__ = "retrieval_runs"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
@@ -250,6 +274,7 @@ class RetrievalRun(Base):
 
 
 class RetrievalCandidate(Base):
+    """检索候选模型：记录每次检索返回的候选文档块。"""
     __tablename__ = "retrieval_candidates"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
@@ -261,6 +286,7 @@ class RetrievalCandidate(Base):
 
 
 class ForgetRequest(Base):
+    """遗忘请求模型：记录用户要求删除特定记忆的请求。"""
     __tablename__ = "forget_requests"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
@@ -271,6 +297,7 @@ class ForgetRequest(Base):
 
 
 class Task(Base):
+    """任务模型：记录定时任务、提醒、条件检查等异步任务。"""
     __tablename__ = "tasks"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
@@ -287,6 +314,7 @@ class Task(Base):
 
 
 class AttentionState(Base):
+    """注意力状态模型：记录 Agent 在每个线程中的关注焦点和决策状态。"""
     __tablename__ = "attention_states"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
