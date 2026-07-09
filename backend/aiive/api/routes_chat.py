@@ -24,6 +24,12 @@ class ChatRequest(BaseModel):
     thread_id: str | None = None
 
 
+class SystemChatRequest(BaseModel):
+    """系统指令请求：不记录 user_message，指令不可见于聊天记录"""
+    message: str = Field(..., min_length=1)
+    thread_id: str
+
+
 class ChatResponse(BaseModel):
     """聊天响应体"""
     reply: str
@@ -56,6 +62,29 @@ def chat(request: ChatRequest, db: Session = Depends(get_db)):
     return result
 
 
+@router.post("/chat/system")
+def chat_system(request: SystemChatRequest, db: Session = Depends(get_db)):
+    """系统指令聊天：不记录 user_message，指令作为系统消息发给 LLM。
+
+    用于提醒确认/延时等系统操作：前端触发后 LLM 调用工具处理，
+    指令本身不污染对话历史。
+
+    Args:
+        request: 包含 message 和 thread_id 的系统指令请求
+        db: 数据库会话
+
+    Returns:
+        ChatResponse
+    """
+    from aiive.core.llm_client import default_llm_client
+    from aiive.runtime.agent_graph import AgentGraph
+
+    client = default_llm_client()
+    graph = AgentGraph(client, db)
+    result = graph.run_system(message=request.message, thread_id=request.thread_id)
+    return result
+
+
 @router.post("/chat/stream")
 def chat_stream(request: ChatRequest, db: Session = Depends(get_db)):
     """流式聊天接口，使用 Server-Sent Events 实时推送回复
@@ -70,12 +99,12 @@ def chat_stream(request: ChatRequest, db: Session = Depends(get_db)):
 
     def generate():
         from aiive.core.llm_client import default_llm_client
-        from aiive.runtime.agent_loop import AgentLoop
+        from aiive.runtime.agent_graph import AgentGraph
 
         client = default_llm_client()
-        loop = AgentLoop(client, db)
+        graph = AgentGraph(client, db)
         try:
-            for event in loop.run_stream(message=request.message, thread_id=request.thread_id):
+            for event in graph.run_stream(message=request.message, thread_id=request.thread_id):
                 yield f"event: {event['event']}\ndata: {json.dumps(event['data'], ensure_ascii=False)}\n\n"
         except LLMClientError as e:
             yield f"event: error\ndata: {json.dumps({'message': str(e)}, ensure_ascii=False)}\n\n"

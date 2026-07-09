@@ -2,7 +2,7 @@
 API路由模块：通知管理
 - 提供统一的通知和提醒查询接口
 - 从事件表中获取最近的通知和提醒
-- 支持按类别筛选：未执行（pending/alerting/snoozed）和已执行（confirmed/cancelled）
+- 支持按类别筛选和删除通知
 """
 import logging
 
@@ -64,3 +64,22 @@ def list_notifications(
         except Exception:
             continue
     return result
+
+
+@router.delete("/notifications/{notification_id}")
+def delete_notification(notification_id: str, db: Session = Depends(get_db)):
+    """删除指定通知（从数据库完整删除 event 记录）。
+
+    Args:
+        notification_id: 通知 ID（即 Event.id）
+        db: 数据库会话
+
+    Returns:
+        ok 为 True 表示成功，False 表示通知不存在
+    """
+    event = db.get(Event, notification_id)
+    if event is None:
+        return {"ok": False, "error": "通知不存在"}
+    db.delete(event)
+    db.commit()
+    return {"ok": True}

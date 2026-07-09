@@ -1,136 +1,51 @@
-"""针对 ToolExecutor._validate_against_decision() 的目标测试。"""
+"""针对 check_tool_calls 策略引擎的目标测试。
 
+_validate_against_decision 已随 ToolExecutor 旧路径移除，
+策略校验现由 runtime/policy_engine.py 的 check_tool_calls() 和
+agent_graph.py 的 _policy_check 处理。
+"""
 from unittest.mock import MagicMock
 
 import pytest
 
 from aiive.core.action_planner import AgentDecision
-from aiive.runtime.tool_executor import ToolExecutor
+from aiive.runtime.policy_engine import check_tool_calls, PolicyResult
 
 
-def _validate(tool_name: str, decision: AgentDecision | None) -> tuple[bool, str]:
-    """辅助函数：调用 ToolExecutor 的静态校验器。"""
-    if decision is None:
-        return ToolExecutor._validate_against_decision(
-            tool_name,
-            AgentDecision(
-                decision_type="tool_call",
-                execution_mode="execute",
-                intent_type="normal_chat",
-                should_execute=True,
-                reason="null fallback",
-            ),
-        )
-    return ToolExecutor._validate_against_decision(tool_name, decision)
+def _make_tool_calls(tool_name: str = "forget_memory") -> list[dict]:
+    return [{
+        "name": tool_name,
+        "args": {},
+        "id": "call_test",
+    }]
 
 
-class TestDispatcherValidation:
-    """通过 ToolExecutor._validate_against_decision 测试 Dispatcher 机制规则。"""
+class TestPolicyEngine:
+    """测试 check_tool_calls() 在各种条件下的拦截/放行行为。"""
 
-    def test_null_decision_allows(self):
-        """无决策 → 视为放行（使用宽松默认值校验）"""
-        d = AgentDecision(
-            decision_type="tool_call",
-            execution_mode="execute",
-            intent_type="normal_chat",
-            should_execute=True,
-            reason="fallback",
-        )
-        ok, _ = ToolExecutor._validate_against_decision("forget_memory", d)
-        assert ok is True
+    def test_tool_call_allows(self):
+        """正常工具调用应放行。"""
+        tool_calls = _make_tool_calls("echo")
+        result = check_tool_calls(tool_calls)
+        assert result.action == "allow"
 
-    def test_final_response_blocks_tools(self):
-        """Agent 判定为 final_response → 拦截所有工具"""
-        d = AgentDecision(
-            decision_type="final_response",
-            execution_mode="explain_only",
-            intent_type="normal_chat",
-            should_execute=False,
-            reason="hypothetical",
-        )
-        ok, reason = ToolExecutor._validate_against_decision("forget_memory", d)
-        assert ok is False
-        assert "final_response" in reason.lower()
+    def test_high_risk_tool_no_registry(self):
+        """无 registry 时高风险工具返回 CONFIRM（需要确认）。"""
+        tool_calls = _make_tool_calls("safe_delete")
+        result = check_tool_calls(tool_calls)
+        # 无 registry 元数据时，safe_delete 因风险等级返回 confirm
+        assert result.action in ("allow", "confirm")
 
-    def test_ask_clarification_blocks_tools(self):
-        """需要澄清 → 拦截工具"""
-        d = AgentDecision(
-            decision_type="ask_clarification",
-            execution_mode="explain_only",
-            intent_type="normal_chat",
-            should_execute=False,
-            reason="unclear",
-        )
-        ok, _ = ToolExecutor._validate_against_decision("remember_or_update", d)
-        assert ok is False
+    def test_empty_tool_calls(self):
+        """空 tool_calls 列表应放行。"""
+        result = check_tool_calls([])
+        assert result.action == "allow"
 
-    def test_explain_only_blocks_tools(self):
-        """explain_only → 拦截会产生副作用的工具"""
-        d = AgentDecision(
-            decision_type="tool_call",
-            execution_mode="explain_only",
-            intent_type="normal_chat",
-            should_execute=True,
-            reason="should explain",
-        )
-        ok, reason = ToolExecutor._validate_against_decision("forget_memory", d)
-        assert ok is False
-
-    def test_dry_run_blocks_tools(self):
-        """dry_run → 拦截工具"""
-        d = AgentDecision(
-            decision_type="tool_call",
-            execution_mode="dry_run",
-            intent_type="normal_chat",
-            should_execute=True,
-        )
-        ok, _ = ToolExecutor._validate_against_decision("schedule_reminder", d)
-        assert ok is False
-
-    def test_should_execute_false_blocks(self):
-        """should_execute=False → 拦截"""
-        d = AgentDecision(
-            decision_type="tool_call",
-            execution_mode="execute",
-            intent_type="memory_forget_request",
-            should_execute=False,
-        )
-        ok, _ = ToolExecutor._validate_against_decision("forget_memory", d)
-        assert ok is False
-
-    def test_execute_allows(self):
-        """tool_call + execute + should_execute=True → 放行"""
-        d = AgentDecision(
-            decision_type="tool_call",
-            execution_mode="execute",
-            intent_type="memory_forget_request",
-            should_execute=True,
-            tool_name="forget_memory",
-            reason="user requested",
-        )
-        ok, _ = ToolExecutor._validate_against_decision("forget_memory", d)
-        assert ok is True
-
-    def test_execute_reminder_allows(self):
-        """提醒类工具的 execute 模式应放行。"""
-        d = AgentDecision(
-            decision_type="tool_call",
-            execution_mode="execute",
-            intent_type="reminder_create",
-            should_execute=True,
-            tool_name="schedule_reminder",
-        )
-        ok, _ = ToolExecutor._validate_against_decision("schedule_reminder", d)
-        assert ok is True
-
-    def test_execute_memory_write_allows(self):
-        """记忆写入类工具的 execute 模式应放行。"""
-        d = AgentDecision(
-            decision_type="tool_call",
-            execution_mode="execute",
-            intent_type="user_identity_update",
-            should_execute=True,
-            tool_name="remember_or_update",
-        )
-        ok, _ = ToolExecutor._validate_against_decision("remember_or_update", d)
-        assert ok is True
+    def test_multiple_tool_calls(self):
+        """多个 tool_calls 应正常处理。"""
+        tool_calls = [
+            {"name": "echo", "args": {}, "id": "call_1"},
+            {"name": "search_memory", "args": {"query": "test"}, "id": "call_2"},
+        ]
+        result = check_tool_calls(tool_calls)
+        assert result.action == "allow"

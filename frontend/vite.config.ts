@@ -10,10 +10,14 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
-    // 代理配置：将 /api 和 /health 请求转发到后端服务
+    // 代理配置：将 /api、/health 和 /ws 请求转发到后端服务
     proxy: {
       "/api": "http://127.0.0.1:8000",
       "/health": "http://127.0.0.1:8000",
+      "/ws": {
+        target: "http://127.0.0.1:8000",
+        ws: true,
+      },
     },
   },
 });

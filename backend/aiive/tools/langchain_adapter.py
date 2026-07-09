@@ -2,6 +2,9 @@
 LangChain 工具适配器：将 ToolRegistry 中的工具转换为 LangChain StructuredTool。
 使得已注册的工具可以通过 llm.bind_tools() 供 LangChain Agent 使用，
 同时保持执行路径仍经过 ToolRegistry.execute() 以确保一致性和安全性。
+
+RunContext 通过 _make_handler 闭包捕获，经由 registry.execute() 注入 handler，
+全程不暴露给 LLM tool schema。
 """
 
 from __future__ import annotations
@@ -10,23 +13,26 @@ from typing import Any
 
 from langchain_core.tools import StructuredTool
 
-from aiive.tools.builtin_tools import set_thread_context
 from aiive.tools.registry import ToolRegistry
 
 
-def _make_handler(registry: ToolRegistry, capability_id: str):
+def _make_handler(registry: ToolRegistry, capability_id: str, run_context):
     """创建包装 ToolRegistry.execute() 的可调用对象。
 
-    参数:
+    闭包捕获 run_context，由 registry.execute() 注入 handler 的 ctx 参数，
+    不与 LLM 交互，不出现于 tool schema。
+
+    Args:
         registry: ToolRegistry 实例
         capability_id: 工具能力标识符
+        run_context: RunContext 对象，由 build_langchain_tools 传入
 
-    返回:
+    Returns:
         一个可调用函数，签名为 (**params) -> str
     """
 
     def handler(**params: Any) -> str:
-        result = registry.execute(capability_id, params, "trusted_user_command")
+        result = registry.execute(capability_id, params, "trusted_user_command", run_context)
         if not result.get("ok"):
             err = result.get("error", "Unknown error")
             if result.get("approval_required"):
@@ -37,7 +43,6 @@ def _make_handler(registry: ToolRegistry, capability_id: str):
                 {"ok": False, "error": err, "error_type": result.get("error_type", "execution_failed")},
                 ensure_ascii=False,
             )
-        # 提取内部结果并转为字符串
         inner = result.get("result", result)
         if isinstance(inner, dict):
             import json
@@ -50,28 +55,21 @@ def _make_handler(registry: ToolRegistry, capability_id: str):
 
 def build_langchain_tools(
     registry: ToolRegistry,
-    thread_id: str | None = None,
+    run_context=None,
     visible_tool_ids: list[str] | None = None,
 ) -> list[StructuredTool]:
     """将 ToolRegistry 中的所有（或过滤后的）工具转换为 LangChain StructuredTool 列表。
 
-    转换过程：
-    1. 设置线程上下文（用于工具执行时的 thread 关联）
-    2. 按 visible_tool_ids 过滤（可选）
-    3. 将参数定义从 {name: type_str} 转换为 args_schema 格式
-    4. 在描述中附加元数据提示（副作用、风险等级）
+    run_context 通过闭包捕获注入，thread_id/trace_id 不进入 LLM schema。
 
-    参数:
+    Args:
         registry: ToolRegistry 单例
-        thread_id: 当前线程 ID，用于设置线程上下文
+        run_context: RunContext 对象（包含 thread_id、trace_id 等）
         visible_tool_ids: 可选的要包含的工具 ID 列表，为 None 则包含全部
 
-    返回:
+    Returns:
         StructuredTool 列表，可直接用于 llm.bind_tools()
     """
-    if thread_id:
-        set_thread_context(thread_id)
-
     tools: list[StructuredTool] = []
     all_regs = registry.list_all()
 
@@ -86,13 +84,11 @@ def build_langchain_tools(
         if reg is None:
             continue
 
-        # 将参数定义从 {name: type_str} 转换为 args_schema 格式
         params = reg.parameters or {}
         args_schema = {}
         for pname, ptype in params.items():
             args_schema[pname] = _type_str_to_python(ptype)
 
-        # 在描述中附加元数据提示，供 LLM 理解工具的副作用和风险
         desc = reg.description
         safety = reg.safety
         if safety.writes_external_world:
@@ -101,7 +97,7 @@ def build_langchain_tools(
             desc += f" (risk: {safety.risk_level})"
 
         tool = StructuredTool.from_function(
-            func=_make_handler(registry, cap_id),
+            func=_make_handler(registry, cap_id, run_context),
             name=cap_id,
             description=desc,
             args_schema=_build_empty_args_schema(cap_id) if not args_schema else _build_args_schema(cap_id, args_schema),

@@ -118,4 +118,4 @@ def delete(ref: ObjectRef):
         ref: ObjectRef 对象引用。
     """
     from aiive.tools.safe_delete import safe_delete
-    safe_delete(str(ref.path), "test_artifacts", "trash")
+    safe_delete(str(ref.path), "object_store", "trash")

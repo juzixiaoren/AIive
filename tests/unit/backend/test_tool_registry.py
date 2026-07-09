@@ -93,7 +93,7 @@ class TestToolRegistry:
         """不可信来源应被拦截。"""
         registry = ToolRegistry()
 
-        def handler(**kw):
+        def handler(ctx=None, **kw):
             return "executed"
 
         registry.register(ToolRegistration(
@@ -108,7 +108,7 @@ class TestToolRegistry:
         """需要确认的工具应返回 approval_required。"""
         registry = ToolRegistry()
 
-        def handler(**kw):
+        def handler(ctx=None, **kw):
             return "should not run"
 
         registry.register(ToolRegistration(
@@ -126,7 +126,7 @@ class TestToolRegistry:
         """安全工具应能正常执行。"""
         registry = ToolRegistry()
 
-        def handler(message: str = "") -> str:
+        def handler(ctx=None, message: str = "") -> str:
             return f"echo: {message}"
 
         registry.register(ToolRegistration(
@@ -142,12 +142,12 @@ class TestBuiltinTools:
     """测试内置工具的注册状态和执行。"""
 
     def test_registry_has_echo_and_read_file(self):
-        """注册表应包含 echo 和 read_text_file_limited 工具。"""
+        """注册表应包含 echo 和 read_text_file 工具。"""
         registry = get_tool_registry()
         tools = registry.list_all()
         ids = {t["capability_id"] for t in tools}
         assert "echo" in ids
-        assert "read_text_file_limited" in ids
+        assert "read_text_file" in ids
 
     def test_echo_executes(self):
         """echo 工具应正确执行并返回结果。"""
@@ -157,11 +157,11 @@ class TestBuiltinTools:
         assert result["result"] == "hello world"
 
     def test_read_file_requires_confirmation(self):
-        """read_text_file_limited 应要求确认且风险等级为 medium。"""
+        """read_text_file 工具注册元数据检查。"""
         registry = get_tool_registry()
-        tool = [t for t in registry.list_all() if t["capability_id"] == "read_text_file_limited"][0]
-        assert tool["requires_confirmation"] is True
-        assert tool["risk_level"] == "medium"
+        tool = [t for t in registry.list_all() if t["capability_id"] == "read_text_file"][0]
+        assert tool.get("risk_level") == "low"
+        assert tool.get("writes_external_world") is False
 
 
 class TestDescriptorHash:

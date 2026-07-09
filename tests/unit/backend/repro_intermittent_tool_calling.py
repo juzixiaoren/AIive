@@ -1,6 +1,6 @@
 """间歇性 Chat-to-Tool 调用的复现脚本。
 
-目的：使用真实的 ActionPlanner + ToolExecutor 类，演示相同的用户输入有时会调用工具、
+目的：使用真实的 ActionPlanner + ToolRegistry 类，演示相同的用户输入有时会调用工具、
 有时却不会——无需真实的 LLM 或数据库。
 
 如何模拟真实场景
@@ -12,11 +12,11 @@
    execution_mode:"explain_only", should_execute:False}。因此 should_execute/
    candidate_tool 受非确定性调用影响。
 
-2) AgentLoop.run() 内的主 Agent LLM 调用未传 temperature 参数，使用模型默认值（高方差）。
+2) AgentGraph.run() 内的主 Agent LLM 调用未传 temperature 参数，使用模型默认值（高方差）。
    模型被要求输出 <tool_call>...</tool_call> 标签或自然语言。
+   本脚本手动解析 <tool_call> 并通过 ToolRegistry.execute() 执行。
 
-关键：AgentDecision 仅作为**拦截器**使用
-（ToolExecutor._validate_against_decision）。没有任何代码路径会在
+关键：AgentDecision 仅作为**拦截器**使用。没有任何代码路径会在
 should_execute=True 时强制调用工具。如果主 LLM 以自然语言回复（无 <tool_call> 标签），
 循环会将该回复作为 FINAL 返回，工具永远不会执行。
 
@@ -41,7 +41,6 @@ sys.path.insert(0, ".")
 
 from aiive.core.action_planner import ActionPlanner, AgentDecision  # noqa: E402
 from aiive.core.llm_client import LLMResponse  # noqa: E402
-from aiive.runtime.tool_executor import ToolExecutor  # noqa: E402
 from aiive.tools.registry import get_tool_registry, ToolRegistration, CapabilitySafetySchema, compute_descriptor_hash  # noqa: E402
 
 
@@ -134,17 +133,8 @@ class FlakyLLM:
         )
 
 
-class _FakeLogger:
-    def log_event(self, *a, **k):
-        pass
-
-
-class _FakeDB:
-    pass
-
-
 def simulate_one_iteration(msg: str, planner_ok: float, main_tool: float, seed: int):
-    """使用真实类复制 AgentLoop.run() 的核心工具调用逻辑。"""
+    """使用 ActionPlanner + ToolRegistry 模拟工具调用执行。"""
     SPY.clear()
     llm = FlakyLLM(planner_ok=planner_ok, main_tool=main_tool, seed=seed)
     planner = ActionPlanner(llm)
@@ -153,15 +143,38 @@ def simulate_one_iteration(msg: str, planner_ok: float, main_tool: float, seed: 
     # 主 LLM 回复（同一 FlakyLLM 实例再抽一次）
     main_reply = llm.chat([{"role": "user", "content": msg}], trace_id=str(uuid.uuid4())).content
 
-    te = ToolExecutor(_FakeDB(), _FakeLogger())
-    cleaned, records, malformed = te.extract_and_execute(
-        text=main_reply,
-        thread_id="thread-repro",
-        trace_id=str(uuid.uuid4()),
-        decision=decision,
-    )
-    executed = any(r.status in ("completed", "failed") for r in records)
-    blocked = any(r.status == "blocked" for r in records)
+    # 解析 <tool_call> XML 标签，通过 ToolRegistry 执行
+    import re
+    registry = get_tool_registry()
+    records: list[dict] = []
+    malformed = False
+    cleaned = main_reply
+
+    tool_pattern = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+    matches = tool_pattern.findall(main_reply)
+    for match in matches:
+        try:
+            parsed = json.loads(match.strip())
+            tool_name = parsed.get("name", "")
+            params = parsed.get("params", {})
+            result = registry.execute(
+                tool_name, params,
+                instruction_source="trusted_user_command",
+            )
+            if result.get("ok"):
+                records.append({"name": tool_name, "status": "completed"})
+            elif result.get("approval_required"):
+                records.append({"name": tool_name, "status": "blocked"})
+            else:
+                records.append({"name": tool_name, "status": "failed"})
+            cleaned = tool_pattern.sub("", cleaned, count=1)
+        except (json.JSONDecodeError, KeyError):
+            malformed = True
+            records.append({"name": "unknown", "status": "failed"})
+
+    cleaned = cleaned.strip() or main_reply
+    executed = any(r["status"] in ("completed", "failed") for r in records)
+    blocked = any(r["status"] == "blocked" for r in records)
 
     return {
         "input": msg,
@@ -172,7 +185,7 @@ def simulate_one_iteration(msg: str, planner_ok: float, main_tool: float, seed: 
         "tool_executed": executed,
         "tool_blocked": blocked,
         "spy_calls": [c.name for c in SPY],
-        "records": [{"name": r.name, "status": r.status} for r in records],
+        "records": records,
         "malformed": malformed,
         "final_reply": cleaned,
         "tasks_table_changed": bool(SPY),

@@ -62,11 +62,15 @@ def _build_safety(capability_id: str, **overrides) -> CapabilitySafetySchema:
 # ═══════════════════════════════════════════════════════════════
 
 def _db_handler(fn):
-    """装饰器：为需要数据库会话的处理函数自动管理会话生命周期（开启/提交/关闭）。"""
-    def wrapper(**params):
+    """装饰器：为需要数据库会话的处理函数自动管理会话生命周期（开启/提交/关闭）。
+
+    提取 ctx 命名参数，传递给被装饰函数 fn(db, ctx, **params)。
+    RunContext 通过 registry.execute() 注入，不经过 LLM schema。
+    """
+    def wrapper(ctx=None, **params):
         db = SessionLocal()
         try:
-            result = fn(db, **params)
+            result = fn(db, ctx, **params)
             db.commit()
             return result
         except Exception:
@@ -79,31 +83,28 @@ def _db_handler(fn):
 
 
 # ── Echo（回显）──
-def _handle_echo(message: str = "") -> str:
+def _handle_echo(ctx=None, message: str = "") -> str:
     """回显工具：原样返回输入消息。"""
     return message
 
 
 # ── Reminder / Task（提醒与任务）──
-# 模块级上下文：用于从 agent loop 向工具处理函数传递当前线程 ID。
-_current_thread_id: str | None = None
 
 
-def set_thread_context(thread_id: str | None) -> None:
-    """设置当前线程上下文，使工具处理函数能关联到正确的对话线程。
-
-    参数:
-        thread_id: 线程 ID，传 None 则清除上下文
-    """
-    global _current_thread_id
-    _current_thread_id = thread_id
+def _require_ctx(ctx, tool_name: str):
+    """side-effect 工具需要 RunContext，缺失时 fast-fail。"""
+    if ctx is None:
+        raise RuntimeError(
+            f"工具 {tool_name} 需要 RunContext，但未传入。"
+            " 请确认 AgentGraph 已通过 build_langchain_tools 传入 RunContext。"
+        )
 
 
 @_db_handler
-def _handle_schedule_reminder(db, content: str, delay_minutes: int = 1):
+def _handle_schedule_reminder(db, ctx, content: str, delay_minutes: int = 1):
     """创建定时提醒，只负责写入 Task 记录。
 
-    Event（reminder_created）由 AgentLoop._finalize() 在主 DB 会话中统一写入，
+    Event（reminder_created）由 AgentGraph._finalize() 在主 DB 会话中统一写入，
     避免工具独立会话与主会话之间的 FK 约束冲突。
 
     参数:
@@ -121,7 +122,8 @@ def _handle_schedule_reminder(db, content: str, delay_minutes: int = 1):
         description=f"延迟{delay_minutes}分钟",
         next_check_at=next_check,
     )
-    task.thread_id = _current_thread_id
+    _require_ctx(ctx, "schedule_reminder")
+    task.thread_id = ctx.thread_id
     db.flush()
     return {
         "reminder_set": True,
@@ -132,7 +134,7 @@ def _handle_schedule_reminder(db, content: str, delay_minutes: int = 1):
 
 
 @_db_handler
-def _handle_remind_alert(db, reminder_id: str):
+def _handle_remind_alert(db, ctx, reminder_id: str):
     """LLM 在提醒到期时调用此工具，激活提醒警报。
 
     将事件状态标记为 alerting，返回操作信息供前端显示确认/延期按钮。
@@ -164,7 +166,7 @@ def _handle_remind_alert(db, reminder_id: str):
 
 
 @_db_handler
-def _handle_confirm_reminder(db, reminder_id: str):
+def _handle_confirm_reminder(db, ctx, reminder_id: str):
     """用户确认提醒完成，将状态标记为 confirmed。
 
     参数:
@@ -186,7 +188,7 @@ def _handle_confirm_reminder(db, reminder_id: str):
 
 
 @_db_handler
-def _handle_snooze_reminder(db, reminder_id: str, delay_minutes: int = 5):
+def _handle_snooze_reminder(db, ctx, reminder_id: str, delay_minutes: int = 5):
     """用户延迟提醒，创建新的延时任务和事件。
 
     流程:
@@ -229,10 +231,11 @@ def _handle_snooze_reminder(db, reminder_id: str, delay_minutes: int = 5):
     db.flush()
 
     # 创建新的 pending 事件
+    _require_ctx(ctx, "snooze_reminder")
     new_event = Event(
         id=str(_uuid.uuid4()),
         trace_id=task.id,
-        thread_id=event.thread_id,
+        thread_id=ctx.thread_id,
         event_type="reminder_created",
         payload={
             "task_id": task.id,
@@ -255,7 +258,7 @@ def _handle_snooze_reminder(db, reminder_id: str, delay_minutes: int = 5):
 
 
 @_db_handler
-def _handle_list_tasks(db, status: str = "", thread_id: str = ""):
+def _handle_list_tasks(db, ctx, status: str = "", thread_id: str = ""):
     """列出所有任务/提醒。
 
     参数:
@@ -270,13 +273,13 @@ def _handle_list_tasks(db, status: str = "", thread_id: str = ""):
     normalized = status.strip().lower() if status else ""
     effective = normalized if normalized not in ("", "all", "全部") else None
     # 默认限定为当前线程，确保用户只看到自己的提醒
-    tid = thread_id or _current_thread_id
+    tid = thread_id or (ctx.thread_id if ctx else None)
     tasks = TaskManager(db).list_all(effective, tid or None)
     return [{"id": t.id, "task_type": t.task_type, "title": t.title, "status": t.status, "next_check_at": t.next_check_at.isoformat() if t.next_check_at else None} for t in tasks]
 
 
 @_db_handler
-def _handle_cancel_task(db, task_id: str):
+def _handle_cancel_task(db, ctx, task_id: str):
     """按 ID 取消一个任务，同时将关联的 reminder_created 事件标记为 cancelled。
 
     参数:
@@ -310,7 +313,7 @@ def _handle_cancel_task(db, task_id: str):
 
 
 @_db_handler
-def _handle_dismiss_notifications(db):
+def _handle_dismiss_notifications(db, ctx):
     """清除未执行的通知：将待提醒/提醒中/已延时的通知标记为 cancelled。
 
     已确认（confirmed）和已取消（cancelled）的通知不受影响，
@@ -341,7 +344,7 @@ def _handle_dismiss_notifications(db):
 
 
 @_db_handler
-def _handle_show_notifications(db):
+def _handle_show_notifications(db, ctx):
     """显示已触发的通知（notification_created 和 reminder_created 事件）。
 
     返回:
@@ -374,7 +377,7 @@ def _handle_show_notifications(db):
 
 # ── Memory（记忆管理）──
 @_db_handler
-def _handle_remember_or_update(db, content: str, memory_type: str = "fact", memory_key: str = ""):
+def _handle_remember_or_update(db, ctx, content: str, memory_type: str = "fact", memory_key: str = ""):
     """创建或更新记忆，通过 MemoryGate + MemoryWriteService 写入。
 
     流程:
@@ -426,7 +429,8 @@ def _handle_remember_or_update(db, content: str, memory_type: str = "fact", memo
         return {"ok": False, "error": f"Memory gate rejected: {decision.reason}"}
 
     # 通过 write service 写入
-    result = writer.write(decision, content, thread_id=_current_thread_id or "")
+    _require_ctx(ctx, "remember_or_update")
+    result = writer.write(decision, content, run_context=ctx)
     db.flush()
     return {
         "ok": True,
@@ -439,7 +443,7 @@ def _handle_remember_or_update(db, content: str, memory_type: str = "fact", memo
 
 
 @_db_handler
-def _handle_forget_memory(db, memory_id: str = "", reason: str = "", scope: str = "memory_id", target: str = ""):
+def _handle_forget_memory(db, ctx, memory_id: str = "", reason: str = "", scope: str = "memory_id", target: str = ""):
     """遗忘/删除存储的记忆。
 
     支持四种操作模式（由 scope 参数决定）:
@@ -517,14 +521,14 @@ def _handle_forget_memory(db, memory_id: str = "", reason: str = "", scope: str 
 
 
 @_db_handler
-def _handle_run_memory_maintenance(db):
+def _handle_run_memory_maintenance(db, ctx):
     """运行记忆维护扫描，检查并报告记忆健康状况。"""
     from aiive.memory.memory_maintenance import MemoryMaintenance
     return MemoryMaintenance(db).scan()
 
 
 @_db_handler
-def _handle_search_memory(db, query: str = ""):
+def _handle_search_memory(db, ctx, query: str = ""):
     """按内容文本搜索记忆。
 
     空查询返回空结果；使用 list_memories 可列出全部。
@@ -551,7 +555,7 @@ def _handle_search_memory(db, query: str = ""):
 
 
 @_db_handler
-def _handle_list_memories(db):
+def _handle_list_memories(db, ctx):
     """列出所有活跃记忆（无搜索过滤）。
 
     返回:
@@ -567,7 +571,7 @@ def _handle_list_memories(db):
 
 
 # ── File / Safe Delete（文件与安全删除）──
-def _handle_safe_delete(path: str, scope_id: str = "test_artifacts", mode: str = "trash"):
+def _handle_safe_delete(path: str, scope_id: str = "test_artifacts", mode: str = "trash", ctx=None):
     """安全删除文件，仅允许删除已注册 scope 内的文件。
 
     参数:
@@ -583,7 +587,7 @@ def _handle_safe_delete(path: str, scope_id: str = "test_artifacts", mode: str =
     return {"allowed": decision.allowed, "reason": decision.reason, "resolved_path": decision.resolved_path}
 
 
-def _handle_read_text_file(path: str, max_lines: int = 50):
+def _handle_read_text_file(path: str, max_lines: int = 50, ctx=None):
     """读取 ~/Documents 目录下的文本文件（最多 max_lines 行）。
 
     只允许读取 ~/Documents 范围内的文件，拒绝其他路径。
@@ -612,7 +616,7 @@ def _handle_read_text_file(path: str, max_lines: int = 50):
 
 # ── Knowledge（知识库）──
 @_db_handler
-def _handle_ingest_document(db, file_path: str):
+def _handle_ingest_document(db, ctx, file_path: str):
     """将文档导入知识库，同时将原始内容保存到对象存储。
 
     参数:
@@ -635,7 +639,7 @@ def _handle_ingest_document(db, file_path: str):
 
 
 @_db_handler
-def _handle_search_knowledge(db, query: str, limit: int = 5):
+def _handle_search_knowledge(db, ctx, query: str, limit: int = 5):
     """搜索已导入的文档知识。
 
     参数:
@@ -650,7 +654,7 @@ def _handle_search_knowledge(db, query: str, limit: int = 5):
 
 
 # ── MCP 集成 ──
-def _handle_search_mcp(goal: str = ""):
+def _handle_search_mcp(ctx=None, goal: str = ""):
     """根据目标搜索匹配的 MCP 候选服务器。
 
     参数:
@@ -665,7 +669,7 @@ def _handle_search_mcp(goal: str = ""):
 
 
 @_db_handler
-def _handle_install_mcp_sandbox(db, candidate_name: str):
+def _handle_install_mcp_sandbox(db, ctx, candidate_name: str):
     """将 MCP 候选服务器安装到沙箱环境。
 
     流程:
@@ -688,7 +692,7 @@ def _handle_install_mcp_sandbox(db, candidate_name: str):
 
 
 # ── Self-Dev（自进化）──
-def _handle_create_selfdev_plan(goal: str = ""):
+def _handle_create_selfdev_plan(ctx=None, goal: str = ""):
     """生成自进化补丁计划。
 
     参数:
@@ -703,19 +707,19 @@ def _handle_create_selfdev_plan(goal: str = ""):
     return SelfDevPlanner(llm).plan(goal)
 
 
-def _handle_apply_patch_to_inactive_slot():
+def _handle_apply_patch_to_inactive_slot(ctx=None):
     """将补丁应用到非活跃槽位（不影响当前运行版本）。"""
     from aiive.selfdev.patch_executor import PatchExecutor
     return PatchExecutor().apply_to_inactive([])
 
 
-def _handle_promote_slot():
+def _handle_promote_slot(ctx=None):
     """健康检查通过后将非活跃槽位提升为活跃版本。"""
     from aiive.selfdev.promote_rollback import PromoteRollback
     return PromoteRollback().promote()
 
 
-def _handle_rollback_slot():
+def _handle_rollback_slot(ctx=None):
     """回滚到上一个活跃槽位版本。
 
     自动检测当前活跃槽位（A/B），回退到另一个槽位。
@@ -729,14 +733,14 @@ def _handle_rollback_slot():
 
 # ── Rhythm / Attention（节奏/注意力）──
 @_db_handler
-def _handle_query_rhythm(db):
+def _handle_query_rhythm(db, ctx):
     """获取每日节奏摘要。"""
     from aiive.runtime.rhythm_manager import RhythmManager
     return RhythmManager(db).daily_summary()
 
 
 @_db_handler
-def _handle_query_attention(db, thread_id: str = ""):
+def _handle_query_attention(db, ctx, thread_id: str = ""):
     """获取当前注意力状态。"""
     from aiive.runtime.attention_manager import AttentionManager
     return AttentionManager(db).recompute(thread_id, "query")

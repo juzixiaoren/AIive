@@ -416,15 +416,15 @@ class TestLangchainAdapter:
         assert resp is not None
 
 
-class TestAgentLoopNoHardcoding:
-    """验证 agent_loop.py 中不存在硬编码的工具特定逻辑。"""
+class TestAgentGraphNoHardcoding:
+    """验证 agent_graph.py 中不存在硬编码的工具特定逻辑。"""
 
     def test_no_hardcoded_tool_names_in_summarize(self):
-        """AgentLoop 不应包含 if/elif 链的 _summarize_tool_result。"""
+        """AgentGraph 不应包含 if/elif 链的 _summarize_tool_result。"""
         import inspect
-        from aiive.runtime.agent_loop import AgentLoop
+        from aiive.runtime.agent_graph import AgentGraph
 
-        source = inspect.getsource(AgentLoop)
+        source = inspect.getsource(AgentGraph)
         # 这些模式表示硬编码的工具特定逻辑
         forbidden_patterns = [
             'if tool_name == "schedule_reminder"',
@@ -442,7 +442,7 @@ class TestAgentLoopNoHardcoding:
         ]
         for pattern in forbidden_patterns:
             assert pattern not in source, \
-                f"AgentLoop 不应包含: {pattern}"
+                f"AgentGraph 不应包含: {pattern}"
 
     def test_no_must_call_tools_in_action_planner(self):
         """ActionPlanner 不应有 MUST_CALL_TOOLS 或 derive_tool_policy。"""
@@ -466,11 +466,11 @@ class TestNoKeywordClassification:
     """验证不存在基于关键词的分类逻辑。"""
 
     def test_no_keyword_patterns(self):
-        """验证 agent_loop 中无关键词意图分类。"""
+        """验证 agent_graph 中无关键词意图分类。"""
         import inspect
-        from aiive.runtime.agent_loop import AgentLoop
+        from aiive.runtime.agent_graph import AgentGraph
 
-        source = inspect.getsource(AgentLoop)
+        source = inspect.getsource(AgentGraph)
 
         # 这些是用户要求移除的确切模式
         forbidden = [
@@ -485,4 +485,4 @@ class TestNoKeywordClassification:
         ]
         for pattern in forbidden:
             assert pattern not in source, \
-                f"AgentLoop 不应包含关键词分类: {pattern}"
+                f"AgentGraph 不应包含关键词分类: {pattern}"

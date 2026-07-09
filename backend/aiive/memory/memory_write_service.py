@@ -39,7 +39,7 @@ class MemoryWriteService:
         self._store = MemoryStore(db)
         self._logger = EventLogger(db)
 
-    def write(self, decision: MemoryGateDecision, content: str, thread_id: str = "") -> dict:
+    def write(self, decision: MemoryGateDecision, content: str, run_context=None) -> dict:
         """执行 MemoryGate 的准入决策，返回可观察的结果。
 
         根据 decision.decision 的值，分三个分支处理：
@@ -53,13 +53,20 @@ class MemoryWriteService:
         Args:
             decision: MemoryGate 的准入决策结果。
             content: 要写入的记忆内容文本。
-            thread_id: 当前线程 ID，用于事件日志关联（必须为有效的线程 ID）。
+            run_context: RunContext，包含线程 ID 和追踪 ID。缺失时静默丢弃则 fail fast。
 
         Returns:
             包含 written（是否写入）、state（状态）、memory_id 等字段的字典。
+
+        Raises:
+            RuntimeError: run_context 缺失或 thread_id 为空
         """
-        # 防护：空的 thread_id 会违反数据库外键约束
-        tid = thread_id or ""
+        if run_context is None or not run_context.thread_id:
+            raise RuntimeError(
+                "MemoryWriteService.write() 需要有效的 RunContext，"
+                " 但 run_context 为 None 或 thread_id 为空。"
+            )
+        tid = run_context.thread_id
 
         try:
             # 分支 1：拒绝写入

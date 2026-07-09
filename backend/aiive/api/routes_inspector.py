@@ -43,6 +43,7 @@ def get_context_run(trace_id: str, db: Session = Depends(get_db)):
         llm_calls = (
             db.query(LLMCall)
             .filter(LLMCall.trace_id == trace_id)
+            .order_by(LLMCall.created_at.asc())
             .limit(10)
             .all()
         )
@@ -57,7 +58,13 @@ def get_context_run(trace_id: str, db: Session = Depends(get_db)):
                 for s in snapshots
             ],
             "llm_calls": [
-                {"model": c.model, "latency_ms": c.latency_ms}
+                {
+                    "model": c.model,
+                    "latency_ms": c.latency_ms,
+                    "input_preview": c.input_preview,
+                    "output_preview": c.output_preview,
+                    "created_at": c.created_at.isoformat() if c.created_at else None,
+                }
                 for c in llm_calls
             ],
         }

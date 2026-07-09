@@ -141,47 +141,36 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
     };
   }, [threadId]);
 
-  /** 处理提醒操作：发送确认/延时指令给 LLM */
+  /** 处理提醒操作：通过系统指令让 LLM 调用 confirm_reminder / snooze_reminder */
   const handleReminderAction = async (action: "confirm" | "snooze", reminderId: string, delayMin?: number) => {
     setError(null);
     setLoading(true);
     const text = action === "confirm"
-      ? `请调用 confirm_reminder 工具确认提醒，reminder_id: ${reminderId}`
-      : `请调用 snooze_reminder 工具延时提醒，reminder_id: ${reminderId}，delay_minutes: ${delayMin ?? 5}`;
-    const userMsg: Message = {
-      role: "user", content: text, traceId: "", threadId: threadId ?? "(new)",
-    };
+      ? `[系统指令] 请调用 confirm_reminder 工具，参数 reminder_id="${reminderId}"`
+      : `[系统指令] 请调用 snooze_reminder 工具，参数 reminder_id="${reminderId}"，delay_minutes=${delayMin ?? 5}`;
+    // 不添加用户消息到聊天列表，作为系统指令隐藏发送
     const placeholderMsg: Message = {
       role: "agent", content: "", traceId: "", threadId: threadId ?? "",
       actionCards: [],
     };
-    setMessages(prev => [...prev, userMsg, placeholderMsg]);
+    setMessages(prev => [...prev, placeholderMsg]);
     try {
-      const result = await sendMessageStream(
-        text, threadId,
-        (token) => {
-          setMessages(prev => {
-            const updated = [...prev];
-            for (let i = updated.length - 1; i >= 0; i--) {
-              if (updated[i].role === "agent" && updated[i].traceId === "") {
-                updated[i] = { ...updated[i], content: updated[i].content + token };
-                return updated;
-              }
-            }
-            return updated;
-          });
-        },
-        () => {}, () => {}, () => {}, (msg) => { setError(msg); },
-      );
+      const res = await fetch("/api/chat/system", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: text, thread_id: threadId }),
+      });
+      const result = await res.json();
       setMessages(prev => {
         const updated = [...prev];
         for (let i = updated.length - 1; i >= 0; i--) {
           if (updated[i].role === "agent" && updated[i].traceId === "") {
             updated[i] = {
               ...updated[i],
+              content: result.reply || "",
               traceId: result.trace_id,
               threadId: result.thread_id,
-              actionCards: result.action_cards,
+              actionCards: result.action_cards || [],
             };
             break;
           }
@@ -313,8 +302,10 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
       });
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "未知错误");
-      // 发生错误时移除占位消息
-      setMessages((prev) => prev.filter((_m, i) => i !== placeholderIdx));
+      // 发生错误时移除占位消息（按特征匹配，避免索引漂移）
+      setMessages((prev) => prev.filter(
+        (m) => !(m.role === "agent" && m.traceId === "" && m.content === "")
+      ));
     } finally {
       setLoading(false);
     }

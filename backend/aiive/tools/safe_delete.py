@@ -58,17 +58,19 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
 
 
 def _build_default_registry() -> SafeDeleteScopeRegistry:
-    """构建默认的范围注册表，注册测试相关的安全范围。
+    """构建默认的范围注册表，注册安全的删除范围。
 
-    默认注册三个范围：
+    默认注册四个范围：
     - test_sandbox: 测试沙箱目录
     - test_artifacts: 测试产物目录
     - inactive_slot_placeholder: 非活跃槽占位目录
+    - object_store: 对象存储目录
     """
     registry = SafeDeleteScopeRegistry()
     registry.register("test_sandbox", REPO_ROOT / "tests" / "artifacts")
     registry.register("test_artifacts", REPO_ROOT / "tests" / "artifacts")
     registry.register("inactive_slot_placeholder", REPO_ROOT / "tests" / "artifacts" / "slot_placeholder")
+    registry.register("object_store", REPO_ROOT / ".data" / "object_store")
     return registry
 
 

@@ -25,7 +25,7 @@ from sqlalchemy.pool import NullPool
 from aiive.core.action_planner import AgentDecision
 from aiive.core.llm_client import FakeLLMClient
 from aiive.db.models import Base, Event, Task, Thread
-from aiive.runtime.agent_loop import AgentLoop
+from aiive.runtime.agent_graph import AgentGraph
 from aiive.runtime.event_logger import EventLogger as _RealEventLogger
 from aiive.tools.registry import get_tool_registry
 
@@ -90,7 +90,7 @@ def app_db():
     tmp = tempfile.mkdtemp()
     db_path = Path(tmp) / "test.db"
     # NullPool：每个 session 获得独立连接，因此工具处理器的
-    # SessionLocal() 提交独立于 AgentLoop session 并实际持久化
+    # SessionLocal() 提交独立于 AgentGraph session 并实际持久化
     # （默认的 SingletonThreadPool 会共享一个连接，在开放事务下提交将失败）。
     engine = create_engine(
         f"sqlite:///{db_path}",
@@ -133,13 +133,13 @@ def _run(app_db, message, decision, thread_id="thread-mustcall"):
     _ensure_thread(app_db, thread_id)
     fake_planner = MagicMock()
     fake_planner.plan.return_value = decision
-    with patch("aiive.runtime.agent_loop.ActionPlanner", return_value=fake_planner), patch(
-        "aiive.runtime.agent_loop.OutboxWorker"
-    ), patch("aiive.runtime.agent_loop.register_all"), patch(
-        "aiive.runtime.agent_loop.EventLogger", _CommittingEventLogger
+    with patch("aiive.runtime.agent_graph.ActionPlanner", return_value=fake_planner), patch(
+        "aiive.runtime.agent_graph.OutboxWorker"
+    ), patch("aiive.runtime.agent_graph.register_all"), patch(
+        "aiive.runtime.agent_graph.EventLogger", _CommittingEventLogger
     ):
-        loop = AgentLoop(FakeLLMClient(), app_db)
-        return loop.run(message, thread_id=thread_id)
+        graph = AgentGraph(FakeLLMClient(), app_db)
+        return graph.run(message, thread_id=thread_id)
 
 
 # ---------------------------------------------------------------------------
@@ -287,13 +287,13 @@ class TestNoRawToolCallLeak:
         llm = FakeLLMClient(fixed_content="I tried </tool_cost> but it failed.")
         fake_planner = MagicMock()
         fake_planner.plan.return_value = decision
-        with patch("aiive.runtime.agent_loop.ActionPlanner", return_value=fake_planner), patch(
-            "aiive.runtime.agent_loop.OutboxWorker"
-        ), patch("aiive.runtime.agent_loop.register_all"), patch(
-            "aiive.runtime.agent_loop.EventLogger", _CommittingEventLogger
+        with patch("aiive.runtime.agent_graph.ActionPlanner", return_value=fake_planner), patch(
+            "aiive.runtime.agent_graph.OutboxWorker"
+        ), patch("aiive.runtime.agent_graph.register_all"), patch(
+            "aiive.runtime.agent_graph.EventLogger", _CommittingEventLogger
         ):
-            loop = AgentLoop(llm, app_db)
-            result = loop.run("test", thread_id="thread-leak")
+            graph = AgentGraph(llm, app_db)
+            result = graph.run("test", thread_id="thread-leak")
         assert "<tool_call>" not in result["reply"]
         assert "</tool_cost>" not in result["reply"]
         assert len(result["parse_errors"]) > 0

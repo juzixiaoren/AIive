@@ -167,25 +167,26 @@ class ToolRegistry:
         capability_id: str,
         params: dict[str, Any],
         instruction_source: str,
+        run_context=None,
     ) -> dict[str, Any]:
         """执行工具调用，包含两道安全守卫。
 
         守卫 1: 检查指令来源是否被授权
         守卫 2: 检查是否需要用户确认（需要时直接拒绝，等待确认后再调用）
 
-        参数:
+        Args:
             capability_id: 工具能力标识符
             params: 调用参数
             instruction_source: 指令来源（如 trusted_user_command）
+            run_context: 运行时上下文（RunContext），注入到 handler 的 ctx 参数
 
-        返回:
+        Returns:
             包含 ok、result（或 error/approval_required）的字典
         """
         reg = self.get(capability_id)
         if not reg:
             return {"ok": False, "error": f"Unknown tool: {capability_id}"}
 
-        # 机械守卫 1：指令来源检查
         if instruction_source not in reg.safety.allowed_instruction_sources:
             return {
                 "ok": False,
@@ -194,7 +195,6 @@ class ToolRegistry:
                 "allowed": reg.safety.allowed_instruction_sources,
             }
 
-        # 机械守卫 2：确认要求检查
         if reg.safety.requires_confirmation:
             return {
                 "ok": False,
@@ -204,7 +204,7 @@ class ToolRegistry:
             }
 
         try:
-            result = reg.handler(**params)
+            result = reg.handler(ctx=run_context, **params)
             return {"ok": True, "result": result}
         except Exception as e:
             logger.exception("工具执行失败: capability_id=%s params=%s", capability_id, params)
