@@ -59,6 +59,32 @@ class ToolRegistry:
             for r in self._tools.values()
         ]
 
+    def render_tool_schemas(self) -> str:
+        """Generate tool schema text for injection into the system prompt.
+
+        Each tool is rendered with its name, params, description, risk_level,
+        side_effect flag, and requires_confirmation flag.
+        """
+        lines = ["## Tools"]
+        for i, reg in enumerate(self._tools.values(), 1):
+            safety = reg.safety
+            params = reg.parameters
+            param_str = ", ".join(f"{k}: {v}" for k, v in params.items()) if params else ""
+            lines.append(f"{i}. {safety.capability_id}({param_str})")
+            lines.append(f"   {reg.description}")
+            side_effect = safety.writes_external_world or safety.can_delete
+            flags = []
+            flags.append(f"risk: {safety.risk_level}")
+            if side_effect:
+                flags.append("side_effect: true")
+            else:
+                flags.append("side_effect: false")
+            if safety.requires_confirmation:
+                flags.append("requires_confirmation: true")
+            lines.append(f"   [{', '.join(flags)}]")
+            lines.append("")
+        return "\n".join(lines)
+
     def execute(
         self,
         capability_id: str,

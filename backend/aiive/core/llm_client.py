@@ -1,3 +1,4 @@
+import json
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -113,6 +114,81 @@ class LLMClient:
         except Exception as e:
             raise LLMClientError(
                 message=f"LLM request failed: {e}",
+                status_code=None,
+                trace_id=trace_id,
+            )
+
+
+    def chat_stream(
+        self,
+        messages: Sequence[dict[str, Any]],
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        timeout: Optional[int] = None,
+        trace_id: Optional[str] = None,
+    ):
+        """Stream chat completions. Yields text chunks."""
+        if trace_id is None:
+            trace_id = str(uuid.uuid4())
+
+        model = model or self._default_model
+        timeout_s = timeout or self._timeout_seconds
+
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": list(messages),
+            "stream": True,
+        }
+        if temperature is not None:
+            payload["temperature"] = temperature
+
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+
+        url = f"{self._base_url}/chat/completions"
+
+        try:
+            with httpx.stream(
+                "POST",
+                url,
+                json=payload,
+                headers=headers,
+                timeout=httpx.Timeout(timeout_s, connect=10.0),
+            ) as response:
+                if response.status_code != 200:
+                    raise LLMClientError(
+                        message=f"LLM API error: {response.status_code} - {response.text[:500]}",
+                        status_code=response.status_code,
+                        trace_id=trace_id,
+                    )
+                for line in response.iter_lines():
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(data_str)
+                        except Exception:
+                            continue
+                        choices = data.get("choices", [])
+                        if choices:
+                            delta = choices[0].get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                yield content
+        except httpx.TimeoutException:
+            raise LLMClientError(
+                message=f"LLM request timed out after {timeout_s}s",
+                status_code=None,
+                trace_id=trace_id,
+            )
+        except LLMClientError:
+            raise
+        except Exception as e:
+            raise LLMClientError(
+                message=f"LLM stream failed: {e}",
                 status_code=None,
                 trace_id=trace_id,
             )
