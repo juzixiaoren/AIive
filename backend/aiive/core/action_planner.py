@@ -6,7 +6,6 @@
 - 不做确定性分发逻辑——工具调用由 LLM 通过原生 tool_calls 决定
 """
 
-import json as _json
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -55,13 +54,12 @@ class ActionPlanner:
         参数:
             llm_client: LLM 客户端实例，留作后续可能的使用
         """
-        self._llm = llm_client
+        self._llm: LLMClient = llm_client
 
     def plan(
         self,
-        *,
         user_message: str,
-        runtime_identity: dict[str, str] | None = None,
+        _runtime_identity: dict[str, str] | None = None,
         tool_schemas_text: str = "",
         trace_id: str | None = None,
     ) -> AgentDecision:
@@ -76,12 +74,16 @@ class ActionPlanner:
         返回值:
             AgentDecision: 包含意图类型和执行模式的决策对象
         """
-        # 简单启发式：如果没有工具 schema，视为普通对话
+        # 简单启发式：没有可用工具 schema 时，直接视为普通对话（仅用于日志追踪）
+        intent_type = "normal_chat" if not tool_schemas_text else "tool_bound_chat"
         return AgentDecision(
             decision_type="final_response",
             execution_mode="explain_only",
-            intent_type="normal_chat",
+            intent_type=intent_type,
             should_execute=False,
             tool_name=None,
-            reason="Intent extraction deferred to LLM native tool_calls",
+            reason=(
+                "Intent extraction deferred to LLM native tool_calls "
+                f"(trace_id={trace_id}, user_message={user_message[:50]!r})"
+            ),
         )

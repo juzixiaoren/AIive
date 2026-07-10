@@ -6,6 +6,7 @@ is the responsibility of IntentClassifier and MemoryExtractor, NOT MemoryGate.
 """
 
 from dataclasses import dataclass, field
+from typing import Any
 
 # Ordered by priority: single-key means at most one active record with this key
 SINGLE_KEY_KEYS = frozenset({
@@ -79,7 +80,7 @@ class MemoryGateInput:
     extracted_memory_type: str | None = None
     extracted_memory_key: str | None = None
     confidence: float = 0.5
-    existing_memory: dict | None = None
+    existing_memory: dict[str, Any] | None = None
     trace_id: str = ""
     source_event_id: str = ""
 
@@ -126,7 +127,7 @@ class MemoryKeyResolver:
 
     @staticmethod
     def resolve(memory_type_hint: str | None, memory_key_hint: str | None,
-                content: str) -> str | None:
+                _content: str) -> str | None:
         """根据记忆类型提示和键提示解析出最终的 memory_key。
 
         Args:
@@ -162,7 +163,7 @@ class MemoryGate:
     """记忆准入策略：仅基于结构化输入做决策，不使用 NLP 或关键词。"""
 
     def __init__(self):
-        self._key_resolver = MemoryKeyResolver()
+        self._key_resolver: MemoryKeyResolver = MemoryKeyResolver()
 
     # pylint: disable=too-many-return-statements,too-many-branches
     def decide(self, inp: MemoryGateInput) -> MemoryGateDecision:

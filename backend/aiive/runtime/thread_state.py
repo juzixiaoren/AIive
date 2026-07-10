@@ -5,7 +5,7 @@
 为 Agent 提供对话上下文。
 """
 import uuid
-from typing import Optional
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -19,7 +19,7 @@ class ThreadState:
         _db: SQLAlchemy 数据库会话
     """
     def __init__(self, db: Session):
-        self._db = db
+        self._db: Session = db
 
     def get_or_create_thread(self, thread_id: str | None = None) -> Thread:
         """获取或创建会话线程。
@@ -43,7 +43,7 @@ class ThreadState:
         self._db.flush()
         return thread
 
-    def get_recent_messages(self, thread_id: str, limit: int = 20) -> list[dict]:
+    def get_recent_messages(self, thread_id: str, limit: int = 20) -> list[dict[str, Any]]:
         """获取线程的最近消息历史。
 
         从 Event 表中查询最近的 user_message 和 llm_response 事件，
@@ -67,7 +67,7 @@ class ThreadState:
             .all()
         )
 
-        messages: list[dict] = []
+        messages: list[dict[str, Any]] = []
         for event in events:
             role = "user" if event.event_type == "user_message" else "assistant"
             p = event.payload or {}

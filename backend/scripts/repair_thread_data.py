@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from aiive.db.base import SessionLocal
-from aiive.db.models import Task, Event, Memory
+from aiive.db.models import Task, Event, MemoryRecord
 from aiive.runtime.thread_bootstrap import ThreadBootstrapService
 
 
@@ -60,7 +60,7 @@ def check_memory_without_event():
     """检测记忆记录是否有对应的事件。"""
     db = SessionLocal()
     try:
-        memories = db.query(Memory).filter(Memory.lifecycle_state == "active").all()
+        memories = db.query(MemoryRecord).filter(MemoryRecord.lifecycle_state == "active").all()
         missing = []
         for m in memories:
             event = db.query(Event).filter(

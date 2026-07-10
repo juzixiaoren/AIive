@@ -6,9 +6,10 @@ Qdrant 向量索引模块。
 """
 
 import logging
+import operator
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any
 
 from aiive.knowledge.embedding_client import EMBEDDING_DIM, EmbeddingClient, FakeEmbeddingClient
 
@@ -20,7 +21,7 @@ class QdrantPoint:
     """Qdrant 向量点，包含唯一标识、向量和负载数据。"""
     id: str
     vector: list[float]
-    payload: dict = field(default_factory=dict)
+    payload: dict[str, Any] = field(default_factory=dict)
 
 
 class QdrantClient:
@@ -32,12 +33,14 @@ class QdrantClient:
     """
 
     def __init__(self, host: str = "localhost", port: int = 6333):
-        self._host = host
-        self._port = port
+        self._host: str = host
+        self._port: int = port
         self._collections: dict[str, dict[str, QdrantPoint]] = {}  # 内存中的集合存储
+        self._vector_sizes: dict[str, int] = {}
 
     def create_collection(self, name: str, vector_size: int) -> None:
         """创建指定名称和向量维度的集合。"""
+        self._vector_sizes[name] = vector_size
         self._collections[name] = {}
 
     def delete_collection(self, name: str) -> None:
@@ -72,7 +75,7 @@ class QdrantClient:
             score = _cosine_similarity(query_vector, point.vector)
             results.append((score, point))
         # 按相似度降序排列
-        results.sort(key=lambda x: x[0], reverse=True)
+        results.sort(key=operator.itemgetter(0), reverse=True)
         return [r[1] for r in results[:limit]]
 
 
@@ -109,15 +112,15 @@ class QdrantIndexer:
             qdrant: Qdrant 客户端实例，默认使用内存版。
             embedding: 嵌入客户端实例，默认使用伪实现。
         """
-        self._qdrant = qdrant or QdrantClient()
-        self._embedding = embedding or FakeEmbeddingClient()
-        self._collection = "kb_docs"  # 默认知识库集合名
+        self._qdrant: QdrantClient = qdrant or QdrantClient()
+        self._embedding: EmbeddingClient = embedding or FakeEmbeddingClient()
+        self._collection: str = "kb_docs"  # 默认知识库集合名
 
     def ensure_collection(self) -> None:
         """确保目标集合已创建。"""
         self._qdrant.create_collection(self._collection, EMBEDDING_DIM)
 
-    def index_chunks(self, chunks: list[dict]) -> int:
+    def index_chunks(self, chunks: list[dict[str, Any]]) -> int:
         """
         将文本块列表向量化后写入 Qdrant。
 
@@ -131,7 +134,7 @@ class QdrantIndexer:
         vectors = self._embedding.embed(texts)
 
         points = []
-        for i, (chunk, vec) in enumerate(zip(chunks, vectors)):
+        for chunk, vec in zip(chunks, vectors):
             points.append(QdrantPoint(
                 id=chunk.get("chunk_id", chunk.get("id", str(uuid.uuid4()))),
                 vector=vec,
@@ -159,7 +162,7 @@ class QdrantIndexer:
         query_vec = self._embedding.embed([query])[0]
         return self._qdrant.search(self._collection, query_vec, limit)
 
-    def rebuild_from_db(self, chunks: list[dict]) -> None:
+    def rebuild_from_db(self, chunks: list[dict[str, Any]]) -> None:
         """从数据库块数据重建向量索引。"""
         self.ensure_collection()
         self.index_chunks(chunks)

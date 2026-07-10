@@ -1,3 +1,54 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/*
+ * 语义颜色令牌（light / dark）
+ * - 所有组件颜色都引用这里的 CSS 变量，切换主题只需改 [data-theme]。
+ * - light 为当前主用主题；dark 暂复用亮色变量，待后续补充暗色调色板。
+ */
+:root,
+[data-theme="light"] {
+  --color-bg: #f8fafc;            /* 主背景（slate-50） */
+  --color-surface: #ffffff;       /* 卡片 / 气泡 / 输入框（white） */
+  --color-surface-muted: #f1f5f9; /* 次级底色（slate-100） */
+  --color-content: #1e293b;       /* 主文字（slate-800） */
+  --color-title: #334155;         /* 标题文字（slate-700） */
+  --color-muted: #64748b;         /* 次要文字（slate-500） */
+  --color-faint: #94a3b8;         /* 弱化提示（slate-400） */
+  --color-subtle: #cbd5e1;        /* 极弱分隔 / 图标（slate-300） */
+  --color-divider: #e2e8f0;       /* 边框 / 分割线（slate-200） */
+  --color-code: #475569;          /* 代码 / 预格式化（slate-600） */
+
+  --color-primary: #3b82f6;       /* 主题色（blue-500） */
+  --color-primary-hover: #2563eb; /* 主题色 hover（blue-600） */
+  --color-primary-soft: #eff6ff;  /* 主题色浅底（blue-50） */
+  --color-primary-border: #bfdbfe;/* 主题色描边（blue-200） */
+  --color-primary-ring: #93c5fd;  /* 主题色 spinner / ring（blue-300） */
+  --color-on-primary: #ffffff;    /* 主题色之上的反白文字 */
+
+  --color-danger: #ef4444;        /* 危险（red-500） */
+  --color-danger-hover: #dc2626;  /* 危险 hover（red-600） */
+  --color-danger-soft: #fef2f2;   /* 危险浅底（red-50） */
+  --color-danger-border: #fecaca; /* 危险描边（red-200） */
+  --color-danger-text: #dc2626;   /* 危险文字（red-600/700） */
+
+  --color-success: #10b981;       /* 成功（emerald-500） */
+  --color-success-soft: #ecfdf5;  /* 成功浅底（emerald-50） */
+  --color-success-border: #a7f3d0;/* 成功描边（emerald-200） */
+  --color-success-text: #059669;  /* 成功文字（emerald-600/700） */
+
+  --color-warning: #d97706;       /* 警告（amber-600） */
+  --color-warning-soft: #fffbeb;  /* 警告浅底（amber-50） */
+  --color-warning-border: #fde68a;/* 警告描边（amber-200） */
+  --color-warning-text: #b45309;  /* 警告文字（amber-700/800） */
+
+  --color-accent: #a855f7;        /* 强调（purple-500） */
+  --color-accent-soft: #faf5ff;   /* 强调浅底（purple-50） */
+  --color-accent-border: #e9d5ff; /* 强调描边（purple-200） */
+  --color-accent-text: #9333ea;   /* 强调文字（purple-600/700） */
+}
+
+/* TODO: 暗色令牌待补充；当前暂复用亮色变量，切换 data-theme="dark" 不会 visibly 变化。 */
+[data-theme="dark"] {
+}

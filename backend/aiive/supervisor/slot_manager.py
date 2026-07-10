@@ -11,9 +11,9 @@ import json
 import logging
 
 logger = logging.getLogger(__name__)
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 # 槽位根目录
 SLOTS_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent / "slots"
@@ -29,7 +29,7 @@ class SlotInfo:
     name: str  # 槽位名称："A" 或 "B"
     root: Path  # 槽位根目录
     active: bool  # 是否为当前活跃槽位
-    manifest: dict = field(default_factory=dict)  # 版本 manifest 内容
+    manifest: dict[str, Any] = field(default_factory=dict)  # 版本 manifest 内容
     manifest_checksum: str = ""  # manifest 的 SHA-256 校验和（前16位）
 
 
@@ -43,8 +43,8 @@ class SlotManager:
         参数:
             base_dir: 槽位基础目录，默认使用 SLOTS_ROOT。
         """
-        self._base_dir = base_dir or SLOTS_ROOT
-        self._active_file = base_dir.parent / "runtime" / "active_slot" if base_dir else ACTIVE_SLOT_FILE
+        self._base_dir: Path = base_dir or SLOTS_ROOT
+        self._active_file: Path = base_dir.parent / "runtime" / "active_slot" if base_dir else ACTIVE_SLOT_FILE
 
     def get_active_slot(self) -> str:
         """
@@ -111,7 +111,7 @@ class SlotManager:
 
         self.set_active_slot("A")
 
-    def _read_manifest(self, slot_root: Path) -> dict:
+    def _read_manifest(self, slot_root: Path) -> dict[str, Any]:
         """
         读取槽位的 version_manifest.json。
 
@@ -127,7 +127,7 @@ class SlotManager:
         return {}
 
 
-def _compute_manifest_checksum(manifest: dict) -> str:
+def _compute_manifest_checksum(manifest: dict[str, Any]) -> str:
     """
     计算 manifest 的 SHA-256 校验和。
 
@@ -141,7 +141,7 @@ def _compute_manifest_checksum(manifest: dict) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-def create_version_manifest(slot: str, version: str = "0.1.0") -> dict:
+def create_version_manifest(slot: str, version: str = "0.1.0") -> dict[str, Any]:
     """
     创建新的版本 manifest 字典。
 

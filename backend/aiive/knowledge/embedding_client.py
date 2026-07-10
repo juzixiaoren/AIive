@@ -8,7 +8,7 @@
 
 import hashlib
 from abc import ABC, abstractmethod
-from typing import Sequence
+from typing import override
 
 EMBEDDING_DIM = 384  # 向量维度
 
@@ -38,6 +38,7 @@ class FakeEmbeddingClient(EmbeddingClient):
     生产环境必须使用真实的嵌入服务（如 OpenAI text-embedding-3-small）。
     """
 
+    @override
     def embed(self, texts: list[str]) -> list[list[float]]:
         """
         使用 SHA-256 哈希为每个文本生成确定性伪向量。

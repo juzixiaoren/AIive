@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from aiive.db.models import Event, LLMCall
+from typing import Any
 
 
 class EventLogger:
@@ -19,14 +20,14 @@ class EventLogger:
         _db: SQLAlchemy 数据库会话
     """
     def __init__(self, db: Session):
-        self._db = db
+        self._db: Session = db
 
     def log_event(
         self,
         trace_id: str,
         thread_id: str,
         event_type: str,
-        payload: dict | None = None,
+        payload: dict[str, Any] | None = None,
     ) -> Event:
         """记录一条通用运行时事件。
 

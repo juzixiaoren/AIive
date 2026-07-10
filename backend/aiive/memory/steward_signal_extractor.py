@@ -15,7 +15,7 @@
 
 import json
 import logging
-from typing import Sequence
+from typing import Any
 
 from json_repair import repair_json
 
@@ -59,11 +59,11 @@ class StewardSignalExtractor:
         Args:
             llm_client: LLM 客户端实例。
         """
-        self._llm_client = llm_client
+        self._llm_client: LLMClient = llm_client
 
     def extract(
-        self, user_message: str, reply: str, trace_id: str | None = None
-    ) -> list[dict]:
+        self, user_message: str, reply: str,         trace_id: str | None = None
+    ) -> list[dict[str, Any]]:
         """从用户消息和助手回复中提取管家信号。
 
         Args:
@@ -87,7 +87,7 @@ class StewardSignalExtractor:
             raise
         return self._parse(response.content)
 
-    def _parse(self, raw: str) -> list[dict]:
+    def _parse(self, raw: str) -> list[dict[str, Any]]:
         """解析 LLM 原始输出为信号字典列表。
 
         处理 markdown 代码块包装，并过滤出合法的信号类型。

@@ -4,8 +4,8 @@ MCP 运行时客户端：模拟 MCP（Model Context Protocol）运行环境，�
 """
 import logging
 
-from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from dataclasses import dataclass
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 

@@ -5,7 +5,7 @@
 """
 
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Any, Callable
 
 from sqlalchemy.orm import Session
 
@@ -30,10 +30,10 @@ class OutboxWorker:
         参数:
             db_session_factory: 数据库会话工厂函数
         """
-        self._factory = db_session_factory
-        self._handlers: dict[str, Callable] = {}
+        self._factory: Callable[[], Session] = db_session_factory
+        self._handlers: dict[str, Callable[..., Any]] = {}
 
-    def register_handler(self, job_type: str, handler: Callable) -> None:
+    def register_handler(self, job_type: str, handler: Callable[..., Any]) -> None:
         """注册一个作业类型的处理函数。
 
         参数:
@@ -43,7 +43,7 @@ class OutboxWorker:
         self._handlers[job_type] = handler
 
     def enqueue(
-        self, db: Session, job_type: str, payload: dict,
+        self, db: Session, job_type: str, payload: dict[str, Any],
         trace_id: str | None = None, operation_id: str | None = None,
     ) -> OutboxJob:
         """将新作业加入发件箱队列。

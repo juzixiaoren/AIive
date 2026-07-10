@@ -10,7 +10,8 @@
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -21,11 +22,7 @@ class HealthResult:
     healthy: bool  # 是否健康
     slot: str  # 槽位名称
     message: str = ""  # 健康状态描述
-    checks: list[dict] = None  # 各项检查详情
-
-    def __post_init__(self):
-        if self.checks is None:
-            self.checks = []
+    checks: list[dict[str, Any]] = field(default_factory=list)  # 各项检查详情
 
 
 class HealthProbe:
@@ -42,7 +39,7 @@ class HealthProbe:
         返回:
             HealthResult 包含 healthy、slot、message 和 checks 详情。
         """
-        checks: list[dict] = []
+        checks: list[dict[str, Any]] = []
         healthy = True
 
         # 检查 1：manifest 文件是否存在

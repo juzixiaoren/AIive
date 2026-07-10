@@ -7,16 +7,16 @@
 """
 
 import logging
-import os
 import subprocess
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 # 源代码目录 → 测试文件映射表
 # 当某目录下的文件发生变更时，自动运行对应的测试文件
 TEST_MAPPING = {
-    "backend/aiive/core/": ["tests/unit/backend/test_llm_client.py", "tests/unit/backend/test_context_builder.py"],
+    "backend/aiive/core/": ["tests/unit/backend/test_agent_graph.py", "tests/unit/backend/test_identity_memory.py"],
     "backend/aiive/memory/": ["tests/unit/backend/test_memory_store.py", "tests/unit/backend/test_memory_gate.py", "tests/unit/backend/test_memory_extractor.py", "tests/unit/backend/test_memory_types.py", "tests/unit/backend/test_steward_signal_extractor.py"],
     "backend/aiive/tools/": ["tests/unit/backend/test_tool_registry.py", "tests/unit/backend/test_permission_manager.py", "tests/unit/backend/test_safe_delete.py"],
     "backend/aiive/mcp/": ["tests/unit/backend/test_mcp_discovery.py", "tests/unit/backend/test_mcp_installer.py", "tests/unit/backend/test_mcp_runtime_client.py"],
@@ -36,11 +36,11 @@ class TargetedTestRunner:
         参数:
             repo_root: 项目根目录路径，默认从当前文件向上推导。
         """
-        self._repo_root = repo_root or Path(__file__).resolve().parent.parent.parent.parent.parent
+        self._repo_root: Path = repo_root or Path(__file__).resolve().parent.parent.parent.parent.parent
 
     def run_for_changed_files(
         self, changed_files: list[str], artifact_dir: Path | None = None
-    ) -> dict:
+    ) -> dict[str, Any]:
         """
         根据变更文件列表，选择并运行相关的单元测试。
 
@@ -74,7 +74,7 @@ class TargetedTestRunner:
                     selected.update(test_files)
         return sorted(selected)
 
-    def _run_tests(self, test_files: list[str], artifact_dir: Path | None) -> dict:
+    def _run_tests(self, test_files: list[str], artifact_dir: Path | None) -> dict[str, Any]:
         """
         执行指定的测试文件列表，收集结果。
 

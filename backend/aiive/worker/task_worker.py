@@ -5,6 +5,7 @@
 
 import logging
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 from sqlalchemy.orm import Session
 
@@ -12,6 +13,10 @@ from aiive.db.base import SessionLocal
 from aiive.runtime.event_logger import EventLogger
 from aiive.runtime.task_manager import TaskManager
 from aiive.runtime.thread_bootstrap import ThreadBootstrapService
+from typing import Any
+
+if TYPE_CHECKING:
+    from aiive.db.models import Task
 
 logger = logging.getLogger(__name__)
 
@@ -32,9 +37,9 @@ class TaskWorker:
         参数:
             db: 数据库会话
         """
-        self._db = db
+        self._db: Session = db
 
-    def poll_and_notify(self) -> list[dict]:
+    def poll_and_notify(self) -> list[dict[str, Any]]:
         """轮询到期任务并触发通知。
 
         对于每个到期的提醒：
@@ -74,8 +79,8 @@ class TaskWorker:
                     )
                     continue
 
-                logger = EventLogger(self._db)
-                logger.log_event(
+                event_logger = EventLogger(self._db)
+                event_logger.log_event(
                     trace_id=task.id,
                     thread_id=target_thread_id,
                     event_type="reminder_triggered",
@@ -99,7 +104,7 @@ class TaskWorker:
         self._db.commit()
         return results
 
-    def _wake_agent_for_reminder(self, task, target_thread_id: str):
+    def _wake_agent_for_reminder(self, task: Task, target_thread_id: str):
         """调用 Agent Loop 处理提醒，让 Agent 在对话线程中主动回复。
 
         构造系统提示词，要求 Agent 先调用 remind_alert 工具激活提醒，
@@ -111,7 +116,7 @@ class TaskWorker:
         """
         try:
             from aiive.core.llm_client import default_llm_client
-            from aiive.runtime.agent_graph import AgentGraph
+            from aiive.runtime.agent_graph import AgentGraph, RuntimeEvent  # 延迟导入避免与 agent_graph 的循环依赖（运行时安全）
             from aiive.runtime.thread_bootstrap import ThreadBootstrapService
             from aiive.db.models import Event
             # 确保目标 thread 已 committed，使 AgentGraph 内工具 handler 可通过 FK 校验
@@ -131,16 +136,15 @@ class TaskWorker:
             reminder_id = reminder_event.id if reminder_event else ""
 
             graph = AgentGraph(client, self._db)
-            prompt = (
-                f"[System Reminder — You MUST call the remind_alert tool with the reminder_id below. "
-                f"Do NOT just say '好的' or confirm receipt. "
-                f"Call remind_alert first, then deliver the reminder naturally.]\n\n"
-                f"A scheduled reminder is now due: \"{task.title}\".\n"
-                f"reminder_id: {reminder_id}\n\n"
-                f"First call remind_alert(reminder_id=\"{reminder_id}\") to activate the alert, "
-                f"then inform the user naturally."
+            # 以结构化 RuntimeEvent 进入图（system 角色渲染），而非伪造 human 消息
+            event = RuntimeEvent(
+                event_type="reminder",
+                reminder_id=reminder_id,
+                content=task.title,
+                required_backend_action="remind_alert",
+                source="scheduler",
             )
-            result = graph.run(message=prompt, thread_id=target_thread_id)
+            result = graph.run_runtime_event(event, target_thread_id)
             reply_text = result.get("reply", "")
             logger.info(
                 "提醒 Agent 唤醒成功: task_id=%s title=%s thread_id=%s",

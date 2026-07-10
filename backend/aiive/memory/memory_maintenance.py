@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from aiive.db.models import ForgetRequest, MemoryRecord
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -32,9 +33,9 @@ class MemoryMaintenance:
         Args:
             db: 数据库会话。
         """
-        self._db = db
+        self._db: Session = db
 
-    def forget(self, memory_id: str, reason: str = "") -> dict:
+    def forget(self, memory_id: str, reason: str = "") -> dict[str, Any]:
         """永久删除（遗忘）指定记忆。
 
         将记忆状态设为 forgotten，用墓碑值替换内容，并创建 ForgetRequest 审计记录。
@@ -70,7 +71,7 @@ class MemoryMaintenance:
             logger.exception("记忆遗忘操作失败: memory_id=%s", memory_id)
             raise
 
-    def sleep(self, memory_id: str) -> dict:
+    def sleep(self, memory_id: str) -> dict[str, Any]:
         """将指定记忆设为休眠状态。
 
         休眠的记忆暂时不参与上下文构建，但不会被删除。
@@ -94,7 +95,7 @@ class MemoryMaintenance:
             logger.exception("记忆休眠操作失败: memory_id=%s", memory_id)
             raise
 
-    def archive(self, memory_id: str) -> dict:
+    def archive(self, memory_id: str) -> dict[str, Any]:
         """将指定记忆归档。
 
         归档的记忆表示长期不需要，可在清理策略中被正式删除。
@@ -115,7 +116,7 @@ class MemoryMaintenance:
             logger.exception("记忆归档操作失败: memory_id=%s", memory_id)
             raise
 
-    def scan(self) -> dict:
+    def scan(self) -> dict[str, Any]:
         """扫描所有活跃和候选记忆，找出应休眠或归档的记录。
 
         扫描规则：

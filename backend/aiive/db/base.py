@@ -8,6 +8,7 @@ import logging
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
+from collections.abc import Generator
 
 from aiive.config import settings
 
@@ -22,7 +23,7 @@ engine = create_engine(
 SessionLocal = sessionmaker(bind=engine)
 
 
-def get_db() -> Session:
+def get_db() -> Generator[Session, None, None]:
     """FastAPI 依赖注入生成器：为每个请求创建数据库会话并确保请求结束后关闭。"""
     db = SessionLocal()
     try:

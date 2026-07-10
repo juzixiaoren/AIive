@@ -6,6 +6,9 @@ API路由模块：MCP 安装与冒烟测试
 """
 from __future__ import annotations
 
+import logging
+from typing import Any
+
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -14,6 +17,9 @@ from aiive.db.base import get_db
 from aiive.db.models import Capability
 from aiive.mcp.discovery import search_mcp_candidates
 from aiive.mcp.installer import install_sandbox, run_smoke
+from aiive.mcp.runtime_client import MCPRuntimeClient
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/mcp")
 
@@ -28,7 +34,7 @@ class InstallRequest(BaseModel):
 class SmokeRequest(BaseModel):
     """冒烟测试请求体"""
     tool_name: str = Field(...)
-    params: dict = {}
+    params: dict[str, Any] = {}
 
 
 @router.post("/{candidate_name}/install-sandbox")
@@ -89,10 +95,8 @@ def smoke_capability(
     Returns:
         冒烟测试结果
     """
-    from aiive.mcp.runtime_client import MCPRuntimeClient
-
     # 构建一个简单的测试客户端，注册待测工具
-    client = _build_test_client(request.tool_name)
+    client = _build_test_client()
     tool_result = client.call_tool(request.tool_name, request.params)
 
     result = run_smoke(
@@ -141,19 +145,14 @@ def list_installed_capabilities(db: Session = Depends(get_db)):
         raise
 
 
-def _build_test_client(tool_name: str) -> MCPRuntimeClient:
+def _build_test_client() -> MCPRuntimeClient:
     """构建冒烟测试用的 MCP 运行时客户端
 
     预注册内置测试工具（echo、list_files）。
 
-    Args:
-        tool_name: 待测工具名称
-
     Returns:
         已注册工具的 MCPRuntimeClient 实例
     """
-    from aiive.mcp.runtime_client import MCPRuntimeClient
-
     client = MCPRuntimeClient()
 
     # 内置测试工具

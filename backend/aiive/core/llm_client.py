@@ -9,10 +9,11 @@ import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
-from typing import Any, Optional, Sequence
+from collections.abc import Sequence
+from typing import Any, override
 
 import httpx
 
@@ -39,10 +40,10 @@ class LLMResponse:
 
 class LLMClientError(Exception):
     """LLM 客户端异常，携带 HTTP 状态码和追踪 ID 便于排查。"""
-    def __init__(self, message: str, status_code: Optional[int] = None, trace_id: Optional[str] = None):
+    def __init__(self, message: str, status_code: int | None = None, trace_id: str | None = None):
         super().__init__(message)
-        self.status_code = status_code
-        self.trace_id = trace_id
+        self.status_code: int | None = status_code
+        self.trace_id: str | None = trace_id
 
 
 class LLMClient:
@@ -66,18 +67,18 @@ class LLMClient:
             default_model: 默认模型名称
             timeout_seconds: 默认超时时间（秒）
         """
-        self._base_url = base_url.rstrip("/")
-        self._api_key = api_key
-        self._default_model = default_model
-        self._timeout_seconds = timeout_seconds
+        self._base_url: str = base_url.rstrip("/")
+        self._api_key: str = api_key
+        self._default_model: str = default_model
+        self._timeout_seconds: int = timeout_seconds
 
     def chat(
         self,
         messages: Sequence[dict[str, Any]],
-        model: Optional[str] = None,
-        temperature: Optional[float] = None,
-        timeout: Optional[int] = None,
-        trace_id: Optional[str] = None,
+        model: str | None = None,
+        temperature: float | None = None,
+        timeout: int | None = None,
+        trace_id: str | None = None,
     ) -> LLMResponse:
         """发送同步聊天完成请求，返回完整的 LLMResponse。
 
@@ -171,10 +172,10 @@ class LLMClient:
     def chat_stream(
         self,
         messages: Sequence[dict[str, Any]],
-        model: Optional[str] = None,
-        temperature: Optional[float] = None,
-        timeout: Optional[int] = None,
-        trace_id: Optional[str] = None,
+        model: str | None = None,
+        temperature: float | None = None,
+        timeout: int | None = None,
+        trace_id: str | None = None,
     ):
         """流式聊天完成请求，逐块 yield 文本内容。
 
@@ -259,6 +260,22 @@ class LLMClient:
                 trace_id=trace_id,
             )
 
+    @property
+    def default_model(self) -> str:
+        return self._default_model
+
+    @property
+    def api_key(self) -> str:
+        return self._api_key
+
+    @property
+    def base_url(self) -> str:
+        return self._base_url
+
+    @property
+    def timeout_seconds(self) -> int:
+        return self._timeout_seconds
+
 
 def default_llm_client() -> "LLMClient":
     """基于项目配置构架 LLMClient 实例的工厂函数。
@@ -286,7 +303,7 @@ class FakeLLMClient(LLMClient):
         self,
         fixed_content: str = "Hello from FakeLLM",
         fixed_model: str = "fake-model",
-        fixed_usage: Optional[dict[str, int]] = None,
+        fixed_usage: dict[str, int] | None = None,
         latency_ms: float = 10.0,
     ):
         """初始化假 LLM 客户端。
@@ -303,23 +320,24 @@ class FakeLLMClient(LLMClient):
             default_model=fixed_model,
             timeout_seconds=1,
         )
-        self._fixed_content = fixed_content
-        self._fixed_model = fixed_model
-        self._fixed_usage = fixed_usage or {
+        self._fixed_content: str = fixed_content
+        self._fixed_model: str = fixed_model
+        self._fixed_usage: dict[str, int] = fixed_usage or {
             "prompt_tokens": 10,
             "completion_tokens": 5,
             "total_tokens": 15,
         }
-        self._latency_ms = latency_ms
+        self._latency_ms: float = latency_ms
         self._call_history: list[dict[str, Any]] = []
 
+    @override
     def chat(
         self,
         messages: Sequence[dict[str, Any]],
-        model: Optional[str] = None,
-        temperature: Optional[float] = None,
-        timeout: Optional[int] = None,
-        trace_id: Optional[str] = None,
+        model: str | None = None,
+        temperature: float | None = None,
+        timeout: int | None = None,
+        trace_id: str | None = None,
     ) -> LLMResponse:
         """模拟同步聊天完成，记录调用历史并返回固定的预设内容。
 

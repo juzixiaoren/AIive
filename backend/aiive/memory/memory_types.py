@@ -64,3 +64,17 @@ PERSONAL_SIGNAL_TYPES = frozenset({
     MemoryType.HABIT.value,
     MemoryType.SCHEDULE.value,
 })
+
+
+# 记忆键规范：写记忆时的唯一事实来源（显式工具与自动提取器都引用它）。
+# 不属于 Runtime Identity，也不常驻系统提示词。
+MEMORY_KEY_GUIDE = """记忆键规范（写记忆时使用，同 key 自动覆盖旧记忆）：
+- agent.display_name: Agent 可见名称。触发："以后你叫X" → content="X"（纯值）
+- user.display_name: 用户称呼。触发："以后叫我X" → content="X"（纯值）
+- user.name: 用户真实姓名，仅当用户明确说"我的真实姓名是X"。content="X"（纯值）
+- user.preference.response_style: 回复风格偏好。触发："我喜欢你回答简洁一点"
+- agent.persona.tone: Agent 语气/人格。触发："你以后说话活泼一点"
+- agent.persona.relationship: 主从/关系风格（"你是我的主人""我是你的上司"）。严禁写进 display_name 或 user.name
+- user.preference.<topic>: 用户某主题偏好
+- project.<project_name>.<topic>: 项目决策。触发："AIive 后端用 FastAPI" → project.aiive.backend_stack
+身份键（user.name/user.display_name/agent.display_name/agent.persona.*）的 content 必须是纯值，不要含"我的名字叫""以后叫我"等前缀，也不要把关系表述（"你是我的主人"）塞进这些键。"""

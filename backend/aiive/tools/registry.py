@@ -9,10 +9,13 @@
 """
 
 import hashlib
+import inspect
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable
+
+from aiive.context.run_context import RunContext
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +50,7 @@ class CapabilitySafetySchema:
     tool_description_is_instruction: bool = False
 
 
-def compute_descriptor_hash(schema: dict) -> str:
+def compute_descriptor_hash(schema: dict[str, Any]) -> str:
     """计算安全 schema 的 SHA256 哈希值（取前 16 位）。
 
     用于检测工具定义是否发生变化。
@@ -167,7 +170,7 @@ class ToolRegistry:
         capability_id: str,
         params: dict[str, Any],
         instruction_source: str,
-        run_context=None,
+        run_context: RunContext | None = None,
     ) -> dict[str, Any]:
         """执行工具调用，包含两道安全守卫。
 
@@ -204,7 +207,10 @@ class ToolRegistry:
             }
 
         try:
-            result = reg.handler(ctx=run_context, **params)
+            if "ctx" in inspect.signature(reg.handler).parameters:
+                result = reg.handler(ctx=run_context, **params)
+            else:
+                result = reg.handler(**params)
             return {"ok": True, "result": result}
         except Exception as e:
             logger.exception("工具执行失败: capability_id=%s params=%s", capability_id, params)

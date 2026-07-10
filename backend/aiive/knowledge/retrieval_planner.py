@@ -10,9 +10,10 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
-from aiive.db.models import Chunk, Document
+from aiive.db.models import Chunk
 from aiive.knowledge.ingestor import search_chunks
 from aiive.knowledge.qdrant_indexer import QdrantIndexer
+from typing import Any
 
 
 class RetrievalPlanner:
@@ -26,10 +27,10 @@ class RetrievalPlanner:
             db: SQLAlchemy 数据库会话。
             indexer: Qdrant 索引器实例，默认使用内存版。
         """
-        self._db = db
-        self._indexer = indexer or QdrantIndexer()
+        self._db: Session = db
+        self._indexer: QdrantIndexer = indexer or QdrantIndexer()
 
-    def retrieve(self, query: str, limit: int = 5) -> list[dict]:
+    def retrieve(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         """
         执行混合检索：稠密向量检索 + 文本关键词检索，去重后融合返回。
 

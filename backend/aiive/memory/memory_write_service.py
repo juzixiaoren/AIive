@@ -15,7 +15,9 @@ from sqlalchemy.orm import Session
 
 from aiive.memory.memory_gate import MemoryGateDecision
 from aiive.memory.memory_store import MemoryStore
+from aiive.context.run_context import RunContext
 from aiive.runtime.event_logger import EventLogger
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -35,11 +37,13 @@ class MemoryWriteService:
         Args:
             db: 数据库会话。
         """
-        self._db = db
-        self._store = MemoryStore(db)
-        self._logger = EventLogger(db)
+        self._db: Session = db
+        self._store: MemoryStore = MemoryStore(db)
+        self._logger: EventLogger = EventLogger(db)
 
-    def write(self, decision: MemoryGateDecision, content: str, run_context=None) -> dict:
+    def write(
+        self, decision: MemoryGateDecision, content: str, run_context: RunContext | None = None
+    ) -> dict[str, Any]:
         """执行 MemoryGate 的准入决策，返回可观察的结果。
 
         根据 decision.decision 的值，分三个分支处理：
@@ -63,8 +67,7 @@ class MemoryWriteService:
         """
         if run_context is None or not run_context.thread_id:
             raise RuntimeError(
-                "MemoryWriteService.write() 需要有效的 RunContext，"
-                " 但 run_context 为 None 或 thread_id 为空。"
+                "MemoryWriteService.write() 需要有效的 RunContext，但 run_context 为 None 或 thread_id 为空。"
             )
         tid = run_context.thread_id
 

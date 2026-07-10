@@ -43,23 +43,23 @@ export default function App() {
   ];
 
   return (
-    <div className="min-h-screen flex flex-col bg-slate-50">
+    <div className="h-screen flex flex-col bg-background overflow-hidden">
       {/* 顶部导航栏 */}
-      <header className="border-b border-slate-200 bg-white px-6 py-4 flex items-center justify-between shadow-sm">
+      <header className="border-b border-divider bg-surface px-6 py-4 flex items-center justify-between shadow-sm">
         <div className="flex items-center gap-3">
-          <h1 className="text-xl font-bold tracking-tight text-slate-800">AIive</h1>
-          <span className="text-xs text-slate-400 bg-slate-100 px-2 py-0.5 rounded">个人管家</span>
+          <h1 className="text-xl font-bold tracking-tight text-content">AIive</h1>
+          <span className="text-xs text-faint bg-surface-muted px-2 py-0.5 rounded">个人管家</span>
         </div>
         {/* Tab 切换按钮组 */}
-        <div className="flex gap-1 bg-slate-100 rounded-lg p-1">
+        <div className="flex gap-1 bg-surface-muted rounded-lg p-1">
           {tabs.map(t => (
             <button
               key={t.key}
               onClick={() => setTab(t.key)}
               className={`px-4 py-1.5 text-sm rounded-md transition-all ${
                 tab === t.key
-                  ? "bg-white text-slate-800 shadow-sm font-medium"
-                  : "text-slate-500 hover:text-slate-700"
+                  ? "bg-surface text-content shadow-sm font-medium"
+                  : "text-muted hover:text-title"
               }`}
             >
               {t.label}
@@ -69,14 +69,19 @@ export default function App() {
       </header>
 
       {/* 主内容区域，按当前选中的 Tab 渲染对应页面 */}
-      <main className="flex-1 w-full max-w-3xl mx-auto py-6 px-4">
-        {tab === "chat" && (
+      <main className="flex-1 min-h-0 w-full max-w-3xl mx-auto px-4 flex flex-col">
+        {tab === "chat" ? (
+          // 对话页占满可用高度，输入框贴底
           <ChatPage onInspectTrace={(tid) => { setInspectTraceId(tid); setTab("context"); }} />
+        ) : (
+          // 其余页面在独立可滚动容器中展示
+          <div className="flex-1 min-h-0 overflow-y-auto py-6">
+            {tab === "events" && <EventTimeline traceId={inspectTraceId} />}
+            {tab === "context" && <ContextInspector traceId={inspectTraceId} />}
+            {tab === "tools" && <ToolsPage />}
+            {tab === "notifs" && <NotificationsPage />}
+          </div>
         )}
-        {tab === "events" && <EventTimeline traceId={inspectTraceId} />}
-        {tab === "context" && <ContextInspector traceId={inspectTraceId} />}
-        {tab === "tools" && <ToolsPage />}
-        {tab === "notifs" && <NotificationsPage />}
       </main>
     </div>
   );

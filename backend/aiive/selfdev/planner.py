@@ -69,7 +69,7 @@ class SelfDevPlanner:
         参数:
             llm_client: LLM 客户端实例，用于调用大模型生成计划。
         """
-        self._llm_client = llm_client
+        self._llm_client: LLMClient = llm_client
 
     def plan(self, goal: str, trace_id: str | None = None) -> dict[str, Any]:
         """
@@ -128,7 +128,7 @@ class SelfDevPlanner:
 
         return self._validate(plan)
 
-    def _validate(self, plan: dict) -> dict[str, Any]:
+    def _validate(self, plan: dict[str, Any]) -> dict[str, Any]:
         """
         验证并规范化计划内容，包括：
         - 为缺失字段设置默认值

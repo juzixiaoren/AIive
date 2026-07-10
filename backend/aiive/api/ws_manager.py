@@ -5,6 +5,8 @@ WebSocket 连接管理器：管理按 thread_id 分组的 WebSocket 连接。
 import asyncio
 import json
 import logging
+from typing import Any
+
 from fastapi import WebSocket
 
 logger = logging.getLogger(__name__)
@@ -41,7 +43,7 @@ class ConnectionManager:
             if not self._connections[thread_id]:
                 del self._connections[thread_id]
 
-    async def broadcast_to_thread(self, thread_id: str, event_type: str, data: dict) -> None:
+    async def broadcast_to_thread(self, thread_id: str, event_type: str, data: dict[str, Any]) -> None:
         """向指定线程的所有连接推送事件。"""
         if thread_id not in self._connections:
             return
@@ -55,7 +57,7 @@ class ConnectionManager:
         for ws in dead:
             self.disconnect(thread_id, ws)
 
-    def broadcast_to_thread_sync(self, thread_id: str, event_type: str, data: dict) -> None:
+    def broadcast_to_thread_sync(self, thread_id: str, event_type: str, data: dict[str, Any]) -> None:
         """线程安全的同步广播入口，供后台 daemon 线程调用。
 
         通过 asyncio.run_coroutine_threadsafe 将 async 操作投递到主事件循环。
@@ -68,7 +70,7 @@ class ConnectionManager:
             self._main_loop,
         )
 
-    async def broadcast_all(self, event_type: str, data: dict) -> None:
+    async def broadcast_all(self, event_type: str, data: dict[str, Any]) -> None:
         """向所有连接推送事件。"""
         for thread_id in list(self._connections.keys()):
             await self.broadcast_to_thread(thread_id, event_type, data)

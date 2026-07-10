@@ -5,10 +5,11 @@ API路由模块：聊天接口
 """
 import json
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from typing import Any
 
 from aiive.core.llm_client import LLMClientError
 from aiive.db.base import get_db
@@ -38,8 +39,8 @@ class ChatResponse(BaseModel):
     action_cards: list[ActionCard] = []
     pending_operations: list[PendingOperation] = []
     intent_type: str = "plain_chat"
-    tool_calls: list[dict] = []
-    tool_results: list[dict] = []
+    tool_calls: list[dict[str, Any]] = []
+    tool_results: list[dict[str, Any]] = []
     parse_errors: list[str] = []
 
 

@@ -7,6 +7,7 @@ API路由模块：自进化开发（Self-Dev）
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from typing import Any
 
 from aiive.config import settings
 from aiive.core.llm_client import LLMClient
@@ -151,7 +152,7 @@ def get_request(request_id: str, db: Session = Depends(get_db)):
 
 class ApplyRequest(BaseModel):
     """补丁应用请求体"""
-    operations: list[dict] = Field(default_factory=list)
+    operations: list[dict[str, Any]] = Field(default_factory=list)
 
 
 @router.post("/{request_id}/apply-inactive")
@@ -205,7 +206,7 @@ def promote(request_id: str, req: PromoteRequest, db: Session = Depends(get_db))
     from aiive.selfdev.promote_rollback import PromoteRollback
 
     pr = PromoteRollback()
-    result = pr.promote()
+    result = pr.promote(run_health_check=req.run_health_check)
 
     sreq.status = "promoted" if result["ok"] else "promote_failed"
     db.commit()
@@ -230,7 +231,7 @@ def rollback(request_id: str, db: Session = Depends(get_db)):
 
     from aiive.selfdev.promote_rollback import PromoteRollback
 
-    active = PromoteRollback()._manager.get_active_slot()
+    active = PromoteRollback().get_active_slot()
     previous = "B" if active == "A" else "A"
 
     pr = PromoteRollback()

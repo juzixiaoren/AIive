@@ -3,6 +3,9 @@
 集成 V20 MemoryGate + MemoryWriteService，实现记忆提取和管家信号提取。
 """
 import logging
+from typing import TYPE_CHECKING
+
+from sqlalchemy.orm import Session
 
 from aiive.config import settings
 from aiive.context.run_context import RunContext
@@ -11,6 +14,10 @@ from aiive.memory.memory_extractor import MemoryExtractor
 from aiive.memory.memory_gate import MemoryGate, MemoryGateInput
 from aiive.memory.memory_write_service import MemoryWriteService
 from aiive.memory.steward_signal_extractor import StewardSignalExtractor
+from typing import Any
+
+if TYPE_CHECKING:
+    from aiive.worker.outbox_worker import OutboxWorker
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +36,7 @@ def _get_llm_client() -> LLMClient:
     )
 
 
-def handle_memory_extraction(db, payload: dict, trace_id: str | None) -> None:
+def handle_memory_extraction(db: Session, payload: dict[str, Any], trace_id: str | None) -> None:
     """处理记忆提取作业。
 
     流程：
@@ -97,7 +104,7 @@ def handle_memory_extraction(db, payload: dict, trace_id: str | None) -> None:
         raise
 
 
-def handle_steward_extraction(db, payload: dict, trace_id: str | None) -> None:
+def handle_steward_extraction(db: Session, payload: dict[str, Any], trace_id: str | None) -> None:
     """处理管家信号提取作业。
 
     流程与记忆提取类似，但使用 StewardSignalExtractor 提取管家信号
@@ -126,16 +133,10 @@ def handle_steward_extraction(db, payload: dict, trace_id: str | None) -> None:
         evidence_source = payload.get("source", "trusted_user_message")
 
         for s in signals:
-            if isinstance(s, dict):
-                content = s.get("content", "")
-                signal_type = s.get("signal_type", "routine")
-                confidence = s.get("confidence", 0.7)
-                memory_key = s.get("memory_key", "")
-            else:
-                content = s.content
-                signal_type = s.memory_type if hasattr(s, 'memory_type') else "routine"
-                confidence = s.confidence if hasattr(s, 'confidence') else 0.7
-                memory_key = s.memory_key if hasattr(s, 'memory_key') else ""
+            content = s.get("content", "")
+            signal_type = s.get("signal_type", "routine")
+            confidence = s.get("confidence", 0.7)
+            memory_key = s.get("memory_key", "")
 
             decision = gate.decide(MemoryGateInput(
                 content=content,
@@ -163,7 +164,7 @@ def handle_steward_extraction(db, payload: dict, trace_id: str | None) -> None:
         raise
 
 
-def register_all(worker):
+def register_all(worker: OutboxWorker):
     """将所有处理器注册到发件箱工作器。
 
     参数:

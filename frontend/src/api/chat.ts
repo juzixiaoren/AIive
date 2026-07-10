@@ -94,9 +94,10 @@ export async function snoozeReminder(reminderId: string, delayMinutes: number, t
  * @param threadId - 可选的对话线程 ID
  * @param onToken - 收到 token 时的回调
  * @param onToolCall - 检测到工具调用时的回调（工具名 + 参数）
- * @param onToolResult - 工具执行完成时的回调（工具名 + 结果）
+ * @param onToolResult - 工具执行完成时的回调（工具名 + 结果 + 状态）
  * @param onActionCard - 收到操作卡片时的回调
  * @param onError - 发生错误时的回调
+ * @param signal - 可选的 AbortSignal，用于中断流式请求
  * @returns 包含 thread_id、trace_id、reply 和 action_cards 的结果对象
  */
 export async function sendMessageStream(
@@ -104,14 +105,23 @@ export async function sendMessageStream(
   threadId: string | undefined,
   onToken: (text: string) => void,
   onToolCall: (name: string, params: Record<string, unknown>) => void,
-  onToolResult: (name: string, result: unknown) => void,
+  onToolResult: (name: string, result: unknown, status?: string) => void,
   onActionCard: (card: ActionCard) => void,
   onError: (msg: string) => void,
-): Promise<{ thread_id: string; trace_id: string; reply: string; action_cards: ActionCard[] }> {
+  signal?: AbortSignal,
+): Promise<{
+  thread_id: string;
+  trace_id: string;
+  reply: string;
+  action_cards: ActionCard[];
+  tool_calls?: Array<{ name: string; params?: Record<string, unknown>; status?: string }>;
+  tool_results?: Array<{ name: string; params?: Record<string, unknown>; result?: unknown; status?: string }>;
+}> {
   const res = await fetch("/api/chat/stream", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ message, thread_id: threadId ?? null }),
+    signal,
   });
 
   if (!res.ok) {
@@ -125,7 +135,14 @@ export async function sendMessageStream(
   const decoder = new TextDecoder();
   let buffer = "";
   let currentEvent = "";
-  let result = { thread_id: "", trace_id: "", reply: "", action_cards: [] as ActionCard[] };
+  let result = {
+    thread_id: "",
+    trace_id: "",
+    reply: "",
+    action_cards: [] as ActionCard[],
+    tool_calls: [] as Array<{ name: string; params?: Record<string, unknown>; status?: string }>,
+    tool_results: [] as Array<{ name: string; params?: Record<string, unknown>; result?: unknown; status?: string }>,
+  };
 
   try {
     while (true) {
@@ -156,8 +173,8 @@ export async function sendMessageStream(
                 onToolCall(data.name as string, data.params as Record<string, unknown>);
                 break;
               case "tool_result":
-                // 工具执行结果
-                onToolResult(data.name as string, data.result);
+                // 工具执行结果（含状态：completed / failed）
+                onToolResult(data.name as string, data.result, data.status as string);
                 break;
               case "action_card":
                 // 操作卡片（如任务创建、记忆修改等）
@@ -170,6 +187,8 @@ export async function sendMessageStream(
                   trace_id: data.trace_id as string,
                   reply: data.reply as string,
                   action_cards: (data.action_cards || []) as ActionCard[],
+                  tool_calls: (data.tool_calls || []) as Array<{ name: string; params?: Record<string, unknown>; status?: string }>,
+                  tool_results: (data.tool_results || []) as Array<{ name: string; params?: Record<string, unknown>; result?: unknown; status?: string }>,
                 };
                 break;
               case "error":
@@ -181,6 +200,13 @@ export async function sendMessageStream(
           }
         }
       }
+    }
+  } catch (err) {
+    // 用户主动中断（AbortSignal）时正常结束，不抛出错误
+    if (signal?.aborted || (err instanceof Error && err.name === "AbortError")) {
+      // 主动中断，忽略
+    } else {
+      throw err;
     }
   } finally {
     reader.releaseLock();

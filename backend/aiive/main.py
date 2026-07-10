@@ -9,7 +9,8 @@ import sys
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 
 logging.basicConfig(
@@ -82,7 +83,7 @@ def create_app() -> FastAPI:
     """
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI):
+    async def lifespan(_app: FastAPI):
         """应用生命周期管理：启动时执行初始化，关闭时执行清理。"""
         import asyncio
         from aiive.worker.scheduler_daemon import start_daemon
@@ -106,8 +107,9 @@ def create_app() -> FastAPI:
     app = FastAPI(title="AIive", version="0.1.0", lifespan=lifespan)
 
     # 全局异常处理中间件
-    @app.middleware("http")
-    async def catch_unhandled_exceptions(request: Request, call_next):
+    async def catch_unhandled_exceptions(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ):
         try:
             return await call_next(request)
         except Exception:
@@ -116,6 +118,8 @@ def create_app() -> FastAPI:
                 status_code=500,
                 content={"detail": "Internal server error"},
             )
+
+    app.middleware("http")(catch_unhandled_exceptions)
 
     # 配置 CORS 中间件，允许前端开发服务器跨域访问
     app.add_middleware(

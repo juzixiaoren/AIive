@@ -20,11 +20,11 @@ type ContextItem = {
 
 /** 上下文类型的中文标签和样式映射 */
 const KIND_META: Record<string, { label: string; bg: string; text: string; border: string }> = {
-  stable_prefix:   { label: "系统前缀",  bg: "bg-purple-50", text: "text-purple-700", border: "border-purple-200" },
-  tool_schemas:    { label: "工具列表",  bg: "bg-teal-50",    text: "text-teal-700",    border: "border-teal-200" },
-  evidence_memory: { label: "注入记忆",  bg: "bg-amber-50",   text: "text-amber-700",   border: "border-amber-200" },
-  history_message: { label: "历史消息",  bg: "bg-blue-50",    text: "text-blue-700",    border: "border-blue-200" },
-  user_message:    { label: "当前消息",  bg: "bg-rose-50",    text: "text-rose-700",    border: "border-rose-200" },
+  stable_prefix:   { label: "系统前缀",  bg: "bg-accent-soft", text: "text-accent-text", border: "border-accent-border" },
+  tool_schemas:    { label: "工具列表",  bg: "bg-success-soft",    text: "text-success-text",    border: "border-success-border" },
+  evidence_memory: { label: "注入记忆",  bg: "bg-warning-soft",   text: "text-warning-text",   border: "border-warning-border" },
+  history_message: { label: "历史消息",  bg: "bg-primary-soft",    text: "text-primary",    border: "border-primary-border" },
+  user_message:    { label: "当前消息",  bg: "bg-danger-soft",    text: "text-danger-text",    border: "border-danger-border" },
 };
 
 /** 信任级别中文标签 */
@@ -65,16 +65,16 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
 
   // 无 traceId 时显示引导提示
   if (!traceId) return (
-    <div className="text-center text-slate-400 py-16">
+    <div className="text-center text-faint py-16">
       <p className="text-lg mb-2">🔍 上下文检查器</p>
       <p className="text-sm">在对话页面点击 trace_id 即可查看该次对话的完整上下文</p>
     </div>
   );
 
-  if (error) return <div className="text-center text-red-500 py-16">{error}</div>;
-  if (!data || (data as Record<string, unknown>).error) return <div className="text-center text-slate-400 py-16">
+  if (error) return <div className="text-center text-danger py-16">{error}</div>;
+  if (!data || (data as Record<string, unknown>).error) return <div className="text-center text-faint py-16">
     <p className="text-sm">未找到 trace 记录: {traceId.slice(0, 8)}…</p>
-    <p className="text-xs mt-2 text-slate-300">请确保已经产生过对话</p>
+    <p className="text-xs mt-2 text-subtle">请确保已经产生过对话</p>
   </div>;
 
   const snapshots = (data.snapshots || []) as Array<Record<string, unknown>>;
@@ -85,8 +85,8 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
 
   return (
     <div>
-      <h2 className="text-lg font-semibold text-slate-800 mb-1">上下文快照</h2>
-      <p className="text-xs text-slate-400 mb-4 font-mono break-all">trace_id: {traceId}</p>
+      <h2 className="text-lg font-semibold text-content mb-1">上下文快照</h2>
+      <p className="text-xs text-faint mb-4 font-mono break-all">trace_id: {traceId}</p>
 
       {/* 统计卡片区域 */}
       <div className="grid grid-cols-4 gap-3 mb-5">
@@ -96,9 +96,9 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
           { label: "预估 Token", value: `~${meta.total_tokens || "-"}` },
           { label: "注入记忆", value: `${injected.length} 条` },
         ].map(c => (
-          <div key={c.label} className="bg-white border border-slate-200 rounded-lg p-3 text-center shadow-sm">
-            <div className="text-xs text-slate-400 mb-0.5">{c.label}</div>
-            <div className="text-sm font-mono text-slate-700 truncate">{c.value}</div>
+          <div key={c.label} className="bg-surface border border-divider rounded-lg p-3 text-center shadow-sm">
+            <div className="text-xs text-faint mb-0.5">{c.label}</div>
+            <div className="text-sm font-mono text-title truncate">{c.value}</div>
           </div>
         ))}
       </div>
@@ -106,28 +106,28 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
       {/* LLM 调用（完整输入/输出） */}
       {llm_calls.length > 0 && (
         <div className="mb-5">
-          <h3 className="text-sm font-medium text-slate-600 mb-3">
+          <h3 className="text-sm font-medium text-code mb-3">
             LLM 调用 ({llm_calls.length})
-            <span className="text-xs text-slate-400 ml-2 font-normal">如实记录每次模型输入与输出</span>
+            <span className="text-xs text-faint ml-2 font-normal">如实记录每次模型输入与输出</span>
           </h3>
           <div className="flex flex-col gap-3">
             {llm_calls.map((c, i) => (
-              <div key={i} className="border border-slate-200 rounded-xl shadow-sm overflow-hidden">
-                <div className="px-4 py-2 bg-slate-50 flex items-center gap-3">
-                  <span className="text-xs font-medium px-2 py-0.5 rounded-full bg-slate-200 text-slate-700">#{i + 1}</span>
-                  <code className="text-xs text-slate-600 font-mono">{String(c.model || "-")}</code>
-                  <span className="text-[11px] text-slate-400">{c.latency_ms} ms</span>
+              <div key={i} className="border border-divider rounded-xl shadow-sm overflow-hidden">
+                <div className="px-4 py-2 bg-background flex items-center gap-3">
+                  <span className="text-xs font-medium px-2 py-0.5 rounded-full bg-divider text-title">#{i + 1}</span>
+                  <code className="text-xs text-code font-mono">{String(c.model || "-")}</code>
+                  <span className="text-[11px] text-faint">{c.latency_ms} ms</span>
                 </div>
                 <div className="px-4 py-3 grid grid-cols-1 gap-3">
                   <div>
-                    <div className="text-[10px] text-slate-400 uppercase mb-1">输入（完整消息）</div>
-                    <pre className="text-[11px] text-slate-600 bg-slate-50 rounded-lg px-3 py-2 whitespace-pre-wrap break-all font-mono leading-relaxed max-h-60 overflow-auto">
+                    <div className="text-[10px] text-faint uppercase mb-1">输入（完整消息）</div>
+                    <pre className="text-[11px] text-code bg-background rounded-lg px-3 py-2 whitespace-pre-wrap break-all font-mono leading-relaxed max-h-60 overflow-auto">
                       {String(c.input_preview || "(空)")}
                     </pre>
                   </div>
                   <div>
-                    <div className="text-[10px] text-slate-400 uppercase mb-1">输出（内容 + 工具调用）</div>
-                    <pre className="text-[11px] text-slate-600 bg-slate-50 rounded-lg px-3 py-2 whitespace-pre-wrap break-all font-mono leading-relaxed max-h-60 overflow-auto">
+                    <div className="text-[10px] text-faint uppercase mb-1">输出（内容 + 工具调用）</div>
+                    <pre className="text-[11px] text-code bg-background rounded-lg px-3 py-2 whitespace-pre-wrap break-all font-mono leading-relaxed max-h-60 overflow-auto">
                       {String(c.output_preview || "(空)")}
                     </pre>
                   </div>
@@ -141,26 +141,26 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
       {/* 注入的记忆 ID 列表 */}
       {injected.length > 0 && (
         <div className="mb-4">
-          <h3 className="text-sm font-medium text-slate-600 mb-2">注入的记忆</h3>
+          <h3 className="text-sm font-medium text-code mb-2">注入的记忆</h3>
           <div className="flex flex-wrap gap-1">
             {injected.map((id: string) => (
-              <code key={id} className="text-[11px] bg-blue-50 text-blue-600 px-2 py-0.5 rounded font-mono">{id.slice(0, 8)}</code>
+              <code key={id} className="text-[11px] bg-primary-soft text-primary-hover px-2 py-0.5 rounded font-mono">{id.slice(0, 8)}</code>
             ))}
           </div>
         </div>
       )}
 
       {/* 上下文项列表 */}
-      <h3 className="text-sm font-medium text-slate-600 mb-3">
+      <h3 className="text-sm font-medium text-code mb-3">
         上下文项 ({items.length})
-        <span className="text-xs text-slate-400 ml-2 font-normal">点击卡片展开详情</span>
+        <span className="text-xs text-faint ml-2 font-normal">点击卡片展开详情</span>
       </h3>
       {items.length === 0 ? (
-        <p className="text-sm text-slate-400">无上下文项</p>
+        <p className="text-sm text-faint">无上下文项</p>
       ) : (
         <div className="flex flex-col gap-2">
           {items.map((item, i) => {
-            const kindMeta = KIND_META[item.kind] || { label: item.kind, bg: "bg-slate-50", text: "text-slate-600", border: "border-slate-200" };
+            const kindMeta = KIND_META[item.kind] || { label: item.kind, bg: "bg-background", text: "text-code", border: "border-divider" };
             const isOpen = expanded === i;
 
             return (
@@ -170,7 +170,7 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
                 className={`
                   border rounded-xl cursor-pointer transition-all duration-200 shadow-sm hover:shadow-md
                   ${kindMeta.border} ${kindMeta.bg}
-                  ${isOpen ? "ring-2 ring-slate-300" : ""}
+                  ${isOpen ? "ring-2 ring-subtle" : ""}
                 `}
               >
                 {/* 折叠状态：摘要头部 */}
@@ -178,12 +178,12 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
                   <span className={`text-xs font-medium px-2.5 py-0.5 rounded-full ${kindMeta.text} ${kindMeta.bg} border ${kindMeta.border} shrink-0`}>
                     {kindMeta.label}
                   </span>
-                  <span className="text-xs text-slate-600 truncate flex-1 min-w-0">
+                  <span className="text-xs text-code truncate flex-1 min-w-0">
                     {(item.content_preview || "").slice(0, 120)}
                   </span>
-                  <span className="text-[11px] text-slate-400 font-mono shrink-0">~{item.token_estimate}t</span>
+                  <span className="text-[11px] text-faint font-mono shrink-0">~{item.token_estimate}t</span>
                   <svg
-                    className={`w-4 h-4 text-slate-400 shrink-0 transition-transform duration-200 ${isOpen ? "rotate-180" : ""}`}
+                    className={`w-4 h-4 text-faint shrink-0 transition-transform duration-200 ${isOpen ? "rotate-180" : ""}`}
                     fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
                   >
                     <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
@@ -192,7 +192,7 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
 
                 {/* 展开状态：详细信息 */}
                 {isOpen && (
-                  <div className="px-4 pb-4 border-t border-slate-200/60">
+                  <div className="px-4 pb-4 border-t border-divider/60">
                     {/* 元数据网格 */}
                     <div className="grid grid-cols-4 gap-2 mt-3 mb-3">
                       {[
@@ -201,32 +201,32 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
                         { label: "信任级别", value: TRUST_LABEL[item.trust_level] || item.trust_level },
                         { label: "Token", value: `~${item.token_estimate}` },
                       ].map(f => (
-                        <div key={f.label} className="bg-white/60 rounded-lg px-2.5 py-1.5">
-                          <div className="text-[10px] text-slate-400 uppercase">{f.label}</div>
-                          <div className="text-xs text-slate-700 font-medium truncate">{f.value}</div>
+                        <div key={f.label} className="bg-surface/60 rounded-lg px-2.5 py-1.5">
+                          <div className="text-[10px] text-faint uppercase">{f.label}</div>
+                          <div className="text-xs text-title font-medium truncate">{f.value}</div>
                         </div>
                       ))}
                     </div>
 
                     {/* Item ID */}
                     <div className="mb-2">
-                      <div className="text-[10px] text-slate-400 uppercase mb-0.5">Item ID</div>
-                      <code className="text-[11px] bg-white/60 text-slate-500 px-2 py-0.5 rounded font-mono break-all block">
+                      <div className="text-[10px] text-faint uppercase mb-0.5">Item ID</div>
+                      <code className="text-[11px] bg-surface/60 text-muted px-2 py-0.5 rounded font-mono break-all block">
                         {item.item_id}
                       </code>
                     </div>
 
                     {/* 内容预览（限制 2 行） */}
                     <div className="mb-0.5">
-                      <div className="text-[10px] text-slate-400 uppercase mb-1">内容预览</div>
-                      <pre className="text-xs text-slate-600 bg-white/70 rounded-lg px-3 py-2 whitespace-pre-wrap break-all font-mono leading-relaxed line-clamp-2">
+                      <div className="text-[10px] text-faint uppercase mb-1">内容预览</div>
+                      <pre className="text-xs text-code bg-surface/70 rounded-lg px-3 py-2 whitespace-pre-wrap break-all font-mono leading-relaxed line-clamp-2">
                         {item.content_preview || "(空)"}
                       </pre>
                     </div>
 
                     {/* "查看更多" 链接 */}
                     <div
-                      className="text-xs text-blue-500 hover:text-blue-600 cursor-pointer mt-1 select-none"
+                      className="text-xs text-primary hover:text-primary-hover cursor-pointer mt-1 select-none"
                       onClick={(e) => { e.stopPropagation(); setModalItem(item); }}
                     >
                       点击查看更多 →
@@ -244,28 +244,28 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
         <div className="fixed inset-0 z-50 flex items-center justify-center p-6">
           {/* 背景遮罩 */}
           <div
-            className="absolute inset-0 bg-black/40 backdrop-blur-sm"
+            className="absolute inset-0 bg-content/40 backdrop-blur-sm"
             onClick={() => setModalItem(null)}
           />
 
           {/* 弹窗主体 */}
-          <div className="relative w-full max-w-3xl max-h-[70vh] bg-white rounded-2xl shadow-2xl flex flex-col animate-fade-in">
+          <div className="relative w-full max-w-3xl max-h-[70vh] bg-surface rounded-2xl shadow-2xl flex flex-col animate-fade-in">
             {/* 弹窗头部 */}
-            <div className="shrink-0 px-5 py-3 border-b border-slate-100 flex items-center justify-between">
+            <div className="shrink-0 px-5 py-3 border-b border-surface-muted flex items-center justify-between">
               <div className="flex items-center gap-2 min-w-0">
                 {(() => {
-                  const m = KIND_META[modalItem.kind] || { label: modalItem.kind, bg: "bg-slate-50", text: "text-slate-600", border: "border-slate-200" };
+                  const m = KIND_META[modalItem.kind] || { label: modalItem.kind, bg: "bg-background", text: "text-code", border: "border-divider" };
                   return (
                     <span className={`text-xs font-medium px-2.5 py-0.5 rounded-full ${m.text} ${m.bg} border ${m.border} shrink-0`}>
                       {m.label}
                     </span>
                   );
                 })()}
-                <span className="text-sm font-semibold text-slate-800 truncate">{modalItem.item_id}</span>
+                <span className="text-sm font-semibold text-content truncate">{modalItem.item_id}</span>
               </div>
               <button
                 onClick={() => setModalItem(null)}
-                className="p-1.5 rounded-lg hover:bg-slate-100 text-slate-400 hover:text-slate-600 transition-colors shrink-0"
+                className="p-1.5 rounded-lg hover:bg-surface-muted text-faint hover:text-code transition-colors shrink-0"
               >
                 <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
@@ -282,9 +282,9 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
                   { label: "Token", value: `~${modalItem.token_estimate}` },
                   { label: "长度", value: `${(modalItem.content_preview || "").length} 字符` },
                 ].map(f => (
-                  <div key={f.label} className="bg-slate-50 rounded-lg px-2.5 py-1.5">
-                    <div className="text-[10px] text-slate-400 uppercase">{f.label}</div>
-                    <div className="text-xs text-slate-700 font-medium truncate">{f.value}</div>
+                  <div key={f.label} className="bg-background rounded-lg px-2.5 py-1.5">
+                    <div className="text-[10px] text-faint uppercase">{f.label}</div>
+                    <div className="text-xs text-title font-medium truncate">{f.value}</div>
                   </div>
                 ))}
               </div>
@@ -292,7 +292,7 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
 
             {/* 可滚动的完整内容区域 */}
             <div className="flex-1 overflow-y-auto px-5 pb-6">
-              <pre className="text-xs text-slate-700 whitespace-pre-wrap break-all font-mono leading-relaxed">
+              <pre className="text-xs text-title whitespace-pre-wrap break-all font-mono leading-relaxed">
                 {modalItem.content_preview || "(空)"}
               </pre>
             </div>

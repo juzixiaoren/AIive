@@ -13,12 +13,19 @@
 - 节奏/注意力：query_rhythm, query_attention
 """
 
+import inspect
 import logging
 import os
 import uuid as _uuid
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy.orm import Session
+
+from aiive.context.run_context import RunContext
 from aiive.db.base import SessionLocal
+from aiive.memory.memory_types import MEMORY_KEY_GUIDE
+from typing import Any
 
 logger = logging.getLogger(__name__)
 from aiive.tools.registry import (
@@ -29,7 +36,7 @@ from aiive.tools.registry import (
 )
 
 
-def _build_safety(capability_id: str, **overrides) -> CapabilitySafetySchema:
+def _build_safety(capability_id: str, **overrides: Any) -> CapabilitySafetySchema:
     """构建工具的安全配置 schema。
 
     使用默认安全配置作为基础，允许通过 overrides 覆盖特定字段。
@@ -41,7 +48,7 @@ def _build_safety(capability_id: str, **overrides) -> CapabilitySafetySchema:
     返回:
         构建好的 CapabilitySafetySchema 实例
     """
-    base = dict(
+    base: dict[str, Any] = dict(
         capability_id=capability_id,
         definition_source="local_builtin",
         definition_trust_level="trusted",
@@ -61,16 +68,21 @@ def _build_safety(capability_id: str, **overrides) -> CapabilitySafetySchema:
 # 处理函数
 # ═══════════════════════════════════════════════════════════════
 
-def _db_handler(fn):
+def _db_handler(fn: Callable[..., Any]):
     """装饰器：为需要数据库会话的处理函数自动管理会话生命周期（开启/提交/关闭）。
 
-    提取 ctx 命名参数，传递给被装饰函数 fn(db, ctx, **params)。
+    提取 ctx 命名参数，仅在被装饰函数声明 ctx 时传递给 fn(db, ctx, **params)。
     RunContext 通过 registry.execute() 注入，不经过 LLM schema。
     """
-    def wrapper(ctx=None, **params):
+    _accepts_ctx = "ctx" in inspect.signature(fn).parameters
+
+    def wrapper(ctx: RunContext | None = None, **params: Any):
         db = SessionLocal()
         try:
-            result = fn(db, ctx, **params)
+            if _accepts_ctx:
+                result = fn(db, ctx, **params)
+            else:
+                result = fn(db, **params)
             db.commit()
             return result
         except Exception:
@@ -83,7 +95,7 @@ def _db_handler(fn):
 
 
 # ── Echo（回显）──
-def _handle_echo(ctx=None, message: str = "") -> str:
+def _handle_echo(message: str = "") -> str:
     """回显工具：原样返回输入消息。"""
     return message
 
@@ -91,17 +103,17 @@ def _handle_echo(ctx=None, message: str = "") -> str:
 # ── Reminder / Task（提醒与任务）──
 
 
-def _require_ctx(ctx, tool_name: str):
+def _require_ctx(ctx: RunContext | None, tool_name: str) -> RunContext:
     """side-effect 工具需要 RunContext，缺失时 fast-fail。"""
     if ctx is None:
         raise RuntimeError(
-            f"工具 {tool_name} 需要 RunContext，但未传入。"
-            " 请确认 AgentGraph 已通过 build_langchain_tools 传入 RunContext。"
+            f"工具 {tool_name} 需要 RunContext，但未传入。请确认 AgentGraph 已通过 build_langchain_tools 传入 RunContext。"
         )
+    return ctx
 
 
 @_db_handler
-def _handle_schedule_reminder(db, ctx, content: str, delay_minutes: int = 1):
+def _handle_schedule_reminder(db: Session, ctx: RunContext | None, content: str, delay_minutes: int = 1):
     """创建定时提醒，只负责写入 Task 记录。
 
     Event（reminder_created）由 AgentGraph._finalize() 在主 DB 会话中统一写入，
@@ -122,7 +134,7 @@ def _handle_schedule_reminder(db, ctx, content: str, delay_minutes: int = 1):
         description=f"延迟{delay_minutes}分钟",
         next_check_at=next_check,
     )
-    _require_ctx(ctx, "schedule_reminder")
+    ctx = _require_ctx(ctx, "schedule_reminder")
     task.thread_id = ctx.thread_id
     db.flush()
     return {
@@ -134,7 +146,7 @@ def _handle_schedule_reminder(db, ctx, content: str, delay_minutes: int = 1):
 
 
 @_db_handler
-def _handle_remind_alert(db, ctx, reminder_id: str):
+def _handle_remind_alert(db: Session, reminder_id: str):
     """LLM 在提醒到期时调用此工具，激活提醒警报。
 
     将事件状态标记为 alerting，返回操作信息供前端显示确认/延期按钮。
@@ -166,7 +178,7 @@ def _handle_remind_alert(db, ctx, reminder_id: str):
 
 
 @_db_handler
-def _handle_confirm_reminder(db, ctx, reminder_id: str):
+def _handle_confirm_reminder(db: Session, reminder_id: str):
     """用户确认提醒完成，将状态标记为 confirmed。
 
     参数:
@@ -188,7 +200,7 @@ def _handle_confirm_reminder(db, ctx, reminder_id: str):
 
 
 @_db_handler
-def _handle_snooze_reminder(db, ctx, reminder_id: str, delay_minutes: int = 5):
+def _handle_snooze_reminder(db: Session, ctx: RunContext | None, reminder_id: str, delay_minutes: int = 5):
     """用户延迟提醒，创建新的延时任务和事件。
 
     流程:
@@ -231,7 +243,7 @@ def _handle_snooze_reminder(db, ctx, reminder_id: str, delay_minutes: int = 5):
     db.flush()
 
     # 创建新的 pending 事件
-    _require_ctx(ctx, "snooze_reminder")
+    ctx = _require_ctx(ctx, "snooze_reminder")
     new_event = Event(
         id=str(_uuid.uuid4()),
         trace_id=task.id,
@@ -258,7 +270,7 @@ def _handle_snooze_reminder(db, ctx, reminder_id: str, delay_minutes: int = 5):
 
 
 @_db_handler
-def _handle_list_tasks(db, ctx, status: str = "", thread_id: str = ""):
+def _handle_list_tasks(db: Session, ctx: RunContext | None, status: str = "", thread_id: str = ""):
     """列出所有任务/提醒。
 
     参数:
@@ -279,7 +291,7 @@ def _handle_list_tasks(db, ctx, status: str = "", thread_id: str = ""):
 
 
 @_db_handler
-def _handle_cancel_task(db, ctx, task_id: str):
+def _handle_cancel_task(db: Session, task_id: str):
     """按 ID 取消一个任务，同时将关联的 reminder_created 事件标记为 cancelled。
 
     参数:
@@ -313,7 +325,7 @@ def _handle_cancel_task(db, ctx, task_id: str):
 
 
 @_db_handler
-def _handle_dismiss_notifications(db, ctx):
+def _handle_dismiss_notifications(db: Session):
     """清除未执行的通知：将待提醒/提醒中/已延时的通知标记为 cancelled。
 
     已确认（confirmed）和已取消（cancelled）的通知不受影响，
@@ -344,7 +356,7 @@ def _handle_dismiss_notifications(db, ctx):
 
 
 @_db_handler
-def _handle_show_notifications(db, ctx):
+def _handle_show_notifications(db: Session):
     """显示已触发的通知（notification_created 和 reminder_created 事件）。
 
     返回:
@@ -377,7 +389,7 @@ def _handle_show_notifications(db, ctx):
 
 # ── Memory（记忆管理）──
 @_db_handler
-def _handle_remember_or_update(db, ctx, content: str, memory_type: str = "fact", memory_key: str = ""):
+def _handle_remember_or_update(db: Session, ctx: RunContext | None, content: str, memory_type: str = "fact", memory_key: str = ""):
     """创建或更新记忆，通过 MemoryGate + MemoryWriteService 写入。
 
     流程:
@@ -429,7 +441,7 @@ def _handle_remember_or_update(db, ctx, content: str, memory_type: str = "fact",
         return {"ok": False, "error": f"Memory gate rejected: {decision.reason}"}
 
     # 通过 write service 写入
-    _require_ctx(ctx, "remember_or_update")
+    ctx = _require_ctx(ctx, "remember_or_update")
     result = writer.write(decision, content, run_context=ctx)
     db.flush()
     return {
@@ -443,7 +455,7 @@ def _handle_remember_or_update(db, ctx, content: str, memory_type: str = "fact",
 
 
 @_db_handler
-def _handle_forget_memory(db, ctx, memory_id: str = "", reason: str = "", scope: str = "memory_id", target: str = ""):
+def _handle_forget_memory(db: Session, memory_id: str = "", reason: str = "", scope: str = "memory_id", target: str = ""):
     """遗忘/删除存储的记忆。
 
     支持四种操作模式（由 scope 参数决定）:
@@ -521,14 +533,14 @@ def _handle_forget_memory(db, ctx, memory_id: str = "", reason: str = "", scope:
 
 
 @_db_handler
-def _handle_run_memory_maintenance(db, ctx):
+def _handle_run_memory_maintenance(db: Session):
     """运行记忆维护扫描，检查并报告记忆健康状况。"""
     from aiive.memory.memory_maintenance import MemoryMaintenance
     return MemoryMaintenance(db).scan()
 
 
 @_db_handler
-def _handle_search_memory(db, ctx, query: str = ""):
+def _handle_search_memory(db: Session, query: str = ""):
     """按内容文本搜索记忆。
 
     空查询返回空结果；使用 list_memories 可列出全部。
@@ -555,7 +567,7 @@ def _handle_search_memory(db, ctx, query: str = ""):
 
 
 @_db_handler
-def _handle_list_memories(db, ctx):
+def _handle_list_memories(db: Session):
     """列出所有活跃记忆（无搜索过滤）。
 
     返回:
@@ -571,7 +583,7 @@ def _handle_list_memories(db, ctx):
 
 
 # ── File / Safe Delete（文件与安全删除）──
-def _handle_safe_delete(path: str, scope_id: str = "test_artifacts", mode: str = "trash", ctx=None):
+def _handle_safe_delete(path: str, scope_id: str = "test_artifacts", mode: str = "trash"):
     """安全删除文件，仅允许删除已注册 scope 内的文件。
 
     参数:
@@ -587,7 +599,7 @@ def _handle_safe_delete(path: str, scope_id: str = "test_artifacts", mode: str =
     return {"allowed": decision.allowed, "reason": decision.reason, "resolved_path": decision.resolved_path}
 
 
-def _handle_read_text_file(path: str, max_lines: int = 50, ctx=None):
+def _handle_read_text_file(path: str, max_lines: int = 50):
     """读取 ~/Documents 目录下的文本文件（最多 max_lines 行）。
 
     只允许读取 ~/Documents 范围内的文件，拒绝其他路径。
@@ -616,7 +628,7 @@ def _handle_read_text_file(path: str, max_lines: int = 50, ctx=None):
 
 # ── Knowledge（知识库）──
 @_db_handler
-def _handle_ingest_document(db, ctx, file_path: str):
+def _handle_ingest_document(db: Session, file_path: str):
     """将文档导入知识库，同时将原始内容保存到对象存储。
 
     参数:
@@ -639,7 +651,7 @@ def _handle_ingest_document(db, ctx, file_path: str):
 
 
 @_db_handler
-def _handle_search_knowledge(db, ctx, query: str, limit: int = 5):
+def _handle_search_knowledge(db: Session, query: str, limit: int = 5):
     """搜索已导入的文档知识。
 
     参数:
@@ -654,7 +666,7 @@ def _handle_search_knowledge(db, ctx, query: str, limit: int = 5):
 
 
 # ── MCP 集成 ──
-def _handle_search_mcp(ctx=None, goal: str = ""):
+def _handle_search_mcp(goal: str = ""):
     """根据目标搜索匹配的 MCP 候选服务器。
 
     参数:
@@ -669,7 +681,7 @@ def _handle_search_mcp(ctx=None, goal: str = ""):
 
 
 @_db_handler
-def _handle_install_mcp_sandbox(db, ctx, candidate_name: str):
+def _handle_install_mcp_sandbox(db: Session, candidate_name: str):
     """将 MCP 候选服务器安装到沙箱环境。
 
     流程:
@@ -692,7 +704,7 @@ def _handle_install_mcp_sandbox(db, ctx, candidate_name: str):
 
 
 # ── Self-Dev（自进化）──
-def _handle_create_selfdev_plan(ctx=None, goal: str = ""):
+def _handle_create_selfdev_plan(goal: str = ""):
     """生成自进化补丁计划。
 
     参数:
@@ -707,40 +719,40 @@ def _handle_create_selfdev_plan(ctx=None, goal: str = ""):
     return SelfDevPlanner(llm).plan(goal)
 
 
-def _handle_apply_patch_to_inactive_slot(ctx=None):
+def _handle_apply_patch_to_inactive_slot():
     """将补丁应用到非活跃槽位（不影响当前运行版本）。"""
     from aiive.selfdev.patch_executor import PatchExecutor
     return PatchExecutor().apply_to_inactive([])
 
 
-def _handle_promote_slot(ctx=None):
+def _handle_promote_slot():
     """健康检查通过后将非活跃槽位提升为活跃版本。"""
     from aiive.selfdev.promote_rollback import PromoteRollback
     return PromoteRollback().promote()
 
 
-def _handle_rollback_slot(ctx=None):
+def _handle_rollback_slot():
     """回滚到上一个活跃槽位版本。
 
     自动检测当前活跃槽位（A/B），回退到另一个槽位。
     """
     from aiive.selfdev.promote_rollback import PromoteRollback
     pr = PromoteRollback()
-    active = pr._manager.get_active_slot()
+    active = pr.get_active_slot()
     previous = "B" if active == "A" else "A"
     return pr.rollback(previous)
 
 
 # ── Rhythm / Attention（节奏/注意力）──
 @_db_handler
-def _handle_query_rhythm(db, ctx):
+def _handle_query_rhythm(db: Session):
     """获取每日节奏摘要。"""
     from aiive.runtime.rhythm_manager import RhythmManager
     return RhythmManager(db).daily_summary()
 
 
 @_db_handler
-def _handle_query_attention(db, ctx, thread_id: str = ""):
+def _handle_query_attention(db: Session, thread_id: str = ""):
     """获取当前注意力状态。"""
     from aiive.runtime.attention_manager import AttentionManager
     return AttentionManager(db).recompute(thread_id, "query")
@@ -762,37 +774,65 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         # 基础工具
         ("echo", _handle_echo, "回显输入消息", {"message": "str"}, "low", False, False),
         # 提醒 / 任务
-        ("schedule_reminder", _handle_schedule_reminder, "创建定时提醒，立即写入 events 表", {"content": "str", "delay_minutes": "int"}, "low", True, False),
-        ("remind_alert", _handle_remind_alert, "激活到期提醒警报，前端显示确认/延期操作按钮", {"reminder_id": "str"}, "low", False, False),
-        ("confirm_reminder", _handle_confirm_reminder, "确认提醒已完成", {"reminder_id": "str"}, "low", True, False),
-        ("snooze_reminder", _handle_snooze_reminder, "延迟提醒 N 分钟，创建新的延时任务", {"reminder_id": "str", "delay_minutes": "int"}, "low", True, False),
-        ("list_tasks", _handle_list_tasks, "列出所有任务/提醒，status='all'/'pending'/'completed'", {"status": "str"}, "low", False, False),
-        ("cancel_task", _handle_cancel_task, "按 ID 取消任务", {"task_id": "str"}, "low", True, False),
+        ("schedule_reminder", _handle_schedule_reminder, "创建定时提醒，立即写入 events 表",
+         {"content": "str", "delay_minutes": {"type": "int", "description": "默认 1"}}, "low", True, False),
+        ("remind_alert", _handle_remind_alert, "激活到期提醒警报，前端显示确认/延期操作按钮",
+         {"reminder_id": "str"}, "low", False, False),
+        ("confirm_reminder", _handle_confirm_reminder, "确认提醒已完成",
+         {"reminder_id": "str"}, "low", True, False),
+        ("snooze_reminder", _handle_snooze_reminder, "延迟提醒 N 分钟，创建新的延时任务",
+         {"reminder_id": "str", "delay_minutes": {"type": "int", "description": "默认 5"}}, "low", True, False),
+        ("list_tasks", _handle_list_tasks, "列出所有任务/提醒，status='all'/'pending'/'completed'",
+         {"status": {"type": "str", "description": "空或 all=全部; pending/completed 可选"}}, "low", False, False),
+        ("cancel_task", _handle_cancel_task, "按 ID 取消任务",
+         {"task_id": "str"}, "low", True, False),
         ("dismiss_notifications", _handle_dismiss_notifications, "清除未执行的通知（待提醒/提醒中/已延时），将其标记为已取消。已确认和已取消的不受影响", {}, "low", True, False),
         ("show_notifications", _handle_show_notifications, "显示已触发的通知", {}, "low", False, False),
         # 记忆管理
-        ("remember_or_update", _handle_remember_or_update, "记住或更新用户信息。使用一致的 memory_key（如 'user.name'、'user.pref'），同 key 自动覆盖旧记忆", {"content": "str", "memory_type": "str", "memory_key": "str"}, "low", True, False),
-        ("forget_memory", _handle_forget_memory, "遗忘/删除记忆：按 ID、memory_key、主题，或使用 scope=all 清空全部", {"memory_id": "str", "reason": "str", "scope": "str", "target": "str"}, "medium", True, False),
+        ("remember_or_update", _handle_remember_or_update,
+        "记住或更新用户信息（长期记忆）。用一致的 memory_key 写入，同 key 自动覆盖旧记忆。\n"
+        + MEMORY_KEY_GUIDE,
+         {
+             "content": {"type": "str", "description": "身份键(user.name/user.display_name/agent.display_name/agent.persona.*)的 content 只填纯值"},
+             "memory_type": {"type": "str", "description": "user_profile / agent_self / preference 等"},
+             "memory_key": {"type": "str", "description": "稳定键: user.name/user.display_name/agent.display_name/agent.persona.relationship/user.preference.<topic>，同 key 自动覆盖"},
+         }, "low", True, False),
+        ("forget_memory", _handle_forget_memory, "遗忘/删除记忆：按 ID、memory_key、主题，或使用 scope=all 清空全部",
+         {"memory_id": {"type": "str", "description": "scope=memory_id 时必填"},
+          "reason": {"type": "str", "description": "可选"},
+          "scope": {"type": "str", "description": "memory_id / memory_key / topic / all"},
+          "target": {"type": "str", "description": "scope=memory_key 或 topic 时必填"}}, "medium", True, False),
         ("run_memory_maintenance", _handle_run_memory_maintenance, "扫描并报告记忆健康状况", {}, "low", False, False),
-        ("search_memory", _handle_search_memory, "按内容文本搜索记忆，需要非空查询词", {"query": "str"}, "low", False, False),
+        ("search_memory", _handle_search_memory, "按内容文本搜索记忆，需要非空查询词",
+         {"query": {"type": "str", "description": "非空"}}, "low", False, False),
         ("list_memories", _handle_list_memories, "列出所有活跃记忆（无过滤）", {}, "low", False, False),
         # 文件操作
-        ("safe_delete", _handle_safe_delete, "在允许范围内安全删除文件", {"path": "str", "scope_id": "str", "mode": "str"}, "high", True, True),
-        ("read_text_file", _handle_read_text_file, "读取 ~/Documents 下的文本文件（最多 50 行）", {"path": "str", "max_lines": "int"}, "low", False, False),
+        ("safe_delete", _handle_safe_delete, "在允许范围内安全删除文件",
+         {"path": "str",
+          "scope_id": {"type": "str", "description": "默认 test_artifacts"},
+          "mode": {"type": "str", "description": "trash / quarantine / hard_delete_for_test_only"}}, "high", True, True),
+        ("read_text_file", _handle_read_text_file, "读取 ~/Documents 下的文本文件（最多 50 行）",
+         {"path": {"type": "str", "description": "限 ~/Documents"}, "max_lines": {"type": "int", "description": "默认 50"}}, "low", False, False),
         # 知识库
-        ("ingest_document", _handle_ingest_document, "导入文档到知识库", {"file_path": "str"}, "low", True, False),
-        ("search_knowledge", _handle_search_knowledge, "搜索已导入的文档", {"query": "str", "limit": "int"}, "low", False, False),
+        ("ingest_document", _handle_ingest_document, "导入文档到知识库",
+         {"file_path": "str"}, "low", True, False),
+        ("search_knowledge", _handle_search_knowledge, "搜索已导入的文档",
+         {"query": "str", "limit": {"type": "int", "description": "默认 5"}}, "low", False, False),
         # MCP 集成
-        ("search_mcp", _handle_search_mcp, "按目标搜索 MCP 候选服务器", {"goal": "str"}, "low", False, False),
-        ("install_mcp_sandbox", _handle_install_mcp_sandbox, "将 MCP 安装到沙箱", {"candidate_name": "str"}, "medium", True, False),
+        ("search_mcp", _handle_search_mcp, "按目标搜索 MCP 候选服务器",
+         {"goal": "str"}, "low", False, False),
+        ("install_mcp_sandbox", _handle_install_mcp_sandbox, "将 MCP 安装到沙箱",
+         {"candidate_name": "str"}, "medium", True, False),
         # 自进化
-        ("create_selfdev_plan", _handle_create_selfdev_plan, "生成自进化补丁计划", {"goal": "str"}, "low", False, False),
+        ("create_selfdev_plan", _handle_create_selfdev_plan, "生成自进化补丁计划",
+         {"goal": "str"}, "low", False, False),
         ("apply_patch_to_inactive_slot", _handle_apply_patch_to_inactive_slot, "仅将补丁应用到非活跃槽位", {}, "high", True, False),
         ("promote_slot", _handle_promote_slot, "健康检查通过后提升非活跃槽位为活跃", {}, "high", True, False),
         ("rollback_slot", _handle_rollback_slot, "回滚到上一个活跃槽位", {}, "high", True, False),
         # 节奏 / 注意力
         ("query_rhythm", _handle_query_rhythm, "获取每日节奏摘要", {}, "low", False, False),
-        ("query_attention", _handle_query_attention, "获取当前注意力状态", {"thread_id": "str"}, "low", False, False),
+        ("query_attention", _handle_query_attention, "获取当前注意力状态",
+         {"thread_id": {"type": "str", "description": "可选, 默认当前线程"}}, "low", False, False),
     ]
 
     for cap_id, handler, desc, params, risk, writes_ext, can_del in tools:

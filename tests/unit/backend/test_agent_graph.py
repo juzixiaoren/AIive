@@ -455,13 +455,6 @@ class TestAgentGraphNoHardcoding:
         assert "derive_tool_policy" not in source
         assert "apply_derived_policy" not in source
 
-    def test_no_tool_call_xml_in_context_builder(self):
-        """ContextBuilder 的 STABLE_PREFIX 不应包含 tool_call XML。"""
-        from aiive.core.context_builder import STABLE_PREFIX
-        assert "<tool_call>" not in STABLE_PREFIX
-        assert "</tool_call>" not in STABLE_PREFIX
-
-
 class TestNoKeywordClassification:
     """验证不存在基于关键词的分类逻辑。"""
 

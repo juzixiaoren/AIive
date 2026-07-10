@@ -6,7 +6,7 @@ MCP 服务发现模块：管理和搜索 MCP（Model Context Protocol）服务�
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any
 
 
 @dataclass
@@ -37,7 +37,7 @@ class MCPServerCandidate:
     descriptor_hash: str = ""
 
 
-def _compute_hash(candidate: dict) -> str:
+def _compute_hash(candidate: dict[str, Any]) -> str:
     """计算候选条目的 SHA256 哈希（取前 16 位）。
 
     参数:
@@ -51,7 +51,7 @@ def _compute_hash(candidate: dict) -> str:
 
 
 # 内置 MCP 目录（模拟注册表）
-_BUILTIN_CATALOG: list[dict] = [
+_BUILTIN_CATALOG: list[dict[str, Any]] = [
     {
         "name": "@modelcontextprotocol/server-filesystem",
         "source": "official_registry",
