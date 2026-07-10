@@ -8,6 +8,7 @@ import logging
 
 from aiive.supervisor.health_probe import HealthProbe
 from aiive.supervisor.slot_manager import SlotManager
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -22,10 +23,10 @@ class Launcher:
         参数:
             manager: 槽位管理器实例，默认自动创建。
         """
-        self._manager = manager or SlotManager()
-        self._probe = HealthProbe()
+        self._manager: SlotManager = manager or SlotManager()
+        self._probe: HealthProbe = HealthProbe()
 
-    def get_status(self) -> dict:
+    def get_status(self) -> dict[str, Any]:
         """
         获取所有槽位的状态概览。
 
@@ -58,7 +59,7 @@ class Launcher:
             logger.exception("获取槽位状态失败")
             raise
 
-    def health_check(self) -> dict:
+    def health_check(self) -> dict[str, Any]:
         """
         对当前活跃槽位执行健康检查。
 

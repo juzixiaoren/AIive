@@ -6,9 +6,9 @@ bucket/key 模型映射到本地目录结构，方便将来替换为云存储。
 """
 
 import logging
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ class ObjectRef:
     """对象引用，包含 bucket、key 和元数据。"""
     bucket: str  # 存储桶名称
     key: str  # 对象键名
-    metadata: dict = None  # 自定义元数据
+    metadata: dict[str, Any] | None = None  # 自定义元数据
 
     def __post_init__(self):
         if self.metadata is None:
@@ -33,7 +33,7 @@ class ObjectRef:
         return ROOT / self.bucket / self.key
 
 
-def put_text(bucket: str, key: str, text: str, metadata: dict | None = None) -> ObjectRef:
+def put_text(bucket: str, key: str, text: str, metadata: dict[str, Any] | None = None) -> ObjectRef:
     """
     存储文本内容为对象。
 
@@ -52,7 +52,7 @@ def put_text(bucket: str, key: str, text: str, metadata: dict | None = None) -> 
     return ref
 
 
-def put_bytes(bucket: str, key: str, data: bytes, metadata: dict | None = None) -> ObjectRef:
+def put_bytes(bucket: str, key: str, data: bytes, metadata: dict[str, Any] | None = None) -> ObjectRef:
     """
     存储二进制内容为对象。
 

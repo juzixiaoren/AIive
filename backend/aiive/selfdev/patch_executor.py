@@ -6,12 +6,11 @@
 执行前会从活跃槽位复制 manifest 和 app 目录到非活跃槽位，确保变更隔离。
 """
 
-import json
 import logging
 import shutil
-from pathlib import Path
 
 from aiive.supervisor.slot_manager import SlotManager
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -26,17 +25,16 @@ class PatchExecutor:
         参数:
             manager: 槽位管理器实例，默认自动创建。
         """
-        self._manager = manager or SlotManager()
+        self._manager: SlotManager = manager or SlotManager()
 
     def apply_to_inactive(
-        self, operations: list[dict], base_dir: Path | None = None
-    ) -> dict:
+        self, operations: list[dict[str, Any]]
+    ) -> dict[str, Any]:
         """
         将活跃槽位的 manifest 和 app 目录复制到非活跃槽位，然后应用操作列表。
 
         参数:
             operations: 操作列表，每项包含 operation、target_file、content 等字段。
-            base_dir: 槽位基础目录，默认使用 SlotManager 的 _base_dir。
 
         返回:
             包含 active_slot、inactive_slot、operations_applied、
@@ -50,8 +48,6 @@ class PatchExecutor:
         inactive_slot = next((s for s in slots if s.name == inactive_name), None)
         if not active_slot or not inactive_slot:
             return {"ok": False, "error": "Slots not initialized"}
-
-        root = base_dir or self._manager._base_dir
 
         # 第一步：从活跃槽位复制 manifest 到非活跃槽位
         src_manifest = active_slot.root / "version_manifest.json"

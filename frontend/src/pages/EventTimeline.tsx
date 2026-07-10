@@ -70,10 +70,10 @@ export default function EventTimeline({ traceId }: { traceId?: string }) {
 
   return (
     <div>
-      <h2 className="text-lg font-semibold text-slate-800 mb-1">事件时间线</h2>
-      {traceId && <p className="text-xs text-slate-400 mb-4 font-mono">trace_id: {traceId}</p>}
+      <h2 className="text-lg font-semibold text-content mb-1">事件时间线</h2>
+      {traceId && <p className="text-xs text-faint mb-4 font-mono">trace_id: {traceId}</p>}
       {events.length === 0 && (
-        <div className="text-center text-slate-400 text-sm py-12">暂无事件</div>
+        <div className="text-center text-faint text-sm py-12">暂无事件</div>
       )}
       <div className="flex flex-col gap-1">
         {events.map(e => {
@@ -83,24 +83,24 @@ export default function EventTimeline({ traceId }: { traceId?: string }) {
             <div
               key={e.id}
               onClick={() => canExpand ? setExpandedId(isOpen ? null : e.id) : undefined}
-              className={`py-2 border-b border-slate-100 text-sm px-2 rounded ${canExpand ? "cursor-pointer hover:bg-slate-50" : ""}`}
+              className={`py-2 border-b border-surface-muted text-sm px-2 rounded ${canExpand ? "cursor-pointer hover:bg-background" : ""}`}
             >
               <div className="flex gap-3 items-start">
                 {/* 时间戳（仅显示 HH:MM:SS） */}
-                <span className="text-slate-400 w-16 shrink-0 font-mono text-xs pt-0.5">{e.created_at?.slice(11, 19)}</span>
+                <span className="text-faint w-16 shrink-0 font-mono text-xs pt-0.5">{e.created_at?.slice(11, 19)}</span>
                 {/* 事件类型标签 */}
-                <span className="bg-slate-100 px-2 py-0.5 rounded text-xs font-mono text-slate-600 shrink-0">
+                <span className="bg-surface-muted px-2 py-0.5 rounded text-xs font-mono text-code shrink-0">
                   {TYPE_LABELS[e.event_type] || e.event_type}
                 </span>
                 {/* 事件可读摘要 */}
-                <span className="text-slate-500 truncate text-xs pt-0.5 flex-1 min-w-0">{describe(e)}</span>
+                <span className="text-muted truncate text-xs pt-0.5 flex-1 min-w-0">{describe(e)}</span>
                 {canExpand && (
-                  <span className="text-[11px] text-slate-400 shrink-0">{isOpen ? "收起" : "详情"}</span>
+                  <span className="text-[11px] text-faint shrink-0">{isOpen ? "收起" : "详情"}</span>
                 )}
               </div>
               {/* 展开后的完整 payload */}
               {isOpen && canExpand && (
-                <pre className="mt-2 ml-20 text-[11px] text-slate-600 bg-slate-50 rounded-lg px-3 py-2 whitespace-pre-wrap break-all font-mono leading-relaxed max-h-80 overflow-auto">
+                <pre className="mt-2 ml-20 text-[11px] text-code bg-background rounded-lg px-3 py-2 whitespace-pre-wrap break-all font-mono leading-relaxed max-h-80 overflow-auto">
                   {JSON.stringify(e.payload, null, 2)}
                 </pre>
               )}

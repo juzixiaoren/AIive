@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from aiive.db.models import Document, Chunk
 from aiive.knowledge.chunker import chunk_text
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +28,9 @@ class KnowledgeIngestor:
         参数:
             db: SQLAlchemy 数据库会话。
         """
-        self._db = db
+        self._db: Session = db
 
-    def ingest(self, file_path: str) -> dict:
+    def ingest(self, file_path: str) -> dict[str, Any]:
         """
         摄取单个文件：读取、去重、分块、入库。
 
@@ -106,7 +107,7 @@ class KnowledgeIngestor:
             raise
 
 
-def search_chunks(db: Session, query: str, limit: int = 5) -> list[dict]:
+def search_chunks(db: Session, query: str, limit: int = 5) -> list[dict[str, Any]]:
     """
     基于关键词在数据库中进行全文检索（ILIKE）。
 

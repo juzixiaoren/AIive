@@ -7,7 +7,7 @@
 RunContext 通过 _make_handler 闭包捕获 → registry.execute() 注入 handler，
 全程不经过 LLM tool schema，模型不可见。
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass

@@ -5,7 +5,7 @@ MCP 安装器：管理 MCP（Model Context Protocol）服务器的沙箱安装�
 
 import hashlib
 import json
-from typing import Optional
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -31,8 +31,8 @@ def install_sandbox(
     version: str,
     transport: str,
     declared_tools: list[str],
-    definition: dict,
-) -> dict:
+    definition: dict[str, Any],
+) -> dict[str, Any]:
     """将 MCP 候选服务器安装到沙箱环境。
 
     流程：
@@ -116,8 +116,8 @@ def install_sandbox(
 def run_smoke(
     db: Session,
     capability_id: str,
-    smoke_result: dict,
-) -> dict:
+    smoke_result: dict[str, Any],
+) -> dict[str, Any]:
     """对沙箱中的 MCP 能力运行冒烟测试。
 
     冒烟测试通过 -> 状态变为 active

@@ -3,23 +3,19 @@
 记忆系统是 AIive 的核心组件，负责 Agent 的长期记忆管理和检索。
 本模块负责从对话中提取结构化记忆，输出 ExtractedMemory 并进行语义键解析。
 
-语义键解析示例：
-- "以后叫我B" → user.display_name（用户显示名）
-- "以后你叫千早爱音" → agent.display_name（Agent 显示名）
-- "我的真实姓名是李光悦" → user.name（用户真实姓名）
-- "我喜欢你回答简洁一点" → user.preference.response_style（回复风格偏好）
-- "你以后说话活泼一点" → agent.persona.tone（Agent 语气人格）
-- "AIive 后端用 FastAPI" → project.aiive.backend_stack（项目技术栈）
+记忆键规范（单一事实来源）见 aiive.memory.memory_types.MEMORY_KEY_GUIDE，
+EXTRACT_PROMPT 直接引用它，避免键映射在多处重复维护。
 """
 
 import json
 import logging
-from typing import Any, Sequence
+from typing import Any
 
 from json_repair import repair_json
 from pydantic import BaseModel, Field
 
 from aiive.core.llm_client import LLMClient, LLMResponse
+from aiive.memory.memory_types import MEMORY_KEY_GUIDE
 
 logger = logging.getLogger(__name__)
 
@@ -54,24 +50,17 @@ EXTRACT_PROMPT = """从对话中提取关于用户的持久性个人信息和偏
     policy（规则、约束、要求）
     procedural（用户建立的工作流、流程、操作指南）
     episodic（值得记住的一次性事件或对话）
-- memory_key: 用于去重的稳定键，使用点号表示法：
-    user.name, user.display_name → 用户身份
-    agent.display_name → Agent 身份
-    user.preference.response_style → 交互偏好
-    user.preference.<topic> → 特定偏好
-    agent.persona.tone → Agent 语气
-    project.<name>.<aspect> → 项目信息
+- memory_key: 用于去重的稳定键，规范见下方『记忆键规范』，使用其中列出的键
 - confidence: 0.0-1.0（你对这是持久事实的确定程度）
 - source_span: 用户消息中包含该事实的原始句子或短语
 
-重要规则：
-- "以后叫我B" → memory_key=user.display_name，而非 user.name（除非明确说"真实姓名"）
-- "我的真实姓名是X" → memory_key=user.name
-- "以后你叫千早爱音" → memory_key=agent.display_name
-- "我喜欢你回答简洁一点" → memory_key=user.preference.response_style
-- "我的代码报错了" → 不要提取（暂时性情况，非持久事实）
-- "今天好累" → 不要提取（暂时性感受）
+记忆键规范：
+""" + MEMORY_KEY_GUIDE + """
+
+重要规则（提取行为，与键规范互补）：
 - 只提取用户明确陈述的信息，不要推断或猜测
+- 身份类记忆的 content 必须是【纯值】，不要带主语或整句（如"以后叫我博士" → content="博士"）
+- "我的代码报错了""今天好累" 等暂时性情况不要提取
 - 如果没有任何可提取的内容，返回空数组 []
 
 对话内容：
@@ -98,7 +87,7 @@ class MemoryExtractor:
         Args:
             llm_client: LLM 客户端实例，用于调用大模型。
         """
-        self._llm_client = llm_client
+        self._llm_client: LLMClient = llm_client
 
     def extract(
         self, user_message: str, reply: str, trace_id: str | None = None

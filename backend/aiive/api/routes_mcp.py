@@ -63,7 +63,7 @@ def list_capabilities(state: str = "candidate"):
     """
     try:
         all_candidates = search_mcp_candidates("")
-        return [
+        items = [
             {
                 "capability_id": f"mcp:{c.name}",
                 "name": c.name,
@@ -75,6 +75,9 @@ def list_capabilities(state: str = "candidate"):
             }
             for c in all_candidates
         ]
+        if state != "candidate":
+            items = [it for it in items if it["state"] == state]
+        return items
     except Exception:
         logger.exception("获取能力列表失败")
         raise

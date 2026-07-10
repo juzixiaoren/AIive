@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import DateTime, ForeignKey, Index, JSON, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from typing import Any
 
 
 class Base(DeclarativeBase):
@@ -29,7 +30,7 @@ def _new_uuid() -> str:
 
 class Thread(Base):
     """对话线程模型：代表一个完整的对话会话。"""
-    __tablename__ = "threads"
+    __tablename__: str = "threads"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -47,27 +48,27 @@ class Thread(Base):
 
 class Event(Base):
     """事件模型：记录对话中的各类事件（用户消息、工具调用、系统事件等）。"""
-    __tablename__ = "events"
+    __tablename__: str = "events"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     trace_id: Mapped[str] = mapped_column(String(36), index=True)
     thread_id: Mapped[str] = mapped_column(String(36), ForeignKey("threads.id"), index=True)
     event_type: Mapped[str] = mapped_column(String(64), index=True)
-    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
 
     thread: Mapped["Thread"] = relationship(back_populates="events")
 
-    __table_args__ = (
+    __table_args__: tuple[Index, ...] = (
         Index("ix_events_thread_created", "thread_id", "created_at"),
     )
 
 
 class LLMCall(Base):
     """LLM 调用记录模型：记录每次大模型 API 调用的元信息。"""
-    __tablename__ = "llm_calls"
+    __tablename__: str = "llm_calls"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     trace_id: Mapped[str] = mapped_column(String(36), index=True)
@@ -85,28 +86,28 @@ class LLMCall(Base):
 
 class ContextSnapshot(Base):
     """上下文快照模型：保存每次对话的上下文构建结果，用于调试和审计。"""
-    __tablename__ = "context_snapshots"
+    __tablename__: str = "context_snapshots"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     trace_id: Mapped[str] = mapped_column(String(36), index=True)
     thread_id: Mapped[str] = mapped_column(String(36), ForeignKey("threads.id"), index=True)
     stable_prefix_hash: Mapped[str] = mapped_column(String(32))
-    context_items: Mapped[list[dict]] = mapped_column(JSON, default=list)
-    meta: Mapped[dict] = mapped_column(JSON, default=dict)
+    context_items: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    meta: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
 
     thread: Mapped["Thread"] = relationship(back_populates="context_snapshots")
 
-    __table_args__ = (
+    __table_args__: tuple[Index, ...] = (
         Index("ix_snapshots_trace", "trace_id", "thread_id"),
     )
 
 
 class MemoryRecord(Base):
     """记忆记录模型：持久化存储用户的各类记忆，支持生命周期管理和版本控制。"""
-    __tablename__ = "memory_records"
+    __tablename__: str = "memory_records"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     memory_type: Mapped[str] = mapped_column(String(64), index=True)
@@ -132,7 +133,7 @@ class MemoryRecord(Base):
 
 class Capability(Base):
     """能力注册模型：记录 Agent 的各类能力及其状态。"""
-    __tablename__ = "capabilities"
+    __tablename__: str = "capabilities"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     capability_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
@@ -141,7 +142,7 @@ class Capability(Base):
         String(32), default="candidate", index=True
     )
     descriptor_hash: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    definition: Mapped[dict] = mapped_column(JSON, default=dict)
+    definition: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
@@ -152,14 +153,14 @@ class Capability(Base):
 
 class CapabilityVersion(Base):
     """能力版本模型：记录每个能力的版本变更历史。"""
-    __tablename__ = "capability_versions"
+    __tablename__: str = "capability_versions"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     capability_id: Mapped[str] = mapped_column(String(36), ForeignKey("capabilities.id"), index=True)
     version: Mapped[str] = mapped_column(String(64))
     descriptor_hash: Mapped[str] = mapped_column(String(32))
     tool_list_hash: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    smoke_result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    smoke_result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
@@ -167,7 +168,7 @@ class CapabilityVersion(Base):
 
 class MCPInstallRecord(Base):
     """MCP 安装记录模型：记录 MCP 服务器的安装信息。"""
-    __tablename__ = "mcp_install_records"
+    __tablename__: str = "mcp_install_records"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     capability_id: Mapped[str] = mapped_column(String(36), ForeignKey("capabilities.id"), index=True)
@@ -175,7 +176,7 @@ class MCPInstallRecord(Base):
     package_ref: Mapped[str] = mapped_column(String(256))
     version: Mapped[str] = mapped_column(String(64))
     transport: Mapped[str] = mapped_column(String(32))
-    declared_tools: Mapped[list] = mapped_column(JSON, default=list)
+    declared_tools: Mapped[list[Any]] = mapped_column(JSON, default=list)
     sandbox_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
@@ -184,14 +185,14 @@ class MCPInstallRecord(Base):
 
 class SelfDevRequest(Base):
     """自进化请求模型：Agent 自行提出的代码修改请求。"""
-    __tablename__ = "selfdev_requests"
+    __tablename__: str = "selfdev_requests"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     trace_id: Mapped[str] = mapped_column(String(36), index=True)
     source_event_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="proposed")
     goal: Mapped[str] = mapped_column(Text)
-    plan: Mapped[dict] = mapped_column(JSON, default=dict)
+    plan: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
@@ -199,7 +200,7 @@ class SelfDevRequest(Base):
 
 class PatchOperation(Base):
     """补丁操作模型：记录自进化请求对应的代码修改操作。"""
-    __tablename__ = "patch_operations"
+    __tablename__: str = "patch_operations"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     request_id: Mapped[str] = mapped_column(String(36), ForeignKey("selfdev_requests.id"), index=True)
@@ -217,13 +218,13 @@ class PatchOperation(Base):
 
 class OutboxJob(Base):
     """发件箱任务模型：用于异步任务调度，支持重试和幂等。"""
-    __tablename__ = "outbox_jobs"
+    __tablename__: str = "outbox_jobs"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     operation_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
     job_type: Mapped[str] = mapped_column(String(64), index=True)
     status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
-    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     trace_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     retry_count: Mapped[int] = mapped_column(default=0)
     max_retries: Mapped[int] = mapped_column(default=3)
@@ -238,7 +239,7 @@ class OutboxJob(Base):
 
 class Document(Base):
     """文档模型：记录已导入的知识文档元信息。"""
-    __tablename__ = "documents"
+    __tablename__: str = "documents"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     source_path: Mapped[str] = mapped_column(String(512))
@@ -250,7 +251,7 @@ class Document(Base):
 
 class Chunk(Base):
     """文档分块模型：存储文档的语义分块内容。"""
-    __tablename__ = "chunks"
+    __tablename__: str = "chunks"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     document_id: Mapped[str] = mapped_column(String(36), ForeignKey("documents.id"), index=True)
@@ -264,7 +265,7 @@ class Chunk(Base):
 
 class RetrievalRun(Base):
     """检索运行模型：记录每次知识检索的执行信息。"""
-    __tablename__ = "retrieval_runs"
+    __tablename__: str = "retrieval_runs"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     trace_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
@@ -275,7 +276,7 @@ class RetrievalRun(Base):
 
 class RetrievalCandidate(Base):
     """检索候选模型：记录每次检索返回的候选文档块。"""
-    __tablename__ = "retrieval_candidates"
+    __tablename__: str = "retrieval_candidates"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     run_id: Mapped[str] = mapped_column(String(36), ForeignKey("retrieval_runs.id"), index=True)
@@ -287,7 +288,7 @@ class RetrievalCandidate(Base):
 
 class ForgetRequest(Base):
     """遗忘请求模型：记录用户要求删除特定记忆的请求。"""
-    __tablename__ = "forget_requests"
+    __tablename__: str = "forget_requests"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     memory_id: Mapped[str] = mapped_column(String(36), index=True)
@@ -298,7 +299,7 @@ class ForgetRequest(Base):
 
 class Task(Base):
     """任务模型：记录定时任务、提醒、条件检查等异步任务。"""
-    __tablename__ = "tasks"
+    __tablename__: str = "tasks"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     task_type: Mapped[str] = mapped_column(String(32), index=True)
@@ -315,12 +316,12 @@ class Task(Base):
 
 class AttentionState(Base):
     """注意力状态模型：记录 Agent 在每个线程中的关注焦点和决策状态。"""
-    __tablename__ = "attention_states"
+    __tablename__: str = "attention_states"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     thread_id: Mapped[str] = mapped_column(String(36), index=True)
     focus_topic: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    recent_topics: Mapped[list] = mapped_column(JSON, default=list)
+    recent_topics: Mapped[list[Any]] = mapped_column(JSON, default=list)
     decision: Mapped[str] = mapped_column(String(32), default="continue")
     suggestion: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

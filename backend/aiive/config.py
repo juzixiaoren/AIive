@@ -4,12 +4,14 @@
 - 提供统一的 Settings 单例，供整个后端项目引用
 - 涵盖 LLM、数据库、服务器和应用元信息等配置项
 """
+from typing import ClassVar
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     """应用配置类：从 .env 文件和环境变量加载所有配置项，提供类型校验和默认值。"""
-    model_config = SettingsConfigDict(
+    model_config: ClassVar[SettingsConfigDict] = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",

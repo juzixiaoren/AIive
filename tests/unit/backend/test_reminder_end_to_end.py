@@ -1,6 +1,7 @@
 """提醒功能的端到端测试：无需 60 秒等待，使用过期时间模拟任务触发。"""
 
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 from aiive.db.models import Event
 from aiive.runtime.task_manager import TaskManager
@@ -10,8 +11,12 @@ from aiive.worker.task_worker import TaskWorker
 class TestReminderEndToEnd:
     """测试提醒从创建到触发的完整端到端流程。"""
 
-    def test_create_task_and_worker_fires_notification(self, db_session):
-        """创建过期任务后，Worker 应触发通知事件并标记任务为完成。"""
+    @patch("aiive.runtime.agent_graph.ChatOpenAI", side_effect=Exception("llm unavailable in test"))
+    def test_create_task_and_worker_fires_notification(self, mock_chat, db_session):
+        """创建过期任务后，Worker 应触发通知事件并标记任务为完成。
+
+        LLM 不可用（强制回退路径），确保测试不依赖外部 LLM 可达性。
+        """
         # 1. 创建过期任务（模拟 5 分钟之前）
         past = datetime.now(timezone.utc) - timedelta(minutes=5)
         mgr = TaskManager(db_session)

@@ -7,9 +7,8 @@
 import logging
 import os
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -191,7 +190,7 @@ def safe_delete(
     if scope_root is None:
         return DeleteDecision(
             allowed=False,
-            reason=f"Unknown scope: {scope_id}",
+            reason=f"Any scope: {scope_id}",
             resolved_path=resolved_str,
         )
 
@@ -240,7 +239,7 @@ def safe_delete(
         else:
             return DeleteDecision(
                 allowed=False,
-                reason=f"Unknown mode: {mode}",
+                reason=f"Any mode: {mode}",
                 resolved_path=resolved_str,
             )
 

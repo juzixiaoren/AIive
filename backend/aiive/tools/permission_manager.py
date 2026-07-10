@@ -4,6 +4,7 @@
 """
 
 from aiive.tools.registry import ToolRegistry
+from typing import Any
 
 
 class PermissionManager:
@@ -21,7 +22,7 @@ class PermissionManager:
         参数:
             registry: 工具注册表实例，用于查询工具的安全配置
         """
-        self._registry = registry
+        self._registry: ToolRegistry = registry
 
     def can_trigger_from(self, capability_id: str, instruction_source: str) -> bool:
         """检查指定指令来源是否有权限触发该工具。
@@ -42,7 +43,7 @@ class PermissionManager:
         self,
         capability_id: str,
         instruction_source: str,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """执行权限检查，返回详细的检查结果。
 
         参数:

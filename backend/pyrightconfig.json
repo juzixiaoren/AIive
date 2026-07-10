@@ -1,0 +1,17 @@
+{
+  "reportImportCycles": "none",
+  "reportCallInDefaultInitializer": "none",
+  "reportUnknownMemberType": "none",
+  "reportUnknownArgumentType": "none",
+  "reportMissingTypeStubs": "none",
+  "reportAny": "none",
+  "reportExplicitAny": "none",
+  "reportUntypedFunctionDecorator": "none",
+  "reportUnknownVariableType": "none",
+  "reportUnknownParameterType": "none",
+  "reportUnusedCallResult": "none",
+  "reportMissingModuleSource": "none",
+  "exclude": [
+    "alembic/versions"
+  ]
+}

@@ -5,10 +5,12 @@
 采用按行累加的方式，确保每块不超过指定字符数，同时尽量保持行的完整性。
 """
 
+from typing import Any
+
 CHUNK_SIZE = 500  # 每个块的默认字符数
 
 
-def chunk_text(text: str, chunk_size: int = CHUNK_SIZE) -> list[dict]:
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE) -> list[dict[str, Any]]:
     """
     将文本按行分割为多个块。
 

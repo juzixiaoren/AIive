@@ -15,6 +15,7 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 
 from aiive.db.models import MemoryRecord
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,7 @@ class MemoryProjection:
         Args:
             db: 数据库会话。
         """
-        self._db = db
+        self._db: Session = db
 
     def to_markdown(self) -> str:
         """将所有活跃记忆导出为 Markdown 格式。
@@ -54,7 +55,7 @@ class MemoryProjection:
             lines.append(f"- [{r.memory_type}] {r.content} (confidence: {r.confidence:.2f})")
         return "\n".join(lines)
 
-    def to_json(self) -> list[dict]:
+    def to_json(self) -> list[dict[str, Any]]:
         """将所有活跃记忆导出为 JSON 可序列化的字典列表。
 
         包含 id、memory_type、content、confidence 和 lineage 字段。
@@ -80,7 +81,7 @@ class MemoryProjection:
             for r in records
         ]
 
-    def write_projection(self, output_dir: Path) -> dict:
+    def write_projection(self, output_dir: Path) -> dict[str, Any]:
         """将活跃记忆以 Markdown 和 JSON 两种格式写入指定目录。
 
         自动创建目标目录（如不存在），生成 memories.md 和 memories.json 两个文件。

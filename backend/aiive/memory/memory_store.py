@@ -10,7 +10,7 @@
 import logging
 
 from datetime import datetime, timezone
-from typing import Optional, Sequence
+from collections.abc import Sequence
 
 from sqlalchemy.orm import Session
 
@@ -32,7 +32,7 @@ class MemoryStore:
         Args:
             db: 数据库会话。
         """
-        self._db = db
+        self._db: Session = db
 
     def create(
         self,
@@ -44,7 +44,6 @@ class MemoryStore:
         lineage: str | None = None,
         pinned: bool = False,
         memory_key: str | None = None,
-        exclusivity: str = "multi_active",
         revision_num: int = 1,
         supersedes: str | None = None,
     ) -> MemoryRecord:
@@ -59,7 +58,6 @@ class MemoryStore:
             lineage: 谱系信息，用于追踪记忆的来源和演化。
             pinned: 是否固定（固定记忆不受自动清理影响）。
             memory_key: 去重用稳定键。
-            exclusivity: 排他性模式（multi_active 或 single_active）。
             revision_num: 修订版本号。
             supersedes: 替代的目标记忆 ID。
 
@@ -103,7 +101,7 @@ class MemoryStore:
             record.lifecycle_state = lifecycle_state
         return record
 
-    def update_content(self, memory_id: str, new_content: str, reason: str = "") -> MemoryRecord | None:
+    def update_content(self, memory_id: str, new_content: str) -> MemoryRecord | None:
         """更新记忆的内容文本。
 
         Args:
@@ -120,7 +118,7 @@ class MemoryStore:
             record.updated_at = datetime.now(timezone.utc)
         return record
 
-    def supersede(self, old_id: str, new_content: str, reason: str = "") -> MemoryRecord | None:
+    def supersede(self, old_id: str, new_content: str) -> MemoryRecord | None:
         """用新内容替代旧记忆。
 
         将旧记录标记为 superseded，创建一条新记录并建立双向关联。
@@ -179,7 +177,7 @@ class MemoryStore:
     def resolve_for_context(self) -> Sequence[MemoryRecord]:
         """获取用于上下文注入的活跃记忆列表。
 
-        只返回活跃且未被替代的记录，供 context_builder 构建对话上下文时使用。
+        只返回活跃且未被替代的记录，供 agent_graph 构建对话上下文（Runtime Identity / User Memory 块）时使用。
 
         Returns:
             可用于上下文的记忆序列。

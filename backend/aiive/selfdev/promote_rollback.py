@@ -9,6 +9,7 @@ import logging
 
 from aiive.supervisor.health_probe import HealthProbe
 from aiive.supervisor.slot_manager import SlotManager
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -23,14 +24,21 @@ class PromoteRollback:
         参数:
             manager: 槽位管理器实例，默认自动创建。
         """
-        self._manager = manager or SlotManager()
-        self._probe = HealthProbe()
+        self._manager: SlotManager = manager or SlotManager()
+        self._probe: HealthProbe = HealthProbe()
 
-    def promote(self) -> dict:
+    def get_active_slot(self) -> str:
+        """返回当前活跃槽位标识（A/B）。"""
+        return self._manager.get_active_slot()
+
+    def promote(self, run_health_check: bool = True) -> dict[str, Any]:
         """
         将非活跃槽位升级为活跃槽位。
 
         流程：先对非活跃槽位执行健康检查，通过后切换活跃指针。
+
+        参数:
+            run_health_check: 是否在切换前执行健康检查，默认 True。
 
         返回:
             包含 ok、previous_active、new_active 的结果字典。
@@ -44,15 +52,16 @@ class PromoteRollback:
         if not inactive_slot:
             return {"ok": False, "error": "Inactive slot not found"}
 
-        # 对非活跃槽位执行健康检查
-        result = self._probe.check(inactive, str(inactive_slot.root))
-        if not result.healthy:
-            return {
-                "ok": False,
-                "error": "Health check failed for inactive slot",
-                "health": result.message,
-                "checks": [c for c in result.checks if not c.get("ok", True)],
-            }
+        # 对非活跃槽位执行健康检查（可跳过）
+        if run_health_check:
+            result = self._probe.check(inactive, str(inactive_slot.root))
+            if not result.healthy:
+                return {
+                    "ok": False,
+                    "error": "Health check failed for inactive slot",
+                    "health": result.message,
+                    "checks": [c for c in result.checks if not c.get("ok", True)],
+                }
 
         # 切换活跃槽位指针
         self._manager.set_active_slot(inactive)
@@ -62,7 +71,7 @@ class PromoteRollback:
             "new_active": inactive,
         }
 
-    def rollback(self, previous_active: str) -> dict:
+    def rollback(self, previous_active: str) -> dict[str, Any]:
         """
         回滚到指定的之前活跃槽位。
 

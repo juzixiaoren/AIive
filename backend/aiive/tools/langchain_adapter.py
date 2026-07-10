@@ -12,11 +12,13 @@ from __future__ import annotations
 from typing import Any
 
 from langchain_core.tools import StructuredTool
+from pydantic import Field
 
+from aiive.context.run_context import RunContext
 from aiive.tools.registry import ToolRegistry
 
 
-def _make_handler(registry: ToolRegistry, capability_id: str, run_context):
+def _make_handler(registry: ToolRegistry, capability_id: str, run_context: RunContext | None):
     """创建包装 ToolRegistry.execute() 的可调用对象。
 
     闭包捕获 run_context，由 registry.execute() 注入 handler 的 ctx 参数，
@@ -31,10 +33,10 @@ def _make_handler(registry: ToolRegistry, capability_id: str, run_context):
         一个可调用函数，签名为 (**params) -> str
     """
 
-    def handler(**params: Any) -> str:
+    def handler(**params: object) -> str:
         result = registry.execute(capability_id, params, "trusted_user_command", run_context)
         if not result.get("ok"):
-            err = result.get("error", "Unknown error")
+            err = result.get("error", "Any error")
             if result.get("approval_required"):
                 err = f"Approval required for {capability_id}"
             import json
@@ -55,7 +57,7 @@ def _make_handler(registry: ToolRegistry, capability_id: str, run_context):
 
 def build_langchain_tools(
     registry: ToolRegistry,
-    run_context=None,
+    run_context: RunContext | None = None,
     visible_tool_ids: list[str] | None = None,
 ) -> list[StructuredTool]:
     """将 ToolRegistry 中的所有（或过滤后的）工具转换为 LangChain StructuredTool 列表。
@@ -85,9 +87,16 @@ def build_langchain_tools(
             continue
 
         params = reg.parameters or {}
-        args_schema = {}
-        for pname, ptype in params.items():
-            args_schema[pname] = _type_str_to_python(ptype)
+        args_schema: dict[str, Any] = {}
+        for pname, pdef in params.items():
+            # 支持两种写法：纯类型字符串（"str"）或带描述的字典（{"type": "str", "description": "..."}）
+            if isinstance(pdef, dict):
+                ptype = pdef.get("type", "str")
+                pdesc = pdef.get("description", "")
+            else:
+                ptype = pdef
+                pdesc = ""
+            args_schema[pname] = (_type_str_to_python(ptype), pdesc)
 
         desc = reg.description
         safety = reg.safety
@@ -134,12 +143,13 @@ def _build_empty_args_schema(name: str) -> type:
     return create_model(f"{name}_args", __base__=BaseModel)
 
 
-def _build_args_schema(name: str, fields: dict[str, type]) -> type:
+def _build_args_schema(name: str, fields: dict[str, tuple[type, str]]) -> type:
     """为工具参数构建 Pydantic 模型（用于 LangChain args_schema）。
 
     参数:
         name: 模型名称前缀
-        fields: {字段名: Python 类型} 的字典
+        fields: {字段名: (Python 类型, 字段描述)} 的字典；字段描述会出现在工具 schema 中，
+                是约束 LLM 传参的主要手段（尤其对 content 这类需要语义约束的参数）。
 
     返回:
         动态创建的 Pydantic BaseModel 子类
@@ -147,17 +157,17 @@ def _build_args_schema(name: str, fields: dict[str, type]) -> type:
     注意:
         对 int 字段启用 strict 模式，拒绝 float → int 的隐式截断（如 0.5 → 0）。
     """
-    from pydantic import BaseModel, ConfigDict, Field, create_model
+    from pydantic import create_model
 
     field_defs: dict[str, Any] = {}
-    for fname, ftype in fields.items():
+    for fname, (ftype, fdesc) in fields.items():
         if ftype is int:
-            field_defs[fname] = (int, Field(default=None, strict=True))
+            field_defs[fname] = (int, Field(default=None, strict=True, description=fdesc))
         elif ftype is float:
-            field_defs[fname] = (float, Field(default=None))
+            field_defs[fname] = (float, Field(default=None, description=fdesc))
         elif ftype is str:
-            field_defs[fname] = (str, Field(default=""))
+            field_defs[fname] = (str, Field(default="", description=fdesc))
         else:
-            field_defs[fname] = (ftype, Field(default=None))
+            field_defs[fname] = (ftype, Field(default=None, description=fdesc))
 
     return create_model(f"{name}_args", **field_defs)
