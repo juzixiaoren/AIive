@@ -1,22 +1,72 @@
 """
-模块功能说明：
-- 轻量级意图提取器，仅用于日志记录和追踪（logging/tracing）
-- 在 LangGraph 重构后，工具调用由 LLM + bind_tools() 原生机制处理
-- 本模块保留用于 outbox 意图提取（memory_extraction、steward_extraction）和日志记录
-- 不做确定性分发逻辑——工具调用由 LLM 通过原生 tool_calls 决定
+ActionPlanner: lightweight structured decision extraction.
+
+- AgentDecision: the main agent's structured output (logging + memory signal)
+- classify_memory_signal(): cheap model call for memory extraction signal
+  (SKIP / EXTRACT_ASYNC / EXTRACT_SYNC). Replaces keyword-based heuristics.
+
+MemorySignalDecision is independent of intent_type and execution_mode.
+Produced by a cheap model call after the main LLM reply.
 """
 
+from __future__ import annotations
+
+import json
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from aiive.core.llm_client import LLMClient
+from aiive.memory.extraction_policy import MemorySignalAction
+
+
+# ============================================================================
+# MemorySignalDecision — model-based extraction signal (not keywords)
+# ============================================================================
+
+
+class MemorySignalDecision(BaseModel):
+    """Model-classified memory extraction signal.
+
+    Produced by classify_memory_signal().
+    No keyword matching, no length heuristics, no hardcoded marker lists.
+    """
+    action: str = Field(default=MemorySignalAction.EXTRACT_ASYNC.value)
+    confidence: float = Field(ge=0.0, le=1.0, default=0.5)
+    reason: str = ""
+
+
+_MEMORY_SIGNAL_PROMPT: str = """Classify whether the following conversation turn contains information worth remembering long-term.
+
+Output ONLY a JSON object:
+{
+  "action": "skip" | "extract_async" | "extract_sync",
+  "confidence": 0.0-1.0,
+  "reason": "brief explanation"
+}
+
+Rules:
+- skip: pure greeting, simple acknowledgement, transient problem report ("my code errored"), small talk, one-off factual question. Do NOT extract.
+- extract_async: contains preferences, facts, habits, project details, or general information that may be useful later. Enqueue for background processing.
+- extract_sync: contains explicit identity changes, policy rules, or critical corrections that must be remembered immediately. Use sparingly.
+
+Conversation:
+User: {user_message}
+Assistant: {reply}
+
+Output ONLY valid JSON, no markdown:"""
+
+
+# ============================================================================
+# AgentDecision — lightweight structured output (logging only)
+# ============================================================================
 
 
 class AgentDecision(BaseModel):
-    """轻量级决策模型，仅用于日志记录和追踪。
+    """Structured decision output — used for logging, NOT for tool dispatch.
 
-    不再用于工具分发——工具分发现在由 LangGraph 原生 tool_calls + policy_check 节点处理。
+    Tool dispatch is handled by LangGraph native tool_calls + policy_check.
+    memory_signal is produced by classify_memory_signal() after main LLM reply.
     """
     decision_type: str = "final_response"
     execution_mode: str = "explain_only"
@@ -29,9 +79,10 @@ class AgentDecision(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0, default=0.5)
     parse_failed: bool = False
     reason: str = ""
+    # Memory extraction signal (model-classified, NOT keyword-based)
+    memory_signal: MemorySignalDecision | None = None
 
     def to_intent_dict(self) -> dict[str, Any]:
-        """将决策信息转换为意图字典，供下游日志模块使用。"""
         return {
             "intent_type": self.intent_type,
             "execution_mode": self.execution_mode,
@@ -42,18 +93,18 @@ class AgentDecision(BaseModel):
         }
 
 
-class ActionPlanner:
-    """最小化规划器：提供意图提取能力，仅用于日志记录。
+# ============================================================================
+# ActionPlanner
+# ============================================================================
 
-    不做工具分发逻辑。主 agent graph（agent_graph.py）通过 LLM + bind_tools() 原生机制处理所有工具调用。
+
+class ActionPlanner:
+    """Lightweight planner: intent extraction (for logging) + memory signal classifier.
+
+    Does NOT perform tool dispatch.
     """
 
     def __init__(self, llm_client: LLMClient):
-        """初始化规划器。
-
-        参数:
-            llm_client: LLM 客户端实例，留作后续可能的使用
-        """
         self._llm: LLMClient = llm_client
 
     def plan(
@@ -63,18 +114,7 @@ class ActionPlanner:
         tool_schemas_text: str = "",
         trace_id: str | None = None,
     ) -> AgentDecision:
-        """提取用户消息的意图信息，仅用于日志记录，不做实际的工具分发。
-
-        参数:
-            user_message: 用户的原始消息内容
-            runtime_identity: 运行时身份信息字典
-            tool_schemas_text: 可用工具 schema 的文本描述
-            trace_id: 追踪 ID
-
-        返回值:
-            AgentDecision: 包含意图类型和执行模式的决策对象
-        """
-        # 简单启发式：没有可用工具 schema 时，直接视为普通对话（仅用于日志追踪）
+        """Extract intent info (logging only)."""
         intent_type = "normal_chat" if not tool_schemas_text else "tool_bound_chat"
         return AgentDecision(
             decision_type="final_response",
@@ -83,7 +123,71 @@ class ActionPlanner:
             should_execute=False,
             tool_name=None,
             reason=(
-                "Intent extraction deferred to LLM native tool_calls "
+                f"Intent extraction deferred to LLM native tool_calls "
                 f"(trace_id={trace_id}, user_message={user_message[:50]!r})"
             ),
         )
+
+    def classify_memory_signal(
+        self,
+        user_message: str,
+        reply: str,
+        trace_id: str | None = None,
+    ) -> MemorySignalDecision:
+        """Use cheap model call to classify memory extraction signal.
+
+        Args:
+            user_message: User's message.
+            reply: Assistant's reply.
+            trace_id: Trace ID.
+
+        Returns:
+            MemorySignalDecision with skip/extract_async/extract_sync.
+        """
+        prompt = _MEMORY_SIGNAL_PROMPT.format(
+            user_message=user_message, reply=reply
+        )
+        messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+
+        try:
+            # Use a cheap model call with low temperature for classification
+            from aiive.core.llm_client import LLMResponse
+            response: LLMResponse = self._llm.chat(
+                messages, trace_id=trace_id, temperature=0.0,
+            )
+            return self._parse_signal(response.content)
+        except Exception:
+            # On failure: default to EXTRACT_ASYNC (conservative)
+            return MemorySignalDecision(
+                action=MemorySignalAction.EXTRACT_ASYNC.value,
+                confidence=0.3,
+                reason="Classifier failed, defaulting to extract_async",
+            )
+
+    @staticmethod
+    def _parse_signal(raw: str) -> MemorySignalDecision:
+        """Parse model output into MemorySignalDecision."""
+        try:
+            text = raw.strip()
+            for fence in ("```json", "```"):
+                if text.startswith(fence):
+                    text = text[len(fence):].strip()
+                if text.endswith("```"):
+                    text = text[:-3].strip()
+            data: dict[str, Any] = json.loads(text)
+            action_raw = str(data.get("action", "extract_async")).lower()
+            # Validate action
+            valid_actions = {a.value for a in MemorySignalAction}
+            if action_raw not in valid_actions:
+                action_raw = MemorySignalAction.EXTRACT_ASYNC.value
+            return MemorySignalDecision(
+                action=action_raw,
+                confidence=float(data.get("confidence", 0.5)),
+                reason=str(data.get("reason", ""))[:200],
+            )
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return MemorySignalDecision(
+                action=MemorySignalAction.EXTRACT_ASYNC.value,
+                confidence=0.3,
+                reason="Parse failed, defaulting to extract_async",
+            )

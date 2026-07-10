@@ -5,18 +5,15 @@
 
 import logging
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import Any
 
 from sqlalchemy.orm import Session
 
 from aiive.db.base import SessionLocal
+from aiive.db.models import Event, Task
 from aiive.runtime.event_logger import EventLogger
 from aiive.runtime.task_manager import TaskManager
 from aiive.runtime.thread_bootstrap import ThreadBootstrapService
-from typing import Any
-
-if TYPE_CHECKING:
-    from aiive.db.models import Task
 
 logger = logging.getLogger(__name__)
 
@@ -105,38 +102,51 @@ class TaskWorker:
         return results
 
     def _wake_agent_for_reminder(self, task: Task, target_thread_id: str):
-        """调用 Agent Loop 处理提醒，让 Agent 在对话线程中主动回复。
+        """委托给模块级函数，保留实例方法以兼容 poll_and_notify 内部调用。"""
+        _wake_agent_for_reminder(task, target_thread_id)
 
-        构造系统提示词，要求 Agent 先调用 remind_alert 工具激活提醒，
-        再以自然语言告知用户。成功后写入 notification_created 事件供前端通知页展示。
 
-        参数:
-            task: 到期任务对象
-            target_thread_id: 目标对话线程 ID
-        """
+def _wake_agent_for_reminder(task: Task, target_thread_id: str):
+    """在独立 DB 会话中运行 AgentGraph 处理提醒，线程安全。
+
+    不使用任何外部传入的会话，全部使用 SessionLocal() 独立管理。
+    可被 scheduler_daemon 的 ThreadPoolExecutor 安全并发调用。
+
+    参数:
+        task: 到期任务对象
+        target_thread_id: 目标对话线程 ID
+    """
+    # 1. 查找 reminder_created 事件（独立短会话）
+    lookup_db = SessionLocal()
+    try:
+        recent_reminders = (
+            lookup_db.query(Event)
+            .filter(Event.event_type == "reminder_created")
+            .order_by(Event.created_at.desc())
+            .limit(20)
+            .all()
+        )
+        reminder_event = next(
+            (e for e in recent_reminders if (e.payload or {}).get("task_id") == task.id),
+            None,
+        )
+        reminder_id = reminder_event.id if reminder_event else ""
+    finally:
+        lookup_db.close()
+
+    # 2. AgentGraph 运行（独立会话）
+    try:
+        from aiive.core.llm_client import default_llm_client
+        from aiive.runtime.agent_graph import AgentGraph, RuntimeEvent
+        from aiive.runtime.thread_bootstrap import ThreadBootstrapService
+        from aiive.api.ws_manager import ws_manager
+
+        ThreadBootstrapService.ensure_committed_thread(target_thread_id)
+        client = default_llm_client()
+
+        agent_db = SessionLocal()
         try:
-            from aiive.core.llm_client import default_llm_client
-            from aiive.runtime.agent_graph import AgentGraph, RuntimeEvent  # 延迟导入避免与 agent_graph 的循环依赖（运行时安全）
-            from aiive.runtime.thread_bootstrap import ThreadBootstrapService
-            from aiive.db.models import Event
-            # 确保目标 thread 已 committed，使 AgentGraph 内工具 handler 可通过 FK 校验
-            ThreadBootstrapService.ensure_committed_thread(target_thread_id)
-            client = default_llm_client()
-            recent_reminders = (
-                self._db.query(Event)
-                .filter(Event.event_type == "reminder_created")
-                .order_by(Event.created_at.desc())
-                .limit(20)
-                .all()
-            )
-            reminder_event = next(
-                (e for e in recent_reminders if (e.payload or {}).get("task_id") == task.id),
-                None,
-            )
-            reminder_id = reminder_event.id if reminder_event else ""
-
-            graph = AgentGraph(client, self._db)
-            # 以结构化 RuntimeEvent 进入图（system 角色渲染），而非伪造 human 消息
+            graph = AgentGraph(client, agent_db)
             event = RuntimeEvent(
                 event_type="reminder",
                 reminder_id=reminder_id,
@@ -146,13 +156,12 @@ class TaskWorker:
             )
             result = graph.run_runtime_event(event, target_thread_id)
             reply_text = result.get("reply", "")
+            agent_db.commit()
             logger.info(
                 "提醒 Agent 唤醒成功: task_id=%s title=%s thread_id=%s",
                 task.id, task.title, target_thread_id,
             )
 
-            # 通过主事件循环安全推送 LLM 回复到前端聊天页
-            from aiive.api.ws_manager import ws_manager
             ws_manager.broadcast_to_thread_sync(
                 target_thread_id,
                 "new_message",
@@ -163,13 +172,16 @@ class TaskWorker:
                     "action_cards": result.get("action_cards", []),
                 },
             )
-        except Exception:
-            logger.exception(
-                "提醒 Agent 唤醒失败，回退为 notification_created: task_id=%s title=%s",
-                task.id, task.title,
-            )
-            event_logger = EventLogger(self._db)
-            event_logger.log_event(
+        finally:
+            agent_db.close()
+    except Exception:
+        logger.exception(
+            "提醒 Agent 唤醒失败，回退为 notification_created: task_id=%s title=%s",
+            task.id, task.title,
+        )
+        fallback_db = SessionLocal()
+        try:
+            EventLogger(fallback_db).log_event(
                 trace_id=task.id,
                 thread_id=target_thread_id,
                 event_type="notification_created",
@@ -181,6 +193,11 @@ class TaskWorker:
                     "status": "alerting",
                 },
             )
+            fallback_db.commit()
+        except Exception:
+            logger.exception("回退事件写入失败")
+        finally:
+            fallback_db.close()
 
 
 def run_once():

@@ -10,6 +10,7 @@ import logging
 import shutil
 
 from aiive.supervisor.slot_manager import SlotManager
+from aiive.tools.safe_delete import get_scope_registry, safe_delete
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -87,8 +88,26 @@ class PatchExecutor:
                         results.append({"ok": False, "file": str(target), "reason": "not found"})
                 elif op_type == "delete_file":
                     if target.exists():
-                        target.unlink()
-                        results.append({"ok": True, "file": str(target), "deleted": True})
+                        # 删除必须走 safe_delete 唯一入口：scope 仅放行 inactive
+                        # 槽位的 app 目录，可拦截 ../ 路径穿越与符号链接删除。
+                        registry = get_scope_registry()
+                        scope_id = f"inactive_slot_app_{inactive_name}"
+                        registry.register(scope_id, inactive_slot.root / "app")
+                        decision = safe_delete(
+                            str(target), scope_id, mode="trash", registry=registry
+                        )
+                        if decision.allowed:
+                            results.append(
+                                {"ok": True, "file": str(target), "deleted": True}
+                            )
+                        else:
+                            results.append(
+                                {
+                                    "ok": False,
+                                    "file": str(target),
+                                    "reason": decision.reason,
+                                }
+                            )
                     else:
                         results.append({"ok": False, "file": str(target), "reason": "not found"})
                 else:

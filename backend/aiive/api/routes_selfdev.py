@@ -92,7 +92,7 @@ def create_plan(request: PlanRequest, db: Session = Depends(get_db)):
             risk_notes=op.get("risk_notes", ""),
             requires_schema_change=op.get("requires_schema_change", False),
             safe_delete_scope=op.get("safe_delete_scope"),
-            not_allowed_yet=op.get("not_allowed_yet", True),
+            not_allowed_yet=op.get("not_allowed_yet", False),
         )
         db.add(patch)
 

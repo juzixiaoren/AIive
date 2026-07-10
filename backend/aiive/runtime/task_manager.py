@@ -88,6 +88,20 @@ class TaskManager:
             .all()
         )
 
+    def next_due_at(self) -> datetime | None:
+        """获取最早待处理任务的到期时间，用于精确调度。
+
+        Returns:
+            最早到期时间，无待处理任务时返回 None
+        """
+        task = (
+            self._db.query(Task)
+            .filter(Task.status == "pending")
+            .order_by(Task.next_check_at.asc())
+            .first()
+        )
+        return task.next_check_at if task else None
+
     def check_now(self, task_id: str) -> dict[str, Any]:
         """立即检查并处理指定任务。
 
