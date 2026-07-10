@@ -20,6 +20,10 @@ def invoke_chat(message: str, thread_id: str | None = None) -> dict[str, Any]:
     Returns:
         包含 reply、thread_id、trace_id、action_cards 等的字典
     """
+    import logging
+    _log = logging.getLogger(__name__)
+    _log.info("[TRACE:invoke_chat] ENTER message=%s thread_id=%s", message[:50], thread_id)
+
     from aiive.core.llm_client import default_llm_client
     from aiive.runtime.agent_graph import AgentGraph
     from aiive.db.base import SessionLocal
@@ -28,6 +32,9 @@ def invoke_chat(message: str, thread_id: str | None = None) -> dict[str, Any]:
     try:
         client = default_llm_client()
         graph = AgentGraph(client, db)
-        return graph.run(message=message, thread_id=thread_id)
+        _log.info("[TRACE:invoke_chat] calling graph.run()")
+        result = graph.run(message=message, thread_id=thread_id)
+        _log.info("[TRACE:invoke_chat] DONE reply=%s", str(result.get("reply", ""))[:80])
+        return result
     finally:
         db.close()

@@ -25,6 +25,9 @@ const KIND_META: Record<string, { label: string; bg: string; text: string; borde
   evidence_memory: { label: "注入记忆",  bg: "bg-warning-soft",   text: "text-warning-text",   border: "border-warning-border" },
   history_message: { label: "历史消息",  bg: "bg-primary-soft",    text: "text-primary",    border: "border-primary-border" },
   user_message:    { label: "当前消息",  bg: "bg-danger-soft",    text: "text-danger-text",    border: "border-danger-border" },
+  agent_output:    { label: "Agent 输出", bg: "bg-accent-soft",  text: "text-accent-text", border: "border-accent-border" },
+  tool_call:       { label: "工具调用",  bg: "bg-success-soft",   text: "text-success-text",   border: "border-success-border" },
+  tool_result:     { label: "工具结果",  bg: "bg-warning-soft",  text: "text-warning-text",  border: "border-warning-border" },
 };
 
 /** 信任级别中文标签 */
@@ -49,6 +52,9 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
   const [error, setError] = useState("");
   const [expanded, setExpanded] = useState<number | null>(null);
   const [modalItem, setModalItem] = useState<ContextItem | null>(null);
+  /** 懒加载的完整内容缓存: item_id → full_content */
+  const [fullContents, setFullContents] = useState<Record<string, string>>({});
+  const [loadingItem, setLoadingItem] = useState<string | null>(null);
 
   // 当 traceId 变化时，从后端加载上下文快照
   useEffect(() => {
@@ -56,12 +62,41 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
       setError("");
       setExpanded(null);
       setModalItem(null);
+      setFullContents({});
       fetch(`/api/context-runs/${traceId}`)
         .then(r => { if (!r.ok) throw new Error(`${r.status}`); return r.json(); })
         .then(setData)
         .catch(e => setError(`加载失败: ${e.message}`));
     }
   }, [traceId]);
+
+  /** 懒加载某条上下文项的完整内容 */
+  const fetchDetail = (itemId: string) => {
+    if (fullContents[itemId] !== undefined || loadingItem) return;
+    setLoadingItem(itemId);
+    fetch(`/api/context-runs/${traceId}/items/${itemId}`)
+      .then(r => { if (!r.ok) throw new Error(`${r.status}`); return r.json(); })
+      .then((res: Record<string, unknown>) => {
+        setFullContents(prev => ({ ...prev, [itemId]: String(res.full_content ?? "") }));
+      })
+      .catch(e => {
+        setFullContents(prev => ({ ...prev, [itemId]: `加载失败: ${e.message}` }));
+      })
+      .finally(() => setLoadingItem(null));
+  };
+
+  /** 展开项的处理：对后执行项触发懒加载 */
+  const handleExpand = (i: number, item: ContextItem) => {
+    if (expanded === i) {
+      setExpanded(null);
+      return;
+    }
+    setExpanded(i);
+    // 后执行上下文项：agent_output / tool_call / tool_result 需要懒加载详情
+    if (["agent_output", "tool_call", "tool_result"].includes(item.kind)) {
+      fetchDetail(item.item_id);
+    }
+  };
 
   // 无 traceId 时显示引导提示
   if (!traceId) return (
@@ -81,7 +116,6 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
   const items = (snapshots[0]?.context_items as ContextItem[]) || [];
   const meta = (snapshots[0]?.meta || {}) as Record<string, unknown>;
   const injected = (meta.injected_memory_ids as string[]) || [];
-  const llm_calls = (data.llm_calls || []) as Array<Record<string, unknown>>;
 
   return (
     <div>
@@ -102,41 +136,6 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
           </div>
         ))}
       </div>
-
-      {/* LLM 调用（完整输入/输出） */}
-      {llm_calls.length > 0 && (
-        <div className="mb-5">
-          <h3 className="text-sm font-medium text-code mb-3">
-            LLM 调用 ({llm_calls.length})
-            <span className="text-xs text-faint ml-2 font-normal">如实记录每次模型输入与输出</span>
-          </h3>
-          <div className="flex flex-col gap-3">
-            {llm_calls.map((c, i) => (
-              <div key={i} className="border border-divider rounded-xl shadow-sm overflow-hidden">
-                <div className="px-4 py-2 bg-background flex items-center gap-3">
-                  <span className="text-xs font-medium px-2 py-0.5 rounded-full bg-divider text-title">#{i + 1}</span>
-                  <code className="text-xs text-code font-mono">{String(c.model || "-")}</code>
-                  <span className="text-[11px] text-faint">{c.latency_ms} ms</span>
-                </div>
-                <div className="px-4 py-3 grid grid-cols-1 gap-3">
-                  <div>
-                    <div className="text-[10px] text-faint uppercase mb-1">输入（完整消息）</div>
-                    <pre className="text-[11px] text-code bg-background rounded-lg px-3 py-2 whitespace-pre-wrap break-all font-mono leading-relaxed max-h-60 overflow-auto">
-                      {String(c.input_preview || "(空)")}
-                    </pre>
-                  </div>
-                  <div>
-                    <div className="text-[10px] text-faint uppercase mb-1">输出（内容 + 工具调用）</div>
-                    <pre className="text-[11px] text-code bg-background rounded-lg px-3 py-2 whitespace-pre-wrap break-all font-mono leading-relaxed max-h-60 overflow-auto">
-                      {String(c.output_preview || "(空)")}
-                    </pre>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
 
       {/* 注入的记忆 ID 列表 */}
       {injected.length > 0 && (
@@ -166,7 +165,7 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
             return (
               <div
                 key={i}
-                onClick={() => setExpanded(isOpen ? null : i)}
+                onClick={() => handleExpand(i, item)}
                 className={`
                   border rounded-xl cursor-pointer transition-all duration-200 shadow-sm hover:shadow-md
                   ${kindMeta.border} ${kindMeta.bg}
@@ -216,11 +215,16 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
                       </code>
                     </div>
 
-                    {/* 内容预览（限制 2 行） */}
+                    {/* 内容预览 / 完整内容 */}
                     <div className="mb-0.5">
-                      <div className="text-[10px] text-faint uppercase mb-1">内容预览</div>
-                      <pre className="text-xs text-code bg-surface/70 rounded-lg px-3 py-2 whitespace-pre-wrap break-all font-mono leading-relaxed line-clamp-2">
-                        {item.content_preview || "(空)"}
+                      <div className="text-[10px] text-faint uppercase mb-1">
+                        {fullContents[item.item_id] !== undefined ? "完整内容" : "内容预览"}
+                        {loadingItem === item.item_id && <span className="ml-1 animate-pulse">加载中...</span>}
+                      </div>
+                      <pre className="text-xs text-code bg-surface/70 rounded-lg px-3 py-2 whitespace-pre-wrap break-all font-mono leading-relaxed max-h-60 overflow-auto">
+                        {fullContents[item.item_id] !== undefined
+                          ? fullContents[item.item_id]
+                          : item.content_preview || "(空)"}
                       </pre>
                     </div>
 
@@ -293,7 +297,9 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
             {/* 可滚动的完整内容区域 */}
             <div className="flex-1 overflow-y-auto px-5 pb-6">
               <pre className="text-xs text-title whitespace-pre-wrap break-all font-mono leading-relaxed">
-                {modalItem.content_preview || "(空)"}
+                {fullContents[modalItem.item_id] !== undefined
+                  ? fullContents[modalItem.item_id]
+                  : modalItem.content_preview || "(空)"}
               </pre>
             </div>
           </div>

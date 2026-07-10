@@ -4,16 +4,17 @@ API路由模块：聊天接口
 - 支持 Server-Sent Events (SSE) 流式响应
 """
 import json
+from typing import Any
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
-from typing import Any
 
-from aiive.core.llm_client import LLMClientError
+from aiive.core.llm_client import LLMClientError, default_llm_client
 from aiive.db.base import get_db
 from aiive.runtime.action_cards import ActionCard, PendingOperation
+from aiive.runtime.agent_graph import AgentGraph
 from aiive.runtime.graph import invoke_chat
 
 router = APIRouter(prefix="/api")
@@ -87,7 +88,7 @@ def chat_system(request: SystemChatRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/chat/stream")
-def chat_stream(request: ChatRequest, db: Session = Depends(get_db)):
+async def chat_stream(request: ChatRequest, db: Session = Depends(get_db)):
     """流式聊天接口，使用 Server-Sent Events 实时推送回复
 
     Args:
@@ -98,14 +99,11 @@ def chat_stream(request: ChatRequest, db: Session = Depends(get_db)):
         StreamingResponse，以 text/event-stream 格式逐条推送事件
     """
 
-    def generate():
-        from aiive.core.llm_client import default_llm_client
-        from aiive.runtime.agent_graph import AgentGraph
-
+    async def generate():
         client = default_llm_client()
         graph = AgentGraph(client, db)
         try:
-            for event in graph.run_stream(message=request.message, thread_id=request.thread_id):
+            async for event in graph.run_stream(message=request.message, thread_id=request.thread_id):
                 yield f"event: {event['event']}\ndata: {json.dumps(event['data'], ensure_ascii=False)}\n\n"
         except LLMClientError as e:
             yield f"event: error\ndata: {json.dumps({'message': str(e)}, ensure_ascii=False)}\n\n"

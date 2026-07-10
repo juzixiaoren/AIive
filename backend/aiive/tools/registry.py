@@ -8,6 +8,7 @@
 - ToolRegistry: 工具注册表，管理注册、查询、schema 渲染和执行
 """
 
+import concurrent.futures
 import hashlib
 import inspect
 import json
@@ -18,6 +19,15 @@ from typing import Any, Callable
 from aiive.context.run_context import RunContext
 
 logger = logging.getLogger(__name__)
+
+# 所有工具的默认超时时间（秒）
+DEFAULT_TOOL_TIMEOUT = 30
+
+# 模块级线程池：复用避免重复创建开销，daemon 线程不阻止进程退出
+_tool_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4,
+    thread_name_prefix="tool-worker",
+)
 
 
 @dataclass(frozen=True)
@@ -36,6 +46,7 @@ class CapabilitySafetySchema:
         allowed_instruction_sources: 允许的指令来源列表
         descriptor_hash: 安全描述的 SHA256 哈希（用于变更检测）
         tool_description_is_instruction: 工具描述是否可作为指令
+        timeout_seconds: float = 0  # 工具执行超时（秒），0 时使用全局默认 DEFAULT_TOOL_TIMEOUT
     """
     capability_id: str
     definition_source: str  # 来源：local_builtin | generated_by_agent | remote_mcp | user_installed
@@ -48,6 +59,7 @@ class CapabilitySafetySchema:
     allowed_instruction_sources: list[str] = field(default_factory=lambda: ["trusted_user_command"])
     descriptor_hash: str = ""
     tool_description_is_instruction: bool = False
+    timeout_seconds: float = 0
 
 
 def compute_descriptor_hash(schema: dict[str, Any]) -> str:
@@ -79,6 +91,32 @@ class ToolRegistration:
     handler: Callable[..., Any]
     description: str = ""
     parameters: dict[str, Any] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# 工具调用辅助函数（在独立线程中执行，支持超时中断）
+# ---------------------------------------------------------------------------
+
+def _invoke_handler(
+    handler: Callable[..., Any],
+    has_ctx: bool,
+    run_context: RunContext | None,
+    params: dict[str, Any],
+) -> Any:
+    """在独立线程中调用工具 handler，隔离超时控制。
+
+    Args:
+        handler: 工具处理函数
+        has_ctx: handler 是否接受 ctx 参数
+        run_context: 运行时上下文
+        params: 工具调用参数
+
+    Returns:
+        handler 的返回值
+    """
+    if has_ctx:
+        return handler(ctx=run_context, **params)
+    return handler(**params)
 
 
 class ToolRegistry:
@@ -172,10 +210,11 @@ class ToolRegistry:
         instruction_source: str,
         run_context: RunContext | None = None,
     ) -> dict[str, Any]:
-        """执行工具调用，包含两道安全守卫。
+        """执行工具调用，包含三道安全守卫。
 
         守卫 1: 检查指令来源是否被授权
         守卫 2: 检查是否需要用户确认（需要时直接拒绝，等待确认后再调用）
+        守卫 3: 超时保护 — 工具执行超过阈值自动中断并返回超时结果给 LLM
 
         Args:
             capability_id: 工具能力标识符
@@ -184,13 +223,16 @@ class ToolRegistry:
             run_context: 运行时上下文（RunContext），注入到 handler 的 ctx 参数
 
         Returns:
-            包含 ok、result（或 error/approval_required）的字典
+            包含 ok、result（或 error/approval_required/timeout）的字典
         """
+        logger.info("[TRACE:registry] EXECUTE tool=%s params=%s source=%s", capability_id, params, instruction_source)
         reg = self.get(capability_id)
         if not reg:
+            logger.warning("[TRACE:registry] UNKNOWN tool=%s", capability_id)
             return {"ok": False, "error": f"Unknown tool: {capability_id}"}
 
         if instruction_source not in reg.safety.allowed_instruction_sources:
+            logger.warning("[TRACE:registry] UNAUTHORIZED tool=%s source=%s", capability_id, instruction_source)
             return {
                 "ok": False,
                 "error": "Instruction source not authorized for this tool",
@@ -199,6 +241,7 @@ class ToolRegistry:
             }
 
         if reg.safety.requires_confirmation:
+            logger.info("[TRACE:registry] CONFIRMATION_REQUIRED tool=%s", capability_id)
             return {
                 "ok": False,
                 "approval_required": True,
@@ -206,15 +249,33 @@ class ToolRegistry:
                 "params": params,
             }
 
+        has_ctx = "ctx" in inspect.signature(reg.handler).parameters
+
+        # 确定超时时间：工具自身配置 > 全局默认
+        timeout = reg.safety.timeout_seconds or DEFAULT_TOOL_TIMEOUT
+
+        future = _tool_executor.submit(_invoke_handler, reg.handler, has_ctx, run_context, params)
         try:
-            if "ctx" in inspect.signature(reg.handler).parameters:
-                result = reg.handler(ctx=run_context, **params)
-            else:
-                result = reg.handler(**params)
+            result = future.result(timeout=timeout)
+            logger.info("[TRACE:registry] SUCCESS tool=%s result_type=%s", capability_id, type(result).__name__)
             return {"ok": True, "result": result}
+        except concurrent.futures.TimeoutError:
+            # 关键：超时后不 cancel + wait，直接返回错误。
+            # 子线程会继续运行直到自行结束（DB I/O 完成后自然退出）。
+            # 如果 cancel 并 wait，会因为 DB 阻塞 I/O 无法中断而死锁。
+            logger.error(
+                "[TRACE:registry] TIMEOUT tool=%s after %.0fs params=%s",
+                capability_id, timeout, params,
+            )
+            return {
+                "ok": False,
+                "error": f"Tool '{capability_id}' timed out after {timeout:.0f}s",
+                "error_type": "timeout",
+                "timeout_seconds": timeout,
+            }
         except Exception as e:
-            logger.exception("工具执行失败: capability_id=%s params=%s", capability_id, params)
-            return {"ok": False, "error": str(e)}
+            logger.exception("[TRACE:registry] FAILED tool=%s error=%s", capability_id, e)
+            return {"ok": False, "error": str(e), "error_type": "execution_failed"}
 
 
 # 全局单例

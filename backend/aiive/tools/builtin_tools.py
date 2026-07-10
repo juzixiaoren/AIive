@@ -77,6 +77,7 @@ def _db_handler(fn: Callable[..., Any]):
     _accepts_ctx = "ctx" in inspect.signature(fn).parameters
 
     def wrapper(ctx: RunContext | None = None, **params: Any):
+        logger.info("[TRACE:_db_handler] ENTER fn=%s params=%s", fn.__name__, params)
         db = SessionLocal()
         try:
             if _accepts_ctx:
@@ -84,9 +85,10 @@ def _db_handler(fn: Callable[..., Any]):
             else:
                 result = fn(db, **params)
             db.commit()
+            logger.info("[TRACE:_db_handler] COMMIT fn=%s result=%s", fn.__name__, result)
             return result
         except Exception:
-            logger.exception("数据库处理函数执行失败: fn=%s", fn.__name__)
+            logger.exception("[TRACE:_db_handler] ROLLBACK fn=%s", fn.__name__)
             db.rollback()
             raise
         finally:
@@ -476,16 +478,28 @@ def _handle_forget_memory(db: Session, memory_id: str = "", reason: str = "", sc
     from aiive.memory.memory_maintenance import MemoryMaintenance
     from aiive.memory.memory_store import MemoryStore
 
+    logger.info(
+        "[TRACE:forget_memory] ENTER scope=%s memory_id=%s target=%s reason=%s",
+        scope, memory_id[:16] if memory_id else "(empty)", target, reason,
+    )
+
     maint = MemoryMaintenance(db)
     store = MemoryStore(db)
     deleted: list[str] = []
 
     if scope == "all":
-        # 清空所有活跃记忆
         records = [r for r in store.get_active()]
+        logger.info("[TRACE:forget_memory] scope=all: found %d active records", len(records))
         for r in records:
-            maint.forget(r.id, reason)
-            deleted.append(r.id)
+            result = maint.forget(r.id, reason)
+            if result.get("ok"):
+                deleted.append(r.id)
+            else:
+                logger.warning(
+                    "[TRACE:forget_memory] scope=all: forget failed for %s: %s",
+                    r.id[:16], result.get("error", "unknown"),
+                )
+        logger.info("[TRACE:forget_memory] scope=all: deleted %d/%d records", len(deleted), len(records))
         return {
             "ok": True,
             "deleted_count": len(deleted),
@@ -495,13 +509,20 @@ def _handle_forget_memory(db: Session, memory_id: str = "", reason: str = "", sc
         }
 
     if scope == "memory_key":
-        # 按 memory_key 删除
         if not target:
+            logger.warning("[TRACE:forget_memory] scope=memory_key: missing target")
             return {"ok": False, "error": "target is required for scope=memory_key"}
         records = [r for r in store.get_active() if r.memory_key == target]
+        logger.info("[TRACE:forget_memory] scope=memory_key target=%s: found %d records", target, len(records))
         for r in records:
-            maint.forget(r.id, reason)
-            deleted.append(r.id)
+            result = maint.forget(r.id, reason)
+            if result.get("ok"):
+                deleted.append(r.id)
+            else:
+                logger.warning(
+                    "[TRACE:forget_memory] scope=memory_key: forget failed for %s: %s",
+                    r.id[:16], result.get("error", "unknown"),
+                )
         return {
             "ok": True,
             "deleted_count": len(deleted),
@@ -511,13 +532,20 @@ def _handle_forget_memory(db: Session, memory_id: str = "", reason: str = "", sc
         }
 
     if scope == "topic":
-        # 按主题内容搜索删除
         if not target:
+            logger.warning("[TRACE:forget_memory] scope=topic: missing target")
             return {"ok": False, "error": "target is required for scope=topic"}
         records = [r for r in store.get_active() if target.lower() in r.content.lower()]
+        logger.info("[TRACE:forget_memory] scope=topic target=%s: found %d records", target, len(records))
         for r in records:
-            maint.forget(r.id, reason)
-            deleted.append(r.id)
+            result = maint.forget(r.id, reason)
+            if result.get("ok"):
+                deleted.append(r.id)
+            else:
+                logger.warning(
+                    "[TRACE:forget_memory] scope=topic: forget failed for %s: %s",
+                    r.id[:16], result.get("error", "unknown"),
+                )
         return {
             "ok": True,
             "deleted_count": len(deleted),
@@ -528,8 +556,11 @@ def _handle_forget_memory(db: Session, memory_id: str = "", reason: str = "", sc
 
     # 默认：按 memory_id 删除
     if not memory_id:
+        logger.warning("[TRACE:forget_memory] scope=memory_id: missing memory_id")
         return {"ok": False, "error": "memory_id is required for scope=memory_id (or use scope=all/topic/memory_key)"}
-    return maint.forget(memory_id, reason)
+    result = maint.forget(memory_id, reason)
+    logger.info("[TRACE:forget_memory] scope=memory_id: result=%s", result)
+    return result
 
 
 @_db_handler

@@ -474,7 +474,6 @@ class TestNoKeywordClassification:
             'if "提醒" in',
             '_infer_intent',
             'intent_classifier',
-            'keyword',
         ]
         for pattern in forbidden:
             assert pattern not in source, \

@@ -12,7 +12,6 @@ from aiive.db.base import get_db
 from aiive.db.models import (
     ContextSnapshot,
     Event,
-    LLMCall,
     RetrievalRun,
     RetrievalCandidate,
 )
@@ -30,20 +29,13 @@ def get_context_run(trace_id: str, db: Session = Depends(get_db)):
         db: 数据库会话
 
     Returns:
-        上下文快照列表和LLM调用记录
+        上下文快照列表（包含前执行和后执行的全部上下文项）
     """
     try:
         snapshots = (
             db.query(ContextSnapshot)
             .filter(ContextSnapshot.trace_id == trace_id)
             .order_by(ContextSnapshot.created_at.desc())
-            .limit(10)
-            .all()
-        )
-        llm_calls = (
-            db.query(LLMCall)
-            .filter(LLMCall.trace_id == trace_id)
-            .order_by(LLMCall.created_at.asc())
             .limit(10)
             .all()
         )
@@ -57,19 +49,40 @@ def get_context_run(trace_id: str, db: Session = Depends(get_db)):
                 }
                 for s in snapshots
             ],
-            "llm_calls": [
-                {
-                    "model": c.model,
-                    "latency_ms": c.latency_ms,
-                    "input_preview": c.input_preview,
-                    "output_preview": c.output_preview,
-                    "created_at": c.created_at.isoformat() if c.created_at else None,
-                }
-                for c in llm_calls
-            ],
         }
     except Exception:
         logger.exception("获取上下文构建运行详情失败: trace_id=%s", trace_id)
+        raise
+
+
+@router.get("/context-runs/{trace_id}/items/{item_id}")
+def get_context_item_detail(trace_id: str, item_id: str, db: Session = Depends(get_db)):
+    """获取指定上下文项的完整内容（懒加载）
+
+    Args:
+        trace_id: 追踪ID
+        item_id: 上下文项ID（如 agent_output、tool_call:0、tool_result:1）
+        db: 数据库会话
+
+    Returns:
+        {"item_id": ..., "full_content": "..."}
+    """
+    try:
+        snapshot = (
+            db.query(ContextSnapshot)
+            .filter(ContextSnapshot.trace_id == trace_id)
+            .order_by(ContextSnapshot.created_at.desc())
+            .first()
+        )
+        if not snapshot:
+            return {"error": "snapshot not found"}
+        full_contents: dict = snapshot.meta.get("full_contents", {}) if snapshot.meta else {}
+        content = full_contents.get(item_id)
+        if content is None:
+            return {"error": "item not found"}
+        return {"item_id": item_id, "full_content": content}
+    except Exception:
+        logger.exception("获取上下文项详情失败: trace_id=%s, item_id=%s", trace_id, item_id)
         raise
 
 

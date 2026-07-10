@@ -167,12 +167,14 @@ class MemoryStore:
         Returns:
             活跃记忆的序列。
         """
-        return (
+        result = (
             self._db.query(MemoryRecord)
             .filter(MemoryRecord.lifecycle_state == "active")
             .order_by(MemoryRecord.updated_at.desc())
             .all()
         )
+        logger.info("[TRACE:get_active] found %d active records", len(result))
+        return result
 
     def resolve_for_context(self) -> Sequence[MemoryRecord]:
         """获取用于上下文注入的活跃记忆列表。
