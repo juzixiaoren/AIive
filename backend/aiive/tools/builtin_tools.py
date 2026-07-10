@@ -392,175 +392,93 @@ def _handle_show_notifications(db: Session):
 # ── Memory（记忆管理）──
 @_db_handler
 def _handle_remember_or_update(db: Session, ctx: RunContext | None, content: str, memory_type: str = "fact", memory_key: str = ""):
-    """创建或更新记忆，通过 MemoryGate + MemoryWriteService 写入。
-
-    流程:
-    1. 如果提供了 memory_key，查找已有的同 key 记忆
-    2. 通过 MemoryGate 决策（接受/拒绝/更新）
-    3. 使用 MemoryWriteService 写入
-
-    参数:
-        content: 记忆内容
-        memory_type: 记忆类型（fact / preference / steward_signal 等）
-        memory_key: 记忆键（如 "user.name"），同 key 自动覆盖旧记忆
-
-    返回:
-        包含 ok、memory_id、content、memory_type、state 的字典
-    """
-    from aiive.memory.memory_gate import MemoryGate, MemoryGateInput
-    from aiive.memory.memory_store import MemoryStore
+    """创建或更新记忆，通过 MemoryWriteService 统一写入（查重下沉到服务层）。"""
+    from aiive.memory.memory_types import EvidenceItem, TrustLevel
+    from aiive.memory.proposal_normalizer import ProposalNormalizer
     from aiive.memory.memory_write_service import MemoryWriteService
 
-    store = MemoryStore(db)
-    gate = MemoryGate()
+    ctx = _require_ctx(ctx, "remember_or_update")
     writer = MemoryWriteService(db)
 
-    # 查找同 key 的已有记忆（用于更新而非重复创建）
-    existing = None
-    if memory_key:
-        for old in store.get_active():
-            if old.memory_key == memory_key:
-                existing = {"id": old.id, "content": old.content, "memory_type": old.memory_type}
-                break
+    evidence = [EvidenceItem(
+        source_type="user_message",
+        trust_level=TrustLevel.TRUSTED.value,
+        relation="supports",
+        content_span=content,
+    )]
 
-    # 通过 Gate 决策
-    gate_input = MemoryGateInput(
+    normalizer = ProposalNormalizer()
+    result = normalizer.normalize(
         content=content,
-        user_message=content,
-        source="tool_call",
-        intent_type="memory_update",
-        execution_mode="execute",
-        should_execute=True,
-        evidence_source="trusted_user_message",
-        extracted_memory_type=memory_type,
-        extracted_memory_key=memory_key or None,
+        memory_type_hint=memory_type or None,
+        memory_key_hint=memory_key or None,
         confidence=0.95,
-        existing_memory=existing,
+        importance=0.8,
+        trust_level=TrustLevel.TRUSTED.value,
+        evidence=[e.model_dump() for e in evidence],
+        extractor_name="remember_or_update_tool",
+        extractor_version="1.0",
+        thread_id=ctx.thread_id,
     )
-    decision = gate.decide(gate_input)
 
-    if decision.decision == "reject":
-        return {"ok": False, "error": f"Memory gate rejected: {decision.reason}"}
+    if result.error or result.proposal is None:
+        return {"ok": False, "error": result.error or "Normalization failed"}
 
-    # 通过 write service 写入
-    ctx = _require_ctx(ctx, "remember_or_update")
-    result = writer.write(decision, content, run_context=ctx)
+    write_result = writer.write(result.proposal, run_context=ctx)
     db.flush()
+
     return {
-        "ok": True,
-        "memory_id": result.get("memory_id", ""),
+        "ok": write_result.written,
+        "memory_id": write_result.memory_id,
         "content": content,
-        "memory_type": decision.memory_type or memory_type,
-        "state": result.get("state", ""),
-        "superseded_old": result.get("superseded_old", False),
+        "memory_type": result.proposal.memory_type,
+        "canonical_key": result.proposal.canonical_key,
+        "state": write_result.state,
+        "operation": write_result.operation,
     }
 
 
 @_db_handler
-def _handle_forget_memory(db: Session, memory_id: str = "", reason: str = "", scope: str = "memory_id", target: str = ""):
-    """遗忘/删除存储的记忆。
-
-    支持四种操作模式（由 scope 参数决定）:
-    - memory_id（默认）: 按 ID 删除单条记录（使用 memory_id 参数）
-    - memory_key: 删除所有匹配 memory_key 的活跃记录（使用 target 参数）
-    - topic: 搜索并删除内容中包含 target 文本的记录
-    - all: 清空所有活跃记忆（需要显式确认）
-
-    参数:
-        memory_id: 单条记忆 ID（scope=memory_id 时使用）
-        reason: 删除原因
-        scope: 操作范围（memory_id / memory_key / topic / all）
-        target: 目标关键词（scope=memory_key 或 topic 时使用）
-
-    返回:
-        包含 ok、deleted_count、deleted_ids 等字段的字典
-    """
-    from aiive.memory.memory_maintenance import MemoryMaintenance
+def _handle_forget_memory(db: Session, ctx: RunContext | None, memory_id: str = "", reason: str = "", scope: str = "memory_id", target: str = ""):
+    """遗忘/删除存储的记忆。使用 MemoryWriteService.forget() 执行 Saga。"""
     from aiive.memory.memory_store import MemoryStore
+    from aiive.memory.memory_write_service import MemoryWriteService
 
-    logger.info(
-        "[TRACE:forget_memory] ENTER scope=%s memory_id=%s target=%s reason=%s",
-        scope, memory_id[:16] if memory_id else "(empty)", target, reason,
-    )
-
-    maint = MemoryMaintenance(db)
+    ctx = _require_ctx(ctx, "forget_memory")
+    writer = MemoryWriteService(db)
     store = MemoryStore(db)
     deleted: list[str] = []
 
     if scope == "all":
-        records = [r for r in store.get_active()]
-        logger.info("[TRACE:forget_memory] scope=all: found %d active records", len(records))
-        for r in records:
-            result = maint.forget(r.id, reason)
-            if result.get("ok"):
+        for r in store.get_active():
+            result = writer.forget(r.id, reason=reason, run_context=ctx)
+            if result.written:
                 deleted.append(r.id)
-            else:
-                logger.warning(
-                    "[TRACE:forget_memory] scope=all: forget failed for %s: %s",
-                    r.id[:16], result.get("error", "unknown"),
-                )
-        logger.info("[TRACE:forget_memory] scope=all: deleted %d/%d records", len(deleted), len(records))
-        return {
-            "ok": True,
-            "deleted_count": len(deleted),
-            "deleted_ids": deleted,
-            "scope": "all",
-            "reason": reason,
-        }
+        return {"ok": True, "deleted_count": len(deleted), "deleted_ids": deleted, "scope": "all", "reason": reason}
 
     if scope == "memory_key":
         if not target:
-            logger.warning("[TRACE:forget_memory] scope=memory_key: missing target")
             return {"ok": False, "error": "target is required for scope=memory_key"}
-        records = [r for r in store.get_active() if r.memory_key == target]
-        logger.info("[TRACE:forget_memory] scope=memory_key target=%s: found %d records", target, len(records))
-        for r in records:
-            result = maint.forget(r.id, reason)
-            if result.get("ok"):
+        for r in store.get_active_by_key(target):
+            result = writer.forget(r.id, reason=reason, run_context=ctx)
+            if result.written:
                 deleted.append(r.id)
-            else:
-                logger.warning(
-                    "[TRACE:forget_memory] scope=memory_key: forget failed for %s: %s",
-                    r.id[:16], result.get("error", "unknown"),
-                )
-        return {
-            "ok": True,
-            "deleted_count": len(deleted),
-            "deleted_ids": deleted,
-            "scope": "memory_key",
-            "target": target,
-        }
+        return {"ok": True, "deleted_count": len(deleted), "deleted_ids": deleted, "scope": "memory_key", "target": target}
 
     if scope == "topic":
         if not target:
-            logger.warning("[TRACE:forget_memory] scope=topic: missing target")
             return {"ok": False, "error": "target is required for scope=topic"}
-        records = [r for r in store.get_active() if target.lower() in r.content.lower()]
-        logger.info("[TRACE:forget_memory] scope=topic target=%s: found %d records", target, len(records))
-        for r in records:
-            result = maint.forget(r.id, reason)
-            if result.get("ok"):
-                deleted.append(r.id)
-            else:
-                logger.warning(
-                    "[TRACE:forget_memory] scope=topic: forget failed for %s: %s",
-                    r.id[:16], result.get("error", "unknown"),
-                )
-        return {
-            "ok": True,
-            "deleted_count": len(deleted),
-            "deleted_ids": deleted,
-            "scope": "topic",
-            "target": target,
-        }
+        for r in store.get_active():
+            if target.lower() in (r.content or "").lower():
+                result = writer.forget(r.id, reason=reason, run_context=ctx)
+                if result.written:
+                    deleted.append(r.id)
+        return {"ok": True, "deleted_count": len(deleted), "deleted_ids": deleted, "scope": "topic", "target": target}
 
-    # 默认：按 memory_id 删除
     if not memory_id:
-        logger.warning("[TRACE:forget_memory] scope=memory_id: missing memory_id")
-        return {"ok": False, "error": "memory_id is required for scope=memory_id (or use scope=all/topic/memory_key)"}
-    result = maint.forget(memory_id, reason)
-    logger.info("[TRACE:forget_memory] scope=memory_id: result=%s", result)
-    return result
+        return {"ok": False, "error": "memory_id is required for scope=memory_id"}
+    result = writer.forget(memory_id, reason=reason, run_context=ctx)
+    return {"ok": result.written, "memory_id": memory_id, "error": "" if result.written else result.reason}
 
 
 @_db_handler

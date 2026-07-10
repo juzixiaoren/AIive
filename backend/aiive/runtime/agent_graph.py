@@ -42,9 +42,11 @@ from sqlalchemy.orm import Session
 from typing_extensions import TypedDict
 
 from aiive.context.run_context import RunContext
-from aiive.core.action_planner import ActionPlanner, AgentDecision
+from aiive.core.action_planner import ActionPlanner, AgentDecision, MemorySignalDecision
 from aiive.core.llm_client import LLMClient
 from aiive.db.models import ContextSnapshot, Thread
+from aiive.memory.extraction_policy import MemorySignalAction
+from aiive.memory.memory_read_model import MemoryReadModel, ReadContext
 from aiive.memory.memory_store import MemoryStore
 from aiive.runtime.event_logger import EventLogger
 from aiive.runtime.policy_engine import check_tool_calls, PolicyAction
@@ -259,36 +261,41 @@ class AgentGraph:
     # ------------------------------------------------------------------
 
     def _resolve_memories_for_context(self) -> list[dict[str, Any]]:
-        """解析并去重活跃记忆，返回用于上下文的已解析记忆列表。"""
-        all_active = list(self._memory_store.resolve_for_context())
+        """使用 MemoryReadModel 解析上下文记忆（非全量扫描）。"""
+        read_model = MemoryReadModel(self._memory_store)
+        ctx: ReadContext = read_model.build_context()
         resolved: list[dict[str, Any]] = []
-        seen_keys: dict[str, dict[str, Any]] = {}
-        for mem in all_active:
-            key = mem.memory_key
-            if key:
-                seen_keys[key] = {"id": mem.id, "content": mem.content, "memory_type": mem.memory_type}
-            else:
-                resolved.append({"id": mem.id, "content": mem.content, "memory_type": mem.memory_type})
-        resolved.extend(seen_keys.values())
+        identity = ctx.runtime_identity
+        if identity.agent_display_name:
+            resolved.append({"id": "ri:agent", "content": identity.agent_display_name,
+                           "memory_type": "agent_self", "canonical_key": "agent.display_name"})
+        if identity.user_display_name:
+            resolved.append({"id": "ri:user", "content": identity.user_display_name,
+                           "memory_type": "user_profile", "canonical_key": "user.display_name"})
+        if identity.relationship_style:
+            resolved.append({"id": "ri:rel", "content": identity.relationship_style,
+                           "memory_type": "agent_self", "canonical_key": "agent.persona.relationship"})
+        for p in ctx.policies:
+            resolved.append({"id": p.get("id", ""), "content": p.get("content", ""),
+                           "memory_type": "policy", "canonical_key": p.get("key", "")})
+        for m in ctx.user_memories[:20]:
+            resolved.append({"id": m.get("id", ""), "content": m.get("content", ""),
+                           "memory_type": m.get("memory_type", ""),
+                           "canonical_key": m.get("key", "")})
         return resolved
 
     def _get_runtime_identity(self) -> dict[str, str]:
-        """从活跃记忆记录中解析 Agent 和用户的运行时身份。"""
-        identity: dict[str, str] = {}
-        for mem in self._memory_store.get_active():
-            if mem.memory_key == "agent.display_name":
-                identity["agent_display_name"] = mem.content
-            elif mem.memory_key == "agent.runtime_id":
-                identity["agent_runtime_id"] = mem.content
-            elif mem.memory_key == "user.display_name":
-                # 称呼优先作为对用户说话时使用的名字
-                identity["user_display_name"] = mem.content
-            elif mem.memory_key == "user.name" and "user_display_name" not in identity:
-                # 真实姓名作为称呼的回退（兼容存量数据）
-                identity["user_display_name"] = mem.content
-            elif mem.memory_key == "agent.persona.relationship":
-                identity["relationship_style"] = mem.content
-        return identity
+        """使用 MemoryReadModel 解析 Runtime Identity（精确 key 查询，非全量扫描）。"""
+        read_model = MemoryReadModel(self._memory_store)
+        rt = read_model.resolve_identity()
+        result: dict[str, str] = {}
+        if rt.agent_display_name:
+            result["agent_display_name"] = rt.agent_display_name
+        if rt.user_display_name:
+            result["user_display_name"] = rt.user_display_name
+        if rt.relationship_style:
+            result["relationship_style"] = rt.relationship_style
+        return result
 
     def _get_tasks_context(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """查询待处理任务，按活跃/到期分类。"""
@@ -601,8 +608,8 @@ Final responses should be natural, brief unless detail is requested, transparent
         tools: list[StructuredTool],
         registry: ToolRegistry,
         trace_id: str = "",
-        thread_id: str = "",
-        model: str = "",
+        _thread_id: str = "",
+        _model: str = "",
     ) -> tuple[Any, list[dict[str, Any]]]:
         """构建并返回编译后的 StateGraph 和工具记录引用列表。
 
@@ -776,8 +783,8 @@ Final responses should be natural, brief unless detail is requested, transparent
         logger.info("[TRACE:run] building graph...")
         compiled, records = self._build_graph(
             llm_with_tools, tools, registry,
-            trace_id=trace.trace_id, thread_id=thread.id,
-            model=self._llm_client.default_model,
+            trace_id=trace.trace_id, _thread_id=thread.id,
+            _model=self._llm_client.default_model,
         )
         logger.info("[TRACE:run] invoking graph with %d messages...", len(initial_messages))
         result = compiled.invoke({"messages": initial_messages})
@@ -870,8 +877,8 @@ Final responses should be natural, brief unless detail is requested, transparent
 
         compiled, records = self._build_graph(
             llm_with_tools, tools, registry,
-            trace_id=trace.trace_id, thread_id=thread.id,
-            model=self._llm_client.default_model,
+            trace_id=trace.trace_id, _thread_id=thread.id,
+            _model=self._llm_client.default_model,
         )
         result = compiled.invoke({"messages": initial_messages})
 
@@ -961,8 +968,8 @@ Final responses should be natural, brief unless detail is requested, transparent
 
         compiled, records = self._build_graph(
             llm_with_tools, tools, registry,
-            trace_id=trace.trace_id, thread_id=thread.id,
-            model=self._llm_client.default_model,
+            trace_id=trace.trace_id, _thread_id=thread.id,
+            _model=self._llm_client.default_model,
         )
         result = compiled.invoke({"messages": initial_messages, "runtime_events": [event]})
 
@@ -1153,8 +1160,8 @@ Final responses should be natural, brief unless detail is requested, transparent
             node = metadata.get("langgraph_node", "")
 
             if kind == "on_chat_model_stream":
-                chunk = event["data"]["chunk"]
-                if chunk.content:
+                chunk = event["data"].get("chunk")
+                if chunk is not None and chunk.content:
                     text = str(chunk.content)
                     accumulated.append(text)
                     yield {"event": "token", "data": {"text": text}}
@@ -1289,29 +1296,47 @@ Final responses should be natural, brief unless detail is requested, transparent
         # 基于 tool result 在主会话中创建系统事件
         _create_tool_result_events(self._db, thread.id, records)
 
-        # 排队 outbox 异步任务
-        self._outbox.enqueue(
-            db=self._db,
-            job_type="memory_extraction",
-            payload={
-                "user_message": message, "reply": reply, "thread_id": thread.id,
-                "intent_type": self._last_intent.get("intent_type", "chat"),
-                "execution_mode": self._last_intent.get("execution_mode", "explain_only"),
-                "should_execute": self._last_intent.get("should_execute", False),
-            },
-            trace_id=trace.trace_id,
+        # 模型分类记忆提取信号（替代关键词表）
+        signal: MemorySignalDecision = MemorySignalDecision(
+            action=MemorySignalAction.EXTRACT_ASYNC.value,
+            confidence=0.5, reason="default",
         )
-        self._outbox.enqueue(
-            db=self._db,
-            job_type="steward_extraction",
-            payload={
-                "user_message": message, "reply": reply, "thread_id": thread.id,
-                "intent_type": self._last_intent.get("intent_type", "chat"),
-                "execution_mode": self._last_intent.get("execution_mode", "explain_only"),
-                "should_execute": self._last_intent.get("should_execute", False),
-            },
-            trace_id=trace.trace_id,
-        )
+        try:
+            signal = self._action_planner.classify_memory_signal(
+                user_message=message, reply=reply, trace_id=trace.trace_id,
+            )
+        except Exception:
+            pass
+        if self._last_decision is not None:
+            self._last_decision.memory_signal = signal
+
+        if signal.action == MemorySignalAction.EXTRACT_SYNC.value:
+            # LLM extraction OUTSIDE database transaction
+            from aiive.memory.memory_extractor import UnifiedMemoryExtractor
+            from aiive.memory.memory_write_service import MemoryWriteService
+            from aiive.context.run_context import RunContext
+            extractor = UnifiedMemoryExtractor(self._llm_client)
+            proposals = extractor.extract(
+                user_message=message, reply=reply,
+                trace_id=trace.trace_id, thread_id=thread.id,
+            )
+            # Write inside existing transaction (short, no LLM)
+            writer = MemoryWriteService(self._db)
+            for proposal in proposals:
+                run_ctx = RunContext(
+                    thread_id=thread.id, trace_id=trace.trace_id, source="sync_extract"
+                )
+                writer.write(proposal, run_context=run_ctx)
+            self._db.flush()
+        elif signal.action == MemorySignalAction.EXTRACT_ASYNC.value:
+            self._outbox.enqueue(
+                db=self._db,
+                job_type="memory_extraction",
+                payload={
+                    "user_message": message, "reply": reply, "thread_id": thread.id,
+                },
+                trace_id=trace.trace_id,
+            )
 
         # 保存上下文快照（合并前执行 + 后执行上下文项）
         meta = dict(self._last_ctx_meta) if self._last_ctx_meta else {}
@@ -1337,7 +1362,7 @@ Final responses should be natural, brief unless detail is requested, transparent
             },
         )
         self._db.add(snapshot)
-        self._outbox.process_all(self._db, max_jobs=10)
+        # Outbox jobs consumed by independent worker (真正异步)
         try:
             from aiive.worker.task_worker import TaskWorker  # 延迟导入避免与 task_worker 的循环依赖（运行时安全）
             TaskWorker(self._db).poll_and_notify()

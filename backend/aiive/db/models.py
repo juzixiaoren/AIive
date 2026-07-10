@@ -106,23 +106,70 @@ class ContextSnapshot(Base):
 
 
 class MemoryRecord(Base):
-    """记忆记录模型：持久化存储用户的各类记忆，支持生命周期管理和版本控制。"""
+    """记忆记录模型：持久化存储用户的各类记忆，支持生命周期管理和版本控制。
+
+    memory_records 是记忆生命周期的唯一真相源。
+    lifecycle_state (candidate/active/sleeping/archived/forgotten) 与
+    validity_state (valid/superseded/contradicted/expired) 是两个独立维度。
+    """
     __tablename__: str = "memory_records"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     memory_type: Mapped[str] = mapped_column(String(64), index=True)
+    canonical_key: Mapped[str | None] = mapped_column(
+        String(256), nullable=True, index=True
+    )
+    cardinality: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    scope_type: Mapped[str] = mapped_column(
+        String(32), default="global", index=True
+    )
+    scope_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    content: Mapped[str] = mapped_column(Text)
+    structured_value: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     lifecycle_state: Mapped[str] = mapped_column(
         String(32), default="candidate", index=True
     )
-    content: Mapped[str] = mapped_column(Text)
-    source_event_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    validity_state: Mapped[str] = mapped_column(
+        String(32), default="valid"
+    )
+    trust_level: Mapped[str] = mapped_column(String(32), default="semi_trusted")
+    stability: Mapped[str] = mapped_column(
+        String(32), default="contextual"
+    )
+    sensitivity: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, default=None
+    )
+    content_hash: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+    structured_value_hash: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+    stability_score: Mapped[float | None] = mapped_column(nullable=True)
     confidence: Mapped[float] = mapped_column(default=0.5)
+    importance: Mapped[float] = mapped_column(default=0.5)
+    record_version: Mapped[int] = mapped_column(default=1)
+    reinforce_count: Mapped[int] = mapped_column(default=0)
+    source_event_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     lineage: Mapped[str | None] = mapped_column(String(128), nullable=True)
     pinned: Mapped[bool] = mapped_column(default=False)
-    memory_key: Mapped[str | None] = mapped_column("memory_key", String(128), nullable=True, index=True)
+    memory_key: Mapped[str | None] = mapped_column(
+        "memory_key", String(128), nullable=True, index=True
+    )
     revision_num: Mapped[int] = mapped_column("revision_num", default=1)
     supersedes: Mapped[str | None] = mapped_column(String(36), nullable=True)
     superseded_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_from: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    revision_of: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    merged_from: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    last_reinforced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
@@ -294,7 +341,95 @@ class ForgetRequest(Base):
     memory_id: Mapped[str] = mapped_column(String(36), index=True)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     tombstone: Mapped[str] = mapped_column(String(256))
+    saga_state: Mapped[str] = mapped_column(
+        String(32), default="running"
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class MemoryProposal(Base):
+    """记忆提案模型：持久化所有记忆写入的提案记录，支持审计与重放。
+
+    每次记忆提取、工具调用或维护操作产生的 MemoryProposal 在此持久化。
+    """
+    __tablename__: str = "memory_proposals"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    proposal_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    source_event_ids: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    memory_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    canonical_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    scope_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    scope_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    structured_value: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    evidence: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    trust_level: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    confidence: Mapped[float | None] = mapped_column(nullable=True)
+    importance: Mapped[float | None] = mapped_column(nullable=True)
+    stability: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    stability_score: Mapped[float | None] = mapped_column(nullable=True)
+    proposed_operation: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    gate_decision: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    gate_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    blocked_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    final_operation: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    final_memory_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    requires_confirmation: Mapped[bool] = mapped_column(default=False)
+    extractor_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    extractor_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(128), unique=True, nullable=True, index=True
+    )
+    raw_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    normalized_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+
+class MemoryEvidence(Base):
+    """记忆证据模型：逐条记录记忆的证据来源和关系。
+
+    支持 supports/contradicts/confirms/corrects/derived_from 五种关系。
+    """
+    __tablename__: str = "memory_evidence"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    memory_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("memory_records.id"), index=True
+    )
+    source_event_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    source_type: Mapped[str] = mapped_column(String(32))
+    trust_level: Mapped[str] = mapped_column(String(32), default="semi_trusted")
+    relation: Mapped[str] = mapped_column(String(32), default="supports")
+    content_span: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+
+class MemoryLineage(Base):
+    """记忆谱系模型：正式记录记忆之间的演进关系。
+
+    revise/supersede/merge 等操作在此创建正式谱系记录。
+    memory_records 上的快捷字段仅作索引，本表为权威来源。
+    """
+    __tablename__: str = "memory_lineage"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    predecessor_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("memory_records.id"), index=True
+    )
+    successor_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("memory_records.id"), index=True
+    )
+    operation: Mapped[str] = mapped_column(String(32))
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    proposal_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
 
 
 class Task(Base):

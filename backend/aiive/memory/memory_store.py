@@ -1,211 +1,249 @@
-"""V20 MemoryStore：记忆数据持久化层。
+"""MemoryStore: internal memory persistence repository.
 
-记忆系统是 AIive 的核心组件，负责 Agent 的长期记忆管理和检索。
-本模块提供记忆记录的 CRUD 基础操作，是记忆系统中最底层的数据访问层。
-上层 MemoryWriteService 和 MemoryMaintenance 通过本模块操作数据库。
+Provides structured CRUD for MemoryRecord, used exclusively by MemoryWriteService
+and read-side components (MemoryReadModel, MemoryRetriever).
 
-重要规则：生产路径中所有记忆写入必须通过 MemoryWriteService，
-不应直接调用 MemoryStore.create() 或 MemoryStore.supersede()。
+Production write paths MUST NOT call create_record() / update_lifecycle() directly;
+they must go through MemoryWriteService.
+
+Read paths (get_active, get_by_id, get_by_key_scope, etc.) are safe for
+MemoryReadModel and MemoryRetriever to use.
 """
-import logging
 
+from __future__ import annotations
+
+import uuid
 from datetime import datetime, timezone
 from collections.abc import Sequence
+from typing import Any
 
 from sqlalchemy.orm import Session
 
 from aiive.db.models import MemoryRecord
-
-logger = logging.getLogger(__name__)
+from aiive.memory.memory_types import MemoryProposal, LifecycleState, ValidityState
 
 
 class MemoryStore:
-    """记忆存储层：封装 MemoryRecord 的数据库操作。
+    """Internal repository for memory_records operations.
 
-    提供创建、更新、替代、查询等基础操作。
-    注意：生产环境应通过 MemoryWriteService 间接使用本类。
+    Write operations: called only by MemoryWriteService.
+    Read operations: called by MemoryReadModel, MemoryRetriever, Context Builder.
     """
 
-    def __init__(self, db: Session):
-        """初始化记忆存储。
-
-        Args:
-            db: 数据库会话。
-        """
+    def __init__(self, db: Session) -> None:
         self._db: Session = db
 
-    def create(
+    # ------------------------------------------------------------------
+    # Write operations (internal — called only by MemoryWriteService)
+    # ------------------------------------------------------------------
+
+    def create_record(
         self,
-        content: str,
-        memory_type: str = "fact",
-        lifecycle_state: str = "candidate",
-        source_event_id: str | None = None,
-        confidence: float = 0.5,
-        lineage: str | None = None,
-        pinned: bool = False,
-        memory_key: str | None = None,
-        revision_num: int = 1,
+        proposal: MemoryProposal,
+        lifecycle_state: str = LifecycleState.CANDIDATE.value,
+        validity_state: str = ValidityState.VALID.value,
         supersedes: str | None = None,
+        revision_of: str | None = None,
+        merged_from: list[str] | None = None,
+        revision_num: int = 1,
     ) -> MemoryRecord:
-        """创建一条新的记忆记录。
+        """Create a new MemoryRecord from a normalized proposal.
 
-        Args:
-            content: 记忆内容文本。
-            memory_type: 记忆类型，默认为 "fact"。
-            lifecycle_state: 生命周期状态，默认为 "candidate"。
-            source_event_id: 源事件 ID，用于追溯。
-            confidence: 置信度，0.0-1.0。
-            lineage: 谱系信息，用于追踪记忆的来源和演化。
-            pinned: 是否固定（固定记忆不受自动清理影响）。
-            memory_key: 去重用稳定键。
-            revision_num: 修订版本号。
-            supersedes: 替代的目标记忆 ID。
-
-        Returns:
-            新创建的 MemoryRecord 实例。
+        Called ONLY by MemoryWriteService.
         """
-        try:
-            record = MemoryRecord(
-                memory_type=memory_type,
-                lifecycle_state=lifecycle_state,
-                content=content,
-                source_event_id=source_event_id,
-                confidence=confidence,
-                lineage=lineage,
-                pinned=pinned,
-                memory_key=memory_key,
-                revision_num=revision_num,
-                supersedes=supersedes,
-                created_at=datetime.now(timezone.utc),
-                updated_at=datetime.now(timezone.utc),
-            )
-            self._db.add(record)
-            self._db.flush()
-            return record
-        except Exception:
-            logger.exception("创建记忆记录失败")
-            raise
-
-    def update_state(self, memory_id: str, lifecycle_state: str) -> MemoryRecord | None:
-        """更新记忆的生命周期状态。
-
-        Args:
-            memory_id: 记忆 ID。
-            lifecycle_state: 新的生命周期状态。
-
-        Returns:
-            更新后的 MemoryRecord，不存在则返回 None。
-        """
-        record = self._db.get(MemoryRecord, memory_id)
-        if record:
-            record.lifecycle_state = lifecycle_state
+        now = datetime.now(timezone.utc)
+        record = MemoryRecord(
+            id=str(uuid.uuid4()),
+            memory_type=proposal.memory_type,
+            canonical_key=proposal.canonical_key,
+            cardinality=self._infer_cardinality(proposal.canonical_key),
+            scope_type=proposal.scope_type,
+            scope_id=proposal.scope_id,
+            content=proposal.content,
+            structured_value=proposal.structured_value,
+            lifecycle_state=lifecycle_state,
+            validity_state=validity_state,
+            trust_level=proposal.trust_level,
+            stability=proposal.stability,
+            stability_score=proposal.stability_score,
+            confidence=proposal.confidence,
+            importance=proposal.importance,
+            record_version=1,
+            reinforce_count=0,
+            source_event_id=proposal.source_event_ids[0] if proposal.source_event_ids else None,
+            created_from=proposal.proposal_id,
+            revision_of=revision_of,
+            supersedes=supersedes,
+            merged_from=merged_from,
+            revision_num=revision_num,
+            valid_from=now,
+            observed_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        self._db.add(record)
+        self._db.flush()
         return record
 
-    def update_content(self, memory_id: str, new_content: str) -> MemoryRecord | None:
-        """更新记忆的内容文本。
-
-        Args:
-            memory_id: 记忆 ID。
-            new_content: 新的内容。
-            reason: 更新原因。
-
-        Returns:
-            更新后的 MemoryRecord，不存在则返回 None。
-        """
+    def update_lifecycle(self, memory_id: str, state: str) -> None:
+        """Update lifecycle_state. Called only by MemoryWriteService."""
         record = self._db.get(MemoryRecord, memory_id)
         if record:
-            record.content = new_content
+            record.lifecycle_state = state
             record.updated_at = datetime.now(timezone.utc)
-        return record
-
-    def supersede(self, old_id: str, new_content: str) -> MemoryRecord | None:
-        """用新内容替代旧记忆。
-
-        将旧记录标记为 superseded，创建一条新记录并建立双向关联。
-        新记录继承旧记录的 memory_type、memory_key 等核心属性，
-        版本号递增，置信度设为 1.0。
-
-        Args:
-            old_id: 被替代的旧记忆 ID。
-            new_content: 新记忆内容。
-            reason: 替代原因。
-
-        Returns:
-            新创建的 MemoryRecord，旧记录不存在则返回 None。
-        """
-        try:
-            old = self._db.get(MemoryRecord, old_id)
-            if not old:
-                return None
-            # 将旧记录标记为已被替代
-            old.lifecycle_state = "superseded"
-            old.updated_at = datetime.now(timezone.utc)
             self._db.flush()
 
-            # 创建新记录，继承旧记录的核心属性
-            new_rec = self.create(
-                content=new_content,
-                memory_type=old.memory_type,
-                lifecycle_state="active",
-                confidence=1.0,
-                lineage=f"supersedes:{old_id}",
-                memory_key=old.memory_key,
-                revision_num=old.revision_num + 1,
-                supersedes=old.id,
-            )
-            # 建立双向关联
-            old.superseded_by = new_rec.id
+    def update_validity(self, memory_id: str, state: str) -> None:
+        """Update validity_state. Called only by MemoryWriteService."""
+        record = self._db.get(MemoryRecord, memory_id)
+        if record:
+            record.validity_state = state
+            record.updated_at = datetime.now(timezone.utc)
             self._db.flush()
-            return new_rec
-        except Exception:
-            logger.exception("替代记忆失败: old_id=%s", old_id)
-            raise
 
-    def get_active(self) -> Sequence[MemoryRecord]:
-        """获取所有活跃状态的记忆记录，按更新时间降序排列。
+    # ------------------------------------------------------------------
+    # Read operations — safe for any consumer
+    # ------------------------------------------------------------------
 
-        Returns:
-            活跃记忆的序列。
-        """
-        result = (
+    def get_by_id(self, memory_id: str) -> MemoryRecord | None:
+        """Get a single record by ID."""
+        return self._db.get(MemoryRecord, memory_id)
+
+    # Active = lifecycle='active' AND validity='valid'
+    _ACTIVE_VALID: tuple[Any, Any] = (
+        MemoryRecord.lifecycle_state == LifecycleState.ACTIVE.value,
+        MemoryRecord.validity_state == ValidityState.VALID.value,
+    )
+
+    def get_active_valid(self) -> Sequence[MemoryRecord]:
+        """Get all active+valid records (prefer scoped queries)."""
+        return (
             self._db.query(MemoryRecord)
-            .filter(MemoryRecord.lifecycle_state == "active")
+            .filter(*self._ACTIVE_VALID)
             .order_by(MemoryRecord.updated_at.desc())
             .all()
         )
-        logger.info("[TRACE:get_active] found %d active records", len(result))
-        return result
 
-    def resolve_for_context(self) -> Sequence[MemoryRecord]:
-        """获取用于上下文注入的活跃记忆列表。
+    def get_active(self) -> Sequence[MemoryRecord]:
+        """DEPRECATED: use get_active_valid(). Kept for backward compat."""
+        return self.get_active_valid()
 
-        只返回活跃且未被替代的记录，供 agent_graph 构建对话上下文（Runtime Identity / User Memory 块）时使用。
+    def get_active_by_key(self, canonical_key: str) -> Sequence[MemoryRecord]:
+        """Get active+valid records by canonical_key."""
+        return (
+            self._db.query(MemoryRecord)
+            .filter(
+                MemoryRecord.canonical_key == canonical_key,
+                *self._ACTIVE_VALID,
+            )
+            .order_by(MemoryRecord.updated_at.desc())
+            .all()
+        )
 
-        Returns:
-            可用于上下文的记忆序列。
+    def get_active_by_key_scope(
+        self, canonical_key: str, scope_type: str, scope_id: str | None
+    ) -> Sequence[MemoryRecord]:
+        """Get active+valid records by canonical_key + scope."""
+        query = self._db.query(MemoryRecord).filter(
+            MemoryRecord.canonical_key == canonical_key,
+            MemoryRecord.scope_type == scope_type,
+            *self._ACTIVE_VALID,
+        )
+        if scope_id is not None:
+            query = query.filter(MemoryRecord.scope_id == scope_id)
+        else:
+            query = query.filter(MemoryRecord.scope_id.is_(None))
+        return query.order_by(MemoryRecord.updated_at.desc()).all()
+
+    def get_active_by_key_scope_locked(
+        self, canonical_key: str, scope_type: str, scope_id: str | None
+    ) -> Sequence[MemoryRecord]:
+        """SELECT FOR UPDATE on active+valid records + candidates (for conflict resolution).
+
+        Returns all records with same key+scope that are either active+valid or candidate.
+        This enables candidate promotion in ConflictResolver.
         """
-        return self.get_active()
+        query = self._db.query(MemoryRecord).filter(
+            MemoryRecord.canonical_key == canonical_key,
+            MemoryRecord.scope_type == scope_type,
+            MemoryRecord.lifecycle_state.in_([
+                LifecycleState.ACTIVE.value,
+                LifecycleState.CANDIDATE.value,
+            ]),
+        )
+        if scope_id is not None:
+            query = query.filter(MemoryRecord.scope_id == scope_id)
+        else:
+            query = query.filter(MemoryRecord.scope_id.is_(None))
+        try:
+            return query.order_by(
+                MemoryRecord.lifecycle_state.desc(),  # active before candidate
+                MemoryRecord.updated_at.desc(),
+            ).with_for_update().all()
+        except Exception:
+            return query.order_by(
+                MemoryRecord.lifecycle_state.desc(),
+                MemoryRecord.updated_at.desc(),
+            ).all()
 
-    def list_all(self) -> Sequence[MemoryRecord]:
-        """列出所有记忆记录（最多 100 条），按更新时间降序排列。
+    def get_by_context_roles(
+        self, roles: Sequence[str]
+    ) -> Sequence[MemoryRecord]:
+        """Get active+valid records by context role keys."""
+        from aiive.memory.memory_key_registry import get_memory_key_registry
+        registry = get_memory_key_registry()
+        keys: set[str] = set()
+        for role in roles:
+            keys.update(registry.get_context_role_keys(role))
+        if not keys:
+            return []
+        return (
+            self._db.query(MemoryRecord)
+            .filter(
+                MemoryRecord.canonical_key.in_(list(keys)),
+                *self._ACTIVE_VALID,
+            )
+            .order_by(MemoryRecord.updated_at.desc())
+            .all()
+        )
 
-        Returns:
-            记忆记录的序列。
-        """
+    def get_candidates_for_promotion(self, limit: int = 20) -> Sequence[MemoryRecord]:
+        """Get candidate records eligible for promotion review."""
+        return (
+            self._db.query(MemoryRecord)
+            .filter(MemoryRecord.lifecycle_state == LifecycleState.CANDIDATE.value)
+            .order_by(MemoryRecord.confidence.desc())
+            .limit(limit)
+            .all()
+        )
+
+    def list_all(self, limit: int = 100) -> Sequence[MemoryRecord]:
+        """List all records (for inspection)."""
         return (
             self._db.query(MemoryRecord)
             .order_by(MemoryRecord.updated_at.desc())
-            .limit(100)
+            .limit(limit)
             .all()
         )
 
-    def get_by_id(self, memory_id: str) -> MemoryRecord | None:
-        """按 ID 获取单条记忆记录。
+    def db_session(self) -> Session:
+        """Return the raw DB session (for Retriever)."""
+        return self._db
 
-        Args:
-            memory_id: 记忆 ID。
+    # Backward-compat aliases (deprecated)
+    def resolve_for_context(self) -> Sequence[MemoryRecord]:
+        """Deprecated: use MemoryReadModel or MemoryRetriever instead."""
+        return self.get_active_valid()
 
-        Returns:
-            MemoryRecord 或 None。
-        """
-        return self._db.get(MemoryRecord, memory_id)
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _infer_cardinality(canonical_key: str) -> str:
+        """Quick cardinality check without full registry resolution."""
+        from aiive.memory.memory_key_registry import get_memory_key_registry
+        registry = get_memory_key_registry()
+        if registry.is_single_cardinality(canonical_key):
+            return "single"
+        return "multi"

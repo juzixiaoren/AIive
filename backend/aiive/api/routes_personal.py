@@ -10,7 +10,9 @@ from sqlalchemy.orm import Session
 
 from aiive.db.base import get_db
 from aiive.db.models import MemoryRecord
-from aiive.memory.memory_types import PERSONAL_SIGNAL_TYPES
+
+# Personal signal types mapped to canonical: user_profile + keys with user.* patterns
+_PERSONAL_SIGNAL_TYPES = frozenset({"user_profile", "agent_self"})
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
@@ -31,7 +33,7 @@ def list_personal_signals(db: Session = Depends(get_db)):
     try:
         records = (
             db.query(MemoryRecord)
-            .filter(MemoryRecord.memory_type.in_(PERSONAL_SIGNAL_TYPES))
+            .filter(MemoryRecord.memory_type.in_(_PERSONAL_SIGNAL_TYPES))
             .order_by(MemoryRecord.updated_at.desc())
             .limit(50)
             .all()

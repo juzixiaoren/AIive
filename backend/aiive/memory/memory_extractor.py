@@ -1,11 +1,13 @@
-"""V20 MemoryExtractor：基于 LLM 的结构化记忆提取器。
+"""Unified MemoryExtractor: single LLM call for all memory types.
 
-记忆系统是 AIive 的核心组件，负责 Agent 的长期记忆管理和检索。
-本模块负责从对话中提取结构化记忆，输出 ExtractedMemory 并进行语义键解析。
+Replaces MemoryExtractor (general) + StewardSignalExtractor (personal signals).
+Outputs a list of normalized MemoryProposal via ProposalNormalizer.
 
-记忆键规范（单一事实来源）见 aiive.memory.memory_types.MEMORY_KEY_GUIDE，
-EXTRACT_PROMPT 直接引用它，避免键映射在多处重复维护。
+Steward enrichment (routine, preference, habit detection) is integrated
+into the single extraction prompt, not a second LLM call.
 """
+
+from __future__ import annotations
 
 import json
 import logging
@@ -15,94 +17,106 @@ from json_repair import repair_json
 from pydantic import BaseModel, Field
 
 from aiive.core.llm_client import LLMClient, LLMResponse
-from aiive.memory.memory_types import MEMORY_KEY_GUIDE
+from aiive.memory.memory_types import MEMORY_KEY_GUIDE, MemoryProposal, TrustLevel
+from aiive.memory.proposal_normalizer import ProposalNormalizer, NormalizationResult
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# ExtractedMemory - 提取出的结构化记忆数据模型
+# ExtractedMemory (internal intermediate model)
 # ---------------------------------------------------------------------------
 
 class ExtractedMemory(BaseModel):
-    """从对话中提取的单条结构化记忆。"""
-    content: str  # 记忆内容文本
-    memory_type: str  # 记忆类型：user_profile | agent_self | preference | project_decision | policy | environment | procedural | episodic
-    memory_key: str = ""  # 去重用的稳定键（点号分隔，如 user.display_name）
-    confidence: float = Field(ge=0.0, le=1.0, default=0.5)  # 置信度，0.0-1.0
-    source_span: str = ""  # 原文片段，用于追溯
-    durable: bool = True  # 是否为持久记忆
+    """Single extracted memory item from LLM output."""
+    content: str
+    memory_type: str = ""
+    memory_key: str = ""
+    confidence: float = Field(ge=0.0, le=1.0, default=0.5)
+    source_span: str = ""
+    durable: bool = True
+    importance: float = Field(ge=0.0, le=1.0, default=0.5)
+    signal_type: str = ""  # routine / preference / habit / schedule (steward enrichment)
 
 
 # ---------------------------------------------------------------------------
-# EXTRACT_PROMPT - LLM 提取提示词模板
+# Unified extraction prompt (covers both MemoryExtractor + StewardSignalExtractor)
 # ---------------------------------------------------------------------------
 
-EXTRACT_PROMPT = """从对话中提取关于用户的持久性个人信息和偏好。
-输出 JSON 数组，每个对象包含以下键：
+UNIFIED_EXTRACT_PROMPT = """从以下对话中提取持久性信息。输出 JSON 数组，每个对象包含：
 
-- content: 事实/偏好的简洁表述
-- memory_type: 以下之一：
-    user_profile（身份信息：姓名、年龄、地点、职业、语言）
-    agent_self（Agent 自身的身份、名称、人格）
-    preference（喜好、厌恶、习惯、交互风格）
-    project_decision（技术栈、项目配置、架构决策）
-    policy（规则、约束、要求）
-    procedural（用户建立的工作流、流程、操作指南）
-    episodic（值得记住的一次性事件或对话）
-- memory_key: 用于去重的稳定键，规范见下方『记忆键规范』，使用其中列出的键
-- confidence: 0.0-1.0（你对这是持久事实的确定程度）
-- source_span: 用户消息中包含该事实的原始句子或短语
+- content: 事实/偏好/习惯/日程的简洁表述
+- memory_type: 以下 canonical 类型之一：
+    user_profile（身份信息、偏好、习惯、日程、规律）
+    agent_self（Agent 的名称、人格、关系风格）
+    project（项目决策、技术栈、架构选择）
+    policy（规则、约束、禁止事项）
+    procedural（工作流、执行方法、经验教训）
+    episodic（值得记住的一次性事件）
+    knowledge（通用事实和知识）
+    environment（环境配置信息）
+- memory_key: 去重用稳定键，规范见下方
+- confidence: 0.0-1.0（对持久性的确信度）
+- importance: 0.0-1.0（重要性）
+- source_span: 用户消息中包含该事实的原文片段
+- signal_type: 可选的管家信号标记（routine/habit/schedule/preference），无则留空
 
 记忆键规范：
 """ + MEMORY_KEY_GUIDE + """
 
-重要规则：
-- 只提取用户明确陈述的信息，不要推断或猜测
-- 身份类记忆的 content 必须是【纯值】，不要带主语或整句（如"以后叫我博士" → content="博士"）
-- "我的代码报错了""今天好累" 等暂时性情况不要提取
-- 如果没有任何可提取的内容，返回空数组 []
+关键规则：
+- 只提取用户明确陈述的信息，不推断或猜测
+- 身份键的 content 必须是纯值，不含前缀
+- "我的代码报错了""今天好累""帮我看看"等暂时性情况不提取
+- 用户明确要求"记住X""以后叫我X"的，confidence 设为 0.95+
+- 用户陈述的日常规律（每天/每周）标记 signal_type=routine
+- 用户陈述的习惯（喜欢/不喜欢/习惯）标记 signal_type=habit 或 preference
+- 带时间/日期的计划标记 signal_type=schedule
+- 无任何可提取内容时返回空数组 []
 
-对话内容：
+对话：
 User: {user_message}
 Assistant: {reply}
 
-只输出有效的 JSON，不要 markdown 标记，不要解释："""
+只输出有效 JSON，不用 markdown 标记："""
 
 
 # ---------------------------------------------------------------------------
-# MemoryExtractor - 记忆提取器类
+# UnifiedMemoryExtractor
 # ---------------------------------------------------------------------------
 
-class MemoryExtractor:
-    """使用 LLM 从对话中提取结构化记忆。
+class UnifiedMemoryExtractor:
+    """Unified memory extractor: single LLM call for all memory signal types.
 
-    接收用户消息和助手回复，调用 LLM 进行分析，
-    返回结构化的 ExtractedMemory 列表。
+    Replaces MemoryExtractor + StewardSignalExtractor with one extraction.
+    Outputs normalized MemoryProposal items via ProposalNormalizer.
     """
 
-    def __init__(self, llm_client: LLMClient):
-        """初始化记忆提取器。
-
-        Args:
-            llm_client: LLM 客户端实例，用于调用大模型。
-        """
+    def __init__(self, llm_client: LLMClient) -> None:
         self._llm_client: LLMClient = llm_client
+        self._normalizer: ProposalNormalizer = ProposalNormalizer()
 
     def extract(
-        self, user_message: str, reply: str, trace_id: str | None = None
-    ) -> list[ExtractedMemory]:
-        """从用户消息和助手回复中提取记忆。
+        self,
+        user_message: str,
+        reply: str,
+        trace_id: str | None = None,
+        thread_id: str = "",
+    ) -> list[MemoryProposal]:
+        """Extract memories from a single conversation turn.
 
         Args:
-            user_message: 用户发送的原始消息。
-            reply: 助手生成的回复内容。
-            trace_id: 可选的追踪 ID，用于链路跟踪。
+            user_message: User's original message.
+            reply: Assistant's reply.
+            trace_id: Trace ID for logging.
+            thread_id: Thread ID for scope inference.
 
         Returns:
-            ExtractedMemory 列表，如果没有可提取的记忆则返回空列表。
+            List of normalized MemoryProposal.
         """
-        prompt = EXTRACT_PROMPT.format(user_message=user_message, reply=reply)
+        prompt = UNIFIED_EXTRACT_PROMPT.format(
+            user_message=user_message, reply=reply
+        )
         messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
 
         try:
@@ -110,27 +124,22 @@ class MemoryExtractor:
                 messages, trace_id=trace_id, temperature=0.1
             )
         except Exception:
-            logger.exception("记忆提取LLM调用失败: trace_id=%s", trace_id)
-            raise
-        return self._parse(response.content)
+            logger.exception("Unified extraction LLM call failed: trace_id=%s", trace_id)
+            return []
+
+        extracted: list[ExtractedMemory] = self._parse(response.content)
+        return self._normalize_all(extracted, thread_id)
+
+    # ------------------------------------------------------------------
+    # Parsing
+    # ------------------------------------------------------------------
 
     def _parse(self, raw: str) -> list[ExtractedMemory]:
-        """解析 LLM 原始输出为 ExtractedMemory 列表。
-
-        处理可能的 markdown 代码块包装，并对每一条尝试构造数据模型。
-        解析失败时静默跳过并返回空列表。
-
-        Args:
-            raw: LLM 返回的原始文本。
-
-        Returns:
-            解析后的 ExtractedMemory 列表。
-        """
+        """Parse LLM raw output into ExtractedMemory list."""
         try:
             text = raw.strip()
             if not text:
                 return []
-            # 去除可能的 markdown 代码块标记
             for fence in ("```json", "```"):
                 if text.startswith(fence):
                     text = text[len(fence):].strip()
@@ -150,16 +159,69 @@ class MemoryExtractor:
                 try:
                     results.append(ExtractedMemory(
                         content=item.get("content", ""),
-                        memory_type=item.get("memory_type", "fact"),
+                        memory_type=item.get("memory_type", ""),
                         memory_key=item.get("memory_key", ""),
-                        confidence=item.get("confidence", 0.5),
+                        confidence=float(item.get("confidence", 0.5)),
                         source_span=item.get("source_span", ""),
                         durable=item.get("durable", True),
+                        importance=float(item.get("importance", 0.5)),
+                        signal_type=item.get("signal_type", ""),
                     ))
                 except Exception:
-                    logger.warning("单条记忆解析失败", exc_info=True)
+                    logger.warning("Single extraction parse failed", exc_info=True)
                     continue
             return results
         except (json.JSONDecodeError, ValueError):
-            logger.warning("记忆提取JSON解析失败", exc_info=True)
+            logger.warning("Extraction JSON parse failed", exc_info=True)
             return []
+
+    # ------------------------------------------------------------------
+    # Normalization
+    # ------------------------------------------------------------------
+
+    def _normalize_all(
+        self,
+        extracted: list[ExtractedMemory],
+        thread_id: str,
+    ) -> list[MemoryProposal]:
+        """Normalize all extracted items through ProposalNormalizer."""
+        results: list[MemoryProposal] = []
+        for em in extracted:
+            # Build evidence
+            evidence: list[dict[str, Any]] = []
+            if em.source_span:
+                evidence.append({
+                    "source_type": "user_message",
+                    "trust_level": TrustLevel.TRUSTED.value,
+                    "relation": "supports",
+                    "content_span": em.source_span,
+                })
+
+            result: NormalizationResult = self._normalizer.normalize(
+                content=em.content,
+                memory_type_hint=em.memory_type or None,
+                memory_key_hint=em.memory_key or None,
+                confidence=em.confidence,
+                importance=em.importance,
+                trust_level=TrustLevel.TRUSTED.value,
+                evidence=evidence,
+                extractor_name="UnifiedMemoryExtractor",
+                extractor_version="1.0",
+                thread_id=thread_id,
+            )
+            if result.proposal is not None:
+                results.append(result.proposal)
+            else:
+                logger.debug(
+                    "Proposal normalization failed: %s", result.error
+                )
+
+        return results
+
+
+# ============================================================================
+# Backward-compatible aliases
+# ============================================================================
+
+# Deprecated: use UnifiedMemoryExtractor directly
+MemoryExtractor = UnifiedMemoryExtractor
