@@ -24,7 +24,7 @@ from __future__ import annotations
 import hashlib
 import json as _json
 import logging
-import time
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Annotated, Any
 
@@ -138,6 +138,13 @@ def _compute_stable_prefix_hash(content: str) -> str:
     return hashlib.sha256(content.encode()).hexdigest()[:16]
 
 
+def _truncate(text: str, max_len: int) -> str:
+    """截断文本到指定长度，超出部分用 … 表示。"""
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + "…"
+
+
 def _create_tool_result_events(db: Session, thread_id: str, records: list[dict[str, Any]]) -> None:
     """基于 tool result 在主 DB 会话中创建系统事件。
 
@@ -244,6 +251,7 @@ class AgentGraph:
             base_url=self._llm_client.base_url,
             temperature=0,
             timeout=self._llm_client.timeout_seconds,
+            streaming=True,
         )
 
     # ------------------------------------------------------------------
@@ -527,6 +535,62 @@ Final responses should be natural, brief unless detail is requested, transparent
         }
         return items, meta
 
+    @staticmethod
+    def _build_post_context_items(
+        reply: str,
+        records: list[dict[str, Any]],
+    ) -> tuple[list[ContextItem], dict[str, str]]:
+        """构建后执行上下文项：Agent 输出、工具调用和工具结果。
+
+        返回 (context_items, full_contents)：
+        - context_items: 折叠态展示的截断预览（~20 字）
+        - full_contents: item_id → 完整文本的映射，供前端展开时懒加载
+        """
+        items: list[ContextItem] = []
+        full: dict[str, str] = {}
+
+        # Agent 输出
+        if reply:
+            item_id = "agent_output"
+            preview = reply[:20] + ("..." if len(reply) > 20 else "")
+            items.append(ContextItem(
+                item_id=item_id, kind="agent_output", source="agent",
+                trust_level="trusted", content_preview=preview,
+                token_estimate=max(1, len(reply) // 4),
+            ))
+            full[item_id] = reply
+
+        # 工具调用 + 工具结果
+        for i, r in enumerate(records):
+            name = r.get("name", "unknown")
+            params = r.get("params", {})
+            result = r.get("result", {})
+            status = r.get("status", "unknown")
+
+            # 工具调用
+            call_id = f"tool_call:{i}"
+            params_text = _json.dumps(params, ensure_ascii=False)
+            preview = f"{name}({_truncate(params_text, 20)})"
+            items.append(ContextItem(
+                item_id=call_id, kind="tool_call", source="tools",
+                trust_level="trusted", content_preview=preview,
+                token_estimate=max(1, len(params_text) // 4),
+            ))
+            full[call_id] = f"名称: {name}\n参数: {params_text}"
+
+            # 工具结果
+            result_id = f"tool_result:{i}"
+            result_text = _json.dumps(result, ensure_ascii=False)
+            preview = f"[{status}] {_truncate(result_text, 20)}"
+            items.append(ContextItem(
+                item_id=result_id, kind="tool_result", source="tools",
+                trust_level="trusted", content_preview=preview,
+                token_estimate=max(1, len(result_text) // 4),
+            ))
+            full[result_id] = f"名称: {name}\n状态: {status}\n结果: {result_text}"
+
+        return items, full
+
     # ------------------------------------------------------------------
     # 图构建（非流式）
     # ------------------------------------------------------------------
@@ -551,46 +615,37 @@ Final responses should be natural, brief unless detail is requested, transparent
         def _assistant(state: _AgentState) -> dict[str, Any]:
             """assistant 节点：LLM 推理，可生成 tool_calls。"""
             msgs = state["messages"]
-            start = time.monotonic()
+            logger.info("[TRACE:graph] ASSISTANT(ns) msgs_count=%d", len(msgs))
             resp = llm_with_tools.invoke(msgs)
-            latency_ms = round((time.monotonic() - start) * 1000, 2)
+            tc_count = len(getattr(resp, "tool_calls", None) or [])
+            logger.info("[TRACE:graph] ASSISTANT(ns) tool_calls=%d content_len=%d", tc_count, len(str(resp.content or "")))
+            if tc_count > 0:
+                for tc in resp.tool_calls:
+                    logger.info("[TRACE:graph] ASSISTANT(ns) tc: name=%s args=%s", tc.get("name", "?"), tc.get("args", {}))
             # 收集 tool_call 参数，供后续 tool_result 关联
             for tc in getattr(resp, "tool_calls", None) or []:
                 args_by_id[tc.get("id", "") or ""] = tc.get("args", {})
-            # 记录 LLM 调用日志
-            try:
-                in_preview = _json.dumps(
-                    [{"role": getattr(m, "type", type(m).__name__), "content": str(m.content)}
-                     for m in msgs],
-                    ensure_ascii=False, default=str,
-                )
-                out_preview = _json.dumps(
-                    {"content": str(resp.content), "tool_calls": getattr(resp, "tool_calls", None) or []},
-                    ensure_ascii=False, default=str,
-                )
-                self._logger.log_llm_call(
-                    trace_id=trace_id, thread_id=thread_id, model=model,
-                    latency_ms=latency_ms,
-                    input_preview=in_preview, output_preview=out_preview,
-                )
-            except Exception:
-                logger.exception("记录 LLM 调用失败")
             return {"messages": [resp]}
 
         def _policy_check(state: _AgentState) -> str:
             """策略检查节点：根据 ToolRegistry 元数据校验 tool_calls。"""
             msgs = state.get("messages", [])
             if not msgs:
+                logger.info("[TRACE:graph] POLICY_CHECK(ns): no messages → finalize")
                 return "finalize"
             last_msg = msgs[-1]
             if not isinstance(last_msg, AIMessage) or not last_msg.tool_calls:
+                logger.info("[TRACE:graph] POLICY_CHECK(ns): no tool_calls → finalize")
                 return "finalize"
             tool_calls_raw = [
                 {"name": tc["name"], "args": tc.get("args", {}), "id": tc.get("id", "")}
                 for tc in last_msg.tool_calls
             ]
+            logger.info("[TRACE:graph] POLICY_CHECK(ns): %d tool_calls=%s", len(tool_calls_raw), [tc["name"] for tc in tool_calls_raw])
             result = check_tool_calls(tool_calls_raw, registry)
-            if result.action in (PolicyAction.BLOCK, PolicyAction.CONFIRM):
+            logger.info("[TRACE:graph] POLICY_CHECK(ns): action=%s → %s", result.action, "finalize" if result.action == PolicyAction.BLOCK else "continue")
+            # CONFIRM 不等于拒绝：确认机制尚未实现，不应等同 BLOCK。后续有确认 UI 再单独处理。
+            if result.action == PolicyAction.BLOCK:
                 return "finalize"
             return "continue"
 
@@ -598,7 +653,14 @@ Final responses should be natural, brief unless detail is requested, transparent
             """tools 节点：执行工具并追踪执行记录。"""
             native_tool_node = ToolNode(tools)
             last_msg = state["messages"][-1]
-            result = native_tool_node.invoke(state)
+            tc_names = [tc["name"] for tc in (last_msg.tool_calls or [])] if isinstance(last_msg, AIMessage) else []
+            logger.info("[TRACE:graph] TOOLS(ns): invoking %d tools=%s", len(tc_names), tc_names)
+            try:
+                result = native_tool_node.invoke(state)
+                logger.info("[TRACE:graph] TOOLS(ns): result messages=%d", len(result.get("messages", [])))
+            except Exception:
+                logger.exception("[TRACE:graph] TOOLS(ns): invoke FAILED")
+                raise
 
             # 追踪每个工具调用的结果
             if isinstance(last_msg, AIMessage) and last_msg.tool_calls:
@@ -676,6 +738,7 @@ Final responses should be natural, brief unless detail is requested, transparent
         registry = get_tool_registry()
         run_ctx = RunContext(thread_id=thread.id, trace_id=trace.trace_id, source="user_chat")
         tools = build_langchain_tools(registry, run_context=run_ctx)
+        logger.info("[TRACE:run] built %d tools: %s", len(tools), [getattr(t, "name", "?") for t in tools])
         llm_with_tools = langchain_llm.bind_tools(tools)
 
         # 构建初始消息列表
@@ -710,12 +773,15 @@ Final responses should be natural, brief unless detail is requested, transparent
         initial_messages.append(HumanMessage(content=message))
 
         # 构建并运行图
+        logger.info("[TRACE:run] building graph...")
         compiled, records = self._build_graph(
             llm_with_tools, tools, registry,
             trace_id=trace.trace_id, thread_id=thread.id,
             model=self._llm_client.default_model,
         )
+        logger.info("[TRACE:run] invoking graph with %d messages...", len(initial_messages))
         result = compiled.invoke({"messages": initial_messages})
+        logger.info("[TRACE:run] graph done, total messages=%d, records=%d", len(result.get("messages", [])), len(records))
 
         # 提取回复
         reply = ""
@@ -734,7 +800,8 @@ Final responses should be natural, brief unless detail is requested, transparent
         for r in records:
             r["trace_id"] = trace.trace_id
 
-        return self._finalize(reply, message, thread, trace, records, [])
+        post_items, post_full = self._build_post_context_items(reply, records)
+        return self._finalize(reply, message, thread, trace, records, [], post_items, post_full)
 
     # ------------------------------------------------------------------
     # 主入口：系统指令执行
@@ -823,7 +890,8 @@ Final responses should be natural, brief unless detail is requested, transparent
         for r in records:
             r["trace_id"] = trace.trace_id
 
-        return self._finalize(reply, message, thread, trace, records, [])
+        post_items, post_full = self._build_post_context_items(reply, records)
+        return self._finalize(reply, message, thread, trace, records, [], post_items, post_full)
 
     # ------------------------------------------------------------------
     # 主入口：后端运行时事件（调度器触发，非用户聊天）
@@ -915,17 +983,18 @@ Final responses should be natural, brief unless detail is requested, transparent
         for r in records:
             r["trace_id"] = trace.trace_id
 
-        return self._finalize(reply, _RUNTIME_EVENT_TRIGGER, thread, trace, records, [])
+        post_items, post_full = self._build_post_context_items(reply, records)
+        return self._finalize(reply, _RUNTIME_EVENT_TRIGGER, thread, trace, records, [], post_items, post_full)
 
     # ------------------------------------------------------------------
     # 主入口：流式执行
     # ------------------------------------------------------------------
 
-    def run_stream(self, message: str, thread_id: str | None = None) -> Any:
-        """执行一次流式的 Agent 对话轮次（生成器）。
+    async def run_stream(self, message: str, thread_id: str | None = None) -> AsyncGenerator[dict[str, Any], None]:
+        """执行一次流式的 Agent 对话轮次（异步生成器）。
 
-        使用 LangGraph stream API，逐步产生 token、tool_call、tool_result 事件，
-        最终产生 done 事件。
+        使用 LangGraph astream_events API，逐步产生 token、tool_call、tool_result 事件，
+        最终产生 done 事件。LLM 调用使用真正的 token 级流式传输。
 
         Args:
             message: 用户输入消息
@@ -996,47 +1065,45 @@ Final responses should be natural, brief unless detail is requested, transparent
         def _assistant(state: _AgentState) -> dict[str, Any]:
             """assistant 节点：LLM 推理。"""
             msgs = state["messages"]
-            start = time.monotonic()
+            logger.info("[TRACE:graph] ASSISTANT msgs_count=%d", len(msgs))
             resp = llm_with_tools.invoke(msgs)
-            latency_ms = round((time.monotonic() - start) * 1000, 2)
+            tc_count = len(getattr(resp, "tool_calls", None) or [])
+            logger.info("[TRACE:graph] ASSISTANT tool_calls=%d content_len=%d", tc_count, len(str(resp.content or "")))
+            if tc_count > 0:
+                for tc in resp.tool_calls:
+                    logger.info("[TRACE:graph] ASSISTANT tc: name=%s args=%s", tc.get("name", "?"), tc.get("args", {}))
             # 收集 tool_call 参数，供后续 tool_result 关联
             for tc in getattr(resp, "tool_calls", None) or []:
                 pending_args[tc.get("id", "") or ""] = tc.get("args", {})
-            # 记录 LLM 调用日志
-            try:
-                in_preview = _json.dumps(
-                    [{"role": getattr(m, "type", type(m).__name__), "content": str(m.content)}
-                     for m in msgs],
-                    ensure_ascii=False, default=str,
-                )
-                out_preview = _json.dumps(
-                    {"content": str(resp.content), "tool_calls": getattr(resp, "tool_calls", None) or []},
-                    ensure_ascii=False, default=str,
-                )
-                self._logger.log_llm_call(
-                    trace_id=trace.trace_id, thread_id=thread.id,
-                    model=self._llm_client.default_model,
-                    latency_ms=latency_ms,
-                    input_preview=in_preview, output_preview=out_preview,
-                )
-            except Exception:
-                logger.exception("记录 LLM 调用失败")
             return {"messages": [resp]}
 
         def _policy_check(state: _AgentState) -> str:
             """策略检查节点：返回值路由到 tools 或直接结束。"""
             msgs = state.get("messages", [])
             if not msgs:
+                logger.info("[TRACE:graph] POLICY_CHECK: no messages → finalize")
                 return "finalize"
             last_msg = msgs[-1]
             if not isinstance(last_msg, AIMessage) or not last_msg.tool_calls:
+                logger.info(
+                    "[TRACE:graph] POLICY_CHECK: no tool_calls (type=%s, has_tc=%s) → finalize",
+                    type(last_msg).__name__,
+                    bool(getattr(last_msg, "tool_calls", None)),
+                )
                 return "finalize"
             tool_calls_raw = [
                 {"name": tc["name"], "args": tc.get("args", {}), "id": tc.get("id", "")}
                 for tc in last_msg.tool_calls
             ]
+            logger.info("[TRACE:graph] POLICY_CHECK: %d tool_calls=%s", len(tool_calls_raw), [tc["name"] for tc in tool_calls_raw])
             result = check_tool_calls(tool_calls_raw, registry)
-            if result.action in (PolicyAction.BLOCK, PolicyAction.CONFIRM):
+            logger.info(
+                "[TRACE:graph] POLICY_CHECK: action=%s blocked=%s confirm=%s → %s",
+                result.action, result.blocked_tools, result.confirm_tools,
+                "finalize" if result.action == PolicyAction.BLOCK else "continue",
+            )
+            # CONFIRM 不等于拒绝：确认机制尚未实现，不应等同 BLOCK。
+            if result.action == PolicyAction.BLOCK:
                 return "finalize"
             return "continue"
 
@@ -1046,30 +1113,20 @@ Final responses should be natural, brief unless detail is requested, transparent
             """tools 节点：执行工具并记录结果。"""
             last_msg = state["messages"][-1]
             if not isinstance(last_msg, AIMessage) or not last_msg.tool_calls:
+                logger.warning("[TRACE:graph] TOOLS: no AIMessage/tool_calls, skipping")
                 return {"messages": []}
 
-            result = native_tool_node.invoke(state)
+            tc_names = [tc["name"] for tc in last_msg.tool_calls]
+            logger.info("[TRACE:graph] TOOLS: invoking %d tools=%s", len(tc_names), tc_names)
 
-            for i, tc in enumerate(last_msg.tool_calls):
-                tool_messages = [m for m in result.get("messages", []) if isinstance(m, ToolMessage)]
-                tm = tool_messages[i] if i < len(tool_messages) else None
-                content = str(tm.content) if tm else ""
-                is_error = content.startswith("Error:") if content else False
-                if not is_error and content.startswith("{"):
-                    try:
-                        parsed = _json.loads(content)
-                        if isinstance(parsed, dict) and not parsed.get("ok", True):
-                            is_error = True
-                    except (ValueError, TypeError):
-                        pass
-                all_records.append({
-                    "name": tc["name"],
-                    "params": pending_args.get(tc.get("id", "") or "", {}),
-                    "result": {"ok": not is_error, "result": content},
-                    "status": "failed" if is_error else "completed",
-                    "trace_id": trace.trace_id,
-                })
+            try:
+                result = native_tool_node.invoke(state)
+                logger.info("[TRACE:graph] TOOLS: result messages=%d", len(result.get("messages", [])))
+            except Exception:
+                logger.exception("[TRACE:graph] TOOLS: invoke FAILED")
+                raise
 
+            # 工具记录统一由 astream_events 的 on_tool_end 处理，此处不追加，避免重复
             return {"messages": result.get("messages", [])}
 
         graph = StateGraph(_AgentState)
@@ -1084,65 +1141,72 @@ Final responses should be natural, brief unless detail is requested, transparent
         graph.add_edge("tools", "assistant")
         compiled = graph.compile()
 
-        # 流式执行
+        # 流式执行 — 使用 astream_events(v2) 实现 token 级真正流式
         accumulated: list[str] = []
-        tool_emitted: set[str] = set()
+        pending_tool_inputs: dict[str, dict[str, Any]] = {}
 
         input_state: _AgentState = {"messages": initial_messages, "runtime_events": []}
-        for event in compiled.stream(
-            input_state,
-            stream_mode="updates",
-        ):
-            for node_name, node_output in event.items():
-                if node_name == "assistant" and "messages" in node_output:
-                    for msg in node_output["messages"]:
-                        if isinstance(msg, AIMessage):
-                            # 发送 tool_call 事件（去重）
-                            if msg.tool_calls:
-                                for tc in msg.tool_calls:
-                                    key = f"{tc['name']}_{tc.get('id', '')}"
-                                    if key not in tool_emitted:
-                                        tool_emitted.add(key)
-                                        yield {
-                                            "event": "tool_call",
-                                            "data": {
-                                                "name": tc["name"],
-                                                "params": tc.get("args", {}),
-                                                "status": "pending",
-                                                "trace_id": trace.trace_id,
-                                            },
-                                        }
-                            # 发送 token 事件
-                            if msg.content:
-                                content = str(msg.content)
-                                accumulated.append(content)
-                                for char in content:
-                                    yield {"event": "token", "data": {"text": char}}
+        async for event in compiled.astream_events(input_state, version="v2"):
+            kind = event["event"]
+            evt_name = event.get("name", "")
+            metadata = event.get("metadata", {})
+            node = metadata.get("langgraph_node", "")
 
-                elif node_name == "tools" and "messages" in node_output:
-                    for msg in node_output["messages"]:
-                        if hasattr(msg, "tool_call_id"):
-                            content = str(msg.content)
-                            is_error = content.startswith("Error:")
-                            if not is_error and content.startswith("{"):
-                                try:
-                                    parsed = _json.loads(content)
-                                    if isinstance(parsed, dict) and not parsed.get("ok", True):
-                                        is_error = True
-                                except (ValueError, TypeError):
-                                    pass
-                            yield {
-                                "event": "tool_result",
-                                "data": {
-                                    "name": getattr(msg, "name", "unknown"),
-                                    "result": content,
-                                    "status": "failed" if is_error else "completed",
-                                    "trace_id": trace.trace_id,
-                                },
-                            }
+            if kind == "on_chat_model_stream":
+                chunk = event["data"]["chunk"]
+                if chunk.content:
+                    text = str(chunk.content)
+                    accumulated.append(text)
+                    yield {"event": "token", "data": {"text": text}}
+
+            elif kind == "on_tool_start" and node == "tools":
+                input_data = event["data"].get("input", {})
+                run_id = event.get("run_id", "")
+                if run_id:
+                    pending_tool_inputs[run_id] = input_data
+                yield {
+                    "event": "tool_call",
+                    "data": {
+                        "name": evt_name,
+                        "params": input_data,
+                        "status": "pending",
+                        "trace_id": trace.trace_id,
+                    },
+                }
+
+            elif kind == "on_tool_end" and node == "tools":
+                output = event["data"].get("output", "")
+                content = str(output)
+                is_error = content.startswith("Error:")
+                if not is_error and content.startswith("{"):
+                    try:
+                        parsed = _json.loads(content)
+                        if isinstance(parsed, dict) and not parsed.get("ok", True):
+                            is_error = True
+                    except (ValueError, TypeError):
+                        pass
+                run_id = event.get("run_id", "")
+                record = {
+                    "name": evt_name,
+                    "params": pending_tool_inputs.pop(run_id, {}),
+                    "result": {"ok": not is_error, "result": content},
+                    "status": "failed" if is_error else "completed",
+                    "trace_id": trace.trace_id,
+                }
+                all_records.append(record)
+                yield {
+                    "event": "tool_result",
+                    "data": {
+                        "name": evt_name,
+                        "result": content,
+                        "status": record["status"],
+                        "trace_id": trace.trace_id,
+                    },
+                }
 
         reply = "".join(accumulated)
-        result = self._finalize(reply, message, thread, trace, all_records, [])
+        post_items, post_full = self._build_post_context_items(reply, all_records)
+        result = self._finalize(reply, message, thread, trace, all_records, [], post_items, post_full)
         action_cards = build_action_cards(
             [ToolCallRecord(
                 name=r["name"], params=r.get("params", {}), result=r["result"],
@@ -1174,8 +1238,13 @@ Final responses should be natural, brief unless detail is requested, transparent
         trace: Trace,
         records: list[dict[str, Any]],
         malformed_errors: list[str],
+        post_ctx_items: list[ContextItem] | None = None,
+        post_full_contents: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """终结处理：记录事件、排队 outbox 任务、保存快照、构建最终响应。"""
+        """终结处理：记录事件、排队 outbox 任务、保存快照、构建最终响应。
+
+        post_ctx_items / post_full_contents: 后执行上下文项（工具调用/结果/输出），
+        将与前执行上下文合并存入 ContextSnapshot。"""
         # 先构建 action_cards，再记入 llm_response 事件
         action_cards = build_action_cards(
             [ToolCallRecord(
@@ -1244,19 +1313,27 @@ Final responses should be natural, brief unless detail is requested, transparent
             trace_id=trace.trace_id,
         )
 
-        # 保存上下文快照
+        # 保存上下文快照（合并前执行 + 后执行上下文项）
         meta = dict(self._last_ctx_meta) if self._last_ctx_meta else {}
+        all_ctx_items = list(self._last_ctx_items)
+        all_full_contents: dict[str, str] = {}
+        if post_ctx_items:
+            all_ctx_items.extend(post_ctx_items)
+        if post_full_contents:
+            all_full_contents.update(post_full_contents)
         snapshot = ContextSnapshot(
             trace_id=trace.trace_id,
             thread_id=thread.id,
             stable_prefix_hash=self._last_ctx_meta.get("stable_prefix_hash", ""),
-            context_items=[_serialize_context_item(it) for it in self._last_ctx_items],
+            context_items=[_serialize_context_item(it) for it in all_ctx_items],
             meta={
-                "total_items": meta.get("total_items", 0),
-                "total_tokens": meta.get("total_tokens", 0),
+                "total_items": meta.get("total_items", 0) + len(post_ctx_items or []),
+                "total_tokens": meta.get("total_tokens", 0)
+                    + sum(it.token_estimate for it in (post_ctx_items or [])),
                 "thread_id": meta.get("thread_id", ""),
                 "trace_id": meta.get("trace_id", ""),
                 "total_tool_calls": len(records),
+                "full_contents": all_full_contents,
             },
         )
         self._db.add(snapshot)

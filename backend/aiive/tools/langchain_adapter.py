@@ -34,7 +34,11 @@ def _make_handler(registry: ToolRegistry, capability_id: str, run_context: RunCo
     """
 
     def handler(**params: object) -> str:
+        import logging
+        _log = logging.getLogger(__name__)
+        _log.info("[TRACE:langchain] CALL tool=%s params=%s", capability_id, params)
         result = registry.execute(capability_id, params, "trusted_user_command", run_context)
+        _log.info("[TRACE:langchain] RESULT tool=%s ok=%s result_type=%s", capability_id, result.get("ok"), type(result).__name__)
         if not result.get("ok"):
             err = result.get("error", "Any error")
             if result.get("approval_required"):

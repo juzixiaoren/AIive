@@ -49,9 +49,16 @@ class MemoryMaintenance:
             包含 ok 状态和 memory_id 的字典。
         """
         try:
+            logger.info("[TRACE:forget] memory_id=%s reason=%s", memory_id[:16], reason)
             record = self._db.get(MemoryRecord, memory_id)
             if not record:
+                logger.warning("[TRACE:forget] memory_id=%s NOT FOUND (lifecycle_state may not be 'active')", memory_id[:16])
                 return {"ok": False, "error": "Memory not found"}
+
+            logger.info(
+                "[TRACE:forget] found record id=%s type=%s state=%s content=%s",
+                memory_id[:16], record.memory_type, record.lifecycle_state, record.content[:80],
+            )
 
             # 生成墓碑值：包含记忆 ID 前缀和当前时间
             tombstone = f"forgotten:{memory_id[:8]}:{datetime.now(timezone.utc).isoformat()}"
@@ -65,10 +72,10 @@ class MemoryMaintenance:
                 tombstone=tombstone,
             )
             self._db.add(fr)
-            self._db.flush()
+            logger.info("[TRACE:forget] SUCCESS memory_id=%s tombstone=%s", memory_id[:16], tombstone[:50])
             return {"ok": True, "memory_id": memory_id, "tombstone": tombstone}
         except Exception:
-            logger.exception("记忆遗忘操作失败: memory_id=%s", memory_id)
+            logger.exception("[TRACE:forget] FAILED memory_id=%s", memory_id[:16])
             raise
 
     def sleep(self, memory_id: str) -> dict[str, Any]:
