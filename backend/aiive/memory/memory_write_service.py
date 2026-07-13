@@ -563,7 +563,22 @@ class MemoryWriteService:
         final_op: str,
         final_memory_id: str = "",
     ) -> None:
-        """Persist a MemoryProposal to the memory_proposals table."""
+        """Persist a MemoryProposal to the memory_proposals table.
+
+        Checks idempotency_key before insert to safely handle retries
+        and batch deduplication without raising UniqueViolation.
+        """
+        ikey: str = proposal.idempotency_key
+        if ikey:
+            existing = self._db.query(MemoryProposalModel).filter(
+                MemoryProposalModel.idempotency_key == ikey
+            ).first()
+            if existing is not None:
+                logger.debug(
+                    "Proposal idempotency_key already exists, skipping: %s", ikey
+                )
+                return
+
         mp = MemoryProposalModel(
             proposal_id=proposal.proposal_id,
             source_event_ids=proposal.source_event_ids,
@@ -645,6 +660,19 @@ class MemoryWriteService:
 
         base_key = f"{record.id}:{record.record_version}"
         is_candidate = record.lifecycle_state == LifecycleState.CANDIDATE.value
+
+        # Core Memory projection refresh: only for keys that feed Core Memory.
+        # Enqueued on every write of a core-keyed record so the small, stable
+        # projection stays consistent (V2 §五/§九).
+        if record.canonical_key and record.canonical_key in self._registry.get_core_memory_keys():
+            self._db.add(OutboxJob(
+                operation_id=f"core:{base_key}:{_uuid.uuid4().hex[:8]}",
+                job_type="core_memory_refresh",
+                status="pending",
+                payload={"memory_id": record.id, "record_version": record.record_version},
+                trace_id=record.id,
+                max_retries=3,
+            ))
 
         # Vector upsert: only for active records (candidates not searchable)
         if event_type in ("memory.created", "memory.reinforced", "memory.superseded",

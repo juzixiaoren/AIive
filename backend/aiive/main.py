@@ -25,6 +25,7 @@ from aiive.api.routes_debug import router as debug_router
 from aiive.api.routes_memories import router as memories_router
 from aiive.api.routes_personal import router as personal_router
 from aiive.api.routes_tools import router as tools_router
+from aiive.api.routes_capabilities import router as capabilities_router
 from aiive.api.routes_mcp import router as mcp_router
 from aiive.api.routes_mcp_install import router as mcp_install_router
 from aiive.api.routes_selfdev import router as selfdev_router
@@ -137,6 +138,7 @@ def create_app() -> FastAPI:
     app.include_router(memories_router)
     app.include_router(personal_router)
     app.include_router(tools_router)
+    app.include_router(capabilities_router)
     app.include_router(mcp_router)
     app.include_router(mcp_install_router)
     app.include_router(selfdev_router)

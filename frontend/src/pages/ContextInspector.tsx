@@ -20,14 +20,16 @@ type ContextItem = {
 
 /** 上下文类型的中文标签和样式映射 */
 const KIND_META: Record<string, { label: string; bg: string; text: string; border: string }> = {
-  stable_prefix:   { label: "系统前缀",  bg: "bg-accent-soft", text: "text-accent-text", border: "border-accent-border" },
-  tool_schemas:    { label: "工具列表",  bg: "bg-success-soft",    text: "text-success-text",    border: "border-success-border" },
-  evidence_memory: { label: "注入记忆",  bg: "bg-warning-soft",   text: "text-warning-text",   border: "border-warning-border" },
-  history_message: { label: "历史消息",  bg: "bg-primary-soft",    text: "text-primary",    border: "border-primary-border" },
-  user_message:    { label: "当前消息",  bg: "bg-danger-soft",    text: "text-danger-text",    border: "border-danger-border" },
-  agent_output:    { label: "Agent 输出", bg: "bg-accent-soft",  text: "text-accent-text", border: "border-accent-border" },
-  tool_call:       { label: "工具调用",  bg: "bg-success-soft",   text: "text-success-text",   border: "border-success-border" },
-  tool_result:     { label: "工具结果",  bg: "bg-warning-soft",  text: "text-warning-text",  border: "border-warning-border" },
+  stable_prefix:      { label: "系统前缀",  bg: "bg-accent-soft", text: "text-accent-text", border: "border-accent-border" },
+  tool_schemas:       { label: "工具列表",  bg: "bg-success-soft",    text: "text-success-text",    border: "border-success-border" },
+  evidence_memory:    { label: "注入记忆",  bg: "bg-warning-soft",   text: "text-warning-text",   border: "border-warning-border" },
+  history_user:       { label: "用户消息",  bg: "bg-primary-soft",    text: "text-primary",    border: "border-primary-border" },
+  history_assistant:  { label: "模型回复",  bg: "bg-primary-soft/60", text: "text-primary/70", border: "border-primary-border/50" },
+  user_message:       { label: "当前消息",  bg: "bg-danger-soft",    text: "text-danger-text",    border: "border-danger-border" },
+  agent_output:       { label: "Agent 输出", bg: "bg-accent-soft",  text: "text-accent-text", border: "border-accent-border" },
+  recall_memory:      { label: "召回记忆",  bg: "bg-success-soft",   text: "text-success-text",   border: "border-success-border" },
+  tool_call:          { label: "工具调用",  bg: "bg-success-soft",   text: "text-success-text",   border: "border-success-border" },
+  tool_result:        { label: "工具结果",  bg: "bg-warning-soft",  text: "text-warning-text",  border: "border-warning-border" },
 };
 
 /** 信任级别中文标签 */
@@ -56,6 +58,13 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
   const [fullContents, setFullContents] = useState<Record<string, string>>({});
   const [loadingItem, setLoadingItem] = useState<string | null>(null);
 
+  // "查看更多" modal 打开时触发懒加载完整内容
+  useEffect(() => {
+    if (modalItem && !fullContents[modalItem.item_id]) {
+      fetchDetail(modalItem.item_id);
+    }
+  }, [modalItem?.item_id]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // 当 traceId 变化时，从后端加载上下文快照
   useEffect(() => {
     if (traceId) {
@@ -75,9 +84,13 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
     if (fullContents[itemId] !== undefined || loadingItem) return;
     setLoadingItem(itemId);
     fetch(`/api/context-runs/${traceId}/items/${itemId}`)
-      .then(r => { if (!r.ok) throw new Error(`${r.status}`); return r.json(); })
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
       .then((res: Record<string, unknown>) => {
-        setFullContents(prev => ({ ...prev, [itemId]: String(res.full_content ?? "") }));
+        if (res.error) {
+          setFullContents(prev => ({ ...prev, [itemId]: `错误: ${String(res.error)}` }));
+        } else {
+          setFullContents(prev => ({ ...prev, [itemId]: String(res.full_content ?? res.error ?? "(空") }));
+        }
       })
       .catch(e => {
         setFullContents(prev => ({ ...prev, [itemId]: `加载失败: ${e.message}` }));
@@ -85,17 +98,13 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
       .finally(() => setLoadingItem(null));
   };
 
-  /** 展开项的处理：对后执行项触发懒加载 */
-  const handleExpand = (i: number, item: ContextItem) => {
+  /** 展开项的处理：展开不自动加载，点击"查看更多"才触发懒加载 */
+  const handleExpand = (i: number, _item: ContextItem) => {
     if (expanded === i) {
       setExpanded(null);
       return;
     }
     setExpanded(i);
-    // 后执行上下文项：agent_output / tool_call / tool_result 需要懒加载详情
-    if (["agent_output", "tool_call", "tool_result"].includes(item.kind)) {
-      fetchDetail(item.item_id);
-    }
   };
 
   // 无 traceId 时显示引导提示
@@ -296,11 +305,19 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
 
             {/* 可滚动的完整内容区域 */}
             <div className="flex-1 overflow-y-auto px-5 pb-6">
-              <pre className="text-xs text-title whitespace-pre-wrap break-all font-mono leading-relaxed">
-                {fullContents[modalItem.item_id] !== undefined
-                  ? fullContents[modalItem.item_id]
-                  : modalItem.content_preview || "(空)"}
-              </pre>
+              {loadingItem === modalItem.item_id ? (
+                <div className="text-sm text-faint py-8 text-center animate-pulse">加载中...</div>
+              ) : (
+                <pre className={`text-xs whitespace-pre-wrap break-all font-mono leading-relaxed ${
+                  (fullContents[modalItem.item_id] || "").startsWith("错误") || (fullContents[modalItem.item_id] || "").startsWith("加载失败")
+                    ? "text-danger"
+                    : "text-title"
+                }`}>
+                  {fullContents[modalItem.item_id] !== undefined
+                    ? fullContents[modalItem.item_id]
+                    : modalItem.content_preview || "(空)"}
+                </pre>
+              )}
             </div>
           </div>
         </div>

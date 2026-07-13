@@ -36,6 +36,8 @@ class MemoryKeySpec:
     maintenance_policy: str = "persist"  # persist / decay / expire_7d / expire_30d
     structured_value_schema: dict[str, Any] | None = None
     is_pattern: bool = False             # True for "project.*" style patterns
+    core_memory_role: str | None = None  # "core.human_identity" / "core.interaction_defaults" /
+                                         # "core.agent_persona" — only these keys may feed Core Memory
 
 
 # ============================================================================
@@ -56,6 +58,7 @@ class KeyPattern:
     conflict_policy: str = "append"
     maintenance_policy: str = "persist"
     structured_value_schema: dict[str, Any] | None = None
+    core_memory_role: str | None = None
 
     def match(self, key: str) -> bool:
         """Return True if key starts with this pattern's prefix."""
@@ -93,7 +96,7 @@ class MemoryKeyRegistry:
 
     def _init_keys(self) -> None:
         exacts: list[MemoryKeySpec] = [
-            # -- User identity --
+            # -- User identity -- (also feeds Core Memory: human_identity)
             MemoryKeySpec(
                 canonical_key="user.display_name",
                 memory_type=MemoryType.USER_PROFILE.value,
@@ -101,6 +104,7 @@ class MemoryKeyRegistry:
                 context_roles=("runtime_identity",),
                 conflict_policy="supersede",
                 maintenance_policy="persist",
+                core_memory_role="core.human_identity",
             ),
             MemoryKeySpec(
                 canonical_key="user.name",
@@ -109,8 +113,9 @@ class MemoryKeyRegistry:
                 context_roles=("runtime_identity",),
                 conflict_policy="supersede",
                 maintenance_policy="persist",
+                core_memory_role="core.human_identity",
             ),
-            # -- User preference (exact single keys) --
+            # -- User preference (exact single keys) -- (feeds Core Memory: interaction_defaults)
             MemoryKeySpec(
                 canonical_key="user.preference.response_style",
                 memory_type=MemoryType.USER_PROFILE.value,
@@ -118,8 +123,18 @@ class MemoryKeyRegistry:
                 context_roles=("runtime_identity",),
                 conflict_policy="supersede",
                 maintenance_policy="persist",
+                core_memory_role="core.interaction_defaults",
             ),
-            # -- Agent identity --
+            MemoryKeySpec(
+                canonical_key="user.preference.default_language",
+                memory_type=MemoryType.USER_PROFILE.value,
+                cardinality="single",
+                context_roles=("runtime_identity",),
+                conflict_policy="supersede",
+                maintenance_policy="persist",
+                core_memory_role="core.interaction_defaults",
+            ),
+            # -- Agent identity -- (feeds Core Memory: agent_persona)
             MemoryKeySpec(
                 canonical_key="agent.display_name",
                 memory_type=MemoryType.AGENT_SELF.value,
@@ -127,6 +142,7 @@ class MemoryKeyRegistry:
                 context_roles=("runtime_identity",),
                 conflict_policy="supersede",
                 maintenance_policy="persist",
+                core_memory_role="core.agent_persona",
             ),
             MemoryKeySpec(
                 canonical_key="agent.persona.tone",
@@ -135,6 +151,7 @@ class MemoryKeyRegistry:
                 context_roles=("runtime_identity",),
                 conflict_policy="supersede",
                 maintenance_policy="persist",
+                core_memory_role="core.agent_persona",
             ),
             MemoryKeySpec(
                 canonical_key="agent.persona.relationship",
@@ -143,6 +160,32 @@ class MemoryKeyRegistry:
                 context_roles=("runtime_identity",),
                 conflict_policy="supersede",
                 maintenance_policy="persist",
+                core_memory_role="core.agent_persona",
+            ),
+            # -- Explicit Core Memory projection keys (Agent may write directly) --
+            MemoryKeySpec(
+                canonical_key="core.human_identity",
+                memory_type=MemoryType.USER_PROFILE.value,
+                cardinality="single",
+                conflict_policy="supersede",
+                maintenance_policy="persist",
+                core_memory_role="core.human_identity",
+            ),
+            MemoryKeySpec(
+                canonical_key="core.interaction_defaults",
+                memory_type=MemoryType.USER_PROFILE.value,
+                cardinality="single",
+                conflict_policy="supersede",
+                maintenance_policy="persist",
+                core_memory_role="core.interaction_defaults",
+            ),
+            MemoryKeySpec(
+                canonical_key="core.agent_persona",
+                memory_type=MemoryType.AGENT_SELF.value,
+                cardinality="single",
+                conflict_policy="supersede",
+                maintenance_policy="persist",
+                core_memory_role="core.agent_persona",
             ),
         ]
         for ks in exacts:
@@ -284,6 +327,31 @@ class MemoryKeyRegistry:
         for key, spec in self._exact.items():
             if role in spec.context_roles:
                 result.append(key)
+        return result
+
+    def get_context_role_patterns(self, role: str) -> list[str]:
+        """Return pattern prefixes whose context_roles include `role`.
+
+        Used by query-based resolution (e.g. `policy.*` records) so we can match
+        records without a full table scan.
+        """
+        result: list[str] = []
+        for p in self._patterns:
+            if role in p.context_roles:
+                result.append(p.prefix)
+        return result
+
+    def get_core_memory_keys(self) -> dict[str, str]:
+        """Return mapping canonical_key -> core_memory_role for all registered keys.
+
+        Only keys explicitly declaring a core_memory_role may feed the Core
+        Memory projection. Dynamic patterns are intentionally excluded so the
+        projection stays small and stable.
+        """
+        result: dict[str, str] = {}
+        for key, spec in self._exact.items():
+            if spec.core_memory_role:
+                result[key] = spec.core_memory_role
         return result
 
     def get_context_role_types(self, role: str) -> list[str]:

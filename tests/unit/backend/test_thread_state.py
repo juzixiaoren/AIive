@@ -46,7 +46,7 @@ class TestThreadState:
         assert messages == []
 
     def test_get_recent_messages_returns_ordered(self, db_session):
-        """消息应按时间顺序返回，且包含正确的角色映射。"""
+        """消息应按时间顺序返回，且包含正确的类型映射。"""
         logger = EventLogger(db_session)
         state = ThreadState(db_session)
         thread = state.get_or_create_thread()
@@ -62,9 +62,9 @@ class TestThreadState:
 
         messages = state.get_recent_messages(thread.id)
         assert len(messages) == 4
-        assert messages[0]["role"] == "user"
+        assert messages[0]["type"] == "user"
         assert messages[0]["content"] == "Hi"
-        assert messages[1]["role"] == "assistant"
+        assert messages[1]["type"] == "assistant"
         assert messages[1]["content"] == "Hello!"
         assert messages[2]["content"] == "How are you?"
         assert messages[3]["content"] == "Good!"

@@ -18,6 +18,7 @@ const TYPE_LABELS: Record<string, string> = {
   chat_ended: "对话结束", system_injection: "系统注入", tool_call: "工具调用",
   tool_result: "工具结果", memory_active: "记忆激活", memory_candidate: "记忆候选",
   steward_signal: "管家信号", context_truncated: "上下文截断", delete_request: "删除请求",
+  automatic_recall: "自动召回", memory_extracted: "记忆提取",
 };
 
 /** 从事件 payload 生成可读摘要 */
@@ -44,6 +45,26 @@ function describe(e: EventItem): string {
     }
     case "chat_ended":
       return `工具 ${p.tool_calls ?? 0} 次 · 成功 ${p.tool_succeeded ?? 0} · 失败 ${p.tool_failed ?? 0}`;
+    case "automatic_recall": {
+      const sel = Number(p.selected_count ?? 0);
+      const excl = Number(p.excluded_count ?? 0);
+      const total = Number(p.total_candidates ?? 0);
+      const items: unknown[] = Array.isArray(p.selected) ? p.selected : [];
+      const preview = items.map((it: unknown) => {
+        const i = it as Record<string, unknown>;
+        return `${i.canonical_key ?? ""}: ${String(i.content_preview ?? "").slice(0, 40)}`;
+      }).join(" | ");
+      return `查询「${String(p.query ?? "").slice(0, 50)}」→ 命中 ${sel}/${total}（排除 ${excl}）${preview ? " · " + preview : ""}`;
+    }
+    case "memory_extracted": {
+      const total = Number(p.total ?? 0);
+      const proposals: unknown[] = Array.isArray(p.proposals) ? p.proposals : [];
+      const preview = proposals.map((pp: unknown) => {
+        const pr = pp as Record<string, unknown>;
+        return `${pr.canonical_key ?? ""}: ${String(pr.content_preview ?? "").slice(0, 30)}`;
+      }).join(" | ");
+      return `从「${String(p.source_message ?? "").slice(0, 40)}」提取 ${total} 条${preview ? " · " + preview : ""}`;
+    }
     default:
       return JSON.stringify(p);
   }

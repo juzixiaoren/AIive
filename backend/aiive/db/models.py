@@ -230,6 +230,28 @@ class MCPInstallRecord(Base):
     )
 
 
+class CapabilityPlan(Base):
+    """能力安装计划：记录 MCP 自举的完整生命周期。"""
+    __tablename__: str = "capability_plans"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    goal: Mapped[str] = mapped_column(Text)
+    goal_summary: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    missing_capability_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    candidates: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    risk_scores: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    selected_candidate: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="proposed", index=True)
+    install_plan: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    smoke_result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    capability_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lesson_memory_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
 class SelfDevRequest(Base):
     """自进化请求模型：Agent 自行提出的代码修改请求。"""
     __tablename__: str = "selfdev_requests"
@@ -459,4 +481,57 @@ class AttentionState(Base):
     recent_topics: Mapped[list[Any]] = mapped_column(JSON, default=list)
     decision: Mapped[str] = mapped_column(String(32), default="continue")
     suggestion: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class CoreMemoryBlock(Base):
+    """Core Memory 投影表：memory_records 的极小、稳定派生投影。
+
+    memory_records 仍是事实与生命周期唯一真相源；本表只是可重建投影。
+    只有 MemoryKeyRegistry 中显式声明 core_memory_role 的键才能参与。
+    """
+    __tablename__: str = "core_memory_blocks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    block_name: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    content: Mapped[str] = mapped_column(Text)
+    source_memory_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    projection_version: Mapped[int] = mapped_column(default=1)
+    record_versions: Mapped[dict[str, int]] = mapped_column(JSON, default=dict)
+    token_count: Mapped[int] = mapped_column(default=0)
+    checksum: Mapped[str] = mapped_column(String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class MemoryRecallRun(Base):
+    """召回运行记录：每次 Automatic / Agent-Initiated Recall 的可追溯记录。"""
+    __tablename__: str = "memory_recall_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    trace_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    request_query: Mapped[str] = mapped_column(Text)
+    scope_context: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    routes_executed: Mapped[list[str]] = mapped_column(JSON, default=list)
+    token_budget: Mapped[int] = mapped_column(default=0)
+    result_count: Mapped[int] = mapped_column(default=0)
+    total_latency_ms: Mapped[float] = mapped_column(default=0.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class MemoryRecallCandidate(Base):
+    """召回候选记录：每次召回的每个候选及其原始分、融合分、入选/排除原因。"""
+    __tablename__: str = "memory_recall_candidates"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    run_id: Mapped[str] = mapped_column(String(36), index=True)
+    memory_id: Mapped[str] = mapped_column(String(36), index=True)
+    route: Mapped[str] = mapped_column(String(32))
+    raw_score: Mapped[float] = mapped_column(default=0.0)
+    fused_score: Mapped[float] = mapped_column(default=0.0)
+    selected: Mapped[bool] = mapped_column(default=False)
+    exclusion_reason: Mapped[str] = mapped_column(String(64), default="")
+    token_cost: Mapped[int] = mapped_column(default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

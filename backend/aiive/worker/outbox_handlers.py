@@ -57,6 +57,31 @@ def handle_memory_extraction(
             trace_id=trace_id, thread_id=thread_id,
         )
 
+        # Log extraction trace for debugging
+        if proposals:
+            from aiive.runtime.event_logger import EventLogger
+            _elog = EventLogger(db)
+            _elog.log_event(
+                trace_id=trace_id or "", thread_id=thread_id,
+                event_type="memory_extracted",
+                payload={
+                    "source_message": user_message[:200],
+                    "proposals": [
+                        {
+                            "proposal_id": p.proposal_id,
+                            "memory_type": p.memory_type,
+                            "canonical_key": p.canonical_key,
+                            "content_preview": (p.content or "")[:100],
+                            "confidence": p.confidence,
+                            "importance": p.importance,
+                            "proposed_operation": p.proposed_operation,
+                        }
+                        for p in proposals
+                    ],
+                    "total": len(proposals),
+                },
+            )
+
         for proposal in proposals:
             run_ctx = RunContext(
                 thread_id=thread_id, trace_id=trace_id or "", source="outbox_worker",
@@ -139,6 +164,25 @@ def handle_memory_cache_invalidate(
     logger.debug("Cache invalidate stub: mid=%s", payload.get("memory_id", ""))
 
 
+def handle_core_memory_refresh(
+    db: Session,
+    payload: dict[str, Any],
+    _trace_id: str | None,
+) -> None:
+    """Rebuild and persist the Core Memory projection blocks.
+
+    Reconstructs the small, stable Core Memory projection from memory_records
+    (the single source of truth). Stale-version protection is applied inside
+    CoreMemoryProjection.refresh() so out-of-order jobs are skipped.
+    """
+    memory_id: str = payload.get("memory_id", "")
+    record_version: int = payload.get("record_version", 0)
+    from aiive.memory.core_memory_projection import CoreMemoryProjection
+    from aiive.memory.recall_config import RecallConfig
+
+    CoreMemoryProjection.refresh(db, memory_id, record_version, RecallConfig())
+
+
 # ============================================================================
 # Registration
 # ============================================================================
@@ -151,3 +195,4 @@ def register_all(worker: "OutboxWorker") -> None:
     worker.register_handler("memory_vector_delete", handle_memory_vector_delete)
     worker.register_handler("memory_markdown_project", handle_memory_markdown_project)
     worker.register_handler("memory_cache_invalidate", handle_memory_cache_invalidate)
+    worker.register_handler("core_memory_refresh", handle_core_memory_refresh)

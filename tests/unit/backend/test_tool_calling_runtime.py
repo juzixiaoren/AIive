@@ -9,10 +9,23 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from aiive.memory.recall_models import MemoryRecallPack
 from aiive.runtime.tool_executor import (
     ToolCallRecord,
     build_action_cards,
 )
+
+# V2: context assembly happens in _build_agent_context. The integration tests
+# below focus on response structure, so we stub it with a stable context.
+FAKE_AGENT_CTX: dict = {
+    "system_content": "SYSTEM",
+    "identity": None,
+    "policies": [],
+    "core_blocks": [],
+    "recall_pack": MemoryRecallPack(request_id="x"),
+    "recall_traces": [],
+    "recall_run_id": "run-1",
+}
 
 
 # ============================================================================
@@ -97,18 +110,20 @@ class TestBuildActionCards:
 
 
 # ============================================================================
-# 测试：search_memory 与 list_memories
+# 测试：memory_search（V2 Agent-Initiated Recall）
 # ============================================================================
 
-class TestSearchMemoryEmptyQuery:
-    """需求 6、7：search_memory("") 不循环；空查询被拒绝并附提示。"""
+class TestMemorySearchEmptyQuery:
+    """V2：memory_search("") 不循环；空查询被拒绝并附提示（需合法 RunContext）。"""
 
     def test_empty_query_search_returns_empty_list(self):
         """空查询返回空列表而非错误。"""
+        from aiive.context.run_context import RunContext
         from aiive.tools.registry import get_tool_registry
 
         registry = get_tool_registry()
-        result = registry.execute("search_memory", {"query": ""}, "trusted_user_command", run_context=None)
+        ctx = RunContext(thread_id="t1", trace_id="tr1")
+        result = registry.execute("memory_search", {"query": ""}, "trusted_user_command", run_context=ctx)
         assert isinstance(result, dict)
         assert result.get("ok") is True
         inner = result.get("result", {})
@@ -128,7 +143,8 @@ class TestAgentGraphToolIntegration:
     @patch("aiive.runtime.agent_graph.ChatOpenAI")
     @patch("aiive.runtime.agent_graph.build_action_cards", return_value=[])
     @patch("aiive.runtime.agent_graph.AgentGraph._build_graph")
-    def test_run_never_returns_tool_call_tags(self, mock_graph, mock_cards, mock_chat):
+    @patch("aiive.runtime.agent_graph.AgentGraph._build_agent_context", return_value=FAKE_AGENT_CTX)
+    def test_run_never_returns_tool_call_tags(self, mock_ctx, mock_graph, mock_cards, mock_chat):
         """用户可见回复绝不能包含 <tool_call> 标签。"""
         from aiive.runtime.agent_graph import AgentGraph
 
@@ -156,7 +172,8 @@ class TestAgentGraphToolIntegration:
     @patch("aiive.runtime.agent_graph.ChatOpenAI")
     @patch("aiive.runtime.agent_graph.build_action_cards", return_value=[])
     @patch("aiive.runtime.agent_graph.AgentGraph._build_graph")
-    def test_run_returns_structured_response(self, mock_graph, mock_cards, mock_chat):
+    @patch("aiive.runtime.agent_graph.AgentGraph._build_agent_context", return_value=FAKE_AGENT_CTX)
+    def test_run_returns_structured_response(self, mock_ctx, mock_graph, mock_cards, mock_chat):
         """run() 返回的 dict 包含必要的结构字段。"""
         from aiive.runtime.agent_graph import AgentGraph
 

@@ -1,6 +1,6 @@
 """Test MemoryReadModel context building with both exact keys and dynamic patterns."""
 from aiive.memory.memory_store import MemoryStore
-from aiive.memory.memory_read_model import MemoryReadModel
+from aiive.memory.memory_read_model import MemoryReadModel, RuntimeIdentity
 from aiive.memory.memory_types import (
     MemoryProposal,
     EvidenceItem,
@@ -36,8 +36,10 @@ class TestMemoryReadModel:
         assert identity.user_display_name == "Alice"
         assert identity.relationship_style == "trusted assistant"
 
-    def test_dynamic_memories_in_context(self, db_session):
-        """Dynamic memories with pattern keys should appear in build_context()."""
+    def test_dynamic_memories_not_in_deprecated_batch(self, db_session):
+        """V2: dynamic (pattern-key) memories are retrieved query-aware via
+        AutomaticRecallEngine, not injected as a flat list.
+        """
         store = MemoryStore(db_session)
         _make_and_store(store, "user.preference.color", "Blue", "user_profile")
         _make_and_store(store, "user.routine.morning", "Wake at 7am", "user_profile")
@@ -46,16 +48,21 @@ class TestMemoryReadModel:
         db_session.flush()
 
         model = MemoryReadModel(store)
-        ctx = model.build_context()
+        # V2: resolve_identity + resolve_policies replace deprecated build_context().
+        identity = model.resolve_identity()
+        assert isinstance(identity, RuntimeIdentity)
 
-        # user_memories should NOT be empty
-        assert len(ctx.user_memories) > 0, (
-            "Dynamic pattern memories should appear in context, but got empty list. "
-            "Context role type-based fallback must work."
-        )
+        # The same memories ARE retrievable via the new query-aware recall path.
+        from aiive.memory.automatic_recall import AutomaticRecallEngine
+        from aiive.memory.recall_config import RecallConfig
+        from aiive.memory.recall_models import MemoryRecallRequest, ScopeContext
 
-        contents = {m["content"] for m in ctx.user_memories}
-        assert "Blue" in contents
+        engine = AutomaticRecallEngine(db_session, RecallConfig())
+        pack, _ = engine.recall(MemoryRecallRequest(
+            query="morning routine wake and nightly reading", scope_context=ScopeContext(thread_id="t"),
+            top_k=8, token_budget=2000,
+        ))
+        contents = {it.content for it in pack.items}
         assert "Wake at 7am" in contents
         assert "Reads nightly" in contents
 
@@ -65,15 +72,15 @@ class TestMemoryReadModel:
         db_session.flush()
 
         model = MemoryReadModel(store)
-        ctx = model.build_context()
-        # Policy records are retrieved via Retriever into user_memories (active+valid global)
-        all_content = {m["content"] for m in ctx.user_memories}
+        policies = model.resolve_policies()
+        all_content = {p["content"] for p in policies}
         assert "No external MCP installs" in all_content
 
     def test_empty_context_no_crash(self, db_session):
         store = MemoryStore(db_session)
         model = MemoryReadModel(store)
-        ctx = model.build_context()
-        # Should not crash, just return empty
-        assert ctx.user_memories == []
-        assert ctx.policies == []
+        identity = model.resolve_identity()
+        policies = model.resolve_policies()
+        # No memories stored — identity empty, policies empty, no crash.
+        assert identity.is_empty()
+        assert policies == []

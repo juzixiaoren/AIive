@@ -10,27 +10,38 @@ from unittest.mock import MagicMock, patch
 
 from langchain_core.messages import AIMessage
 
+from aiive.memory.recall_models import MemoryRecallPack
 from aiive.runtime.agent_graph import (
     AgentGraph,
     RuntimeEvent,
     _RUNTIME_EVENT_TRIGGER,
 )
 
+# V2: context is assembled by _build_agent_context. Patch it with a stable stub
+# so the runtime-event rendering tests focus on system/human role handling.
+FAKE_AGENT_CTX: dict = {
+    "system_content": "SYSTEM",
+    "identity": None,
+    "policies": [],
+    "core_blocks": [],
+    "recall_pack": MemoryRecallPack(request_id="x"),
+    "recall_traces": [],
+    "recall_run_id": "run-1",
+}
+
 
 class TestRunRuntimeEvent:
     """run_runtime_event：事件以 system 角色进入图，不污染聊天历史。"""
 
     @patch("aiive.runtime.agent_graph.ThreadBootstrapService.ensure_committed_thread", side_effect=lambda tid: tid)
-    @patch("aiive.runtime.agent_graph.AgentGraph._get_runtime_identity", return_value={})
-    @patch("aiive.runtime.agent_graph.AgentGraph._resolve_memories_for_context", return_value=[])
-    @patch("aiive.runtime.agent_graph.AgentGraph._get_tasks_context", return_value=([], []))
+    @patch("aiive.runtime.agent_graph.AgentGraph._build_agent_context", return_value=FAKE_AGENT_CTX)
     @patch("aiive.runtime.agent_graph.ThreadState.get_recent_messages", return_value=[])
     @patch("aiive.runtime.agent_graph.ChatOpenAI")
     @patch("aiive.runtime.agent_graph.build_action_cards", return_value=[])
     @patch("aiive.runtime.agent_graph.AgentGraph._build_graph")
     def test_runtime_event_rendered_as_system_not_user(
         self, mock_graph, mock_cards, mock_chat,
-        mock_hist, mock_tasks, mock_mem, mock_ident, mock_bootstrap,
+        mock_hist, mock_ctx, mock_bootstrap,
     ):
         """指令必须出现在 system 消息，human 轮次只能是中性占位符。"""
         captured: dict = {}
@@ -75,16 +86,14 @@ class TestRunRuntimeEvent:
         assert result["reply"] == "喝咖啡时间到"
 
     @patch("aiive.runtime.agent_graph.ThreadBootstrapService.ensure_committed_thread", side_effect=lambda tid: tid)
-    @patch("aiive.runtime.agent_graph.AgentGraph._get_runtime_identity", return_value={})
-    @patch("aiive.runtime.agent_graph.AgentGraph._resolve_memories_for_context", return_value=[])
-    @patch("aiive.runtime.agent_graph.AgentGraph._get_tasks_context", return_value=([], []))
+    @patch("aiive.runtime.agent_graph.AgentGraph._build_agent_context", return_value=FAKE_AGENT_CTX)
     @patch("aiive.runtime.agent_graph.ThreadState.get_recent_messages", return_value=[])
     @patch("aiive.runtime.agent_graph.ChatOpenAI")
     @patch("aiive.runtime.agent_graph.build_action_cards", return_value=[])
     @patch("aiive.runtime.agent_graph.AgentGraph._build_graph")
     def test_runtime_event_records_runtime_event_not_user_message(
         self, mock_graph, mock_cards, mock_chat,
-        mock_hist, mock_tasks, mock_mem, mock_ident, mock_bootstrap,
+        mock_hist, mock_ctx, mock_bootstrap,
     ):
         """run_runtime_event 应记录 runtime_event 事件，而非伪造的 user_message。"""
         mock_compiled = MagicMock()

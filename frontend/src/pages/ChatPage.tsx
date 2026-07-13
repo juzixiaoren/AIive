@@ -507,19 +507,26 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
                 ) as Array<{ name: string; params?: Record<string, unknown>; result?: unknown; status?: string }>;
                 let toolCalls = ex;
                 if (ex.length === 0 && finals.length) {
-                  toolCalls = finals.map((t, idx) => ({
-                    id: `${result.trace_id}-${idx}`,
-                    name: t.name,
-                    params: t.params || {},
-                    status: t.status === "failed" ? "failed" : "completed",
-                    result: t.result !== undefined ? String(t.result) : undefined,
-                  }));
-                } else if (ex.length && finals.length === ex.length) {
-                  toolCalls = ex.map((e, idx) => ({
-                    ...e,
-                    status: finals[idx].status === "failed" ? "failed" : "completed",
-                    result: finals[idx].result !== undefined ? String(finals[idx].result) : e.result,
-                  }));
+              toolCalls = finals.map((t, idx) => ({
+                id: `${result.trace_id}-${idx}`,
+                name: t.name,
+                params: t.params || {},
+                status: t.status === "failed" ? "failed" : "completed",
+                result: t.result !== undefined
+                  ? (typeof t.result === "string" ? t.result : typeof t.result === "object" && t.result !== null && "result" in t.result ? String((t.result as Record<string, unknown>).result) : JSON.stringify(t.result))
+                  : undefined,
+              }));
+            } else if (ex.length && finals.length === ex.length) {
+              toolCalls = ex.map((e, idx) => {
+                const fr = finals[idx].result;
+                return {
+                  ...e,
+                  status: finals[idx].status === "failed" ? "failed" : "completed",
+                  result: fr !== undefined
+                    ? (typeof fr === "string" ? fr : typeof fr === "object" && fr !== null && "result" in fr ? String((fr as Record<string, unknown>).result) : JSON.stringify(fr))
+                    : e.result,
+                };
+              });
                 }
                 updated[i] = {
                   ...updated[i],

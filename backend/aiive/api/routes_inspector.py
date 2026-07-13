@@ -14,6 +14,8 @@ from aiive.db.models import (
     Event,
     RetrievalRun,
     RetrievalCandidate,
+    MemoryRecallRun,
+    MemoryRecallCandidate,
 )
 
 logger = logging.getLogger(__name__)
@@ -118,6 +120,54 @@ def get_retrieval_run(run_id: str, db: Session = Depends(get_db)):
         }
     except Exception:
         logger.exception("获取检索运行详情失败: run_id=%s", run_id)
+        raise
+
+
+@router.get("/memory-recall-runs/{run_id}")
+def get_memory_recall_run(run_id: str, db: Session = Depends(get_db)):
+    """获取指定 run_id 的 V2 记忆召回运行详情（含每个候选的路由、原始分、融合分、入选/排除原因）。
+
+    Args:
+        run_id: 记忆召回运行ID
+        db: 数据库会话
+
+    Returns:
+        召回运行详情 + 候选列表（供 Retrieval Inspector 解释召回过程）
+    """
+    try:
+        run = db.get(MemoryRecallRun, run_id)
+        if not run:
+            return {"error": "not found"}
+        candidates = (
+            db.query(MemoryRecallCandidate)
+            .filter(MemoryRecallCandidate.run_id == run_id)
+            .all()
+        )
+        return {
+            "run_id": run.id,
+            "trace_id": run.trace_id,
+            "request_query": run.request_query,
+            "scope_context": run.scope_context,
+            "routes_executed": run.routes_executed,
+            "token_budget": run.token_budget,
+            "result_count": run.result_count,
+            "total_latency_ms": run.total_latency_ms,
+            "created_at": run.created_at.isoformat() if run.created_at else None,
+            "candidates": [
+                {
+                    "memory_id": c.memory_id,
+                    "route": c.route,
+                    "raw_score": c.raw_score,
+                    "fused_score": c.fused_score,
+                    "selected": c.selected,
+                    "exclusion_reason": c.exclusion_reason,
+                    "token_cost": c.token_cost,
+                }
+                for c in candidates
+            ],
+        }
+    except Exception:
+        logger.exception("获取记忆召回运行详情失败: run_id=%s", run_id)
         raise
 
 

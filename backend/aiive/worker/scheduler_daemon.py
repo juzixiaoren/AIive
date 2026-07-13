@@ -17,7 +17,6 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
 
 from aiive.db.base import SessionLocal
-from aiive.runtime.event_logger import EventLogger
 from aiive.runtime.task_manager import TaskManager
 from aiive.runtime.thread_bootstrap import ThreadBootstrapService
 from aiive.worker.task_worker import _wake_agent_for_reminder
@@ -39,7 +38,6 @@ def _poll_job():
         now = datetime.now(timezone.utc)
         due = mgr.get_due(now)
 
-        event_logger = EventLogger(db)
         for task in due:
             result = mgr.check_now(task.id)
             if result.get("action") != "notify":
@@ -55,17 +53,10 @@ def _poll_job():
                 )
                 continue
 
-            event_logger.log_event(
-                trace_id=task.id,
-                thread_id=tid,
-                event_type="reminder_triggered",
-                payload={
-                    "task_id": task.id,
-                    "task_type": task.task_type,
-                    "title": task.title,
-                },
-            )
-            wake_tasks.append((task, tid))
+            # event_type="reminder_triggered" 由 task_worker 在真正投递时写入，
+            # 此处只负责协调调度，不写重复事件。
+            # 传递基本值而非 ORM 对象，避免 session 关闭后 DetachedInstanceError
+            wake_tasks.append((task.id, task.title, tid))
 
         db.commit()
 
@@ -84,23 +75,23 @@ def _poll_job():
     # 并行投递（每个提醒使用独立 DB 会话 + LLM）
     if wake_tasks:
         if len(wake_tasks) == 1:
-            t, tid = wake_tasks[0]
+            tid_val, title, target = wake_tasks[0]
             try:
-                _wake_agent_for_reminder(t, tid)
+                _wake_agent_for_reminder(tid_val, title, target)
             except Exception:
-                logger.exception("提醒投递异常: task_id=%s", t.id)
+                logger.exception("提醒投递异常: task_id=%s", tid_val)
         else:
             with ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, len(wake_tasks))) as pool:
                 futures = {
-                    pool.submit(_wake_agent_for_reminder, t, tid): (t, tid)
-                    for t, tid in wake_tasks
+                    pool.submit(_wake_agent_for_reminder, tid_val, title, target): (tid_val,)
+                    for tid_val, title, target in wake_tasks
                 }
                 for f in as_completed(futures):
-                    t, tid = futures[f]
+                    tid_val = futures[f][0]
                     try:
                         f.result(timeout=120)
                     except Exception:
-                        logger.exception("提醒并行投递异常: task_id=%s", t.id)
+                        logger.exception("提醒并行投递异常: task_id=%s", tid_val)
 
     # 自调度下一次
     scheduler.add_job(
