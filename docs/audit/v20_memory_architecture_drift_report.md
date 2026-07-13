@@ -1,5 +1,9 @@
 # V20 Memory Architecture Drift Report
 
+> ⚠️ 本文为历史审计记录。所列 BLOCKER/MAJOR 问题已在终局重构中修复，
+> 当前架构与实现以 `docs/memory_architecture_design.md`（v2.0，已与代码核对）为准。
+> 本报告的"目标架构"即现在的实际实现。
+
 > 审计时间: 2026-07-09  
 > 审计范围: MemoryGate, MemoryExtractor, StewardSignalExtractor, MemoryStore, remember_or_update tool, outbox_handlers, agent_loop, context_builder
 

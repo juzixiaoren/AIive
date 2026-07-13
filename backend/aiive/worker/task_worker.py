@@ -103,17 +103,18 @@ class TaskWorker:
 
     def _wake_agent_for_reminder(self, task: Task, target_thread_id: str):
         """委托给模块级函数，保留实例方法以兼容 poll_and_notify 内部调用。"""
-        _wake_agent_for_reminder(task, target_thread_id)
+        _wake_agent_for_reminder(task.id, task.title, target_thread_id)
 
 
-def _wake_agent_for_reminder(task: Task, target_thread_id: str):
+def _wake_agent_for_reminder(task_id: str, task_title: str, target_thread_id: str):
     """在独立 DB 会话中运行 AgentGraph 处理提醒，线程安全。
 
     不使用任何外部传入的会话，全部使用 SessionLocal() 独立管理。
     可被 scheduler_daemon 的 ThreadPoolExecutor 安全并发调用。
 
     参数:
-        task: 到期任务对象
+        task_id: 到期任务的 ID
+        task_title: 任务标题
         target_thread_id: 目标对话线程 ID
     """
     # 1. 查找 reminder_created 事件（独立短会话）
@@ -127,7 +128,7 @@ def _wake_agent_for_reminder(task: Task, target_thread_id: str):
             .all()
         )
         reminder_event = next(
-            (e for e in recent_reminders if (e.payload or {}).get("task_id") == task.id),
+            (e for e in recent_reminders if (e.payload or {}).get("task_id") == task_id),
             None,
         )
         reminder_id = reminder_event.id if reminder_event else ""
@@ -150,7 +151,7 @@ def _wake_agent_for_reminder(task: Task, target_thread_id: str):
             event = RuntimeEvent(
                 event_type="reminder",
                 reminder_id=reminder_id,
-                content=task.title,
+                content=task_title,
                 required_backend_action="remind_alert",
                 source="scheduler",
             )

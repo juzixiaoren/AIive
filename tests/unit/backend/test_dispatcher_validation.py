@@ -45,7 +45,7 @@ class TestPolicyEngine:
         """多个 tool_calls 应正常处理。"""
         tool_calls = [
             {"name": "echo", "args": {}, "id": "call_1"},
-            {"name": "search_memory", "args": {"query": "test"}, "id": "call_2"},
+            {"name": "memory_search", "args": {"query": "test"}, "id": "call_2"},
         ]
         result = check_tool_calls(tool_calls)
         assert result.action == "allow"

@@ -1,13 +1,13 @@
 """MemoryStore: internal memory persistence repository.
 
 Provides structured CRUD for MemoryRecord, used exclusively by MemoryWriteService
-and read-side components (MemoryReadModel, MemoryRetriever).
+and read-side components (MemoryReadModel).
 
 Production write paths MUST NOT call create_record() / update_lifecycle() directly;
 they must go through MemoryWriteService.
 
 Read paths (get_active, get_by_id, get_by_key_scope, etc.) are safe for
-MemoryReadModel and MemoryRetriever to use.
+MemoryReadModel to use.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ class MemoryStore:
     """Internal repository for memory_records operations.
 
     Write operations: called only by MemoryWriteService.
-    Read operations: called by MemoryReadModel, MemoryRetriever, Context Builder.
+    Read operations: called by MemoryReadModel, Context Builder.
     """
 
     def __init__(self, db: Session) -> None:
@@ -189,20 +189,31 @@ class MemoryStore:
     def get_by_context_roles(
         self, roles: Sequence[str]
     ) -> Sequence[MemoryRecord]:
-        """Get active+valid records by context role keys."""
+        """Get active+valid records by context role keys (exact + pattern prefixes).
+
+        Query-based: matches exact canonical_keys OR canonical_key LIKE prefix%.
+        No full table scan.
+        """
+        from sqlalchemy import or_
+
         from aiive.memory.memory_key_registry import get_memory_key_registry
+
         registry = get_memory_key_registry()
-        keys: set[str] = set()
+        exact_keys: set[str] = set()
+        prefixes: list[str] = []
         for role in roles:
-            keys.update(registry.get_context_role_keys(role))
-        if not keys:
+            exact_keys.update(registry.get_context_role_keys(role))
+            prefixes.extend(registry.get_context_role_patterns(role))
+        if not exact_keys and not prefixes:
             return []
+        conditions = []
+        if exact_keys:
+            conditions.append(MemoryRecord.canonical_key.in_(list(exact_keys)))
+        for pfx in prefixes:
+            conditions.append(MemoryRecord.canonical_key.like(f"{pfx}%"))
         return (
             self._db.query(MemoryRecord)
-            .filter(
-                MemoryRecord.canonical_key.in_(list(keys)),
-                *self._ACTIVE_VALID,
-            )
+            .filter(or_(*conditions), *self._ACTIVE_VALID)
             .order_by(MemoryRecord.updated_at.desc())
             .all()
         )
@@ -227,13 +238,8 @@ class MemoryStore:
         )
 
     def db_session(self) -> Session:
-        """Return the raw DB session (for Retriever)."""
+        """Return the raw DB session for read-side components."""
         return self._db
-
-    # Backward-compat aliases (deprecated)
-    def resolve_for_context(self) -> Sequence[MemoryRecord]:
-        """Deprecated: use MemoryReadModel or MemoryRetriever instead."""
-        return self.get_active_valid()
 
     # ------------------------------------------------------------------
     # Helpers

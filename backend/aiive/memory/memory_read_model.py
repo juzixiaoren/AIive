@@ -4,12 +4,14 @@ Provides Runtime Identity and Policy resolution using MemoryKeyRegistry
 context roles. Does NOT perform full table scans — queries by specific
 canonical_keys registered for each context role.
 
-Replaces AgentGraph._get_runtime_identity() and _resolve_memories_for_context().
+V2: dynamic, query-aware recall is handled by AutomaticRecallEngine
+(see `automatic_recall.py`). The Kernel Contract keeps Runtime Identity +
+Policy (exact keys) only.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from collections.abc import Sequence
 from typing import Any
 
@@ -51,30 +53,13 @@ class RuntimeIdentity:
         ])
 
 
-@dataclass
-class ReadContext:
-    """Context items for injection into LLM system prompt.
-
-    Uses deterministic key-based reading, NOT full active scan.
-    """
-    runtime_identity: RuntimeIdentity = field(default_factory=RuntimeIdentity)
-    policies: list[dict[str, Any]] = field(default_factory=list)
-    user_memories: list[dict[str, Any]] = field(default_factory=list)
-
-    def is_empty(self) -> bool:
-        return self.runtime_identity.is_empty() and not self.policies and not self.user_memories
-
-
 class MemoryReadModel:
     """Deterministic memory reader using MemoryKeyRegistry context roles.
 
-    Replaces:
-    - AgentGraph._get_runtime_identity() (full scan)
-    - AgentGraph._resolve_memories_for_context() (full scan)
-
     Usage:
         model = MemoryReadModel(MemoryStore(db))
-        ctx = model.build_context()
+        identity = model.resolve_identity()
+        policies = model.resolve_policies()
     """
 
     def __init__(self, store: MemoryStore) -> None:
@@ -106,34 +91,22 @@ class MemoryReadModel:
                     identity.user_display_name = rec.content
             elif rec.canonical_key == "agent.persona.relationship":
                 identity.relationship_style = rec.content
+            elif rec.canonical_key == "agent.persona.tone":
+                identity.response_style = rec.content
             elif rec.canonical_key == "user.preference.response_style":
                 identity.response_style = rec.content
 
         return identity
 
     # ------------------------------------------------------------------
-    # Context Building
+    # Policy (exact keys only — part of the stable Kernel Contract)
     # ------------------------------------------------------------------
 
-    def build_context(self, agent_runtime_id: str = "") -> ReadContext:
-        """Build context: exact keys for identity + Retriever for dynamic memories."""
-        identity = self.resolve_identity(agent_runtime_id)
-
-        # Policy: exact keys ONLY (no type-based fallback)
+    def resolve_policies(self) -> list[dict[str, Any]]:
+        """Resolve policy records via exact 'policy' context role keys."""
         policy_records = self._store.get_by_context_roles(["policy"])
-        policies = [
+        return [
             {"id": r.id, "content": r.content, "key": r.canonical_key,
              "importance": r.importance or 0.5}
             for r in policy_records
         ]
-
-        # Dynamic memories: use MemoryRetriever (scope-ranked, NOT type-based)
-        from aiive.memory.memory_retriever import MemoryRetriever, ScopeContext
-        retriever = MemoryRetriever(self._store.db_session())
-        user_memories = retriever.retrieve(ScopeContext())  # global default
-
-        return ReadContext(
-            runtime_identity=identity,
-            policies=policies,
-            user_memories=user_memories,
-        )

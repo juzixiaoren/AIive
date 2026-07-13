@@ -43,24 +43,27 @@ class ThreadState:
         self._db.flush()
         return thread
 
-    def get_recent_messages(self, thread_id: str, limit: int = 20) -> list[dict[str, Any]]:
-        """获取线程的最近消息历史。
+    def get_recent_messages(self, thread_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        """获取线程的最近消息历史（含工具交互）。
 
-        从 Event 表中查询最近的 user_message 和 llm_response 事件，
-        转换为角色-内容格式的列表。llm_response 中可能携带 action_cards。
+        查询 user_message、tool_call、tool_result、llm_response 事件，
+        按时间顺序返回结构化记录，用于重建完整的 LangChain 消息序列。
+        tool_call 与 tool_result 按时间顺序成对出现。
 
         Args:
             thread_id: 线程 ID
-            limit: 需要获取的消息数量（上限）
+            limit: 需要获取的事件数量（上限，默认 100）
 
         Returns:
-            包含 role、content、action_cards、event_id 字段的字典列表
+            包含 type、content、tool_name、tool_params、tool_result 等字段的字典列表
         """
         events = (
             self._db.query(Event)
             .filter(
                 Event.thread_id == thread_id,
-                Event.event_type.in_(["user_message", "llm_response"]),
+                Event.event_type.in_([
+                    "user_message", "tool_call", "tool_result", "llm_response",
+                ]),
             )
             .order_by(Event.created_at.asc())
             .limit(limit)
@@ -69,15 +72,47 @@ class ThreadState:
 
         messages: list[dict[str, Any]] = []
         for event in events:
-            role = "user" if event.event_type == "user_message" else "assistant"
             p = event.payload or {}
-            content = p.get("content", "")
-            if content:
+            etype = event.event_type
+
+            if etype == "user_message":
+                content = p.get("content", "")
+                if content:
+                    messages.append({
+                        "type": "user",
+                        "content": content,
+                        "event_id": event.id,
+                        "trace_id": event.trace_id,
+                    })
+
+            elif etype == "tool_call":
                 messages.append({
-                    "role": role,
-                    "content": content,
-                    "action_cards": p.get("action_cards", []),
+                    "type": "tool_call",
+                    "tool_name": p.get("name", ""),
+                    "tool_params": p.get("params", {}),
                     "event_id": event.id,
                     "trace_id": event.trace_id,
                 })
+
+            elif etype == "tool_result":
+                messages.append({
+                    "type": "tool_result",
+                    "tool_name": p.get("name", ""),
+                    "tool_result": p.get("result", {}),
+                    "tool_status": p.get("status", "unknown"),
+                    "event_id": event.id,
+                    "trace_id": event.trace_id,
+                })
+
+            elif etype == "llm_response":
+                content = p.get("content", "")
+                if content:
+                    messages.append({
+                        "type": "assistant",
+                        "content": content,
+                        "action_cards": p.get("action_cards", []),
+                        "event_id": event.id,
+                        "trace_id": event.trace_id,
+                    })
+
         return messages

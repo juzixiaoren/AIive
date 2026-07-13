@@ -128,7 +128,7 @@ class UnifiedMemoryExtractor:
             return []
 
         extracted: list[ExtractedMemory] = self._parse(response.content)
-        return self._normalize_all(extracted, thread_id)
+        return self._normalize_all(extracted, thread_id, trace_id)
 
     # ------------------------------------------------------------------
     # Parsing
@@ -183,10 +183,16 @@ class UnifiedMemoryExtractor:
         self,
         extracted: list[ExtractedMemory],
         thread_id: str,
+        trace_id: str | None = None,
     ) -> list[MemoryProposal]:
-        """Normalize all extracted items through ProposalNormalizer."""
+        """Normalize all extracted items through ProposalNormalizer.
+
+        Each proposal receives a unique idempotency key based on
+        trace_id + proposal_index to prevent batch collisions.
+        """
+        source_event_ids: list[str] = [trace_id] if trace_id else []
         results: list[MemoryProposal] = []
-        for em in extracted:
+        for i, em in enumerate(extracted):
             # Build evidence
             evidence: list[dict[str, Any]] = []
             if em.source_span:
@@ -205,11 +211,14 @@ class UnifiedMemoryExtractor:
                 importance=em.importance,
                 trust_level=TrustLevel.TRUSTED.value,
                 evidence=evidence,
+                source_event_ids=source_event_ids,
                 extractor_name="UnifiedMemoryExtractor",
                 extractor_version="1.0",
                 thread_id=thread_id,
             )
             if result.proposal is not None:
+                # Override idempotency with unique index per batch item
+                result.proposal.compute_request_idempotency(proposal_index=i)
                 results.append(result.proposal)
             else:
                 logger.debug(
@@ -219,9 +228,3 @@ class UnifiedMemoryExtractor:
         return results
 
 
-# ============================================================================
-# Backward-compatible aliases
-# ============================================================================
-
-# Deprecated: use UnifiedMemoryExtractor directly
-MemoryExtractor = UnifiedMemoryExtractor
