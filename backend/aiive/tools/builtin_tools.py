@@ -800,7 +800,8 @@ def _handle_ingest_document(db: Session, file_path: str):
     # 将原始文档保存到对象存储供后续检索
     if result.get("ok") and not result.get("duplicate"):
         try:
-            content = open(file_path).read()
+            with open(file_path) as f:
+                content = f.read()
             put_text("raw-documents", os.path.basename(file_path), content)
         except Exception:
             logger.warning("对象存储写入失败: file_path=%s", file_path, exc_info=True)
@@ -927,10 +928,15 @@ def _handle_create_selfdev_plan(goal: str = ""):
     return SelfDevPlanner(llm).plan(goal)
 
 
-def _handle_apply_patch_to_inactive_slot():
-    """将补丁应用到非活跃槽位（不影响当前运行版本）。"""
+def _handle_apply_patch_to_inactive_slot(operations=None):
+    """将补丁应用到非活跃槽位（不影响当前运行版本）。
+
+    参数:
+        operations: 操作列表，每项包含 operation、target_file、content 等字段。
+                    来自 create_selfdev_plan 的 plan.operations。
+    """
     from aiive.selfdev.patch_executor import PatchExecutor
-    return PatchExecutor().apply_to_inactive([])
+    return PatchExecutor().apply_to_inactive(operations or [])
 
 
 def _handle_promote_slot():
@@ -1058,7 +1064,8 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         # 自进化
         ("create_selfdev_plan", _handle_create_selfdev_plan, "生成自进化补丁计划",
          {"goal": "str"}, "low", False, False),
-        ("apply_patch_to_inactive_slot", _handle_apply_patch_to_inactive_slot, "仅将补丁应用到非活跃槽位", {}, "high", True, False),
+        ("apply_patch_to_inactive_slot", _handle_apply_patch_to_inactive_slot, "仅将补丁应用到非活跃槽位",
+         {"operations": {"type": "list", "description": "补丁操作列表，来自 create_selfdev_plan 返回的 plan.operations"}}, "high", True, False),
         ("promote_slot", _handle_promote_slot, "健康检查通过后提升非活跃槽位为活跃", {}, "high", True, False),
         ("rollback_slot", _handle_rollback_slot, "回滚到上一个活跃槽位", {}, "high", True, False),
         # 节奏 / 注意力

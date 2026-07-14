@@ -8,9 +8,12 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from aiive.context.run_context import RunContext
 from aiive.db.base import get_db
 from aiive.memory.memory_maintenance import MemoryMaintenance
 from aiive.memory.memory_store import MemoryStore
+from aiive.memory.memory_types import MemoryProposal
+from aiive.memory.memory_write_service import MemoryWriteService
 from aiive.memory.projection import MemoryProjection
 
 router = APIRouter(prefix="/api")
@@ -96,10 +99,10 @@ def forget_memory(memory_id: str, request: ForgetRequest, db: Session = Depends(
     Returns:
         遗忘操作结果
     """
-    maint = MemoryMaintenance(db)
-    result = maint.forget(memory_id, request.reason)
+    writer = MemoryWriteService(db)
+    result = writer.forget(memory_id, reason=request.reason)
     db.commit()
-    return result
+    return {"ok": result.written, "memory_id": result.memory_id, "reason": result.reason}
 
 
 @router.post("/memories/{memory_id}/sleep")
@@ -113,10 +116,17 @@ def sleep_memory(memory_id: str, db: Session = Depends(get_db)):
     Returns:
         休眠操作结果
     """
-    maint = MemoryMaintenance(db)
-    result = maint.sleep(memory_id)
+    writer = MemoryWriteService(db)
+    proposal = MemoryProposal(
+        source_event_ids=[memory_id],
+        memory_type="",
+        canonical_key="",
+        proposed_operation="sleep",
+    )
+    ctx = RunContext(thread_id="api", trace_id=memory_id, source="api")
+    result = writer.execute_maintenance(proposal, ctx)
     db.commit()
-    return result
+    return {"ok": result.written, "memory_id": result.memory_id, "reason": result.reason}
 
 
 @router.post("/memories/{memory_id}/archive")
@@ -130,10 +140,17 @@ def archive_memory(memory_id: str, db: Session = Depends(get_db)):
     Returns:
         归档操作结果
     """
-    maint = MemoryMaintenance(db)
-    result = maint.archive(memory_id)
+    writer = MemoryWriteService(db)
+    proposal = MemoryProposal(
+        source_event_ids=[memory_id],
+        memory_type="",
+        canonical_key="",
+        proposed_operation="archive",
+    )
+    ctx = RunContext(thread_id="api", trace_id=memory_id, source="api")
+    result = writer.execute_maintenance(proposal, ctx)
     db.commit()
-    return result
+    return {"ok": result.written, "memory_id": result.memory_id, "reason": result.reason}
 
 
 @router.post("/maintenance/memory-scan")

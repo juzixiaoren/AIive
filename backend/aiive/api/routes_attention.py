@@ -38,7 +38,13 @@ def get_attention(thread_id: str = Query(...), db: Session = Depends(get_db)):
         mgr = AttentionManager(db)
         state = mgr.get_current(thread_id)
         if not state:
-            return {"thread_id": thread_id, "decision": "continue"}
+            return {
+                "thread_id": thread_id,
+                "decision": "continue",
+                "suggestion": None,
+                "focus_topic": None,
+                "recent_topics": [],
+            }
         return {
             "thread_id": state.thread_id,
             "decision": state.decision,

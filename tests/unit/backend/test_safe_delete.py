@@ -11,9 +11,26 @@ import pytest
 from aiive.tools.safe_delete import (
     DANGEROUS_PATHS,
     DeleteDecision,
+    REPO_ROOT,
     SafeDeleteScopeRegistry,
     safe_delete,
 )
+
+
+class TestRepoRoot:
+    """回归测试：REPO_ROOT 必须正确指向仓库根（曾因多算一层 parent 而偏移）。"""
+
+    def test_repo_root_is_project_root(self):
+        """REPO_ROOT 应解析为包含 backend/aiive 的仓库根目录。"""
+        assert REPO_ROOT.name == "AIive"
+        assert (REPO_ROOT / "backend" / "aiive" / "tools" / "safe_delete.py").exists()
+
+    def test_dangerous_paths_protect_real_repo(self):
+        """危险路径集合必须覆盖真实仓库根与 backend，而非仓库外一级。"""
+        assert str(REPO_ROOT) in DANGEROUS_PATHS
+        assert str(REPO_ROOT / "backend") in DANGEROUS_PATHS
+        # 仓库外一级目录绝不应被列为危险路径
+        assert str(REPO_ROOT.parent) not in DANGEROUS_PATHS
 
 
 class TestSafeDeleteScopeRegistry:
@@ -141,7 +158,7 @@ class TestSafeDelete:
         """未知范围的删除应被拒绝。"""
         decision = safe_delete(str(tmp_path / "x.txt"), "nonexistent", "trash")
         assert decision.allowed is False
-        assert "unknown scope" in decision.reason.lower()
+        assert "Any scope" in decision.reason
 
     def test_denies_symlink(self, tmp_path):
         """符号链接的删除应被拒绝。"""
@@ -182,7 +199,7 @@ class TestSafeDelete:
 
         decision = safe_delete(str(test_file), "sandbox", "invalid_mode", registry)
         assert decision.allowed is False
-        assert "unknown mode" in decision.reason.lower()
+        assert "Any mode" in decision.reason
 
     def test_denies_repo_root(self, tmp_path):
         """仓库根目录的删除应被拒绝。"""

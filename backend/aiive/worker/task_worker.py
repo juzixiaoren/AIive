@@ -103,10 +103,10 @@ class TaskWorker:
 
     def _wake_agent_for_reminder(self, task: Task, target_thread_id: str):
         """委托给模块级函数，保留实例方法以兼容 poll_and_notify 内部调用。"""
-        _wake_agent_for_reminder(task.id, task.title, target_thread_id)
+        _wake_agent_for_reminder(task.id, task.title, task.task_type, target_thread_id)
 
 
-def _wake_agent_for_reminder(task_id: str, task_title: str, target_thread_id: str):
+def _wake_agent_for_reminder(task_id: str, task_title: str, task_type: str, target_thread_id: str):
     """在独立 DB 会话中运行 AgentGraph 处理提醒，线程安全。
 
     不使用任何外部传入的会话，全部使用 SessionLocal() 独立管理。
@@ -160,7 +160,7 @@ def _wake_agent_for_reminder(task_id: str, task_title: str, target_thread_id: st
             agent_db.commit()
             logger.info(
                 "提醒 Agent 唤醒成功: task_id=%s title=%s thread_id=%s",
-                task.id, task.title, target_thread_id,
+                task_id, task_title, target_thread_id,
             )
 
             ws_manager.broadcast_to_thread_sync(
@@ -178,19 +178,19 @@ def _wake_agent_for_reminder(task_id: str, task_title: str, target_thread_id: st
     except Exception:
         logger.exception(
             "提醒 Agent 唤醒失败，回退为 notification_created: task_id=%s title=%s",
-            task.id, task.title,
+            task_id, task_title,
         )
         fallback_db = SessionLocal()
         try:
             EventLogger(fallback_db).log_event(
-                trace_id=task.id,
+                trace_id=task_id,
                 thread_id=target_thread_id,
                 event_type="notification_created",
                 payload={
-                    "task_id": task.id,
-                    "task_type": task.task_type,
-                    "title": task.title,
-                    "message": f"提醒: {task.title}",
+                    "task_id": task_id,
+                    "task_type": task_type,
+                    "title": task_title,
+                    "message": f"提醒: {task_title}",
                     "status": "alerting",
                 },
             )

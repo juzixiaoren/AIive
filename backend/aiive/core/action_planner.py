@@ -107,27 +107,6 @@ class ActionPlanner:
     def __init__(self, llm_client: LLMClient):
         self._llm: LLMClient = llm_client
 
-    def plan(
-        self,
-        user_message: str,
-        _runtime_identity: dict[str, str] | None = None,
-        tool_schemas_text: str = "",
-        trace_id: str | None = None,
-    ) -> AgentDecision:
-        """Extract intent info (logging only)."""
-        intent_type = "normal_chat" if not tool_schemas_text else "tool_bound_chat"
-        return AgentDecision(
-            decision_type="final_response",
-            execution_mode="explain_only",
-            intent_type=intent_type,
-            should_execute=False,
-            tool_name=None,
-            reason=(
-                f"Intent extraction deferred to LLM native tool_calls "
-                f"(trace_id={trace_id}, user_message={user_message[:50]!r})"
-            ),
-        )
-
     def classify_memory_signal(
         self,
         user_message: str,

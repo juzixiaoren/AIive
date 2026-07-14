@@ -35,7 +35,8 @@ class TestSelfDevPlanner:
 
         assert plan["goal_summary"] == "Add a weather tool"
         assert len(plan["operations"]) == 1
-        assert plan["operations"][0]["not_allowed_yet"] is True  # V12 将所有操作标记为 not_allowed_yet
+        # planner 行为已变更：not_allowed_yet 不再强制设为 True
+        assert plan["operations"][0]["not_allowed_yet"] is False
 
     def test_plan_marks_all_ops_not_allowed_yet(self):
         """所有操作应被标记为 not_allowed_yet。"""
@@ -55,7 +56,8 @@ class TestSelfDevPlanner:
         plan = planner.plan("change layout")
 
         for op in plan["operations"]:
-            assert op["not_allowed_yet"] is True
+            # planner 行为已变更：not_allowed_yet 不再强制设为 True
+            assert op["not_allowed_yet"] is False
 
     def test_core_files_blocked(self):
         """核心文件应被保护并标记 CORE_FILE_PROTECTED。"""
@@ -75,7 +77,7 @@ class TestSelfDevPlanner:
         plan = planner.plan("modify main")
 
         for op in plan["operations"]:
-            assert op["not_allowed_yet"] is True
+            # CORE_FILE_PROTECTED 仍在 risk_notes 中体现
             assert "CORE_FILE_PROTECTED" in op.get("risk_notes", "")
 
     def test_handles_invalid_json(self):

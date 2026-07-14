@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json as _json
 import logging
+import time
 import uuid as _uuid
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
@@ -313,10 +314,9 @@ class AgentGraph:
             token_budget=config.automatic_recall_token_budget,
         )
         engine = AutomaticRecallEngine(self._db, config)
-        import time as _time
-        _t0 = _time.monotonic()
+        _t0 = time.monotonic()
         pack, traces = engine.recall(request)
-        _latency = (_time.monotonic() - _t0) * 1000.0
+        _latency = (time.monotonic() - _t0) * 1000.0
 
         # Persist recall run + candidate traces (explainability, V2 §十四)
         run_id = self._persist_recall_run(trace_id, request, pack, traces, _latency)

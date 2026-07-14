@@ -66,7 +66,11 @@ class AttentionManager:
         suggestion = None
 
         if last_state:
-            created = last_state.created_at.replace(tzinfo=timezone.utc) if last_state.created_at.tzinfo is None else last_state.created_at
+            created = last_state.created_at
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            else:
+                created = created.astimezone(timezone.utc)
             hours = (now - created).total_seconds() / 3600
 
             if hours > HARD_SWITCH_THRESHOLD_HOURS:

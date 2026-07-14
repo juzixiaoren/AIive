@@ -5,9 +5,62 @@
 
 from datetime import datetime, timedelta, timezone
 
-from aiive.db.models import Event
+import pytest
+
+from aiive.api.routes_notifications import delete_notification
+from aiive.db.base import SessionLocal
+from aiive.db.models import Event, Task
 from aiive.runtime.task_manager import TaskManager
 from aiive.worker.task_worker import TaskWorker
+
+
+class TestDeleteNotificationCancelsTask:
+    """回归测试：P1 问题 5。删除通知必须同步取消关联定时任务。
+
+    修复前 delete_notification 只物理删除 Event，关联 Task 仍为 pending，
+    后台调度守护进程到期会再次触发该提醒。
+    """
+
+    def test_delete_cancels_linked_task(self, db_session):
+        """删除带 task_id 的通知后，关联 Task 应被标记为 cancelled。"""
+        mgr = TaskManager(db_session)
+        past = datetime.now(timezone.utc) - timedelta(minutes=5)
+        task = mgr.create("reminder", "喝水提醒", next_check_at=past)
+        db_session.flush()
+        assert task.status == "pending"
+
+        event = Event(
+            event_type="notification_created",
+            thread_id="thread-1",
+            trace_id=task.id,
+            payload={"task_id": task.id, "title": "喝水提醒", "status": "alerting"},
+        )
+        db_session.add(event)
+        db_session.flush()
+
+        result = delete_notification(event.id, db_session)
+        db_session.flush()
+
+        assert result["ok"] is True
+        assert result["task_cancelled"] is True
+        updated = db_session.get(Task, task.id)
+        assert updated.status == "cancelled"
+
+    def test_delete_without_task_does_not_error(self, db_session):
+        """没有关联 task_id 的通知也应可正常删除。"""
+        event = Event(
+            event_type="notification_created",
+            thread_id="thread-1",
+            trace_id="no-task",
+            payload={"title": "无任务通知"},
+        )
+        db_session.add(event)
+        db_session.flush()
+
+        result = delete_notification(event.id, db_session)
+        assert result["ok"] is True
+        assert result["task_cancelled"] is False
+        assert db_session.get(Event, event.id) is None
 
 
 class TestTaskWorkerEndToEnd:
@@ -29,15 +82,19 @@ class TestTaskWorkerEndToEnd:
         updated = mgr._db.get(type(task), task.id)
         assert updated.status == "completed"
 
-        # 应存在通知事件
-        notif = (
-            db_session.query(Event)
-            .filter(
-                Event.event_type == "notification_created",
-                Event.trace_id == task.id,
+        # Worker 回退路径用独立 SessionLocal() 写入通知，查询时也用 SessionLocal()
+        lookup_db = SessionLocal()
+        try:
+            notif = (
+                lookup_db.query(Event)
+                .filter(
+                    Event.event_type == "notification_created",
+                    Event.trace_id == task.id,
+                )
+                .first()
             )
-            .first()
-        )
+        finally:
+            lookup_db.close()
         assert notif is not None
         assert notif.payload["title"] == "测试提醒"
 

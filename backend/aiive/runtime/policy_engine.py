@@ -125,7 +125,9 @@ def check_tool_calls(
         allowed.append(tool_name)
 
     # 确定整体策略动作
-    if blocked and not allowed and not confirm:
+    # 安全优先：只要存在被阻止（含未知）工具，整批次必须阻止，
+    # 无论同批是否还有允许或需确认的工具。
+    if blocked:
         return PolicyResult(
             action=PolicyAction.BLOCK,
             reason="; ".join(block_reasons),
@@ -133,15 +135,22 @@ def check_tool_calls(
         )
 
     if confirm:
-        # 如果既有允许又有需要确认的工具，为安全起见阻止整批次，避免部分执行
-        reason_parts = confirm_reasons[:]
+        # 同批次同时存在允许与需确认的工具：为安全起见阻止整批次，避免部分执行
         if allowed:
-            reason_parts.append(f"Also blocking {len(allowed)} other tools in same batch")
+            return PolicyResult(
+                action=PolicyAction.BLOCK,
+                reason=(
+                    f"Mixed allow+confirm in same batch; "
+                    f"blocking {len(allowed)} allowed and {len(confirm)} confirm tools"
+                ),
+                blocked_tools=confirm,
+                confirm_tools=confirm,
+                allowed_tools=allowed,
+            )
         return PolicyResult(
             action=PolicyAction.CONFIRM,
-            reason="; ".join(reason_parts),
+            reason="; ".join(confirm_reasons),
             confirm_tools=confirm,
-            allowed_tools=allowed,
         )
 
     return PolicyResult(

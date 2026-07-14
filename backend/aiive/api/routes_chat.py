@@ -46,12 +46,11 @@ class ChatResponse(BaseModel):
 
 
 @router.post("/chat")
-def chat(request: ChatRequest, db: Session = Depends(get_db)):
+def chat(request: ChatRequest):
     """同步聊天接口，发送消息并等待完整回复
 
     Args:
         request: 包含 message 和可选 thread_id 的聊天请求
-        db: 数据库会话
 
     Returns:
         ChatResponse，包含回复、trace_id、action_cards 等
@@ -59,7 +58,6 @@ def chat(request: ChatRequest, db: Session = Depends(get_db)):
     try:
         result = invoke_chat(message=request.message, thread_id=request.thread_id)
     except LLMClientError:
-        db.rollback()
         raise
     return result
 

@@ -111,16 +111,22 @@ def activate_capability(plan_id: str, db: Session = Depends(get_db)):
         cap = db.query(Capability).filter(
             Capability.capability_id == f"mcp:{c.name}"
         ).first()
-        if cap:
-            smoke_result = run_smoke(db, cap.id, {"passed": True, "test": "basic_smoke"})
-            plan.capability_id = cap.id
-            plan.status = "activated" if smoke_result.get("ok") else "installed"
+        if cap is None:
+            plan.status = "failed"
+            db.commit()
+            return ActivateResponse(
+                ok=False,
+                error="Install succeeded but capability record not found",
+            )
+        smoke_result = run_smoke(db, cap.id, {"passed": True, "test": "basic_smoke"})
+        plan.capability_id = cap.id
+        plan.status = "activated" if smoke_result.get("ok") else "installed"
         plan.smoke_result = {"status": plan.status}
         db.commit()
 
         return ActivateResponse(
             ok=True,
-            capability_id=plan.capability_id or "",
+            capability_id=plan.capability_id,
             smoke_result=plan.smoke_result,
         )
     except Exception:
