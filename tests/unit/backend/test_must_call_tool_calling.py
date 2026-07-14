@@ -23,7 +23,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 
 from aiive.core.action_planner import AgentDecision
-from aiive.core.llm_client import FakeLLMClient
+from aiive.core.llm_client import FakeLLMClient, default_llm_client
 from aiive.db.models import Base, Event, Task, Thread
 from aiive.runtime.agent_graph import AgentGraph
 from aiive.runtime.event_logger import EventLogger as _RealEventLogger
@@ -101,6 +101,11 @@ def app_db():
     test_sessionmaker = sessionmaker(bind=engine)
     with patch("aiive.db.base.SessionLocal", test_sessionmaker), patch(
         "aiive.tools.builtin_tools.SessionLocal", test_sessionmaker
+    ), patch(
+        "aiive.runtime.thread_bootstrap.SessionLocal", test_sessionmaker
+    ), patch(
+        "aiive.runtime.thread_bootstrap.ThreadBootstrapService.ensure_committed_thread",
+        side_effect=lambda tid: tid,
     ):
         session = test_sessionmaker()
         try:
@@ -138,7 +143,7 @@ def _run(app_db, message, decision, thread_id="thread-mustcall"):
     ), patch("aiive.runtime.agent_graph.register_all"), patch(
         "aiive.runtime.agent_graph.EventLogger", _CommittingEventLogger
     ):
-        graph = AgentGraph(FakeLLMClient(), app_db)
+        graph = AgentGraph(default_llm_client(), app_db)
         return graph.run(message, thread_id=thread_id)
 
 

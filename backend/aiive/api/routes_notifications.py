@@ -68,7 +68,7 @@ def list_notifications(
 
 @router.delete("/notifications/{notification_id}")
 def delete_notification(notification_id: str, db: Session = Depends(get_db)):
-    """删除指定通知（从数据库完整删除 event 记录）。
+    """删除指定通知，并同步取消关联的定时任务，避免提醒再次弹出。
 
     Args:
         notification_id: 通知 ID（即 Event.id）
@@ -77,9 +77,34 @@ def delete_notification(notification_id: str, db: Session = Depends(get_db)):
     Returns:
         ok 为 True 表示成功，False 表示通知不存在
     """
+    from aiive.db.models import Task
+
     event = db.get(Event, notification_id)
     if event is None:
         return {"ok": False, "error": "通知不存在"}
+
+    task_id = (event.payload or {}).get("task_id")
     db.delete(event)
+
+    # 同步取消关联的定时任务：否则后台调度守护进程到期仍会再次触发该提醒。
+    # 与 builtin_tools._handle_cancel_task 语义保持一致。
+    if task_id:
+        task = db.get(Task, task_id)
+        if task is not None:
+            task.status = "cancelled"
+        # 关联的 reminder_created 事件也标记为已取消，保持前端 pending 列表一致
+        related = (
+            db.query(Event)
+            .filter(Event.event_type == "reminder_created")
+            .order_by(Event.created_at.desc())
+            .limit(50)
+            .all()
+        )
+        for e in related:
+            if (e.payload or {}).get("task_id") == task_id:
+                p = dict(e.payload or {})
+                p["status"] = "cancelled"
+                e.payload = p
+
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "task_cancelled": bool(task_id)}

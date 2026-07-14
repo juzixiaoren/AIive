@@ -52,8 +52,9 @@ class SafeDeleteScopeRegistry:
         return {k: str(v) for k, v in self._scopes.items()}
 
 
-# 项目根目录
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
+# 项目根目录：本文件位于 backend/aiive/tools/safe_delete.py
+# __file__.parents[3] = backend/aiive/tools -> aiive -> backend -> AIive(仓库根)
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _build_default_registry() -> SafeDeleteScopeRegistry:

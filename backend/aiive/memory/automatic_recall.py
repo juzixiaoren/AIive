@@ -74,12 +74,25 @@ def _recency_score(r: MemoryRecord) -> float:
     return round(max(0.0, 1.0 - age_days / 30.0), 3)
 
 
-def _scope_score(actual_scope: str, chain: list[tuple[str, str | None]]) -> float:
-    """Higher score for tighter scope (thread > ... > global)."""
+def _scope_score(actual_scope_type: str, actual_scope_id: str | None, chain: list[tuple[str, str | None]]) -> float:
+    """Higher score for tighter scope (thread > ... > global).
+
+    Matches (scope_type, scope_id) precisely; falls back to scope_type-only
+    match when exact pair is not found (e.g. for records inserted before chain
+    scopes were fully specified).
+    """
+    # Exact (scope_type, scope_id) match
     try:
-        idx = [s[0] for s in chain].index(actual_scope)
-    except ValueError:
-        return 0.0
+        idx = next(
+            i for i, s in enumerate(chain)
+            if s[0] == actual_scope_type and s[1] == actual_scope_id
+        )
+    except StopIteration:
+        # Fall back to scope_type-only match
+        try:
+            idx = next(i for i, s in enumerate(chain) if s[0] == actual_scope_type)
+        except StopIteration:
+            return 0.0
     return round(1.0 - idx / max(1, len(chain)), 3)
 
 
@@ -280,7 +293,7 @@ class AutomaticRecallEngine:
             scope_type=r.scope_type or "global",
             scope_id=r.scope_id,
             relevance_score=round(relevance, 3),
-            scope_score=_scope_score(r.scope_type or "global", chain),
+            scope_score=_scope_score(r.scope_type or "global", r.scope_id, chain),
             recency_score=_recency_score(r),
             importance_score=r.importance or 0.5,
             trust_level=r.trust_level or "semi_trusted",

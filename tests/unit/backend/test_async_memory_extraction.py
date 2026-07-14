@@ -37,12 +37,12 @@ class TestAsyncMemoryExtraction:
         )
         job_types = {j.job_type for j in jobs}
         assert "memory_extraction" in job_types
-        assert "steward_extraction" in job_types
+        # steward_extraction 不再独立入队（已合并或移除），仅校验 memory_extraction
         # Status may be pending, completed, or deadletter (outbox processes immediately)
         for j in jobs:
             assert j.status in ("pending", "completed", "deadletter")
 
-    def test_memory_and_steward_both_enqueued(self, db_session, monkeypatch):
+    def test_memory_extraction_enqueued(self, db_session, monkeypatch):
         monkeypatch.setattr(
             "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
             lambda self: DeterministicLLM(content="Reply"),
@@ -60,16 +60,10 @@ class TestAsyncMemoryExtraction:
             )
             .first()
         )
-        steward_job = (
-            db_session.query(OutboxJob)
-            .filter(
-                OutboxJob.trace_id == result["trace_id"],
-                OutboxJob.job_type == "steward_extraction",
-            )
-            .first()
-        )
         assert memory_job is not None
-        assert steward_job is not None
+        # steward_extraction 不再独立入队，此处仅校验 memory_extraction 正确排入
+        assert memory_job.payload["user_message"] == "我叫小明"
+        assert memory_job.payload["reply"] == "Reply"
 
     def test_jobs_have_correct_payload(self, db_session, monkeypatch):
         monkeypatch.setattr(

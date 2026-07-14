@@ -27,6 +27,7 @@ FAKE_AGENT_CTX: dict = {
     "recall_pack": MemoryRecallPack(request_id="x"),
     "recall_traces": [],
     "recall_run_id": "run-1",
+    "recall_messages": [],
 }
 
 

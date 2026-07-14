@@ -1,11 +1,76 @@
 """提醒功能的端到端测试：无需 60 秒等待，使用过期时间模拟任务触发。"""
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+import pytest
+
+from aiive.db.base import SessionLocal
 from aiive.db.models import Event
 from aiive.runtime.task_manager import TaskManager
+from aiive.worker import task_worker
 from aiive.worker.task_worker import TaskWorker
+
+
+class TestReminderWakeSuccess:
+    """回归测试：P0 问题 2。提醒成功唤醒后必须向线程广播消息。
+
+    修复前模块级 _wake_agent_for_reminder 在成功 commit 后引用未定义变量
+    ``task``，导致 NameError，使 broadcast_to_thread_sync 永远执行不到，
+    用户收不到提醒。此处直接验证成功路径会真正广播。
+    """
+
+    def test_success_broadcasts_to_thread(self):
+        """Agent 成功生成回复后，应向目标线程广播 new_message。"""
+
+        class _FakeSession:
+            def query(self, *a, **k):
+                return self
+
+            def filter(self, *a, **k):
+                return self
+
+            def order_by(self, *a, **k):
+                return self
+
+            def limit(self, n):
+                return self
+
+            def all(self):
+                return []
+
+            def close(self):
+                pass
+
+            def commit(self):
+                pass
+
+        fake_graph = MagicMock()
+        fake_graph.run_runtime_event.return_value = {
+            "reply": "提醒：喝水",
+            "thread_id": "thread-1",
+            "trace_id": "trace-1",
+            "action_cards": [],
+        }
+
+        with patch.object(task_worker, "SessionLocal", lambda: _FakeSession()), \
+                patch("aiive.core.llm_client.default_llm_client", MagicMock()), \
+                patch("aiive.runtime.agent_graph.AgentGraph", return_value=fake_graph), \
+                patch("aiive.runtime.thread_bootstrap.ThreadBootstrapService") as tb, \
+                patch("aiive.api.ws_manager.ws_manager") as ws:
+            tb.ensure_committed_thread.return_value = None
+            task_worker._wake_agent_for_reminder(
+                task_id="task-1",
+                task_title="喝水提醒",
+                task_type="reminder",
+                target_thread_id="thread-1",
+            )
+
+        ws.broadcast_to_thread_sync.assert_called_once()
+        args, kwargs = ws.broadcast_to_thread_sync.call_args
+        assert args[0] == "thread-1"
+        assert args[1] == "new_message"
+        assert args[2]["reply"] == "提醒：喝水"
 
 
 class TestReminderEndToEnd:
@@ -33,10 +98,15 @@ class TestReminderEndToEnd:
         assert updated.status == "completed"
 
         # 4. 应存在通知事件
-        notif = db_session.query(Event).filter(
-            Event.event_type == "notification_created",
-            Event.trace_id == task.id,
-        ).first()
+        # Worker 回退路径用独立 SessionLocal() 写入，查询时也用 SessionLocal()
+        lookup_db = SessionLocal()
+        try:
+            notif = lookup_db.query(Event).filter(
+                Event.event_type == "notification_created",
+                Event.trace_id == task.id,
+            ).first()
+        finally:
+            lookup_db.close()
         assert notif is not None, "Worker 必须产生通知事件"
         assert notif.payload["title"] == "hi"
 

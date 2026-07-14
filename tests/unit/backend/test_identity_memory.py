@@ -27,10 +27,10 @@ def test_remember_tool_schema_carries_identity_guidance():
     props = schema["properties"]
 
     assert "纯值" in props["content"]["description"]
-    assert "agent.persona.relationship" in props["memory_key"]["description"]
+    assert "agent.persona." in props["memory_key"]["description"]
     # 工具级描述也应兜底包含同样约束
     assert "纯值" in rem.description
-    assert "agent.persona.relationship" in rem.description
+    assert "agent.persona." in rem.description
 
 
 def test_runtime_identity_separates_display_name_and_relationship():

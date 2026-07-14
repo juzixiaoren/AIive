@@ -1,4 +1,5 @@
 """测试 MCP 安装器——沙箱安装、版本管理和冒烟测试。"""
+from aiive.api.routes_mcp_install import SmokeRequest, smoke_capability
 from aiive.db.models import Capability, CapabilityVersion, MCPInstallRecord
 from aiive.mcp.installer import install_sandbox, run_smoke
 
@@ -120,3 +121,39 @@ class TestSmoke:
         # 已激活，不能再次冒烟
         result = run_smoke(db_session, "mcp:active-one", {"ok": True})
         assert result["ok"] is False
+
+
+class TestSmokeCapabilityDeclaredTool:
+    """回归测试：P1 问题 18。冒烟被测工具必须确属该能力声明。
+
+    修复前冒烟注册 echo/list_files 等无关 stub 却调用真实工具名，
+    造成“逻辑矛盾”。现在校验被测工具确属该能力声明，否则明确失败。
+    """
+
+    def test_smoke_rejects_undeclared_tool(self, db_session):
+        """冒烟未声明工具应明确失败，而非用无关 stub 冒充。"""
+        install_sandbox(db_session, "srv", "npm:srv", "1.0", "stdio", ["real_tool"], {})
+        db_session.flush()
+
+        result = smoke_capability(
+            "srv",
+            SmokeRequest(tool_name="not_declared", params={}),
+            db_session,
+        )
+        assert result["ok"] is False
+        assert "not_declared" in result["error"]
+        assert "real_tool" in result["error"]
+
+    def test_smoke_accepts_declared_tool(self, db_session):
+        """冒烟已声明工具应通过校验（无真实执行器时诚实置 needs_review）。"""
+        install_sandbox(db_session, "srv2", "npm:srv2", "1.0", "stdio", ["real_tool"], {})
+        db_session.flush()
+
+        result = smoke_capability(
+            "srv2",
+            SmokeRequest(tool_name="real_tool", params={}),
+            db_session,
+        )
+        # 通过校验后进入执行：当前无真实 MCP 执行器，应诚实失败而非伪造成功
+        assert result["ok"] is True
+        assert result["state"] == "needs_review"

@@ -14,10 +14,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from aiive.db.base import get_db
-from aiive.db.models import Capability
+from aiive.db.models import Capability, MCPInstallRecord
 from aiive.mcp.discovery import search_mcp_candidates
 from aiive.mcp.installer import install_sandbox, run_smoke
-from aiive.mcp.runtime_client import MCPRuntimeClient
+from aiive.mcp.runtime_client import MCPRuntimeClient, MCPToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +85,7 @@ def smoke_capability(
 ):
     """对已安装的能力进行冒烟测试
 
-    通过模拟调用工具并检查结果来验证能力是否正常工作。
+    通过调用该能力真实声明的工具并检查结果来验证能力是否正常工作。
 
     Args:
         capability_id: 能力ID
@@ -95,13 +95,42 @@ def smoke_capability(
     Returns:
         冒烟测试结果
     """
-    # 构建一个简单的测试客户端，注册待测工具
-    client = _build_test_client()
+    full_id = f"mcp:{capability_id}"
+    cap = (
+        db.query(Capability)
+        .filter(Capability.capability_id == full_id)
+        .first()
+    )
+    if cap is None:
+        return {"ok": False, "error": f"Capability not found: {full_id}"}
+    if cap.state != "sandbox":
+        return {"ok": False, "error": f"Capability must be in sandbox, current: {cap.state}"}
+
+    # 取该能力声明的工具列表（最近一次安装记录）
+    install = (
+        db.query(MCPInstallRecord)
+        .filter(MCPInstallRecord.capability_id == cap.id)
+        .order_by(MCPInstallRecord.created_at.desc())
+        .first()
+    )
+    declared_tools = list(install.declared_tools) if install else []
+
+    # 冒烟目标工具必须确实属于该能力，避免用无关 stub 冒充目标能力
+    if request.tool_name not in declared_tools:
+        return {
+            "ok": False,
+            "error": (
+                f"tool_name '{request.tool_name}' 不是能力 '{full_id}' "
+                f"声明的工具（已声明: {declared_tools}）"
+            ),
+        }
+
+    client = _build_test_client(declared_tools)
     tool_result = client.call_tool(request.tool_name, request.params)
 
     result = run_smoke(
         db=db,
-        capability_id=f"mcp:{capability_id}",
+        capability_id=full_id,
         smoke_result={
             "ok": tool_result.ok,
             "tool_name": request.tool_name,
@@ -145,28 +174,32 @@ def list_installed_capabilities(db: Session = Depends(get_db)):
         raise
 
 
-def _build_test_client() -> MCPRuntimeClient:
+def _build_test_client(declared_tools: list[str]) -> MCPRuntimeClient:
     """构建冒烟测试用的 MCP 运行时客户端
 
-    预注册内置测试工具（echo、list_files）。
+    注册目标能力真实声明的工具，而非无关的本地 stub。
+
+    注意：当前环境没有真实 MCP 执行器，声明的工具以“不可执行”的诚实处理器
+    注册。冒烟仅验证工具声明与接线是否正确，绝不会伪造成功结果。
+
+    Args:
+        declared_tools: 目标能力声明的工具名称列表
 
     Returns:
         已注册工具的 MCPRuntimeClient 实例
     """
     client = MCPRuntimeClient()
 
-    # 内置测试工具
-    def echo(msg: str = "") -> str:
-        return f"echo: {msg}"
+    def _make_not_executable(tool_name: str):
+        def _handler(**kwargs):
+            # 当前环境没有真实 MCP 执行器：抛异常使 call_tool 进入错误分支，
+            # 返回 ok=False，冒烟会诚实置为 needs_review，绝不伪造成功。
+            raise RuntimeError(
+                f"本环境无真实 MCP 执行器，无法真正调用工具 '{tool_name}'"
+            )
+        return _handler
 
-    def list_files(path: str = ".") -> list[str]:
-        import os
-        try:
-            return os.listdir(path)[:10]
-        except Exception:
-            return []
-
-    client.register_tool("echo", echo)
-    client.register_tool("list_files", list_files)
+    for name in declared_tools:
+        client.register_tool(name, _make_not_executable(name))
 
     return client

@@ -190,7 +190,7 @@ def test_memory_search_events_respects_thread_scope(db_session):
 
     run_ctx = RunContext(thread_id="t_A", trace_id="tr", source="user_chat")
     with patch.object(bt, "SessionLocal", lambda: db_session):
-        result = bt._handle_memory_search_events(ctx=run_ctx, query="alpha")
+        result = bt._handle_memory_search(ctx=run_ctx, query="alpha")
     assert result["ok"]
     returned = {r["memory_id"] for r in result["results"]}
     assert id_a in returned

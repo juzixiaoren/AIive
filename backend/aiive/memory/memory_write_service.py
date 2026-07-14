@@ -495,7 +495,10 @@ class MemoryWriteService:
             final_op=resolution.operation, final_memory_id=new_record.id,
         )
         self._log_event(thread_id, proposal, "memory.superseded", new_record.id)
-        self._enqueue_projection(new_record, "memory.superseded", invalidate_cache=True)
+        # 新记录作为 active 记忆写入向量库（upsert，不删除）
+        self._enqueue_projection(new_record, "memory.created", invalidate_cache=True)
+        # 旧记录已失效，从向量库移除其旧向量（delete only）
+        self._enqueue_projection(old, "memory.superseded", invalidate_cache=True)
 
         return WriteResult(
             written=True,
@@ -675,8 +678,10 @@ class MemoryWriteService:
             ))
 
         # Vector upsert: only for active records (candidates not searchable)
-        if event_type in ("memory.created", "memory.reinforced", "memory.superseded",
-                          "memory.revised", "memory.merged", "memory.wake"):
+        # 注意：memory.superseded 已从 upsert 列表移除——它代表旧记录失效，
+        # 只应触发向量删除（见下方删除分支），不应再将已失效记录写入向量库。
+        if event_type in ("memory.created", "memory.reinforced",
+                          "memory.merged", "memory.wake"):
             if not is_candidate:
                 self._db.add(OutboxJob(
                     operation_id=f"vec:{base_key}:{_uuid.uuid4().hex[:8]}",

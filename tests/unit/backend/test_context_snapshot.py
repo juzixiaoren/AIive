@@ -61,6 +61,12 @@ class TestContextSnapshot:
             "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
             lambda self: DeterministicLLM(content="Reply"),
         )
+        # ensure_committed_thread 内部用独立 SessionLocal()，测试 db_session 的
+        # 写入对其不可见；patch 为 no-op 将校验交给 AgentGraph 自身的会话。
+        monkeypatch.setattr(
+            "aiive.runtime.thread_bootstrap.ThreadBootstrapService.ensure_committed_thread",
+            staticmethod(lambda tid=None: tid),
+        )
         llm = FakeLLMClient(fixed_content="Reply")
         graph = AgentGraph(llm, db_session)
 

@@ -36,5 +36,9 @@ def invoke_chat(message: str, thread_id: str | None = None) -> dict[str, Any]:
         result = graph.run(message=message, thread_id=thread_id)
         _log.info("[TRACE:invoke_chat] DONE reply=%s", str(result.get("reply", ""))[:80])
         return result
+    except Exception:
+        # 调用失败时在自身会话上回滚，避免遗留悬挂事务
+        db.rollback()
+        raise
     finally:
         db.close()
