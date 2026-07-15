@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 from aiive.context.run_context import RunContext
 from aiive.db.base import SessionLocal
 from aiive.memory.memory_types import MEMORY_KEY_GUIDE
+from aiive.runtime.working_state import WorkingStateService
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -393,12 +394,17 @@ def _handle_show_notifications(db: Session):
 # ── Memory（记忆管理）──
 @_db_handler
 def _handle_remember_or_update(db: Session, ctx: RunContext | None, content: str, memory_type: str = "fact", memory_key: str = ""):
-    """创建或更新记忆，通过 MemoryWriteService 统一写入（查重下沉到服务层）。"""
+    """创建或更新记忆，通过 MemoryWriteService 统一写入（查重下沉到服务层）。
+
+    execution_mode = "user_required"：写入失败时本工具返回 error，Turn 不得声称成功。
+    """
     from aiive.memory.memory_types import EvidenceItem, TrustLevel
     from aiive.memory.proposal_normalizer import ProposalNormalizer
     from aiive.memory.memory_write_service import MemoryWriteService
 
     ctx = _require_ctx(ctx, "remember_or_update")
+    # Phase 2: user_required 失败语义 — 写入失败必须明确返回 error
+    ctx.execution_mode = "user_required"
     writer = MemoryWriteService(db)
 
     evidence = [EvidenceItem(
@@ -423,9 +429,19 @@ def _handle_remember_or_update(db: Session, ctx: RunContext | None, content: str
     )
 
     if result.error or result.proposal is None:
-        return {"ok": False, "error": result.error or "Normalization failed"}
+        return {"ok": False, "error": result.error or "Normalization failed", "memory_write_failed": True}
 
-    write_result = writer.write(result.proposal, run_context=ctx)
+    # Phase 2: provenance — 真实 Event.id + TurnRecord PK
+    result.proposal.source_turn_record_id = ctx.turn_record_id
+    result.proposal.source_turn_id = ctx.turn_id
+    result.proposal.source_event_ids = list(ctx.source_event_ids)
+    result.proposal.execution_mode = ctx.execution_mode
+
+    try:
+        write_result = writer.write(result.proposal, run_context=ctx)
+    except Exception as e:
+        return {"ok": False, "error": str(e), "memory_write_failed": True}
+
     db.flush()
 
     return {
@@ -928,7 +944,7 @@ def _handle_create_selfdev_plan(goal: str = ""):
     return SelfDevPlanner(llm).plan(goal)
 
 
-def _handle_apply_patch_to_inactive_slot(operations=None):
+def _handle_apply_patch_to_inactive_slot(operations: list[dict[str, Any]] | None = None):
     """将补丁应用到非活跃槽位（不影响当前运行版本）。
 
     参数:
@@ -970,6 +986,51 @@ def _handle_query_attention(db: Session, thread_id: str = ""):
     """获取当前注意力状态。"""
     from aiive.runtime.attention_manager import AttentionManager
     return AttentionManager(db).recompute(thread_id, "query")
+
+
+# ── Working State（显式语义字段维护）──
+@_db_handler
+def _handle_update_working_state(
+    db: Session, ctx: RunContext | None,
+    field: str, operation: str = "set",
+    payload: dict[str, Any] | None = None, idempotency_key: str = "",
+):
+    """显式维护 WorkingState 的语义字段。
+
+    仅用于 current_objective / open_loops / active_constraints 三种语义字段。
+    确定性字段（pending_approvals / artifact_refs / verified_tool_states /
+    uncommitted_side_effects / running_tool_state）由 Turn 生命周期自动维护，
+    不通过此工具修改。
+
+    idempotency_key 用于防止同一更新被重复应用（崩溃重试场景）。
+    """
+    ctx = _require_ctx(ctx, "update_working_state")
+    payload = payload or {}
+    ws_service = WorkingStateService()
+    ws = ws_service.get_or_create(db, ctx.thread_id)
+
+    # 幂等：同一 idempotency_key 仅应用一次
+    applied_keys = list(ws.applied_idempotency_keys or [])
+    if idempotency_key and idempotency_key in applied_keys:
+        return {"ok": True, "applied": False, "reason": "idempotent_skip", "field": field}
+
+    if field == "current_objective":
+        ws.current_objective = payload.get("value", "")
+    elif field in ("open_loops", "active_constraints"):
+        ws_service.update_semantic_field(
+            db, ctx.thread_id, field, operation, payload,
+            ctx.turn_id or "", idempotency_key or "",
+        )
+    else:
+        return {"ok": False, "error": f"unsupported field: {field}"}
+
+    if idempotency_key:
+        applied_keys.append(idempotency_key)
+        ws.applied_idempotency_keys = applied_keys
+        ws.version = (ws.version or 0) + 1
+        ws.updated_at = datetime.now(timezone.utc)
+
+    return {"ok": True, "applied": True, "field": field}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1072,6 +1133,16 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         ("query_rhythm", _handle_query_rhythm, "获取每日节奏摘要", {}, "low", False, False),
         ("query_attention", _handle_query_attention, "获取当前注意力状态",
          {"thread_id": {"type": "str", "description": "可选, 默认当前线程"}}, "low", False, False),
+        # Working State（仅显式语义字段）
+        ("update_working_state", _handle_update_working_state,
+        "显式维护 WorkingState 语义字段: current_objective（设置当前目标）/ open_loops / active_constraints。"
+        + "确定性字段（pending_approvals/artifact_refs/verified_tool_states/uncommitted_side_effects/running_tool_state）由系统自动维护，不要通过此工具修改。",
+         {
+             "field": {"type": "str", "description": "current_objective / open_loops / active_constraints"},
+             "operation": {"type": "str", "description": "add / remove / update；current_objective 忽略此参数"},
+             "payload": {"type": "dict", "description": "字段内容。open_loops/active_constraints 单项需带 id；current_objective 为 {'value': '...'}"},
+             "idempotency_key": {"type": "str", "description": "可选，重复提交保护"},
+         }, "low", False, False),
     ]
 
     for cap_id, handler, desc, params, risk, writes_ext, can_del in tools:

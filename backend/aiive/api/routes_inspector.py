@@ -4,6 +4,7 @@ API路由模块：诊断检查器
 - 提供事件诊断检查接口
 """
 import logging
+from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
@@ -78,7 +79,7 @@ def get_context_item_detail(trace_id: str, item_id: str, db: Session = Depends(g
         )
         if not snapshot:
             return {"error": "snapshot not found"}
-        full_contents: dict = snapshot.meta.get("full_contents", {}) if snapshot.meta else {}
+        full_contents: dict[str, Any] = snapshot.meta.get("full_contents", {}) if snapshot.meta else {}
         content = full_contents.get(item_id)
         if content is None:
             return {"error": "item not found"}

@@ -10,6 +10,7 @@ Multi key deduplicates by content_hash.
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import dataclass, field
 from collections.abc import Sequence
 from typing import Any
@@ -17,6 +18,8 @@ from typing import Any
 from aiive.db.models import MemoryRecord
 from aiive.memory.memory_key_registry import MemoryKeyRegistry, get_memory_key_registry
 from aiive.memory.memory_types import LifecycleState, MemoryProposal
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -190,4 +193,5 @@ class ConflictResolver:
             raw = json.dumps(value, sort_keys=True, ensure_ascii=False)
             return hashlib.sha256(raw.encode()).hexdigest()[:16]
         except Exception:
+            logger.debug("记忆结构化哈希计算失败，返回空串（可能影响冲突判定）", exc_info=True)
             return ""

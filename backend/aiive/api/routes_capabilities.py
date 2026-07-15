@@ -126,7 +126,7 @@ def activate_capability(plan_id: str, db: Session = Depends(get_db)):
 
         return ActivateResponse(
             ok=True,
-            capability_id=plan.capability_id,
+            capability_id=plan.capability_id or "",
             smoke_result=plan.smoke_result,
         )
     except Exception:

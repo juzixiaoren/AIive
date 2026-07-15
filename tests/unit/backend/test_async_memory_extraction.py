@@ -1,9 +1,17 @@
-"""Test async memory extraction via OutboxJob enqueue."""
+"""Test async memory extraction via OutboxJob enqueue (via TurnExecutionService)."""
 from langchain_core.messages import AIMessage
 
-from aiive.core.llm_client import FakeLLMClient
 from aiive.db.models import OutboxJob
-from aiive.runtime.agent_graph import AgentGraph
+
+
+def _run(message, thread_id=None, llm_client=None):
+    """走真实 TurnExecutionService（ContextAssembler + _execute_graph）。"""
+    from aiive.core.llm_client import FakeLLMClient
+    from aiive.runtime.turn_execution import TurnExecutionService
+
+    return TurnExecutionService(llm_client=llm_client or FakeLLMClient()).execute_turn(
+        message, thread_id=thread_id,
+    )
 
 
 class DeterministicLLM:
@@ -26,9 +34,7 @@ class TestAsyncMemoryExtraction:
             lambda self: DeterministicLLM(content="Hello!"),
         )
 
-        llm = FakeLLMClient(fixed_content="Hello!")
-        graph = AgentGraph(llm, db_session)
-        result = graph.run(message="Hi")
+        result = _run(message="Hi")
 
         jobs = (
             db_session.query(OutboxJob)
@@ -48,9 +54,7 @@ class TestAsyncMemoryExtraction:
             lambda self: DeterministicLLM(content="Reply"),
         )
 
-        llm = FakeLLMClient(fixed_content="Reply")
-        graph = AgentGraph(llm, db_session)
-        result = graph.run(message="我叫小明")
+        result = _run(message="我叫小明")
 
         memory_job = (
             db_session.query(OutboxJob)
@@ -71,9 +75,7 @@ class TestAsyncMemoryExtraction:
             lambda self: DeterministicLLM(content="OK"),
         )
 
-        llm = FakeLLMClient(fixed_content="OK")
-        graph = AgentGraph(llm, db_session)
-        graph.run(message="Test message")
+        _run(message="Test message")
 
         job = db_session.query(OutboxJob).first()
         assert job.payload["user_message"] == "Test message"

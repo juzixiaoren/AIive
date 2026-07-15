@@ -87,8 +87,15 @@ def create_app() -> FastAPI:
     async def lifespan(_app: FastAPI):
         """应用生命周期管理：启动时执行初始化，关闭时执行清理。"""
         import asyncio
+        import os
+        import uuid as _uuid
         from aiive.worker.scheduler_daemon import start_daemon
+        from aiive.worker.outbox_worker import OutboxWorker
+        from aiive.worker.outbox_heartbeat import ActiveClaimRegistry, OutboxHeartbeat
+        from aiive.worker.handler_registry import HandlerRegistry
+        from aiive.worker.outbox_handlers import register_all
         from aiive.api.ws_manager import ws_manager
+
         # 绑定主事件循环，供后台线程安全推送 WebSocket
         ws_manager.set_main_loop(asyncio.get_running_loop())
         try:
@@ -103,7 +110,48 @@ def create_app() -> FastAPI:
             start_daemon()
         except Exception:
             logger.exception("调度守护进程启动失败")
+
+        # ── Phase 0.5B: Outbox Worker + Heartbeat ──
+        worker_id = f"outbox-{os.getpid()}-{_uuid.uuid4().hex[:8]}"
+        handler_registry = HandlerRegistry()
+        active_claims = ActiveClaimRegistry()
+        register_all(handler_registry)
+
+        outbox_worker = OutboxWorker(
+            worker_id=worker_id,
+            registry=handler_registry,
+            claims=active_claims,
+        )
+        heartbeat = OutboxHeartbeat(worker_id=worker_id, registry=active_claims)
+
+        heartbeat.start()
+        logger.info("OutboxWorker started: worker_id=%s", worker_id)
+
+        # 注册 OutboxWorker 并接入 APScheduler 周期 poll（spec 附录 C 第 7 项）
+        try:
+            from aiive.worker.scheduler_daemon import (
+                schedule_outbox_poll,
+                set_outbox_worker,
+            )
+            set_outbox_worker(outbox_worker)
+            schedule_outbox_poll()
+        except Exception:
+            logger.exception("Outbox poll 调度注册失败")
+
         yield
+
+        # 关闭：先 wait_active 结束在途 poll/调度任务，再停止租约心跳
+        try:
+            from aiive.worker.scheduler_daemon import stop_daemon
+            stop_daemon()
+            logger.info("Scheduler daemon stopped (wait_active)")
+        except Exception:
+            logger.exception("调度器关闭失败")
+        try:
+            heartbeat.stop()
+            logger.info("OutboxHeartbeat stopped")
+        except Exception:
+            logger.exception("Heartbeat 关闭失败")
 
     app = FastAPI(title="AIive", version="0.1.0", lifespan=lifespan)
 

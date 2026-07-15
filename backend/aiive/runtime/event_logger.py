@@ -28,6 +28,8 @@ class EventLogger:
         thread_id: str,
         event_type: str,
         payload: dict[str, Any] | None = None,
+        turn_id: str | None = None,
+        turn_event_index: int | None = None,
     ) -> Event:
         """记录一条通用运行时事件。
 
@@ -36,6 +38,8 @@ class EventLogger:
             thread_id: 会话线程 ID
             event_type: 事件类型（如 user_message、llm_response、chat_ended 等）
             payload: 事件携带的可选数据
+            turn_id: 可选，所属 Turn ID
+            turn_event_index: 可选，Turn 内事件序号
 
         Returns:
             已创建的 Event 对象
@@ -46,6 +50,8 @@ class EventLogger:
             thread_id=thread_id,
             event_type=event_type,
             payload=payload or {},
+            turn_id=turn_id,
+            turn_event_index=turn_event_index,
             created_at=datetime.now(timezone.utc),
         )
         self._db.add(event)

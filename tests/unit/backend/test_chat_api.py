@@ -47,10 +47,19 @@ def _mock_ensure_committed_thread(db_session, thread_id=None):
 
 
 class TestAgentGraph:
-    """测试 AgentGraph.run 的回复、线程 ID 和 trace_id。"""
+    """通过真实 TurnExecutionService（含 ContextAssembler + _execute_graph）验证请求-响应。"""
+
+    @staticmethod
+    def _run(message, thread_id=None):
+        from aiive.core.llm_client import FakeLLMClient
+        from aiive.runtime.turn_execution import TurnExecutionService
+
+        return TurnExecutionService(llm_client=FakeLLMClient()).execute_turn(
+            message, thread_id=thread_id,
+        )
 
     def test_returns_reply_and_thread_id(self, db_session, monkeypatch):
-        """AgentGraph.run 应返回 reply、thread_id 和 trace_id。"""
+        """execute_turn 应返回 reply、thread_id 和 trace_id。"""
         mock_llm = DeterministicLLM(content="Hello, user!")
 
         monkeypatch.setattr(
@@ -58,13 +67,11 @@ class TestAgentGraph:
             lambda self: mock_llm,
         )
         monkeypatch.setattr(
-            "aiive.runtime.agent_graph.ThreadBootstrapService.ensure_committed_thread",
+            "aiive.runtime.thread_bootstrap.ThreadBootstrapService.ensure_committed_thread",
             staticmethod(lambda tid=None: _mock_ensure_committed_thread(db_session, tid)),
         )
 
-        from aiive.core.llm_client import FakeLLMClient
-        graph = AgentGraph(FakeLLMClient(), db_session)
-        result = graph.run(message="Hi")
+        result = self._run(message="Hi")
         assert result["reply"] == "Hello, user!"
         assert result["thread_id"]
         assert result["trace_id"]
@@ -81,13 +88,11 @@ class TestAgentGraph:
             lambda self: mock_llm,
         )
         monkeypatch.setattr(
-            "aiive.runtime.agent_graph.ThreadBootstrapService.ensure_committed_thread",
+            "aiive.runtime.thread_bootstrap.ThreadBootstrapService.ensure_committed_thread",
             staticmethod(lambda tid=None: _mock_ensure_committed_thread(db_session, tid)),
         )
 
-        from aiive.core.llm_client import FakeLLMClient
-        graph = AgentGraph(FakeLLMClient(), db_session)
-        result = graph.run(message="Hi", thread_id="thread-42")
+        result = self._run(message="Hi", thread_id="thread-42")
         assert result["thread_id"] == "thread-42"
 
     def test_generates_thread_id_when_not_provided(self, db_session, monkeypatch):
@@ -98,14 +103,12 @@ class TestAgentGraph:
             lambda self: mock_llm,
         )
         monkeypatch.setattr(
-            "aiive.runtime.agent_graph.ThreadBootstrapService.ensure_committed_thread",
+            "aiive.runtime.thread_bootstrap.ThreadBootstrapService.ensure_committed_thread",
             staticmethod(lambda tid=None: _mock_ensure_committed_thread(db_session, tid)),
         )
 
-        from aiive.core.llm_client import FakeLLMClient
-        graph = AgentGraph(FakeLLMClient(), db_session)
-        r1 = graph.run(message="A")
-        r2 = graph.run(message="B")
+        r1 = self._run(message="A")
+        r2 = self._run(message="B")
         assert r1["thread_id"] != r2["thread_id"]
 
     def test_continues_existing_thread(self, db_session, monkeypatch):
@@ -116,14 +119,12 @@ class TestAgentGraph:
             lambda self: mock_llm,
         )
         monkeypatch.setattr(
-            "aiive.runtime.agent_graph.ThreadBootstrapService.ensure_committed_thread",
+            "aiive.runtime.thread_bootstrap.ThreadBootstrapService.ensure_committed_thread",
             staticmethod(lambda tid=None: _mock_ensure_committed_thread(db_session, tid)),
         )
 
-        from aiive.core.llm_client import FakeLLMClient
-        graph = AgentGraph(FakeLLMClient(), db_session)
-        r1 = graph.run(message="First")
-        r2 = graph.run(message="Second", thread_id=r1["thread_id"])
+        r1 = self._run(message="First")
+        r2 = self._run(message="Second", thread_id=r1["thread_id"])
         assert r2["thread_id"] == r1["thread_id"]
         assert r2["reply"] == "Reply"
 
@@ -134,15 +135,22 @@ class TestChatAPI:
     @pytest.fixture
     def client(self, db_session, monkeypatch):
         """创建测试用的 HTTP 客户端，注入 mock LLM 和 DB。"""
+        from sqlalchemy.orm import sessionmaker as _sm
+        from aiive.db import base
+
         mock_llm = DeterministicLLM(content="API reply")
         monkeypatch.setattr(
             "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
             lambda self: mock_llm,
         )
         monkeypatch.setattr(
-            "aiive.runtime.agent_graph.ThreadBootstrapService.ensure_committed_thread",
+            "aiive.runtime.thread_bootstrap.ThreadBootstrapService.ensure_committed_thread",
             staticmethod(lambda tid=None: _mock_ensure_committed_thread(db_session, tid)),
         )
+        # invoke_chat 内用 from aiive.db.base import SessionLocal 创建独立会话；
+        # 替换为 SQLite 工厂，避免连 PostgreSQL。
+        test_factory = _sm(bind=db_session.get_bind())
+        monkeypatch.setattr(base, "SessionLocal", test_factory)
 
         app = create_app()
         app.dependency_overrides[get_db] = lambda: db_session

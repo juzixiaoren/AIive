@@ -8,7 +8,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Index, JSON, String, Text
+from sqlalchemy import BigInteger, CheckConstraint, DateTime, ForeignKey, Index, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from typing import Any
 
@@ -55,6 +55,8 @@ class Event(Base):
     thread_id: Mapped[str] = mapped_column(String(36), ForeignKey("threads.id"), index=True)
     event_type: Mapped[str] = mapped_column(String(64), index=True)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    turn_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    turn_event_index: Mapped[int | None] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
@@ -63,6 +65,7 @@ class Event(Base):
 
     __table_args__: tuple[Index, ...] = (
         Index("ix_events_thread_created", "thread_id", "created_at"),
+        Index("ix_events_turn_order", "thread_id", "turn_id", "turn_event_index"),
     )
 
 
@@ -77,11 +80,52 @@ class LLMCall(Base):
     latency_ms: Mapped[float] = mapped_column()
     input_preview: Mapped[str | None] = mapped_column(Text, nullable=True)
     output_preview: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Phase 1: token estimation tracking (observability only)
+    estimated_prompt_tokens: Mapped[int | None] = mapped_column(nullable=True)
+    safe_prompt_tokens: Mapped[int | None] = mapped_column(nullable=True)
+    actual_prompt_tokens: Mapped[int | None] = mapped_column(nullable=True)
+    actual_completion_tokens: Mapped[int | None] = mapped_column(nullable=True)
+    token_source: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
 
     thread: Mapped["Thread"] = relationship(back_populates="llm_calls")
+
+
+class TurnRecord(Base):
+    """Turn 幂等记录：一个用户轮次的完整生命周期。
+
+    状态机：not_started → running → (completed | interrupted_unknown)
+    原子抢占：UPDATE WHERE status='not_started' → affected_rows=1 方可进入。
+    """
+    __tablename__: str = "turn_records"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    thread_id: Mapped[str] = mapped_column(String(36), ForeignKey("threads.id"), nullable=False)
+    turn_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    turn_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="not_started")
+    execution_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempt_no: Mapped[int] = mapped_column(default=1)
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    request_event_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    response_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # Phase 1: immutable epoch/segment attribution (nullable for legacy, enforced by app)
+    epoch_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    segment_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__: tuple[UniqueConstraint | Index, ...] = (
+        UniqueConstraint("thread_id", "turn_id", name="uq_turn_record_thread_turn"),
+        Index("ix_turn_records_thread_status", "thread_id", "status"),
+        Index("ix_turn_records_thread_sequence", "thread_id", "turn_sequence"),
+    )
 
 
 class ContextSnapshot(Base):
@@ -94,6 +138,12 @@ class ContextSnapshot(Base):
     stable_prefix_hash: Mapped[str] = mapped_column(String(32))
     context_items: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     meta: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # Phase 1 additions
+    epoch_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    segment_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    turn_sequence: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    retention: Mapped[str] = mapped_column(String(32), default="temporary")
+    token_total: Mapped[int] = mapped_column(default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
@@ -102,6 +152,7 @@ class ContextSnapshot(Base):
 
     __table_args__: tuple[Index, ...] = (
         Index("ix_snapshots_trace", "trace_id", "thread_id"),
+        Index("ix_snapshots_thread_retention", "thread_id", "retention"),
     )
 
 
@@ -164,6 +215,9 @@ class MemoryRecord(Base):
     merged_from: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    retention_policy: Mapped[str] = mapped_column(
+        String(32), default="normal"
+    )  # "ephemeral" | "normal" | "pinned"
     observed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
@@ -298,11 +352,25 @@ class OutboxJob(Base):
     retry_count: Mapped[int] = mapped_column(default=0)
     max_retries: Mapped[int] = mapped_column(default=3)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Phase 0.5B 新增
+    locked_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    claim_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    schema_version: Mapped[int] = mapped_column(default=1)
+    available_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    terminal_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    original_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    migration_batch_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__: tuple[Index, ...] = (
+        Index("ix_outbox_claim", "status", "available_at", "lease_expires_at"),
+        Index("ix_outbox_migration_batch", "migration_batch_id"),
     )
 
 
@@ -405,8 +473,55 @@ class MemoryProposal(Base):
     )
     raw_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     normalized_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # Phase 0.5B 新增
+    source_turn_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    ingestion_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    proposal_index: Mapped[int | None] = mapped_column(nullable=True)
+    # Phase 2: execution mode + retention + durability
+    execution_mode: Mapped[str] = mapped_column(
+        String(32), default="system_best_effort"
+    )  # "user_required" | "system_best_effort"
+    retention_policy: Mapped[str] = mapped_column(
+        String(32), default="normal"
+    )  # "ephemeral" | "normal" | "pinned"
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    durable: Mapped[bool] = mapped_column(default=True)
+    source_turn_record_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
+    )
+
+    __table_args__: tuple[UniqueConstraint, ...] = (
+        UniqueConstraint("ingestion_run_id", "proposal_index",
+                         name="uq_memory_proposal_run_index"),
+    )
+
+
+class MemoryIngestionRun(Base):
+    """记忆提取运行记录：跟踪每次异步 memory_extraction 的完整生命周期。
+
+    execution_token 复用 OutboxJob.claim_token。
+    无独立租约 —— 活跃性通过 OutboxJob 判断。
+    """
+    __tablename__: str = "memory_ingestion_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    source_turn_record_id: Mapped[str] = mapped_column(String(36), ForeignKey("turn_records.id"), nullable=False)
+    extractor_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    extractor_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    execution_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    proposal_count: Mapped[int] = mapped_column(default=0)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+    __table_args__: tuple[UniqueConstraint, ...] = (
+        UniqueConstraint("source_turn_record_id", "extractor_name", "extractor_version",
+                         name="uq_ingestion_run_source_extractor"),
     )
 
 
@@ -535,3 +650,149 @@ class MemoryRecallCandidate(Base):
     exclusion_reason: Mapped[str] = mapped_column(String(64), default="")
     token_cost: Mapped[int] = mapped_column(default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+# ============================================================================
+# Phase 1: Epoch, Segment, WorkingState, Artifact
+# ============================================================================
+
+
+class Epoch(Base):
+    """后端运行阶段。每个 Thread 可有多个 Epoch，自动轮换但用户无感。"""
+    __tablename__: str = "epochs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    thread_id: Mapped[str] = mapped_column(String(36), ForeignKey("threads.id"), nullable=False, index=True)
+    epoch_no: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    start_turn_sequence: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    end_turn_sequence: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    checkpoint_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    sealed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__: tuple[UniqueConstraint | Index, ...] = (
+        UniqueConstraint("thread_id", "epoch_no", name="uq_epoch_thread_no"),
+        Index("ix_epochs_thread_status", "thread_id", "status"),
+    )
+
+
+class Segment(Base):
+    """Epoch 内一个可独立密封的工作片段。"""
+    __tablename__: str = "segments"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    epoch_id: Mapped[str] = mapped_column(String(36), ForeignKey("epochs.id"), nullable=False, index=True)
+    thread_id: Mapped[str] = mapped_column(String(36), ForeignKey("threads.id"), nullable=False)
+    segment_no: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="open")
+    start_turn_sequence: Mapped[int | None] = mapped_column(BigInteger, nullable=False)
+    end_turn_sequence: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    source_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    summary_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    pending_seal_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    sealed_by_turn: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    sealed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__: tuple[UniqueConstraint | Index | CheckConstraint, ...] = (
+        UniqueConstraint("epoch_id", "segment_no", name="uq_segment_epoch_no"),
+        Index("ix_segments_epoch_status", "epoch_id", "status"),
+        CheckConstraint("start_turn_sequence IS NOT NULL", name="ck_segment_start_turn"),
+        CheckConstraint(
+            "end_turn_sequence IS NULL OR end_turn_sequence >= start_turn_sequence",
+            name="ck_segment_turn_range",
+        ),
+    )
+
+
+class SegmentSummary(Base):
+    """Segment 的 LLM 摘要（Phase 3 填充，Phase 1 仅建表）。"""
+    __tablename__: str = "segment_summaries"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    segment_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    goal: Mapped[str | None] = mapped_column(Text, nullable=True)
+    outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
+    decisions: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    open_loops: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    entities: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    artifacts: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    important_tool_results: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    source_turn_range: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    source_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    summary_version: Mapped[int] = mapped_column(default=1)
+    model_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    token_count: Mapped[int] = mapped_column(default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class EpochCheckpoint(Base):
+    """Epoch 的工作检查点（Phase 3 填充，Phase 1 仅建表）。"""
+    __tablename__: str = "epoch_checkpoints"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    epoch_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    current_goal: Mapped[str | None] = mapped_column(Text, nullable=True)
+    completed_milestones: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    open_loops: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    active_constraints: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    current_decisions: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    referenced_artifacts: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    relevant_entities: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    latest_verified_tool_states: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    source_segment_ids: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    version: Mapped[int] = mapped_column(default=1)
+    token_count: Mapped[int] = mapped_column(default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class WorkingState(Base):
+    """当前操作上下文的 WorkingState。1:1 Thread。"""
+    __tablename__: str = "working_states"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    thread_id: Mapped[str] = mapped_column(String(36), ForeignKey("threads.id"), nullable=False)
+    epoch_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    current_objective: Mapped[str | None] = mapped_column(Text, nullable=True)
+    open_loops: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    active_constraints: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    pending_approvals: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    artifact_refs: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    verified_tool_states: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    uncommitted_side_effects: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    running_tool_state: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    applied_idempotency_keys: Mapped[list[str]] = mapped_column(JSON, default=list)
+    token_count: Mapped[int] = mapped_column(default=0)
+    version: Mapped[int] = mapped_column(default=1)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__: tuple[UniqueConstraint, ...] = (
+        UniqueConstraint("thread_id", name="uq_working_state_thread"),
+    )
+
+
+class Artifact(Base):
+    """大型工具结果或结构化数据的持久化存储。"""
+    __tablename__: str = "artifacts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    thread_id: Mapped[str] = mapped_column(String(36), ForeignKey("threads.id"), index=True)
+    trace_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    kind: Mapped[str] = mapped_column(String(64), default="tool_result")
+    ref: Mapped[str] = mapped_column(String(256), unique=True, index=True)
+    content: Mapped[str] = mapped_column(Text)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    token_count: Mapped[int] = mapped_column(default=0)
+    # provenance
+    turn_record_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    execution_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    tool_call_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    __table_args__: tuple[UniqueConstraint, ...] = (
+        # 同一 Turn 内同一工具调用只允许一个 Artifact，防止重试重复创建
+        UniqueConstraint("turn_record_id", "tool_call_id", name="uq_artifact_turn_tool"),
+    )

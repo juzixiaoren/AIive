@@ -217,6 +217,9 @@ class UnifiedMemoryExtractor:
                 thread_id=thread_id,
             )
             if result.proposal is not None:
+                # Phase 2: durable + execution_mode
+                result.proposal.durable = em.durable
+                result.proposal.execution_mode = "system_best_effort"
                 # Override idempotency with unique index per batch item
                 result.proposal.compute_request_idempotency(proposal_index=i)
                 results.append(result.proposal)

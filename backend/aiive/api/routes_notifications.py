@@ -62,6 +62,7 @@ def list_notifications(
                 "created_at": e.created_at.isoformat() if e.created_at else "",
             })
         except Exception:
+            logger.warning("通知条目解析失败，已跳过: event_id=%s", e.id, exc_info=True)
             continue
     return result
 

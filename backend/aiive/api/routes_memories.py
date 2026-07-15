@@ -4,7 +4,9 @@ API路由模块：记忆管理
 - 支持记忆的遗忘、休眠、归档等生命周期操作
 - 提供记忆扫描和投影维护接口
 """
-from fastapi import APIRouter, Depends
+import uuid as _uuid
+
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -12,9 +14,10 @@ from aiive.context.run_context import RunContext
 from aiive.db.base import get_db
 from aiive.memory.memory_maintenance import MemoryMaintenance
 from aiive.memory.memory_store import MemoryStore
-from aiive.memory.memory_types import MemoryProposal
+from aiive.memory.memory_types import MemoryProposal, ScopeType, TrustLevel
 from aiive.memory.memory_write_service import MemoryWriteService
 from aiive.memory.projection import MemoryProjection
+from aiive.memory.proposal_normalizer import ProposalNormalizer
 
 router = APIRouter(prefix="/api")
 
@@ -56,29 +59,75 @@ def list_memories(db: Session = Depends(get_db)):
 
 
 @router.post("/memories")
-def create_memory(request: CreateMemoryRequest, db: Session = Depends(get_db)):
-    """创建新记忆
+def create_memory(request: CreateMemoryRequest,
+                   db: Session = Depends(get_db),
+                   idempotency_key: str = Header(None, alias="Idempotency-Key")):
+    """创建新记忆 — 走完整写入链路（ProposalNormalizer → MemoryWriteService）。
 
-    Args:
-        request: 包含 content、memory_type 和 pinned 的请求体
-        db: 数据库会话
-
-    Returns:
-        新创建记忆的 id、content 和 lifecycle_state
+    支持 Idempotency-Key header 去重。
+    execution_mode = "user_required"：写入失败返回 409。
     """
-    store = MemoryStore(db)
-    record = store.create(
+    from aiive.db.models import MemoryProposal as MemoryProposalModel
+
+    # 幂等检查：已存在相同 idempotency_key 的 proposal → 返回已有结果
+    if idempotency_key:
+        existing = db.query(MemoryProposalModel).filter(
+            MemoryProposalModel.idempotency_key == idempotency_key
+        ).first()
+        if existing is not None and existing.final_memory_id:
+            return {
+                "id": existing.final_memory_id,
+                "content": request.content,
+                "lifecycle_state": "active",
+                "_idempotent": True,
+            }
+
+    normalizer = ProposalNormalizer()
+    result = normalizer.normalize(
         content=request.content,
-        memory_type=request.memory_type,
-        lifecycle_state="active",
-        pinned=request.pinned,
-        lineage="manual",
+        memory_type_hint=request.memory_type or None,
+        memory_key_hint=None,
+        confidence=0.95,
+        importance=0.8,
+        trust_level=TrustLevel.TRUSTED.value,
+        evidence=[],
+        source_event_ids=[],
+        extractor_name="manual_memory_api",
+        extractor_version="1.0",
+        thread_id="",
     )
+
+    if result.error or result.proposal is None:
+        raise HTTPException(status_code=422, detail=result.error or "Normalization failed")
+
+    proposal = result.proposal
+    proposal.execution_mode = "user_required"
+    proposal.retention_policy = "pinned" if request.pinned else "normal"
+    proposal.source_turn_record_id = ""  # API 无 Turn 上下文
+    if idempotency_key:
+        proposal.idempotency_key = idempotency_key
+
+    ctx = RunContext(
+        thread_id="manual_api",
+        trace_id=str(_uuid.uuid4()),
+        source="manual_memory_api",
+        execution_mode="user_required",
+    )
+
+    writer = MemoryWriteService(db)
+    try:
+        write_result = writer.write(proposal, run_context=ctx)
+    except Exception as e:
+        raise HTTPException(status_code=409, detail=f"Memory write failed: {e}")
+
     db.commit()
+
     return {
-        "id": record.id,
-        "content": record.content,
-        "lifecycle_state": record.lifecycle_state,
+        "id": write_result.memory_id,
+        "content": request.content,
+        "lifecycle_state": write_result.state,
+        "memory_type": proposal.memory_type,
+        "canonical_key": proposal.canonical_key,
     }
 
 

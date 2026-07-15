@@ -89,9 +89,12 @@ class MemoryGate:
         2. Trust boundary (sensitive types must have trusted evidence)
         3. External content restrictions
         4. Assistant reply restrictions
-        5. Confidence threshold → candidate
-        6. Evidence quality → candidate
-        7. Default: active
+        5. Durability — non-durable with no future value → reject
+        6. Pinned — only user_required can pin
+        7. Ephemeral — must have valid_to > valid_from
+        8. Confidence threshold → candidate
+        9. Evidence quality → candidate
+        10. Default: active
         """
         # Rule 1: Type validation
         if proposal.memory_type not in {t.value for t in MemoryType}:
@@ -133,14 +136,50 @@ class MemoryGate:
                     blocked_reason="blocked_by_assistant_source",
                 )
 
-        # Rule 5: Confidence threshold → candidate
+        # Rule 5: Durability — non-durable with no future value → reject
+        if not proposal.durable:
+            return GateDecision(
+                decision="reject",
+                reason="Non-durable memory (durable=False): no long-term retention value",
+                blocked_reason="blocked_by_durability",
+            )
+
+        # Rule 6: Pinned only allowed via user_required
+        if (proposal.retention_policy == "pinned"
+                and proposal.execution_mode != "user_required"):
+            return GateDecision(
+                decision="reject",
+                reason="retention_policy=pinned requires execution_mode=user_required",
+                blocked_reason="blocked_pinned_not_user_required",
+            )
+
+        # Rule 7: Ephemeral must have valid_to > valid_from
+        if proposal.retention_policy == "ephemeral":
+            if proposal.valid_to is None:
+                return GateDecision(
+                    decision="reject",
+                    reason="retention_policy=ephemeral requires valid_to (no indefinite ephemeral)",
+                    blocked_reason="blocked_ephemeral_no_ttl",
+                )
+            # valid_from will be set to now at write time, but if proposal already
+            # carries a valid_to, we verify it's in the future
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            if proposal.valid_to <= now:
+                return GateDecision(
+                    decision="reject",
+                    reason=f"valid_to={proposal.valid_to} is not in the future",
+                    blocked_reason="blocked_ephemeral_expired_ttl",
+                )
+
+        # Rule 8: Confidence threshold → candidate
         if proposal.confidence < 0.7:
             return GateDecision(
                 decision="candidate",
                 reason=f"Confidence {proposal.confidence} below 0.7 threshold",
             )
 
-        # Rule 6: No evidence → candidate
+        # Rule 9: No evidence → candidate
         if not proposal.evidence:
             return GateDecision(
                 decision="candidate",

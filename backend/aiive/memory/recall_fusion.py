@@ -9,8 +9,6 @@ ordinary pack. This module performs the ordinary-pack fusion only.
 """
 from __future__ import annotations
 
-from typing import Any
-
 from aiive.memory.recall_config import RecallConfig
 from aiive.memory.recall_models import (
     MemoryRecallItem,
@@ -65,7 +63,7 @@ def fuse_and_pack(
 
     for item in items:
         rrf = 0.0
-        for route, ids in route_ids.items():
+        for _route, ids in route_ids.items():
             if item.memory_id in ids:
                 rank = ids.index(item.memory_id) + 1
                 rrf += 1.0 / (k + rank)

@@ -1,9 +1,14 @@
-"""Test ContextSnapshot saving and querying."""
+"""Test ContextSnapshot saving and querying (via TurnExecutionService).
+
+Phase 1: 上下文组装走 ContextAssembler + _execute_graph（assembled_ctx 路径），
+快照由 TurnExecutionService._rotate_snapshot 写入，meta 仅含 total_tool_calls，
+stable_prefix_hash 作为独立列存储。
+"""
+import uuid
 from langchain_core.messages import AIMessage
 
-from aiive.core.llm_client import FakeLLMClient
 from aiive.db.models import ContextSnapshot
-from aiive.runtime.agent_graph import AgentGraph
+from aiive.core.llm_client import FakeLLMClient
 
 
 class DeterministicLLM:
@@ -16,15 +21,26 @@ class DeterministicLLM:
         return AIMessage(content=self._content)
 
 
+def _run(message, thread_id=None):
+    """走真实 TurnExecutionService（ContextAssembler + _execute_graph）。"""
+    from aiive.runtime.turn_execution import TurnExecutionService
+    return TurnExecutionService(llm_client=FakeLLMClient()).execute_turn(
+        message, thread_id=thread_id,
+    )
+
+
 class TestContextSnapshot:
     def test_snapshot_saved_on_chat(self, db_session, monkeypatch):
         monkeypatch.setattr(
             "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
             lambda self: DeterministicLLM(content="Hello!"),
         )
-        llm = FakeLLMClient(fixed_content="Hello!")
-        graph = AgentGraph(llm, db_session)
-        result = graph.run(message="Hi")
+        # 防止 TaskWorker 连接外部 PostgreSQL（execute_turn 不再调用它，保留以防万一）
+        monkeypatch.setattr(
+            "aiive.worker.task_worker.SessionLocal",
+            lambda: db_session,
+        )
+        result = _run(message="Hi")
         trace_id = result["trace_id"]
 
         snapshots = (
@@ -35,24 +51,24 @@ class TestContextSnapshot:
         assert len(snapshots) == 1
         snapshot = snapshots[0]
         assert snapshot.thread_id == result["thread_id"]
-        # context_items may be empty in the new inline-message flow
-        assert snapshot.meta["total_items"] >= 0
+        assert snapshot.meta["total_tool_calls"] >= 0
 
     def test_snapshot_items_include_stable_prefix(self, db_session, monkeypatch):
         monkeypatch.setattr(
             "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
             lambda self: DeterministicLLM(content="Hi!"),
         )
-        llm = FakeLLMClient(fixed_content="Hi!")
-        graph = AgentGraph(llm, db_session)
-        result = graph.run(message="Hello")
+        monkeypatch.setattr(
+            "aiive.worker.task_worker.SessionLocal",
+            lambda: db_session,
+        )
+        result = _run(message="Hello")
 
         snapshot = (
             db_session.query(ContextSnapshot)
             .filter(ContextSnapshot.trace_id == result["trace_id"])
             .first()
         )
-        # Context snapshot is persisted; items count may vary
         assert snapshot is not None
         assert snapshot.trace_id == result["trace_id"]
 
@@ -61,17 +77,17 @@ class TestContextSnapshot:
             "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
             lambda self: DeterministicLLM(content="Reply"),
         )
-        # ensure_committed_thread 内部用独立 SessionLocal()，测试 db_session 的
-        # 写入对其不可见；patch 为 no-op 将校验交给 AgentGraph 自身的会话。
         monkeypatch.setattr(
             "aiive.runtime.thread_bootstrap.ThreadBootstrapService.ensure_committed_thread",
-            staticmethod(lambda tid=None: tid),
+            staticmethod(lambda tid=None: tid if tid else str(uuid.uuid4())),
         )
-        llm = FakeLLMClient(fixed_content="Reply")
-        graph = AgentGraph(llm, db_session)
+        monkeypatch.setattr(
+            "aiive.worker.task_worker.SessionLocal",
+            lambda: db_session,
+        )
 
-        r1 = graph.run(message="First")
-        r2 = graph.run(message="Second", thread_id=r1["thread_id"])
+        r1 = _run(message="First")
+        r2 = _run(message="Second", thread_id=r1["thread_id"])
 
         s1 = (
             db_session.query(ContextSnapshot)
@@ -92,30 +108,33 @@ class TestContextSnapshot:
             "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
             lambda self: DeterministicLLM(content="Reply"),
         )
-        llm = FakeLLMClient(fixed_content="Reply")
-        graph = AgentGraph(llm, db_session)
-        result = graph.run(message="Test")
+        monkeypatch.setattr(
+            "aiive.worker.task_worker.SessionLocal",
+            lambda: db_session,
+        )
+        result = _run(message="Test")
 
         snapshot = (
             db_session.query(ContextSnapshot)
             .filter(ContextSnapshot.trace_id == result["trace_id"])
             .first()
         )
-        assert snapshot.meta["total_tokens"] >= 0
+        assert snapshot.meta["total_tool_calls"] >= 0
 
     def test_snapshot_has_stable_prefix_hash(self, db_session, monkeypatch):
         monkeypatch.setattr(
             "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
             lambda self: DeterministicLLM(content="Reply"),
         )
-        llm = FakeLLMClient(fixed_content="Reply")
-        graph = AgentGraph(llm, db_session)
-        result = graph.run(message="Test")
+        monkeypatch.setattr(
+            "aiive.worker.task_worker.SessionLocal",
+            lambda: db_session,
+        )
+        result = _run(message="Test")
 
         snapshot = (
             db_session.query(ContextSnapshot)
             .filter(ContextSnapshot.trace_id == result["trace_id"])
             .first()
         )
-        # stable_prefix_hash should be present (may be empty for simplified flow)
         assert snapshot.stable_prefix_hash is not None

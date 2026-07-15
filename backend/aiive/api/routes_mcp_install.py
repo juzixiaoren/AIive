@@ -17,7 +17,7 @@ from aiive.db.base import get_db
 from aiive.db.models import Capability, MCPInstallRecord
 from aiive.mcp.discovery import search_mcp_candidates
 from aiive.mcp.installer import install_sandbox, run_smoke
-from aiive.mcp.runtime_client import MCPRuntimeClient, MCPToolResult
+from aiive.mcp.runtime_client import MCPRuntimeClient
 
 logger = logging.getLogger(__name__)
 
@@ -191,7 +191,7 @@ def _build_test_client(declared_tools: list[str]) -> MCPRuntimeClient:
     client = MCPRuntimeClient()
 
     def _make_not_executable(tool_name: str):
-        def _handler(**kwargs):
+        def _handler(**_kwargs: Any):
             # 当前环境没有真实 MCP 执行器：抛异常使 call_tool 进入错误分支，
             # 返回 ok=False，冒烟会诚实置为 needs_review，绝不伪造成功。
             raise RuntimeError(

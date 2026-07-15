@@ -9,7 +9,6 @@ These are pure Pydantic models — no DB access, no magic numbers
 from __future__ import annotations
 
 import uuid
-from typing import Any
 
 from pydantic import BaseModel, Field
 

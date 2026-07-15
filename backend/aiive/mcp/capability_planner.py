@@ -5,11 +5,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
 from aiive.core.llm_client import LLMClient, LLMResponse
+
+logger = logging.getLogger(__name__)
 
 _PLAN_PROMPT: str = """分析用户目标，判断需要什么类型的外部能力，输出 JSON：
 
@@ -75,6 +78,7 @@ class CapabilityPlanner:
             )
             return self._parse_analysis(resp.content)
         except Exception:
+            logger.warning("能力目标分析失败，使用默认规划: goal=%s", goal[:80], exc_info=True)
             return {
                 "goal_summary": goal[:80],
                 "missing_capability_type": "other",

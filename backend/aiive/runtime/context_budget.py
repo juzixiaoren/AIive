@@ -1,0 +1,128 @@
+"""Phase 1: ContextBudget 配置。
+
+所有分区上限在此定义，业务代码中无魔术数字。
+"""
+from __future__ import annotations
+
+import json as _json
+import logging
+import os
+from dataclasses import dataclass
+from typing import ClassVar
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PartitionBudget:
+    """单个上下文分区的 token 预算。"""
+    name: str
+    soft_limit_tokens: int
+    hard_limit_tokens: int
+    priority: int
+    description: str = ""
+
+
+@dataclass(frozen=True)
+class ContextBudget:
+    """全局上下文预算，从 model context_window 切分。
+
+    安全余量通过 TokenCount.safe_tokens 表达，不在此处作为独立分区。
+    """
+    model_context_window: int
+    reserved_output: PartitionBudget
+    stable_contract: PartitionBudget
+    core_memory: PartitionBudget
+    working_state: PartitionBudget
+    tool_definitions: PartitionBudget
+    recent_messages: PartitionBudget
+    retrieved_memory: PartitionBudget
+    tool_results: PartitionBudget
+
+    @property
+    def hard_input_limit(self) -> int:
+        return self.model_context_window - self.reserved_output.hard_limit_tokens
+
+    @property
+    def soft_input_limit(self) -> int:
+        return int(self.hard_input_limit * 0.80)
+
+    @property
+    def all_partitions(self) -> tuple[PartitionBudget, ...]:
+        return (
+            self.stable_contract, self.core_memory, self.working_state,
+            self.tool_definitions, self.recent_messages, self.retrieved_memory,
+            self.tool_results,
+        )
+
+    def validate(self) -> None:
+        total = sum(p.hard_limit_tokens for p in self.all_partitions)
+        total += self.reserved_output.hard_limit_tokens
+        if total > self.model_context_window:
+            raise ValueError(
+                f"分区 hard limits ({total}) 超过 "
+                + f"context window ({self.model_context_window})"
+            )
+
+    # ── deepseek-chat (128000 上下文) 默认实例 ──
+    DEFAULT: ClassVar["ContextBudget"]
+
+    @classmethod
+    def default(cls) -> "ContextBudget":
+        return cls(
+            model_context_window=128000,
+            reserved_output=PartitionBudget("reserved_output", -1, 4096, -1, "保留输出 token"),
+            stable_contract=PartitionBudget("stable_contract", 3500, 4000, 1, "内核契约"),
+            core_memory=PartitionBudget("core_memory", 500, 600, 2, "核心记忆块"),
+            working_state=PartitionBudget("working_state", 1500, 2000, 3, "结构化工作状态"),
+            tool_definitions=PartitionBudget("tool_definitions", 4000, 6000, 4, "工具 Schema"),
+            recent_messages=PartitionBudget("recent_messages", 85000, 97000, 5, "近期 Turn 消息"),
+            retrieved_memory=PartitionBudget("retrieved_memory", 1000, 1200, 6, "召回记忆"),
+            tool_results=PartitionBudget("tool_results", 5000, 8000, 7, "工具结果"),
+        )
+
+    @classmethod
+    def from_env(cls) -> "ContextBudget":
+        """从环境变量读取可选的分区覆盖，返回（可能定制后的）预算。
+
+        通过 AIIVE_CONTEXT_BUDGET_JSON 提供 JSON 覆盖，例如:
+          {"tool_results": {"soft_limit_tokens": 3000, "hard_limit_tokens": 5000}}
+        未设置或解析失败时回退到默认预算，不影响既有行为。
+        """
+        raw = os.environ.get("AIIVE_CONTEXT_BUDGET_JSON")
+        if not raw:
+            return cls.default()
+        try:
+            overrides = _json.loads(raw)
+        except (_json.JSONDecodeError, TypeError):
+            logger.warning("AIIVE_CONTEXT_BUDGET_JSON 解析失败，使用默认预算")
+            return cls.default()
+
+        base = cls.default()
+        if not isinstance(overrides, dict):
+            return base
+        new_partitions = {p.name: p for p in base.all_partitions}
+        for p in base.all_partitions:
+            ov = overrides.get(p.name)
+            if isinstance(ov, dict):
+                new_partitions[p.name] = PartitionBudget(
+                    name=p.name,
+                    soft_limit_tokens=int(ov.get("soft_limit_tokens", p.soft_limit_tokens)),
+                    hard_limit_tokens=int(ov.get("hard_limit_tokens", p.hard_limit_tokens)),
+                    priority=p.priority,
+                    description=p.description,
+                )
+        return cls(
+            model_context_window=base.model_context_window,
+            reserved_output=base.reserved_output,
+            stable_contract=new_partitions["stable_contract"],
+            core_memory=new_partitions["core_memory"],
+            working_state=new_partitions["working_state"],
+            tool_definitions=new_partitions["tool_definitions"],
+            recent_messages=new_partitions["recent_messages"],
+            retrieved_memory=new_partitions["retrieved_memory"],
+            tool_results=new_partitions["tool_results"],
+        )
+
+
+ContextBudget.DEFAULT = ContextBudget.default()

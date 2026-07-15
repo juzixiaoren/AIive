@@ -12,6 +12,7 @@ MemoryReadModel to use.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime, timezone
 from collections.abc import Sequence
@@ -21,6 +22,8 @@ from sqlalchemy.orm import Session
 
 from aiive.db.models import MemoryRecord
 from aiive.memory.memory_types import MemoryProposal, LifecycleState, ValidityState
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryStore:
@@ -77,6 +80,8 @@ class MemoryStore:
             merged_from=merged_from,
             revision_num=revision_num,
             valid_from=now,
+            valid_to=proposal.valid_to,
+            retention_policy=proposal.retention_policy,
             observed_at=now,
             created_at=now,
             updated_at=now,
@@ -181,6 +186,7 @@ class MemoryStore:
                 MemoryRecord.updated_at.desc(),
             ).with_for_update().all()
         except Exception:
+            logger.warning("记忆查询加锁失败，回退非锁定查询（并发风险）", exc_info=True)
             return query.order_by(
                 MemoryRecord.lifecycle_state.desc(),
                 MemoryRecord.updated_at.desc(),

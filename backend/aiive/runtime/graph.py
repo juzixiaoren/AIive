@@ -1,44 +1,29 @@
 """
 运行时层 - LangGraph 适配器。
 
-为 AIive 聊天管线提供 invoke_chat() 入口，内部委托给 AgentGraph.run()。
-AgentGraph 全面使用 LangGraph 原生 tool_calls + ToolNode 机制。
+为 AIive 聊天管线提供 invoke_chat() 入口，内部委托给 TurnExecutionService。
 """
-
 from typing import Any
 
 
 def invoke_chat(message: str, thread_id: str | None = None) -> dict[str, Any]:
-    """通过 AgentGraph 执行单次聊天轮次。
+    """通过 TurnExecutionService 执行单次聊天轮次。
 
-    由 POST /api/chat 调用。每次请求创建新的 AgentGraph 实例并绑定独立的数据库会话。
-
-    Args:
-        message: 用户输入消息
-        thread_id: 会话线程 ID（可选，不传则创建新线程）
-
-    Returns:
-        包含 reply、thread_id、trace_id、action_cards 等的字典
+    由 POST /api/chat 调用。
     """
-    import logging
-    _log = logging.getLogger(__name__)
-    _log.info("[TRACE:invoke_chat] ENTER message=%s thread_id=%s", message[:50], thread_id)
-
     from aiive.core.llm_client import default_llm_client
-    from aiive.runtime.agent_graph import AgentGraph
-    from aiive.db.base import SessionLocal
+    from aiive.runtime.turn_execution import TurnExecutionService
 
-    db = SessionLocal()
-    try:
-        client = default_llm_client()
-        graph = AgentGraph(client, db)
-        _log.info("[TRACE:invoke_chat] calling graph.run()")
-        result = graph.run(message=message, thread_id=thread_id)
-        _log.info("[TRACE:invoke_chat] DONE reply=%s", str(result.get("reply", ""))[:80])
-        return result
-    except Exception:
-        # 调用失败时在自身会话上回滚，避免遗留悬挂事务
-        db.rollback()
-        raise
-    finally:
-        db.close()
+    client = default_llm_client()
+    service = TurnExecutionService(client)
+    result = service.execute_turn(message=message, thread_id=thread_id)
+    # 过滤内部状态字段
+    if result.get("_status"):
+        status_code = result.pop("_status")
+        if status_code == 409:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=409, detail=result.get("error", "conflict"))
+        if status_code == 202:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=202, detail=result.get("error", "turn_in_progress"))
+    return result

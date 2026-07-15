@@ -21,7 +21,7 @@ class TestReminderWakeSuccess:
     """
 
     def test_success_broadcasts_to_thread(self):
-        """Agent 成功生成回复后，应向目标线程广播 new_message。"""
+        """Agent 成功生成回复后，应向目标线程广播 new_message（新路径：TurnExecutionService.execute_turn）。"""
 
         class _FakeSession:
             def query(self, *a, **k):
@@ -45,8 +45,7 @@ class TestReminderWakeSuccess:
             def commit(self):
                 pass
 
-        fake_graph = MagicMock()
-        fake_graph.run_runtime_event.return_value = {
+        fake_result = {
             "reply": "提醒：喝水",
             "thread_id": "thread-1",
             "trace_id": "trace-1",
@@ -55,7 +54,7 @@ class TestReminderWakeSuccess:
 
         with patch.object(task_worker, "SessionLocal", lambda: _FakeSession()), \
                 patch("aiive.core.llm_client.default_llm_client", MagicMock()), \
-                patch("aiive.runtime.agent_graph.AgentGraph", return_value=fake_graph), \
+                patch("aiive.runtime.turn_execution.TurnExecutionService.execute_turn", return_value=fake_result), \
                 patch("aiive.runtime.thread_bootstrap.ThreadBootstrapService") as tb, \
                 patch("aiive.api.ws_manager.ws_manager") as ws:
             tb.ensure_committed_thread.return_value = None
