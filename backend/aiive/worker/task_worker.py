@@ -131,33 +131,40 @@ def _wake_agent_for_reminder(task_id: str, task_title: str, task_type: str, targ
             (e for e in recent_reminders if (e.payload or {}).get("task_id") == task_id),
             None,
         )
-        reminder_id = reminder_event.id if reminder_event else ""
+        reminder_content = (
+            (reminder_event.payload or {}).get("content", "") if reminder_event else ""
+        )
     finally:
         lookup_db.close()
 
-    # 2. AgentGraph 运行（独立会话）
+    # 2. TurnExecutionService 运行（独立会话，Phase 1 bounded context）
     try:
         from aiive.core.llm_client import default_llm_client
-        from aiive.runtime.agent_graph import AgentGraph, RuntimeEvent
         from aiive.runtime.thread_bootstrap import ThreadBootstrapService
+        from aiive.runtime.turn_execution import TurnExecutionService
         from aiive.api.ws_manager import ws_manager
+        import hashlib
 
         ThreadBootstrapService.ensure_committed_thread(target_thread_id)
         client = default_llm_client()
 
-        agent_db = SessionLocal()
-        try:
-            graph = AgentGraph(client, agent_db)
-            event = RuntimeEvent(
-                event_type="reminder",
-                reminder_id=reminder_id,
-                content=task_title,
-                required_backend_action="remind_alert",
-                source="scheduler",
-            )
-            result = graph.run_runtime_event(event, target_thread_id)
-            reply_text = result.get("reply", "")
-            agent_db.commit()
+        occurrence_id = task_id + "_" + str(datetime.now(timezone.utc).strftime("%Y%m%d%H%M"))
+        operation_id = hashlib.sha256(
+            f"runtime_event:{target_thread_id}:{task_id}:{occurrence_id}".encode()
+        ).hexdigest()
+        turn_id = "runtime_" + operation_id[:32]
+
+        message = f"[Reminder triggered]\n{task_title}\nContent: {reminder_content or task_title}"
+        service = TurnExecutionService(client, source="runtime_event")
+        result = service.execute_turn(
+            message=message,
+            thread_id=target_thread_id,
+            turn_id=turn_id,
+        )
+        reply_text = result.get("reply", "")
+        if result.get("error"):
+            logger.warning("Runtime event Turn returned error: %s", result.get("error"))
+        else:
             logger.info(
                 "提醒 Agent 唤醒成功: task_id=%s title=%s thread_id=%s",
                 task_id, task_title, target_thread_id,
@@ -173,8 +180,6 @@ def _wake_agent_for_reminder(task_id: str, task_title: str, task_type: str, targ
                     "action_cards": result.get("action_cards", []),
                 },
             )
-        finally:
-            agent_db.close()
     except Exception:
         logger.exception(
             "提醒 Agent 唤醒失败，回退为 notification_created: task_id=%s title=%s",

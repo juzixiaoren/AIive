@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from datetime import datetime
 from enum import StrEnum
 
 from pydantic import BaseModel, Field
@@ -204,6 +205,15 @@ class Sensitivity(StrEnum):
     SECRET = "secret"
 
 
+class WriteOutcome(StrEnum):
+    """单个 Proposal 写入结果枚举。用于 write_batch 判断批次回滚。"""
+    WRITTEN = "written"
+    GATE_REJECTED = "gate_rejected"
+    IGNORED = "ignored"
+    REINFORCE_SKIPPED = "reinforce_skipped"
+    FAILED = "failed"
+
+
 # Per-type allowed evidence sources.
 # agent_self: accepts test/kernel/tool/selfdev evidence, not only user.
 # environment: accepts tool_observation.
@@ -328,6 +338,18 @@ class MemoryProposal(BaseModel):
     requires_confirmation: bool = False
     raw_payload: dict[str, object] | None = None
     normalized_payload: dict[str, object] | None = None
+
+    # Phase 0.5B: ingestion tracing
+    source_turn_id: str = ""
+    ingestion_run_id: str = ""
+    proposal_index: int = 0
+
+    # Phase 2: execution mode + retention + durability
+    execution_mode: str = "system_best_effort"  # "user_required" | "system_best_effort"
+    source_turn_record_id: str = ""  # TurnRecord 数据库主键（FK 关联用）
+    retention_policy: str = "normal"  # "ephemeral" | "normal" | "pinned"
+    valid_to: datetime | None = None  # ephemeral 记录的过期时间
+    durable: bool = True  # 提取器判断是否有长期价值
 
     def compute_request_idempotency(self, proposal_index: int = 0) -> str:
         """计算请求幂等键: 防止同一事件重复处理。

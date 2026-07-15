@@ -58,13 +58,13 @@ def collect_file_imports(path: Path):
 
     class Visitor(ast.NodeVisitor):
         def __init__(self):
-            self.in_typecheck = False
-            self.in_func = 0
+            self.in_typecheck: bool = False
+            self.in_func: int = 0
             self.runtime: set[str] = set()
             self.typecheck: set[str] = set()
             self.deferred: set[str] = set()
 
-        def _targets_from_node(self, node) -> set[str]:
+        def _targets_from_node(self, node: ast.AST) -> set[str]:
             targets: set[str] = set()
             if isinstance(node, ast.Import):
                 for alias in node.names:
@@ -80,7 +80,7 @@ def collect_file_imports(path: Path):
             return targets
 
         @override
-        def visit_Import(self, node):
+        def visit_Import(self, node: ast.Import):
             targets = self._targets_from_node(node)
             if self.in_typecheck:
                 self.typecheck |= targets
@@ -90,7 +90,7 @@ def collect_file_imports(path: Path):
                 self.runtime |= targets
 
         @override
-        def visit_ImportFrom(self, node):
+        def visit_ImportFrom(self, node: ast.ImportFrom):
             targets = self._targets_from_node(node)
             if self.in_typecheck:
                 self.typecheck |= targets
@@ -100,26 +100,26 @@ def collect_file_imports(path: Path):
                 self.runtime |= targets
 
         @override
-        def visit_FunctionDef(self, node):
+        def visit_FunctionDef(self, node: ast.FunctionDef):
             self.in_func += 1
             self.generic_visit(node)
             self.in_func -= 1
 
         @override
-        def visit_AsyncFunctionDef(self, node):
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
             self.in_func += 1
             self.generic_visit(node)
             self.in_func -= 1
 
         @override
-        def visit_ClassDef(self, node):
+        def visit_ClassDef(self, node: ast.ClassDef):
             # class body imports count as deferred (not runtime at module import)
             self.in_func += 1
             self.generic_visit(node)
             self.in_func -= 1
 
         @override
-        def visit_If(self, node):
+        def visit_If(self, node: ast.If):
             is_tc = False
             test = node.test
             if isinstance(test, ast.Name):
@@ -165,7 +165,7 @@ def main():
 
     sys.setrecursionlimit(10000)
 
-    def strongconnect(v):
+    def strongconnect(v: str):
         index[v] = index_counter[0]
         lowlink[v] = index_counter[0]
         index_counter[0] += 1

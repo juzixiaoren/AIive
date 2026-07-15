@@ -12,12 +12,15 @@ Produced by a cheap model call after the main LLM reply.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from aiive.core.llm_client import LLMClient
 from aiive.memory.extraction_policy import MemorySignalAction
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -136,6 +139,7 @@ class ActionPlanner:
             )
             return self._parse_signal(response.content)
         except Exception:
+            logger.warning("记忆信号分类失败，回退为 extract_async: trace_id=%s", trace_id, exc_info=True)
             # On failure: default to EXTRACT_ASYNC (conservative)
             return MemorySignalDecision(
                 action=MemorySignalAction.EXTRACT_ASYNC.value,

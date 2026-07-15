@@ -23,9 +23,8 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 
 from aiive.core.action_planner import AgentDecision
-from aiive.core.llm_client import FakeLLMClient, default_llm_client
+from aiive.core.llm_client import FakeLLMClient
 from aiive.db.models import Base, Event, Task, Thread
-from aiive.runtime.agent_graph import AgentGraph
 from aiive.runtime.event_logger import EventLogger as _RealEventLogger
 from aiive.tools.registry import get_tool_registry
 
@@ -134,17 +133,18 @@ def _decision(tool_name, intent_type, args=None, execution_mode="execute"):
 
 def _run(app_db, message, decision, thread_id="thread-mustcall"):
     # get_or_create_thread only reuses a thread when its id already exists,
-    # so seed a stable Thread to keep create/list on the same thread.
+    # so seed a stable Thread to keep create/list on the same thread。
     _ensure_thread(app_db, thread_id)
-    fake_planner = MagicMock()
-    fake_planner.plan.return_value = decision
-    with patch("aiive.runtime.agent_graph.ActionPlanner", return_value=fake_planner), patch(
-        "aiive.runtime.agent_graph.OutboxWorker"
-    ), patch("aiive.runtime.agent_graph.register_all"), patch(
-        "aiive.runtime.agent_graph.EventLogger", _CommittingEventLogger
-    ):
-        graph = AgentGraph(default_llm_client(), app_db)
-        return graph.run(message, thread_id=thread_id)
+    # 生产路径已统一为 TurnExecutionService.execute_turn（AgentGraph.run 已删除）。
+    # ActionPlanner 在 Graph 路径中不再使用；保留 OutboxWorker/register_all/EventLogger
+    # 的 patch（AgentGraph.__init__ 仍会引用它们）。
+    with patch("aiive.runtime.agent_graph.OutboxWorker"), patch(
+        "aiive.runtime.agent_graph.register_all"
+    ), patch("aiive.runtime.agent_graph.EventLogger", _CommittingEventLogger):
+        from aiive.core.llm_client import default_llm_client
+        from aiive.runtime.turn_execution import TurnExecutionService
+        service = TurnExecutionService(llm_client=default_llm_client(), source="user_chat")
+        return service.execute_turn(message=message, thread_id=thread_id)
 
 
 # ---------------------------------------------------------------------------
@@ -290,15 +290,12 @@ class TestNoRawToolCallLeak:
         )
         # 主 LLM 发出畸形标签
         llm = FakeLLMClient(fixed_content="I tried </tool_cost> but it failed.")
-        fake_planner = MagicMock()
-        fake_planner.plan.return_value = decision
-        with patch("aiive.runtime.agent_graph.ActionPlanner", return_value=fake_planner), patch(
-            "aiive.runtime.agent_graph.OutboxWorker"
-        ), patch("aiive.runtime.agent_graph.register_all"), patch(
-            "aiive.runtime.agent_graph.EventLogger", _CommittingEventLogger
-        ):
-            graph = AgentGraph(llm, app_db)
-            result = graph.run("test", thread_id="thread-leak")
+        with patch("aiive.runtime.agent_graph.OutboxWorker"), patch(
+            "aiive.runtime.agent_graph.register_all"
+        ), patch("aiive.runtime.agent_graph.EventLogger", _CommittingEventLogger):
+            from aiive.runtime.turn_execution import TurnExecutionService
+            service = TurnExecutionService(llm_client=llm, source="user_chat")
+            result = service.execute_turn(message="test", thread_id="thread-leak")
         assert "<tool_call>" not in result["reply"]
         assert "</tool_cost>" not in result["reply"]
         assert len(result["parse_errors"]) > 0

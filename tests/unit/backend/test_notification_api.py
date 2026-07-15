@@ -66,8 +66,12 @@ class TestDeleteNotificationCancelsTask:
 class TestTaskWorkerEndToEnd:
     """真实端到端测试：创建任务 -> Worker 轮询 -> 产生通知事件。"""
 
-    def test_overdue_task_produces_notification_event(self, db_session):
+    def test_overdue_task_produces_notification_event(self, db_session, monkeypatch):
         """过期的提醒任务经 Worker 处理后应产生通知事件并标记为完成。"""
+        # 将 SessionLocal 替换为 db_session 的工厂，避免连接外部 PostgreSQL
+        monkeypatch.setattr("aiive.worker.task_worker.SessionLocal", lambda: db_session)
+        monkeypatch.setattr("aiive.db.base.SessionLocal", lambda: db_session)
+
         mgr = TaskManager(db_session)
         past = datetime.now(timezone.utc) - timedelta(minutes=5)
         task = mgr.create("reminder", "测试提醒", next_check_at=past)
@@ -82,19 +86,15 @@ class TestTaskWorkerEndToEnd:
         updated = mgr._db.get(type(task), task.id)
         assert updated.status == "completed"
 
-        # Worker 回退路径用独立 SessionLocal() 写入通知，查询时也用 SessionLocal()
-        lookup_db = SessionLocal()
-        try:
-            notif = (
-                lookup_db.query(Event)
-                .filter(
-                    Event.event_type == "notification_created",
-                    Event.trace_id == task.id,
-                )
-                .first()
+        # Worker fallback 使用 monkeypatched SessionLocal → 写入同一个 SQLite db_session
+        notif = (
+            db_session.query(Event)
+            .filter(
+                Event.event_type == "notification_created",
+                Event.trace_id == task.id,
             )
-        finally:
-            lookup_db.close()
+            .first()
+        )
         assert notif is not None
         assert notif.payload["title"] == "测试提醒"
 

@@ -20,6 +20,10 @@ class RunContext:
         thread_id: 已 committed 的会话线程 ID
         trace_id: 链路追踪 ID
         source: 调用来源（"user_chat"、"system_reminder"、"outbox_worker" 等）
+        turn_id: 当前轮次业务 turn_id（稳定审计标识，非 DB 主键）
+        turn_record_id: 当前 TurnRecord 数据库主键（用于 FK 关联）
+        execution_mode: 记忆写入失败语义控制（"user_required" | "system_best_effort"）
+        source_event_ids: 当前 Turn 中已持久化的真实 Event.id 列表
         memory_tool_calls: Kernel 强制的单轮 Agent-Initiated Recall 预算计数
         project_id / workspace_id / environment_id: Scope Chain 高层 scope（V2 §九）。
             当前运行时尚未独立追踪这些实体，由 chat 入口在可用时填充；
@@ -30,6 +34,10 @@ class RunContext:
     thread_id: str
     trace_id: str
     source: str = "user_chat"
+    turn_id: str = ""  # 当前轮次业务 turn_id
+    turn_record_id: str = ""  # TurnRecord 数据库主键
+    execution_mode: str = "system_best_effort"  # "user_required" | "system_best_effort"
+    source_event_ids: list[str] = field(default_factory=list)  # 真实 Event.id
     memory_tool_calls: int = 0  # Kernel-enforced per-turn Agent-Initiated Recall budget
     project_id: str | None = None
     workspace_id: str | None = None

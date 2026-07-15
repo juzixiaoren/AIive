@@ -15,7 +15,6 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from datetime import datetime, timezone
-from typing import Any
 
 # ---------------------------------------------------------------------------
 # CJK-aware tokenization — avoids the \W+ pitfall where Chinese text
@@ -24,11 +23,11 @@ from typing import Any
 # standard \W+ token list so character-level matching works.
 # ---------------------------------------------------------------------------
 
-_CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]+")
+_CJK_RE = re.compile("[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]+")
 
 
 def _tokenize_cjk_aware(text: str, min_len: int = 2) -> list[str]:
-    """Split text into tokens: \W+ for Latin/punctuation, overlapping bigrams for CJK.
+    """Split text into tokens: \\W+ for Latin/punctuation, overlapping bigrams for CJK.
 
     Example: "我喜欢咖啡 preference" → ["我喜欢咖啡", "我喜", "喜欢", "欢咖", "咖啡", "preference"]
     """
@@ -66,8 +65,6 @@ _KEYISH = re.compile(r"^[A-Za-z0-9_.]+$")
 def _recency_score(r: MemoryRecord) -> float:
     """Recency in 0..1 over a 30-day window."""
     ref = r.observed_at or r.updated_at or r.created_at
-    if ref is None:
-        return 0.5
     if ref.tzinfo is None:
         ref = ref.replace(tzinfo=timezone.utc)
     age_days = (datetime.now(timezone.utc) - ref).total_seconds() / 86400.0
@@ -100,9 +97,9 @@ class AutomaticRecallEngine:
     """Runs Automatic Recall once per user turn (or per Agent memory tool call)."""
 
     def __init__(self, db: Session, config: RecallConfig | None = None) -> None:
-        self._db = db
-        self._store = MemoryStore(db)
-        self._config = config or RecallConfig()
+        self._db: Session = db
+        self._store: MemoryStore = MemoryStore(db)
+        self._config: RecallConfig = config or RecallConfig()
 
     # ------------------------------------------------------------------
     # Public API
@@ -133,7 +130,7 @@ class AutomaticRecallEngine:
         if not _KEYISH.match(q):
             return []
         out: list[MemoryRecallItem] = []
-        for scope_type, scope_id in chain:
+        for scope_type, _scope_id in chain:
             recs = (
                 self._db.query(MemoryRecord)
                 .filter(
@@ -176,13 +173,13 @@ class AutomaticRecallEngine:
         out.sort(key=lambda x: x.relevance_score, reverse=True)
         return out[: self._config.automatic_recall_top_k * 2]
 
-    def _route_vector(self, request: MemoryRecallRequest) -> list[MemoryRecallItem]:
+    def _route_vector(self, _request: MemoryRecallRequest) -> list[MemoryRecallItem]:
         """Semantic route. Adapter not wired (Qdrant) → stub returns empty."""
         if not self._config.vector_adapter_enabled:
             return []
         return []
 
-    def _route_temporal_graph(self, request: MemoryRecallRequest) -> list[MemoryRecallItem]:
+    def _route_temporal_graph(self, _request: MemoryRecallRequest) -> list[MemoryRecallItem]:
         """Temporal / multi-hop KG route. Adapter not wired → stub returns empty."""
         if not self._config.temporal_graph_adapter_enabled:
             return []
@@ -265,7 +262,7 @@ class AutomaticRecallEngine:
         ).all()
 
     @staticmethod
-    def _text_relevance(r: MemoryRecord, tokens: list[str], qlow: str) -> float:
+    def _text_relevance(r: MemoryRecord, tokens: list[str], _qlow: str) -> float:
         content_low = (r.content or "").lower()
         key_low = (r.canonical_key or "").lower()
         matched = sum(1 for t in tokens if t in content_low or t in key_low)

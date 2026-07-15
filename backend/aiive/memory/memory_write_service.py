@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 from aiive.context.run_context import RunContext
 from aiive.db.models import (
     MemoryEvidence,
+    MemoryIngestionRun,
     MemoryLineage,
     MemoryProposal as MemoryProposalModel,
     MemoryRecord,
@@ -42,6 +43,7 @@ from aiive.memory.memory_types import (
     MemoryProposal,
     TrustLevel,
     ValidityState,
+    WriteOutcome,
 )
 from aiive.runtime.event_logger import EventLogger
 
@@ -55,6 +57,7 @@ logger = logging.getLogger(__name__)
 class WriteResult:
     """Result of a single MemoryWriteService.write() call."""
 
+    outcome: WriteOutcome
     written: bool
     operation: str
     memory_id: str
@@ -64,14 +67,16 @@ class WriteResult:
 
     def __init__(
         self,
-        written: bool,
+        outcome: WriteOutcome = WriteOutcome.WRITTEN,
+        written: bool = False,
         operation: str = "",
         memory_id: str = "",
         state: str = "",
         reason: str = "",
         superseded_ids: list[str] | None = None,
     ) -> None:
-        self.written = written
+        self.outcome = outcome
+        self.written = written or outcome == WriteOutcome.WRITTEN
         self.operation = operation
         self.memory_id = memory_id
         self.state = state
@@ -87,6 +92,15 @@ class WriteResult:
             "reason": self.reason,
             "superseded_ids": self.superseded_ids,
         }
+
+
+# ============================================================================
+# MemoryBatchWriteError
+# ============================================================================
+
+
+class MemoryBatchWriteError(Exception):
+    """write_batch 中某个 Proposal 不可恢复失败。"""
 
 
 # ============================================================================
@@ -113,6 +127,156 @@ class MemoryWriteService:
         self._registry: MemoryKeyRegistry = registry or get_memory_key_registry()
 
     # ------------------------------------------------------------------
+    # write_batch: atomic batch write
+    # ------------------------------------------------------------------
+
+    # 合法 no-op outcome，不导致批次回滚
+    _VALID_NOOP_OUTCOMES: frozenset[WriteOutcome] = frozenset({
+        WriteOutcome.GATE_REJECTED,
+        WriteOutcome.IGNORED,
+        WriteOutcome.REINFORCE_SKIPPED,
+    })
+
+    def write_batch(
+        self,
+        proposals: list[MemoryProposal],
+        ingestion_run: MemoryIngestionRun,
+        run_context: RunContext,
+    ) -> list[WriteResult]:
+        """原子写入一个提取批次。
+
+        前置: ingestion_run 已通过 SELECT FOR UPDATE 锁定，status='running'。
+        事务: 所有 Proposal 在同一 Session 中，不自行 commit。
+        锁: 在事务开头一次性按序获取所有 advisory lock。
+        """
+        # Step 0: 收集并排序所有 lock_id
+        lock_ids: list[int] = []
+        seen: set[int] = set()
+        for p in proposals:
+            lid = self._compute_lock_id(p.canonical_key, p.scope_type, p.scope_id)
+            if lid not in seen:
+                seen.add(lid)
+                lock_ids.append(lid)
+        lock_ids.sort()
+
+        # Step 1: 一次性按序获取所有 advisory lock
+        for lid in lock_ids:
+            self._acquire_lock(lid)
+
+        # Step 2: 逐 Proposal 写入
+        results: list[WriteResult] = []
+        for i, p in enumerate(proposals):
+            p.ingestion_run_id = ingestion_run.id
+            p.proposal_index = i
+            p.source_turn_id = run_context.turn_id
+            p.source_turn_record_id = run_context.turn_record_id
+            p.execution_mode = run_context.execution_mode
+
+            result = self._write_single_in_transaction(p, run_context)
+            results.append(result)
+
+            if result.outcome not in self._VALID_NOOP_OUTCOMES and result.outcome != WriteOutcome.WRITTEN:
+                raise MemoryBatchWriteError(
+                    f"Proposal {i} failed: outcome={result.outcome.value}, reason={result.reason}"
+                )
+
+        self._db.flush()
+        return results
+
+    def _write_single_in_transaction(
+        self, proposal: MemoryProposal, run_context: RunContext,
+    ) -> WriteResult:
+        """单个 Proposal 的 Gate → Resolve → Execute → Persist 流程。
+
+        不再获取/释放 advisory lock（由 write_batch 统一管理）。
+        """
+        gate_decision = self._gate.decide(proposal)
+        if gate_decision.decision == "reject":
+            self._persist_proposal(proposal, gate_decision, final_op="reject")
+            return WriteResult(outcome=WriteOutcome.GATE_REJECTED, reason=gate_decision.reason)
+
+        existing_active = self._store.get_active_by_key_scope_locked(
+            proposal.canonical_key, proposal.scope_type, proposal.scope_id,
+        )
+        resolution = self._resolver.resolve(proposal, existing_active)
+        tid = run_context.thread_id
+
+        if resolution.operation == "reinforce":
+            return self._execute_reinforce_in_transaction(
+                proposal, resolution.existing_record or existing_active[0],
+                gate_decision, tid,
+            )
+        elif resolution.operation in ("supersede", "revise"):
+            return self._execute_supersede_or_revise(
+                proposal, resolution, gate_decision, tid,
+            )
+        elif resolution.operation == "promote":
+            return self._execute_promote_candidate(proposal, resolution, gate_decision, tid)
+        elif resolution.operation == "merge":
+            return self._execute_merge(proposal, resolution, gate_decision, tid)
+        elif resolution.operation == "ignore":
+            self._persist_proposal(proposal, gate_decision, final_op="ignore")
+            return WriteResult(outcome=WriteOutcome.IGNORED, reason=resolution.reason)
+        else:
+            target_state = (
+                LifecycleState.CANDIDATE.value
+                if gate_decision.decision == "candidate"
+                else LifecycleState.ACTIVE.value
+            )
+            record = self._store.create_record(
+                proposal=proposal, lifecycle_state=target_state,
+                validity_state=ValidityState.VALID.value,
+            )
+            self._write_evidence_batch(record.id, proposal.evidence)
+            self._persist_proposal(proposal, gate_decision, final_op="create", final_memory_id=record.id)
+            self._log_event(tid, proposal, "memory.created", record.id)
+            self._enqueue_projection(record, "memory.created")
+            return WriteResult(outcome=WriteOutcome.WRITTEN, operation="create",
+                               memory_id=record.id, state=target_state)
+
+    def _execute_reinforce_in_transaction(
+        self,
+        proposal: MemoryProposal,
+        existing: MemoryRecord,
+        gate_decision: GateDecision,
+        thread_id: str,
+    ) -> WriteResult:
+        """Reinforce variant for batch writes。"""
+        new_event_ids = set(proposal.source_event_ids or [])
+        if new_event_ids:
+            existing_event_ids = {
+                e.source_event_id for e in
+                self._db.query(MemoryEvidence).filter(
+                    MemoryEvidence.memory_id == existing.id,
+                    MemoryEvidence.source_event_id.in_(list(new_event_ids)),
+                ).all()
+            }
+            new_count = len(new_event_ids - existing_event_ids)
+            if new_count == 0:
+                self._persist_proposal(proposal, gate_decision, final_op="ignore", final_memory_id=existing.id)
+                return WriteResult(
+                    outcome=WriteOutcome.REINFORCE_SKIPPED,
+                    reason="All source_events already counted",
+                )
+        else:
+            new_count = 1
+
+        trust_mult = 0.1 if proposal.trust_level == TrustLevel.TRUSTED.value else 0.05
+        existing.confidence = min(1.0, (existing.confidence or 0.5) + trust_mult * new_count)
+        existing.reinforce_count = (existing.reinforce_count or 0) + new_count
+        existing.last_reinforced_at = datetime.now(timezone.utc)
+        existing.observed_at = datetime.now(timezone.utc)
+        existing.record_version += 1
+        existing.updated_at = datetime.now(timezone.utc)
+
+        self._write_evidence_batch(existing.id, proposal.evidence)
+        self._persist_proposal(proposal, gate_decision, final_op="reinforce", final_memory_id=existing.id)
+        self._log_event(thread_id, proposal, "memory.reinforced", existing.id)
+        self._enqueue_projection(existing, "memory.reinforced", invalidate_cache=True)
+        return WriteResult(outcome=WriteOutcome.WRITTEN, written=True, operation="reinforce",
+                           memory_id=existing.id, state=LifecycleState.ACTIVE.value)
+
+    # ------------------------------------------------------------------
     # Public API: write a normalized proposal
     # ------------------------------------------------------------------
 
@@ -136,7 +300,7 @@ class MemoryWriteService:
         if gate_decision.decision == "reject":
             self._persist_proposal(proposal, gate_decision, final_op="reject")
             return WriteResult(
-                written=False,
+                outcome=WriteOutcome.GATE_REJECTED,
                 reason=f"Gate rejected: {gate_decision.reason}",
             )
 
@@ -609,6 +773,12 @@ class MemoryWriteService:
             idempotency_key=proposal.idempotency_key,
             raw_payload=proposal.raw_payload,
             normalized_payload=proposal.normalized_payload,
+            # Phase 2: execution mode + retention + durability
+            execution_mode=proposal.execution_mode,
+            retention_policy=proposal.retention_policy,
+            valid_to=proposal.valid_to,
+            durable=proposal.durable,
+            source_turn_record_id=proposal.source_turn_record_id or None,
         )
         self._db.add(mp)
 
@@ -656,17 +826,16 @@ class MemoryWriteService:
     ) -> None:
         """Enqueue async projection outbox jobs.
 
+        Phase 0.5B: Capability flag 控制。未启用的投影类型不入队。
         Projection jobs carry memory_id + record_version for stale detection.
-        Candidate records skip vector upsert (only active records are searchable).
         """
         import uuid as _uuid
+        from aiive.memory.recall_config import get_projection_capabilities
 
+        caps = get_projection_capabilities()
         base_key = f"{record.id}:{record.record_version}"
         is_candidate = record.lifecycle_state == LifecycleState.CANDIDATE.value
 
-        # Core Memory projection refresh: only for keys that feed Core Memory.
-        # Enqueued on every write of a core-keyed record so the small, stable
-        # projection stays consistent (V2 §五/§九).
         if record.canonical_key and record.canonical_key in self._registry.get_core_memory_keys():
             self._db.add(OutboxJob(
                 operation_id=f"core:{base_key}:{_uuid.uuid4().hex[:8]}",
@@ -677,43 +846,44 @@ class MemoryWriteService:
                 max_retries=3,
             ))
 
-        # Vector upsert: only for active records (candidates not searchable)
-        # 注意：memory.superseded 已从 upsert 列表移除——它代表旧记录失效，
-        # 只应触发向量删除（见下方删除分支），不应再将已失效记录写入向量库。
-        if event_type in ("memory.created", "memory.reinforced",
-                          "memory.merged", "memory.wake"):
-            if not is_candidate:
+        if caps.vector_projection_enabled:
+            if event_type in ("memory.created", "memory.reinforced",
+                              "memory.merged", "memory.wake"):
+                if not is_candidate:
+                    self._db.add(OutboxJob(
+                        operation_id=f"vec:{base_key}:{_uuid.uuid4().hex[:8]}",
+                        job_type="memory_vector_upsert",
+                        status="pending",
+                        payload={"memory_id": record.id, "record_version": record.record_version},
+                        trace_id=record.id,
+                        max_retries=3,
+                    ))
+
+        if caps.markdown_projection_enabled:
+            if event_type in ("memory.created", "memory.reinforced",
+                              "memory.merged", "memory.wake"):
                 self._db.add(OutboxJob(
-                    operation_id=f"vec:{base_key}:{_uuid.uuid4().hex[:8]}",
-                    job_type="memory_vector_upsert",
+                    operation_id=f"md:{base_key}:{_uuid.uuid4().hex[:8]}",
+                    job_type="memory_markdown_project",
                     status="pending",
                     payload={"memory_id": record.id, "record_version": record.record_version},
                     trace_id=record.id,
                     max_retries=3,
                 ))
-            # Markdown projection for all records (candidates visible for review)
-            self._db.add(OutboxJob(
-                operation_id=f"md:{base_key}:{_uuid.uuid4().hex[:8]}",
-                job_type="memory_markdown_project",
-                status="pending",
-                payload={"memory_id": record.id, "record_version": record.record_version},
-                trace_id=record.id,
-                max_retries=3,
-            ))
 
-        # Delete / cache invalidate
-        if event_type in ("memory.forgotten", "memory.sleep", "memory.archived",
-                          "memory.superseded"):
-            self._db.add(OutboxJob(
-                operation_id=f"vec-del:{base_key}:{_uuid.uuid4().hex[:8]}",
-                job_type="memory_vector_delete",
-                status="pending",
-                payload={"memory_id": record.id, "record_version": record.record_version},
-                trace_id=record.id,
-                max_retries=3,
-            ))
+        if caps.vector_projection_enabled:
+            if event_type in ("memory.forgotten", "memory.sleep", "memory.archived",
+                              "memory.superseded"):
+                self._db.add(OutboxJob(
+                    operation_id=f"vec-del:{base_key}:{_uuid.uuid4().hex[:8]}",
+                    job_type="memory_vector_delete",
+                    status="pending",
+                    payload={"memory_id": record.id, "record_version": record.record_version},
+                    trace_id=record.id,
+                    max_retries=3,
+                ))
 
-        if invalidate_cache:
+        if caps.cache_projection_enabled and invalidate_cache:
             self._db.add(OutboxJob(
                 operation_id=f"cache:{base_key}:{_uuid.uuid4().hex[:8]}",
                 job_type="memory_cache_invalidate",

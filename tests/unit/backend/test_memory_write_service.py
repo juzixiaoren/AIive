@@ -120,8 +120,12 @@ class TestMemoryWriteService:
         assert record.lifecycle_state == LifecycleState.FORGOTTEN.value
         assert "forgotten:" in record.content
 
-    def test_event_and_outbox_written(self, db_session):
+    def test_event_and_outbox_written(self, db_session, monkeypatch):
+        """Phase 0.5B: capability flags control projection outbox; enable for test."""
         from aiive.db.models import Event, OutboxJob
+        from aiive.memory.recall_config import get_projection_capabilities
+        caps = get_projection_capabilities()
+        monkeypatch.setattr(caps, "vector_projection_enabled", True)
 
         writer = MemoryWriteService(db_session)
         proposal = _make_proposal("user.preference.drink", "Tea")
@@ -137,7 +141,7 @@ class TestMemoryWriteService:
         )
         assert len(events) >= 1
 
-        # Outbox jobs enqueued (check at least one exists for this memory_id)
+        # Outbox jobs enqueued
         jobs = (
             db_session.query(OutboxJob)
             .filter(OutboxJob.trace_id == result.memory_id)
@@ -145,7 +149,7 @@ class TestMemoryWriteService:
         )
         assert len(jobs) >= 1, f"Expected at least 1 outbox job, got {len(jobs)}"
         job_types = {j.job_type for j in jobs}
-        assert "memory_vector_upsert" in job_types or "memory_markdown_project" in job_types
+        assert "memory_vector_upsert" in job_types, f"Got job_types: {job_types}"
 
     def test_evidence_table_written(self, db_session):
         writer = MemoryWriteService(db_session)

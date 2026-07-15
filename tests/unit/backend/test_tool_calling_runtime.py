@@ -2,31 +2,23 @@
 
 旧 ToolExecutor（XML 解析、去重、execute、extract_and_execute）已由 LangGraph ToolNode 替代，
 相关测试已移除。
+
+AgentGraph 集成测试现通过真实 TurnExecutionService（ContextAssembler + _execute_graph）
+执行，LLM 以 mock 注入，仅验证返回结构与无 <tool_call> 标签泄露。
 """
 
-import json as _json
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-import pytest
+from langchain_core.messages import AIMessage
 
-from aiive.memory.recall_models import MemoryRecallPack
+from aiive.core.llm_client import FakeLLMClient
 from aiive.runtime.tool_executor import (
     ToolCallRecord,
     build_action_cards,
 )
 
-# V2: context assembly happens in _build_agent_context. The integration tests
-# below focus on response structure, so we stub it with a stable context.
-FAKE_AGENT_CTX: dict = {
-    "system_content": "SYSTEM",
-    "identity": None,
-    "policies": [],
-    "core_blocks": [],
-    "recall_pack": MemoryRecallPack(request_id="x"),
-    "recall_traces": [],
-    "recall_run_id": "run-1",
-    "recall_messages": [],
-}
+# V2: context assembly happens in ContextAssembler. The integration tests
+# below focus on response structure, so we inject a stable mocked LLM.
 
 
 # ============================================================================
@@ -135,34 +127,25 @@ class TestMemorySearchEmptyQuery:
 
 
 # ============================================================================
-# 测试：AgentGraph 工具集成（简化版）
+# 测试：AgentGraph 工具集成（走 TurnExecutionService 真实路径）
 # ============================================================================
 
 class TestAgentGraphToolIntegration:
-    """需求 1、4：AgentGraph.run() 返回结构正确，无 tool_call 标签泄露。"""
+    """需求 1、4：execute_turn 返回结构正确，无 tool_call 标签泄露。"""
 
-    @patch("aiive.runtime.agent_graph.ChatOpenAI")
-    @patch("aiive.runtime.agent_graph.build_action_cards", return_value=[])
-    @patch("aiive.runtime.agent_graph.AgentGraph._build_graph")
-    @patch("aiive.runtime.agent_graph.AgentGraph._build_agent_context", return_value=FAKE_AGENT_CTX)
-    def test_run_never_returns_tool_call_tags(self, mock_ctx, mock_graph, mock_cards, mock_chat):
+    def test_run_never_returns_tool_call_tags(self, monkeypatch):
         """用户可见回复绝不能包含 <tool_call> 标签。"""
-        from aiive.runtime.agent_graph import AgentGraph
+        from aiive.runtime.turn_execution import TurnExecutionService
 
-        mock_graph.return_value = (MagicMock(), [])
-        mock_llm = MagicMock()
-        mock_llm._default_model = "gpt-4"
-        mock_llm._api_key = "sk-test"
-        mock_llm._base_url = "https://api.openai.com/v1"
-        mock_llm._timeout_seconds = 30
+        llm = MagicMock()
+        llm.bind_tools.return_value = llm
+        llm.invoke.return_value = AIMessage(content="Hello, how can I help?")
+        monkeypatch.setattr(
+            "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
+            lambda self: llm,
+        )
 
-        # Need to also mock the compiled graph's invoke
-        mock_compiled = MagicMock()
-        mock_compiled.invoke.return_value = {"messages": [MagicMock(content="Hello, how can I help?", tool_calls=None)]}
-        mock_graph.return_value = (mock_compiled, [])
-
-        graph = AgentGraph(mock_llm, MagicMock())
-        result = graph.run(message="hi")
+        result = TurnExecutionService(llm_client=FakeLLMClient()).execute_turn("hi")
 
         reply = result.get("reply", "")
         assert "<tool_call>" not in reply
@@ -170,26 +153,19 @@ class TestAgentGraphToolIntegration:
         assert "thread_id" in result
         assert "trace_id" in result
 
-    @patch("aiive.runtime.agent_graph.ChatOpenAI")
-    @patch("aiive.runtime.agent_graph.build_action_cards", return_value=[])
-    @patch("aiive.runtime.agent_graph.AgentGraph._build_graph")
-    @patch("aiive.runtime.agent_graph.AgentGraph._build_agent_context", return_value=FAKE_AGENT_CTX)
-    def test_run_returns_structured_response(self, mock_ctx, mock_graph, mock_cards, mock_chat):
-        """run() 返回的 dict 包含必要的结构字段。"""
-        from aiive.runtime.agent_graph import AgentGraph
+    def test_run_returns_structured_response(self, monkeypatch):
+        """execute_turn 返回的 dict 包含必要的结构字段。"""
+        from aiive.runtime.turn_execution import TurnExecutionService
 
-        mock_compiled = MagicMock()
-        mock_compiled.invoke.return_value = {"messages": [MagicMock(content="Done.", tool_calls=None)]}
-        mock_graph.return_value = (mock_compiled, [])
+        llm = MagicMock()
+        llm.bind_tools.return_value = llm
+        llm.invoke.return_value = AIMessage(content="Done.")
+        monkeypatch.setattr(
+            "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
+            lambda self: llm,
+        )
 
-        mock_llm = MagicMock()
-        mock_llm._default_model = "gpt-4"
-        mock_llm._api_key = "sk-test"
-        mock_llm._base_url = "https://api.openai.com/v1"
-        mock_llm._timeout_seconds = 30
-
-        graph = AgentGraph(mock_llm, MagicMock())
-        result = graph.run(message="test")
+        result = TurnExecutionService(llm_client=FakeLLMClient()).execute_turn("test")
 
         assert "reply" in result
         assert "thread_id" in result

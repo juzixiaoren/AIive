@@ -46,7 +46,30 @@ class RecallConfig:
     # --- Core projection refresh debounce ---
     core_projection_refresh_debounce_s: int = 5
 
-    # Default token estimator (chars / 4)
-    @staticmethod
-    def estimate_tokens(text: str) -> int:
-        return max(1, len(text) // 4)
+
+# ============================================================================
+# Phase 0.5B: Projection capability flags + Outbox allowlist
+# ============================================================================
+
+
+@dataclass
+class ProjectionCapabilities:
+    """Phase 0.5B 投影能力 flag。未启用时不创建对应 OutboxJob。"""
+    vector_projection_enabled: bool = False
+    markdown_projection_enabled: bool = False
+    cache_projection_enabled: bool = False
+    temporal_graph_projection_enabled: bool = False
+
+
+# 当前实际能力状态
+_projection_capabilities = ProjectionCapabilities()
+
+
+def get_projection_capabilities() -> ProjectionCapabilities:
+    return _projection_capabilities
+
+
+ENABLED_OUTBOX_JOB_TYPES: frozenset[str] = frozenset({
+    "memory_extraction",
+    "core_memory_refresh",
+})
