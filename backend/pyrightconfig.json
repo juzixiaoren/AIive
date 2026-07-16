@@ -12,6 +12,8 @@
   "reportUnusedCallResult": "none",
   "reportMissingModuleSource": "none",
   "exclude": [
-    "alembic/versions"
+    "alembic/versions",
+    "tests",
+    "conftest.py"
   ]
 }

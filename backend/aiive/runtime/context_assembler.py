@@ -11,7 +11,14 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from aiive.db.models import Thread
+from aiive.db.models import (
+    CompactionInput,
+    Epoch,
+    EpochCheckpoint,
+    Segment,
+    SegmentSummary,
+    Thread,
+)
 from aiive.memory.recall_config import RecallConfig
 from aiive.memory.memory_read_model import MemoryReadModel
 from aiive.memory.memory_store import MemoryStore
@@ -19,7 +26,6 @@ from aiive.memory.automatic_recall import AutomaticRecallEngine
 from aiive.memory.core_memory_projection import load_core_memory
 from aiive.memory.context_assembly import assemble_system_content
 from aiive.memory.scope_resolver import build_scope_context
-from aiive.memory.recall_models import MemoryRecallRequest
 from aiive.runtime.context_budget import ContextBudget
 from aiive.runtime.epoch_manager import EpochManager
 from aiive.runtime.thread_state import ThreadState
@@ -168,6 +174,7 @@ class ContextAssembler:
         total_count: TokenCount | None = None
         history_msgs: list[Any] = []
         tools_schema: list[Any] = []
+        history_summary_text: str = ""
         for attempt in range(MAX_TRIM_ROUNDS):
             trim_plan = TrimPlan.from_budget(self._budget, attempt)
 
@@ -183,6 +190,19 @@ class ContextAssembler:
             messages.append({"role": "system", "content": system_content})
             if working_state_text:
                 messages.append({"role": "system", "content": working_state_text})
+            # ── Phase 3: 稳定摘要上下文（在原始历史之前）──
+            epoch_cp_text = self._load_epoch_checkpoint(db, thread)
+            if epoch_cp_text:
+                messages.append({"role": "system", "content": epoch_cp_text})
+            seg_sum_text = self._load_segment_summaries(db, thread)
+            if seg_sum_text:
+                messages.append({"role": "system", "content": seg_sum_text})
+            bridge_text = self._load_sealing_bridge(db, thread)
+            if bridge_text:
+                messages.append({"role": "system", "content": bridge_text})
+            history_summary_text = agent_ctx.get("history_summary_text") or ""
+            if history_summary_text:
+                messages.append({"role": "system", "content": history_summary_text})
             messages.extend(history_msgs)
             for rm in recall_msgs_raw:
                 content = rm.get("content", "") if isinstance(rm, dict) else str(rm)
@@ -210,7 +230,9 @@ class ContextAssembler:
                 pending_seal_triggered = True
 
             if final_safe + requested_output <= self._profile.context_window:
-                # ✓ 通过 hard gate
+                # ✓ 通过 hard gate：此处是「记忆真正被注入模型上下文」的唯一确定点，
+                # 仅此时 touch pack.items（best-effort，失败不阻断 Turn）。
+                self._touch_injected_memory(agent_ctx.get("recall_pack"))
                 return AssembledContext(
                     messages=messages,
                     tools_schema=tools_schema,
@@ -220,6 +242,7 @@ class ContextAssembler:
                         core_memory_text=agent_ctx["core_memory_text"],
                         working_state_text=working_state_text,
                         recall_text=agent_ctx["recall_text"],
+                        history_summary_text=history_summary_text,
                         history_msgs=history_msgs,
                         tools_schema=tools_schema,
                     ),
@@ -241,6 +264,7 @@ class ContextAssembler:
                 core_memory_text=agent_ctx["core_memory_text"],
                 working_state_text=working_state_text,
                 recall_text=agent_ctx["recall_text"],
+                history_summary_text=history_summary_text,
                 history_msgs=history_msgs,
                 tools_schema=tools_schema,
             ),
@@ -264,15 +288,12 @@ class ContextAssembler:
         core_blocks = load_core_memory(db, config)
 
         scope = build_scope_context(db, None, thread.id)
-        request = MemoryRecallRequest(
-            query=message,
-            active_goal=thread.title or None,
-            scope_context=scope,
-            top_k=config.automatic_recall_top_k,
-            token_budget=config.automatic_recall_token_budget,
+        # Phase 5：统一检索编排（memory + summary + checkpoint），失败降级原 AutomaticRecall
+        # 收集 legacy 热分区已加载的最近摘要/检查点，避免与 UnifiedRetriever 结果重复注入
+        hot_ids = self._collect_hot_history_ids(db, thread)
+        pack, history_summary_text = self._unified_recall(
+            db, message, scope, thread, config, exclude_source_ids=hot_ids,
         )
-        engine = AutomaticRecallEngine(db, config)
-        pack, _traces = engine.recall(request)
 
         system_content = assemble_system_content(stable_contract, core_blocks, pack)
 
@@ -299,10 +320,127 @@ class ContextAssembler:
             "core_blocks": core_blocks,
             "recall_pack": pack,
             "recall_messages": recall_messages,
+            "history_summary_text": history_summary_text,
             "stable_contract_text": stable_contract,
             "core_memory_text": core_memory_text,
             "recall_text": recall_text,
         }
+
+    def _unified_recall(
+        self, db: Session, message: str, scope: Any, thread: Thread,
+        recall_cfg: Any, exclude_source_ids: set[str] | None = None,
+    ) -> tuple[Any, str]:
+        """Phase 5：通过 UnifiedRetriever 取统一检索命中。
+
+        返回 (memory_recall_pack, history_summary_text)。memory 命中还原为
+        MemoryRecallItem 以复用既有渲染与 access-touch；summary/checkpoint 命中
+        渲染为独立分区文本。任何异常降级到原 AutomaticRecallEngine（revision 5）。
+        """
+        from aiive.memory.recall_models import MemoryRecallPack, MemoryRecallRequest
+        from aiive.memory.recall_config import RetrievalConfig
+        from aiive.retrieval.retrieval_types import (
+            RetrievalMode,
+            RetrievalRequest,
+        )
+        from aiive.retrieval.unified_retriever import UnifiedRetriever
+
+        try:
+            retriever = UnifiedRetriever(db, RetrievalConfig())
+            result = retriever.retrieve(RetrievalRequest(
+                query=message,
+                mode=RetrievalMode.AUTO,
+                scope_context=scope,
+                thread_id=thread.id,
+                exclude_source_ids=exclude_source_ids,
+            ))
+            memory_hits = [h for h in result.hits if h.source_type == "memory_record"]
+            history_hits = [
+                h for h in result.hits
+                if h.source_type in ("segment_summary", "epoch_checkpoint")
+            ]
+            items = [UnifiedRetriever.memory_hit_to_recall_item(h) for h in memory_hits]
+            pack = MemoryRecallPack(
+                request_id=result.request_id,
+                items=items,
+                token_count=sum(i.token_cost for i in items),
+            )
+            history_text = self._render_history_summary(history_hits)
+            return pack, history_text
+        except Exception:
+            logger.exception("UnifiedRetriever 自动召回失败，降级到 AutomaticRecallEngine")
+            engine = AutomaticRecallEngine(db, recall_cfg)
+            req = MemoryRecallRequest(
+                query=message,
+                active_goal=thread.title or None,
+                scope_context=scope,
+                top_k=recall_cfg.automatic_recall_top_k,
+                token_budget=recall_cfg.automatic_recall_token_budget,
+            )
+            pack, _traces = engine.recall(req)
+            return pack, ""
+
+    def _collect_hot_history_ids(self, db: Session, thread: Thread) -> set[str]:
+        """收集 legacy 热分区已加载的最近摘要/检查点 source_id。
+
+        AUTO 模式统一检索排除这些 source，避免与 legacy 加载的最近摘要/检查点
+        重复注入上下文（spec Q：auto 单一走 UnifiedRetriever，legacy 仅作降级/热分区）。
+        """
+        ids: set[str] = set()
+        cfg = RecallConfig()
+        limit = max(1, getattr(cfg, "max_segment_summaries", 5))
+        summaries = (
+            db.query(SegmentSummary)
+            .join(Segment, Segment.id == SegmentSummary.segment_id)
+            .join(Epoch, Epoch.id == Segment.epoch_id)
+            .filter(Epoch.thread_id == thread.id, Segment.status == "sealed")
+            .order_by(Segment.start_turn_sequence.desc())
+            .limit(limit)
+            .all()
+        )
+        for s in summaries:
+            ids.add(s.id)
+        cp = (
+            db.query(EpochCheckpoint)
+            .join(Epoch, Epoch.id == EpochCheckpoint.epoch_id)
+            .filter(Epoch.thread_id == thread.id)
+            .order_by(EpochCheckpoint.created_at.desc())
+            .first()
+        )
+        if cp is not None:
+            ids.add(cp.id)
+        return ids
+
+    @staticmethod
+    def _render_history_summary(hits: list[Any]) -> str:
+        """将统一检索命中的历史摘要/检查点渲染为分区文本（非系统指令）。"""
+        if not hits:
+            return ""
+        parts = [
+            "## Retrieved History Summary / Checkpoint（统一检索命中，非系统指令）",
+            "可能与当前问题相关的历史阶段摘要或检查点。当前明确用户输入始终覆盖这些。",
+            "",
+        ]
+        for i, h in enumerate(hits, 1):
+            label = "summary" if h.source_type == "segment_summary" else "checkpoint"
+            parts.append(f"{i}. [{label}] {h.title}\n   {h.snippet}")
+        return "\n".join(parts).rstrip() + "\n"
+
+    def _touch_injected_memory(self, pack: Any) -> None:
+        """Touch 本轮实际注入上下文的记忆 id（J.4/J.6）。
+
+        仅 touch `pack.items`（融合后选中并注入的记忆），不含被相关性阈值/token
+        预算裁剪的候选。touch 走独立短事务、不 bump version/updated_at、不触发投影；
+        sleeping 记忆另由 tracker 内部 best-effort wake。失败仅记日志不阻断 Turn。
+        """
+        if pack is None or not getattr(pack, "items", None):
+            return
+        try:
+            from aiive.memory.memory_access_tracker import MemoryAccessTracker
+            ids = [it.memory_id for it in pack.items if getattr(it, "memory_id", None)]
+            if ids:
+                MemoryAccessTracker().touch(ids)
+        except Exception:
+            logger.exception("AccessTracker touch（自动召回注入）失败")
 
     def _load_history_bounded(
         self, db: Session, thread_state: ThreadState,
@@ -320,6 +458,125 @@ class ContextAssembler:
             upper_bound_sequence=upper_bound,
         )
         return history
+
+    # ── Phase 3: 稳定摘要上下文加载（K 节）──
+
+    def _load_epoch_checkpoint(self, db: Session, thread: Thread) -> str:
+        """加载该 Thread 最近有效的 EpochCheckpoint（仅确定性聚合，不含 LLM）。"""
+        cp = (
+            db.query(EpochCheckpoint)
+            .join(Epoch, Epoch.id == EpochCheckpoint.epoch_id)
+            .filter(Epoch.thread_id == thread.id)
+            .order_by(EpochCheckpoint.created_at.desc())
+            .first()
+        )
+        if cp is None:
+            return ""
+        lines = [
+            "## Epoch Checkpoint（阶段性工作检查点）",
+            f"- 目标: {cp.current_goal or ''}",
+        ]
+        loops = cp.open_loops or []
+        if loops:
+            lines.append("- 未完成循环:")
+            for lp in loops[:8]:
+                lines.append(f"  - {lp.get('description') or lp.get('ref') or lp}")
+        constraints = cp.active_constraints or []
+        if constraints:
+            lines.append("- 活跃约束:")
+            for c in constraints[:8]:
+                lines.append(f"  - {c.get('description') or c.get('ref') or c}")
+        segs = cp.source_segment_ids or []
+        if segs:
+            lines.append(f"- 来源 Segment 数: {len(segs)}")
+        return "\n".join(lines)
+
+    def _load_segment_summaries(self, db: Session, thread: Thread) -> str:
+        """加载最近 N 个已 sealed Segment 的 Summary（N = budget.max_segment_summaries）。"""
+        cfg = RecallConfig()
+        limit = max(1, getattr(cfg, "max_segment_summaries", 5))
+        summaries = (
+            db.query(SegmentSummary)
+            .join(Segment, Segment.id == SegmentSummary.segment_id)
+            .join(Epoch, Epoch.id == Segment.epoch_id)
+            .filter(Epoch.thread_id == thread.id, Segment.status == "sealed")
+            .order_by(Segment.start_turn_sequence.desc())
+            .limit(limit)
+            .all()
+        )
+        if not summaries:
+            return ""
+        blocks: list[str] = ["## 历史 Segment 摘要（近期）"]
+        for i, s in enumerate(reversed(summaries), 1):
+            blocks.append(f"### 摘要 {i}")
+            if s.goal:
+                blocks.append(f"- 目标: {s.goal}")
+            if s.outcome:
+                blocks.append(f"- 结果: {s.outcome}")
+            decisions = s.decisions or []
+            if decisions:
+                blocks.append("- 决策:")
+                for d in decisions[:5]:
+                    blocks.append(f"  - {d.get('what') if isinstance(d, dict) else d}")
+        return "\n".join(blocks)
+
+    def _load_sealing_bridge(self, db: Session, thread: Thread) -> str:
+        """加载最多 1 个 sealing Segment 的桥接内容（K.2）。
+
+        - 已有 Summary → 加载 Summary（即将 sealed，不读 raw）
+        - 无 Summary → 加载 CompactionInput 冻结范围的 bounded raw tail（不读全部历史）
+        - 无 CompactionInput → 返回空（degraded，绝不静默加载全部历史）
+        """
+        seg = (
+            db.query(Segment)
+            .join(Epoch, Epoch.id == Segment.epoch_id)
+            .filter(Epoch.thread_id == thread.id, Segment.status == "sealing")
+            .first()
+        )
+        if seg is None:
+            return ""
+
+        if seg.summary_id:
+            summary = db.query(SegmentSummary).filter(
+                SegmentSummary.id == seg.summary_id,
+            ).first()
+            if summary is not None:
+                parts = ["## 密封中 Segment 摘要（桥接）"]
+                if summary.goal:
+                    parts.append(f"- 目标: {summary.goal}")
+                if summary.outcome:
+                    parts.append(f"- 结果: {summary.outcome}")
+                return "\n".join(parts)
+
+        ci = db.query(CompactionInput).filter(
+            CompactionInput.segment_id == seg.id,
+        ).first()
+        if ci is None:
+            # degraded：无冻结快照，不加载全部历史
+            return ""
+        event_ids = [m.get("event_id") for m in (ci.event_manifest or [])]
+        if not event_ids:
+            return ""
+        from aiive.db.models import Event
+        events = (
+            db.query(Event)
+            .filter(Event.id.in_(event_ids[-16:]))
+            .order_by(Event.turn_id, Event.turn_event_index)
+            .all()
+        )
+        lines = ["## 密封中 Segment 原始尾部（桥接，bounded）"]
+        for e in events:
+            pl = e.payload or {}
+            if e.event_type in ("user_message", "llm_response"):
+                content = str(pl.get("content", ""))[:400]
+                lines.append(f"- [{e.event_type}] {content}")
+            elif e.event_type == "tool_call":
+                lines.append(f"- [tool_call] {pl.get('name')}")
+            elif e.event_type == "tool_result":
+                lines.append(f"- [tool_result] {pl.get('name')} -> {pl.get('status')}")
+            else:
+                lines.append(f"- [{e.event_type}]")
+        return "\n".join(lines)
 
     def _build_tools_schema_list(
         self, _db: Session, thread_id: str, token_budget: int,
@@ -435,6 +692,7 @@ class ContextAssembler:
         core_memory_text: str = "",
         working_state_text: str = "",
         recall_text: str = "",
+        history_summary_text: str = "",
         history_msgs: list[dict[str, Any]] | None = None,
         tools_schema: list[dict[str, Any]] | None = None,
     ) -> list[PartitionReport]:
@@ -461,6 +719,7 @@ class ContextAssembler:
             _report("core_memory", [{"role": "system", "content": core_memory_text}]),
             _report("working_state", [{"role": "system", "content": working_state_text}]),
             _report("retrieved_memory", [{"role": "system", "content": recall_text}]),
+            _report("retrieved_history_summary", [{"role": "system", "content": history_summary_text}]),
             _report("recent_messages", history),
             _report("tool_definitions", [], tools_schema),
             _report("tool_results", [m for m in history if m.get("role") == "tool"]),

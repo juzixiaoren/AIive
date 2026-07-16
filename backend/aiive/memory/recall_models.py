@@ -82,6 +82,7 @@ class MemoryRecallItem(BaseModel):
     token_cost: int = 0
     route: str = ""          # which route produced this candidate (exact/fts/episode/vector/graph)
     fused_score: float = 0.0  # final fused score after fusion
+    lifecycle_state: str = ""  # 源记录的 lifecycle（active/sleeping/archived/forgotten 等）
 
 
 class MemoryRecallPack(BaseModel):

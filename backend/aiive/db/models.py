@@ -8,7 +8,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, CheckConstraint, DateTime, ForeignKey, Index, JSON, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, CheckConstraint, DateTime, ForeignKey, Index, JSON, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from typing import Any
 
@@ -39,6 +39,11 @@ class Thread(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+    # 最后活动时间：Idle Scanner（Phase 3）与维护 Idle 触发（Phase 4）据此判定空闲线程。
+    # 缺省为 NULL（即“未观测到活动”），NULL 不参与 `last_activity_at <= cutoff` 过滤。
+    last_activity_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
     events: Mapped[list["Event"]] = relationship(back_populates="thread", cascade="all, delete-orphan")
@@ -222,6 +227,11 @@ class MemoryRecord(Base):
         DateTime(timezone=True), default=_utcnow
     )
     last_reinforced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Phase 4：最近一次被注入上下文的时间。nullable、无默认、不历史回填；
+    # 只有 MemoryAccessTracker 在记忆实际进入上下文时写入，且不会更新 updated_at。
+    last_accessed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
@@ -703,6 +713,11 @@ class Segment(Base):
             "end_turn_sequence IS NULL OR end_turn_sequence >= start_turn_sequence",
             name="ck_segment_turn_range",
         ),
+        # 合法 sealed 必须已生成 Summary（L.4 不变量）
+        CheckConstraint(
+            "status <> 'sealed' OR summary_id IS NOT NULL",
+            name="ck_segment_sealed_requires_summary",
+        ),
     )
 
 
@@ -719,12 +734,21 @@ class SegmentSummary(Base):
     entities: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
     artifacts: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
     important_tool_results: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    source_turn_ids: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    source_event_ids: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    active_constraints: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    unresolved_failures: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    omitted_artifact_refs: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
     source_turn_range: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
     source_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     summary_version: Mapped[int] = mapped_column(default=1)
     model_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     token_count: Mapped[int] = mapped_column(default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    __table_args__: tuple[UniqueConstraint, ...] = (
+        UniqueConstraint("segment_id", "summary_version", name="uq_segment_summary_segment_version"),
+    )
 
 
 class EpochCheckpoint(Base):
@@ -742,9 +766,14 @@ class EpochCheckpoint(Base):
     relevant_entities: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
     latest_verified_tool_states: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
     source_segment_ids: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    source_hashes: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
     version: Mapped[int] = mapped_column(default=1)
     token_count: Mapped[int] = mapped_column(default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    __table_args__: tuple[UniqueConstraint, ...] = (
+        UniqueConstraint("epoch_id", "version", name="uq_epoch_checkpoint_epoch_version"),
+    )
 
 
 class WorkingState(Base):
@@ -795,4 +824,504 @@ class Artifact(Base):
     __table_args__: tuple[UniqueConstraint, ...] = (
         # 同一 Turn 内同一工具调用只允许一个 Artifact，防止重试重复创建
         UniqueConstraint("turn_record_id", "tool_call_id", name="uq_artifact_turn_tool"),
+    )
+
+
+# ============================================================================
+# Phase 3: SegmentSummary / EpochCheckpoint 运行记录与不可变输入快照
+# ============================================================================
+
+
+class CompactionInput(Base):
+    """Segment 压缩的不可变输入快照。
+
+    在 begin_segment_sealing 同一事务中持久化，是 Phase B 内容校验与覆盖校验的
+    唯一权威来源。turn_manifest / event_manifest 为完整清单，不再单独存储
+    散列的 source_turn_ids / source_event_ids（由之派生）。
+    """
+
+    __tablename__: str = "compaction_inputs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    segment_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("segments.id"), nullable=False, index=True
+    )
+    start_turn_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    end_turn_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    turn_manifest: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    event_manifest: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    working_state_version: Mapped[int] = mapped_column(nullable=False)
+    working_state_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    source_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    summary_version: Mapped[int] = mapped_column(default=1)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+    __table_args__: tuple[UniqueConstraint, ...] = (
+        UniqueConstraint(
+            "segment_id", "source_hash", "summary_version",
+            name="uq_compaction_input_segment_hash_version",
+        ),
+    )
+
+
+class CompactionRun(Base):
+    """Segment 压缩运行记录：一个 OutboxJob 固定对应一个 CompactionRun。"""
+
+    __tablename__: str = "compaction_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    segment_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("segments.id"), nullable=False, index=True
+    )
+    compaction_input_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("compaction_inputs.id"), nullable=False
+    )
+    outbox_job_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("outbox_jobs.id"), nullable=False
+    )
+    source_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    summary_version: Mapped[int] = mapped_column(default=1)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
+    execution_token: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(default=0)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__: tuple[UniqueConstraint | Index, ...] = (
+        UniqueConstraint(
+            "segment_id", "source_hash", "summary_version",
+            name="uq_compaction_segment_hash_version",
+        ),
+        UniqueConstraint("outbox_job_id", name="uq_compaction_run_outbox_job"),
+        Index("ix_compaction_segment_status", "segment_id", "status"),
+    )
+
+
+class EpochCompactionInput(Base):
+    """Epoch rollover 边界的不可变 WorkingState 快照。"""
+
+    __tablename__: str = "epoch_compaction_inputs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    epoch_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("epochs.id"), nullable=False, index=True
+    )
+    boundary_turn_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    working_state_version: Mapped[int] = mapped_column(nullable=False)
+    current_objective: Mapped[str | None] = mapped_column(Text, nullable=True)
+    open_loops: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    active_constraints: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    artifact_refs: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    verified_tool_states: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    source_segment_ids: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    source_hashes: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    snapshot_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    checkpoint_version: Mapped[int] = mapped_column(default=1)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+    __table_args__: tuple[UniqueConstraint, ...] = (
+        UniqueConstraint(
+            "epoch_id", "snapshot_hash", "checkpoint_version",
+            name="uq_epoch_input_epoch_hash_version",
+        ),
+    )
+
+
+class CheckpointRun(Base):
+    """EpochCheckpoint 运行记录：一个 OutboxJob 固定对应一个 CheckpointRun。"""
+
+    __tablename__: str = "checkpoint_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    epoch_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("epochs.id"), nullable=False, index=True
+    )
+    epoch_compaction_input_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("epoch_compaction_inputs.id"), nullable=False
+    )
+    outbox_job_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("outbox_jobs.id"), nullable=False
+    )
+    boundary_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    checkpoint_version: Mapped[int] = mapped_column(default=1)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
+    execution_token: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(default=0)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__: tuple[UniqueConstraint | Index, ...] = (
+        UniqueConstraint(
+            "epoch_id", "boundary_hash", "checkpoint_version",
+            name="uq_checkpoint_epoch_hash_version",
+        ),
+        UniqueConstraint("outbox_job_id", name="uq_checkpoint_run_outbox_job"),
+        Index("ix_checkpoint_epoch_status", "epoch_id", "status"),
+    )
+
+
+# ============================================================================
+# Phase 4: 长期记忆生命周期维护（Daily Dream）
+# ============================================================================
+
+
+class MemoryMaintenanceRun(Base):
+    """记忆维护运行记录：一个 `memory_maintenance` OutboxJob 固定对应一个 Run。
+
+    - 单一全量 Run 覆盖所有 MemoryRecord（`scope_type=all_user_memories`）。
+    - 与 `MemoryRecord.scope_type=global` 无关。
+    - `claim_count` 仅计接管次数；`failure_attempt_count` 仅真正失败重试时累计，
+      CONTINUE 分页不计入失败。
+    - `cutoff_updated_at` 为固定快照上界（提交后不可变）；
+      `cursor_updated_at`/`cursor_id` 为 changed lane 的续跑游标（仅 seed 推进）。
+    """
+
+    __tablename__: str = "memory_maintenance_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    scope_type: Mapped[str] = mapped_column(String(32), default="all_user_memories")
+    scope_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    outbox_job_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("outbox_jobs.id"), nullable=False
+    )
+    operation_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="running", index=True)
+    execution_token: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    claim_count: Mapped[int] = mapped_column(default=0)
+    failure_attempt_count: Mapped[int] = mapped_column(default=0)
+    policy_version: Mapped[str] = mapped_column(String(32), default="phase4.v1")
+    window_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    window_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cutoff_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    cursor_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cursor_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    plan_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    candidate_count: Mapped[int] = mapped_column(default=0)
+    applied_count: Mapped[int] = mapped_column(default=0)
+    skipped_stale_count: Mapped[int] = mapped_column(default=0)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__: tuple[UniqueConstraint | Index, ...] = (
+        UniqueConstraint("outbox_job_id", name="uq_maintenance_run_outbox_job"),
+        UniqueConstraint("operation_id", name="uq_maintenance_run_operation"),
+        Index("ix_maintenance_run_scope_status", "scope_type", "status"),
+    )
+
+
+class MemoryMaintenanceBatch(Base):
+    """维护有界批次：一个 Run 内的有界处理单元，只属于一条 lane。
+
+    - `candidate_lane` ∈ {changed, expired_ephemeral, candidate_due, sleep_due}。
+    - `lane_cursor_time`/`lane_cursor_id` 为该 lane 的复合续跑游标。
+    - 崩溃恢复优先接管 `frozen/planned/applying` 状态的 Batch。
+    - 终态统一为 `done` 或 `deadletter`（禁止混用 aborted+abort_reason）。
+    """
+
+    __tablename__: str = "memory_maintenance_batches"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("memory_maintenance_runs.id"), nullable=False
+    )
+    batch_no: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    candidate_lane: Mapped[str] = mapped_column(String(32), default="changed")
+    status: Mapped[str] = mapped_column(String(32), default="frozen", index=True)
+    lane_cursor_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lane_cursor_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    cursor_start_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cursor_start_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    cursor_end_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cursor_end_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    input_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    plan_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    candidate_count: Mapped[int] = mapped_column(default=0)
+    action_count: Mapped[int] = mapped_column(default=0)
+    applied_count: Mapped[int] = mapped_column(default=0)
+    skipped_stale_count: Mapped[int] = mapped_column(default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    planned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__: tuple[UniqueConstraint | Index, ...] = (
+        UniqueConstraint("run_id", "batch_no", name="uq_maintenance_batch_run_no"),
+        Index("ix_maintenance_batch_run_status", "run_id", "status"),
+    )
+
+
+class MemoryMaintenanceInput(Base):
+    """维护不可变输入快照：Phase A 冻结的候选记忆，崩溃后可复现相同 plan。
+
+    - `input_sequence` 为本 Batch 内稳定序号（确定性重算复现）。
+    - `record_state_hash` 含记录态（不含访问时间）；`decision_hash` 额外纳入访问时间维度。
+    - `user_required_protected`/`user_required_source_ids` 为冻结时计算的沿 lineage 保护标记。
+    - 写入后不可变；续跑复用既有 Batch 的 Input，不重建。
+    """
+
+    __tablename__: str = "memory_maintenance_inputs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("memory_maintenance_runs.id"), nullable=False
+    )
+    batch_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("memory_maintenance_batches.id"), nullable=False
+    )
+    input_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    memory_record_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("memory_records.id"), nullable=False
+    )
+    input_role: Mapped[str] = mapped_column(String(16), default="seed")
+    record_version: Mapped[int] = mapped_column(default=1)
+    record_state_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    decision_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    user_required_protected: Mapped[bool] = mapped_column(default=False)
+    user_required_source_ids: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    canonical_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    scope_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    scope_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    snapshot_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
+    __table_args__: tuple[UniqueConstraint | Index, ...] = (
+        UniqueConstraint(
+            "batch_id", "memory_record_id", name="uq_maintenance_input_batch_record"
+        ),
+        UniqueConstraint(
+            "batch_id", "input_sequence", name="uq_maintenance_input_batch_seq"
+        ),
+        Index("ix_maintenance_input_batch", "batch_id"),
+    )
+
+
+class MemoryMaintenanceAction(Base):
+    """维护动作审计表：Phase B2 持久化的确定性动作，Phase C 消费执行。
+
+    - `action_sequence` 为本 Batch plan 内稳定序号，不依赖数据库返回顺序。
+    - `source_input_ids` 记录来源 Input（一个 Input 可产生多个 Action）。
+    - `operation_group_id` 由确定性公式生成，保证复合动作整组原子 skip_stale。
+    - `preconditions` 区分 `record_state_hash` 与 `decision_hash`。
+    """
+
+    __tablename__: str = "memory_maintenance_actions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("memory_maintenance_runs.id"), nullable=False
+    )
+    batch_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("memory_maintenance_batches.id"), nullable=False
+    )
+    action_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    source_input_ids: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    operation_group_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    subject_memory_record_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("memory_records.id"), nullable=True
+    )
+    related_record_ids: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    canonical_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    scope_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    scope_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    action_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    expected_record_version: Mapped[int | None] = mapped_column(nullable=True)
+    preconditions: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    after_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    details: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__: tuple[UniqueConstraint | Index, ...] = (
+        UniqueConstraint("idempotency_key", name="uq_maintenance_action_idem"),
+        UniqueConstraint(
+            "batch_id", "action_sequence", name="uq_maintenance_action_batch_seq"
+        ),
+        Index("ix_maintenance_action_batch", "batch_id"),
+        Index("ix_maintenance_action_run", "run_id"),
+    )
+
+
+# ============================================================================
+# Phase 5: 冷热历史分层与统一检索（RetrievalIndex）
+# ============================================================================
+
+
+class RetrievalIndexGeneration(Base):
+    """检索索引全局 generation（Phase 5）。
+
+    查询真相源是唯一 `status='active'` 的 generation 的 `index_version`；
+    每条 Entry 的 `is_current` 仅表示「同 source 仅一个当前版本」，不充当全局真相。
+    """
+
+    __tablename__: str = "retrieval_index_generations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    index_version: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="building")
+    build_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    build_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    source_cutoff: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    policy_version: Mapped[str] = mapped_column(String(32), default="phase5.v1")
+    # 该 generation 是否已完成初始全量 backfill（bootstrap 流程判定）
+    backfill_done: Mapped[bool] = mapped_column(default=False)
+
+    __table_args__: tuple[CheckConstraint, ...] = (
+        CheckConstraint(
+            "status IN ('building','active','retired','failed')",
+            name="ck_retrieval_gen_status",
+        ),
+    )
+
+
+class RetrievalIndexEntry(Base):
+    """统一检索投影 Entry（Phase 5）。
+
+    v1 不定义 embedding 列；语义检索接口仅代码层占位。
+    """
+
+    __tablename__: str = "retrieval_index_entries"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    source_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    index_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    thread_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    epoch_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    segment_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    memory_record_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    scope_type: Mapped[str] = mapped_column(String(32), default="global")
+    scope_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    canonical_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    lifecycle_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    validity_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    retrieval_tier: Mapped[str] = mapped_column(String(16), default="warm")
+    title: Mapped[str] = mapped_column(Text, default="")
+    search_text: Mapped[str] = mapped_column(Text, default="")
+    snippet: Mapped[str] = mapped_column(Text, default="")
+    extra_metadata: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
+    created_source_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_source_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    indexed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    is_current: Mapped[bool] = mapped_column(default=True)
+    is_searchable: Mapped[bool] = mapped_column(default=True)
+
+    __table_args__: tuple[UniqueConstraint | Index | CheckConstraint, ...] = (
+        UniqueConstraint(
+            "source_type", "source_id", "source_version", "index_version",
+            name="uq_retrieval_entry_src_ver_gen",
+        ),
+        # 部分唯一索引：同 (index_version, source_type, source_id) 最多一个 is_current=True
+        Index(
+            "uq_retrieval_entry_current",
+            "index_version", "source_type", "source_id",
+            unique=True,
+            postgresql_where=text("is_current IS TRUE"),
+            sqlite_where=text("is_current = 1"),
+        ),
+        Index("ix_retrieval_entry_active", "index_version", "is_current", "source_type"),
+        Index("ix_retrieval_entry_thread", "thread_id"),
+        Index("ix_retrieval_entry_scope", "scope_type", "scope_id"),
+        Index("ix_retrieval_entry_tier", "retrieval_tier"),
+        CheckConstraint(
+            "source_type IN ('memory_record','segment_summary','epoch_checkpoint')",
+            name="ck_retrieval_entry_src",
+        ),
+        CheckConstraint(
+            "retrieval_tier IN ('hot','warm','cold')",
+            name="ck_retrieval_entry_tier",
+        ),
+    )
+
+
+class RetrievalIndexToken(Base):
+    """可移植倒排 posting（Phase 5）。
+
+    按 token 精确查 posting 并聚合命中数；`search_text` 不在此路径。
+    """
+
+    __tablename__: str = "retrieval_index_tokens"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    entry_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("retrieval_index_entries.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    index_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    token: Mapped[str] = mapped_column(String(64), nullable=False)
+    token_kind: Mapped[str] = mapped_column(String(16), default="word")
+    term_frequency: Mapped[int] = mapped_column(default=1)
+
+    __table_args__: tuple[UniqueConstraint | Index, ...] = (
+        UniqueConstraint("entry_id", "token", name="uq_retrieval_token_entry"),
+        Index("ix_retrieval_token_lookup", "index_version", "token", "entry_id"),
+        Index("ix_retrieval_token_entry", "entry_id"),
+    )
+
+
+class RetrievalIndexRun(Base):
+    """全量 rebuild Run（Phase 5）。一 `retrieval_index_rebuild` OutboxJob 一 Run。"""
+
+    __tablename__: str = "retrieval_index_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    outbox_job_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("outbox_jobs.id"), nullable=False
+    )
+    operation_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="running", index=True)
+    execution_token: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(default=0)
+    failure_attempt_count: Mapped[int] = mapped_column(default=0)
+    index_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    batch_cursor: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    indexed_count: Mapped[int] = mapped_column(default=0)
+    skipped_stale_count: Mapped[int] = mapped_column(default=0)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__: tuple[UniqueConstraint | Index, ...] = (
+        UniqueConstraint("outbox_job_id", name="uq_retrieval_run_outbox_job"),
+        UniqueConstraint("operation_id", name="uq_retrieval_run_operation"),
+        Index("ix_retrieval_run_status", "status"),
     )

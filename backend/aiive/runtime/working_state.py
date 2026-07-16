@@ -82,12 +82,17 @@ class WorkingStateService:
     def update_verified_tool_state(
         self, db: Session, thread_id: str, tool_name: str, state: dict[str, Any],
     ) -> None:
-        """工具验证成功后：更新已验证工具状态。"""
+        """工具验证成功后：更新已验证工具状态。
+
+        verified_tool_states 每条目保持 tool_name 去重语义，并将 tool_call_id
+        提升为顶层字段（Phase 3 以 tool_call_id 作为稳定键），同时保留完整 state。
+        """
         ws = self.get_or_create(db, thread_id)
         states = list(ws.verified_tool_states or [])
         states = [s for s in states if s.get("tool_name") != tool_name]
         states.append({
             "tool_name": tool_name,
+            "tool_call_id": state.get("tool_call_id"),
             "state": state,
             "verified_at": datetime.now(timezone.utc).isoformat(),
         })

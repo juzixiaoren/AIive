@@ -14,7 +14,7 @@ from aiive.context.run_context import RunContext
 from aiive.db.base import get_db
 from aiive.memory.memory_maintenance import MemoryMaintenance
 from aiive.memory.memory_store import MemoryStore
-from aiive.memory.memory_types import MemoryProposal, ScopeType, TrustLevel
+from aiive.memory.memory_types import MemoryProposal, TrustLevel
 from aiive.memory.memory_write_service import MemoryWriteService
 from aiive.memory.projection import MemoryProjection
 from aiive.memory.proposal_normalizer import ProposalNormalizer

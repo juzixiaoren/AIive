@@ -19,23 +19,14 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from aiive.db.models import MemoryRecord
+from aiive.memory.memory_store import MemoryStore
+from aiive.memory.maintenance_hashes import effective_last_accessed_at
+from aiive.memory.recall_config import MaintenanceConfig
 from aiive.memory.memory_types import (
-    EvidenceItem,
     LifecycleState,
-    MemoryProposal,
-    MemoryType,
-    TrustLevel,
 )
 
 logger = logging.getLogger(__name__)
-
-
-# Types that maintenance MUST NOT create/revise/supersede
-_PROTECTED_TYPES: frozenset[str] = frozenset({
-    MemoryType.USER_PROFILE.value,
-    MemoryType.POLICY.value,
-    MemoryType.AGENT_SELF.value,
-})
 
 
 class MemoryMaintenance:
@@ -53,10 +44,13 @@ class MemoryMaintenance:
     # ------------------------------------------------------------------
 
     def scan(self) -> dict[str, Any]:
-        """Scan for memory records needing maintenance.
+        """扫描需要维护的记忆记录，返回各类候选计数（只读诊断）。
 
-        Returns candidates for sleep, archive, consolidate, and stale detection.
+        阈值与 planner（memory_maintenance_planner.plan_batch）保持一致，均取自
+        MaintenanceConfig，避免诊断数字与真实决策口径不一致。
         """
+        cfg = MaintenanceConfig()
+        store = MemoryStore(self._db)
         records = (
             self._db.query(MemoryRecord)
             .filter(MemoryRecord.lifecycle_state.in_([
@@ -75,29 +69,45 @@ class MemoryMaintenance:
         now = datetime.now(timezone.utc)
 
         for r in records:
-            if r.pinned:
+            # effective_pinned：pinned 或 retention_policy=='pinned' 禁止任何自动降级
+            if r.pinned or r.retention_policy == "pinned":
                 continue
 
-            age_days = (now - (r.observed_at or r.created_at).replace(
-                tzinfo=timezone.utc
-            )).days if (r.observed_at or r.created_at) else 0
+            # expired ephemeral（与 planner 一致）
+            if (
+                r.retention_policy == "ephemeral"
+                and r.valid_to is not None
+                and r.valid_to <= now
+                and r.lifecycle_state in (
+                    LifecycleState.ACTIVE.value, LifecycleState.CANDIDATE.value,
+                )
+            ):
+                archive_candidates.append(r.id)
+                continue
 
-            # Stale candidate: not observed for 7+ days (but was active)
-            if r.lifecycle_state == LifecycleState.ACTIVE.value and age_days > 7:
-                if r.memory_type in _PROTECTED_TYPES:
-                    # Protected types: sleep instead of archive
+            # candidate：超过 candidate_ttl_days 无新证据则过期归档（与 planner 一致）
+            if r.lifecycle_state == LifecycleState.CANDIDATE.value:
+                if r.created_at and (now - r.created_at).days >= cfg.candidate_ttl_days:
+                    archive_candidates.append(r.id)
+                continue
+
+            # active：importance 低于阈值且达到冷却期 → 冷却到 sleeping（与 planner 一致）
+            if r.lifecycle_state == LifecycleState.ACTIVE.value:
+                # user-required 受保护记录使用更长的冷却期（与 planner 一致）
+                cooling_days = (
+                    cfg.user_required_sleep_cooling_days
+                    if store.is_user_required_protected(r.id)[0]
+                    else cfg.sleep_cooling_days
+                )
+                eff = effective_last_accessed_at(
+                    r.last_accessed_at, r.observed_at, r.created_at,
+                )
+                if (r.importance < cfg.importance_sleep_threshold
+                        and (now - eff).days >= cooling_days):
                     sleep_candidates.append(r.id)
-                else:
-                    stale_candidates.append(r.id)
+                continue
 
-            # Expired candidate: candidate for 7+ days → archive
-            if r.lifecycle_state == LifecycleState.CANDIDATE.value and age_days > 7:
-                archive_candidates.append(r.id)
-
-            # Archived candidate: sleeping for 30+ days → archive
-            if r.lifecycle_state == LifecycleState.SLEEPING.value and age_days > 30:
-                archive_candidates.append(r.id)
-
+            # sleeping：planner 当前不自动归档 sleeping，故诊断中不计入 archive。
         return {
             "total_scanned": len(records),
             "sleep_candidates": len(sleep_candidates),
@@ -109,130 +119,3 @@ class MemoryMaintenance:
             "stale_ids": stale_candidates,
             "consolidate_ids": consolidate_candidates,
         }
-
-    # ------------------------------------------------------------------
-    # Generate maintenance proposals
-    # ------------------------------------------------------------------
-
-    def generate_sleep_proposals(self, memory_ids: list[str]) -> list[MemoryProposal]:
-        """Generate sleep proposals for specified records.
-
-        Protected types (user_profile, policy, agent_self) are filtered out.
-        """
-        proposals: list[MemoryProposal] = []
-        for mid in memory_ids:
-            record = self._db.get(MemoryRecord, mid)
-            if record is None:
-                continue
-            if record.memory_type in _PROTECTED_TYPES:
-                logger.info("Skipping sleep for protected type: %s (%s)", mid, record.memory_type)
-                continue
-
-            proposal = MemoryProposal(
-                source_event_ids=[mid],
-                memory_type=record.memory_type,
-                canonical_key=record.canonical_key or "",
-                scope_type=record.scope_type or "global",
-                scope_id=record.scope_id,
-                content=record.content or "",
-                proposed_operation="sleep",
-                extractor_name="MemoryMaintenance",
-                extractor_version="1.0",
-                evidence=[EvidenceItem(
-                    source_type="maintenance",
-                    trust_level=TrustLevel.SEMI_TRUSTED.value,
-                    relation="supports",
-                )],
-            )
-            proposal.compute_request_idempotency()
-            proposals.append(proposal)
-        return proposals
-
-    def generate_archive_proposals(self, memory_ids: list[str]) -> list[MemoryProposal]:
-        """Generate archive proposals for specified records."""
-        proposals: list[MemoryProposal] = []
-        for mid in memory_ids:
-            record = self._db.get(MemoryRecord, mid)
-            if record is None:
-                continue
-
-            proposal = MemoryProposal(
-                source_event_ids=[mid],
-                memory_type=record.memory_type,
-                canonical_key=record.canonical_key or "",
-                scope_type=record.scope_type or "global",
-                scope_id=record.scope_id,
-                content=record.content or "",
-                proposed_operation="archive",
-                extractor_name="MemoryMaintenance",
-                extractor_version="1.0",
-                evidence=[EvidenceItem(
-                    source_type="maintenance",
-                    trust_level=TrustLevel.SEMI_TRUSTED.value,
-                    relation="supports",
-                )],
-            )
-            proposal.compute_request_idempotency()
-            proposals.append(proposal)
-        return proposals
-
-    def generate_wake_proposals(self, memory_ids: list[str]) -> list[MemoryProposal]:
-        """Generate wake proposals for sleeping records."""
-        proposals: list[MemoryProposal] = []
-        for mid in memory_ids:
-            record = self._db.get(MemoryRecord, mid)
-            if record is None:
-                continue
-            if record.lifecycle_state != LifecycleState.SLEEPING.value:
-                continue
-
-            proposal = MemoryProposal(
-                source_event_ids=[mid],
-                memory_type=record.memory_type,
-                canonical_key=record.canonical_key or "",
-                scope_type=record.scope_type or "global",
-                scope_id=record.scope_id,
-                content=record.content or "",
-                proposed_operation="wake",
-                extractor_name="MemoryMaintenance",
-                extractor_version="1.0",
-                evidence=[EvidenceItem(
-                    source_type="maintenance",
-                    trust_level=TrustLevel.SEMI_TRUSTED.value,
-                    relation="supports",
-                )],
-            )
-            proposal.compute_request_idempotency()
-            proposals.append(proposal)
-        return proposals
-
-    # ------------------------------------------------------------------
-    # Backward-compatible direct operations (deprecated)
-    # These now generate proposals and should run through MemoryWriteService.
-    # ------------------------------------------------------------------
-
-    def forget(self, _memory_id: str = "", _reason: str = "") -> dict[str, Any]:
-        """DEPRECATED: Use MemoryWriteService.forget() instead.
-
-        Kept for backward compatibility in builtin_tools.
-        The builtin handler should migrate to MemoryWriteService.forget().
-        """
-        logger.warning(
-            "MemoryMaintenance.forget() is deprecated. Use MemoryWriteService.forget()."
-        )
-        # Return structure that callers expect; actual forget must go through WriteService
-        return {"ok": False, "error": "Deprecated: use MemoryWriteService.forget()"}
-
-    def sleep(self, _memory_id: str = "") -> dict[str, Any]:
-        """DEPRECATED: Use MemoryWriteService.execute_maintenance() instead."""
-        logger.warning(
-            "MemoryMaintenance.sleep() is deprecated. Use MemoryWriteService.execute_maintenance()."
-        )
-        return {"ok": False, "error": "Deprecated: use MemoryWriteService.execute_maintenance()"}
-
-    def archive(self, _memory_id: str = "") -> dict[str, Any]:
-        """DEPRECATED: Use MemoryWriteService.execute_maintenance() instead."""
-        logger.warning(
-            "MemoryMaintenance.archive() is deprecated. Use MemoryWriteService.execute_maintenance()."
-        )
-        return {"ok": False, "error": "Deprecated: use MemoryWriteService.execute_maintenance()"}
