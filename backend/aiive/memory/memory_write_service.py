@@ -30,11 +30,12 @@ from aiive.db.models import (
     MemoryLineage,
     MemoryProposal as MemoryProposalModel,
     MemoryRecord,
-    OutboxJob,
 )
 from aiive.memory.conflict_resolver import ConflictResolver, ResolutionResult
 from aiive.memory.memory_gate import GateDecision, MemoryGate
 from aiive.memory.memory_key_registry import MemoryKeyRegistry, get_memory_key_registry
+from aiive.memory.memory_lifecycle_service import MemoryLifecycleService
+from aiive.memory.memory_mutation import MemoryMutationExecutor
 from aiive.memory.memory_store import MemoryStore
 from aiive.memory.memory_types import (
     EvidenceItem,
@@ -125,6 +126,15 @@ class MemoryWriteService:
         self._resolver: ConflictResolver = ConflictResolver(registry)
         self._logger: EventLogger = EventLogger(db)
         self._registry: MemoryKeyRegistry = registry or get_memory_key_registry()
+        # 共享底层 mutation executor + lifecycle service（单向依赖，见 L 节）：
+        # promote/execute_maintenance 委托 lifecycle，_enqueue_projection 委托 executor，
+        # 全链路复用同一套「锁 + 版本 bump + lineage + 投影」语义。
+        self._executor: MemoryMutationExecutor = MemoryMutationExecutor(
+            db, registry=self._registry, logger=self._logger
+        )
+        self._lifecycle: MemoryLifecycleService = MemoryLifecycleService(
+            db, executor=self._executor, registry=self._registry
+        )
 
     # ------------------------------------------------------------------
     # write_batch: atomic batch write
@@ -183,6 +193,35 @@ class MemoryWriteService:
         self._db.flush()
         return results
 
+    def _load_existing_or_wake_sleeping(
+        self, proposal: MemoryProposal, run_context: RunContext,
+    ) -> Sequence[MemoryRecord]:
+        """resolve 前置：加载 active 同键记录；若为空则唤醒 sleeping 同键记录。
+
+        J.4/J.5「wake 闭合」：用户再次确认或显式更新 sleeping 记忆时，write 路径
+        必须先唤醒原记录再 resolve，否则 resolver 找不到 active 记录会新建一条，
+        造成与旧 sleeping 记忆重复/分叉。唤醒走共享 executor，同事务内改动可见。
+        """
+        existing = self._store.get_active_by_key_scope_locked(
+            proposal.canonical_key, proposal.scope_type, proposal.scope_id,
+        )
+        if existing:
+            return existing
+        sleeping = self._store.get_sleeping_by_key_scope_locked(
+            proposal.canonical_key, proposal.scope_type, proposal.scope_id,
+        )
+        if sleeping:
+            # 唤醒最近更新的一条 sleeping 记录，再重新加载 active 视野
+            self._lifecycle.wake(
+                sleeping[0].id,
+                trace_id=run_context.trace_id or "",
+                thread_id=run_context.thread_id,
+            )
+            existing = self._store.get_active_by_key_scope_locked(
+                proposal.canonical_key, proposal.scope_type, proposal.scope_id,
+            )
+        return existing
+
     def _write_single_in_transaction(
         self, proposal: MemoryProposal, run_context: RunContext,
     ) -> WriteResult:
@@ -195,9 +234,7 @@ class MemoryWriteService:
             self._persist_proposal(proposal, gate_decision, final_op="reject")
             return WriteResult(outcome=WriteOutcome.GATE_REJECTED, reason=gate_decision.reason)
 
-        existing_active = self._store.get_active_by_key_scope_locked(
-            proposal.canonical_key, proposal.scope_type, proposal.scope_id,
-        )
+        existing_active = self._load_existing_or_wake_sleeping(proposal, run_context)
         resolution = self._resolver.resolve(proposal, existing_active)
         tid = run_context.thread_id
 
@@ -311,13 +348,9 @@ class MemoryWriteService:
         self._acquire_lock(lock_id)
 
         try:
-            # 3. SELECT FOR UPDATE existing active records
-            existing_active: Sequence[MemoryRecord] = (
-                self._store.get_active_by_key_scope_locked(
-                    proposal.canonical_key,
-                    proposal.scope_type,
-                    proposal.scope_id,
-                )
+            # 3. SELECT FOR UPDATE existing active records（无 active 则先唤醒 sleeping 同键记录）
+            existing_active: Sequence[MemoryRecord] = self._load_existing_or_wake_sleeping(
+                proposal, run_context
             )
 
             # 4. Conflict resolution
@@ -389,8 +422,13 @@ class MemoryWriteService:
         proposal: MemoryProposal,
         run_context: RunContext,
     ) -> WriteResult:
-        """Execute a maintenance proposal (sleep/archive/wake) on an existing record."""
+        """Execute a maintenance proposal (sleep/archive/wake) on an existing record.
+
+        委托到 `MemoryLifecycleService`：走共享 executor（版本 bump + lineage +
+        投影），消除此前 `self._store.update_lifecycle` 的无版本校验旁路（L 节）。
+        """
         tid: str = run_context.thread_id
+        trace: str = run_context.trace_id
         target_memory_id: str = proposal.source_event_ids[0] if proposal.source_event_ids else ""
 
         if not target_memory_id:
@@ -403,23 +441,19 @@ class MemoryWriteService:
         op: str = proposal.proposed_operation
 
         if op == "sleep":
-            self._store.update_lifecycle(record.id, LifecycleState.SLEEPING.value)
-            self._log_event(tid, proposal, "memory.sleep", record.id)
-            self._enqueue_projection(record, "memory.sleep", invalidate_cache=True)
-            return WriteResult(written=True, operation="sleep", memory_id=record.id)
+            ok, reason = self._lifecycle.sleep(record.id, trace_id=trace, thread_id=tid)
+            return WriteResult(written=ok, operation="sleep", memory_id=record.id,
+                               reason="" if ok else reason)
 
         if op == "archive":
-            self._store.update_lifecycle(record.id, LifecycleState.ARCHIVED.value)
-            self._store.update_validity(record.id, ValidityState.EXPIRED.value)
-            self._log_event(tid, proposal, "memory.archived", record.id)
-            self._enqueue_projection(record, "memory.archived", invalidate_cache=True)
-            return WriteResult(written=True, operation="archive", memory_id=record.id)
+            ok, reason = self._lifecycle.archive(record.id, trace_id=trace, thread_id=tid)
+            return WriteResult(written=ok, operation="archive", memory_id=record.id,
+                               reason="" if ok else reason)
 
         if op == "wake":
-            self._store.update_lifecycle(record.id, LifecycleState.ACTIVE.value)
-            self._log_event(tid, proposal, "memory.wake", record.id)
-            self._enqueue_projection(record, "memory.wake")
-            return WriteResult(written=True, operation="wake", memory_id=record.id)
+            ok = self._lifecycle.wake(record.id, trace_id=trace, thread_id=tid)
+            return WriteResult(written=ok, operation="wake", memory_id=record.id,
+                               reason="" if ok else "Cannot wake: record is not sleeping")
 
         return WriteResult(written=False, reason=f"Unknown maintenance operation: {op}")
 
@@ -455,17 +489,18 @@ class MemoryWriteService:
             MemoryEvidence.memory_id == memory_id
         ).delete()
 
-        # 3. Record tombstone event
+        # 3. Record tombstone event（隔离写入，失败不影响遗忘主流程）
         if run_context and run_context.thread_id:
-            self._logger.log_event(
+            self._executor.log_event(
                 trace_id=run_context.trace_id,
-                thread_id=run_context.thread_id,
                 event_type="memory.forgotten",
+                memory_id=memory_id,
                 payload={
                     "memory_id": memory_id,
                     "reason": reason,
                     "tombstone": tombstone,
                 },
+                thread_id=run_context.thread_id,
             )
 
         # 4. Enqueue projection cleanup
@@ -488,37 +523,20 @@ class MemoryWriteService:
     # ------------------------------------------------------------------
 
     def promote(self, memory_id: str, run_context: RunContext) -> WriteResult:
-        """Promote a candidate record to active (with lineage)."""
-        record: MemoryRecord | None = self._store.get_by_id(memory_id)
-        if record is None:
-            return WriteResult(written=False, reason="Memory not found")
-        if record.lifecycle_state != LifecycleState.CANDIDATE.value:
-            return WriteResult(
-                written=False,
-                reason=f"Cannot promote: current state is {record.lifecycle_state}",
-            )
+        """Promote a candidate record to active (with lineage).
 
-        # Write lineage for promote
-        self._db.add(MemoryLineage(
-            predecessor_id=record.id,
-            successor_id=record.id,
-            operation=LineageOperation.PROMOTE.value,
+        委托到 `MemoryLifecycleService.promote`：走共享 executor（版本 bump +
+        lineage + 投影），不再直接改写 lifecycle（L 节）。
+        """
+        ok, reason = self._lifecycle.promote(
+            memory_id,
+            trace_id=run_context.trace_id,
+            thread_id=run_context.thread_id,
             reason="Candidate promoted to active",
-        ))
-
-        record.lifecycle_state = LifecycleState.ACTIVE.value
-        record.observed_at = datetime.now(timezone.utc)
-        record.record_version += 1
-        record.updated_at = datetime.now(timezone.utc)
-
-        self._log_event(
-            run_context.thread_id,
-            MemoryProposal(memory_type=record.memory_type, canonical_key=record.canonical_key or "", content=""),
-            "memory.promoted",
-            record.id,
         )
-
-        return WriteResult(written=True, operation="promote", memory_id=record.id)
+        if not ok:
+            return WriteResult(written=False, reason=reason)
+        return WriteResult(written=True, operation="promote", memory_id=memory_id)
 
     # ------------------------------------------------------------------
     # Internal execution helpers
@@ -800,23 +818,25 @@ class MemoryWriteService:
         self, thread_id: str, proposal: MemoryProposal,
         event_type: str, memory_id: str,
     ) -> None:
-        """Log a memory lifecycle event."""
+        """记录一条记忆生命周期事件。
+
+        委托共享 `MemoryMutationExecutor.log_event`：事件写入在 SAVEPOINT 内单独
+        flush 并隔离，失败仅丢弃事件本身，不污染外层维护事务。
+        """
         if not thread_id:
             return
-        try:
-            self._logger.log_event(
-                trace_id=proposal.proposal_id,
-                thread_id=thread_id,
-                event_type=event_type,
-                payload={
-                    "memory_id": memory_id,
-                    "canonical_key": proposal.canonical_key,
-                    "memory_type": proposal.memory_type,
-                    "operation": event_type,
-                },
-            )
-        except Exception:
-            logger.exception("Failed to log event: %s", event_type)
+        self._executor.log_event(
+            trace_id=proposal.proposal_id,
+            event_type=event_type,
+            memory_id=memory_id,
+            payload={
+                "memory_id": memory_id,
+                "canonical_key": proposal.canonical_key,
+                "memory_type": proposal.memory_type,
+                "operation": event_type,
+            },
+            thread_id=thread_id,
+        )
 
     def _enqueue_projection(
         self,
@@ -826,72 +846,10 @@ class MemoryWriteService:
     ) -> None:
         """Enqueue async projection outbox jobs.
 
-        Phase 0.5B: Capability flag 控制。未启用的投影类型不入队。
-        Projection jobs carry memory_id + record_version for stale detection.
+        委托到共享的 `MemoryMutationExecutor.enqueue_projection`（唯一投影入队入口），
+        与生命周期维护路径复用同一套投影语义，避免出现两份逻辑（L 节）。
         """
-        import uuid as _uuid
-        from aiive.memory.recall_config import get_projection_capabilities
-
-        caps = get_projection_capabilities()
-        base_key = f"{record.id}:{record.record_version}"
-        is_candidate = record.lifecycle_state == LifecycleState.CANDIDATE.value
-
-        if record.canonical_key and record.canonical_key in self._registry.get_core_memory_keys():
-            self._db.add(OutboxJob(
-                operation_id=f"core:{base_key}:{_uuid.uuid4().hex[:8]}",
-                job_type="core_memory_refresh",
-                status="pending",
-                payload={"memory_id": record.id, "record_version": record.record_version},
-                trace_id=record.id,
-                max_retries=3,
-            ))
-
-        if caps.vector_projection_enabled:
-            if event_type in ("memory.created", "memory.reinforced",
-                              "memory.merged", "memory.wake"):
-                if not is_candidate:
-                    self._db.add(OutboxJob(
-                        operation_id=f"vec:{base_key}:{_uuid.uuid4().hex[:8]}",
-                        job_type="memory_vector_upsert",
-                        status="pending",
-                        payload={"memory_id": record.id, "record_version": record.record_version},
-                        trace_id=record.id,
-                        max_retries=3,
-                    ))
-
-        if caps.markdown_projection_enabled:
-            if event_type in ("memory.created", "memory.reinforced",
-                              "memory.merged", "memory.wake"):
-                self._db.add(OutboxJob(
-                    operation_id=f"md:{base_key}:{_uuid.uuid4().hex[:8]}",
-                    job_type="memory_markdown_project",
-                    status="pending",
-                    payload={"memory_id": record.id, "record_version": record.record_version},
-                    trace_id=record.id,
-                    max_retries=3,
-                ))
-
-        if caps.vector_projection_enabled:
-            if event_type in ("memory.forgotten", "memory.sleep", "memory.archived",
-                              "memory.superseded"):
-                self._db.add(OutboxJob(
-                    operation_id=f"vec-del:{base_key}:{_uuid.uuid4().hex[:8]}",
-                    job_type="memory_vector_delete",
-                    status="pending",
-                    payload={"memory_id": record.id, "record_version": record.record_version},
-                    trace_id=record.id,
-                    max_retries=3,
-                ))
-
-        if caps.cache_projection_enabled and invalidate_cache:
-            self._db.add(OutboxJob(
-                operation_id=f"cache:{base_key}:{_uuid.uuid4().hex[:8]}",
-                job_type="memory_cache_invalidate",
-                status="pending",
-                payload={"memory_id": record.id, "record_version": record.record_version},
-                trace_id=record.id,
-                max_retries=3,
-            ))
+        self._executor.enqueue_projection(record, event_type, invalidate_cache)
 
     # ------------------------------------------------------------------
     # Advisory lock helpers

@@ -11,7 +11,14 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from aiive.db.base import SessionLocal
-from aiive.db.models import MemoryIngestionRun, OutboxJob
+from aiive.db.models import (
+    CheckpointRun,
+    CompactionRun,
+    MemoryIngestionRun,
+    MemoryMaintenanceBatch,
+    MemoryMaintenanceRun,
+    OutboxJob,
+)
 from aiive.memory.recall_config import ENABLED_OUTBOX_JOB_TYPES
 from aiive.worker.handler_registry import HandlerRegistry
 from aiive.worker.outbox_dto import (
@@ -207,6 +214,8 @@ class OutboxWorker:
             self._finalize_job(claimed, result.reason)
         elif result.outcome == HandlerOutcome.RETRY_LATER:
             self._retry_later(claimed, result.retry_available_at, result.reason)
+        elif result.outcome == HandlerOutcome.CONTINUE:
+            self._continue_later(claimed, result.reason)
         elif result.outcome == HandlerOutcome.NON_RETRYABLE:
             self._deadletter_job_and_ingestion_run(
                 claimed,
@@ -334,6 +343,39 @@ class OutboxWorker:
         finally:
             db.close()
 
+    def _continue_later(self, claimed: ClaimedJob, reason: str) -> None:
+        """正常分页 CONTINUE：同 Job 重新 pending、清 claim/lease、next_attempt_at=now。
+
+        不增加 retry_count / failure_attempt_count / error / deadletter 计数；
+        MemoryMaintenanceRun 保持 running（第 2/8 点）。
+        """
+        db = SessionLocal()
+        try:
+            affected = db.query(OutboxJob).filter(
+                OutboxJob.id == claimed.id,
+                OutboxJob.claim_token == claimed.claim_token,
+                OutboxJob.locked_by == claimed.worker_id,
+                OutboxJob.status == "running",
+            ).update({
+                OutboxJob.status: "pending",
+                OutboxJob.error_message: reason[:500] if reason else None,
+                OutboxJob.locked_by: None,
+                OutboxJob.claim_token: None,
+                OutboxJob.lease_expires_at: None,
+                OutboxJob.available_at: datetime.now(timezone.utc),
+                OutboxJob.updated_at: datetime.now(timezone.utc),
+            }, synchronize_session=False)
+            if affected != 1:
+                raise FencingViolationError(
+                    f"continue fencing: job_id={claimed.id}"
+                )
+            db.commit()
+        except FencingViolationError:
+            db.rollback()
+            logger.warning("continue fencing violation: job_id=%s", claimed.id)
+        finally:
+            db.close()
+
     # ------------------------------------------------------------------
     # atomic deadletter: OutboxJob + MemoryIngestionRun
     # ------------------------------------------------------------------
@@ -390,6 +432,38 @@ class OutboxWorker:
                     irun.execution_token = None
                     irun.error_message = f"Outbox deadletter: {error[:200]}"
                     irun.completed_at = datetime.now(timezone.utc)
+
+            # Phase 3 Run（CompactionRun / CheckpointRun）与 OutboxJob 须处于同一终态
+            # （F 节原子契约）：其 outbox_job_id 即本 Job 的 id，按类型定位并原子置 deadletter。
+            if job.job_type in ("segment_sealing", "epoch_checkpoint"):
+                for run_cls in (CompactionRun, CheckpointRun):
+                    run = db.query(run_cls).filter(
+                        run_cls.outbox_job_id == job.id,
+                    ).with_for_update().first()
+                    if run is not None and run.status in ("running", "failed"):
+                        run.status = "deadletter"
+                        run.execution_token = None
+                        run.error_message = f"Outbox deadletter: {error[:200]}"
+                        run.completed_at = datetime.now(timezone.utc)
+
+            # Phase 4：MemoryMaintenanceRun 与 OutboxJob 原子 deadletter（F 节原子契约）。
+            # 其未完成 Batch 统一置 `deadletter`（禁止混用 aborted+abort_reason，第 8 点）。
+            if job.job_type == "memory_maintenance":
+                mrun = db.query(MemoryMaintenanceRun).filter(
+                    MemoryMaintenanceRun.outbox_job_id == job.id,
+                ).with_for_update().first()
+                if mrun is not None and mrun.status in ("running", "failed"):
+                    mrun.status = "deadletter"
+                    mrun.execution_token = None
+                    mrun.error_message = f"Outbox deadletter: {error[:200]}"
+                    mrun.completed_at = datetime.now(timezone.utc)
+                    db.query(MemoryMaintenanceBatch).filter(
+                        MemoryMaintenanceBatch.run_id == mrun.id,
+                        MemoryMaintenanceBatch.status.in_(["frozen", "planned", "applying"]),
+                    ).update({
+                        MemoryMaintenanceBatch.status: "deadletter",
+                        MemoryMaintenanceBatch.completed_at: datetime.now(timezone.utc),
+                    }, synchronize_session=False)
 
             db.commit()
         except Exception:

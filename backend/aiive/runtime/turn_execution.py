@@ -203,8 +203,7 @@ class TurnExecutionService:
             yield {"type": "error", "error": "internal_error"}
             return
 
-        if isinstance(result, dict):
-            yield {"type": "done", **result}
+        yield {"type": "done", **result}
 
     # =====================================================================
     # Phase 1: Resolve, preempt, attribute epoch/segment

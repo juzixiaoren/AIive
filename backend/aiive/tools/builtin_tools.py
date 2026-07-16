@@ -500,9 +500,22 @@ def _handle_forget_memory(db: Session, ctx: RunContext | None, memory_id: str = 
 
 @_db_handler
 def _handle_run_memory_maintenance(db: Session):
-    """运行记忆维护扫描，检查并报告记忆健康状况。"""
+    """触发记忆维护（Daily Dream）：真正 enqueue `memory_maintenance` OutboxJob 执行。
+
+    同时返回只读诊断扫描结果（scan 仍作为只读统计，不替代执行）。
+    """
     from aiive.memory.memory_maintenance import MemoryMaintenance
-    return MemoryMaintenance(db).scan()
+    from aiive.worker.scheduler_daemon import enqueue_maintenance_job
+
+    scan = MemoryMaintenance(db).scan()
+    operation_id = enqueue_maintenance_job(db)
+    db.commit()
+    return {
+        "ok": True,
+        "enqueued": operation_id is not None,
+        "operation_id": operation_id,
+        "scan": scan,
+    }
 
 
 @_db_handler
@@ -513,11 +526,13 @@ def _handle_memory_search(
     memory_types: list[str] | None = None,
     top_k: int | None = None,
     token_budget: int | None = None,
+    include_archived: bool = False,
 ):
     """Agent-Initiated Recall: query-aware 搜索长期记忆（只读，不触发写入）。
 
-    Runtime 注入合法 ScopeContext（thread 为下界，不得越权扩展）。
-    空查询返回空结果。结果作为 Tool Observation 返回，不写回 System Contract。
+    内部统一走 UnifiedRetriever（mode=SEARCH, source_types=["memory_record"]）；
+    不再直接调用 AutomaticRecallEngine。AutomaticRecallEngine 仅作为
+    UnifiedRetriever 内部的 Memory route adapter。
 
     参数:
         query: 自然语言查询
@@ -526,12 +541,12 @@ def _handle_memory_search(
         token_budget: token 预算
 
     返回:
-        包含 results（MemoryRecallItem 列表）与 trace 的字典
+        包含 results 的字典（兼容旧输出格式）
     """
-    from aiive.memory.automatic_recall import AutomaticRecallEngine
-    from aiive.memory.recall_config import RecallConfig
-    from aiive.memory.recall_models import MemoryRecallRequest
+    from aiive.memory.recall_config import RecallConfig, RetrievalConfig
     from aiive.memory.scope_resolver import build_scope_context
+    from aiive.retrieval.retrieval_types import RetrievalMode, RetrievalRequest
+    from aiive.retrieval.unified_retriever import UnifiedRetriever
 
     ctx = _require_ctx(ctx, "memory_search")
     # Kernel-enforced per-turn budget (requirement #28)
@@ -546,44 +561,128 @@ def _handle_memory_search(
     if not query or not query.strip():
         return {"ok": True, "results": [], "hint": "Empty query. Provide a non-empty query."}
 
-    # 防御 None 值：dataclass 显式传 None 不会回退到默认值
-    effective_top_k: int = top_k if top_k is not None else 8
-    effective_token_budget: int = token_budget if token_budget is not None else 1000
-    config = RecallConfig(
-        memory_tool_top_k=effective_top_k,
-        memory_tool_token_budget=effective_token_budget,
-    )
+    rcfg = RetrievalConfig()
+    effective_top_k: int = top_k if top_k is not None else rcfg.search_max_results
+    effective_token_budget: int = token_budget if token_budget is not None else rcfg.search_token_budget
+
     scope = build_scope_context(db, ctx, ctx.thread_id)
-    request = MemoryRecallRequest(
-        query=query, scope_context=scope,
-        top_k=config.memory_tool_top_k, token_budget=config.memory_tool_token_budget,
-    )
-    engine = AutomaticRecallEngine(db, config)
-    pack, _traces = engine.recall(request)
+    retriever = UnifiedRetriever(db, rcfg)
+    result = retriever.retrieve(RetrievalRequest(
+        query=query,
+        mode=RetrievalMode.SEARCH,
+        scope_context=scope,
+        thread_id=ctx.thread_id,
+        source_types=["memory_record"],
+        include_sleeping=True,
+        include_archived=include_archived,
+        max_results=effective_top_k,
+        token_budget=effective_token_budget,
+    ))
 
-    items = pack.items
+    # 兼容旧输出格式：RetrievalHit → dict
+    items = result.hits
     if memory_types:
-        items = [it for it in items if it.memory_type in memory_types]
+        items = [h for h in items if h.provenance.get("memory_type", "") in memory_types]
 
-    results = [
-        {
-            "memory_id": it.memory_id,
-            "content": it.content,
-            "memory_type": it.memory_type,
-            "canonical_key": it.canonical_key,
-            "scope_type": it.scope_type,
-            "relevance_score": it.relevance_score,
-            "validity_state": it.validity_state,
-        }
-        for it in items
-    ]
+    results = []
+    touched_ids: list[str] = []
+    for h in items:
+        results.append({
+            "memory_id": h.memory_record_id or h.source_id,
+            "content": h.snippet,
+            "memory_type": h.provenance.get("memory_type", ""),
+            "canonical_key": h.canonical_key or h.title,
+            "scope_type": h.scope_type,
+            "relevance_score": h.lexical_score,
+            "validity_state": "valid",
+            "lifecycle_state": h.lifecycle_state,
+        })
+        # archived / forgotten 不 touch（不得影响生命周期、不得 wake）
+        if h.lifecycle_state in ("archived", "forgotten"):
+            continue
+        mid = h.memory_record_id or h.source_id
+        if mid:
+            touched_ids.append(str(mid))
+
+    # touch 实际返回的记忆（best-effort，排除 archived/forgotten）
+    try:
+        if touched_ids:
+            from aiive.memory.memory_access_tracker import MemoryAccessTracker
+            MemoryAccessTracker().touch(touched_ids)
+    except Exception:
+        logger.exception("AccessTracker touch（memory_search 返回）失败")
+
     return {
         "ok": True,
         "query": query,
         "memory_types": memory_types or [],
         "results": results,
         "total": len(results),
-        "note": "retrieved historical memory; may be stale — current explicit user input overrides defaults",
+        "degraded": result.degraded,
+        "note": "统一检索（经 UnifiedRetriever）；retrieved historical memory; may be stale — current explicit user input overrides defaults",
+    }
+
+
+@_db_handler
+def _handle_history_search(
+    db: Session,
+    ctx: RunContext | None,
+    query: str = "",
+    deep: bool = False,
+    top_k: int | None = None,
+    token_budget: int | None = None,
+    include_archived: bool = False,
+):
+    """统一检索：跨记忆 / 阶段摘要 / 检查点检索历史（只读，不触发写入）。
+
+    Runtime 注入合法 ScopeContext（thread 为下界，不得越权扩展）。deep=True 时
+    额外二阶段回溯原始 Turn/Event（raw）。空查询返回空。
+
+    参数:
+        query: 自然语言查询
+        deep: 是否回溯原始历史（默认 False）
+        top_k: 返回条数上限
+        token_budget: token 预算上限
+
+    返回:
+        包含 results（统一 RetrievalHit 列表）的字典
+    """
+    from aiive.memory.recall_config import RetrievalConfig
+    from aiive.memory.scope_resolver import build_scope_context
+    from aiive.retrieval.retrieval_types import RetrievalMode, RetrievalRequest
+    from aiive.retrieval.unified_retriever import UnifiedRetriever
+
+    ctx = _require_ctx(ctx, "history_search")
+    if not query or not query.strip():
+        return {"ok": True, "results": [], "hint": "Empty query. Provide a non-empty query."}
+
+    rcfg = RetrievalConfig()
+    effective_top_k: int = top_k if top_k is not None else rcfg.search_max_results
+    effective_budget: int = token_budget if token_budget is not None else rcfg.search_token_budget
+
+    scope = build_scope_context(db, ctx, ctx.thread_id)
+    mode = RetrievalMode.DEEP if deep else RetrievalMode.SEARCH
+    req = RetrievalRequest(
+        query=query,
+        mode=mode,
+        scope_context=scope,
+        thread_id=ctx.thread_id,
+        include_archived=include_archived,
+        max_results=effective_top_k,
+        token_budget=effective_budget,
+    )
+    retriever = UnifiedRetriever(db, rcfg)
+    result = retriever.retrieve(req)
+
+    results = [h.model_dump(exclude_none=True) for h in result.hits]
+    return {
+        "ok": True,
+        "query": query,
+        "deep": deep,
+        "results": results,
+        "total": len(results),
+        "degraded": result.degraded,
+        "note": "统一检索结果（含记忆/摘要/检查点/原始）；当前明确用户输入始终覆盖这些默认值",
     }
 
 
@@ -1103,6 +1202,15 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
          "按关键词搜索原始 episodic 记忆（dialogue/tool 结果/失败日志等原始事件记录）。" +
          "区别于 memory_search 的语义检索，本工具做字符串匹配，适合回溯\"那次对话说了什么\"\"某工具结果\"",
          {"query": {"type": "str", "description": "关键词，在 episodic 记忆的 content 中做子串匹配"}}, "low", False, False),
+        ("history_search", _handle_history_search,
+         "统一检索历史（记忆/阶段摘要/检查点，可选回溯原始事件）。根据查询语义跨三类源检索，" +
+         "deep=True 时二阶段回溯原始 Turn/Event。受 Runtime ScopeContext 约束。空查询返回空。",
+         {
+             "query": {"type": "str", "description": "自然语言查询"},
+             "deep": {"type": "bool", "description": "是否回溯原始历史，默认 false"},
+             "top_k": {"type": "int", "description": "返回条数，默认 20"},
+             "token_budget": {"type": "int", "description": "结果 token 上限，默认 2000"},
+         }, "low", False, False),
         # 文件操作
         ("safe_delete", _handle_safe_delete, "在允许范围内安全删除文件",
          {"path": "str",

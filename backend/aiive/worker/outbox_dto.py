@@ -20,6 +20,7 @@ class HandlerOutcome(StrEnum):
     NON_RETRYABLE = "non_retryable"
     RETRYABLE_ERROR = "retryable_error"
     CLAIM_LOST = "claim_lost"
+    CONTINUE = "continue"
 
 
 @dataclass(frozen=True)

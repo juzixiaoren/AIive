@@ -36,6 +36,7 @@ from aiive.api.routes_tasks import router as tasks_router
 from aiive.api.routes_attention import router as attention_router
 from aiive.api.routes_notifications import router as notifications_router
 from aiive.api.routes_threads import router as threads_router
+from aiive.api.routes_epochs import router as epochs_router
 from aiive.api.routes_ws import router as ws_router
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,32 @@ def _ensure_system_thread():
         ThreadBootstrapService.ensure_system_thread()
     except Exception:
         logger.error("Failed to ensure system thread", exc_info=True)
+
+
+def _ensure_retrieval_generation():
+    """确保存在唯一 active 的检索索引 generation（Phase 5 查询真相源）。
+
+    无 active generation 时，refresh_source 无的放矢、lexical 路由空转，统一检索失效。
+    幂等：仅当库内尚不存在任何 generation（全新部署）时创建 index_version=1 的
+    active generation；若已有 generation（如正在进行的 rebuild 持有 building），
+    则不干预，交由 rebuild 流程原子激活。
+    """
+    from aiive.db.base import SessionLocal
+    from aiive.db.models import RetrievalIndexGeneration
+    from aiive.retrieval.retrieval_index import RetrievalIndexManager
+
+    try:
+        db = SessionLocal()
+        try:
+            mgr = RetrievalIndexManager()
+            exists = db.query(RetrievalIndexGeneration).first() is not None
+            if not exists:
+                mgr.create_generation(db, 1, status="active")
+                db.commit()
+        finally:
+            db.close()
+    except Exception:
+        logger.error("Failed to ensure retrieval generation", exc_info=True)
 
 
 def _ensure_schema():
@@ -106,6 +133,20 @@ def create_app() -> FastAPI:
             _ensure_system_thread()
         except Exception:
             logger.exception("系统线程初始化失败")
+        try:
+            _ensure_retrieval_generation()
+        except Exception:
+            logger.exception("检索索引 generation 初始化失败")
+        try:
+            from aiive.retrieval.retrieval_bootstrap import ensure_retrieval_backfill
+            ensure_retrieval_backfill()
+        except Exception:
+            logger.exception("检索索引历史 backfill 引导失败")
+        try:
+            from aiive.runtime.context_budget import ContextBudget
+            ContextBudget.default().validate()
+        except Exception:
+            logger.exception("ContextBudget 启动校验失败")
         try:
             start_daemon()
         except Exception:
@@ -197,6 +238,7 @@ def create_app() -> FastAPI:
     app.include_router(attention_router)
     app.include_router(notifications_router)
     app.include_router(threads_router)
+    app.include_router(epochs_router)
     app.include_router(ws_router)
     return app
 

@@ -38,6 +38,13 @@ class ContextBudget:
     recent_messages: PartitionBudget
     retrieved_memory: PartitionBudget
     tool_results: PartitionBudget
+    # Phase 3 新增分区
+    epoch_checkpoint: PartitionBudget
+    segment_summaries: PartitionBudget
+    sealing_bridge: PartitionBudget
+    # Phase 5 新增分区
+    retrieved_history_summary: PartitionBudget
+    deep_history_raw: PartitionBudget
 
     @property
     def hard_input_limit(self) -> int:
@@ -52,7 +59,9 @@ class ContextBudget:
         return (
             self.stable_contract, self.core_memory, self.working_state,
             self.tool_definitions, self.recent_messages, self.retrieved_memory,
-            self.tool_results,
+            self.tool_results, self.epoch_checkpoint,
+            self.segment_summaries, self.sealing_bridge,
+            self.retrieved_history_summary, self.deep_history_raw,
         )
 
     def validate(self) -> None:
@@ -79,6 +88,11 @@ class ContextBudget:
             recent_messages=PartitionBudget("recent_messages", 85000, 97000, 5, "近期 Turn 消息"),
             retrieved_memory=PartitionBudget("retrieved_memory", 1000, 1200, 6, "召回记忆"),
             tool_results=PartitionBudget("tool_results", 5000, 8000, 7, "工具结果"),
+            epoch_checkpoint=PartitionBudget("epoch_checkpoint", 500, 800, 8, "最近 Epoch 检查点"),
+            segment_summaries=PartitionBudget("segment_summaries", 1200, 2000, 9, "近期 Segment 摘要"),
+            sealing_bridge=PartitionBudget("sealing_bridge", 1500, 2300, 10, "密封中 Segment 原始尾部桥接"),
+            retrieved_history_summary=PartitionBudget("retrieved_history_summary", 800, 1000, 11, "统一检索命中的历史摘要/检查点"),
+            deep_history_raw=PartitionBudget("deep_history_raw", 0, 1500, 12, "deep 模式原始历史回溯（auto 模式不使用）"),
         )
 
     @classmethod
@@ -122,6 +136,11 @@ class ContextBudget:
             recent_messages=new_partitions["recent_messages"],
             retrieved_memory=new_partitions["retrieved_memory"],
             tool_results=new_partitions["tool_results"],
+            epoch_checkpoint=new_partitions["epoch_checkpoint"],
+            segment_summaries=new_partitions["segment_summaries"],
+            sealing_bridge=new_partitions["sealing_bridge"],
+            retrieved_history_summary=new_partitions["retrieved_history_summary"],
+            deep_history_raw=new_partitions["deep_history_raw"],
         )
 
 

@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 _CJK_RE = re.compile("[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]+")
 
 
-def _tokenize_cjk_aware(text: str, min_len: int = 2) -> list[str]:
+def tokenize_cjk_aware(text: str, min_len: int = 2) -> list[str]:
     """Split text into tokens: \\W+ for Latin/punctuation, overlapping bigrams for CJK.
 
     Example: "我喜欢咖啡 preference" → ["我喜欢咖啡", "我喜", "喜欢", "欢咖", "咖啡", "preference"]
@@ -106,22 +106,49 @@ class AutomaticRecallEngine:
     # ------------------------------------------------------------------
 
     def recall(
-        self, request: MemoryRecallRequest
+        self, request: MemoryRecallRequest, include_sleeping: bool = False,
+        include_archived: bool = False,
     ) -> tuple[MemoryRecallPack, list[RecallCandidateTrace]]:
-        """Execute all enabled routes and fuse into a pack."""
+        """执行全部启用的召回路由并融合为一个 pack。
+
+        include_sleeping=True 时（J.5「扩大召回/高相关」），仅 exact / fts 两条
+        高相关路由放宽到 `lifecycle_state IN (active, sleeping)`；episode 兜底路由
+        始终仅 active，避免陈旧、低价值的情节记忆被重新带回上下文。
+        include_archived=True 时追加 archived（仅经统一检索显式请求，不自动 wake）。
+        """
         candidates: list[MemoryRecallItem] = []
-        candidates += self._route_exact(request)
-        candidates += self._route_fts(request)
+        candidates += self._route_exact(request, include_sleeping, include_archived)
+        candidates += self._route_fts(request, include_sleeping, include_archived)
         candidates += self._route_vector(request)
         candidates += self._route_temporal_graph(request)
         candidates += self._route_recent_episode(request)
         return fuse_and_pack(candidates, request, self._config)
 
+    @staticmethod
+    def _lifecycle_states(
+        include_sleeping: bool, include_archived: bool = False,
+    ) -> list[str]:
+        """返回参与召回的 lifecycle_state 取值列表。
+
+        默认仅 active；include_sleeping=True 时追加 sleeping（J.5）；
+        include_archived=True 时追加 archived（统一检索显式请求，不自动 wake）。
+        forgotten / superseded / expired / candidate 永不进入普通召回。
+        """
+        states = [LifecycleState.ACTIVE.value]
+        if include_sleeping:
+            states.append(LifecycleState.SLEEPING.value)
+        if include_archived:
+            states.append(LifecycleState.ARCHIVED.value)
+        return states
+
     # ------------------------------------------------------------------
     # Routes
     # ------------------------------------------------------------------
 
-    def _route_exact(self, request: MemoryRecallRequest) -> list[MemoryRecallItem]:
+    def _route_exact(
+        self, request: MemoryRecallRequest, include_sleeping: bool = False,
+        include_archived: bool = False,
+    ) -> list[MemoryRecallItem]:
         """Match canonical_key / scope-id precisely. High precision → passes threshold."""
         q = request.query.strip()
         if not q:
@@ -129,12 +156,13 @@ class AutomaticRecallEngine:
         chain = request.scope_context.chain()
         if not _KEYISH.match(q):
             return []
+        states = self._lifecycle_states(include_sleeping, include_archived)
         out: list[MemoryRecallItem] = []
         for scope_type, _scope_id in chain:
             recs = (
                 self._db.query(MemoryRecord)
                 .filter(
-                    MemoryRecord.lifecycle_state == LifecycleState.ACTIVE.value,
+                    MemoryRecord.lifecycle_state.in_(states),
                     MemoryRecord.validity_state == ValidityState.VALID.value,
                     MemoryRecord.scope_type == scope_type,
                     (MemoryRecord.canonical_key == q) | (MemoryRecord.scope_id == q),
@@ -148,12 +176,15 @@ class AutomaticRecallEngine:
                 break
         return out
 
-    def _route_fts(self, request: MemoryRecallRequest) -> list[MemoryRecallItem]:
+    def _route_fts(
+        self, request: MemoryRecallRequest, include_sleeping: bool = False,
+        include_archived: bool = False,
+    ) -> list[MemoryRecallItem]:
         """PostgreSQL/SQLite text search. query genuinely participates."""
         q = request.query.strip()
         if len(q) < 2:
             return []
-        tokens = _tokenize_cjk_aware(q.lower())
+        tokens = tokenize_cjk_aware(q.lower())
         if not tokens:
             return []
         chain = request.scope_context.chain()
@@ -161,7 +192,9 @@ class AutomaticRecallEngine:
         out: list[MemoryRecallItem] = []
         qlow = q.lower()
         for scope_type, scope_id in chain:
-            recs = self._query_scope_text(scope_type, scope_id, qlow, tokens)
+            recs = self._query_scope_text(
+                scope_type, scope_id, qlow, tokens, include_sleeping, include_archived,
+            )
             for r in recs:
                 if r.id in seen:
                     continue
@@ -201,7 +234,7 @@ class AutomaticRecallEngine:
         q = request.query.strip().lower()
         if len(q) < 2:
             return []
-        tokens = _tokenize_cjk_aware(q)
+        tokens = tokenize_cjk_aware(q)
         if not tokens:
             return []
         chain = request.scope_context.chain()
@@ -238,10 +271,13 @@ class AutomaticRecallEngine:
     # ------------------------------------------------------------------
 
     def _query_scope_text(
-        self, scope_type: str, scope_id: str | None, qlow: str, tokens: list[str]
+        self, scope_type: str, scope_id: str | None, qlow: str, tokens: list[str],
+        include_sleeping: bool = False, include_archived: bool = False,
     ) -> Sequence[MemoryRecord]:
         q = self._db.query(MemoryRecord).filter(
-            MemoryRecord.lifecycle_state == LifecycleState.ACTIVE.value,
+            MemoryRecord.lifecycle_state.in_(
+                self._lifecycle_states(include_sleeping, include_archived),
+            ),
             MemoryRecord.validity_state == ValidityState.VALID.value,
             MemoryRecord.scope_type == scope_type,
         )
@@ -298,4 +334,5 @@ class AutomaticRecallEngine:
             record_version=r.record_version or 1,
             token_cost=max(1, len(r.content or "") // 4),
             route=route,
+            lifecycle_state=r.lifecycle_state or "",
         )
