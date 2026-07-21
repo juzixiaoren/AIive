@@ -32,6 +32,7 @@ from aiive.db.models import (
     OutboxJob,
     Segment,
     SegmentSummary,
+    Task,
     TurnRecord,
 )
 from aiive.memory.extraction_policy import MemoryExtractionPolicy
@@ -95,6 +96,7 @@ def handle_memory_extraction(claimed: ClaimedJob) -> HandlerResult:
     source_turn_record_id: str = payload.get("source_turn_record_id", "")
     source_turn_id: str = payload.get("source_turn_id", "")
     source_event_ids: list[str] = payload.get("source_event_ids", [])
+    assistant_event_id: str = payload.get("assistant_event_id", "")
 
     if MemoryExtractionPolicy.should_skip_system_message(user_message):
         return HandlerResult(HandlerOutcome.COMPLETED, "system_message_skipped")
@@ -158,6 +160,8 @@ def handle_memory_extraction(claimed: ClaimedJob) -> HandlerResult:
         proposals: list[MemoryProposal] = extractor.extract(
             user_message=user_message, reply=reply,
             trace_id=claimed.trace_id, thread_id=thread_id,
+            source_event_ids=source_event_ids or None,
+            assistant_event_ids=[assistant_event_id] if assistant_event_id else None,
         )
     except Exception as e:
         _mark_ingestion_failed_fencing(run_id, execution_token, str(e))
@@ -247,10 +251,14 @@ def handle_memory_extraction(claimed: ClaimedJob) -> HandlerResult:
                                  ingestion_run_id=run_id)
 
         # C3: 注入 Phase 2 provenance 到 proposal → 原子写入批次
+        # Phase B 抽取时已按 payload 的真实事件构建 evidence 与 source_event_ids；
+        # 此处仅补充 turn 溯源字段。source_event_ids 只在 payload 非空时覆盖，
+        # 避免把 Phase B 使用的 trace_id 兜底清空导致 evidence 与 source_event_ids 不一致。
         for p in proposals:
             p.source_turn_id = source_turn_id
             p.source_turn_record_id = source_turn_record_id
-            p.source_event_ids = list(source_event_ids)
+            if source_event_ids:
+                p.source_event_ids = list(source_event_ids)
             p.execution_mode = "system_best_effort"
         writer.write_batch(proposals=proposals, ingestion_run=run_c, run_context=run_ctx)
 
@@ -289,6 +297,131 @@ def handle_memory_extraction(claimed: ClaimedJob) -> HandlerResult:
 
 
 # ============================================================================
+# reminder_delivery
+# ============================================================================
+
+
+def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
+    """投递到期提醒：使用确定性 Turn 唤醒 Agent，成功后完成 Task。"""
+    import uuid as _uuid
+
+    payload = claimed.payload
+    task_id = str(payload.get("task_id", ""))
+    thread_id = str(payload.get("thread_id", ""))
+    title = str(payload.get("title", ""))
+    content = str(payload.get("content", "")) or title
+    operation_id = str(payload.get("operation_id", "")) or f"reminder_delivery:{task_id}"
+    if not task_id or not thread_id or not title:
+        return HandlerResult(
+            HandlerOutcome.NON_RETRYABLE,
+            "提醒投递参数不完整",
+            terminal_reason="invalid_reminder_payload",
+        )
+
+    db_a = SessionLocal()
+    try:
+        outbox = db_a.query(OutboxJob).filter(OutboxJob.id == claimed.id).with_for_update().first()
+        if outbox is None or not _claim_matches(outbox, claimed, datetime.now(timezone.utc)):
+            return HandlerResult(HandlerOutcome.CLAIM_LOST, "提醒投递 claim 已失效")
+        task = db_a.query(Task).filter(Task.id == task_id).with_for_update().first()
+        if task is None:
+            return HandlerResult(
+                HandlerOutcome.NON_RETRYABLE,
+                "提醒任务不存在",
+                terminal_reason="reminder_task_not_found",
+            )
+        if task.status == "completed":
+            return HandlerResult(HandlerOutcome.COMPLETED, "提醒已由其他执行完成")
+        if task.status != "dispatching":
+            return HandlerResult(
+                HandlerOutcome.NON_RETRYABLE,
+                f"提醒任务状态无效: {task.status}",
+                terminal_reason="invalid_reminder_task_status",
+            )
+        db_a.commit()
+    finally:
+        db_a.close()
+
+    turn_id = str(_uuid.uuid5(_uuid.NAMESPACE_URL, operation_id))
+    message = f"[Reminder triggered]\n{title}\nContent: {content}"
+    try:
+        from aiive.core.llm_client import default_llm_client
+        from aiive.runtime.turn_execution import TurnExecutionService
+
+        result = TurnExecutionService(
+            default_llm_client(), source="runtime_event",
+        ).execute_turn(message=message, thread_id=thread_id, turn_id=turn_id)
+    except Exception as exc:
+        logger.exception("提醒 Agent 执行异常: task_id=%s", task_id)
+        return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, f"提醒 Agent 执行异常: {exc}")
+
+    if result.get("error"):
+        if result.get("error") == "turn_in_progress":
+            return HandlerResult(HandlerOutcome.RETRY_LATER, "提醒 Turn 正在执行")
+        return HandlerResult(
+            HandlerOutcome.RETRYABLE_ERROR,
+            f"提醒 Agent 执行失败: {result.get('error')}",
+        )
+
+    db_c = SessionLocal()
+    try:
+        outbox = db_c.query(OutboxJob).filter(OutboxJob.id == claimed.id).with_for_update().first()
+        if outbox is None or not _claim_matches(outbox, claimed, datetime.now(timezone.utc)):
+            db_c.rollback()
+            return HandlerResult(HandlerOutcome.CLAIM_LOST, "提醒完成阶段 claim 已失效")
+        task = db_c.query(Task).filter(Task.id == task_id).with_for_update().first()
+        if task is None:
+            db_c.rollback()
+            return HandlerResult(
+                HandlerOutcome.NON_RETRYABLE,
+                "提醒任务不存在",
+                terminal_reason="reminder_task_not_found",
+            )
+        if task.status == "dispatching":
+            db_c.add(Event(
+                trace_id=claimed.trace_id or task_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                event_type="reminder_triggered",
+                payload={
+                    "task_id": task_id,
+                    "task_type": task.task_type,
+                    "title": title,
+                    "turn_id": turn_id,
+                },
+            ))
+            task.status = "completed"
+        elif task.status != "completed":
+            db_c.rollback()
+            return HandlerResult(HandlerOutcome.CLAIM_LOST, f"提醒状态已变化: {task.status}")
+        db_c.commit()
+    except Exception as exc:
+        db_c.rollback()
+        logger.exception("提醒完成状态持久化失败: task_id=%s", task_id)
+        return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, f"提醒完成状态持久化失败: {exc}")
+    finally:
+        db_c.close()
+
+    try:
+        from aiive.api.ws_manager import ws_manager
+
+        ws_manager.broadcast_to_thread_sync(
+            thread_id,
+            "new_message",
+            {
+                "reply": result.get("reply", ""),
+                "thread_id": result.get("thread_id", thread_id),
+                "trace_id": result.get("trace_id", ""),
+                "action_cards": result.get("action_cards", []),
+            },
+        )
+    except Exception:
+        logger.exception("提醒回复 WebSocket 推送失败: task_id=%s", task_id)
+
+    return HandlerResult(HandlerOutcome.COMPLETED, "提醒 Agent 回复已完成")
+
+
+# ============================================================================
 # core_memory_refresh (unified interface)
 # ============================================================================
 
@@ -311,6 +444,31 @@ def handle_core_memory_refresh(claimed: ClaimedJob) -> HandlerResult:
         db.rollback()
         logger.exception("core_memory_refresh failed")
         return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, str(e))
+    finally:
+        db.close()
+
+
+def handle_memory_vector_refresh(claimed: ClaimedJob) -> HandlerResult:
+    """按 MemoryRecord 真相源状态刷新或删除 pgvector 投影。"""
+    memory_id = str(claimed.payload.get("memory_id", ""))
+    record_version = int(claimed.payload.get("record_version", 0))
+    if not memory_id or record_version <= 0:
+        return HandlerResult(
+            HandlerOutcome.NON_RETRYABLE,
+            "向量投影任务缺少 memory_id 或 record_version",
+            terminal_reason="invalid_payload",
+        )
+    db = SessionLocal()
+    try:
+        from aiive.memory.vector_projection import MemoryVectorProjectionService
+
+        result = MemoryVectorProjectionService(db).refresh(memory_id, record_version)
+        db.commit()
+        return HandlerResult(HandlerOutcome.COMPLETED, result)
+    except Exception as exc:
+        db.rollback()
+        logger.exception("memory_vector_refresh failed")
+        return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, str(exc))
     finally:
         db.close()
 
@@ -957,9 +1115,17 @@ def _mark_maintenance_run_failed(run_id: str, execution_token: str, error: str) 
 
 
 def register_all(registry: HandlerRegistry) -> None:
+    from aiive.tools.operation_executor import handle_tool_operation
+
+    registry.register("tool_operation", handle_tool_operation,
+                       supported_schema_versions=frozenset({1}))
     registry.register("memory_extraction", handle_memory_extraction,
                        supported_schema_versions=frozenset({1}))
+    registry.register("reminder_delivery", handle_reminder_delivery,
+                       supported_schema_versions=frozenset({1}))
     registry.register("core_memory_refresh", handle_core_memory_refresh,
+                       supported_schema_versions=frozenset({1}))
+    registry.register("memory_vector_refresh", handle_memory_vector_refresh,
                        supported_schema_versions=frozenset({1}))
     # Phase 3
     registry.register("segment_sealing", handle_segment_sealing,
@@ -975,6 +1141,28 @@ def register_all(registry: HandlerRegistry) -> None:
     registry.register("retrieval_index_refresh", handle_retrieval_index_refresh,
                        supported_schema_versions=frozenset({1}))
     registry.register("retrieval_index_rebuild", handle_retrieval_index_rebuild,
+                       supported_schema_versions=frozenset({1}))
+    # Phase 6A: Forget Saga
+    from aiive.worker.handlers_forget import (
+        handle_forget_cascade,
+        handle_forget_purge,
+        handle_forget_rebuild,
+        handle_forget_reconcile,
+        handle_forget_verify,
+    )
+    registry.register("forget_cascade", handle_forget_cascade,
+                       supported_schema_versions=frozenset({1}))
+    registry.register("forget_rebuild_dependencies", handle_forget_rebuild,
+                       supported_schema_versions=frozenset({1}))
+    registry.register("forget_purge", handle_forget_purge,
+                       supported_schema_versions=frozenset({1}))
+    registry.register("forget_verify", handle_forget_verify,
+                       supported_schema_versions=frozenset({1}))
+    registry.register("forget_reconcile", handle_forget_reconcile,
+                       supported_schema_versions=frozenset({1}))
+    # Phase 6B: Retention Cleanup
+    from aiive.worker.handlers_retention import handle_retention_cleanup
+    registry.register("retention_cleanup", handle_retention_cleanup,
                        supported_schema_versions=frozenset({1}))
 
 

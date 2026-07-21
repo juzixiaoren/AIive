@@ -275,6 +275,8 @@ class UnifiedRetriever:
                     MemoryRecord.validity_state,
                     MemoryRecord.record_version,
                     MemoryRecord.content_hash,
+                    MemoryRecord.created_at,
+                    MemoryRecord.sensitivity,
                 )
                 .filter(MemoryRecord.id.in_(list(set(memory_ids))))
                 .all()
@@ -289,6 +291,7 @@ class UnifiedRetriever:
                     SegmentSummary.id,
                     SegmentSummary.summary_version,
                     SegmentSummary.source_hash,
+                    SegmentSummary.created_at,
                 )
                 .filter(SegmentSummary.id.in_(list(set(summary_ids))))
                 .all()
@@ -303,6 +306,7 @@ class UnifiedRetriever:
                     EpochCheckpoint.id,
                     EpochCheckpoint.version,
                     EpochCheckpoint.source_hashes,
+                    EpochCheckpoint.created_at,
                 )
                 .filter(EpochCheckpoint.id.in_(list(set(checkpoint_ids))))
                 .all()
@@ -310,12 +314,34 @@ class UnifiedRetriever:
             for r in rows:
                 valid_checkpoint[r[0]] = r
 
+        # Phase 6A fail-closed：被 active Shield（含 all_user_data）或 Tombstone 屏蔽的
+        # 命中一律丢弃，防止被忘内容经检索路径泄漏。
+        from aiive.forget.visibility_service import ForgetVisibilityService
+        from aiive.memory.memory_policy import MemoryPolicyEngine, MemoryReadChannel
+
+        memory_policy = MemoryPolicyEngine()
+        blocked_memory = ForgetVisibilityService.blocked_target_ids(
+            self._db, "memory_record",
+            [(r[0], r[5]) for r in valid_memory.values()],
+        )
+        blocked_summary = ForgetVisibilityService.blocked_target_ids(
+            self._db, "segment_summary",
+            [(r[0], r[3]) for r in valid_summary.values()],
+        )
+        blocked_checkpoint = ForgetVisibilityService.blocked_target_ids(
+            self._db, "epoch_checkpoint",
+            [(r[0], r[3]) for r in valid_checkpoint.values()],
+        )
+
         # 逐条校验
         kept: list[RetrievalHit] = []
         stale: list[tuple[str, str, str]] = []  # (source_type, source_id, source_version)
 
         for h in hits:
             if h.source_type == "memory_record":
+                if h.source_id in blocked_memory:
+                    stale.append(("memory_record", h.source_id, ""))
+                    continue
                 src = valid_memory.get(h.source_id)
                 if src is None:
                     stale.append(("memory_record", h.source_id, ""))
@@ -329,9 +355,16 @@ class UnifiedRetriever:
                     continue
                 if lifecycle == "sleeping" and not include_sleeping:
                     continue
+                if not memory_policy.decide_read(
+                    src[6], MemoryReadChannel.TOOL,
+                ).allowed:
+                    continue
                 kept.append(h)
 
             elif h.source_type == "segment_summary":
+                if h.source_id in blocked_summary:
+                    stale.append(("segment_summary", h.source_id, ""))
+                    continue
                 src = valid_summary.get(h.source_id)
                 if src is None:
                     stale.append(("segment_summary", h.source_id, ""))
@@ -346,6 +379,9 @@ class UnifiedRetriever:
                 kept.append(h)
 
             elif h.source_type == "epoch_checkpoint":
+                if h.source_id in blocked_checkpoint:
+                    stale.append(("epoch_checkpoint", h.source_id, ""))
+                    continue
                 src = valid_checkpoint.get(h.source_id)
                 if src is None:
                     stale.append(("epoch_checkpoint", h.source_id, ""))
@@ -398,6 +434,7 @@ class UnifiedRetriever:
                 )
                 if existing is not None:
                     continue
+                sp = None
                 try:
                     sp = self._db.begin_nested()
                     self._db.add(OutboxJob(
@@ -416,7 +453,8 @@ class UnifiedRetriever:
                     self._db.flush()
                     sp.commit()
                 except Exception:
-                    sp.rollback()
+                    if sp is not None:
+                        sp.rollback()
                     logger.warning("best-effort stale refresh 单条入队失败（不阻断检索）", exc_info=True)
         except Exception:
             logger.warning("best-effort stale refresh 入队失败（不阻断检索）", exc_info=True)

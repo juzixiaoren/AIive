@@ -15,37 +15,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from aiive.memory.memory_key_registry import MemoryKeyRegistry, get_memory_key_registry
+from aiive.memory.memory_policy import MemoryPolicyEngine
 from aiive.memory.memory_types import (
     MemoryProposal,
-    TrustLevel,
+    Sensitivity,
     MemoryType,
 )
-
-
-# Memory types that must NOT come from untrusted sources
-TRUST_REQUIRED_MEMORY_TYPES: frozenset[str] = frozenset({
-    MemoryType.USER_PROFILE.value,
-    MemoryType.AGENT_SELF.value,
-    MemoryType.POLICY.value,
-})
-
-# Evidence source types that are considered "trusted" (direct user input)
-TRUSTED_SOURCE_TYPES: frozenset[str] = frozenset({
-    "user_message",
-    "user_command",
-})
-
-# External (untrusted) evidence source types
-EXTERNAL_SOURCE_TYPES: frozenset[str] = frozenset({
-    "webpage",
-    "pdf",
-    "email",
-    "code_comment",
-    "retrieved_knowledge",
-    "tool_observation",
-    "mcp_description",
-    "llm_reply",
-})
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +51,7 @@ class MemoryGate:
 
     def __init__(self, registry: MemoryKeyRegistry | None = None) -> None:
         self._registry: MemoryKeyRegistry = registry or get_memory_key_registry()
+        self._policy = MemoryPolicyEngine()
 
     # ------------------------------------------------------------------
     # Public API
@@ -84,17 +60,8 @@ class MemoryGate:
     def decide(self, proposal: MemoryProposal) -> GateDecision:
         """Evaluate a MemoryProposal and return a GateDecision.
 
-        Rules applied in order:
-        1. Type validation (must be canonical)
-        2. Trust boundary (sensitive types must have trusted evidence)
-        3. External content restrictions
-        4. Assistant reply restrictions
-        5. Durability — non-durable with no future value → reject
-        6. Pinned — only user_required can pin
-        7. Ephemeral — must have valid_to > valid_from
-        8. Confidence threshold → candidate
-        9. Evidence quality → candidate
-        10. Default: active
+        按顺序执行：类型与敏感度校验、统一来源权威、持久性、固定保留、
+        临时记忆期限、置信度和 evidence 完整性检查。
         """
         # Rule 1: Type validation
         if proposal.memory_type not in {t.value for t in MemoryType}:
@@ -104,39 +71,26 @@ class MemoryGate:
                 blocked_reason="unknown_memory_type",
             )
 
-        # Rule 2: Trust boundary — sensitive types
-        if proposal.memory_type in TRUST_REQUIRED_MEMORY_TYPES:
-            if not self._has_trusted_user_evidence(proposal):
+        if proposal.sensitivity not in {item.value for item in Sensitivity}:
+            return GateDecision(
+                decision="reject",
+                reason=f"未知记忆敏感度: {proposal.sensitivity}",
+                blocked_reason="unknown_sensitivity",
+            )
+
+        if proposal.evidence:
+            authority = self._policy.decide_authority(
+                proposal.memory_type,
+                [item.source_type for item in proposal.evidence],
+            )
+            if not authority.allowed:
                 return GateDecision(
                     decision="reject",
-                    reason=(
-                        f"Sensitive memory type '{proposal.memory_type}' "
-                        f"requires trusted user evidence"
-                    ),
-                    blocked_reason="blocked_by_trust_boundary",
+                    reason=f"证据来源无写入权威: {authority.reason_code}",
+                    blocked_reason=authority.reason_code,
                 )
 
-        # Rule 3: External content cannot produce user_profile/policy/agent_self
-        if self._has_only_external_evidence(proposal):
-            if proposal.memory_type in TRUST_REQUIRED_MEMORY_TYPES:
-                return GateDecision(
-                    decision="reject",
-                    reason=(
-                        f"External content cannot write '{proposal.memory_type}'"
-                    ),
-                    blocked_reason="blocked_by_external_source",
-                )
-
-        # Rule 4: Assistant reply cannot independently create/strengthen user profile
-        if self._is_pure_assistant_evidence(proposal):
-            if proposal.memory_type == MemoryType.USER_PROFILE.value:
-                return GateDecision(
-                    decision="reject",
-                    reason="Assistant reply cannot independently create user profile",
-                    blocked_reason="blocked_by_assistant_source",
-                )
-
-        # Rule 5: Durability — non-durable with no future value → reject
+        # Rule 2: Durability — non-durable with no future value → reject
         if not proposal.durable:
             return GateDecision(
                 decision="reject",
@@ -190,40 +144,4 @@ class MemoryGate:
         return GateDecision(
             decision="active",
             reason="All admission checks passed",
-        )
-
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _has_trusted_user_evidence(proposal: MemoryProposal) -> bool:
-        """Return True if any evidence item is from a trusted user source."""
-        for ev in proposal.evidence:
-            if ev.source_type in TRUSTED_SOURCE_TYPES:
-                if ev.trust_level in (
-                    TrustLevel.TRUSTED.value,
-                    TrustLevel.SEMI_TRUSTED.value,
-                ):
-                    return True
-        return False
-
-    @staticmethod
-    def _has_only_external_evidence(proposal: MemoryProposal) -> bool:
-        """Return True if ALL evidence is from external sources."""
-        if not proposal.evidence:
-            return False
-        return all(
-            ev.source_type in EXTERNAL_SOURCE_TYPES
-            for ev in proposal.evidence
-        )
-
-    @staticmethod
-    def _is_pure_assistant_evidence(proposal: MemoryProposal) -> bool:
-        """Return True if ALL evidence is from LLM replies only."""
-        if not proposal.evidence:
-            return False
-        return all(
-            ev.source_type == "llm_reply"
-            for ev in proposal.evidence
         )

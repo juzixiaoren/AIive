@@ -11,7 +11,7 @@
 |---|---|---|
 | `ContextAssembler` | ✅ | `aiive.runtime.context_assembler.ContextAssembler.assemble()`，唯一上下文组装入口 |
 | Core Memory 投影 | ✅ | `aiive.memory.core_memory_projection`（`load_core_memory` / `CoreMemoryProjection.refresh`），表 `core_memory_blocks` |
-| `AutomaticRecallEngine` | ✅ | `aiive.memory.automatic_recall.AutomaticRecallEngine.recall()`；routes：exact / fts / vector(stub) / temporal_graph(stub) / recent_episode |
+| `AutomaticRecallEngine` | ✅ | `aiive.memory.automatic_recall.AutomaticRecallEngine.recall()`；routes：exact / lexical / vector（OpenAI + pgvector）/ recent_episode；temporal_graph 未实现 |
 | `memory_search`（语义检索） | ✅（仅 MemoryRecord） | `aiive.tools.builtin_tools._handle_memory_search` → `AutomaticRecallEngine.recall(include_sleeping=True)` |
 | `memory_timeline` | ✅ | `_handle_memory_timeline`（按 id/key 取版本历史） |
 | `memory_event_log`（原始事件搜索） | ✅（仅 episodic MemoryRecord） | `_handle_memory_event_log`，对 `memory_type='episodic'` 做 ILIKE 子串匹配 |
@@ -20,11 +20,11 @@
 | Raw Turn / Event 检索接口 | ❌（无独立搜索） | 仅在 compaction 事务内 `_reconstruct_source_turns`（按 `event_manifest`）；工具侧无 `search_raw_history` |
 | MemoryRecord 默认召回过滤 | ✅ | `AutomaticRecallEngine._lifecycle_states(include_sleeping)` → 默认 `active`；expanded 模式加 `sleeping`；`archived/forgotten/candidate` 永不召回 |
 | Outbox | ✅ | `aiive.worker.outbox_job/outbox_handlers/outbox_worker/handler_registry`；allowlist `recall_config.ENABLED_OUTBOX_JOB_TYPES` |
-| P3/P4 生命周期变更通知下游 | ⚠️ 部分 | `MemoryMutationExecutor.enqueue_projection()` 会尝试入队 `memory_vector_upsert/delete` 等，但 `ProjectionCapabilities.*_enabled` 默认 False 且这些 job_type **不在 allowlist** → 实际未触发；唯一真实触发的是 `core_memory_refresh` |
+| P3/P4 生命周期变更通知下游 | ✅ | `MemoryMutationExecutor.enqueue_projection()` 只生产已有消费者的 `core_memory_refresh` 与 `retrieval_index_refresh`；未实现的向量/图投影不设开关、不创建任务 |
 | `RetrievalIndexEntry` | ❌ | **新增表** `retrieval_index_entries`（本文 D/G） |
 | `RetrievalIndexRun` | ❌ | **新增表** `retrieval_index_runs`（本文 P） |
 | `RetrievalHit` | ❌ | **新增** `retrieval/retrieval_types.py` 中的 Pydantic 模型 |
-| 语义检索/embedding | ⚠️ 占位 | `knowledge/embedding_client.py`（`FakeEmbeddingClient`，SHA-256 伪向量，**测试专用**）、`knowledge/qdrant_indexer.py`（内存版）。**与记忆无关**，且 `RecallConfig.vector_adapter_enabled=False` → 真实项目未接入向量设施 |
+| 语义检索/embedding | ⚠️ 未接入 | `knowledge/embedding_client.py`（`FakeEmbeddingClient`，SHA-256 伪向量，**测试专用**）、`knowledge/qdrant_indexer.py`（内存版）均与记忆无关；记忆召回未注册向量 adapter |
 | `source_version` | ✅ | MemoryRecord：`record_version`+`content_hash`；SegmentSummary：`summary_version`+`source_hash`；EpochCheckpoint：`version`+`source_hashes`；Event：compaction `event_content_hash`+`turn_event_index` |
 | 维护 Run 模式 | ✅ | `MemoryMaintenanceRun/Batch/Input/Action`（claim/lease/fencing/续跑），**Phase 5 索引 Run 复用同一套范式** |
 | `TokenCounter` | ✅ | `aiive.runtime.token_counter.LiteLLMTokenCounter.count_text()`；Phase 5 检索命中 `token_count` 均使用真实 TokenCounter 计算（非 `len//4`） |
@@ -101,8 +101,9 @@ AgentGraph → ContextAssembler.assemble(db, message, thread, ...)
 ## D. 当前检索技术与依赖（真实现状）
 
 - **FTS**：仅 `MemoryRecord.content.ilike(f"%{t}%")` + `canonical_key.ilike` 子串匹配（`_query_scope_text`）。**无 `to_tsvector`、无 GIN、无 `pg_trgm`、无 `tsvector` 列**。中文靠 `_tokenize_cjk_aware`（CJK 二元 + `\W+`）在 Python 侧 tokenize。
-- **向量**：`RecallConfig.vector_adapter_enabled=False`、`temporal_graph_adapter_enabled=False`。`knowledge/` 下的 Qdrant/FakeEmbedding 是文档知识库专用、测试伪实现，**未接记忆**。
-- **依赖**：`requirements` 中无 `pgvector`、无 `qdrant-client`（内存版是本地类）、无真实 embedding provider。
+- **向量**：记忆召回使用 OpenAI Embeddings + PostgreSQL pgvector；独立 `memory_vector_projections` 表通过 Outbox 最终一致维护，查询必须回源校验 scope、生命周期、版本和 Forget 状态。
+- **时序图**：仍未实现，不进入生产召回链路。
+- **依赖**：已引入 `pgvector` Python 包；本地数据库使用 `pgvector/pgvector:pg16`。知识库的 FakeEmbedding/Qdrant 不参与记忆生产路径。
 - **数据库**：Alembic head 在 `backend/alembic/versions`（如 `p4a0b1c2d3e4f_phase4_memory_maintenance.py`、`p4b2c3d4e5f6_thread_last_activity.py`）；ORM 同时兼容 Postgres（prod）与 **SQLite（测试）**。
 - **检索索引表**：无。`retrieval_runs`/`retrieval_candidates` 是**知识库文档检索**专用，非记忆检索。
 - **投影表**：`core_memory_blocks`（已存在，可重建）。无统一检索投影。
@@ -134,13 +135,13 @@ Phase 5 v1 只做**逻辑分层 + 检索投影**，不物理搬迁/删除原始�
 | 方案 | 适用性 | 本项目现状 | 结论 |
 |---|---|---|---|
 | A. PostgreSQL 原生 FTS（`tsvector`/GIN/`pg_trgm`） | 个人级、低运维、关键词为主 | 当前仅 ILIKE，无 tsvector；需新增列/索引；中文需 `pg_trgm` 或 simple+二元 | **v1 主选（便携版）** |
-| B. PostgreSQL + pgvector | 需稳定 embedding、同库事务 | `vector_adapter_enabled=False`、无 provider、无 pgvector 依赖 | v1 不启用；保留 `embedding` 列接口 |
+| B. PostgreSQL + pgvector | 需稳定 embedding、同库事务 | 无记忆向量 adapter、无 provider、无 pgvector 依赖 | v1 不启用；保留后续扩展设计 |
 | C. Qdrant 外部库 | 需外部部署 | 仅内存伪实现、未接记忆、无部署 | v1 不采用 |
 
 **最终建议（v1）**：
 1. 主方案 = **方案 A 的「应用层可移植词汇检索」变体**：在 `retrieval_index_entries` 上存一个**规范化 `search_text`**（Python 侧用 `_tokenize_cjk_aware` 生成空白分隔 token，复用 `automatic_recall` 既有函数），检索时用 `ILIKE`/trigram 在 `search_text` 上做**确定性词汇匹配**（Postgres 与 SQLite 均支持，测试不破）。
 2. 不引入 `tsvector`/GIN 到 **v1 的强制路径**（SQLite 不支持），但 `retrieval_index_entries` 预留 `tsvector` 生成列钩子（Postgres 专用迁移可选，v1 不阻塞）。
-3. **不引入 embedding / pgvector / Qdrant**（无 provider、无依赖、测试要求 SQLite 兼容）。Schema 仍保留 `embedding` 等列（nullable），为未来 hybrid 留缝，但 v1 不填充。
+3. 第二阶段新增独立 `memory_vector_projections`，生产 PostgreSQL 使用 1536 维 pgvector；SQLite 定向测试仅作类型兼容，不执行语义 SQL。OpenAI provider 通过配置启用，禁止生产使用 FakeEmbedding。
 4. 评分融合采用文档推荐的**确定性加权 + RRF**（复用 `recall_fusion` 范式），绝不不同量纲直接相加。
 
 ---
@@ -702,6 +703,8 @@ SQLite 冲突仅回滚单条插入不破坏整个事务（#12）。
   `(-final_score, source_type, source_id)`。`scope` 信号当前未接到 `RetrievalHit`（以中性
   0.5 占位，仅贡献常数基线、不影响相对排序）；文档公式中的 `lifecycle` 分量因 `RetrievalConfig`
   无对应权重而暂不计入。`retrieval_relevance_threshold` 仍为零引用（属候选过滤阈值，非融合项）。
-- `RetrievalIndexRun.failure_attempt_count` 为预留占位列，索引失败路径（`index_rebuild` /
-  `outbox_worker` 错误分支）尚未写入；如需启用需在失败重试分支累计。
+- `RetrievalIndexRun.failure_attempt_count` 已接线上报：在 `index_rebuild._mark_run_failed`
+  的持久化 UPDATE 中 `failure_attempt_count += 1`（每次真正失败落地一次）。CONTINUE 分页
+  不调用 `_mark_run_failed`，故不计入；与 `attempt_count`（仅计接管/重试获取次数）语义区分
+  清晰，符合 `RetrievalIndexRun` 模型注释约定。
 

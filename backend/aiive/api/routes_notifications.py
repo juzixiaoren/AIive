@@ -6,9 +6,10 @@ API路由模块：通知管理
 """
 import logging
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+from aiive.api.ws_manager import ws_manager
 from aiive.db.base import get_db
 from aiive.db.models import Event
 
@@ -19,6 +20,36 @@ router = APIRouter(prefix="/api")
 PENDING_STATUSES = ["pending", "alerting", "snoozed"]
 # 已执行状态：已确认、已取消
 DONE_STATUSES = ["confirmed", "cancelled"]
+
+
+def count_pending_notifications(db: Session) -> int:
+    """统计当前处于 pending 状态的通知数量。
+
+    Args:
+        db: 数据库会话
+
+    Returns:
+        pending 状态的通知数量
+    """
+    events = (
+        db.query(Event)
+        .filter(Event.event_type.in_(["notification_created", "reminder_created"]))
+        .all()
+    )
+    return sum(
+        1 for e in events
+        if not (e.payload or {}).get("dismissed")
+        and (e.payload or {}).get("status") in PENDING_STATUSES
+    )
+
+
+def broadcast_pending_count(db: Session) -> None:
+    """计算并推送最新 pending 数量到全局通知通道，供前端角标即时更新。
+
+    Args:
+        db: 数据库会话
+    """
+    ws_manager.broadcast_notification_sync(count_pending_notifications(db))
 
 
 @router.get("/notifications")
@@ -43,6 +74,7 @@ def list_notifications(
         .all()
     )
 
+    events = [e for e in events if not (e.payload or {}).get("dismissed")]
     if category == "pending":
         events = [e for e in events if (e.payload or {}).get("status") in PENDING_STATUSES]
     elif category == "done":
@@ -80,32 +112,43 @@ def delete_notification(notification_id: str, db: Session = Depends(get_db)):
     """
     from aiive.db.models import Task
 
-    event = db.get(Event, notification_id)
+    event = (
+        db.query(Event)
+        .filter(
+            Event.id == notification_id,
+            Event.event_type.in_(["notification_created", "reminder_created"]),
+        )
+        .first()
+    )
     if event is None:
-        return {"ok": False, "error": "通知不存在"}
+        raise HTTPException(status_code=404, detail="通知不存在")
 
-    task_id = (event.payload or {}).get("task_id")
-    db.delete(event)
+    payload = dict(event.payload or {})
+    task_id = payload.get("task_id")
+    payload["dismissed"] = True
+    event.payload = payload
 
-    # 同步取消关联的定时任务：否则后台调度守护进程到期仍会再次触发该提醒。
-    # 与 builtin_tools._handle_cancel_task 语义保持一致。
+    task_cancelled = False
     if task_id:
         task = db.get(Task, task_id)
-        if task is not None:
+        if task is not None and task.status in PENDING_STATUSES:
             task.status = "cancelled"
-        # 关联的 reminder_created 事件也标记为已取消，保持前端 pending 列表一致
+            task_cancelled = True
+
         related = (
             db.query(Event)
-            .filter(Event.event_type == "reminder_created")
-            .order_by(Event.created_at.desc())
-            .limit(50)
+            .filter(
+                Event.event_type == "reminder_created",
+                Event.payload["task_id"].as_string() == str(task_id),
+            )
             .all()
         )
-        for e in related:
-            if (e.payload or {}).get("task_id") == task_id:
-                p = dict(e.payload or {})
-                p["status"] = "cancelled"
-                e.payload = p
+        for related_event in related:
+            related_payload = dict(related_event.payload or {})
+            related_payload["status"] = "cancelled"
+            related_payload["dismissed"] = True
+            related_event.payload = related_payload
 
     db.commit()
-    return {"ok": True, "task_cancelled": bool(task_id)}
+    broadcast_pending_count(db)
+    return {"ok": True, "task_cancelled": task_cancelled}

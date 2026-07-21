@@ -15,9 +15,11 @@ import json
 import logging
 from typing import Any
 
+from json_repair import repair_json
 from pydantic import BaseModel, Field
 
 from aiive.core.llm_client import LLMClient
+from aiive.core.text_utils import strip_code_fence
 from aiive.memory.extraction_policy import MemorySignalAction
 
 logger = logging.getLogger(__name__)
@@ -85,15 +87,6 @@ class AgentDecision(BaseModel):
     # Memory extraction signal (model-classified, NOT keyword-based)
     memory_signal: MemorySignalDecision | None = None
 
-    def to_intent_dict(self) -> dict[str, Any]:
-        return {
-            "intent_type": self.intent_type,
-            "execution_mode": self.execution_mode,
-            "should_execute": self.should_execute,
-            "candidate_tool": self.tool_name,
-            "parse_failed": self.parse_failed,
-            "reason": self.reason,
-        }
 
 
 # ============================================================================
@@ -126,8 +119,12 @@ class ActionPlanner:
         Returns:
             MemorySignalDecision with skip/extract_async/extract_sync.
         """
-        prompt = _MEMORY_SIGNAL_PROMPT.format(
-            user_message=user_message, reply=reply
+        # 模板中含字面量 JSON 示例（裸花括号），不能用 str.format，
+        # 否则会把 JSON 里的 {...} 当成格式字段而抛 KeyError。
+        prompt = (
+            _MEMORY_SIGNAL_PROMPT
+            .replace("{user_message}", user_message)
+            .replace("{reply}", reply)
         )
         messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
 
@@ -151,13 +148,11 @@ class ActionPlanner:
     def _parse_signal(raw: str) -> MemorySignalDecision:
         """Parse model output into MemorySignalDecision."""
         try:
-            text = raw.strip()
-            for fence in ("```json", "```"):
-                if text.startswith(fence):
-                    text = text[len(fence):].strip()
-                if text.endswith("```"):
-                    text = text[:-3].strip()
-            data: dict[str, Any] = json.loads(text)
+            text = strip_code_fence(raw)
+            try:
+                data: dict[str, Any] = json.loads(text)
+            except json.JSONDecodeError:
+                data = json.loads(repair_json(text))
             action_raw = str(data.get("action", "extract_async")).lower()
             # Validate action
             valid_actions = {a.value for a in MemorySignalAction}

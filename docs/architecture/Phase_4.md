@@ -97,7 +97,7 @@
 
 ## 5. MemoryRetriever 是否更新 last_accessed_at
 
-- 召回引擎为 `AutomaticRecallEngine`（`memory/automatic_recall.py`）。所有 route（`_route_exact`/`_route_fts`/`_route_recent_episode`）只**读** `MemoryRecord`，**不写 `last_accessed_at`**（该字段本就不存在）。
+- 召回引擎为 `AutomaticRecallEngine`（`memory/automatic_recall.py`）。所有 route（`_route_exact`/`_route_lexical`/`_route_recent_episode`）只**读** `MemoryRecord`，**不写 `last_accessed_at`**（该字段本就不存在）。
 - recency 评分 `_recency_score`（:65）使用 `observed_at or updated_at or created_at`。
 - 结论：**Phase 4 新增 `last_accessed_at` 列（nullable、无默认、不历史回填）**，由新建 `MemoryAccessTracker` 负责触达（第 9 点）：**只 touch 最终实际注入上下文的 memory id**（非全部召回候选）；批量短事务、最小 touch 间隔、不更新 `record_version`、不触发投影、失败不阻断 Turn。维护冷却基准回退顺序：`last_accessed_at` → `observed_at` → `created_at`。
 - **接线点（已实现）**：`ContextAssembler` 在 hard gate 通过、组装 `AssembledContext` 返回前，仅对最终选中并注入的 `pack.items` 调 `MemoryAccessTracker.touch()`；`memory_search` 工具在返回前仅对实际返回的 memory id 调 `touch()`（Agent-Initiated Recall 属“扩大召回/高相关”，传 `include_sleeping=True`，会触达 sleeping → best-effort wake）。两条路径均只 touch 真正进入模型上下文的记录，不 touch 初筛/裁剪掉的候选。

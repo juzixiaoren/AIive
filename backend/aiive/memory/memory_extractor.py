@@ -16,6 +16,8 @@ from typing import Any
 from json_repair import repair_json
 from pydantic import BaseModel, Field
 
+from aiive.core.text_utils import strip_code_fence
+
 from aiive.core.llm_client import LLMClient, LLMResponse
 from aiive.memory.memory_types import MEMORY_KEY_GUIDE, MemoryProposal, TrustLevel
 from aiive.memory.proposal_normalizer import ProposalNormalizer, NormalizationResult
@@ -102,6 +104,8 @@ class UnifiedMemoryExtractor:
         reply: str,
         trace_id: str | None = None,
         thread_id: str = "",
+        source_event_ids: list[str] | None = None,
+        assistant_event_ids: list[str] | None = None,
     ) -> list[MemoryProposal]:
         """Extract memories from a single conversation turn.
 
@@ -110,6 +114,13 @@ class UnifiedMemoryExtractor:
             reply: Assistant's reply.
             trace_id: Trace ID for logging.
             thread_id: Thread ID for scope inference.
+            source_event_ids: 当前 Turn 中已持久化的真实 Event.id 列表，
+                作为记忆的精确 provenance。未提供时退回 ``[trace_id]``，
+                此兜底场景下不会把 trace_id 作为 evidence 的 source_event_id
+                落库（仅保留 span 证据），避免污染 provenance。
+            assistant_event_ids: 属于 assistant 回复事件的 Event.id 列表，
+                其中的事件会被标记为 llm_reply 而非 user_message，使 provenance
+                语义更精确。仅供已确定真实 llm_response Event.id 的同步抽取路径使用。
 
         Returns:
             List of normalized MemoryProposal.
@@ -128,7 +139,11 @@ class UnifiedMemoryExtractor:
             return []
 
         extracted: list[ExtractedMemory] = self._parse(response.content)
-        return self._normalize_all(extracted, thread_id, trace_id)
+        return self._normalize_all(
+            extracted, thread_id, trace_id,
+            source_event_ids=source_event_ids,
+            assistant_event_ids=assistant_event_ids,
+        )
 
     # ------------------------------------------------------------------
     # Parsing
@@ -137,14 +152,7 @@ class UnifiedMemoryExtractor:
     def _parse(self, raw: str) -> list[ExtractedMemory]:
         """Parse LLM raw output into ExtractedMemory list."""
         try:
-            text = raw.strip()
-            if not text:
-                return []
-            for fence in ("```json", "```"):
-                if text.startswith(fence):
-                    text = text[len(fence):].strip()
-                if text.endswith("```"):
-                    text = text[:-3].strip()
+            text = strip_code_fence(raw)
             if not text:
                 return []
             try:
@@ -184,18 +192,57 @@ class UnifiedMemoryExtractor:
         extracted: list[ExtractedMemory],
         thread_id: str,
         trace_id: str | None = None,
+        source_event_ids: list[str] | None = None,
+        assistant_event_ids: list[str] | None = None,
     ) -> list[MemoryProposal]:
         """Normalize all extracted items through ProposalNormalizer.
 
         Each proposal receives a unique idempotency key based on
-        trace_id + proposal_index to prevent batch collisions.
+        source_event_ids + proposal_index to prevent batch collisions.
+
+        证据构建规则：span 与真实事件 id 互补。当调用方提供真实
+        ``source_event_ids`` 时，逐事件建 evidence（``assistant_event_ids``
+        中的事件标为 ``llm_reply``，其余为 ``user_message``），并把
+        ``source_span`` 附到首个 user_message 证据项；未提供真实事件时退回
+        ``[trace_id]`` 且仅保留 span 证据（不落库伪 source_event_id）。
         """
-        source_event_ids: list[str] = [trace_id] if trace_id else []
+        # 区分调用方提供的真实 Event.id 与 trace_id 兜底：只有真实事件才允许
+        # 作为 evidence 的 source_event_id 落库（trace_id 不是真实 Event，
+        # 落库会污染 provenance 且无法与 Event 表 JOIN）。
+        has_real_events = bool(source_event_ids)
+        if not source_event_ids:
+            source_event_ids = [trace_id] if trace_id else []
+        assistant_set = set(assistant_event_ids or [])
         results: list[MemoryProposal] = []
         for i, em in enumerate(extracted):
-            # Build evidence
+            # 构建 evidence：span 与真实事件 id 互补而非互斥。
+            # - 有真实事件：逐事件建 evidence（user→user_message、assistant→llm_reply），
+            #   并把 source_span 附到首个 user_message 证据项，保证 span 与事件关联。
+            # - 无真实事件（trace_id 兜底）：退回仅含 span 的旧行为，不写入伪 source_event_id。
             evidence: list[dict[str, Any]] = []
-            if em.source_span:
+            if has_real_events:
+                span_attached = False
+                for seid in source_event_ids:
+                    is_assistant = seid in assistant_set
+                    item: dict[str, Any] = {
+                        "source_event_id": seid,
+                        "source_type": "llm_reply" if is_assistant else "user_message",
+                        "trust_level": TrustLevel.TRUSTED.value,
+                        "relation": "supports",
+                    }
+                    if em.source_span and not is_assistant and not span_attached:
+                        item["content_span"] = em.source_span
+                        span_attached = True
+                    evidence.append(item)
+                # 无 user_message 事件承载 span 时，追加独立 span 证据项兜底。
+                if em.source_span and not span_attached:
+                    evidence.append({
+                        "source_type": "user_message",
+                        "trust_level": TrustLevel.TRUSTED.value,
+                        "relation": "supports",
+                        "content_span": em.source_span,
+                    })
+            elif em.source_span:
                 evidence.append({
                     "source_type": "user_message",
                     "trust_level": TrustLevel.TRUSTED.value,
@@ -212,6 +259,7 @@ class UnifiedMemoryExtractor:
                 trust_level=TrustLevel.TRUSTED.value,
                 evidence=evidence,
                 source_event_ids=source_event_ids,
+                assistant_event_ids=assistant_event_ids,
                 extractor_name="UnifiedMemoryExtractor",
                 extractor_version="1.0",
                 thread_id=thread_id,

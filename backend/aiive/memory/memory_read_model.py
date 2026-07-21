@@ -16,6 +16,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from aiive.db.models import MemoryRecord
+from aiive.memory.memory_policy import MemoryPolicyEngine, MemoryReadChannel
 from aiive.memory.memory_store import MemoryStore
 
 
@@ -41,16 +42,13 @@ class RuntimeIdentity:
             result["agent_runtime_id"] = self.agent_runtime_id
         if self.user_display_name:
             result["user_display_name"] = self.user_display_name
+        if self.user_name:
+            result["user_name"] = self.user_name
         if self.relationship_style:
             result["relationship_style"] = self.relationship_style
+        if self.response_style:
+            result["response_style"] = self.response_style
         return result
-
-    def is_empty(self) -> bool:
-        return not any([
-            self.agent_display_name,
-            self.user_display_name,
-            self.user_name,
-        ])
 
 
 class MemoryReadModel:
@@ -64,6 +62,7 @@ class MemoryReadModel:
 
     def __init__(self, store: MemoryStore) -> None:
         self._store: MemoryStore = store
+        self._policy = MemoryPolicyEngine()
 
     # ------------------------------------------------------------------
     # Runtime Identity
@@ -81,20 +80,25 @@ class MemoryReadModel:
         )
 
         for rec in records:
+            content = self._policy.render_content(
+                rec.content, rec.sensitivity, MemoryReadChannel.LLM_CONTEXT,
+            )
+            if content is None:
+                continue
             if rec.canonical_key == "agent.display_name":
-                identity.agent_display_name = rec.content
+                identity.agent_display_name = content
             elif rec.canonical_key == "user.display_name":
-                identity.user_display_name = rec.content
+                identity.user_display_name = content
             elif rec.canonical_key == "user.name":
-                identity.user_name = rec.content
+                identity.user_name = content
                 if not identity.user_display_name:
-                    identity.user_display_name = rec.content
+                    identity.user_display_name = content
             elif rec.canonical_key == "agent.persona.relationship":
-                identity.relationship_style = rec.content
+                identity.relationship_style = content
             elif rec.canonical_key == "agent.persona.tone":
-                identity.response_style = rec.content
+                identity.response_style = content
             elif rec.canonical_key == "user.preference.response_style":
-                identity.response_style = rec.content
+                identity.response_style = content
 
         return identity
 
@@ -105,8 +109,16 @@ class MemoryReadModel:
     def resolve_policies(self) -> list[dict[str, Any]]:
         """Resolve policy records via exact 'policy' context role keys."""
         policy_records = self._store.get_by_context_roles(["policy"])
-        return [
-            {"id": r.id, "content": r.content, "key": r.canonical_key,
-             "importance": r.importance or 0.5}
-            for r in policy_records
-        ]
+        result: list[dict[str, Any]] = []
+        for record in policy_records:
+            content = self._policy.render_content(
+                record.content, record.sensitivity, MemoryReadChannel.LLM_CONTEXT,
+            )
+            if content is not None:
+                result.append({
+                    "id": record.id,
+                    "content": content,
+                    "key": record.canonical_key,
+                    "importance": record.importance or 0.5,
+                })
+        return result

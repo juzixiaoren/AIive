@@ -1,7 +1,15 @@
 """Phase 3: EpochManager 单元测试（测试矩阵 31/32/33/47/57/58/64/69）。"""
 from __future__ import annotations
 
-from aiive.db.models import CompactionInput, Epoch, EpochCompactionInput, Segment
+import uuid
+
+from aiive.db.models import (
+    CompactionInput,
+    ContextSnapshot,
+    Epoch,
+    EpochCompactionInput,
+    Segment,
+)
 from aiive.runtime.compaction import derive_unresolved_failures
 from aiive.runtime.epoch_manager import (
     EpochManager,
@@ -172,3 +180,62 @@ def test_69_failed_only_terminal_segment_sealable(db):
     failures = derive_unresolved_failures(db, seg.id)
     assert len(failures) == 1
     assert failures[0]["tool_call_id"] == "tc_fail"
+
+
+def _add_snapshot(db, thread_id, turn_sequence, retention):
+    snap = ContextSnapshot(
+        trace_id=str(uuid.uuid4()),
+        thread_id=thread_id,
+        stable_prefix_hash="",
+        turn_sequence=turn_sequence,
+        retention=retention,
+    )
+    db.add(snap)
+    db.flush()
+    return snap
+
+
+def test_sealing_promotes_current_snapshot_to_audit(db):
+    """Segment 密封时，current 快照晋升为 audit（Phase 1 §14.5）。"""
+    thread = new_thread(db)
+    epoch = new_epoch(db, thread.id)
+    seg = new_segment(db, epoch.id, thread.id)
+    add_turn(db, thread.id, seg.id, 1)
+    add_turn(db, thread.id, seg.id, 2)
+    _add_snapshot(db, thread.id, 2, "current")
+    db.commit()
+
+    mgr = EpochManager()
+    mgr.begin_segment_sealing(db, thread.id, seg.id)
+    db.commit()
+
+    snaps = db.query(ContextSnapshot).filter(
+        ContextSnapshot.thread_id == thread.id,
+    ).all()
+    audit = [s for s in snaps if s.retention == "audit"]
+    current = [s for s in snaps if s.retention == "current"]
+    assert len(audit) == 1
+    assert len(current) == 0
+
+
+def test_audit_snapshots_capped_at_max(db):
+    """审计快照上限：密封时超过 MAX_AUDIT_SNAPSHOTS 的最旧快照被裁剪。"""
+    from aiive.runtime.epoch_manager import MAX_AUDIT_SNAPSHOTS
+    thread = new_thread(db)
+    epoch = new_epoch(db, thread.id)
+    seg = new_segment(db, epoch.id, thread.id)
+    add_turn(db, thread.id, seg.id, 1)
+    for i in range(MAX_AUDIT_SNAPSHOTS):
+        _add_snapshot(db, thread.id, i + 1, "audit")
+    _add_snapshot(db, thread.id, MAX_AUDIT_SNAPSHOTS + 1, "current")
+    db.commit()
+
+    mgr = EpochManager()
+    mgr.begin_segment_sealing(db, thread.id, seg.id)
+    db.commit()
+
+    audit = db.query(ContextSnapshot).filter(
+        ContextSnapshot.thread_id == thread.id,
+        ContextSnapshot.retention == "audit",
+    ).all()
+    assert len(audit) == MAX_AUDIT_SNAPSHOTS

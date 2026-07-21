@@ -52,11 +52,20 @@ class ModelProfile:
 
     @classmethod
     def from_config(cls, provider: str, model_id: str) -> "ModelProfile":
+        """按 provider/model 构建 profile。
+
+        context_window 与 max_output_tokens 从应用配置读取，与 ContextBudget
+        使用同一基准，保证 token 安全校验与分区预算一致。
+        """
+        from aiive.config import settings
+
         full = f"{provider}/{model_id}"
         return cls(
             provider=provider,
             model_id=model_id,
             full_name=full,
+            context_window=settings.aiive_llm_context_window,
+            max_output_tokens=settings.aiive_llm_max_output_tokens,
         )
 
 

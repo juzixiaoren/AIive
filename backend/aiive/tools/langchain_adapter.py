@@ -9,9 +9,9 @@ RunContext 通过 _make_handler 闭包捕获，经由 registry.execute() 注入 
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
-from langchain_core.tools import StructuredTool
+from langchain_core.tools import InjectedToolCallId, StructuredTool
 from pydantic import Field
 
 from aiive.context.run_context import RunContext
@@ -33,11 +33,14 @@ def _make_handler(registry: ToolRegistry, capability_id: str, run_context: RunCo
         一个可调用函数，签名为 (**params) -> str
     """
 
-    def handler(**params: object) -> str:
+    def handler(tool_call_id: str = "", **params: object) -> str:
         import logging
         _log = logging.getLogger(__name__)
         _log.info("[TRACE:langchain] CALL tool=%s params=%s", capability_id, params)
-        result = registry.execute(capability_id, params, "trusted_user_command", run_context)
+        result = registry.execute(
+            capability_id, params, "trusted_user_command", run_context,
+            tool_call_id=tool_call_id,
+        )
         _log.info("[TRACE:langchain] RESULT tool=%s ok=%s result_type=%s", capability_id, result.get("ok"), type(result).__name__)
         if not result.get("ok"):
             err = result.get("error", "Any error")
@@ -46,14 +49,24 @@ def _make_handler(registry: ToolRegistry, capability_id: str, run_context: RunCo
             import json
 
             return json.dumps(
-                {"ok": False, "error": err, "error_type": result.get("error_type", "execution_failed")},
+                {
+                    "ok": False,
+                    "error": err,
+                    "error_type": result.get("error_type", "execution_failed"),
+                    "execution_status": result.get("execution_status", "failed"),
+                    "operation_id": result.get("operation_id", ""),
+                },
                 ensure_ascii=False,
             )
         inner = result.get("result", result)
         if isinstance(inner, dict):
             import json
 
-            return json.dumps(inner, ensure_ascii=False)
+            payload = dict(inner)
+            if result.get("operation_id"):
+                payload["operation_id"] = result["operation_id"]
+                payload["execution_status"] = result.get("execution_status", "committed")
+            return json.dumps(payload, ensure_ascii=False)
         return str(inner)
 
     return handler
@@ -113,7 +126,7 @@ def build_langchain_tools(
             func=_make_handler(registry, cap_id, run_context),
             name=cap_id,
             description=desc,
-            args_schema=_build_empty_args_schema(cap_id) if not args_schema else _build_args_schema(cap_id, args_schema),
+            args_schema=_build_args_schema(cap_id, args_schema, inject_tool_call_id=True),
             return_direct=False,
         )
         tools.append(tool)
@@ -147,7 +160,11 @@ def _build_empty_args_schema(name: str) -> type:
     return create_model(f"{name}_args", __base__=BaseModel)
 
 
-def _build_args_schema(name: str, fields: dict[str, tuple[type, str]]) -> type:
+def _build_args_schema(
+    name: str,
+    fields: dict[str, tuple[type, str]],
+    inject_tool_call_id: bool = False,
+) -> type:
     """为工具参数构建 Pydantic 模型（用于 LangChain args_schema）。
 
     参数:
@@ -173,5 +190,7 @@ def _build_args_schema(name: str, fields: dict[str, tuple[type, str]]) -> type:
             field_defs[fname] = (str, Field(default="", description=fdesc))
         else:
             field_defs[fname] = (ftype, Field(default=None, description=fdesc))
+    if inject_tool_call_id:
+        field_defs["tool_call_id"] = (Annotated[str, InjectedToolCallId], "")
 
     return create_model(f"{name}_args", **field_defs)

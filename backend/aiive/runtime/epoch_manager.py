@@ -19,6 +19,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from aiive.db.models import (
+    ContextSnapshot,
     Epoch,
     EpochCompactionInput,
     OutboxJob,
@@ -37,6 +38,9 @@ logger = logging.getLogger(__name__)
 
 # 阻断密封的非终态 Turn
 NON_TERMINAL_TURN_STATUSES = {"not_started", "running", "interrupted_unknown"}
+
+# 审计快照保留上限（Phase 1 §14.5 / Phase_1.md 保留约束：audit≤5）
+MAX_AUDIT_SNAPSHOTS = 5
 
 
 class SegmentNotSealableError(Exception):
@@ -278,6 +282,9 @@ class EpochManager:
         segment.end_turn_sequence = end_seq
         segment.source_hash = source_hash
 
+        # 5.5 边界审计快照：密封时将当前 current 快照晋升为 audit（Phase 1 §14.5）
+        self._promote_current_snapshot_to_audit(db, thread_id)
+
         # 6. segment_sealing OutboxJob
         operation_id = f"segment_sealing:{segment.id}:{source_hash}:{ci.summary_version}"
         job = OutboxJob(
@@ -319,6 +326,43 @@ class EpochManager:
             successor_id = successor.id
 
         return segment.id, ci.id, successor_id
+
+    def _promote_current_snapshot_to_audit(
+        self, db: Session, thread_id: str,
+    ) -> None:
+        """密封边界处将当前 current 快照晋升为 audit 并裁剪超额审计快照。
+
+        实现 Phase 1 §14.5：Epoch/Segment 密封时，当前 current 快照标记为
+        retention="audit"，作为不可变边界审计留存。晋升后本线程暂无 current
+        快照，下一个 Turn 的快照轮换会自然重建。审计快照按 turn_sequence 保留
+        最新 MAX_AUDIT_SNAPSHOTS 条，超出的最旧快照删除。
+        """
+        current = (
+            db.query(ContextSnapshot)
+            .filter(
+                ContextSnapshot.thread_id == thread_id,
+                ContextSnapshot.retention == "current",
+            )
+            .first()
+        )
+        if current is None:
+            return
+
+        current.retention = "audit"
+        db.flush()
+
+        audit_excess = (
+            db.query(ContextSnapshot)
+            .filter(
+                ContextSnapshot.thread_id == thread_id,
+                ContextSnapshot.retention == "audit",
+            )
+            .order_by(ContextSnapshot.turn_sequence.desc())
+            .offset(MAX_AUDIT_SNAPSHOTS)
+            .all()
+        )
+        for snap in audit_excess:
+            db.delete(snap)
 
     # =====================================================================
     # Phase 3: 普通 Segment 密封

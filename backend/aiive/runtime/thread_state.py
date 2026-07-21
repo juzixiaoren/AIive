@@ -191,70 +191,103 @@ class ThreadState:
                 msgs.append({"role": "tool", "content": tr_str})
         return msgs
 
-    # ── Legacy methods ──
+    # ── 前端历史分页 ──
 
-    def get_recent_messages(
-        self, thread_id: str, max_turns: int = 20,
-        limit: int | None = None,
-    ) -> list[dict[str, Any]]:
-        """合并新 Turn 和旧 Turn 事件。
-
-        limit: backward-compat, overrides max_turns when smaller.
-        """
-        effective_max = max_turns
-        if limit is not None and limit < effective_max:
-            effective_max = limit
-        """合并新 Turn (turn_id NOT NULL) 和旧 Turn (turn_id IS NULL) 的事件。
-
-        排序: 每组计算 sort_key = (earliest_created_at, turn_sequence 或 MAX_BIGINT)
-        按 sort_key 取最后 max_turns 组（最近），保持时间正序。
-        """
-        # ── 新 Turn: 按 turn_sequence DESC 取最近 completed Turn ──
-        new_turns = (
-            self._db.query(TurnRecord)
-            .filter(
-                TurnRecord.thread_id == thread_id,
-                TurnRecord.status == "completed",
-            )
-            .order_by(TurnRecord.turn_sequence.desc())
-            .limit(effective_max * 2)
-            .all()
+    def list_thread_messages_page(
+        self,
+        thread_id: str,
+        page_size: int = 50,
+        before_sequence: int | None = None,
+    ) -> dict[str, Any]:
+        """按 Turn keyset 分页返回前端展示消息，不参与 LLM 上下文选择。"""
+        size = max(1, min(page_size, 100))
+        query = self._db.query(TurnRecord).filter(
+            TurnRecord.thread_id == thread_id,
+            TurnRecord.status == "completed",
         )
-        new_turns_asc = list(reversed(new_turns))
+        if before_sequence is not None:
+            query = query.filter(TurnRecord.turn_sequence < before_sequence)
+        turns_desc = query.order_by(TurnRecord.turn_sequence.desc()).limit(size + 1).all()
+        has_more = len(turns_desc) > size
+        selected_desc = turns_desc[:size]
 
-        new_groups: list[tuple[tuple[Any, int], list[dict[str, Any]]]] = []
-        for turn in new_turns_asc:
+        messages: list[dict[str, Any]] = []
+        for turn in reversed(selected_desc):
             events = (
                 self._db.query(Event)
                 .filter(
                     Event.thread_id == thread_id,
                     Event.turn_id == turn.turn_id,
-                    Event.event_type.in_([
-                        "user_message", "tool_call", "tool_result", "llm_response",
-                    ]),
+                    Event.event_type.in_(["user_message", "tool_call", "tool_result", "llm_response"]),
                 )
-                .order_by(Event.turn_event_index.asc())
+                .order_by(Event.turn_event_index.asc(), Event.created_at.asc(), Event.id.asc())
                 .all()
             )
-            if events:
-                earliest = events[0].created_at
-                sort_key = (earliest, turn.turn_sequence)
-                new_groups.append((sort_key, self._events_to_dicts(events)))
+            messages.extend(self._events_to_display_messages(events))
 
-        # ── 旧 Turn: by user_message boundary ──
-        legacy_groups = self._query_legacy_groups(thread_id, effective_max * 3)
+        # 到达新 Turn 历史末端时，继续拼接旧版 turn_id=NULL 事件。
+        if not has_more:
+            legacy_groups = self._query_legacy_groups(thread_id, size)
+            legacy_items = [item for _, group in legacy_groups for item in group]
+            legacy_messages = [
+                {
+                    "role": item["type"],
+                    "content": item.get("content", ""),
+                    "event_id": item.get("event_id", ""),
+                    "trace_id": item.get("trace_id", ""),
+                    "action_cards": item.get("action_cards", []),
+                    "tool_calls": [],
+                }
+                for item in legacy_items
+                if item.get("type") in ("user", "assistant") and item.get("content")
+            ]
+            messages = legacy_messages + messages
 
-        # ── 合并排序 ──
-        all_groups = legacy_groups + new_groups
-        all_groups.sort(key=lambda g: g[0])
+        next_cursor = selected_desc[-1].turn_sequence if has_more and selected_desc else None
+        return {"messages": messages, "next_cursor": next_cursor, "has_more": has_more}
 
-        # ── 取最后 effective_max 个（最近）──
-        selected = all_groups[-effective_max:] if len(all_groups) > effective_max else all_groups
-
-        result: list[dict[str, Any]] = []
-        for _, events in selected:
-            result.extend(events)
-        return result
+    @staticmethod
+    def _events_to_display_messages(events: list[Event]) -> list[dict[str, Any]]:
+        """把单个 Turn 的事件聚合为前端消息，并把工具事实挂到 Assistant 消息。"""
+        messages: list[dict[str, Any]] = []
+        calls: list[dict[str, Any]] = []
+        call_by_id: dict[str, dict[str, Any]] = {}
+        for event in events:
+            payload = event.payload or {}
+            if event.event_type == "user_message" and payload.get("content"):
+                messages.append({
+                    "role": "user", "content": payload["content"],
+                    "event_id": event.id, "trace_id": event.trace_id,
+                    "action_cards": [], "tool_calls": [],
+                })
+            elif event.event_type == "tool_call":
+                call = {
+                    "tool_call_id": payload.get("tool_call_id", ""),
+                    "name": payload.get("name", ""),
+                    "params": payload.get("params", {}),
+                    "status": "pending",
+                    "result": None,
+                }
+                calls.append(call)
+                if call["tool_call_id"]:
+                    call_by_id[str(call["tool_call_id"])] = call
+            elif event.event_type == "tool_result":
+                call_id = str(payload.get("tool_call_id", "") or "")
+                call = call_by_id.get(call_id)
+                if call is None:
+                    call = next((item for item in reversed(calls) if item["name"] == payload.get("name") and item["status"] == "pending"), None)
+                if call is not None:
+                    call["status"] = payload.get("status", "completed")
+                    call["result"] = payload.get("result")
+            elif event.event_type == "llm_response" and payload.get("content"):
+                messages.append({
+                    "role": "assistant", "content": payload["content"],
+                    "event_id": event.id, "trace_id": event.trace_id,
+                    "action_cards": payload.get("action_cards", []),
+                    "pending_operations": payload.get("pending_operations", []),
+                    "tool_calls": calls,
+                })
+        return messages
 
     def _query_legacy_groups(
         self, thread_id: str, overscan: int,

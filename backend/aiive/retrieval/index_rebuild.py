@@ -350,6 +350,10 @@ def _mark_run_failed(run_id: str, execution_token: str, error: str) -> None:
             RetrievalIndexRun.execution_token: None,
             RetrievalIndexRun.error_message: error[:500],
             RetrievalIndexRun.completed_at: datetime.now(timezone.utc),
+            # 真正失败重试一次即累计一次（CONTINUE 分页不调用本函数，故不计入）。
+            RetrievalIndexRun.failure_attempt_count: (
+                RetrievalIndexRun.failure_attempt_count + 1
+            ),
         }, synchronize_session=False)
         db_m.commit()
         if affected == 0:

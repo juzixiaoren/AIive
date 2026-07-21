@@ -21,7 +21,7 @@
 | 层级 | 名称 | 触发时机 | 检索范围 | 输出形式 |
 |------|------|---------|---------|---------|
 | L1 | Core Memory Projection | 每次对话开始，加载 Thread State 后 | `core_memory_role` 分桶的静态记忆块（human_identity / interaction_defaults / agent_persona） | System Contract 中的压缩记忆块（3 block / 600 token） |
-| L2 | Automatic Recall | 收到用户消息后、首次 LLM 推理前 | `AutomaticRecallEngine` 5 路由检索 + RRF 融合 + 信号加权 | 标注为 MemoryObservation 的少量高相关记忆进上下文 |
+| L2 | Automatic Recall | 收到用户消息后、首次 LLM 推理前 | `UnifiedRetriever` 编排，`AutomaticRecallEngine` 提供 exact / lexical / episode 三条生产路由并参与融合 | 标注为 MemoryObservation 的少量高相关记忆进上下文 |
 | L3 | Agent-Initiated Recall | LLM 推理中主动调用工具 | `memory.search` / `memory.get` / `memory.timeline` / `memory.search_events` / `memory.related` | 工具返回结果，RunContext 闭包注入 |
 
 ### 2.2 完整调用链
@@ -42,10 +42,10 @@
 |------|------|
 | `memory_key_registry.py` | 规范键注册表，映射 `canonical_key` → `core_memory_role` |
 | `memory_read_model.py` | L1 核心记忆读取，`resolve_identity()` + `resolve_policies()` |
-| `recall_engine.py` | L2 自动召回引擎，5 路由 + RRF 融合 + 信号加权 |
+| `automatic_recall.py` | L2 记忆召回引擎，exact / lexical / episode 路由 + RRF 融合 + 信号加权 |
 | `recall_models.py` | L2 召回请求/响应模型 |
-| `memory_store.py` | 记忆持久化存储（Exact/FTS/Vector/Temporal/Episode） |
-| `agent_graph.py` | LangGraph 主图，编排 L1→L2→LLM→L3 流程 |
+| `memory_store.py` | 记忆持久化存储 |
+| `runtime/context_assembler.py` | 上下文装配并通过 `UnifiedRetriever` 编排 L2 召回 |
 | `builtin_tools.py` | L3 工具注册（memory.search/get/timeline 等），RunContext 注入 |
 
 ---
@@ -62,7 +62,7 @@
 
 ### 缺口 B：L2 召回请求缺少意图信号
 
-`agent_graph.py` 构造 `MemoryRecallRequest` 时，`active_goal` 和 `thread_summary` 字段均为 `None`，L2 自动召回缺少当前对话目标/摘要等关键信号。
+该历史版本构造 `MemoryRecallRequest` 时未提供有效的对话目标信号，L2 自动召回缺少当前对话目标等关键信号。当前实现已用 thread 标题填充 `active_goal`；未被生产消费的 `thread_summary` 预留字段已删除。
 
 **影响**：自动召回可能不够精准，无法利用 thread 级别的上下文信息。
 
@@ -114,7 +114,7 @@ request = MemoryRecallRequest(
 | 场景 | 数据流路径 | 结论 |
 |------|-----------|------|
 | 初次对话 | main → agent_graph → L1 Core Projection → L2 Automatic Recall → LLM | ✅ 走通，无旧批量注入 |
-| 对话中召回 | 消息到达 → AutomaticRecallEngine 5 路由(RRF 融合) → MemoryObservation 进上下文 | ✅ 走通，Scope Chain 约束生效 |
+| 对话中召回 | 消息到达 → UnifiedRetriever → AutomaticRecallEngine 三条生产路由（RRF 融合）→ MemoryObservation 进上下文 | ✅ 走通，Scope Chain 约束生效 |
 | 主动工具召回 | LLM 调 `memory.search/get/timeline/...` → RunContext 闭包注入 → 深度召回 | ✅ 走通，RunContext 不暴露给 LLM schema |
 
 ### 确认无旧逻辑残留
@@ -249,10 +249,10 @@ tests/unit/backend/test_memory_write_service.py 9 passed
 
 ## 十二、总结
 
-- **验证结论**：三重召回（L1/L2/L3）架构已完整落地，调用链自 `main` 到 LLM 全路径畅通。
+- **验证结论**：三重召回（L1/L2/L3）分层和主要调用链已落地；L2 的生产能力范围为 exact / lexical / episode。
 - **补齐缺口**：注册 `default_language` 键、填充 L2 召回意图字段（`active_goal`）。
 - **额外修复**：Proposal 批次幂等键冲突问题，确保多 proposal 的 idempotency_key 唯一。
 - **清理死代码**：删除 5 处旧路径/死类/死别名，测试同步更新。
 - **测试验证**：直接相关 14/14 全部通过，全量 279/315 通过（36 个失败为预存问题），lint 零告警。
 - **文档同步**：新增架构文档 + 本修复报告，drift report 与设计文档对齐。
-- **遗留**：`thread_summary` LLM 生成、`Vector/Temporal Graph` 真实检索为后续待办，不影响当前链路可用性。
+- **遗留**：更丰富的 thread 目标摘要、`Vector/Temporal Graph` 真实检索为后续待办，不影响当前链路可用性。

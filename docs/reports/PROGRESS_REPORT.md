@@ -58,7 +58,7 @@ frontend/
 └── src/
     ├── App.tsx
     ├── pages/ChatPage.tsx     # 浅色主题 Chat 页面
-    ├── api/chat.ts            # sendMessage() API 封装
+    ├── api/chat.ts            # 流式聊天、线程历史与审批 API 封装
     └── ...
 
 tests/unit/backend/            # 15 个测试文件，149 tests

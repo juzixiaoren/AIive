@@ -89,18 +89,22 @@ class RetrievalIndexManager:
     def activate_generation(self, db: Session, index_version: int) -> None:
         """原子激活：将目标置 active，其余 active/retired 之间切换。"""
         now = datetime.now(timezone.utc)
-        # 旧 active -> retired
+        # 旧 active -> retired（同时记录 status_changed_at）
         db.query(RetrievalIndexGeneration).filter(
             RetrievalIndexGeneration.status == "active",
             RetrievalIndexGeneration.index_version != index_version,
-        ).update({RetrievalIndexGeneration.status: "retired"}, synchronize_session=False)
-        # 目标 -> active
+        ).update({
+            RetrievalIndexGeneration.status: "retired",
+            RetrievalIndexGeneration.status_changed_at: now,
+        }, synchronize_session=False)
+        # 目标 -> active（同时记录 status_changed_at）
         db.query(RetrievalIndexGeneration).filter(
             RetrievalIndexGeneration.index_version == index_version,
         ).update({
             RetrievalIndexGeneration.status: "active",
             RetrievalIndexGeneration.activated_at: now,
             RetrievalIndexGeneration.build_completed_at: now,
+            RetrievalIndexGeneration.status_changed_at: now,
         }, synchronize_session=False)
         db.flush()
 

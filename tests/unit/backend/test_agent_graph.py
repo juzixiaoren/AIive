@@ -383,6 +383,32 @@ class TestGraphFlow:
         assert "张三" in str(final.content) or len(str(final.content)) > 0
 
 
+class TestToolRecordState:
+    """测试同步与流式共用的 Graph 工具事实转换。"""
+
+    def test_state_records_preserve_ids_batches_and_order(self):
+        """转换器应保留调用 ID、批次并生成稳定全局顺序。"""
+        from aiive.runtime.agent_graph import AgentGraph
+
+        records = AgentGraph._tool_records_from_state([
+            {
+                "tool_call_id": "call-1", "batch_index": 0, "name": "first",
+                "params": {"x": 1}, "result": {"ok": True, "result": "one"},
+                "status": "completed",
+            },
+            {
+                "tool_call_id": "call-2", "batch_index": 1, "name": "second",
+                "params": {"x": 2}, "result": {"ok": False, "result": "two"},
+                "status": "failed",
+            },
+        ])
+
+        assert [record.tool_call_id for record in records] == ["call-1", "call-2"]
+        assert [record.batch_index for record in records] == [0, 1]
+        assert [record.order_index for record in records] == [0, 1]
+        assert records[1].status == "failed"
+
+
 class TestLangchainAdapter:
     """测试 langchain_adapter 能创建有效的 LangChain 工具。"""
 

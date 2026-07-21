@@ -161,11 +161,11 @@ for char in cleaned_text:
 ### 4.4 确认/延时提醒走「自然语言 → LLM 自主决策调工具」（已修复）
 设计正确，不应增加专用端点：前端点击「确认/延时」时自动向 Chat 发送自然语言（如 `确认提醒 <id>`、`延时提醒 <id> N 分钟`），由 LLM 通过 `ActionPlanner` 判定为 `tool_call` 并调用 `confirm_reminder` / `snooze_reminder` 工具。后端工具、schema 注入、ToolExecutor 均支持该路径。原审查中「建议增加专用端点」结论已推翻。
 
-修复项（2026-07-09）：
-- **前端接线**：`NotificationsPage` 为 `alerting` 状态提醒渲染「确认 / 延时 N 分钟」按钮，点击调用 `confirmReminder` / `snoozeReminder`（`chat.ts`）。
-- **清除直调残留**：`_handle_remind_alert` 不再返回 `actions`（工具名+参数），`build_action_cards` 也不再透传，避免绕过 LLM 直调工具。
-- **体验**：`confirmReminder` / `snoozeReminder` 改用流式 `/api/chat/stream`、复用原 `thread_id`（通知接口已返回 `thread_id`），操作完成后刷新列表并展示 LLM 回复。
-- **可靠性**：`PLANNER_PROMPT` 增加 `确认提醒/延时提醒 → confirm_reminder/snooze_reminder` 示例，确保被 `tool_executor._validate_against_decision` 放行而非拦截。
+当前实现：
+- **前端接线**：`ChatPage` 的提醒卡片渲染确认和延时按钮，由 `handleReminderAction` 统一处理。
+- **调用路径**：按钮把隐藏系统指令发送到 `/api/chat/system`，仍由 LLM 决定调用 `confirm_reminder` / `snooze_reminder`，不绕过 ToolRegistry。
+- **清理结果**：旧的 `confirmReminder` / `snoozeReminder` 前端包装函数已删除，避免普通聊天流与系统指令流两套约定并存。
+- **可靠性**：`PLANNER_PROMPT` 包含 `确认提醒/延时提醒 → confirm_reminder/snooze_reminder` 示例，确保工具调用通过策略校验。
 
 ### 4.5 每次 outbox 任务都新建 LLMClient
 `backend/aiive/worker/outbox_handlers.py:11-17`

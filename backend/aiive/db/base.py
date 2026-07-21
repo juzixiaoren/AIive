@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 engine = create_engine(
     settings.database_url,
     pool_pre_ping=True,
+    pool_size=settings.db_pool_size,
+    max_overflow=settings.db_max_overflow,
+    pool_timeout=settings.db_pool_timeout_seconds,
+    pool_recycle=settings.db_pool_recycle_seconds,
 )
 # 创建线程安全的会话工厂，绑定到引擎
 SessionLocal = sessionmaker(bind=engine)

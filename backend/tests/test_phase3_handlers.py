@@ -20,6 +20,7 @@ from aiive.db.models import (
     SegmentSummary,
     TurnRecord,
 )
+from aiive.db import retention_models  # 注册 retention_cleanup_runs 表结构供测试 fixture 建表
 from aiive.runtime.epoch_manager import EpochManager
 from aiive.worker.handler_registry import HandlerRegistry
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome
@@ -354,6 +355,80 @@ def test_phase3_run_deadlettered_with_outbox_job(db):
     job2 = db.query(OutboxJob).filter(OutboxJob.id == "job-dl").first()
     run2 = db.query(CompactionRun).filter(
         CompactionRun.outbox_job_id == "job-dl").first()
+    assert job2.status == "deadletter"
+    assert run2.status == "deadletter"
+
+
+def test_retrieval_index_rebuild_run_deadlettered_with_outbox_job(db):
+    """retrieval_index_rebuild Job 被 deadletter 时，关联的 RetrievalIndexRun 须原子置 deadletter。"""
+    from aiive.db.models import RetrievalIndexRun
+
+    job = OutboxJob(id="job-ri", operation_id="retrieval_rebuild:op",
+                    job_type="retrieval_index_rebuild", status="running",
+                    payload={}, max_retries=3, claim_token="tok-ri",
+                    locked_by="worker-test",
+                    lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=600))
+    db.add(job)
+    db.commit()
+    run = RetrievalIndexRun(
+        outbox_job_id="job-ri", operation_id="retrieval_rebuild:op",
+        status="running", index_version=1,
+        batch_cursor={"source_type": "memory_record", "last_id": None},
+        execution_token="tok-ri",
+    )
+    db.add(run)
+    db.commit()
+
+    claimed = ClaimedJob(id="job-ri", job_type="retrieval_index_rebuild", payload={},
+                         trace_id=None, retry_count=3, max_retries=3,
+                         claim_token="tok-ri", schema_version=1, worker_id="worker-test")
+
+    worker = OutboxWorker(worker_id="w-ri", registry=HandlerRegistry(),
+                          claims=ActiveClaimRegistry())
+    worker._deadletter_job_and_ingestion_run(claimed, "", error="boom",
+                                             terminal_reason="t")
+
+    db.expire_all()
+    job2 = db.query(OutboxJob).filter(OutboxJob.id == "job-ri").first()
+    run2 = db.query(RetrievalIndexRun).filter(
+        RetrievalIndexRun.outbox_job_id == "job-ri").first()
+    assert job2.status == "deadletter"
+    assert run2.status == "deadletter"
+
+
+def test_retention_cleanup_run_deadlettered_with_outbox_job(db):
+    """retention_cleanup Job 被 deadletter 时，关联的 RetentionCleanupRun 须原子置 deadletter。"""
+    from aiive.db.retention_models import RetentionCleanupRun
+
+    job = OutboxJob(id="job-rc", operation_id="retention:all:v1:bucket",
+                    job_type="retention_cleanup", status="running",
+                    payload={}, max_retries=3, claim_token="tok-rc",
+                    locked_by="worker-test",
+                    lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=600))
+    db.add(job)
+    db.commit()
+    run = RetentionCleanupRun(
+        outbox_job_id="job-rc", operation_id="retention:all:v1:bucket",
+        policy_version=1, policy_snapshot={}, status="running",
+        cutoff_at=datetime.now(timezone.utc) - timedelta(days=30),
+        execution_token="tok-rc",
+    )
+    db.add(run)
+    db.commit()
+
+    claimed = ClaimedJob(id="job-rc", job_type="retention_cleanup", payload={},
+                         trace_id=None, retry_count=3, max_retries=3,
+                         claim_token="tok-rc", schema_version=1, worker_id="worker-test")
+
+    worker = OutboxWorker(worker_id="w-rc", registry=HandlerRegistry(),
+                          claims=ActiveClaimRegistry())
+    worker._deadletter_job_and_ingestion_run(claimed, "", error="boom",
+                                             terminal_reason="t")
+
+    db.expire_all()
+    job2 = db.query(OutboxJob).filter(OutboxJob.id == "job-rc").first()
+    run2 = db.query(RetentionCleanupRun).filter(
+        RetentionCleanupRun.outbox_job_id == "job-rc").first()
     assert job2.status == "deadletter"
     assert run2.status == "deadletter"
 

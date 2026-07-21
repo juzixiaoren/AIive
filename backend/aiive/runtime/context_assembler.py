@@ -4,8 +4,10 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json as _json
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -18,6 +20,10 @@ from aiive.db.models import (
     Segment,
     SegmentSummary,
     Thread,
+    RetrievalRun,
+    RetrievalCandidate,
+    MemoryRecallRun,
+    MemoryRecallCandidate,
 )
 from aiive.memory.recall_config import RecallConfig
 from aiive.memory.memory_read_model import MemoryReadModel
@@ -40,6 +46,16 @@ from aiive.runtime.working_state import WorkingStateService
 logger = logging.getLogger(__name__)
 
 MAX_TRIM_ROUNDS = 5
+
+# 输入分区快照的折叠态预览截断长度（字符）
+_SNAPSHOT_PREVIEW_CHARS = 120
+
+
+def _hash_text(text: str) -> str:
+    """对稳定前缀文本做短哈希，用于快照 stable_prefix_hash 展示。"""
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
 @dataclass(frozen=True)
@@ -69,9 +85,6 @@ class TrimPlan:
             limits["retrieved_memory"] = 200
             limits["working_state"] = 500
         return cls(_budget=budget, _round=round_num, _hard_limits=limits)
-
-    def next_round(self) -> "TrimPlan":
-        return TrimPlan.from_budget(self._budget, self._round + 1)
 
     def limit(self, name: str) -> int:
         return self._hard_limits.get(name, self._budget.hard_input_limit)
@@ -146,6 +159,7 @@ class ContextAssembler:
         _source: str = "user_chat",
         requested_output_tokens: int | None = None,
         upper_bound_sequence: int | None = None,
+        trace_id: str | None = None,
     ) -> AssembledContext:
         """组装有界上下文并通过 hard-gate 验证。
 
@@ -157,7 +171,7 @@ class ContextAssembler:
         thread_state = ThreadState(db)
 
         # ── 加载稳定分区（session 内，不受 token 预算影响）──
-        agent_ctx = self._load_agent_context(db, message, thread)
+        agent_ctx = self._load_agent_context(db, message, thread, trace_id)
         system_content = agent_ctx["system_content"]
         recall_msgs_raw = agent_ctx.get("recall_messages") or []
 
@@ -175,6 +189,9 @@ class ContextAssembler:
         history_msgs: list[Any] = []
         tools_schema: list[Any] = []
         history_summary_text: str = ""
+        epoch_cp_text: str = ""
+        seg_sum_text: str = ""
+        bridge_text: str = ""
         for attempt in range(MAX_TRIM_ROUNDS):
             trim_plan = TrimPlan.from_budget(self._budget, attempt)
 
@@ -228,11 +245,33 @@ class ContextAssembler:
                 # 软阈值触发 → 标记待密封（pending_seal 语义与软阈值一致，而非“发生过裁剪”）
                 epoch_mgr.mark_pending_seal(db, thread.id, assembly_started_at_seq or 0)
                 pending_seal_triggered = True
+                # mark_pending_seal 仅做 db.flush()（未提交）。作为调用方必须在此提交，
+                # 否则该 flush 会随 _load_context 的 db.close() 回滚丢弃，
+                # 导致软阈值密封信号（Segment.pending_seal_at）永远无法落库，
+                # 调度器也就无法据此提前触发 segment 密封。失败仅记日志、不阻断 Turn。
+                try:
+                    db.commit()
+                except Exception:
+                    logger.exception("pending_seal 持久化失败（非致命）")
+                    db.rollback()
 
             if final_safe + requested_output <= self._profile.context_window:
                 # ✓ 通过 hard gate：此处是「记忆真正被注入模型上下文」的唯一确定点，
                 # 仅此时 touch pack.items（best-effort，失败不阻断 Turn）。
                 self._touch_injected_memory(agent_ctx.get("recall_pack"))
+                snap_items, snap_full = self._build_input_snapshot(
+                    stable_contract_text=agent_ctx["stable_contract_text"],
+                    core_memory_text=agent_ctx["core_memory_text"],
+                    working_state_text=working_state_text,
+                    epoch_checkpoint_text=epoch_cp_text,
+                    segment_summary_text=seg_sum_text,
+                    sealing_bridge_text=bridge_text,
+                    history_summary_text=history_summary_text,
+                    recall_text=agent_ctx["recall_text"],
+                    history_msgs=history_msgs,
+                    tools_schema=tools_schema,
+                    user_message=message,
+                )
                 return AssembledContext(
                     messages=messages,
                     tools_schema=tools_schema,
@@ -250,6 +289,15 @@ class ContextAssembler:
                     is_safe=True,
                     pending_seal=pending_seal_triggered,
                     working_state_text=working_state_text,
+                    snapshot_items=snap_items,
+                    snapshot_meta={
+                        "stable_prefix_hash": _hash_text(system_content),
+                        "context_items": snap_items,
+                        "full_contents": snap_full,
+                        "injected_memory_ids": self._collect_injected_memory_ids(
+                            agent_ctx.get("recall_pack")
+                        ),
+                    },
                     agent_ctx=agent_ctx,
                 )
 
@@ -275,6 +323,7 @@ class ContextAssembler:
 
     def _load_agent_context(
         self, db: Session, message: str, thread: Thread,
+        trace_id: str | None = None,
     ) -> dict[str, Any]:
         """加载 Stable Contract + Core Memory + Automatic Recall。"""
         config = RecallConfig()
@@ -293,6 +342,7 @@ class ContextAssembler:
         hot_ids = self._collect_hot_history_ids(db, thread)
         pack, history_summary_text = self._unified_recall(
             db, message, scope, thread, config, exclude_source_ids=hot_ids,
+            trace_id=trace_id,
         )
 
         system_content = assemble_system_content(stable_contract, core_blocks, pack)
@@ -329,6 +379,7 @@ class ContextAssembler:
     def _unified_recall(
         self, db: Session, message: str, scope: Any, thread: Thread,
         recall_cfg: Any, exclude_source_ids: set[str] | None = None,
+        trace_id: str | None = None,
     ) -> tuple[Any, str]:
         """Phase 5：通过 UnifiedRetriever 取统一检索命中。
 
@@ -345,14 +396,16 @@ class ContextAssembler:
         from aiive.retrieval.unified_retriever import UnifiedRetriever
 
         try:
-            retriever = UnifiedRetriever(db, RetrievalConfig())
-            result = retriever.retrieve(RetrievalRequest(
+            started_at = time.monotonic()
+            request = RetrievalRequest(
                 query=message,
                 mode=RetrievalMode.AUTO,
                 scope_context=scope,
                 thread_id=thread.id,
                 exclude_source_ids=exclude_source_ids,
-            ))
+            )
+            retriever = UnifiedRetriever(db, RetrievalConfig())
+            result = retriever.retrieve(request)
             memory_hits = [h for h in result.hits if h.source_type == "memory_record"]
             history_hits = [
                 h for h in result.hits
@@ -364,6 +417,45 @@ class ContextAssembler:
                 items=items,
                 token_count=sum(i.token_cost for i in items),
             )
+            routes = sorted({hit.route or hit.source_type for hit in result.hits})
+            retrieval_run = RetrievalRun(
+                id=result.request_id,
+                trace_id=trace_id,
+                query=message,
+                strategy=RetrievalMode.AUTO.value,
+            )
+            db.add(retrieval_run)
+            for hit in result.hits:
+                db.add(RetrievalCandidate(
+                    run_id=retrieval_run.id,
+                    chunk_id=hit.source_id,
+                    source=hit.source_type,
+                    score=hit.final_score or hit.score,
+                ))
+
+            recall_run = MemoryRecallRun(
+                id=result.request_id,
+                trace_id=trace_id,
+                request_query=message,
+                scope_context=scope.model_dump() if hasattr(scope, "model_dump") else {},
+                routes_executed=routes,
+                token_budget=request.token_budget or RetrievalConfig().auto_token_budget,
+                result_count=len(memory_hits),
+                total_latency_ms=round((time.monotonic() - started_at) * 1000, 2),
+            )
+            db.add(recall_run)
+            for hit in memory_hits:
+                db.add(MemoryRecallCandidate(
+                    run_id=recall_run.id,
+                    memory_id=hit.source_id,
+                    route=hit.route or "memory_record",
+                    raw_score=hit.score,
+                    fused_score=hit.final_score,
+                    selected=True,
+                    exclusion_reason="",
+                    token_cost=hit.token_count,
+                ))
+            db.flush()
             history_text = self._render_history_summary(history_hits)
             return pack, history_text
         except Exception:
@@ -442,12 +534,35 @@ class ContextAssembler:
         except Exception:
             logger.exception("AccessTracker touch（自动召回注入）失败")
 
+    def _collect_injected_memory_ids(self, pack: Any) -> list[dict[str, str]]:
+        """收集本轮实际注入上下文的记忆条目，供前端上下文查看器展示。
+
+        与 `_touch_injected_memory` 同源（`pack.items` 为融合后选中并注入的记忆），
+        每条包含 memory_id / canonical_key / memory_type 三个字段。任何异常降级为
+        空列表，不阻断快照落库。
+        """
+        if pack is None or not getattr(pack, "items", None):
+            return []
+        try:
+            return [
+                {
+                    "memory_id": it.memory_id,
+                    "canonical_key": getattr(it, "canonical_key", ""),
+                    "memory_type": getattr(it, "memory_type", ""),
+                }
+                for it in pack.items
+                if getattr(it, "memory_id", None)
+            ]
+        except Exception:
+            logger.exception("收集注入记忆快照失败")
+            return []
+
     def _load_history_bounded(
         self, db: Session, thread_state: ThreadState,
         thread_id: str, token_budget: int,
         upper_bound: int | None = None,
     ) -> list[dict[str, Any]]:
-        """使用 keyset pagination 按 token 预算限定读取近期消息。"""
+        """使用 keyset pagination 按 token 预算限定读取近期消息。Phase 6A：过滤被屏蔽 Event。"""
         history, _stats = thread_state.load_recent_messages_bounded(
             db=db,
             thread_id=thread_id,
@@ -457,7 +572,14 @@ class ContextAssembler:
             normalizer=self._normalizer,
             upper_bound_sequence=upper_bound,
         )
-        return history
+        return self._filter_forgotten_events(db, history)
+
+    def _filter_forgotten_events(
+        self, db: Session, events: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """过滤被 ForgetShield 或 ForgetTombstone 屏蔽的 Event。"""
+        from aiive.forget.visibility_service import ForgetVisibilityService
+        return ForgetVisibilityService.filter_events(db, events)
 
     # ── Phase 3: 稳定摘要上下文加载（K 节）──
 
@@ -471,6 +593,12 @@ class ContextAssembler:
             .first()
         )
         if cp is None:
+            return ""
+        # Phase 6A：若 checkpoint 被 forget 屏蔽则不注入，避免泄漏被忘内容
+        from aiive.forget.visibility_service import ForgetVisibilityService
+        if cp.id in ForgetVisibilityService.blocked_target_ids(
+            db, "epoch_checkpoint", [(cp.id, cp.created_at)],
+        ):
             return ""
         lines = [
             "## Epoch Checkpoint（阶段性工作检查点）",
@@ -504,6 +632,14 @@ class ContextAssembler:
             .limit(limit)
             .all()
         )
+        if not summaries:
+            return ""
+        # Phase 6A：过滤被 forget 屏蔽的 summary，避免泄漏被忘内容
+        from aiive.forget.visibility_service import ForgetVisibilityService
+        blocked = ForgetVisibilityService.blocked_target_ids(
+            db, "segment_summary", [(s.id, s.created_at) for s in summaries],
+        )
+        summaries = [s for s in summaries if s.id not in blocked]
         if not summaries:
             return ""
         blocks: list[str] = ["## 历史 Segment 摘要（近期）"]
@@ -733,3 +869,95 @@ class ContextAssembler:
             trim_reason=reason,
         ))
         return reports
+
+    def _build_input_snapshot(
+        self,
+        stable_contract_text: str = "",
+        core_memory_text: str = "",
+        working_state_text: str = "",
+        epoch_checkpoint_text: str = "",
+        segment_summary_text: str = "",
+        sealing_bridge_text: str = "",
+        history_summary_text: str = "",
+        recall_text: str = "",
+        history_msgs: list[dict[str, Any]] | None = None,
+        tools_schema: list[dict[str, Any]] | None = None,
+        user_message: str = "",
+    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        """构建"送入 LLM 的输入分区"快照，供前端上下文查看器展示。
+
+        返回 (context_items, full_contents)：
+        - context_items: 各输入分区的折叠态描述（预览 + token 估算），
+          顺序与实际拼装进 messages 的顺序一致；
+        - full_contents: item_id → 完整文本，供前端展开时懒加载。
+
+        token 估算使用轻量启发式（字符数 / 4），不调用 LiteLLM 计数器，
+        避免在组装热路径上重复做全量 token 编码。
+        """
+        items: list[dict[str, Any]] = []
+        full: dict[str, str] = {}
+
+        def _add(item_id: str, kind: str, source: str, trust_level: str, text: str) -> None:
+            if not text:
+                return
+            preview = text[:_SNAPSHOT_PREVIEW_CHARS]
+            if len(text) > _SNAPSHOT_PREVIEW_CHARS:
+                preview += "..."
+            items.append({
+                "item_id": item_id,
+                "kind": kind,
+                "source": source,
+                "trust_level": trust_level,
+                "content_preview": preview,
+                "token_estimate": max(1, len(text) // 4),
+            })
+            full[item_id] = text
+
+        # 系统前缀（稳定契约）→ 核心记忆 → 工作状态 → 稳定摘要 → 历史摘要
+        _add("stable_prefix", "stable_prefix", "system", "trusted", stable_contract_text)
+        _add("core_memory", "core_memory", "system", "trusted", core_memory_text)
+        _add("working_state", "working_state", "system", "trusted", working_state_text)
+        _add("epoch_checkpoint", "epoch_checkpoint", "system", "trusted", epoch_checkpoint_text)
+        _add("segment_summary", "segment_summary", "system", "trusted", segment_summary_text)
+        _add("sealing_bridge", "sealing_bridge", "system", "trusted", sealing_bridge_text)
+        _add("history_summary", "history_summary", "system", "trusted", history_summary_text)
+
+        # 原始历史消息（按 role 区分用户 / 模型 / 工具结果）
+        for i, m in enumerate(history_msgs or []):
+            role = m.get("role", "")
+            if role == "user":
+                _add(f"history_user:{i}", "history_user", "history", "trusted", str(m.get("content", "")))
+            elif role == "assistant":
+                content = m.get("content") or ""
+                tool_calls = m.get("tool_calls")
+                if tool_calls:
+                    content = content or _json.dumps(tool_calls, ensure_ascii=False)
+                _add(f"history_assistant:{i}", "history_assistant", "history", "trusted", str(content))
+            elif role == "tool":
+                _add(f"history_tool:{i}", "tool_result", "tools", "trusted", str(m.get("content", "")))
+
+        # 召回记忆（本轮证据，非系统指令 → 标记 untrusted）
+        _add("recall_memory", "recall_memory", "memory", "untrusted", recall_text)
+
+        # 工具定义
+        if tools_schema:
+            tools_text = _json.dumps(tools_schema, ensure_ascii=False)
+            names = [
+                (s.get("function", {}) or {}).get("name", "")
+                for s in tools_schema if isinstance(s, dict)
+            ]
+            preview_src = ", ".join(n for n in names if n) or tools_text
+            items.append({
+                "item_id": "tool_schemas",
+                "kind": "tool_schemas",
+                "source": "tools",
+                "trust_level": "trusted",
+                "content_preview": preview_src[:_SNAPSHOT_PREVIEW_CHARS],
+                "token_estimate": max(1, len(tools_text) // 4),
+            })
+            full["tool_schemas"] = tools_text
+
+        # 当前用户消息
+        _add("user_message", "user_message", "user", "trusted", user_message)
+
+        return items, full

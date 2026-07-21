@@ -63,7 +63,8 @@ cd frontend && npm run dev
   - 消息下方出现 📌 执行卡片
 验证：
   - 查看"工具"Tab，schedule_reminder 在列表中
-  - 切换"通知"Tab，等待 ~70 秒，应出现 "hi" 通知
+  - 等待 ~70 秒，原对话中应出现 Agent 主动生成的 "hi" 回复
+  - 数据库中对应 Task 应按 pending → dispatching → completed 流转；不能用固定通知代替 Agent 回复
 ```
 
 ### 2.2 查看提醒列表

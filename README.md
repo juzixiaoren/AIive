@@ -78,8 +78,8 @@ AIive/
 
 - **AgentGraph**：基于 LangGraph StateGraph，assistant → policy_check → tools 循环
 - **ToolRegistry**：统一工具注册与发现，含 schema / risk_level / permission 元数据
-- **MemoryWriteService**：统一事务化记忆写入入口，含冲突解析、证据追踪、向量投影
-- **AutomaticRecallEngine**：多路记忆召回（精确键 / FTS / 向量 / 时序图 / 最近事件）
+- **MemoryWriteService**：统一事务化记忆写入入口，含冲突解析、证据追踪、核心记忆与统一检索投影
+- **AutomaticRecallEngine**：生产可用的多路记忆召回（精确键 / 词汇匹配 / pgvector 语义向量 / 近期情节）；时序图能力尚未接入
 
 ## 内置工具（28 个，9 大类）
 

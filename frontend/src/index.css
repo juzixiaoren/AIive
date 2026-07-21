@@ -52,3 +52,85 @@
 /* TODO: 暗色令牌待补充；当前暂复用亮色变量，切换 data-theme="dark" 不会 visibly 变化。 */
 [data-theme="dark"] {
 }
+
+/*
+ * Markdown 渲染（@tailwindcss/typography 的 prose）主题化
+ * - 复用项目的语义颜色 CSS 变量，保证与整体配色一致，且 light / dark 切换时自动跟随。
+ * - prose-agent：浅色气泡（agent 消息）正文主题。
+ * - prose-on-colored：主题色气泡（user 消息，蓝底白字）反白主题。
+ */
+.prose-agent {
+  --tw-prose-body: var(--color-content);
+  --tw-prose-headings: var(--color-title);
+  --tw-prose-links: var(--color-primary-hover);
+  --tw-prose-bold: var(--color-title);
+  --tw-prose-counters: var(--color-muted);
+  --tw-prose-bullets: var(--color-faint);
+  --tw-prose-hr: var(--color-divider);
+  --tw-prose-quotes: var(--color-muted);
+  --tw-prose-quote-borders: var(--color-divider);
+  --tw-prose-captions: var(--color-faint);
+  --tw-prose-code: var(--color-code);
+  --tw-prose-pre-code: var(--color-code);
+  --tw-prose-pre-bg: var(--color-surface-muted);
+  --tw-prose-th-borders: var(--color-divider);
+  --tw-prose-td-borders: var(--color-divider);
+}
+
+.prose-on-colored {
+  --tw-prose-body: var(--color-on-primary);
+  --tw-prose-headings: var(--color-on-primary);
+  --tw-prose-links: #dbeafe;
+  --tw-prose-bold: var(--color-on-primary);
+  --tw-prose-counters: rgba(255, 255, 255, 0.7);
+  --tw-prose-bullets: rgba(255, 255, 255, 0.6);
+  --tw-prose-hr: rgba(255, 255, 255, 0.3);
+  --tw-prose-quotes: rgba(255, 255, 255, 0.85);
+  --tw-prose-quote-borders: rgba(255, 255, 255, 0.4);
+  --tw-prose-captions: rgba(255, 255, 255, 0.7);
+  --tw-prose-code: #e0e7ff;
+  --tw-prose-pre-code: #e0e7ff;
+  --tw-prose-pre-bg: rgba(0, 0, 0, 0.25);
+  --tw-prose-th-borders: rgba(255, 255, 255, 0.35);
+  --tw-prose-td-borders: rgba(255, 255, 255, 0.25);
+}
+
+/* 行内代码：去掉 typography 默认的 ` 反引号装饰，并补一个浅底，提升可读性 */
+.prose-agent :not(pre) > code {
+  background-color: var(--color-surface-muted);
+  padding: 0.12em 0.34em;
+  border-radius: 0.3em;
+  font-weight: 500;
+}
+.prose-on-colored :not(pre) > code {
+  background-color: rgba(0, 0, 0, 0.22);
+  padding: 0.12em 0.34em;
+  border-radius: 0.3em;
+  font-weight: 500;
+}
+.prose-agent code::before,
+.prose-agent code::after,
+.prose-on-colored code::before,
+.prose-on-colored code::after {
+  content: "";
+}
+
+/* 代码块：与气泡内边距协调，限制最大高度并允许横向滚动 */
+.prose pre {
+  margin: 0.5rem 0;
+  padding: 0.75rem 0.9rem;
+  border-radius: 0.6rem;
+  font-size: 0.8rem;
+  overflow-x: auto;
+}
+.prose pre code {
+  background: transparent;
+  padding: 0;
+  font-weight: 400;
+}
+
+/* 列表与段落间距收紧，避免气泡内过于松散 */
+.prose p { margin: 0.4rem 0; }
+.prose ul, .prose ol { margin: 0.4rem 0; padding-left: 1.25rem; }
+.prose :first-child { margin-top: 0; }
+.prose :last-child { margin-bottom: 0; }

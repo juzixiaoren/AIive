@@ -43,14 +43,6 @@ class SafeDeleteScopeRegistry:
         """
         return self._scopes.get(scope_id)
 
-    def list_scopes(self) -> dict[str, str]:
-        """列出所有已注册的范围。
-
-        返回:
-            {scope_id: 根目录字符串} 的字典
-        """
-        return {k: str(v) for k, v in self._scopes.items()}
-
 
 # 项目根目录：本文件位于 backend/aiive/tools/safe_delete.py
 # __file__.parents[3] = backend/aiive/tools -> aiive -> backend -> AIive(仓库根)

@@ -83,6 +83,7 @@ class MemoryStore:
             validity_state=validity_state,
             trust_level=proposal.trust_level,
             stability=proposal.stability,
+            sensitivity=proposal.sensitivity,
             stability_score=proposal.stability_score,
             confidence=proposal.confidence,
             importance=proposal.importance,
@@ -113,14 +114,6 @@ class MemoryStore:
             record.updated_at = datetime.now(timezone.utc)
             self._db.flush()
 
-    def update_validity(self, memory_id: str, state: str) -> None:
-        """Update validity_state. Called only by MemoryWriteService."""
-        record = self._db.get(MemoryRecord, memory_id)
-        if record:
-            record.validity_state = state
-            record.updated_at = datetime.now(timezone.utc)
-            self._db.flush()
-
     # ------------------------------------------------------------------
     # Read operations — safe for any consumer
     # ------------------------------------------------------------------
@@ -143,37 +136,6 @@ class MemoryStore:
             .order_by(MemoryRecord.updated_at.desc())
             .all()
         )
-
-    def get_active(self) -> Sequence[MemoryRecord]:
-        """DEPRECATED: use get_active_valid(). Kept for backward compat."""
-        return self.get_active_valid()
-
-    def get_active_by_key(self, canonical_key: str) -> Sequence[MemoryRecord]:
-        """Get active+valid records by canonical_key."""
-        return (
-            self._db.query(MemoryRecord)
-            .filter(
-                MemoryRecord.canonical_key == canonical_key,
-                *self._ACTIVE_VALID,
-            )
-            .order_by(MemoryRecord.updated_at.desc())
-            .all()
-        )
-
-    def get_active_by_key_scope(
-        self, canonical_key: str, scope_type: str, scope_id: str | None
-    ) -> Sequence[MemoryRecord]:
-        """Get active+valid records by canonical_key + scope."""
-        query = self._db.query(MemoryRecord).filter(
-            MemoryRecord.canonical_key == canonical_key,
-            MemoryRecord.scope_type == scope_type,
-            *self._ACTIVE_VALID,
-        )
-        if scope_id is not None:
-            query = query.filter(MemoryRecord.scope_id == scope_id)
-        else:
-            query = query.filter(MemoryRecord.scope_id.is_(None))
-        return query.order_by(MemoryRecord.updated_at.desc()).all()
 
     def get_active_by_key_scope_locked(
         self, canonical_key: str, scope_type: str, scope_id: str | None
@@ -262,16 +224,6 @@ class MemoryStore:
             .all()
         )
 
-    def get_candidates_for_promotion(self, limit: int = 20) -> Sequence[MemoryRecord]:
-        """Get candidate records eligible for promotion review."""
-        return (
-            self._db.query(MemoryRecord)
-            .filter(MemoryRecord.lifecycle_state == LifecycleState.CANDIDATE.value)
-            .order_by(MemoryRecord.confidence.desc())
-            .limit(limit)
-            .all()
-        )
-
     def list_all(self, limit: int = 100) -> Sequence[MemoryRecord]:
         """List all records (for inspection)."""
         return (
@@ -280,10 +232,6 @@ class MemoryStore:
             .limit(limit)
             .all()
         )
-
-    def db_session(self) -> Session:
-        """Return the raw DB session for read-side components."""
-        return self._db
 
     # ------------------------------------------------------------------
     # Phase 4: 维护 dirty-set lane 查询与 Batch 选择

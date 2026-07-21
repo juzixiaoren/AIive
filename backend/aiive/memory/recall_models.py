@@ -54,7 +54,6 @@ class MemoryRecallRequest(BaseModel):
 
     query: str
     active_goal: str | None = None
-    thread_summary: str | None = None
     scope_context: ScopeContext
     top_k: int = 8
     token_budget: int = 1200
@@ -114,10 +113,6 @@ class CoreMemoryBlock(BaseModel):
     source_memory_ids: list[str] = Field(default_factory=list)
     projection_version: int = 1
     token_count: int = 0
-
-    @classmethod
-    def estimate_tokens(cls, text: str) -> int:
-        return max(1, len(text) // 4)
 
 
 

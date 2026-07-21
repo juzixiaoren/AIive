@@ -47,15 +47,6 @@ class TestSafeDeleteScopeRegistry:
         registry = SafeDeleteScopeRegistry()
         assert registry.get_scope_root("unknown") is None
 
-    def test_list_scopes(self, tmp_path):
-        """list_scopes 应返回所有已注册的范围名称。"""
-        registry = SafeDeleteScopeRegistry()
-        registry.register("s1", tmp_path / "a")
-        registry.register("s2", tmp_path / "b")
-        scopes = registry.list_scopes()
-        assert "s1" in scopes
-        assert "s2" in scopes
-
 
 class TestSafeDelete:
     """测试 safe_delete 的各种删除模式和安全检查。"""

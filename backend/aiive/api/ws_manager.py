@@ -11,6 +11,9 @@ from fastapi import WebSocket
 
 logger = logging.getLogger(__name__)
 
+# 全局通知通道：不绑定具体线程，用于跨线程的未读角标等场景
+GLOBAL_THREAD_ID = "__global__"
+
 
 class ConnectionManager:
     """WebSocket 连接管理器（单例）。
@@ -70,10 +73,25 @@ class ConnectionManager:
             self._main_loop,
         )
 
-    async def broadcast_all(self, event_type: str, data: dict[str, Any]) -> None:
-        """向所有连接推送事件。"""
-        for thread_id in list(self._connections.keys()):
-            await self.broadcast_to_thread(thread_id, event_type, data)
+    async def broadcast_notification(self, pending_count: int) -> None:
+        """向全局通知通道推送最新 pending 数量，供前端角标即时更新（替代轮询）。
+
+        Args:
+            pending_count: 当前处于 pending 状态的通知数量
+        """
+        await self.broadcast_to_thread(
+            GLOBAL_THREAD_ID, "notification", {"pending_count": pending_count}
+        )
+
+    def broadcast_notification_sync(self, pending_count: int) -> None:
+        """线程安全的同步推送入口，供后台 daemon 线程调用。"""
+        if self._main_loop is None:
+            logger.warning("主事件循环未绑定，跳过通知广播")
+            return
+        asyncio.run_coroutine_threadsafe(
+            self.broadcast_notification(pending_count),
+            self._main_loop,
+        )
 
 
 # 全局单例

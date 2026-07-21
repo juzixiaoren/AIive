@@ -8,6 +8,8 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
 import "./index.css";
+// 代码块语法高亮主题（rehype-highlight 依赖 highlight.js 的配色）
+import "highlight.js/styles/github.css";
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from aiive.db.models import CoreMemoryBlock as CoreMemoryBlockRow
 from aiive.db.models import MemoryRecord
 from aiive.memory.memory_key_registry import get_memory_key_registry
+from aiive.memory.memory_policy import MemoryPolicyEngine, MemoryReadChannel
 from aiive.memory.memory_types import LifecycleState, ValidityState
 from aiive.memory.recall_config import RecallConfig
 from aiive.memory.recall_models import CoreMemoryBlock
@@ -57,14 +58,24 @@ def build_blocks(db: Session, config: RecallConfig | None = None) -> list[CoreMe
         if recs:
             buckets.setdefault(role, []).extend(recs)
 
+    policy = MemoryPolicyEngine()
     blocks: list[CoreMemoryBlock] = []
     for role, recs in buckets.items():
-        lines = [f"{r.canonical_key}: {r.content}" for r in recs]
+        visible = [
+            (record, policy.render_content(
+                record.content, record.sensitivity, MemoryReadChannel.LLM_CONTEXT,
+            ))
+            for record in recs
+        ]
+        visible = [(record, content) for record, content in visible if content is not None]
+        if not visible:
+            continue
+        lines = [f"{record.canonical_key}: {content}" for record, content in visible]
         content = "\n".join(lines)
         blocks.append(CoreMemoryBlock(
             block_name=role,
             content=content,
-            source_memory_ids=[r.id for r in recs],
+            source_memory_ids=[record.id for record, _ in visible],
             projection_version=1,
             token_count=_estimate(content),
         ))

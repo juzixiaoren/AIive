@@ -5,6 +5,8 @@
 
 from datetime import datetime, timedelta, timezone
 
+from aiive.api.routes_tasks import check_task
+from aiive.db.models import OutboxJob, Thread
 from aiive.runtime.task_manager import TaskManager
 
 
@@ -36,18 +38,36 @@ class TestTaskManager:
         due = mgr.get_due()
         assert len(due) == 1
 
-    def test_check_reminder_completes(self, db_session):
-        """到期提醒经 check_now 检查后应完成。"""
+    def test_check_reminder_requires_enqueue(self, db_session):
+        """check_now 不得在 Agent 回复前提前完成提醒。"""
         mgr = TaskManager(db_session)
         past = datetime.now(timezone.utc) - timedelta(hours=1)
         task = mgr.create("reminder", "Test", next_check_at=past)
         db_session.flush()
 
         result = mgr.check_now(task.id)
-        assert result["action"] == "notify"
+        assert result["action"] == "enqueue"
 
         updated = mgr._db.get(type(task), task.id)
-        assert updated.status == "completed"
+        assert updated.status == "pending"
+
+    def test_check_now_route_enqueues_reminder(self, db_session):
+        """check-now 路由必须真实入队，不能只返回自然语言动作。"""
+        thread = Thread(id="check-now-thread", title="check-now")
+        db_session.add(thread)
+        mgr = TaskManager(db_session)
+        task = mgr.create("reminder", "立即提醒")
+        task.thread_id = thread.id
+        db_session.commit()
+
+        result = check_task(task.id, db_session)
+        db_session.expire_all()
+
+        assert result["status"] == "dispatching"
+        assert db_session.get(type(task), task.id).status == "dispatching"
+        assert db_session.query(OutboxJob).filter(
+            OutboxJob.operation_id == f"reminder_delivery:{task.id}"
+        ).count() == 1
 
     def test_condition_watch_skip(self, db_session):
         """条件为 false 时应跳过。"""

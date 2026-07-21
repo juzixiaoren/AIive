@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from aiive.api.developer_security import require_local_developer
 from aiive.db.base import get_db
 from aiive.db.models import Epoch, Segment
 from aiive.runtime.epoch_manager import EpochManager
@@ -68,7 +69,7 @@ def _current_status(db: Session, thread_id: str) -> EpochStatus:
     )
 
 
-@router.get("/{thread_id}")
+@router.get("/{thread_id}", dependencies=[Depends(require_local_developer)])
 def get_epoch_status(thread_id: str, db: Session = Depends(get_db)) -> EpochStatus:
     """查询 Thread 当前 Epoch 与 Segment 状态。"""
     return _current_status(db, thread_id)

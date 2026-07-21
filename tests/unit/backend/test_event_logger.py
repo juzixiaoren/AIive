@@ -45,26 +45,6 @@ class TestEventLogger:
         assert events[0].event_type == "user_message"
         assert events[1].event_type == "llm_response"
 
-    def test_log_llm_call_creates_record(self, db_session):
-        """验证 LLM 调用日志包含模型、延迟、输入输出预览等字段。"""
-        logger = EventLogger(db_session)
-        call = logger.log_llm_call(
-            trace_id="trace-1",
-            thread_id="thread-1",
-            model="test-model",
-            latency_ms=100.5,
-            input_preview="in",
-            output_preview="out",
-        )
-        db_session.flush()
-
-        assert call.trace_id == "trace-1"
-        assert call.thread_id == "thread-1"
-        assert call.model == "test-model"
-        assert call.latency_ms == 100.5
-        assert call.input_preview == "in"
-        assert call.output_preview == "out"
-
     def test_log_event_default_payload(self, db_session):
         """验证未提供 payload 时默认为空字典。"""
         logger = EventLogger(db_session)

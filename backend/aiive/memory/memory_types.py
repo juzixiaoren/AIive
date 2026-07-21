@@ -75,16 +75,6 @@ LEGACY_TYPE_MAP: dict[str, str | None] = {
     "knowledge": MemoryType.KNOWLEDGE.value,
 }
 
-# Valid memory_key prefix mappings for legacy type → canonical_key inference
-LEGACY_TYPE_TO_KEY_PREFIX: dict[str, str] = {
-    "routine": "user.routine.",
-    "habit": "user.habit.",
-    "schedule": "user.schedule.",
-    "preference": "user.preference.",
-    "name": "user.",
-}
-
-
 # ============================================================================
 # Scope
 # ============================================================================
@@ -184,6 +174,15 @@ class Stability(StrEnum):
     VOLATILE = "volatile"
 
 
+class Sensitivity(StrEnum):
+    """记忆内容敏感度；secret 默认禁止进入普通 LLM 上下文。"""
+
+    NORMAL = "normal"
+    PERSONAL = "personal"
+    CONFIDENTIAL = "confidential"
+    SECRET = "secret"
+
+
 class EvidenceSourceType(StrEnum):
     """Evidence source classification. Used for authority rules."""
     USER_ASSERTION = "user_assertion"
@@ -192,17 +191,6 @@ class EvidenceSourceType(StrEnum):
     KERNEL_RESULT = "kernel_result"
     EXTERNAL_CLAIM = "external_claim"
     LLM_DERIVATION = "llm_derivation"
-
-
-class Sensitivity(StrEnum):
-    """Data sensitivity for model boundary enforcement.
-    
-    Actual redaction/cloud routing is handled by Model Boundary module.
-    """
-    NORMAL = "normal"
-    PERSONAL = "personal"
-    CONFIDENTIAL = "confidential"
-    SECRET = "secret"
 
 
 class WriteOutcome(StrEnum):
@@ -263,10 +251,6 @@ _DEFAULT_AUTHORITY: frozenset[str] = frozenset({
 })
 
 
-def is_evidence_authorized(memory_type: str, source_type: str) -> bool:
-    """Check if evidence source_type is authorized for the given memory_type."""
-    allowed = AUTHORITY_RULES.get(memory_type, _DEFAULT_AUTHORITY)
-    return source_type in allowed
 
 
 # ============================================================================
@@ -308,6 +292,7 @@ class MemoryProposal(BaseModel):
     # --- evidence ---
     evidence: list[EvidenceItem] = Field(default_factory=list)
     trust_level: str = TrustLevel.SEMI_TRUSTED.value
+    sensitivity: str = Sensitivity.NORMAL.value
 
     # --- scores ---
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
@@ -323,10 +308,9 @@ class MemoryProposal(BaseModel):
     extractor_version: str = ""
 
     # --- 幂等与去重 ---
-    # 请求幂等键: 防止同一 source_event 被重复消费
-    # sha256(source_event_ids | extractor_name | extractor_version | proposal_index)
-    request_idempotency_key: str = ""
-    # 旧字段，兼容迁移期，等同于 request_idempotency_key
+    # 请求幂等键: 防止同一来源的记忆提案被重复持久化
+    # sha256(source_event_ids | extractor_name | extractor_version | proposal_index | content_hash)
+    # 唯一落点为 memory_proposals.idempotency_key（唯一约束），去重仅认此字段。
     idempotency_key: str = ""
 
     # --- 语义去重 hash（由 ConflictResolver 使用）---
@@ -352,19 +336,28 @@ class MemoryProposal(BaseModel):
     durable: bool = True  # 提取器判断是否有长期价值
 
     def compute_request_idempotency(self, proposal_index: int = 0) -> str:
-        """计算请求幂等键: 防止同一事件重复处理。
-        
-        格式: sha256(source_event_ids | extractor_name | extractor_version | index)
+        """计算请求幂等键: 防止同一来源的记忆提案被重复持久化。
+
+        格式: sha256(source_event_ids | extractor_name | extractor_version | index | content_hash)
+
+        关键修正（彻底修复固定键冲突）：
+        - 来源为空时退化为 ingestion_run_id，避免退化为固定常量导致所有调用共用
+          同一幂等键而触发唯一约束冲突（remember_or_update 工具曾因此崩溃）；
+        - 引入 content_hash：同一来源的不同内容不会误判为重复，而完全相同的请求仍
+          能稳定去重。旧公式仅依赖来源，既会在来源为空时全部冲突，也会把同来源的
+          不同记忆错误去重。
         """
+        sources = self.source_event_ids or ([self.ingestion_run_id] if self.ingestion_run_id else [])
+        content_hash = self.content_hash or self.compute_content_hash()
         components = [
-            "|".join(sorted(self.source_event_ids)),
+            "|".join(sorted(sources)),
             self.extractor_name,
             self.extractor_version,
             str(proposal_index),
+            content_hash,
         ]
         raw = "|".join(components)
         key = f"req:{hashlib.sha256(raw.encode()).hexdigest()[:24]}"
-        self.request_idempotency_key = key
         self.idempotency_key = key
         return key
 
@@ -377,27 +370,6 @@ class MemoryProposal(BaseModel):
 # ============================================================================
 # Canonical key helpers
 # ============================================================================
-
-def infer_canonical_key(
-    memory_type_hint: str | None,
-    memory_key: str | None,
-    content: str = "",
-) -> str | None:
-    """Best-effort inference of canonical_key from legacy hints.
-
-    Used during migration and for backward-compatible normalization.
-    """
-    if memory_key and memory_key.strip():
-        return memory_key.strip()
-
-    if memory_type_hint:
-        prefix = LEGACY_TYPE_TO_KEY_PREFIX.get(memory_type_hint)
-        if prefix and content:
-            slug = content.lower().replace(" ", "_")[:40]
-            return f"{prefix}{slug}"
-
-    return None
-
 
 def is_canonical_type(value: str) -> bool:
     """Return True if value is a valid canonical MemoryType."""

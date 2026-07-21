@@ -165,6 +165,7 @@ class MemoryLifecycleService:
                 lifecycle_state=LifecycleState.ACTIVE.value,
                 validity_state=ValidityState.VALID.value,
                 trust_level=winner_src.trust_level,
+                sensitivity=winner_src.sensitivity,
                 stability=winner_src.stability,
                 stability_score=winner_src.stability_score,
                 confidence=winner_src.confidence,

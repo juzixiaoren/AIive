@@ -8,7 +8,7 @@
 - 记忆管理：remember_or_update, forget_memory, run_memory_maintenance
 - 记忆召回（V2 Agent-Initiated，只读，结果作证据返回）：memory_search, memory_timeline, memory_event_log
 - 文件操作：safe_delete, read_text_file
-- 知识库：ingest_document, search_knowledge
+- 知识库：ingest_document, reindex_document, search_knowledge
 - MCP 集成：search_mcp, install_mcp_sandbox
 - 自进化：create_selfdev_plan, apply_patch_to_inactive_slot, promote_slot, rollback_slot
 - 节奏/注意力：query_rhythm, query_attention
@@ -36,6 +36,7 @@ from aiive.tools.registry import (
     ToolRegistry,
     compute_descriptor_hash,
 )
+from aiive.tools.forget_tool import handle_forget, handle_forget_status
 
 
 def _build_safety(capability_id: str, **overrides: Any) -> CapabilitySafetySchema:
@@ -95,6 +96,9 @@ def _db_handler(fn: Callable[..., Any]):
             raise
         finally:
             db.close()
+
+    wrapper._aiive_db_handler = fn
+    wrapper._aiive_accepts_ctx = _accepts_ctx
     return wrapper
 
 
@@ -120,8 +124,9 @@ def _require_ctx(ctx: RunContext | None, tool_name: str) -> RunContext:
 def _handle_schedule_reminder(db: Session, ctx: RunContext | None, content: str, delay_minutes: int = 1):
     """创建定时提醒，只负责写入 Task 记录。
 
-    Event（reminder_created）由 AgentGraph._finalize() 在主 DB 会话中统一写入，
-    避免工具独立会话与主会话之间的 FK 约束冲突。
+    本工具在自有 @_db_handler 会话中仅持久化 Task 并 flush，不在此处写入
+    reminder_created Event，避免工具会话与 Turn 主会话之间的 FK 约束冲突。
+    reminder_created Event 由提醒相关流程（如延期）在独立会话中写入。
 
     参数:
         content: 提醒内容
@@ -141,6 +146,9 @@ def _handle_schedule_reminder(db: Session, ctx: RunContext | None, content: str,
     ctx = _require_ctx(ctx, "schedule_reminder")
     task.thread_id = ctx.thread_id
     db.flush()
+    # 提醒创建后推送最新 pending 数量，保持前端角标即时更新
+    from aiive.api.routes_notifications import broadcast_pending_count
+    broadcast_pending_count(db)
     return {
         "reminder_set": True,
         "task_id": task.id,
@@ -200,6 +208,9 @@ def _handle_confirm_reminder(db: Session, reminder_id: str):
     payload["status"] = "confirmed"
     event.payload = payload
     db.flush()
+    # 确认后 pending 数量减少，推送最新计数
+    from aiive.api.routes_notifications import broadcast_pending_count
+    broadcast_pending_count(db)
     return {"ok": True, "reminder_id": reminder_id, "content": payload.get("content", ""), "status": "confirmed"}
 
 
@@ -263,6 +274,9 @@ def _handle_snooze_reminder(db: Session, ctx: RunContext | None, reminder_id: st
     )
     db.add(new_event)
     db.flush()
+    # 延时后新增一条 pending 事件，推送最新计数
+    from aiive.api.routes_notifications import broadcast_pending_count
+    broadcast_pending_count(db)
 
     return {
         "ok": True,
@@ -407,6 +421,10 @@ def _handle_remember_or_update(db: Session, ctx: RunContext | None, content: str
     ctx.execution_mode = "user_required"
     writer = MemoryWriteService(db)
 
+    # 幂等键来源：优先用真实 Event.id；流式/工具上下文缺失时退化为 trace_id，
+    # 保证同轮次稳定、跨轮次不互相冲突（彻底避免固定键冲突）。
+    source_event_ids = list(ctx.source_event_ids) or ([ctx.trace_id] if ctx.trace_id else [])
+
     evidence = [EvidenceItem(
         source_type="user_message",
         trust_level=TrustLevel.TRUSTED.value,
@@ -423,6 +441,7 @@ def _handle_remember_or_update(db: Session, ctx: RunContext | None, content: str
         importance=0.8,
         trust_level=TrustLevel.TRUSTED.value,
         evidence=[e.model_dump() for e in evidence],
+        source_event_ids=source_event_ids,
         extractor_name="remember_or_update_tool",
         extractor_version="1.0",
         thread_id=ctx.thread_id,
@@ -434,8 +453,10 @@ def _handle_remember_or_update(db: Session, ctx: RunContext | None, content: str
     # Phase 2: provenance — 真实 Event.id + TurnRecord PK
     result.proposal.source_turn_record_id = ctx.turn_record_id
     result.proposal.source_turn_id = ctx.turn_id
-    result.proposal.source_event_ids = list(ctx.source_event_ids)
+    result.proposal.source_event_ids = source_event_ids
     result.proposal.execution_mode = ctx.execution_mode
+    # 关键：provenance 注入后重算幂等键，确保键包含真实来源与内容，彻底避免固定键冲突
+    result.proposal.compute_request_idempotency()
 
     try:
         write_result = writer.write(result.proposal, run_context=ctx)
@@ -456,46 +477,17 @@ def _handle_remember_or_update(db: Session, ctx: RunContext | None, content: str
 
 
 @_db_handler
-def _handle_forget_memory(db: Session, ctx: RunContext | None, memory_id: str = "", reason: str = "", scope: str = "memory_id", target: str = ""):
-    """遗忘/删除存储的记忆。使用 MemoryWriteService.forget() 执行 Saga。"""
-    from aiive.memory.memory_store import MemoryStore
-    from aiive.memory.memory_write_service import MemoryWriteService
+def _handle_forget_memory(_db: Session, ctx: RunContext | None, memory_id: str = "", reason: str = "", scope: str = "memory_id", target: str = ""):
+    """[DEPRECATED] 遗忘/删除存储的记忆。Phase 6A 后委托给 forget 工具。"""
+    from aiive.tools.forget_tool import handle_forget
 
-    ctx = _require_ctx(ctx, "forget_memory")
-    writer = MemoryWriteService(db)
-    store = MemoryStore(db)
-    deleted: list[str] = []
-
+    if memory_id:
+        return handle_forget(mode="memory_only", memory_ids=[memory_id], reason=reason, ctx=ctx)
+    if scope == "memory_key" and target:
+        return handle_forget(mode="memory_only", canonical_key=target, reason=reason, ctx=ctx)
     if scope == "all":
-        for r in store.get_active():
-            result = writer.forget(r.id, reason=reason, run_context=ctx)
-            if result.written:
-                deleted.append(r.id)
-        return {"ok": True, "deleted_count": len(deleted), "deleted_ids": deleted, "scope": "all", "reason": reason}
-
-    if scope == "memory_key":
-        if not target:
-            return {"ok": False, "error": "target is required for scope=memory_key"}
-        for r in store.get_active_by_key(target):
-            result = writer.forget(r.id, reason=reason, run_context=ctx)
-            if result.written:
-                deleted.append(r.id)
-        return {"ok": True, "deleted_count": len(deleted), "deleted_ids": deleted, "scope": "memory_key", "target": target}
-
-    if scope == "topic":
-        if not target:
-            return {"ok": False, "error": "target is required for scope=topic"}
-        for r in store.get_active():
-            if target.lower() in (r.content or "").lower():
-                result = writer.forget(r.id, reason=reason, run_context=ctx)
-                if result.written:
-                    deleted.append(r.id)
-        return {"ok": True, "deleted_count": len(deleted), "deleted_ids": deleted, "scope": "topic", "target": target}
-
-    if not memory_id:
-        return {"ok": False, "error": "memory_id is required for scope=memory_id"}
-    result = writer.forget(memory_id, reason=reason, run_context=ctx)
-    return {"ok": result.written, "memory_id": memory_id, "error": "" if result.written else result.reason}
+        return handle_forget(mode="everywhere", all_user_data=True, reason=reason, ctx=ctx)
+    return {"ok": False, "error": "unknown scope; use the new 'forget' tool instead"}
 
 
 @_db_handler
@@ -543,6 +535,8 @@ def _handle_memory_search(
     返回:
         包含 results 的字典（兼容旧输出格式）
     """
+    from aiive.db.models import MemoryRecord
+    from aiive.memory.memory_policy import MemoryPolicyEngine, MemoryReadChannel
     from aiive.memory.recall_config import RecallConfig, RetrievalConfig
     from aiive.memory.scope_resolver import build_scope_context
     from aiive.retrieval.retrieval_types import RetrievalMode, RetrievalRequest
@@ -586,10 +580,19 @@ def _handle_memory_search(
 
     results = []
     touched_ids: list[str] = []
+    policy = MemoryPolicyEngine()
+    memory_ids = [str(h.memory_record_id or h.source_id) for h in items]
+    sensitivities = {
+        row.id: row.sensitivity
+        for row in db.query(MemoryRecord).filter(MemoryRecord.id.in_(memory_ids)).all()
+    }
     for h in items:
+        memory_id = str(h.memory_record_id or h.source_id)
         results.append({
-            "memory_id": h.memory_record_id or h.source_id,
-            "content": h.snippet,
+            "memory_id": memory_id,
+            "content": policy.render_content(
+                h.snippet, sensitivities.get(memory_id), MemoryReadChannel.TOOL,
+            ),
             "memory_type": h.provenance.get("memory_type", ""),
             "canonical_key": h.canonical_key or h.title,
             "scope_type": h.scope_type,
@@ -711,15 +714,19 @@ def _handle_memory_timeline(
         current (最新 active+valid 记录)、revisions (全部版本)、evidence 的字典
     """
     from aiive.db.models import MemoryEvidence, MemoryRecord
+    from aiive.memory.memory_policy import MemoryPolicyEngine, MemoryReadChannel
     from aiive.memory.memory_types import LifecycleState, ValidityState
 
     ctx = _require_ctx(ctx, "memory_timeline")
+
+    policy = MemoryPolicyEngine()
 
     # 辅助：从 MemoryRecord 提取详情
     def _record_detail(r: MemoryRecord) -> dict[str, Any]:
         d: dict[str, Any] = {
             "memory_id": r.id,
-            "content": r.content,
+            "content": policy.render_content(r.content, r.sensitivity, MemoryReadChannel.TOOL),
+            "sensitivity": r.sensitivity or "normal",
             "memory_type": r.memory_type,
             "canonical_key": r.canonical_key,
             "scope_type": r.scope_type,
@@ -797,9 +804,11 @@ def _handle_memory_event_log(db: Session, ctx: RunContext | None, query: str = "
         匹配的 raw episodes 列表，包含 memory_id、content、observed_at
     """
     from aiive.db.models import MemoryRecord
+    from aiive.memory.memory_policy import MemoryPolicyEngine, MemoryReadChannel
     from aiive.memory.memory_types import LifecycleState, ValidityState
 
     ctx = _require_ctx(ctx, "memory_event_log")
+    policy = MemoryPolicyEngine()
     if not query or not query.strip():
         return {"ok": True, "results": [], "hint": "Empty query."}
     q = query.lower()
@@ -837,7 +846,10 @@ def _handle_memory_event_log(db: Session, ctx: RunContext | None, query: str = "
     results = [
         {
             "memory_id": r.id,
-            "content": r.content,
+            "content": policy.render_content(
+                r.content, r.sensitivity, MemoryReadChannel.TOOL,
+            ),
+            "sensitivity": r.sensitivity or "normal",
             "canonical_key": r.canonical_key,
             "scope_type": r.scope_type,
             "scope_id": r.scope_id,
@@ -901,26 +913,18 @@ def _handle_read_text_file(path: str, max_lines: int = 50):
 # ── Knowledge（知识库）──
 @_db_handler
 def _handle_ingest_document(db: Session, file_path: str):
-    """将文档导入知识库，同时将原始内容保存到对象存储。
-
-    参数:
-        file_path: 文档文件路径
-
-    返回:
-        KnowledgeIngestor 的导入结果字典
-    """
+    """通过统一摄取服务持久化原文并导入知识库。"""
     from aiive.knowledge.ingestor import KnowledgeIngestor
-    from aiive.storage.object_store import put_text
-    result = KnowledgeIngestor(db).ingest(file_path)
-    # 将原始文档保存到对象存储供后续检索
-    if result.get("ok") and not result.get("duplicate"):
-        try:
-            with open(file_path) as f:
-                content = f.read()
-            put_text("raw-documents", os.path.basename(file_path), content)
-        except Exception:
-            logger.warning("对象存储写入失败: file_path=%s", file_path, exc_info=True)
-    return result
+
+    return KnowledgeIngestor(db).ingest(file_path)
+
+
+@_db_handler
+def _handle_reindex_document(db: Session, document_id: str):
+    """从持久原文重新生成知识文档分块。"""
+    from aiive.knowledge.ingestor import KnowledgeIngestor
+
+    return KnowledgeIngestor(db).reindex(document_id)
 
 
 @_db_handler
@@ -1148,10 +1152,10 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         # 基础工具
         ("echo", _handle_echo, "回显输入消息", {"message": "str"}, "low", False, False),
         # 提醒 / 任务
-        ("schedule_reminder", _handle_schedule_reminder, "创建定时提醒，立即写入 events 表",
+        ("schedule_reminder", _handle_schedule_reminder, "创建定时提醒并写入 Task 表，由后台可靠投递",
          {"content": "str", "delay_minutes": {"type": "int", "description": "默认 1"}}, "low", True, False),
         ("remind_alert", _handle_remind_alert, "激活到期提醒警报，前端显示确认/延期操作按钮",
-         {"reminder_id": "str"}, "low", False, False),
+         {"reminder_id": "str"}, "low", True, False),
         ("confirm_reminder", _handle_confirm_reminder, "确认提醒已完成",
          {"reminder_id": "str"}, "low", True, False),
         ("snooze_reminder", _handle_snooze_reminder, "延迟提醒 N 分钟，创建新的延时任务",
@@ -1172,11 +1176,29 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
              "memory_key": {"type": "str", "description": "稳定键，推荐格式: user.preference.<topic> / agent.persona.<trait> / project.<name>.<topic>"},
          }, "low", True, False),
         ("forget_memory", _handle_forget_memory,
-         "遗忘/删除记忆，支持四种范围: memory_id（单条）/ memory_key（同 key 全部）/ topic（关键词匹配）/ all（清空全部）",
+         "[DEPRECATED] Phase 6A 后请使用 'forget' 工具。遗忘/删除记忆，支持 memory_id / memory_key / all 范围",
          {"memory_id": {"type": "str", "description": "scope=memory_id 时必填"},
           "reason": {"type": "str", "description": "遗忘原因，辅助审计"},
-          "scope": {"type": "str", "description": "memory_id / memory_key / topic / all"},
-          "target": {"type": "str", "description": "scope=memory_key 或 topic 时必填"}}, "medium", True, False),
+          "scope": {"type": "str", "description": "memory_id / memory_key / all"},
+          "target": {"type": "str", "description": "scope=memory_key 必填"}}, "medium", True, False),
+        # Phase 6A: 新 forget 工具
+        ("forget", handle_forget,
+         "执行 Forget Saga — Phase A 立即屏蔽。长期记忆、原始聊天、派生摘要全部清理。\n"
+         + "mode: everywhere(默认/忘记一切) / memory_only(仅删记忆保留聊天) / history_only(仅删聊天及派生)",
+         {
+             "mode": {"type": "str", "description": "memory_only / history_only / everywhere (默认 everywhere)"},
+             "memory_ids": {"type": "list", "description": "memory_only/everywhere: 精确记忆 ID"},
+             "turn_ids": {"type": "list", "description": "history_only/everywhere: 精确 Turn ID"},
+             "event_ids": {"type": "list", "description": "history_only/everywhere: 精确 Event ID"},
+             "thread_id": {"type": "str", "description": "history_only/everywhere: 整个 Thread"},
+             "canonical_key": {"type": "str", "description": "memory_only/everywhere: 按内容键全删"},
+             "reason": {"type": "str", "description": "遗忘原因"},
+         }, "high", True, False),
+        ("forget_status", handle_forget_status,
+         "查询 forget Operation 的各阶段进度：shield/cascade/rebuild/purge/verify 的完成状态，不返回已删除内容。",
+         {
+             "operation_key": {"type": "str", "description": "forget 工具返回的 operation_key"},
+         }, "low", False, False),
         ("run_memory_maintenance", _handle_run_memory_maintenance,
          "扫描记忆库健康状态：报告各生命周期计数、候选记忆数量、过期/冲突记录等",
          {}, "low", False, False),
@@ -1219,8 +1241,10 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         ("read_text_file", _handle_read_text_file, "读取 ~/Documents 下的文本文件（最多 50 行）",
          {"path": {"type": "str", "description": "限 ~/Documents"}, "max_lines": {"type": "int", "description": "默认 50"}}, "low", False, False),
         # 知识库
-        ("ingest_document", _handle_ingest_document, "导入文档到知识库",
+        ("ingest_document", _handle_ingest_document, "导入文档到知识库并持久化原文",
          {"file_path": "str"}, "low", True, False),
+        ("reindex_document", _handle_reindex_document, "从持久原文重新生成知识文档索引",
+         {"document_id": "str"}, "low", True, False),
         ("search_knowledge", _handle_search_knowledge, "搜索已导入的文档",
          {"query": "str", "limit": {"type": "int", "description": "默认 5"}}, "low", False, False),
         # MCP 集成
@@ -1250,14 +1274,22 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
              "operation": {"type": "str", "description": "add / remove / update；current_objective 忽略此参数"},
              "payload": {"type": "dict", "description": "字段内容。open_loops/active_constraints 单项需带 id；current_objective 为 {'value': '...'}"},
              "idempotency_key": {"type": "str", "description": "可选，重复提交保护"},
-         }, "low", False, False),
+         }, "low", True, False),
     ]
 
+    external_effect_modes = {
+        "forget": "externally_reconcilable",
+        "safe_delete": "non_repeatable_external",
+        "apply_patch_to_inactive_slot": "non_repeatable_external",
+        "promote_slot": "non_repeatable_external",
+        "rollback_slot": "non_repeatable_external",
+    }
     for cap_id, handler, desc, params, risk, writes_ext, can_del in tools:
         safety = _build_safety(
             cap_id, risk_level=risk,
             requires_confirmation=(risk == "high"),
             writes_external_world=writes_ext,
             can_delete=can_del,
+            effect_mode=external_effect_modes.get(cap_id, "db_transactional"),
         )
         registry.register(ToolRegistration(safety=safety, handler=handler, description=desc, parameters=params))

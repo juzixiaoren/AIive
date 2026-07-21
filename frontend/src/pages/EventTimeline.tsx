@@ -32,7 +32,7 @@ function describe(e: EventItem): string {
     case "system_injection": {
       const tools = Array.isArray(p.injected_tools) ? p.injected_tools.join(", ") : "";
       const mem = p.memory_count ?? 0;
-      const tasks = (p.active_task_count ?? 0) + (p.due_task_count ?? 0);
+      const tasks = Number(p.active_task_count ?? 0) + Number(p.due_task_count ?? 0);
       return `注入 ${tools ? tools.split(", ").length : 0} 个工具 · ${mem} 条记忆 · ${tasks} 个任务`;
     }
     case "tool_call": {

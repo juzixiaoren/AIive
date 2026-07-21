@@ -33,7 +33,7 @@ memory/
 ├── memory_read_model.py       # L0/L1 精确 key 读取：身份 + 策略
 ├── memory_key_registry.py     # 记忆 key 注册表（唯一真相源）
 ├── core_memory_projection.py  # L1 Core Memory Block 构建与加载
-├── automatic_recall.py        # L2 自动召回引擎（5 路由）
+├── automatic_recall.py        # L2 自动召回引擎（exact / lexical / vector / episode）
 ├── recall_fusion.py           # 候选融合/去重/阈值/裁剪
 ├── recall_models.py           # 数据契约（Pydantic 模型）
 ├── recall_config.py           # 所有预算、权重、阈值（可配置）
@@ -115,17 +115,18 @@ agent.persona.relationship: personal agent
 
 **职责**：每轮用户消息后、首次 LLM 推理前，自动执行一次轻量召回。
 
-**触发**：`AgentGraph._build_agent_context()` 每轮调用 `AutomaticRecallEngine.recall()`。
+**触发**：`ContextAssembler` 每轮通过 `UnifiedRetriever` 编排召回；其中 `memory_record` 路由调用 `AutomaticRecallEngine.recall()`，统一检索异常时也降级到该引擎。
 
-**五条路由**：
+**当前生产路由**：
 
 | 路由 | 策略 | 说明 |
 |---|---|---|
 | `exact` | canonical_key / scope_id 精确匹配 | 相关性=1.0，必然通过阈值 |
-| `fts` | ILIKE token overlap 打分 | 受 0.12 相关性阈值约束 |
-| `vector` | 语义向量 | stub（Qdrant 未接入） |
-| `graph` | 时序知识图谱 | stub（KG 未接入） |
-| `episode` | query-aware 近期 episodic | 受 0.12 阈值约束，不强制注入 |
+| `lexical` | ILIKE token overlap 打分 | 可移植词汇匹配，并非 PostgreSQL FTS |
+| `vector` | OpenAI Embeddings + pgvector cosine | 配置启用后执行，查询结果按 scope、生命周期、版本和 Forget 状态回源校验 |
+| `episode` | query-aware 近期 episodic | 受相关性阈值约束，不强制注入 |
+
+时序图仍是后续规划能力，当前不进入自动召回调用链。向量能力默认关闭；显式启用但 API key、PostgreSQL、vector 扩展或投影表未就绪时，应用拒绝启动。
 
 **融合流程**（`recall_fusion.fuse_and_pack()`）：
 
@@ -189,21 +190,19 @@ POST /api/chat                              routes_chat.py
       ├─ ensure_committed_thread()          创建 / 查找 thread
       ├─ build_langchain_llm()              ChatOpenAI
       ├─ build_langchain_tools()            25+ 工具 (闭包注入 RunContext)
-      ├─ history = get_recent_messages()    Thread Working State
+      ├─ history = load_recent_messages_bounded()  有界 Thread 历史
       │
-      ├─ _build_agent_context()             ★ V2 核心
+      ├─ ContextAssembler                    ★ V2/Phase 5 上下文装配
       │    ├─ resolve_identity()            L0 Kernel Contract (精确 key)
       │    ├─ resolve_policies()            L0 Kernel Contract (policy key)
-      │    ├─ _build_stable_contract()      System Prompt 组装
       │    ├─ load_core_memory()            ★ L1 Core Memory Projection
       │    ├─ build_scope_context()          Scope Chain (thread→global)
-      │    ├─ AutomaticRecallEngine.recall() ★ L2 Automatic Recall
-      │    │    ├─ _route_exact()
-      │    │    ├─ _route_fts()
-      │    │    ├─ _route_vector()     (stub)
-      │    │    ├─ _route_temporal_graph() (stub)
-      │    │    ├─ _route_recent_episode()
-      │    │    └─ fuse_and_pack()
+      │    ├─ UnifiedRetriever.retrieve()    ★ 统一检索编排
+      │    │    └─ AutomaticRecallEngine.recall()  memory_record 路由
+      │    │         ├─ _route_exact()
+      │    │         ├─ _route_lexical()
+      │    │         ├─ _route_recent_episode()
+      │    │         └─ fuse_and_pack()
       │    ├─ _persist_recall_run()         持久化 recall_runs + candidates
       │    └─ assemble_system_content()     上下文层组装
       │
@@ -291,10 +290,6 @@ class RecallConfig:
     route_timeout_ms = 500
     rrf_k = 60
     route_weights = {"rrf": 0.40, "relevance": 0.30, ...}
-
-    # Adapters (stub)
-    vector_adapter_enabled = False
-    temporal_graph_adapter_enabled = False
 ```
 
 ---
@@ -321,9 +316,9 @@ agent_graph.run()
 | 问题 | 修复 |
 |---|---|
 | episode 路由写死 relevance=0.2，每轮强制注入 | 改为 query-aware，受 0.12 阈值约束 |
-| `routes_executed` 写死 `["exact","fts","episode"]` | 改为从候选 trace 真实推导 |
+| `routes_executed` 写死 `["exact","lexical","episode"]` | 改为从候选 trace 真实推导 |
 | `user.preference.default_language` 未注册 | 加入 MemoryKeyRegistry，role=core.interaction_defaults |
-| `active_goal`/`thread_summary` 未填充 | `active_goal` 取自 `thread.title` |
+| 召回目标信号不足 | `active_goal` 取自 `thread.title`；删除未消费的 `thread_summary` 字段 |
 | `AssembledAgentContext` 死类 | 删除 |
 | `ReadContext` 死类 + `build_context()` 死方法 | 删除 |
 | `StewardSignalExtractor` 死别名文件 | 删除整个文件 |
@@ -336,8 +331,8 @@ agent_graph.run()
 
 | 项目 | 状态 |
 |---|---|
-| Vector 路由 (Qdrant 接入) | stub，`vector_adapter_enabled=False` |
-| Temporal Graph 路由 (KG 接入) | stub，`temporal_graph_adapter_enabled=False` |
-| `thread_summary` LLM 生成 | 模型字段已定义，传 `None` |
+| Vector 路由 (pgvector 接入) | 已实现；使用 OpenAI Embeddings、Outbox 投影、版本 fencing 和 fail-closed 回源 |
+| Temporal Graph 路由 (KG 接入) | 未实现，当前不进入生产召回链路 |
+| Thread 级摘要召回信号 | 未单独建模；当前使用 `active_goal`，阶段摘要由 `SegmentSummary` 负责 |
 | Core Memory 格式转为 YAML 结构块 | 当前 flat key-value，功能等价 |
 | project/workspace/environment 实体追踪 | 模型预留，scope 链退化为 thread→global |

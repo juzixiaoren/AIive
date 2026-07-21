@@ -106,7 +106,7 @@ class TaskManager:
         """立即检查并处理指定任务。
 
         根据任务类型执行不同逻辑：
-        - reminder：标记为已完成，返回通知
+        - reminder：仅返回需要入队的动作，不提前完成任务
         - condition_watch：检查条件，满足则完成，否则保持待处理
         - routine：根据间隔重新调度下一次检查
 
@@ -124,8 +124,7 @@ class TaskManager:
         task.last_checked_at = now
 
         if task.task_type == "reminder":
-            task.status = "completed"
-            return {"ok": True, "action": "notify", "title": task.title, "description": task.description}
+            return {"ok": True, "action": "enqueue", "title": task.title, "description": task.description}
 
         elif task.task_type == "condition_watch":
             # 简单条件判断：条件为 "true" 时触发

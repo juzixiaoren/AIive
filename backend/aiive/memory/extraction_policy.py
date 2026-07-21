@@ -33,25 +33,25 @@ class MemoryExtractionPolicy:
 
     @staticmethod
     def should_skip_system_message(user_message: str) -> bool:
-        """Skip extraction for backend system messages (structural, not semantic)."""
+        """跳过后端内部系统消息，不进行自然语言语义判断。"""
         if not user_message or not user_message.strip():
             return True
         stripped = user_message.strip()
-        # These are internal placeholders, not user natural language
-        system_triggers = ("[runtime event", "[system command")
+        # 这些前缀表示内部占位消息，不是用户自然语言。
+        system_triggers = ("[runtime event", "[system command", "[系统指令]")
         return any(stripped.startswith(t) for t in system_triggers)
 
     @staticmethod
     def resolve_action(
-        signal_action: MemorySignalAction,
+        signal_action: str | MemorySignalAction | None,
         user_message: str,
     ) -> MemorySignalAction:
-        """Resolve final action combining model signal + deterministic rules.
-
-        Args:
-            signal_action: Model-classified action.
-            user_message: Raw user message for structural checks only.
-        """
+        """将模型动作与确定性结构守卫合并为规范动作。"""
         if MemoryExtractionPolicy.should_skip_system_message(user_message):
             return MemorySignalAction.SKIP
-        return signal_action
+        if isinstance(signal_action, MemorySignalAction):
+            return signal_action
+        try:
+            return MemorySignalAction(str(signal_action).strip().lower())
+        except (TypeError, ValueError):
+            return MemorySignalAction.EXTRACT_ASYNC

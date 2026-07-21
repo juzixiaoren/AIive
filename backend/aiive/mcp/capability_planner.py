@@ -10,7 +10,10 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from json_repair import repair_json
+
 from aiive.core.llm_client import LLMClient, LLMResponse
+from aiive.core.text_utils import strip_code_fence
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +74,9 @@ class CapabilityPlanner:
 
     def analyze_goal(self, goal: str) -> dict[str, Any]:
         """调用 LLM 分析用户目标，识别缺失的能力类型。"""
-        prompt = _PLAN_PROMPT.format(goal=goal)
+        # 模板中含字面量 JSON 示例（裸花括号），不能用 str.format，
+        # 否则会把 JSON 里的 {...} 当成格式字段而抛 KeyError。
+        prompt = _PLAN_PROMPT.replace("{goal}", goal)
         try:
             resp: LLMResponse = self._llm.chat(
                 [{"role": "user", "content": prompt}], temperature=0.1,
@@ -190,14 +195,12 @@ class CapabilityPlanner:
 
     @staticmethod
     def _parse_analysis(raw: str) -> dict[str, Any]:
-        text = raw.strip()
-        for fence in ("```json", "```"):
-            if text.startswith(fence):
-                text = text[len(fence):].strip()
-            if text.endswith("```"):
-                text = text[:-3].strip()
+        text = strip_code_fence(raw)
         try:
-            data: dict[str, Any] = json.loads(text)
+            try:
+                data: dict[str, Any] = json.loads(text)
+            except json.JSONDecodeError:
+                data = json.loads(repair_json(text))
             return {
                 "goal_summary": str(data.get("goal_summary", "")),
                 "missing_capability_type": str(data.get("missing_capability_type", "other")),
@@ -205,5 +208,5 @@ class CapabilityPlanner:
                 "risk_tolerance": str(data.get("risk_tolerance", "medium")),
                 "reasoning": str(data.get("reasoning", "")),
             }
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, TypeError):
             return {"goal_summary": "", "missing_capability_type": "other", "search_keywords": [], "risk_tolerance": "medium", "reasoning": ""}

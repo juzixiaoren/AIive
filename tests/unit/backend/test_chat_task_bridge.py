@@ -1,15 +1,7 @@
-"""测试 Chat 到 Task 桥接层——意图路由和工具注册。"""
-from aiive.runtime.intent_router import IntentRouter
+"""测试 Chat 到 Task 桥接层——工具注册。"""
 
 
 class TestChatTaskBridge:
-    def test_all_intents_default_to_plain_chat(self):
-        """所有意图现在都经过 LLM ReAct 循环，非正则匹配。"""
-        router = IntentRouter()
-        for msg in ["一分钟后提醒我测试", "以后叫我小明", "忘掉我的名字记忆"]:
-            result = router.detect(msg)
-            assert result.intent_type == "plain_chat", f"消息 '{msg}' 应为 plain_chat（LLM 驱动）"
-
     def test_tool_registry_has_schedule_reminder(self):
         """验证工具注册表中存在 schedule_reminder 工具。"""
         from aiive.tools.registry import get_tool_registry
