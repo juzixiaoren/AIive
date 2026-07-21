@@ -6,14 +6,23 @@ from alembic import context
 
 from aiive.db.models import Base
 
+# 确保全部 ORM 模型都注册到 Base.metadata：forget_models / retention_models
+# 定义在独立模块且未被 models.py 导入，若不在此显式导入，autogenerate 与
+# create_all 都会遗漏这些表（Phase 6A Forget Saga、Phase 6B 保留治理）。
+import aiive.db.forget_models  # noqa: F401  # pyright: ignore[reportUnusedImport]
+import aiive.db.retention_models  # noqa: F401  # pyright: ignore[reportUnusedImport]
+
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
 
 # Interpret the config file for Python logging.
-# This line sets up loggers basically.
+# 程序化调用（应用启动时 command.upgrade）会复用宿主进程的 logger。
+# 默认 disable_existing_loggers=True 会静默禁用 uvicorn/aiive 已配置的 logger，
+# 表现为迁移日志后"卡住"（实际应用已启动，只是后续日志被吞）。
+# 传 disable_existing_loggers=False 保留宿主 logger。
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # add your model's MetaData object here
 # for 'autogenerate' support

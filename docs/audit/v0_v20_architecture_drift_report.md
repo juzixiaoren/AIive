@@ -18,7 +18,9 @@ grep "from langgraph\|StateGraph\|checkpointer" → 0 matches
 
 **严重程度: BLOCKER**
 
-当前 `/api/chat` → `agent_loop.run()` 是手写 if/else 流程，没有 StateGraph、没有 Checkpointer、没有节点化。Thread state 仅通过 `thread_state.get_recent_messages()` 从 DB 读 history 重建，重启后同 thread 可继续但无 checkpoint resume 机制。
+> 历史审计结论：以下描述对应旧 `agent_loop` 架构，当前生产已迁移到 LangGraph，旧 `ThreadState.get_recent_messages()` 也已删除并由 `load_recent_messages_bounded()` 取代。
+
+审计当时 `/api/chat` → `agent_loop.run()` 是手写 if/else 流程，没有 StateGraph、没有 Checkpointer、没有节点化。Thread state 仅通过旧历史接口从 DB 读 history 重建，重启后同 thread 可继续但无 checkpoint resume 机制。
 
 ### 1.2 /api/chat 的真实调用链
 

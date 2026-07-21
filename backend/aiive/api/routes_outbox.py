@@ -8,11 +8,12 @@ import logging
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
+from aiive.api.developer_security import redact_diagnostic_text, require_local_developer
 from aiive.db.base import get_db
 from aiive.db.models import OutboxJob
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/outbox")
+router = APIRouter(prefix="/api/outbox", dependencies=[Depends(require_local_developer)])
 
 
 @router.get("/jobs")
@@ -48,7 +49,7 @@ def list_jobs(
                 "status": j.status,
                 "trace_id": j.trace_id,
                 "retry_count": j.retry_count,
-                "error_message": j.error_message,
+                "error_message": redact_diagnostic_text(j.error_message),
                 "created_at": j.created_at.isoformat(),
             }
             for j in jobs

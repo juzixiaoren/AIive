@@ -13,6 +13,7 @@
   "reportMissingModuleSource": "none",
   "exclude": [
     "alembic/versions",
+    "alembic/_archive_migrations_20260717",
     "tests",
     "conftest.py"
   ]

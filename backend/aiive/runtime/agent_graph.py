@@ -21,8 +21,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json as _json
 import logging
+import operator
+import uuid as _uuid
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Callable
 
@@ -40,19 +44,19 @@ from sqlalchemy.orm import Session
 from typing_extensions import TypedDict
 
 from aiive.context.run_context import RunContext
-from aiive.core.action_planner import ActionPlanner, AgentDecision, MemorySignalDecision
+from aiive.core.action_planner import ActionPlanner, MemorySignalDecision
+from aiive.core.llm_client import normalize_llm_error
 from aiive.core.llm_client import LLMClient
-from aiive.memory.extraction_policy import MemorySignalAction
+from aiive.memory.extraction_policy import MemoryExtractionPolicy, MemorySignalAction
 from aiive.memory.memory_store import MemoryStore
 from aiive.runtime.event_logger import EventLogger
 from aiive.runtime.policy_engine import check_tool_calls, PolicyAction
 from aiive.runtime.thread_state import ThreadState
-from aiive.runtime.tool_executor import ToolCallRecord, build_action_cards
+from aiive.runtime.action_cards import ActionCard, PendingOperation
+from aiive.runtime.tool_executor import ToolCallRecord, build_action_cards, build_pending_operations
 from aiive.runtime.trace import Trace
 from aiive.tools.langchain_adapter import build_langchain_tools
 from aiive.tools.registry import ToolRegistry, get_tool_registry
-from aiive.worker.outbox_handlers import register_all
-from aiive.worker.outbox_worker import OutboxWorker
 from aiive.runtime.tool_normalizer import ToolResultNormalizer
 from aiive.runtime.token_counter import LiteLLMTokenCounter
 from aiive.runtime.working_state import WorkingStateService
@@ -81,6 +85,7 @@ def _ws_commit(mutate: "Callable[[Session], None]") -> None:
 class _AgentState(TypedDict):
     """LangGraph 状态字典（模块级定义，支持类型解析）。"""
     messages: Annotated[list[Any], add_messages]
+    tool_records: Annotated[list[dict[str, Any]], operator.add]
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +126,9 @@ def _build_runtime_identity(runtime_identity: dict[str, str] | None) -> str:
     rstyle = runtime_identity.get("relationship_style", "")
     if rstyle:
         lines.append(f"- relationship_style: {rstyle}")
+    respstyle = runtime_identity.get("response_style", "")
+    if respstyle:
+        lines.append(f"- response_style: {respstyle}")
     if len(lines) == 1:
         return ""
     return "\n".join(lines) + "\n"
@@ -133,7 +141,7 @@ def _truncate(text: str, max_len: int) -> str:
     return text[:max_len] + "…"
 
 
-def _flatten_tool_result(result: object) -> str:  # pyright: ignore[reportUnusedFunction]
+def flatten_tool_result(result: object) -> str:
     """从嵌套的 {ok: bool, result: str} 结构中提取实际结果字符串。"""
     if isinstance(result, dict) and "result" in result:
         return result["result"]
@@ -154,7 +162,7 @@ class ToolRecord:
     name: str = ""
     params: dict[str, Any] = field(default_factory=dict)
     result: dict[str, Any] = field(default_factory=dict)
-    status: str = "completed"     # "completed" | "failed"
+    status: str = "completed"     # "completed" | "failed" | "execution_unknown"
     order_index: int = 0          # 全局执行顺序
 
 
@@ -166,7 +174,9 @@ class AgentGraphResult:
     trace_id: str = ""
     user_message: str = ""
     tool_records: list[ToolRecord] = field(default_factory=list)
-    action_cards: list[dict[str, Any]] = field(default_factory=list)
+    action_cards: list[ActionCard] = field(default_factory=list)
+    pending_operations: list[PendingOperation] = field(default_factory=list)
+    pending_approvals: list[dict[str, Any]] = field(default_factory=list)
     context_snapshot_items: list["ContextItem"] = field(default_factory=list)
     context_snapshot_meta: dict[str, Any] = field(default_factory=dict)
     post_context_items: list["ContextItem"] = field(default_factory=list)
@@ -194,12 +204,7 @@ class AgentGraph:
         _logger: 事件日志记录器
         _thread_state: 线程状态管理器
         _memory_store: 记忆存储
-        _action_planner: 动作规划器（用于 outbox 意图追踪）
-        _outbox: Outbox 工作队列
-        _last_ctx_items: 最近一次构建的上下文项列表
-        _last_ctx_meta: 最近一次上下文的元数据
-        _last_intent: 最近一次意图检测结果
-        _last_decision: 最近一次 AgentDecision 决策
+        _action_planner: 动作规划器（记忆信号分类）
     """
 
     def __init__(self, llm_client: LLMClient, db: Session):
@@ -209,19 +214,6 @@ class AgentGraph:
         self._thread_state: ThreadState = ThreadState(db)
         self._memory_store: MemoryStore = MemoryStore(db)
         self._action_planner: ActionPlanner = ActionPlanner(llm_client)
-        # Phase 0.5B: OutboxWorker now requires HandlerRegistry + ActiveClaimRegistry
-        from aiive.worker.handler_registry import HandlerRegistry as HR
-        from aiive.worker.outbox_heartbeat import ActiveClaimRegistry
-        _hr = HR()
-        _acr = ActiveClaimRegistry()
-        register_all(_hr)
-        self._outbox: OutboxWorker = OutboxWorker(
-            worker_id="agent-graph", registry=_hr, claims=_acr,
-        )
-        self._last_ctx_items: list[ContextItem] = []
-        self._last_ctx_meta: dict[str, Any] = {}
-        self._last_intent: dict[str, Any] = {}
-        self._last_decision: AgentDecision | None = None
 
     # ------------------------------------------------------------------
     # LangChain LLM 工厂
@@ -258,6 +250,8 @@ class AgentGraph:
 Use the current request, active policies, working context, relevant memories, runtime state, and available tools to help the user.
 
 When provided, use `agent_display_name` as your name and `user_display_name` naturally when addressing the user. Do not invent either value when absent.
+
+When `relationship_style` or `response_style` are provided in Runtime Identity, follow them for tone, formality, and formatting of your replies, unless the user's current explicit request says otherwise.
 
 # Priorities
 
@@ -393,13 +387,14 @@ Be concise by default. Provide additional detail when the task is complex, the u
         thread_id: str = "",
         turn_record_id: str = "",
         execution_id: str = "",
-    ) -> tuple[Any, list[dict[str, Any]]]:
-        """构建并返回编译后的 StateGraph 和工具记录引用列表。
+    ) -> tuple[Any, list[dict[str, Any]], list[dict[str, Any]]]:
+        """构建并返回编译后的 StateGraph、工具记录引用列表和待审批列表。
 
         Returns:
-            (compiled_graph, tool_records) 二元组，tool_records 为可变列表引用
+            (compiled_graph, tool_records, pending_approvals) 三元组
         """
         tool_records: list[dict[str, Any]] = []
+        _pending_approval_list: list[dict[str, Any]] = []
         args_by_id: dict[str, dict[str, Any]] = {}
 
         def _assistant(state: _AgentState) -> dict[str, Any]:
@@ -408,7 +403,15 @@ Be concise by default. Provide additional detail when the task is complex, the u
             logger.info("[TRACE:graph] ASSISTANT(ns) msgs_count=%d", len(msgs))
             resp = llm_with_tools.invoke(msgs)
             tc_count = len(getattr(resp, "tool_calls", None) or [])
-            logger.info("[TRACE:graph] ASSISTANT(ns) tool_calls=%d content_len=%d", tc_count, len(str(resp.content or "")))
+            content_len = len(str(resp.content or ""))
+            logger.info("[TRACE:graph] ASSISTANT(ns) tool_calls=%d content_len=%d", tc_count, content_len)
+            # LLM 返回既无内容也无工具调用属于异常空响应，记录以便定位根因
+            # （模型侧偶发、工具绑定异常、streaming 兼容问题等）。
+            if tc_count == 0 and content_len == 0:
+                logger.warning(
+                    "[TRACE:graph] ASSISTANT(ns) LLM 返回空响应（无内容且无工具调用）: msgs_count=%d",
+                    len(msgs),
+                )
             if tc_count > 0:
                 for tc in resp.tool_calls:
                     logger.info("[TRACE:graph] ASSISTANT(ns) tc: name=%s args=%s", tc.get("name", "?"), tc.get("args", {}))
@@ -419,6 +422,7 @@ Be concise by default. Provide additional detail when the task is complex, the u
 
         def _policy_check(state: _AgentState) -> str:
             """策略检查节点：根据 ToolRegistry 元数据校验 tool_calls。"""
+            nonlocal _pending_approval_list
             msgs = state.get("messages", [])
             if not msgs:
                 logger.info("[TRACE:graph] POLICY_CHECK(ns): no messages → finalize")
@@ -433,11 +437,45 @@ Be concise by default. Provide additional detail when the task is complex, the u
             ]
             logger.info("[TRACE:graph] POLICY_CHECK(ns): %d tool_calls=%s", len(tool_calls_raw), [tc["name"] for tc in tool_calls_raw])
             result = check_tool_calls(tool_calls_raw, registry)
+            if result.action == PolicyAction.CONFIRM:
+                _pending_approval_list[:] = [
+                    {"name": tc["name"], "args": tc.get("args", {}), "id": tc.get("id", ""),
+                     "safe_tool_calls": tool_calls_raw}
+                    for tc in last_msg.tool_calls
+                ]
+                logger.info("[TRACE:graph] POLICY_CHECK(ns): action=CONFIRM → confirm (%d tools)", len(_pending_approval_list))
+                return "confirm"
             logger.info("[TRACE:graph] POLICY_CHECK(ns): action=%s → %s", result.action, "finalize" if result.action == PolicyAction.BLOCK else "continue")
-            # CONFIRM 不等于拒绝：确认机制尚未实现，不应等同 BLOCK。后续有确认 UI 再单独处理。
             if result.action == PolicyAction.BLOCK:
                 return "finalize"
             return "continue"
+
+        def _confirm_node(state: _AgentState) -> dict[str, Any]:  # pyright: ignore[reportUnusedParameter]
+            """确认节点：冻结服务端工具调用，等待 Turn 最终事务持久化。
+
+            CONFIRM 工具不在此节点执行；审批事实与 action card 在 Turn 完成时
+            原子落库，之后只能由审批 API 读取并执行。
+            """
+            if not _pending_approval_list:
+                return {}
+            for pa in _pending_approval_list:
+                tc_name = str(pa.get("name", "") or "")
+                tc_args = pa.get("args", {}) if isinstance(pa.get("args"), dict) else {}
+                reg = registry.get(tc_name)
+                canonical_args = _json.dumps(
+                    tc_args, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
+                )
+                pa["approval_id"] = str(_uuid.uuid4())
+                pa["tool_args_hash"] = hashlib.sha256(canonical_args.encode("utf-8")).hexdigest()
+                pa["descriptor_hash"] = reg.safety.descriptor_hash if reg is not None else ""
+                pa["risk_snapshot"] = {
+                    "risk_level": reg.safety.risk_level if reg is not None else "unknown",
+                    "requires_confirmation": reg.safety.requires_confirmation if reg is not None else True,
+                    "writes_external_world": reg.safety.writes_external_world if reg is not None else False,
+                    "can_delete": reg.safety.can_delete if reg is not None else False,
+                }
+            logger.info("[TRACE:graph] CONFIRM(ns): prepared %d pending approvals", len(_pending_approval_list))
+            return {}
 
         def _tools_node(state: _AgentState) -> dict[str, Any]:
             """tools 节点：执行工具并追踪执行记录。
@@ -454,7 +492,7 @@ Be concise by default. Provide additional detail when the task is complex, the u
             tc_names = [tc.get("name", "") for tc in tc_list]
             logger.info("[TRACE:graph] TOOLS(ns): invoking %d tools=%s", len(tc_names), tc_names)
 
-            # ── 调用前：登记 running_tool_state ──
+            # ── 调用前：登记 running_tool_state + 未提交副作用 ──
             if ws_service is not None and tc_list:
                 ws: WorkingStateService = ws_service
                 def _register(db: Session) -> None:
@@ -463,35 +501,57 @@ Be concise by default. Provide additional detail when the task is complex, the u
                             db, thread_id, turn_record_id, execution_id,
                             str(tc.get("id", "") or ""), str(tc.get("name", "") or ""),
                         )
+                        # 副作用跟踪：writes_external_world 的工具登记未提交副作用
+                        reg = registry.get(str(tc.get("name", "") or ""))
+                        if reg is not None and reg.safety.writes_external_world:
+                            ws.add_uncommitted_side_effect(
+                                db, thread_id,
+                                ref=str(tc.get("id", "") or ""),
+                                description=str(tc.get("name", "") or ""),
+                                risk=reg.safety.risk_level,
+                            )
                 _ws_commit(_register)
 
             try:
                 result = native_tool_node.invoke(state)
                 logger.info("[TRACE:graph] TOOLS(ns): result messages=%d", len(result.get("messages", [])))
             except Exception:
-                # 调用失败：尽力清理 running_tool_state（recover_orphaned_tools 兜底）
+                # 调用失败：尽力清理 running_tool_state + 未提交副作用（recover_orphaned_tools 兜底）
                 if ws_service is not None and tc_list:
                     ws_b: WorkingStateService = ws_service
                     def _clean(db: Session) -> None:
                         for tc in tc_list:
                             ws_b.remove_running_tool(db, thread_id, str(tc.get("id", "") or ""))
+                            ws_b.remove_uncommitted_side_effect(db, thread_id, str(tc.get("id", "") or ""))
                     _ws_commit(_clean)
                 logger.exception("[TRACE:graph] TOOLS(ns): invoke FAILED")
                 raise
 
             tool_messages = [m for m in result.get("messages", []) if isinstance(m, ToolMessage)]
+            batch_index = max(
+                0,
+                sum(1 for m in state["messages"] if isinstance(m, AIMessage) and m.tool_calls) - 1,
+            )
 
             for i, tc in enumerate(tc_list):
                 tm = tool_messages[i] if i < len(tool_messages) else None
                 raw_content = str(tm.content) if tm else ""
                 is_error = raw_content.startswith("Error:") if raw_content else False
+                execution_status = ""
+                operation_id = ""
                 if not is_error and raw_content.startswith("{"):
                     try:
                         parsed = _json.loads(raw_content)
-                        if isinstance(parsed, dict) and not parsed.get("ok", True):
-                            is_error = True
+                        if isinstance(parsed, dict):
+                            execution_status = str(parsed.get("execution_status", "") or "")
+                            operation_id = str(parsed.get("operation_id", "") or "")
+                            if not parsed.get("ok", True):
+                                is_error = True
                     except (ValueError, TypeError):
                         pass
+                record_status = "execution_unknown" if execution_status in (
+                    "queued", "running", "execution_unknown",
+                ) else ("failed" if is_error else "completed")
 
                 # ── A: 规范化（有界引用化 / 内联）──
                 artifact_ref = ""
@@ -512,9 +572,16 @@ Be concise by default. Provide additional detail when the task is complex, the u
                 tool_records.append({
                     "name": tc.get("name", ""),
                     "params": args_by_id.get(str(tc.get("id", "") or ""), {}),
-                    "result": {"ok": not is_error, "result": raw_content},
-                    "status": "failed" if is_error else "completed",
+                    "result": {
+                        "ok": not is_error,
+                        "result": str(tm.content) if tm else raw_content,
+                        "operation_id": operation_id,
+                        "execution_status": execution_status,
+                    },
+                    "status": record_status,
                     "trace_id": trace_id,
+                    "tool_call_id": str(tc.get("id", "") or ""),
+                    "batch_index": batch_index,
                 })
 
                 # ── B: 调用后维护 verified_tool_states / running_tool_state / artifact_refs ──
@@ -525,31 +592,39 @@ Be concise by default. Provide additional detail when the task is complex, the u
                         _tc: Any = tc,
                         _ref: Any = artifact_ref,
                         _err: Any = is_error,
+                        _record_status: str = record_status,
                     ) -> None:
                         ws_c.remove_running_tool(db, thread_id, str(_tc.get("id", "") or ""))
-                        ws_c.update_verified_tool_state(
-                            db, thread_id, str(_tc.get("name", "") or ""),
-                            {"ok": not _err, "tool_call_id": str(_tc.get("id", "") or "")},
-                        )
+                        if _record_status != "execution_unknown":
+                            ws_c.remove_uncommitted_side_effect(db, thread_id, str(_tc.get("id", "") or ""))
+                            ws_c.update_verified_tool_state(
+                                db, thread_id, str(_tc.get("name", "") or ""),
+                                {"ok": not _err, "tool_call_id": str(_tc.get("id", "") or "")},
+                            )
                         if _ref:
                             ws_c.add_artifact_ref(db, thread_id, str(_ref), "tool_result", str(_tc.get("name", "") or ""))
                     _ws_commit(_finalize)
 
-            return {"messages": result.get("messages", [])}
+            return {
+                "messages": result.get("messages", []),
+                "tool_records": tool_records[-len(tc_list):] if tc_list else [],
+            }
 
         graph = StateGraph(_AgentState)
         graph.add_node("assistant", _assistant)
+        graph.add_node("confirm", _confirm_node)
         graph.add_node("tools", _tools_node)
         graph.add_edge(START, "assistant")
         graph.add_conditional_edges(
             "assistant",
             _policy_check,
-            {"continue": "tools", "finalize": END},
+            {"continue": "tools", "confirm": "confirm", "finalize": END},
         )
+        graph.add_edge("confirm", END)
         graph.add_edge("tools", "assistant")
         compiled = graph.compile()
 
-        return compiled, tool_records
+        return compiled, tool_records, _pending_approval_list
 
     # ------------------------------------------------------------------
     # Phase 0.5A: _execute_graph（LLM + 工具执行，无 DB 事件写入）
@@ -557,11 +632,12 @@ Be concise by default. Provide additional detail when the task is complex, the u
 
     def _execute_graph(
         self, message: str, thread_id: str,
-        turn_id: str = "", ctx_bundle: Any = None,
+        turn_id: str = "", turn_record_id: str = "", ctx_bundle: Any = None,
         execution_id: str = "", normalizer: "ToolResultNormalizer | None" = None,
+        trace_id: str | None = None,
     ) -> "AgentGraphResult":
         """Execute graph inference. Uses pre-assembled context from ContextAssembler."""
-        trace = Trace.new()
+        trace = Trace(trace_id=trace_id) if trace_id else Trace.new()
         thread = self._thread_state.get_or_create_thread(thread_id)
 
         # Phase 1: 工具结果规范化（有界引用化）+ WorkingState 生命周期维护
@@ -580,29 +656,47 @@ Be concise by default. Provide additional detail when the task is complex, the u
         ctx_items_data: list[ContextItem] = []
         ctx_meta: dict[str, Any] = dict(assembled_ctx.snapshot_meta or {})
 
-        self._last_ctx_items = ctx_items_data
-        self._last_ctx_meta = ctx_meta
-
         # ── Execute graph ──
         langchain_llm = self._build_langchain_llm()
         registry = get_tool_registry()
-        run_ctx_exec = RunContext(thread_id=thread.id, trace_id=trace.trace_id, source="user_chat", turn_id=turn_id)
+        run_ctx_exec = RunContext(
+            thread_id=thread.id,
+            trace_id=trace.trace_id,
+            source="user_chat",
+            turn_id=turn_id,
+            turn_record_id=turn_record_id,
+        )
         tools = build_langchain_tools(registry, run_context=run_ctx_exec)
         # Phase 1: 当 ContextAssembler 已裁剪工具 schema 时，仅绑定该有界子集，
         # 保证 LLM 实际可见工具数与上下文预算一致。
         if tool_schemas is not None:
             allowed = {s.get("function", {}).get("name") for s in tool_schemas}
             tools = [t for t in tools if getattr(t, "name", None) in allowed]
+        if not tools:
+            logger.warning(
+                "[TRACE:graph] 工具列表为空（tool_schemas=%s），LLM 将无工具可用",
+                "present" if tool_schemas else "none",
+            )
         llm_with_tools = langchain_llm.bind_tools(tools)
 
-        compiled, _records_raw = self._build_graph(
+        compiled, _records_raw, pending_approvals = self._build_graph(
             llm_with_tools, tools, registry,
             trace_id=trace.trace_id, _thread_id=thread.id,
             _model=self._llm_client.default_model,
             normalizer=normalizer, ws_service=ws_service,
-            thread_id=thread.id, turn_record_id=turn_id, execution_id=execution_id,
+            thread_id=thread.id, turn_record_id=turn_record_id, execution_id=execution_id,
         )
-        result = compiled.invoke({"messages": initial_messages})
+        try:
+            result = compiled.invoke({"messages": initial_messages, "tool_records": []})
+        except Exception as error:
+            logger.exception(
+                "[TRACE:graph] compiled.invoke 异常: trace_id=%s model=%s msgs_count=%d tools_count=%d",
+                trace.trace_id,
+                self._llm_client.default_model,
+                len(initial_messages),
+                len(tools),
+            )
+            raise normalize_llm_error(error, trace.trace_id) from error
 
         # ── 提取回复 ──
         reply = ""
@@ -615,13 +709,43 @@ Be concise by default. Provide additional detail when the task is complex, the u
                 if isinstance(m, AIMessage) and m.content:
                     reply = str(m.content); break
 
-        # ── ToolRecord（含 tool_call_id）──
-        tool_records = self._extract_tool_records(all_messages)
+        # ── ToolRecord（Graph state 是同步与流式共同事实源）──
+        tool_records = self._tool_records_from_state(result.get("tool_records", []))
 
-        action_cards = build_action_cards([
+        # 空回复且非审批挂起属于异常情况，记录告警以便定位根因
+        # （LLM 空响应、工具绑定异常、streaming 兼容问题等）。
+        if not reply and not pending_approvals:
+            logger.warning(
+                "[TRACE:graph] _execute_graph 返回空回复: trace_id=%s message=%s msgs_count=%d tool_record_count=%d",
+                trace.trace_id,
+                message[:100],
+                len(all_messages),
+                len(tool_records),
+            )
+
+        # ── 审批记录：CONFIRM 工具未执行，构造 pending_approval 的 ToolRecord ──
+        if pending_approvals:
+            for pa in pending_approvals:
+                tc_name = str(pa.get("name", "") or "")
+                tc_args = pa.get("args", {}) if isinstance(pa.get("args"), dict) else {}
+                tool_records.append(ToolRecord(
+                    tool_call_id=str(pa.get("id", "") or ""),
+                    name=tc_name,
+                    params=tc_args,
+                    result={"ok": False, "result": "awaiting_approval"},
+                    status="pending_approval",
+                    order_index=len(tool_records),
+                ))
+            if not reply and pending_approvals:
+                tool_names = [str(pa.get("name", "")) for pa in pending_approvals]
+                reply = f"需要你的确认来执行以下工具: {', '.join(tool_names)}"
+
+        card_records = [
             ToolCallRecord(name=r.name, params=r.params, result=r.result, status=r.status, trace_id=trace.trace_id)
             for r in tool_records
-        ])
+        ]
+        action_cards = build_action_cards(card_records, pending_approvals=pending_approvals)
+        pending_operations = build_pending_operations(card_records, pending_approvals=pending_approvals)
 
         post_items, post_full = self._build_post_context_items(reply, [
             {"name": r.name, "params": r.params, "result": r.result, "status": r.status, "trace_id": trace.trace_id}
@@ -634,17 +758,245 @@ Be concise by default. Provide additional detail when the task is complex, the u
             signal = self._action_planner.classify_memory_signal(user_message=message, reply=reply, trace_id=trace.trace_id)
         except Exception:
             logger.warning("记忆信号分类失败（已使用默认信号）: trace_id=%s", trace.trace_id, exc_info=True)
+        signal.action = MemoryExtractionPolicy.resolve_action(signal.action, message).value
 
         return AgentGraphResult(
             reply=reply, trace_id=trace.trace_id, user_message=message,
             tool_records=tool_records, action_cards=action_cards,
+            pending_operations=pending_operations,
+            pending_approvals=[dict(item) for item in pending_approvals],
             context_snapshot_items=list(ctx_items_data), context_snapshot_meta=dict(ctx_meta),
             post_context_items=post_items, post_full_contents=post_full, memory_signal=signal,
         )
 
+    # ------------------------------------------------------------------
+    # Phase 0.5B: _execute_graph_stream（流式 LLM + 工具执行）
+    # ------------------------------------------------------------------
+
+    async def _execute_graph_stream(
+        self, message: str, thread_id: str,
+        turn_id: str = "", turn_record_id: str = "", ctx_bundle: Any = None,
+        execution_id: str = "", normalizer: "ToolResultNormalizer | None" = None,
+        trace_id: str | None = None,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """流式执行图推理，逐渐产出 token / tool_call / tool_result 事件。
+
+        最后一个事件固定为 {"type": "__graph_result__", "result": AgentGraphResult}。
+        利用 LangGraph astream_events(v2) 实现 token 级真正流式传输。
+        """
+        trace = Trace(trace_id=trace_id) if trace_id else Trace.new()
+        thread = self._thread_state.get_or_create_thread(thread_id)
+
+        if normalizer is None:
+            normalizer = ToolResultNormalizer(LiteLLMTokenCounter(), self._llm_client.default_model)
+        ws_service = WorkingStateService()
+
+        assembled_ctx = getattr(ctx_bundle, "assembled_ctx", None) if ctx_bundle is not None else None
+        if assembled_ctx is None:
+            raise RuntimeError("execute_turn 必须通过 ContextAssembler 提供 assembled_ctx")
+
+        chat_messages = assembled_ctx.messages
+        tool_schemas = assembled_ctx.tools_schema
+        initial_messages = self._dicts_to_langchain_messages(chat_messages)
+        ctx_items_data: list[ContextItem] = []
+        ctx_meta: dict[str, Any] = dict(assembled_ctx.snapshot_meta or {})
+
+        langchain_llm = self._build_langchain_llm()
+        registry = get_tool_registry()
+        run_ctx_exec = RunContext(
+            thread_id=thread.id,
+            trace_id=trace.trace_id,
+            source="user_chat",
+            turn_id=turn_id,
+            turn_record_id=turn_record_id,
+        )
+        tools = build_langchain_tools(registry, run_context=run_ctx_exec)
+        if tool_schemas is not None:
+            allowed = {s.get("function", {}).get("name") for s in tool_schemas}
+            tools = [t for t in tools if getattr(t, "name", None) in allowed]
+        if not tools:
+            logger.warning(
+                "[TRACE:graph] 工具列表为空（tool_schemas=%s），LLM 将无工具可用",
+                "present" if tool_schemas else "none",
+            )
+        llm_with_tools = langchain_llm.bind_tools(tools)
+
+        compiled, _records_raw, pending_approvals = self._build_graph(
+            llm_with_tools, tools, registry,
+            trace_id=trace.trace_id, _thread_id=thread.id,
+            _model=self._llm_client.default_model,
+            normalizer=normalizer, ws_service=ws_service,
+            thread_id=thread.id, turn_record_id=turn_record_id, execution_id=execution_id,
+        )
+
+        # ── 流式执行 ──
+        accumulated: list[str] = []
+        final_state: dict[str, Any] | None = None
+        input_state: dict[str, Any] = {"messages": initial_messages, "tool_records": []}
+
+        try:
+            async for event in compiled.astream_events(input_state, version="v2"):
+                kind = event["event"]
+                evt_name = event.get("name", "")
+                metadata = event.get("metadata", {})
+                node = metadata.get("langgraph_node", "")
+
+                if kind == "on_chain_end" and not event.get("parent_ids"):
+                    output = event.get("data", {}).get("output")
+                    if isinstance(output, dict) and "messages" in output:
+                        final_state = output
+
+                if kind == "on_chat_model_stream":
+                    chunk = event["data"].get("chunk")
+                    if chunk is not None and chunk.content:
+                        text = str(chunk.content)
+                        accumulated.append(text)
+                        yield {"type": "token", "text": text}
+
+                elif kind == "on_tool_start" and node == "tools":
+                    input_data = event["data"].get("input", {})
+                    tool_call_id = str(
+                        input_data.get("id", "") if isinstance(input_data, dict) else ""
+                    )
+                    tool_params = input_data.get("args", input_data) if isinstance(input_data, dict) else {}
+                    yield {
+                        "type": "tool_call",
+                        "tool_call_id": tool_call_id,
+                        "name": evt_name,
+                        "params": tool_params,
+                    }
+
+                elif kind == "on_tool_end" and node == "tools":
+                    output: Any = event["data"].get("output", "")
+                    first: Any = None
+                    if isinstance(output, dict) and "messages" in output:
+                        msgs = output.get("messages", [])
+                        first = msgs[0] if msgs else None
+                        content = str(first.content) if first and hasattr(first, "content") else str(first) if first else ""
+                    elif isinstance(output, (list, tuple)):
+                        first = output[0] if output else None
+                        content = str(first.content) if first and hasattr(first, "content") else str(first) if first else ""
+                    elif hasattr(output, "content"):
+                        first = output
+                        content = str(getattr(output, "content", ""))
+                    else:
+                        content = str(output)
+                    is_error = content.startswith("Error:")
+                    execution_status = ""
+                    if not is_error and content.startswith("{"):
+                        try:
+                            parsed = _json.loads(content)
+                            if isinstance(parsed, dict):
+                                execution_status = str(parsed.get("execution_status", "") or "")
+                                if not parsed.get("ok", True):
+                                    is_error = True
+                        except (ValueError, TypeError):
+                            pass
+                    result_status = "execution_unknown" if execution_status in (
+                        "queued", "running", "execution_unknown",
+                    ) else ("failed" if is_error else "completed")
+                    tool_call_id = ""
+                    if first is not None and hasattr(first, "tool_call_id"):
+                        tool_call_id = str(getattr(first, "tool_call_id", "") or "")
+                    yield {
+                        "type": "tool_result",
+                        "tool_call_id": tool_call_id,
+                        "name": evt_name,
+                        "result": content,
+                        "status": result_status,
+                    }
+        except Exception as error:
+            logger.exception(
+                "[TRACE:graph] astream_events 异常: trace_id=%s model=%s",
+                trace.trace_id, self._llm_client.default_model,
+            )
+            raise normalize_llm_error(error, trace.trace_id) from error
+
+        reply = "".join(accumulated)
+        if final_state is not None:
+            final_messages = final_state.get("messages", [])
+            for final_message in reversed(final_messages):
+                if isinstance(final_message, AIMessage) and final_message.content and not final_message.tool_calls:
+                    reply = str(final_message.content)
+                    break
+
+        # ── Graph state 是最终事实源；闭包仅用于异常时保留部分执行事实 ──
+        state_records = final_state.get("tool_records", []) if final_state is not None else _records_raw
+        tool_records = self._tool_records_from_state(state_records)
+
+        # ── 审批记录 ──
+        if pending_approvals:
+            for pa in pending_approvals:
+                tc_name = str(pa.get("name", "") or "")
+                tc_args = pa.get("args", {}) if isinstance(pa.get("args"), dict) else {}
+                tool_records.append(ToolRecord(
+                    tool_call_id=str(pa.get("id", "") or ""),
+                    name=tc_name,
+                    params=tc_args,
+                    result={"ok": False, "result": "awaiting_approval"},
+                    status="pending_approval",
+                    order_index=len(tool_records),
+                ))
+            if not reply and pending_approvals:
+                tool_names = [str(pa.get("name", "")) for pa in pending_approvals]
+                reply = f"需要你的确认来执行以下工具: {', '.join(tool_names)}"
+
+        if not reply and not pending_approvals and not _records_raw:
+            logger.warning(
+                "[TRACE:graph] _execute_graph_stream 返回空回复: trace_id=%s message=%s",
+                trace.trace_id, message[:100],
+            )
+
+        card_records = [
+            ToolCallRecord(name=r.name, params=r.params, result=r.result, status=r.status, trace_id=trace.trace_id)
+            for r in tool_records
+        ]
+        action_cards = build_action_cards(card_records, pending_approvals=pending_approvals)
+        pending_operations = build_pending_operations(card_records, pending_approvals=pending_approvals)
+
+        post_items, post_full = self._build_post_context_items(reply, [
+            {"name": r.name, "params": r.params, "result": r.result, "status": r.status, "trace_id": trace.trace_id}
+            for r in tool_records
+        ])
+
+        signal: MemorySignalDecision = MemorySignalDecision(action=MemorySignalAction.EXTRACT_ASYNC.value, confidence=0.5, reason="default")
+        try:
+            signal = self._action_planner.classify_memory_signal(user_message=message, reply=reply, trace_id=trace.trace_id)
+        except Exception:
+            logger.warning("记忆信号分类失败（已使用默认信号）: trace_id=%s", trace.trace_id, exc_info=True)
+        signal.action = MemoryExtractionPolicy.resolve_action(signal.action, message).value
+
+        yield {
+            "type": "__graph_result__",
+            "result": AgentGraphResult(
+                reply=reply, trace_id=trace.trace_id, user_message=message,
+                tool_records=tool_records, action_cards=action_cards,
+                pending_operations=pending_operations,
+                pending_approvals=[dict(item) for item in pending_approvals],
+                context_snapshot_items=list(ctx_items_data), context_snapshot_meta=dict(ctx_meta),
+                post_context_items=post_items, post_full_contents=post_full, memory_signal=signal,
+            ),
+        }
+
+    @staticmethod
+    def _tool_records_from_state(records: list[dict[str, Any]]) -> list["ToolRecord"]:
+        """将 Graph state 中的工具事实转换为统一 ToolRecord。"""
+        return [
+            ToolRecord(
+                tool_call_id=str(record.get("tool_call_id", "") or ""),
+                batch_index=int(record.get("batch_index", 0) or 0),
+                name=str(record.get("name", "") or ""),
+                params=record.get("params", {}) if isinstance(record.get("params"), dict) else {},
+                result=record.get("result", {"ok": False, "result": ""}),
+                status=str(record.get("status", "completed") or "completed"),
+                order_index=index,
+            )
+            for index, record in enumerate(records)
+        ]
+
     @staticmethod
     def _extract_tool_records(all_messages: list[Any]) -> list["ToolRecord"]:
-        """从 graph 结果消息中提取 ToolRecord，含 tool_call_id 和 batch_index。"""
+        """从消息提取 ToolRecord，供历史兼容和测试使用。"""
         records: list[ToolRecord] = []
         batch_index = 0
         order_index = 0

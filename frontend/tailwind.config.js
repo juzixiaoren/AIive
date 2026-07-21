@@ -8,6 +8,8 @@
  *   均采用嵌套令牌，例如 bg-primary / bg-primary-hover / bg-primary-soft / border-primary-border。
  * @type {import('tailwindcss').Config}
  */
+import typography from "@tailwindcss/typography";
+
 export default {
   content: ["./index.html", "./src/**/*.{js,ts,jsx,tsx}"],
   theme: {
@@ -91,5 +93,5 @@ export default {
       },
     },
   },
-  plugins: [],
+  plugins: [typography],
 };

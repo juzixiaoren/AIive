@@ -1,121 +1,128 @@
 """
 本地文件系统对象存储适配器。
 
-提供兼容 S3/MinIO 接口的对象存储抽象层，使用本地文件系统实现。
-bucket/key 模型映射到本地目录结构，方便将来替换为云存储。
+对象键映射到项目内的持久目录；内容寻址写入具备幂等性，并通过同目录原子替换
+避免读取到部分内容。接口保持 bucket/key 形式，便于后续替换为远端对象存储。
 """
 
+import hashlib
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
-# 对象存储根目录
-ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent / ".data" / "object_store"
+ROOT = Path(__file__).resolve().parents[3] / ".data" / "object_store"
 
 
 @dataclass
 class ObjectRef:
-    """对象引用，包含 bucket、key 和元数据。"""
-    bucket: str  # 存储桶名称
-    key: str  # 对象键名
-    metadata: dict[str, Any] | None = None  # 自定义元数据
+    """对象引用，包含存储桶、对象键和可选元数据。"""
 
-    def __post_init__(self):
+    bucket: str
+    key: str
+    metadata: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
         if self.metadata is None:
             self.metadata = {}
+        if not self.bucket or Path(self.bucket).is_absolute() or ".." in Path(self.bucket).parts:
+            raise ValueError("对象存储桶名称无效")
+        if not self.key or Path(self.key).is_absolute() or ".." in Path(self.key).parts:
+            raise ValueError("对象键无效")
 
     @property
     def path(self) -> Path:
-        """根据 bucket 和 key 计算本地文件路径。"""
+        """计算对象在本地适配器中的绝对路径。"""
         return ROOT / self.bucket / self.key
 
 
-def put_text(bucket: str, key: str, text: str, metadata: dict[str, Any] | None = None) -> ObjectRef:
-    """
-    存储文本内容为对象。
-
-    参数:
-        bucket: 存储桶名称。
-        key: 对象键名。
-        text: 文本内容。
-        metadata: 自定义元数据字典。
-
-    返回:
-        创建的 ObjectRef 引用。
-    """
-    ref = ObjectRef(bucket=bucket, key=key, metadata=metadata or {})
+def _atomic_put(ref: ObjectRef, data: bytes) -> ObjectRef:
+    """在对象目录内原子写入字节；已存在且内容一致时直接复用。"""
     ref.path.parent.mkdir(parents=True, exist_ok=True)
-    ref.path.write_text(text, encoding="utf-8")
+    if ref.path.exists():
+        if ref.path.read_bytes() != data:
+            raise ValueError("对象键已存在但内容不一致")
+        return ref
+
+    temporary = ref.path.parent / f".{ref.path.name}.{uuid4().hex}.tmp"
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, ref.path)
+    finally:
+        if temporary.exists():
+            from aiive.tools.safe_delete import safe_delete
+
+            safe_delete(str(temporary), "object_store", "trash")
     return ref
 
 
-def put_bytes(bucket: str, key: str, data: bytes, metadata: dict[str, Any] | None = None) -> ObjectRef:
-    """
-    存储二进制内容为对象。
+def put_text(
+    bucket: str,
+    key: str,
+    text: str,
+    metadata: dict[str, Any] | None = None,
+) -> ObjectRef:
+    """以 UTF-8 字节存储文本对象。"""
+    return put_bytes(bucket, key, text.encode("utf-8"), metadata)
 
-    参数:
-        bucket: 存储桶名称。
-        key: 对象键名。
-        data: 二进制数据。
-        metadata: 自定义元数据字典。
 
-    返回:
-        创建的 ObjectRef 引用。
-    """
-    ref = ObjectRef(bucket=bucket, key=key, metadata=metadata or {})
-    ref.path.parent.mkdir(parents=True, exist_ok=True)
-    ref.path.write_bytes(data)
-    return ref
+def put_bytes(
+    bucket: str,
+    key: str,
+    data: bytes,
+    metadata: dict[str, Any] | None = None,
+) -> ObjectRef:
+    """原子且幂等地存储二进制对象。"""
+    return _atomic_put(ObjectRef(bucket=bucket, key=key, metadata=metadata or {}), data)
+
+
+def put_content_addressed(
+    bucket: str,
+    data: bytes,
+    metadata: dict[str, Any] | None = None,
+) -> tuple[ObjectRef, str]:
+    """按 SHA-256 内容哈希存储对象并返回引用与哈希。"""
+    content_hash = hashlib.sha256(data).hexdigest()
+    key = f"sha256/{content_hash[:2]}/{content_hash}"
+    ref = put_bytes(bucket, key, data, metadata)
+    return ref, content_hash
 
 
 def get(ref: ObjectRef) -> bytes:
-    """
-    读取对象为二进制数据。
-
-    参数:
-        ref: ObjectRef 对象引用。
-
-    返回:
-        对象的二进制内容。
-    """
+    """读取对象的原始字节。"""
     return ref.path.read_bytes()
 
 
+def get_verified(ref: ObjectRef, expected_hash: str) -> bytes:
+    """读取对象并校验 SHA-256 内容哈希。"""
+    data = get(ref)
+    actual_hash = hashlib.sha256(data).hexdigest()
+    if actual_hash != expected_hash:
+        raise ValueError("知识原文对象内容哈希校验失败")
+    return data
+
+
 def get_text(ref: ObjectRef) -> str:
-    """
-    读取对象为文本。
-
-    参数:
-        ref: ObjectRef 对象引用。
-
-    返回:
-        对象的 UTF-8 文本内容。
-    """
-    return ref.path.read_text(encoding="utf-8")
+    """以 UTF-8 读取文本对象。"""
+    return get(ref).decode("utf-8")
 
 
 def exists(ref: ObjectRef) -> bool:
-    """
-    检查对象是否存在。
-
-    参数:
-        ref: ObjectRef 对象引用。
-
-    返回:
-        对象文件是否存在。
-    """
-    return ref.path.exists()
+    """检查对象是否存在。"""
+    return ref.path.is_file()
 
 
-def delete(ref: ObjectRef):
-    """
-    安全删除对象，使用 safe_delete 确保可审计。
-
-    参数:
-        ref: ObjectRef 对象引用。
-    """
+def delete(ref: ObjectRef) -> None:
+    """通过 safe_delete 将对象移入回收站。"""
     from aiive.tools.safe_delete import safe_delete
-    safe_delete(str(ref.path), "object_store", "trash")
+
+    decision = safe_delete(str(ref.path), "object_store", "trash")
+    if not decision.allowed:
+        raise RuntimeError(f"对象安全删除失败：{decision.reason}")

@@ -824,6 +824,8 @@ B active。
 
 ### 5.1 时间 / 任务工具
 
+> 这是期望清单而非当前 ToolRegistry 清单。`schedule_tool_task` 截至 2026-07-20 未实现、未注册且不可用。
+
 ```text
 schedule_reminder
 schedule_tool_task

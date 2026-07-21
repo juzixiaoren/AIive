@@ -54,7 +54,7 @@
    - `content = tombstone`（串 `forgotten:{id8}:{iso}`），`lifecycle_state=forgotten`，`validity_state=superseded`，`structured_value=None`；
    - `DELETE memory_evidence WHERE memory_id=...`（无幂等键、无重算其他 Memory 的 evidence）；
    - `log_event("memory.forgotten", ...)`（仅当 `run_context` 有 thread_id）；
-   - `enqueue_projection(record, "memory.forgotten")` → 入队 `memory_vector_delete` + `retrieval_index_refresh`；
+   - `enqueue_projection(record, "memory.forgotten")` → 入队 `memory_vector_refresh` + `retrieval_index_refresh`；向量 handler 回源后删除失效投影；
    - `ForgetRequest(memory_id, reason, tombstone)` 落库（`saga_state` 默认 `"running"`，**从未被更新**）。
 4. **异步侧**：`retrieval_index_refresh` handler → `refresh_source` → `memory.forgotten ∈ _TOMBSTONE_EVENTS` → `tombstone_by_source`（清 entry 正文 + 删 token）。
 
@@ -186,10 +186,10 @@ reason: str
 
 ---
 
-## H. Forget 数据模型（增量方案，新增 7 张表，不替换旧 `forget_requests`）
+## H. Forget 数据模型（增量方案，新增 10 张表，不替换旧 `forget_requests`）
 
-> **修订（§9）**：保留旧 `forget_requests` 表（只读兼容，旧 API 委托新 Operation），**不 rename/recreate**。新增 7 张表：
-> `forget_operations`、`forget_shields`、`forget_selector_manifests`、`forget_targets`、`forget_dependencies`、`forget_batches`、`forget_actions`、`forget_tombstones`（共 8 张，含 tombstones）。
+> **修订（§9）**：保留旧 `forget_requests` 表（只读兼容，旧 API 委托新 Operation），**不 rename/recreate**。新增 10 张表：
+> `forget_operations`、`forget_selector_manifests`、`forget_shields`、`forget_targets`、`forget_dependencies`、`forget_batches`、`forget_actions`、`forget_tombstones`、`forget_stage_runs`、`content_provenance_refs`（ORM / migration / 文档表数量必须一致，见 §10）。
 
 ### 不可变层级（§3）
 ```text
@@ -202,11 +202,11 @@ ForgetAction            ← 每个具体清理动作（幂等，由 Batch 驱动
 ### `forget_operations`（Saga 根，替换原 `forget_requests` 的职责）
 ```text
 id              PK String(36)
-operation_id    String(128) UNIQUE          # 幂等键，跨重试/接管复用
+operation_key   String(128) UNIQUE          # 幂等键，跨重试/接管复用（stage operation_id = forget:{id}:{stage}）
 mode            String(16)                   # memory_only|history_only|everywhere
 selector_type   String(32)
 selector_hash   String(64)                  # 结构化选择器的确定性哈希
-status          String(32)                  # requested→shielded→cascading→verifying→purge_ready→purging→purged→failed_retryable→deadletter
+status          String(32)                  # requested→shielded→cascading→verifying→purge_ready→purging→purged→failed_retryable→deadletter→shielded_deadletter
 requested_by    String(36)                  # 触发 trace_id / user
 reason_code     String(64)
 target_count    Integer
@@ -217,24 +217,30 @@ error_message   Text nullable
 legacy_request_id String(36) nullable       # 旧 forget_requests.id（旧 API 委托时填）
 created_at / updated_at
 ```
-CHECK(`status IN (...)`)，UNIQUE(`operation_id`)。
+CHECK(`status IN (...)`)，UNIQUE(`operation_key`)。
 
-### `forget_selector_manifests`（§3，Phase A 冻结 selector + cutoff）
+### `forget_selector_manifests`（§3，Phase A 冻结不可变规范化 selector）
 ```text
 id                  PK
-operation_id        FK forget_operations.id
+forget_operation_id FK forget_operations.id
 selector_type       String(32)
-selector_payload_hash String(64)             # 结构化选择器 JSON 的确定性哈希
-cutoff_created_at   DateTime                 # 冻结的时间 cutoff（仅处理早于该时刻的数据）
+selector_payload    JSON                       # 不可变规范化 selector：IDs/scope/时间范围/canonical_key 等结构化条件，不保存匹配原文
+selector_payload_hash String(64)              # 结构化选择器 JSON 的确定性哈希
+cutoff_created_at   DateTime                  # 冻结的时间 cutoff（仅处理早于该时刻的数据）
 frozen_at           DateTime
+UNIQUE(forget_operation_id, selector_payload_hash)   # 重试不重复物化
 ```
-写入后不可修改；重试/接管复用同一份。
+写入后不可修改；**Phase B 只能从该 `selector_payload` 物化 Target**；重试/接管复用同一份。
 
-### `forget_shields`（§2，选择器级即时屏蔽）
+### `forget_shields`（§2，选择器级 + 实体级即时屏蔽）
 ```text
 id                  PK
-operation_id        FK forget_operations.id
-selector_type       String(32)
+forget_operation_id FK forget_operations.id
+selector_type       String(32)               # memory_ids|canonical_key|thread|turn_range|event_ids|time_range|all_user_data
+target_type         String(32) nullable       # 实体级 Shield（memory_record/turn_record/event/...）时填
+target_id           String(36) nullable
+canonical_key       String(256) nullable
+value_fingerprint   String(64) nullable       # HMAC-SHA256(secret, canonical_value)，见 §H 内容指纹
 thread_id           String(36) nullable
 time_from           DateTime nullable
 time_to             DateTime nullable
@@ -243,13 +249,16 @@ scope_id            String(128) nullable
 all_user_data       Boolean default False
 cutoff_created_at   DateTime                  # 同 selector_manifest 的 cutoff
 status              String(16)                # active | superseded
+normalized_shield_key String(256)               # 规范化幂等键（确定性哈希），用于重试去重
 created_at
+UNIQUE(forget_operation_id, normalized_shield_key)   # 禁止依赖包含 nullable 列的普通 UNIQUE 保证幂等
 ```
-所有读取路径先检查 Shield（按 thread/time/scope/all_user_data 快速 fail-closed），再检查逐条 Tombstone。一个 broad selector 可物化多条 Shield 行，但**Phase A 只写 Shield，不枚举全部目标**。
+所有读取路径先检查 Shield（按 selector_type 命中 thread/time/scope/all_user_data/canonical_key 的选择器 Shield，或按 target_type/target_id 的实体级 Shield）快速 fail-closed，再检查逐条 Tombstone。**仅 `memory_ids` / `turn_ids` / `event_ids`（≤ `max_inline_shield_targets`）在 Phase A 写实体级 Shield**；`canonical_key` / `thread` / `time_range` / `scope` / `all_user_data` / 超限 ID 只写选择器 Shield，Target 与 Tombstone 由 Cascade Batch 处理。一个 broad selector 可物化多条 Shield 行，但 Phase A 只写 Shield，不枚举全部 Target。
 
 ### `forget_targets`（§3，有界批次确定性物化，冻结后不可变）
 ```text
-id, operation_id FK
+id                  PK
+forget_operation_id FK forget_operations.id
 target_type    String(32)   # memory_record|thread|turn_record|event|segment|segment_summary|epoch|epoch_checkpoint|retrieval_entry|proposal|working_state
 target_id      String(36)
 source_version String(64) nullable
@@ -257,44 +266,53 @@ source_hash    String(64) nullable
 scope_type     String(32) nullable
 scope_id       String(128) nullable
 canonical_key  String(256) nullable
-value_hash     String(64) nullable
+value_hash     String(64) nullable              # 确定性内容哈希（用于幂等/重算，非安全指纹）
 batch_no       Integer      # 物化批次
 frozen_at      DateTime
+UNIQUE(forget_operation_id, target_type, target_id)   # 重试不重复物化
 ```
 **不保存原文**。写入后不可修改；已冻结批次不得在重试时重新发现或扩大。
 
 ### `forget_dependencies`（§3，由 Target 确定性推导）
 ```text
-id, operation_id FK
-target_id       FK forget_targets.id nullable
-dependency_type String(32)   # proposal|evidence|lineage|summary|checkpoint|retrieval_entry|retrieval_token|maintenance_snapshot|working_state|compaction_input|raw_event|raw_turn|content_provenance
-dependency_id   String(36)
-discovery_batch_no Integer
-status          String(16)   # pending|resolved|skipped
-discovered_at   DateTime
+id                  PK
+forget_operation_id FK forget_operations.id
+target_id           FK forget_targets.id nullable
+dependency_type     String(32)   # proposal|evidence|lineage|summary|checkpoint|retrieval_entry|retrieval_token|maintenance_snapshot|working_state|compaction_input|raw_event|raw_turn|content_provenance
+dependency_id       String(36)
+discovery_batch_no  Integer
+status              String(16)   # pending|resolved|skipped
+discovered_at       DateTime
+UNIQUE(forget_operation_id, dependency_type, dependency_id)   # 重试不重复物化
 ```
 仅基于已冻结 Target + 真实 provenance 推导（不再次扫描全表），重试复用同一批。
 
-### `forget_batches`（§4，stage cursor 表）
+### `forget_batches`（§4，stage cursor 表，复合游标）
 ```text
-id, operation_id FK
-stage           String(16)   # shield|cascade|rebuild|recompute|scrub|purge|verify
-dependency_type String(32) nullable
-batch_no        Integer
-cursor_start    String(64)   # 续跑游标（ID / 偏移）
-cursor_end      String(64) nullable
-cutoff          DateTime    # 同 selector cutoff
-status          String(16)   # pending|running|done|failed
-input_hash      String(64)   # 批次输入确定性哈希（防重放/校验）
-action_count    Integer
-completed_count Integer
+id                  PK
+forget_operation_id FK forget_operations.id
+stage               String(16)   # shield|cascade|rebuild|recompute|scrub|purge|verify
+dependency_type     String(32) nullable
+batch_no           Integer
+cursor_lane         String(32)   # 续跑 lane 标识（按依赖类型/source 分 lane）
+cursor_start_json   JSON         # 复合续跑游标起始（时间+sequence+ID），禁止用数据库 offset
+cursor_end_json     JSON nullable
+cutoff              DateTime    # 同 selector cutoff
+status              String(16)   # pending|running|done|failed
+input_hash          String(64)   # 批次输入确定性哈希（防重放/校验）
+action_count        Integer
+completed_count     Integer
 created_at / updated_at
+UNIQUE(forget_operation_id, stage, dependency_type, batch_no)   # 重试不重复物化
 ```
-恢复时优先处理未完成 Batch；正常分页使用 `HandlerOutcome.CONTINUE`，**不得计为失败**（不增加 `retry_count`）。
+恢复时优先处理未完成 Batch；正常分页使用 `HandlerOutcome.CONTINUE`，**不得计为失败**（不增加 `retry_count`）。不同 lane 保存对应的（时间, sequence, ID）复合游标，**禁止使用数据库 offset**；崩溃后无跳过、无重复。
 
 ### `forget_actions`（§4，每个具体清理动作，幂等）
 ```text
-id, operation_id FK, target_id FK nullable, dependency_id FK nullable
+id                  PK
+forget_operation_id FK forget_operations.id
+target_id           FK forget_targets.id nullable
+dependency_id       FK forget_dependencies.id nullable
 action_type    String(32)   # shield|delete_evidence|scrub_proposal|rebuild_summary|rebuild_checkpoint|recompute_evidence|scrub_entry|delete_token|scrub_maintenance_snapshot|scrub_working_state|scrub_raw_event|scrub_raw_turn|physical_delete|verify
 batch_no       Integer
 status         String(16)   # pending|running|done|skipped|failed
@@ -306,29 +324,61 @@ started_at / completed_at / error_message
 ```
 UNIQUE(`idempotency_key`)。
 
-### `forget_tombstones`（§7，fail-closed + 防重新抽取，精确拦截）
+### `forget_stage_runs`（§7，Stage ↔ Outbox 关联，原子 deadletter）
 ```text
-id, operation_id FK
-target_type / target_id
-canonical_key / scope_type / scope_id / value_hash
-source_event_id / source_turn_record_id
-reason_code
-created_at / purged_at
+id                  PK
+forget_operation_id FK forget_operations.id
+stage               String(16)   # shield|cascade|rebuild|recompute|scrub|purge|verify
+outbox_job_id       FK outbox_jobs.id NOT NULL UNIQUE   # 每个 stage 一个 Job，强关联
+status              String(16)   # pending|running|done|failed|deadletter
+execution_token     String(64) nullable
+claim_count         Integer default 0
+failure_count       Integer default 0
+created_at / updated_at
 ```
-**不含可恢复用户原文**（仅哈希/ID）。索引：`(canonical_key, scope_type, scope_id, value_hash)`、`(source_event_id)`、`(source_turn_record_id)`。
-拦截规则见 E 节 §7。
+OutboxJob `payload.forget_operation_id` 关联；stage operation_id = `forget:{forget_operation_id}:{stage}`。deadletter 时：`forget_operations.status = shielded_deadletter`、`forget_stage_runs.status = deadletter`、**`forget_shields.status` 保持 `active`**（不弱化为 superseded/删除），三者**原子**更新（见 P）；后台清理 deadletter 后可通过 reconciler 恢复 Shield 对应的 stage 继续执行；**不得因后台清理失败解除或弱化 Shield**。
 
-### `content_provenance_refs`（§8，未来写入统一 provenance）
+### `forget_tombstones`（§3/§7，fail-closed + 防重抽 + 内容指纹 + 可审计性）
+```text
+id                  PK
+forget_operation_id FK forget_operations.id
+target_type         String(32)
+target_id           String(36)
+canonical_key       String(256) nullable
+scope_type          String(32) nullable
+scope_id            String(128) nullable
+value_fingerprint   String(64) nullable              # HMAC-SHA256(secret, canonical_value)，见 §H 内容指纹
+fingerprint_key_version Integer nullable
+block_visibility    Boolean default True            # 读取路径 fail-closed 屏蔽
+block_reingestion   Boolean default True            # 拦截旧来源重新抽取
+content_purged      Boolean default False           # 内容是否已不可逆 scrub/删除（审计模式也不可绕过）
+allow_audit_read    Boolean default False           # 是否允许经授权审计模式绕过可见性查看原始内容（memory_only=true）
+source_event_id     String(36) nullable
+source_turn_record_id String(36) nullable
+reason_code         String(64)
+created_at / purged_at
+UNIQUE(forget_operation_id, target_type, target_id)   # 核心幂等（不依赖 nullable canonical_key）
+UNIQUE(forget_operation_id, source_event_id) WHERE source_event_id IS NOT NULL   # partial unique，DDL 用 sqlite_where/postgresql_where
+UNIQUE(forget_operation_id, source_turn_record_id) WHERE source_turn_record_id IS NOT NULL
+```
+**不含可恢复用户原文**。普通 SHA-256 低熵 `value_hash` 不得作为不可恢复指纹；须用 `value_fingerprint`（HMAC）。索引：`(canonical_key, scope_type, scope_id, value_fingerprint)`、`(source_event_id)`、`(source_turn_record_id)`。
+拦截规则见 E 节 §7。四种效果：`block_visibility`（读取屏蔽）、`block_reingestion`（防重抽）、`content_purged`（内容已不可逆清除，任何模式不可见）、`allow_audit_read`（是否允许经授权审计绕过可见性）。审计可见性规则：仅当 `allow_raw_history && allow_audit_read && !content_purged` 同时成立，才能绕过普通可见性屏蔽。memory_only 旧 Event/Turn：`block_visibility=true, block_reingestion=true, content_purged=false, allow_audit_read=true`（保留 raw history，审计可读）；history_only/everywhere：`allow_audit_read=false`（即使在 scrub 完成前，审计模式也不可见）。
+
+### 内容指纹（§5，长期保留）
+`value_fingerprint = HMAC-SHA256(secret, canonical_value)`，`fingerprint_key_version` 记录密钥版本。普通 SHA-256 的 `value_hash` 熵低、可能被字典反推，**不得**作为不可恢复 tombstone 指纹；`value_hash` 仅用于幂等/重算（确定性哈希）。密钥由配置注入，轮转时 bump `fingerprint_key_version`。
+
+### `content_provenance_refs`（§8，规范化逐行引用）
 ```text
 id              PK
-ref_type        String(32)   # llm_call|context_snapshot|artifact|outbox_job|maintenance_snapshot|log
-ref_id          String(36)
-source_turn_record_ids  JSON  # 数组
-source_event_ids        JSON  # 数组
-memory_record_ids       JSON  # 数组
+owner_type      String(32)   # llm_call|context_snapshot|artifact|outbox_job|maintenance_snapshot|log
+owner_id        String(36)
+source_type     String(32)   # memory_record|turn_record|event
+source_id       String(36)
 created_at
+UNIQUE(owner_type, owner_id, source_type, source_id)
+INDEX(source_type, source_id)            # 按源 ID 有界反查
 ```
-供 ForgetVerifier 按源 ID 反查并定位需 scrub 的副本；旧数据无此表则走粗粒度/legacy 标记（见 N）。
+供 ForgetVerifier 按 `source_type+source_id` 有界反查并定位需 scrub 的副本（llm_calls / context_snapshots / artifacts / outbox_jobs / maintenance_snapshots）；旧数据无此表则走粗粒度/legacy 标记（见 N）。
 
 ---
 
@@ -336,18 +386,19 @@ created_at
 
 事务内（单 `ForgetSagaService` 短事务，**不持有长事务、不枚举整个 Thread/时间范围/all_user_data**）：
 
-1. `INSERT forget_operations(status='requested')` + `operation_id`；
-2. 冻结 `forget_selector_manifests`（selector + `cutoff_created_at`）；
-3. 物化选择器级 `forget_shields`（按 thread/time/scope/all_user_data 写 Shield 行；**不展开到逐条 Target**）；
-4. 仅对**显式给定 ID**（如 `memory_ids`）冻结 `forget_targets`（语义搜索只定位、删除基于冻结 ID）；
-5. `INSERT forget_tombstones`（fail-closed 立即生效；memory_only 也写针对来源 Event/Turn 的 tombstone 防重抽）；
-6. 目标 `MemoryRecord.lifecycle_state = forgotten`（fail-closed 读取即不可见）；
-7. `CoreMemoryBlock` 删除/清空（下一轮 `core_memory_refresh` 自然重建，或 Phase A 内直接删相关 block 行）；
-8. `Memory retrieval projection`（`RetrievalIndexEntry`）立即 tombstone（清正文 + 删 token）；
-9. `WorkingState` 中匹配目标的条目 scrub（见 O）；
-10. `INSERT OutboxJob(operation_id="forget:{request_id}:cascade")`；
-11. `forget_operations.status='shielded'`, `shielded_at=now`；
-12. commit。
+1. `INSERT forget_operations(status='requested')` + `operation_key`（幂等键）；
+2. 冻结 `forget_selector_manifests`（写入 `selector_payload` 不可变规范化 selector + `cutoff_created_at`）；
+3. 物化选择器级 `forget_shields`（按 thread/time/scope/all_user_data/canonical_key 写 selector Shield 行；**不展开到逐条 Target**）；
+4. 仅对有界显式 ID（`memory_ids` / `turn_ids` / `event_ids`，且数量 ≤ `max_inline_shield_targets`）**立即写实体级 `forget_shields`**（`target_type`/`target_id` + `normalized_shield_key`）；超出上限的 ID 集合退化为 selector Shield + Cascade Batch 处理；
+5. 仅对显式 Memory ID（有限量）冻结 `forget_targets`；以下选择器不在 Phase A 枚举 Target/Tombstone：`canonical_key` / `thread` / `time_range` / `scope` / `all_user_data` / 超出上限的 ID 集合（Target、Tombstone、投影清理由 Cascade Batch 完成）；
+6. `INSERT forget_tombstones`：fail-closed 立即生效；memory_only 的旧 Event/Turn 写 tombstone 取 `block_visibility=true, block_reingestion=true, content_purged=false, allow_audit_read=true`（保留 raw history，审计可读）；history_only/everywhere 取 `allow_audit_read=false`（即使在 scrub 完成前，审计模式也不可见）；
+7. 目标 `MemoryRecord.lifecycle_state = forgotten`（fail-closed 读取即不可见）；
+8. `CoreMemoryBlock` 删除/清空（下一轮 `core_memory_refresh` 自然重建，或 Phase A 内直接删相关 block 行）；
+9. `Memory retrieval projection`（`RetrievalIndexEntry`）立即 tombstone（清正文 + 删 token）；
+10. `WorkingState` 中匹配目标的条目 scrub（见 O）；
+11. `INSERT OutboxJob(operation_id="forget:{forget_operation_id}:cascade")`，`payload.forget_operation_id` 关联 `forget_stage_runs`；
+12. `forget_operations.status='shielded'`, `shielded_at=now`；
+13. commit。
 
 **只有 Phase A 成功，工具才返回 `forget accepted and shielded`**。对于 `memory_only`/`history_only`/`everywhere`，即使后续异步失败也不可返回目标内容（Shield + Tombstone 双保险）。禁止只在创建异步 Job 尚未屏蔽时声称已忘记。
 
@@ -355,8 +406,8 @@ created_at
 
 ## J. 依赖发现与不可变 Manifest（§3）
 
-Phase B（独立 Job `forget:{operation_id}:cascade`）：
-- 根据冻结 `forget_selector_manifests` + `forget_targets` + 真实 provenance（`MemoryEvidence.source_event_id`、Summary/Checkpoint 的 `source_event_ids`/`source_segment_ids`、`RetrievalIndexEntry.source_id`、CompactionInput manifest）定位 `Proposal`/`Evidence`/`Lineage`/`Summary`/`Checkpoint`/`Retrieval projection`/`Maintenance snapshot`/`Compaction manifest`/`raw Event/Turn`/`WorkingState`。
+Phase B（独立 Job `forget:{forget_operation_id}:cascade`）：
+- 根据冻结 `forget_selector_manifests.selector_payload`（不可变规范化 selector）物化 `forget_targets`（有界批次、写后即冻），并结合已冻结 `forget_targets` + 真实 provenance（`MemoryEvidence.source_event_id`、Summary/Checkpoint 的 `source_event_ids`/`source_segment_ids`、`RetrievalIndexEntry.source_id`、CompactionInput manifest）定位 `Proposal`/`Evidence`/`Lineage`/`Summary`/`Checkpoint`/`Retrieval projection`/`Maintenance snapshot`/`Compaction manifest`/`raw Event/Turn`/`WorkingState`。
 - **有界批次确定性物化**：将发现结果写入 `forget_dependencies`（按 `discovery_batch_no`），并生成幂等 `forget_actions`（UNIQUE `idempotency_key`），登记到 `forget_batches`。
 - **已冻结批次不得在重试时重新发现或扩大**——只读冻结 Manifest，重试复用同一批 Dependency/Action（`forget_batches` 续跑）。
 
@@ -373,7 +424,7 @@ Phase B（独立 Job `forget:{operation_id}:cascade`）：
 ```text
 写新 SegmentSummary version（summary_version+1，复用 (segment_id, summary_version) UNIQUE）
 更新 Segment.summary_id = 新 id
-刷新 P5 RetrievalIndex（旧 entry tombstone，新 entry 写入）
+enqueue retrieval refresh/tombstone（旧 entry tombstone、新 entry 写入；非同步刷新）
 旧 Summary 保持隐藏（is_searchable=False + retrieval tombstone）
 以上同事务提交
 ```
@@ -382,7 +433,7 @@ Phase B（独立 Job `forget:{operation_id}:cascade`）：
 ```text
 写新 EpochCheckpoint version（checkpoint_version+1）
 更新 Epoch.checkpoint_id = 新 id
-刷新 P5 索引
+enqueue retrieval refresh/tombstone（旧 entry tombstone、新 entry 写入；非同步刷新）
 旧 Checkpoint 保持隐藏
 以上同事务提交
 ```
@@ -393,7 +444,7 @@ Phase B（独立 Job `forget:{operation_id}:cascade`）：
 3. 有剩余 → 复用 P3 生成新 `summary_version`；
 4. 无剩余 → 生成确定性 empty/redacted Summary（固定占位文本，如 `[redacted: all source forgotten]`）；
 5. 旧 Summary 内容进入 scrub/purge；
-6. 刷新 P5 索引。
+6. enqueue retrieval refresh/tombstone（旧 entry tombstone、新 entry 写入；非同步刷新）。
 
 受影响 `EpochCheckpoint`：
 1. 旧 Checkpoint 立即不可检索；
@@ -423,7 +474,7 @@ Phase B（独立 Job `forget:{operation_id}:cascade`）：
 
 ### Phase E scrub（小批量，不成长事务）
 - 目标字段：`content`/`structured_value`/`raw_payload`/`normalized_payload`/`content_span`/`search_text`/`snippet`/`metadata` 中的用户内容 / `snapshot_json` 中的用户内容 / 工具结果正文 / `working_states.*` / `segment_summaries.*` / `epoch_checkpoints.*` / `compaction_inputs.working_state_snapshot` / `epoch_compaction_inputs.*` / `memory_maintenance_inputs.snapshot_json` / `artifacts.content` / `context_snapshots.context_items` / `llm_calls.*_preview`。
-- 保留最小审计信息仅限：`ID` / `类型` / `时间` / `哈希` / `状态` / `reason_code` / `operation_id`。
+- 保留最小审计信息仅限：`ID` / `类型` / `时间` / `哈希` / `状态` / `reason_code` / `forget_operation_id`。
 
 ### Phase F 物理 purge（§5 修订：**默认不可逆 scrub，非默认删整行**）
 - 只有以下条件全部成立才能进入 purge：
@@ -458,7 +509,7 @@ Phase B（独立 Job `forget:{operation_id}:cascade`）：
 - Memory Extraction 不会重新创建（查 `forget_tombstones`）。
 
 ### provenance 验证（§8）
-- 对 `content_provenance_refs` 中有 source_id 的副本（llm_calls / context_snapshots / artifacts / outbox_jobs / maintenance_snapshots），按源 ID 反查是否仍含未清理内容；
+- 对 `content_provenance_refs` 中按 `source_type+source_id` 有界反查的副本（llm_calls / context_snapshots / artifacts / outbox_jobs / maintenance_snapshots），定位仍需 scrub 的 owner 行；
 - 对**无 provenance 的旧数据**：按 thread/turn/trace/time range 粗粒度 scrub，或标记 `legacy_unverifiable`；
 - Verifier 输出三态之一：
   - `verified`：所有目标内容已移除且 provenance 可验证；
@@ -473,11 +524,11 @@ Phase B（独立 Job `forget:{operation_id}:cascade`）：
 ## O. 统一 fail-closed VisibilityService
 
 新增 `ForgetVisibilityService`（单例，无状态、不持有长事务）：
-- **先查 Shield 再查 Tombstone**：`is_shielded(selector_ctx)` 检查 `forget_shields`（thread/time/scope/all_user_data + cutoff）；`is_forgotten(target_type, target_id)` / `batch_is_forgotten(ids)` 查 `forget_tombstones` + `memory_records.lifecycle_state='forgotten'`；
+- **先查 Shield 再查 Tombstone**：`is_shielded(selector_ctx)` 检查 `forget_shields`（按 selector_type 命中 thread/time/scope/all_user_data，或按 target_type/target_id、canonical_key、value_fingerprint 实体级命中；含 `cutoff_created_at`）；`is_forgotten(target_type, target_id)` / `batch_is_forgotten(ids)` 查 `forget_tombstones.block_visibility` + `memory_records.lifecycle_state='forgotten'`；
 - `filter_retrieval_hits(hits)`：过滤 RetrievalHit；
 - `filter_raw_events(events)`：DEEP 回溯时过滤被屏蔽 Event（先 Shield 后 Tombstone）；
 - `filter_summary/checkpoint(...) / filter_core_memory(...) / filter_working_state(...)`；
-- 显式历史审计模式：`allow_raw_history=True`（经审计鉴权）可绕过 Shield 查看保留 raw history，但**仍不可绕过 Tombstone**（purged 原文永不返回）；
+- 显式历史审计模式：`allow_raw_history=True`（经审计鉴权）可绕过 `block_visibility` Shield 查看保留 raw history，但**必须 `allow_audit_read=true` 且 `content_purged=false`**——只有 memory_only 的 raw Event/Turn 满足此条件；history_only/everywhere 的 `allow_audit_read=false`，审计模式也不可见；
 - 异常时 **fail-closed（默认不可见）**，不是 fail-open。
 所有读取路径（ContextAssembler、Core Memory loader、AutomaticRecallEngine、UnifiedRetriever、memory_search、history_search、deep raw expansion、memory_timeline、memory_event_log、SegmentSummary loader、EpochCheckpoint loader、WorkingState、前端审计 API）统一调用本服务，禁止各模块自行实现 forgotten 判断。
 
@@ -492,12 +543,13 @@ Phase B（独立 Job `forget:{operation_id}:cascade`）：
   - `forget_purge`（Phase E/M scrub + 物理删除）
   - `forget_verify`（Phase N verifier）
   - `forget_reconcile`（补发遗漏 Job）
-- operation_id：`forget:{operation_id}:cascade|rebuild|purge|verify|reconcile`。
-- OutboxJob 与 `forget_operations` 强关联（`payload.operation_id`）；同一逻辑操作复用同一 Job；retry/takeover 不创建重复 Operation（按 `operation_id` UNIQUE）。
+- stage operation_id：`forget:{forget_operation_id}:cascade|rebuild|purge|verify|reconcile`。
+- OutboxJob 与 `forget_operations` 强关联（`payload.forget_operation_id` 关联 `forget_stage_runs.outbox_job_id`）；同一逻辑操作复用同一 Job；retry/takeover 不创建重复 Operation（按 `operation_key` UNIQUE）。
 - 使用 claim/lease/fencing（`claim_token`/`lease_expires_at`）—— 旧 execution_token 无法提交（参考 `_finalize_job` 的 `affected != 1 → FencingViolationError`）。
 - 正常分页用 `HandlerOutcome.CONTINUE`（不增加 `retry_count`/失败计数，参考 `_continue_later`）。
 - Handler 不直接 finalize OutboxJob（由 Worker 负责）。
-- deadletter 时 `forget_operations` 与 OutboxJob 原子进入终态（参考 `_deadletter_job_and_ingestion_run`）。
+- deadletter 时：`ForgetOperation.status = shielded_deadletter`、`ForgetStageRun.status = deadletter`、**`ForgetShield.status` 保持 `active`**（不得解除或弱化），三者与 OutboxJob **原子**进入终态（参考 `_deadletter_job_and_ingestion_run`）；后台清理 deadletter 后可经 reconciler 恢复 `ForgetOperation` 为 `shielded` 继续执行，Shield 始终保持 `active`。
+- 修改 `outbox_worker.py`：forget Job 在 deadletter/finalize 时联动更新 `forget_stage_runs`（status/execution_token/claim_count/failure_count）与 `forget_operations`，保证原子性；stage 状态变更通过 `forget_stage_runs` 持久化。
 - reconciler（`forget_reconcile`）补发遗漏 Job（基于 `forget_batches` 未完成项）。
 - `scheduler_daemon` 现有轮询已驱动 OutboxWorker，无需改造即可承载新 job types。
 
@@ -507,11 +559,11 @@ Phase B（独立 Job `forget:{operation_id}:cascade`）：
 
 - 合并为一个结构化 `forget` 工具（替换 `forget_memory` 的 scope 推断），参数含 `mode`/`memory_ids`/`canonical_key`/`scope_type`/`scope_id`/`thread_id`/`turn_ids`/`event_ids`/`time_from`/`time_to`/`reason`。
 - 新增 `forget_status`（返回各阶段：`forget_operations.status` + `forget_batches` 进度 + `forget_actions` 汇总 + `shielded_at`/`verified_at`/`purged_at`，**不返回已 scrub 的原文**）。
-- 工具返回 Operation ID + 真实状态；**Phase A 屏蔽完成后才返回成功**；不宣称异步物理 purge 已完成。
+- 工具返回 operation_key + 真实状态；**Phase A 屏蔽完成后才返回成功**；不宣称异步物理 purge 已完成。
 - `memory_only` 明确说明原始历史是否保留（仅显式历史审计模式可见）。
 - 禁止工具名与真实行为不一致。
 - 工具经 `ToolRegistry` 注册（`risk_level`、`requires_confirmation`、`schema`、`trace_id`、`action_card` 一致现有约定）。
-- API：`POST /api/forget`（结构化 body）、`GET /api/forget/{operation_id}/status`。旧 `POST /api/memories/{id}/forget` **保留并委托**新 Operation（写入 `legacy_request_id`），不删除。
+- API：`POST /api/forget`（结构化 body）、`GET /api/forget/{operation_key}/status`。旧 `POST /api/memories/{id}/forget` **保留并委托**新 Operation（写入 `legacy_request_id`），不删除。
 
 ---
 
@@ -519,12 +571,12 @@ Phase B（独立 Job `forget:{operation_id}:cascade`）：
 
 - **真实 Alembic head**：实现时通过 `alembic heads` 确认当前 head revision（现有 `forget_requests` 来自 `9ce8eac83d4b`，revises `e46cc8625031`；**模型 `ForgetRequest.saga_state` 与 migration 不一致，存在 drift**）。新 migration 的 `down_revision` 指向当前 head。
 - **保留旧 `forget_requests`**：本阶段**不 rename/recreate**，旧表只读兼容；旧 API 委托新 `forget_operations`（写入 `legacy_request_id`）。
-- **新增表（8 张）**：`forget_operations`、`forget_selector_manifests`、`forget_shields`、`forget_targets`、`forget_dependencies`、`forget_batches`、`forget_actions`、`forget_tombstones`（见 H）；另可加 `content_provenance_refs`（§8，建议同 migration 或独立 migration）。
-- **FK / UNIQUE / CHECK**：见 H 各表；`forget_selector_manifests.operation_id`→`forget_operations.id`；`forget_shields.operation_id`→`forget_operations.id`；`forget_targets.operation_id`→`forget_operations.id`；`forget_dependencies.operation_id`→`forget_operations.id`；`forget_batches.operation_id`→`forget_operations.id`；`forget_actions.operation_id`→`forget_operations.id`；`forget_tombstones.operation_id`→`forget_operations.id`；`forget_actions.idempotency_key` UNIQUE；`forget_operations.operation_id` UNIQUE。
+- **新增表（10 张，与 §H / ORM / migration 一致）**：`forget_operations`、`forget_selector_manifests`、`forget_shields`、`forget_targets`、`forget_dependencies`、`forget_batches`、`forget_actions`、`forget_tombstones`、`forget_stage_runs`、`content_provenance_refs`（见 H）。
+- **FK / UNIQUE / CHECK**：见 H 各表；所有子表 FK 列统一命名 `forget_operation_id` → `forget_operations.id`；唯一约束：`forget_operations.operation_key` UNIQUE、`forget_selector_manifests(forget_operation_id, selector_payload_hash)`、`forget_targets(forget_operation_id, target_type, target_id)`、`forget_dependencies(forget_operation_id, dependency_type, dependency_id)`、`forget_batches(forget_operation_id, stage, dependency_type, batch_no)`、`forget_actions.idempotency_key` UNIQUE、`forget_tombstones(forget_operation_id, target_type, target_id, canonical_key)`、`forget_stage_runs.outbox_job_id` UNIQUE、`content_provenance_refs(owner_type, owner_id, source_type, source_id)` UNIQUE。
 - **PostgreSQL 与 SQLite 兼容**：所有 DDL 用 SQLAlchemy `op.create_table` / `op.alter_column` 跨库语法；唯一部分索引保持 `postgresql_where`/`sqlite_where` 双后端写法。
 - **upgrade / downgrade**：双向实现；downgrade 删除新表，旧 `forget_requests` 不动。
 - **历史 forgotten 数据回填策略**：旧 `forget_requests` 仅有 `memory_id` + `tombstone` + `saga_state`（从未更新）。migration **不删除**旧行；可选：将旧行映射为只读归档（`legacy_request_id` 反查），新 Operation 不重建旧 saga。
-- **当前已 forgotten 但未 purge 的数据迁移策略**：旧 `memory_records.lifecycle_state='forgotten'` 行内容已是 tombstone 串（无用户原文），迁移时新建 `forget_operations` + `forget_tombstones`（仅标记，无内容需 scrub），状态置 `purged`（内容已不可读）。
+- **当前已 forgotten 但未 purge 的数据迁移策略（§8 修订）**：旧 `memory_records.lifecycle_state='forgotten'` 行内容已是 tombstone 串（无用户原文），**不得直接迁移为 `purged`**。迁移为 `shielded` 或 `legacy_unverifiable`，随后走 Cascade + Verifier 后才能真正 `purged`。
 - **不在 migration 中执行内容删除 / Summary 重建 / 索引 backfill / 修改已部署历史 migration**。
 
 ---
@@ -537,13 +589,13 @@ Phase B（独立 Job `forget:{operation_id}:cascade`）：
 - `backend/aiive/forget/forget_verifier.py`（N，含 provenance 三态）
 - `backend/aiive/forget/forget_rebuild.py`（K/L 重建 + Evidence 重算，复用 P3 纯生成组件）
 - `backend/aiive/worker/handlers_forget.py`（P：5 个 Outbox handler）
-- `backend/aiive/db/forget_models.py`（H 8 张表 + `content_provenance_refs`）
+- `backend/aiive/db/forget_models.py`（H 10 张表，含 `forget_stage_runs` + `content_provenance_refs`）
 - `backend/alembic/versions/<new>_phase6a_forget_saga.py`（T）
 - `backend/aiive/tools/forget_tool.py`（S，替换 builtin 内 forget）
 - `backend/aiive/api/routes_forget.py`（S）
 
 **修改**：
-- `backend/aiive/db/models.py`（新增 8 张表；`ForgetRequest` 保留不动）
+- `backend/aiive/db/models.py`（新增 10 张表；`ForgetRequest` 保留不动）
 - `backend/aiive/memory/memory_write_service.py`（`forget()` 改为只创建 Operation + Phase A；`write/write_batch` 加 tombstone 拦截 §7）
 - `backend/aiive/memory/memory_store.py`（读路径接 VisibilityService）
 - `backend/aiive/memory/memory_maintenance.py`（扫描跳过 forgotten/tombstone，不重复处理）
@@ -553,6 +605,7 @@ Phase B（独立 Job `forget:{operation_id}:cascade`）：
 - `backend/aiive/runtime/context_assembler.py`（`_load_segment_summaries`/`_load_epoch_checkpoint`/`_load_history_bounded` 接 VisibilityService；recent history 屏蔽目标 Event）
 - `backend/aiive/memory/core_memory_projection.py`（已安全，确认）
 - `backend/aiive/worker/outbox_handlers.py`（注册新 handler）
+- `backend/aiive/worker/outbox_worker.py`（forget Job deadletter/finalize 联动 `forget_stage_runs` + `forget_operations` + `forget_shields` 原子更新；支持 `shielded_deadletter`）
 - `backend/aiive/memory/recall_config.py`（`ENABLED_OUTBOX_JOB_TYPES` 加 5 个 forget_*）
 - `backend/aiive/tools/builtin_tools.py`（移除旧 `forget_memory` scope 推断，或委托新工具）
 - `backend/aiive/api/routes_memories.py`（旧 forget endpoint 委托新 Operation，保留兼容）
@@ -577,7 +630,7 @@ Phase B（独立 Job `forget:{operation_id}:cascade`）：
 10. user_required 明确 forget 后仍被删；
 11. ForgetTarget Manifest 不可变（冻结后重试不扩大）；
 12. Manifest 不保存原文；
-13. 重复 Operation 幂等（operation_id UNIQUE）；
+13. 重复 Operation 幂等（operation_key UNIQUE）；
 14. 旧 execution_token 无法提交（fencing）；
 15. CONTINUE 不计失败（forget_batches 续跑不增 retry_count）；
 16. shield 后 crash 仍不可见；
@@ -615,12 +668,37 @@ Phase B（独立 Job `forget:{operation_id}:cascade`）：
 48. P0.5A～P5 全量回归（6A 不引入回归）；
 49. **migration 不替换旧 forget_requests 表（§9 / §10 新增）**。
 
+### Phase 6A 补充测试（§局部修订新增）
+50. selector manifest 可在进程重启后完整恢复原选择器（`selector_payload` 不可变）；
+51. `memory_ids` / `turn_ids` / `event_ids`（≤ `max_inline_shield_targets`）在 Phase A 可立即实体级 Shield，超限退化为 selector Shield；
+52. memory_only 原始历史普通模式不可见、审计模式可见（`block_visibility` 放行但保留 raw history）；
+53. `content_purged` 后审计模式也不可见（`content_purged` 不可绕过）；
+54. reingestion block 不会错误阻止新 Turn/Event（新 source id 放行）；
+55. 重试不会重复 Target / Dependency / Shield（UNIQUE 约束 + 幂等物化）；
+56. 低熵 `value_hash` 无法通过数据库普通 hash 字典反推（须用 HMAC `value_fingerprint`）；
+57. provenance 可通过 `source_type+source_id` 索引有界反查（`content_provenance_refs`）；
+58. stage Job deadletter 后 Shield 仍为 `active`、Operation 为 `shielded_deadletter`、StageRun 为 `deadletter`（不弱化 Shield）；
+59. 旧 forgotten 数据不会未经 Verifier 被标成 `purged`（迁移为 `shielded` / `legacy_unverifiable`）；
+60. Summary/Checkpoint 切换与索引 enqueue 同事务（非同步刷新）；
+61. P0.5A～P5 全量回归通过。
+
+### Phase 6A 第三次补充测试（§5 点局部修订新增）
+62. history_only / everywhere 在 scrub 完成前也不能通过审计模式读取（`allow_audit_read=false`）；
+63. memory_only 原始历史可在授权审计模式读取（`allow_audit_read=true && allow_raw_history=true && !content_purged`）；
+64. `canonical_key` / `all_user_data` 的 Phase A 不枚举目标（仅 selector Shield）；
+65. 超大 ID 列表（>`max_inline_shield_targets`）自动转 selector Shield + Cascade Batch 处理；
+66. nullable `canonical_key` 不会导致重复 Tombstone（UNIQUE 不含 canonical_key）；
+67. Shield 重试不会重复写入（`normalized_shield_key` UNIQUE 幂等）；
+68. 复合游标 crash 后无跳过、无重复（cursor_lane + cursor_start_json 续跑，禁止 offset）；
+69. stage deadletter 后 Shield 仍为 `active`（不被 superseded/删除，reconciler 可恢复执行）；
+70. `shielded_deadletter` Operation 可由 reconciler 恢复 `shielded` 继续 cascade/rebuild。
+
 ---
 
 ## X. 回滚与降级方案（Phase 6A）
 
-- **Migration 回滚**：`downgrade()` 删除 8 张新表 + `content_provenance_refs`，**旧 `forget_requests` 不动**；旧 API 仍可工作。
-- **Saga 中途失败**：任何阶段失败 → Outbox 重试（fencing）→ 最终 deadletter（原子）；`forget_operations.status='deadletter'`，内容已 shielded（fail-closed 不可见），不泄漏。
+- **Migration 回滚**：`downgrade()` 删除 10 张新表（`forget_operations`/`forget_selector_manifests`/`forget_shields`/`forget_targets`/`forget_dependencies`/`forget_batches`/`forget_actions`/`forget_tombstones`/`forget_stage_runs`/`content_provenance_refs`），**旧 `forget_requests` 不动**；旧 API 仍可工作。
+- **Saga 中途失败**：任何阶段失败 → Outbox 重试（fencing）→ 最终 deadletter（原子）；`forget_operations.status='shielded_deadletter'`、`forget_shields.status` 保持 `active`，内容已 shielded（fail-closed 不可见），不泄漏；可由 reconciler 恢复 `shielded` 继续执行。
 - **Verifier 失败**：不进入 `purged`；内容保持 scrubbed + shielded，可人工/定时重试 verify（legacy_unverifiable 需先粗粒度清理）。
 - **重建 LLM 失败**：旧 Summary/Checkpoint 保持不可检索（`is_searchable=False` + tombstone），不影响 fail-closed；下次 `forget_rebuild` 重试。
 - **降级**：若 `ForgetVisibilityService` 异常 → fail-closed（默认不可见），绝不 fail-open。
@@ -647,4 +725,20 @@ Phase B（独立 Job `forget:{operation_id}:cascade`）：
 
 ## 下一步
 
-Phase 6A 方案待确认后，进入：migration 生成 → 模型/服务/工具/API 实现 → 6A 单元测试/集成测试 → 文档同步。Phase 6B（Retention / vacuum / 长期混沌）见 `phase_6B.md`。
+> Phase 6A 方案级审查通过，可以开始实施。
+
+实施顺序：
+
+```text
+migration/models
+→ HMAC fingerprint + selector normalization
+→ VisibilityService/Phase A Shield
+→ Target/Dependency/Batch materialization
+→ StageRun/Outbox fencing
+→ scrub/rebuild/evidence recompute
+→ verifier
+→ tools/API
+→ integration tests
+```
+
+Phase 6B（Retention / vacuum / 长期混沌）见 `phase_6B.md`。

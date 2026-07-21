@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import BigInteger, CheckConstraint, DateTime, ForeignKey, Index, JSON, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from pgvector.sqlalchemy import Vector
 from typing import Any
 
 
@@ -133,6 +134,45 @@ class TurnRecord(Base):
     )
 
 
+class ApprovalRequest(Base):
+    """工具审批请求：保存不可由客户端修改的原始调用和执行状态。"""
+    __tablename__: str = "approval_requests"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    thread_id: Mapped[str] = mapped_column(String(36), ForeignKey("threads.id"), nullable=False)
+    turn_record_id: Mapped[str] = mapped_column(String(36), ForeignKey("turn_records.id"), nullable=False)
+    turn_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    trace_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    tool_call_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    tool_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    tool_args: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    tool_args_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    descriptor_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    risk_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    decision: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    execution_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    execution_result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    result_event_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__: tuple[UniqueConstraint | Index | CheckConstraint, ...] = (
+        UniqueConstraint("turn_record_id", "tool_call_id", name="uq_approval_turn_tool_call"),
+        Index("ix_approval_thread_status", "thread_id", "status"),
+        Index("ix_approval_turn_record", "turn_record_id"),
+        CheckConstraint(
+            "status IN ('pending','executing','succeeded','denied','failed','interrupted_unknown')",
+            name="ck_approval_status",
+        ),
+    )
+
+
 class ContextSnapshot(Base):
     """上下文快照模型：保存每次对话的上下文构建结果，用于调试和审计。"""
     __tablename__: str = "context_snapshots"
@@ -192,8 +232,8 @@ class MemoryRecord(Base):
     stability: Mapped[str] = mapped_column(
         String(32), default="contextual"
     )
-    sensitivity: Mapped[str | None] = mapped_column(
-        String(32), nullable=True, default=None
+    sensitivity: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="normal", server_default="normal"
     )
     content_hash: Mapped[str | None] = mapped_column(
         String(32), nullable=True
@@ -239,6 +279,34 @@ class MemoryRecord(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "sensitivity IN ('normal','personal','confidential','secret')",
+            name="ck_memory_records_sensitivity",
+        ),
+    )
+
+
+class MemoryVectorProjection(Base):
+    """记忆的 pgvector 派生投影；MemoryRecord 仍是唯一真相源。"""
+    __tablename__: str = "memory_vector_projections"
+
+    memory_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("memory_records.id", ondelete="CASCADE"), primary_key=True,
+    )
+    record_version: Mapped[int] = mapped_column(nullable=False)
+    content_hash: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    embedding_model: Mapped[str] = mapped_column(String(128), nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(
+        Vector(1536).with_variant(JSON(), "sqlite"), nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow,
     )
 
 
@@ -369,6 +437,9 @@ class OutboxJob(Base):
     schema_version: Mapped[int] = mapped_column(default=1)
     available_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     terminal_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Phase 6B: 终态不可变时间，completed/deadletter/non-retryable 终态路径原子写入一次
+    # claim / retry / payload scrub 不得更新此字段
+    terminal_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     original_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     migration_batch_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -384,16 +455,73 @@ class OutboxJob(Base):
     )
 
 
+class ToolOperation(Base):
+    """副作用工具操作：持久化请求、执行状态、幂等身份和真实终态。"""
+    __tablename__: str = "tool_operations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    idempotency_key: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    thread_id: Mapped[str] = mapped_column(String(36), ForeignKey("threads.id"), nullable=False)
+    turn_record_id: Mapped[str] = mapped_column(String(36), ForeignKey("turn_records.id"), nullable=False)
+    turn_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    tool_call_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    capability_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    params: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    params_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    descriptor_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    effect_mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    outbox_job_id: Mapped[str] = mapped_column(String(36), ForeignKey("outbox_jobs.id"), nullable=False, unique=True)
+    execution_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    result_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    effect_receipt: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    terminal_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    trace_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__: tuple[UniqueConstraint | Index | CheckConstraint, ...] = (
+        UniqueConstraint("turn_record_id", "tool_call_id", name="uq_tool_operation_turn_call"),
+        Index("ix_tool_operation_thread_status", "thread_id", "status"),
+        CheckConstraint(
+            "status IN ('queued','running','committed','failed','execution_unknown')",
+            name="ck_tool_operation_status",
+        ),
+        CheckConstraint(
+            "effect_mode IN ('db_transactional','externally_reconcilable','non_repeatable_external')",
+            name="ck_tool_operation_effect_mode",
+        ),
+    )
+
+
 class Document(Base):
-    """文档模型：记录已导入的知识文档元信息。"""
+    """知识文档模型：持久化原文对象引用、来源信息和索引状态。"""
     __tablename__: str = "documents"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     source_path: Mapped[str] = mapped_column(String(512))
     content_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    object_bucket: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    object_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    content_size: Mapped[int | None] = mapped_column(nullable=True)
+    mime_type: Mapped[str] = mapped_column(String(255), default="application/octet-stream")
     title: Mapped[str | None] = mapped_column(String(256), nullable=True)
     doc_type: Mapped[str] = mapped_column(String(32), default="text")
+    status: Mapped[str] = mapped_column(String(32), default="indexed", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('indexed','index_failed','source_unavailable')",
+            name="ck_documents_status",
+        ),
+    )
 
 
 class Chunk(Base):
@@ -465,6 +593,7 @@ class MemoryProposal(Base):
     structured_value: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     evidence: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
     trust_level: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    sensitivity: Mapped[str | None] = mapped_column(String(32), nullable=True)
     confidence: Mapped[float | None] = mapped_column(nullable=True)
     importance: Mapped[float | None] = mapped_column(nullable=True)
     stability: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -1112,6 +1241,7 @@ class MemoryMaintenanceInput(Base):
     scope_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     scope_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     snapshot_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     __table_args__: tuple[UniqueConstraint | Index, ...] = (
         UniqueConstraint(
@@ -1195,6 +1325,9 @@ class RetrievalIndexGeneration(Base):
     activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     source_cutoff: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     policy_version: Mapped[str] = mapped_column(String(32), default="phase5.v1")
+    # Phase 6B: 真实终态时间，任何 status 翻转时原子写入
+    # retention cutoff 使用此字段而非可能为空的 build_completed_at
+    status_changed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # 该 generation 是否已完成初始全量 backfill（bootstrap 流程判定）
     backfill_done: Mapped[bool] = mapped_column(default=False)
 

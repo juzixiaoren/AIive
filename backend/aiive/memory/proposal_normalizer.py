@@ -59,6 +59,7 @@ class ProposalNormalizer:
         trust_level: str = TrustLevel.SEMI_TRUSTED.value,
         evidence: list[dict[str, Any]] | None = None,
         source_event_ids: list[str] | None = None,
+        assistant_event_ids: list[str] | None = None,
         structured_value: dict[str, Any] | None = None,
         extractor_name: str = "",
         extractor_version: str = "",
@@ -76,6 +77,8 @@ class ProposalNormalizer:
             trust_level: Evidence trust level.
             evidence: Raw evidence items.
             source_event_ids: Source event IDs.
+            assistant_event_ids: 属于 assistant 回复事件的 Event.id 列表，
+                其中的事件会被标记为 llm_reply，其余保持 user_message。
             structured_value: Optional structured value.
             extractor_name: Name of the extractor.
             extractor_version: Version of the extractor.
@@ -126,10 +129,14 @@ class ProposalNormalizer:
                     content_span=e.get("content_span"),
                 ))
         elif source_event_ids:
+            assistant_set = set(assistant_event_ids or [])
             for seid in source_event_ids:
+                # 用户消息事件保留 trusted 的 user_message；assistant 回复事件
+                # 标记为 llm_reply（外部/不可信来源），使 provenance 语义精确。
+                source_type = "llm_reply" if seid in assistant_set else "user_message"
                 evidence_items.append(EvidenceItem(
                     source_event_id=seid,
-                    source_type="user_message",
+                    source_type=source_type,
                     trust_level=trust_level,
                 ))
 
@@ -153,28 +160,6 @@ class ProposalNormalizer:
         proposal.compute_request_idempotency()
 
         return NormalizationResult(proposal=proposal)
-
-    def normalize_legacy_dict(
-        self,
-        raw: dict[str, Any],
-        extractor_name: str = "legacy_adapter",
-    ) -> NormalizationResult:
-        """Normalize from old-style dict (e.g., steward signal)."""
-        content = raw.get("content", "")
-        signal_type = raw.get("signal_type") or raw.get("memory_type", "")
-        memory_key = raw.get("memory_key", "")
-        confidence = float(raw.get("confidence", 0.7))
-        trust = raw.get("trust_level", TrustLevel.SEMI_TRUSTED.value)
-
-        return self.normalize(
-            content=content,
-            memory_type_hint=signal_type,
-            memory_key_hint=memory_key or None,
-            confidence=confidence,
-            trust_level=trust,
-            evidence=[raw] if raw.get("source_event_id") else [],
-            extractor_name=extractor_name,
-        )
 
     # ------------------------------------------------------------------
     # Private helpers

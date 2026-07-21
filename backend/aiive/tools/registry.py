@@ -16,16 +16,19 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from aiive.config import settings
 from aiive.context.run_context import RunContext
 
 logger = logging.getLogger(__name__)
 
-# 所有工具的默认超时时间（秒）
-DEFAULT_TOOL_TIMEOUT = 30
+# 所有工具的默认超时时间（秒）：来自配置，未显式声明 timeout 的工具使用此值
+DEFAULT_TOOL_TIMEOUT = settings.tool_default_timeout_seconds
 
-# 模块级线程池：复用避免重复创建开销，daemon 线程不阻止进程退出
+# 模块级线程池：复用避免重复创建开销，daemon 线程不阻止进程退出。
+# 池大小来自配置：超时后子线程不被 cancel（见 execute 说明），
+# 阻塞 I/O 型工具接连超时可能占满此池，可按部署环境调大。
 _tool_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=4,
+    max_workers=settings.tool_executor_max_workers,
     thread_name_prefix="tool-worker",
 )
 
@@ -60,6 +63,7 @@ class CapabilitySafetySchema:
     descriptor_hash: str = ""
     tool_description_is_instruction: bool = False
     timeout_seconds: float = 0
+    effect_mode: str = "db_transactional"
 
 
 def compute_descriptor_hash(schema: dict[str, Any]) -> str:
@@ -209,6 +213,7 @@ class ToolRegistry:
         params: dict[str, Any],
         instruction_source: str,
         run_context: RunContext | None = None,
+        tool_call_id: str = "",
     ) -> dict[str, Any]:
         """执行工具调用，包含三道安全守卫。
 
@@ -249,11 +254,27 @@ class ToolRegistry:
                 "params": params,
             }
 
-        has_ctx = "ctx" in inspect.signature(reg.handler).parameters
-
-        # 确定超时时间：工具自身配置 > 全局默认
         timeout = reg.safety.timeout_seconds or DEFAULT_TOOL_TIMEOUT
+        if reg.safety.writes_external_world or reg.safety.can_delete:
+            if run_context is None or not run_context.turn_record_id or not tool_call_id:
+                return {
+                    "ok": False,
+                    "error_type": "missing_execution_identity",
+                    "error": "副作用工具缺少持久化执行身份，已拒绝执行",
+                }
+            from aiive.tools.operation_executor import enqueue_tool_operation, wait_for_tool_operation
 
+            operation = enqueue_tool_operation(
+                capability_id=capability_id,
+                params=params,
+                descriptor_hash=reg.safety.descriptor_hash,
+                effect_mode=reg.safety.effect_mode,
+                run_context=run_context,
+                tool_call_id=tool_call_id,
+            )
+            return wait_for_tool_operation(operation.id, timeout)
+
+        has_ctx = "ctx" in inspect.signature(reg.handler).parameters
         future = _tool_executor.submit(_invoke_handler, reg.handler, has_ctx, run_context, params)
         try:
             result = future.result(timeout=timeout)
@@ -276,6 +297,73 @@ class ToolRegistry:
         except Exception as e:
             logger.exception("[TRACE:registry] FAILED tool=%s error=%s", capability_id, e)
             return {"ok": False, "error": str(e), "error_type": "execution_failed"}
+
+    def execute_approved(
+        self,
+        capability_id: str,
+        params: dict[str, Any],
+        expected_descriptor_hash: str,
+        run_context: RunContext,
+        tool_call_id: str = "",
+    ) -> dict[str, Any]:
+        """执行已经由服务端审批记录授权的工具调用。
+
+        该入口只跳过重复确认守卫；工具存在性、原始指令来源授权、工具定义
+        指纹和超时保护仍然强制校验。调用方必须先原子领取持久化审批记录。
+        """
+        reg = self.get(capability_id)
+        if reg is None:
+            return {"ok": False, "error": f"未知工具: {capability_id}", "error_type": "unknown_tool"}
+        if "trusted_user_command" not in reg.safety.allowed_instruction_sources:
+            return {
+                "ok": False,
+                "error": "原始用户指令无权调用该工具",
+                "error_type": "unauthorized_source",
+            }
+        if reg.safety.descriptor_hash != expected_descriptor_hash:
+            return {
+                "ok": False,
+                "error": "工具定义在审批后发生变化，原审批已失效",
+                "error_type": "descriptor_changed",
+            }
+
+        logger.info("[TRACE:registry] EXECUTE_APPROVED tool=%s", capability_id)
+        timeout = reg.safety.timeout_seconds or DEFAULT_TOOL_TIMEOUT
+        if reg.safety.writes_external_world or reg.safety.can_delete:
+            if not run_context.turn_record_id or not tool_call_id:
+                return {
+                    "ok": False,
+                    "error_type": "missing_execution_identity",
+                    "error": "审批副作用缺少持久化执行身份，已拒绝执行",
+                }
+            from aiive.tools.operation_executor import enqueue_tool_operation, wait_for_tool_operation
+
+            operation = enqueue_tool_operation(
+                capability_id=capability_id,
+                params=params,
+                descriptor_hash=reg.safety.descriptor_hash,
+                effect_mode=reg.safety.effect_mode,
+                run_context=run_context,
+                tool_call_id=tool_call_id,
+            )
+            return wait_for_tool_operation(operation.id, timeout)
+
+        has_ctx = "ctx" in inspect.signature(reg.handler).parameters
+        future = _tool_executor.submit(_invoke_handler, reg.handler, has_ctx, run_context, params)
+        try:
+            result = future.result(timeout=timeout)
+            return {"ok": True, "result": result}
+        except concurrent.futures.TimeoutError:
+            logger.error("[TRACE:registry] APPROVED_TIMEOUT tool=%s after %.0fs", capability_id, timeout)
+            return {
+                "ok": False,
+                "error": f"工具 '{capability_id}' 执行超过 {timeout:.0f} 秒，最终状态未知",
+                "error_type": "timeout",
+                "timeout_seconds": timeout,
+            }
+        except Exception as error:
+            logger.exception("[TRACE:registry] APPROVED_FAILED tool=%s", capability_id)
+            return {"ok": False, "error": str(error), "error_type": "execution_failed"}
 
 
 # 全局单例

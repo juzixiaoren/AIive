@@ -21,6 +21,7 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from aiive.context.run_context import RunContext
@@ -31,6 +32,8 @@ from aiive.db.models import (
     MemoryProposal as MemoryProposalModel,
     MemoryRecord,
 )
+from aiive.forget.phase_a_shield import execute_phase_a_shield
+from aiive.forget.visibility_service import ForgetVisibilityService
 from aiive.memory.conflict_resolver import ConflictResolver, ResolutionResult
 from aiive.memory.memory_gate import GateDecision, MemoryGate
 from aiive.memory.memory_key_registry import MemoryKeyRegistry, get_memory_key_registry
@@ -234,6 +237,22 @@ class MemoryWriteService:
             self._persist_proposal(proposal, gate_decision, final_op="reject")
             return WriteResult(outcome=WriteOutcome.GATE_REJECTED, reason=gate_decision.reason)
 
+        # 1.5. Phase 6A: 防重抽检查（tombstone.block_reingestion）
+        # write_batch 异步抽取路径同样必须拦截，避免被忘事实从被屏蔽旧源事件重建。
+        if proposal.evidence:
+            blocked_events: set[str] = set()
+            for ev in proposal.evidence:
+                if ev.source_event_id and ForgetVisibilityService.is_tombstone_blocked_reingestion(
+                    self._db, source_event_id=ev.source_event_id,
+                ):
+                    blocked_events.add(ev.source_event_id)
+            all_events = {ev.source_event_id for ev in proposal.evidence if ev.source_event_id}
+            if all_events and all_events == blocked_events:
+                return WriteResult(
+                    outcome=WriteOutcome.GATE_REJECTED,
+                    reason="Reingestion blocked: all source events are tombstone-blocked",
+                )
+
         existing_active = self._load_existing_or_wake_sleeping(proposal, run_context)
         resolution = self._resolver.resolve(proposal, existing_active)
         tid = run_context.thread_id
@@ -340,6 +359,23 @@ class MemoryWriteService:
                 outcome=WriteOutcome.GATE_REJECTED,
                 reason=f"Gate rejected: {gate_decision.reason}",
             )
+
+        # 1.5. Phase 6A: 防重抽检查（tombstone.block_reingestion）
+        if proposal.evidence:
+            blocked_events: set[str] = set()
+            for ev in proposal.evidence:
+                if ev.source_event_id:
+                    if ForgetVisibilityService.is_tombstone_blocked_reingestion(
+                        self._db, source_event_id=ev.source_event_id,
+                    ):
+                        blocked_events.add(ev.source_event_id)
+            # 所有 evidence 都来自 blocked source → 拒绝
+            all_events = {ev.source_event_id for ev in proposal.evidence if ev.source_event_id}
+            if all_events and all_events == blocked_events:
+                return WriteResult(
+                    outcome=WriteOutcome.GATE_REJECTED,
+                    reason="Reingestion blocked: all source events are tombstone-blocked",
+                )
 
         # 2. Acquire advisory lock (hash of canonical_key + scope)
         lock_id: int = self._compute_lock_id(
@@ -463,60 +499,85 @@ class MemoryWriteService:
 
     def forget(
         self,
-        memory_id: str,
+        memory_id: str = "",
         reason: str = "",
         run_context: RunContext | None = None,
+        *,
+        # Phase 6A 扩展参数
+        mode: str = "everywhere",
+        memory_ids: list[str] | None = None,
+        turn_ids: list[str] | None = None,
+        event_ids: list[str] | None = None,
+        thread_id: str = "",
+        canonical_key: str = "",
+        scope_type: str = "",
+        scope_id: str = "",
+        all_user_data: bool = False,
+        operation_key: str = "",
     ) -> WriteResult:
-        """Execute forget Saga: irreversibly remove all content and evidence.
+        """执行 Phase 6A Forget Saga — Phase A 立即屏蔽。
 
-        Covers: memory_records, evidence, event (tombstone), outbox (projection cleanup).
+        单事务内完成：Operation → SelectorManifest → Shield → Tombstone →
+        MemoryRecord.forgotten → CoreMemoryBlock 删除 → Retrieval tombstone →
+        Cascade OutboxJob + ForgetStageRun。
+
+        向后兼容旧 API（仅传 memory_id → 自动转 memory_only + memory_ids=[memory_id]）。
         """
-        record: MemoryRecord | None = self._store.get_by_id(memory_id)
-        if record is None:
-            return WriteResult(written=False, reason="Memory not found")
+        # 向后兼容旧 API
+        if memory_id and not memory_ids:
+            memory_ids = [memory_id]
+            if mode == "everywhere":
+                mode = "memory_only"
 
-        tombstone: str = f"forgotten:{memory_id[:8]}:{datetime.now(timezone.utc).isoformat()}"
+        if not memory_ids and not turn_ids and not event_ids and not thread_id \
+                and not canonical_key and not all_user_data \
+                and not (scope_type and scope_id):
+            return WriteResult(written=False, reason="No targets specified for forget")
 
-        # 1. Scrub content
-        record.lifecycle_state = LifecycleState.FORGOTTEN.value
-        record.validity_state = ValidityState.SUPERSEDED.value
-        record.content = tombstone
-        record.structured_value = None
-        record.updated_at = datetime.now(timezone.utc)
-
-        # 2. Delete evidence (CASCADE handled by FK, or manual cleanup)
-        self._db.query(MemoryEvidence).filter(
-            MemoryEvidence.memory_id == memory_id
-        ).delete()
-
-        # 3. Record tombstone event（隔离写入，失败不影响遗忘主流程）
-        if run_context and run_context.thread_id:
-            self._executor.log_event(
-                trace_id=run_context.trace_id,
-                event_type="memory.forgotten",
-                memory_id=memory_id,
-                payload={
-                    "memory_id": memory_id,
-                    "reason": reason,
-                    "tombstone": tombstone,
-                },
-                thread_id=run_context.thread_id,
+        try:
+            result = execute_phase_a_shield(
+                session=self._db,
+                mode=mode,
+                memory_ids=memory_ids,
+                turn_ids=turn_ids,
+                event_ids=event_ids,
+                thread_id=thread_id if thread_id else None,
+                canonical_key=canonical_key if canonical_key else None,
+                scope_type=scope_type if scope_type else None,
+                scope_id=scope_id if scope_id else None,
+                all_user_data=all_user_data,
+                reason=reason,
+                requested_by=run_context.trace_id if run_context else "",
+                operation_key=operation_key if operation_key else None,
             )
 
-        # 4. Enqueue projection cleanup
-        self._enqueue_projection(record, "memory.forgotten", invalidate_cache=True)
+            # 记录 tombstone event（向后兼容）
+            if run_context and run_context.thread_id:
+                try:
+                    self._executor.log_event(
+                        trace_id=run_context.trace_id,
+                        event_type="memory.forgotten",
+                        memory_id=memory_ids[0] if memory_ids else "",
+                        payload={
+                            "operation_key": result["operation_key"],
+                            "mode": mode,
+                            "target_count": result["target_count"],
+                            "reason": reason,
+                        },
+                        thread_id=run_context.thread_id,
+                    )
+                except Exception:
+                    pass  # 隔离写入
 
-        # 5. Persist ForgetRequest audit
-        from aiive.db.models import ForgetRequest
-
-        fr = ForgetRequest(memory_id=memory_id, reason=reason, tombstone=tombstone)
-        self._db.add(fr)
-
-        return WriteResult(
-            written=True,
-            operation="forget",
-            memory_id=memory_id,
-        )
+            return WriteResult(
+                written=True,
+                operation="forget",
+                memory_id=memory_ids[0] if memory_ids else "",
+                reason=f"Phase A shielded: {result['operation_key']}",
+            )
+        except Exception as exc:
+            logger.exception("Phase A shield failed")
+            return WriteResult(written=False, reason=f"Forget failed: {exc}")
 
     # ------------------------------------------------------------------
     # Promotion: candidate → active
@@ -775,6 +836,7 @@ class MemoryWriteService:
             structured_value=proposal.structured_value,
             evidence=[e.model_dump() for e in proposal.evidence],
             trust_level=proposal.trust_level,
+            sensitivity=proposal.sensitivity,
             confidence=proposal.confidence,
             importance=proposal.importance,
             stability=proposal.stability,
@@ -798,7 +860,25 @@ class MemoryWriteService:
             durable=proposal.durable,
             source_turn_record_id=proposal.source_turn_record_id or None,
         )
-        self._db.add(mp)
+        # 防御层：极端并发/重试下唯一约束仍可能冲突，用保存点隔离单次插入。
+        # 冲突时回滚到保存点、确认后跳过，绝不污染整条事务（PendingRollbackError）。
+        try:
+            with self._db.begin_nested():
+                self._db.add(mp)
+                self._db.flush()
+        except IntegrityError:
+            self._db.expunge(mp)
+            if ikey:
+                recheck = self._db.query(MemoryProposalModel).filter(
+                    MemoryProposalModel.idempotency_key == ikey
+                ).first()
+                if recheck is not None:
+                    logger.warning(
+                        "幂等键冲突，跳过重复 proposal: %s", ikey
+                    )
+                    return
+            logger.exception("Proposal 幂等键冲突但记录缺失，需排查: %s", ikey)
+            raise
 
     def _write_evidence_batch(
         self, memory_id: str, evidence: list[EvidenceItem]

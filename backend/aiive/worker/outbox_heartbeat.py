@@ -64,11 +64,6 @@ class ActiveClaimRegistry:
                     "Claim marked lost: job_id=%s token=%s", job_id, claim_token,
                 )
 
-    def is_lost(self, job_id: str, claim_token: str) -> bool:
-        """检查特定 Claim 是否已丢失。"""
-        with self._lock:
-            claim = self._claims.get((job_id, claim_token))
-            return claim.lost if claim else True
 
 
 # ============================================================================

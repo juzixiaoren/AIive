@@ -116,18 +116,19 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    B[AgentGraph._build_agent_context] --> KC[Kernel Contract: _build_stable_contract]
+    B[ContextAssembler] --> KC[Kernel Contract: stable contract]
     KC --> ID[resolve_identity: runtime_identity 角色精确 keys]
     KC --> POL[resolve_policies: context_role=policy 精确 keys + policy.* 模式]
     B --> CM[load_core_memory: Core Memory 投影块]
     CM --> CMB[core.human_identity / core.interaction_defaults / core.agent_persona]
-    B --> AR[AutomaticRecallEngine.recall: query-aware]
+    B --> UR[UnifiedRetriever.retrieve: 统一检索编排]
+    UR --> AR[AutomaticRecallEngine.recall: memory_record 路由]
     AR --> R1[exact: canonical_key/scope_id 精确匹配]
-    AR --> R2[fts: token 级 ILIKE 路由]
-    AR --> R3[recent episode: 兜底近期 episodic]
+    AR --> R2[lexical: token 级 ILIKE 路由]
+    AR --> R3[recent episode: query-aware 近期 episodic]
     AR --> FUSE[fuse_and_pack: RRF + 多信号融合 + token 预算裁剪]
     FUSE --> TRACE[持久化 MemoryRecallRun + Candidates 供 Inspector]
-    KC & CMB & AR --> SYS[assemble_system_content: 分层拼接]
+    KC & CMB & UR --> SYS[assemble_system_content: 分层拼接]
 ```
 
 ---
@@ -411,7 +412,7 @@ create / reinforce / revise / supersede / merge / promote / sleep / wake / archi
 **关键规则**:
 - 未知 canonical type → 返回 error（不入表）。
 - scope 非法组合 → 回退 global。
-- key 无法解析 → 从 type + content 推导 fallback（如 `user.preference.<slug>`）。
+- 缺少 key hint → 从映射后的 canonical type + content 推导通用 fallback（如 `user.preference.<slug>`）；旧 type 本身不参与 key 前缀推导。
 
 ### 6.2 MemoryGate
 
@@ -428,11 +429,11 @@ create / reinforce / revise / supersede / merge / promote / sleep / wake / archi
 
 **不再依赖**: execution_mode, should_execute, intent_type, 任何关键词表。
 
-> 实际信任词汇：`TRUSTED_SOURCE_TYPES = {user_message, user_command}`；
-> `EXTERNAL_SOURCE_TYPES = {webpage, pdf, email, code_comment, retrieved_knowledge,
-> tool_observation, mcp_description, llm_reply}`。
-> 注意与 `memory_types.AUTHORITY_RULES`（使用 `user_assertion` / `external_claim` /
-> `llm_derivation` 等枚举值）**词汇不一致**——详见第十章与第十二章。
+> 写入权威由 `MemoryPolicyEngine` 集中决定。生产链中的旧来源名称会先映射到
+> `EvidenceSourceType` 统一 taxonomy，再按 `AUTHORITY_RULES` 校验；未知来源默认拒绝。
+> `user_message/user_command` 映射为 `user_assertion`，`llm_reply` 映射为
+> `llm_derivation`，`webpage/pdf/email` 等映射为 `external_claim`。`MemoryGate`
+> 不再维护独立的来源权限真相。
 
 ### 6.3 ConflictResolver
 
@@ -540,11 +541,12 @@ recall(MemoryRecallRequest)
 ```
 should_skip_system_message(msg)
   ├─ 空消息 → true
-  └─ 以 "[runtime event" / "[system command" 开头 → true
+  └─ 以 "[runtime event" / "[system command" / "[系统指令]" 开头 → true
 
 resolve_action(signal_action, user_message)
-  ├─ 系统消息 → SKIP
-  └─ 否则 → signal_action (模型决定)
+  ├─ 空消息 / 系统消息 → SKIP
+  ├─ 合法动作 → signal_action（模型决定）
+  └─ 非法动作 → EXTRACT_ASYNC（保持分类失败的安全回退语义）
 ```
 
 **所有语义判断由 `classify_memory_signal()` 完成**，基于模型调用（参见第三章）。
@@ -572,7 +574,7 @@ resolve_action(signal_action, user_message)
 | validity_state | VARCHAR(32) | valid/superseded/contradicted/expired |
 | trust_level | VARCHAR(32) | trusted/semi_trusted/untrusted/untrusted_derived |
 | stability | VARCHAR(32) | stable/contextual/volatile |
-| sensitivity | VARCHAR(32) | normal/personal/confidential/secret（模型边界用，写入时暂未强制填充） |
+| sensitivity | VARCHAR(32) | normal/personal/confidential/secret（写入默认 normal；secret 不进入普通 LLM 上下文，API/工具输出脱敏） |
 | content_hash | VARCHAR(32) | sha256(content)[:16]，ConflictResolver 去重依据 |
 | structured_value_hash | VARCHAR(32) | sha256(json)[:16]，结构化去重依据 |
 | stability_score | FLOAT | 连续评分 |
@@ -807,20 +809,15 @@ EvidenceItem(
 - 置信度 < 0.7 → **candidate**（待后续提升）
 - 无 evidence → **candidate**
 
-### 10.4 已知信任模型不一致（重要）
+### 10.4 统一权威与敏感度策略
 
-`memory_types.py` 中另有一套声明式权威矩阵 `AUTHORITY_RULES`（配合 `EvidenceSourceType`
-枚举：user_assertion / tool_observation / test_result / kernel_result / external_claim /
-llm_derivation）与函数 `is_evidence_authorized()`。但其词汇与 `MemoryGate` 实际使用的不一致：
+`MemoryPolicyEngine` 是记忆策略的集中确定性入口。写入时先把生产链旧来源映射到
+`EvidenceSourceType`，再按 `AUTHORITY_RULES` 校验目标记忆类型；每条 evidence 都必须获授权，
+未知来源和任一矩阵未授权来源均由 `MemoryGate` 拒绝并返回稳定 reason code。
 
-- Gate 用 `"user_message"`，AUTHORITY_RULES 用 `"user_assertion"`；
-- Gate 用 `"llm_reply"`，AUTHORITY_RULES 用 `"llm_derivation"`；
-- Gate 用 `"webpage"/"pdf"/...`，AUTHORITY_RULES 用 `"external_claim"`。
-
-结果：`is_evidence_authorized()` **当前未被 MemoryGate 调用**（提取器生成的 evidence 的
-`source_type` 为 `user_message`，若强行用 AUTHORITY_RULES 校验会全部判为未授权）。
-`AUTHORITY_RULES` 目前属于**未接线的声明式矩阵 / 潜在死代码**。建议后续统一 vocabulary
-并将 `is_evidence_authorized` 接入 Gate，或删除该冗余矩阵（见第十二章）。
+读取时，同一策略引擎按通道处理 `sensitivity`：`secret` 不进入普通 LLM 上下文，API 和
+Tool 输出返回脱敏占位；非法非空敏感度 fail-closed。历史 `NULL` 在迁移时回填为
+`normal`，数据库字段为非空并受值域约束，新 `MemoryProposal` 默认写入 `normal`。
 
 ---
 
@@ -853,13 +850,11 @@ llm_derivation）与函数 `is_evidence_authorized()`。但其词汇与 `MemoryG
 |------|--------|------|
 | EXTRACT_ASYNC 在请求内同步执行 | 中 | `_finalize()` 末尾调用 `TaskWorker.poll_and_notify()`，提取 LLM 调用发生在同一 HTTP 请求内，增加聊天响应延迟。架构已支持改为独立 Worker 消费（去掉该调用即可），无需改调用方 |
 | candidate 无自动提升任务 | 中 | candidate（confidence<0.7 或无 evidence 写入）仅当后续出现同内容 proposal 时才被 `promote`；无定时任务批量提升/清理过期 candidate |
-| 信任模型双 vocabulary | 中 | `MemoryGate` 使用 `user_message`/`llm_reply` 等字符串；`AUTHORITY_RULES`/`EvidenceSourceType` 使用 `user_assertion`/`external_claim` 等枚举，且未被 Gate 调用（潜在死代码/不一致） |
 | routine/schedule 仍写入记忆而非 Scheduler | 中 | 提取提示词将"每天/每周"标记为 signal_type=routine、带时间标记标记为 schedule，但 `ProposalNormalizer` 仅生成 `user.routine.*` / `user.schedule.*` 记忆，未路由到 TaskService/Reminder。与早期"routine 应交 Scheduler"的设计意图存在偏差 |
 | `resolve_identity` 未覆盖 `agent.persona.tone` | 低 | `agent.persona.tone` 已注册为 `runtime_identity` 角色 key，但 `resolve_identity()` 未将其注入 `RuntimeIdentity` 字段（仅注入 display_name / user_name / relationship / response_style） |
-| Qdrant/KG/向量投影为 stub | 低 | Outbox handler 接口已预留（含 record_version 乱序检测），但 `handle_memory_vector_upsert` 等为空实现 |
+| Temporal Graph 未实现 | 低 | pgvector 向量投影已接入；KG 仍未实现，当前不进入生产召回链路 |
 | Thread pending memory overlay 未实现 | 低 | 连续对话短暂失忆的解决方案已设计未落地 |
 | EXTRACT_SYNC 路径复用 `self._llm_client` | 低 | 同一 LLM 实例用于主对话与同步提取，需确认并发安全 |
-| `sensitivity` 列未填充 | 低 | 模型定义了 sensitivity 维度，但写入管线未根据内容设置，模型边界脱敏未接入 |
 | `steward_signal_extractor.py` 残留 | 低 | 保留为 deprecated 委托，建议后续删除 |
 
 ---
@@ -875,7 +870,7 @@ llm_derivation）与函数 `is_evidence_authorized()`。但其词汇与 `MemoryG
 | 冲突解决 | `backend/aiive/memory/conflict_resolver.py` | create/reinforce/supersede/revise/promote/merge/ignore |
 | 写入服务 | `backend/aiive/memory/memory_write_service.py` | 唯一写入入口：锁→解析→持久化→事件→outbox；forget/execute_maintenance/promote |
 | 读取模型 | `backend/aiive/memory/memory_read_model.py` | RuntimeIdentity、resolve_identity、resolve_policies（policy 精确 + 模式键） |
-| 自动召回引擎 | `backend/aiive/memory/automatic_recall.py` | AutomaticRecallEngine：exact/fts/episode 多路由 + query-aware |
+| 自动召回引擎 | `backend/aiive/memory/automatic_recall.py` | AutomaticRecallEngine：exact/lexical/vector/episode 多路由 + query-aware |
 | 召回配置 | `backend/aiive/memory/recall_config.py` | RecallConfig：预算、权重、阈值（无散落魔数） |
 | 召回融合 | `backend/aiive/memory/recall_fusion.py` | fuse_and_pack：RRF + 多信号融合 + 去重 + token 预算裁剪 |
 | 召回模型 | `backend/aiive/memory/recall_models.py` | ScopeContext / MemoryRecallRequest / MemoryRecallItem / MemoryRecallPack / RecallCandidateTrace / CoreMemoryBlock |

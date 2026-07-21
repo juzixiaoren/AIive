@@ -302,6 +302,8 @@ def _mark_interrupted(turn_record_id, execution_id):
 
 ## F. History 合并（新旧 Turn）
 
+> 历史设计说明：该阶段的 `get_recent_messages` 接口已删除；当前生产 LLM 上下文统一使用 `load_recent_messages_bounded`，UI 历史使用 `list_thread_messages_page`。
+
 ```python
 def get_recent_messages(self, thread_id: str, max_turns: int = 20):
     """合并新 Turn (turn_id IS NOT NULL) 和旧 Turn (turn_id IS NULL) 的事件。

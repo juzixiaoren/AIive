@@ -1,7 +1,7 @@
 """V2 记忆读取架构单元测试：Automatic Recall + Core Memory 投影。
 
 验证：
-- AutomaticRecallEngine.query-aware 召回（exact / fts / episode 路由）
+- AutomaticRecallEngine.query-aware 召回（exact / lexical / vector / episode 路由）
 - fuse_and_pack 去重、阈值过滤、token 预算裁剪
 - CoreMemoryProjection.build_blocks / load_core_memory（含丢失投影后从 memory_records 重建）
 - core key 写入会入队 core_memory_refresh outbox 任务
@@ -49,8 +49,48 @@ def test_fts_route_recalls_relevant_memory(db_session):
     assert pack.items, "应当召回至少一条相关记忆"
     contents = [it.content for it in pack.items]
     assert any("dark mode" in c for c in contents)
+    assert {route for item in pack.items for route in item.route.split("|")} <= {
+        "exact", "lexical", "episode",
+    }
+    assert any("lexical" in item.route.split("|") for item in pack.items)
     # 不相关记忆不应入选（低于相关性阈值）
     assert not any("sky is blue" in c for c in pack.items)
+
+
+def test_vector_route_participates_in_fusion(db_session):
+    record = _mk(
+        db_session,
+        "user.preference.editor",
+        "用户喜欢使用深色代码编辑器",
+        memory_type="user_profile",
+    )
+
+    class StubVectorService:
+        """仅用于验证路由装配；生产路径不使用该测试替身。"""
+
+        @staticmethod
+        def search(request, *, include_sleeping, include_archived, limit):
+            assert request.query == "更适合夜间工作的界面"
+            assert include_sleeping is False
+            assert include_archived is False
+            assert limit == 16
+            return [(record, 0.92)]
+
+    engine = AutomaticRecallEngine(
+        db_session,
+        RecallConfig(),
+        vector_service=StubVectorService(),
+    )
+    pack, traces = engine.recall(MemoryRecallRequest(
+        query="更适合夜间工作的界面",
+        scope_context=ScopeContext(),
+        top_k=8,
+        token_budget=2000,
+    ))
+
+    assert [item.memory_id for item in pack.items] == [record.id]
+    assert pack.items[0].route == "vector"
+    assert traces[0].selected is True
 
 
 def test_exact_route_passes_threshold(db_session):

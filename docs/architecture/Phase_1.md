@@ -90,7 +90,7 @@ POST /api/chat
             │         │    ├─ AutomaticRecallEngine.recall()
             │         │    ├─ _persist_recall_run()
             │         │    └─ assemble_system_content()
-            │         ├─ thread_state.get_recent_messages(max_turns=20)
+            │         ├─ thread_state.load_recent_messages_bounded(token_budget=...)
             │         └─ _snapshot_context()
             │              返回 _Ctx (匿名 dataclass)
             ├─ Phase 3: AgentGraph._execute_graph(ctx_bundle)

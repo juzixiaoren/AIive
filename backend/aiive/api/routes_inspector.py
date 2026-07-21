@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
+from aiive.api.developer_security import redact_diagnostic_payload
 from aiive.db.base import get_db
 from aiive.db.models import (
     ContextSnapshot,
@@ -47,8 +48,9 @@ def get_context_run(trace_id: str, db: Session = Depends(get_db)):
             "snapshots": [
                 {
                     "stable_prefix_hash": s.stable_prefix_hash,
-                    "context_items": s.context_items,
-                    "meta": s.meta,
+                    "context_items": redact_diagnostic_payload(s.context_items),
+                    "meta": redact_diagnostic_payload(s.meta),
+                    "token_total": s.token_total,
                 }
                 for s in snapshots
             ],
@@ -83,10 +85,34 @@ def get_context_item_detail(trace_id: str, item_id: str, db: Session = Depends(g
         content = full_contents.get(item_id)
         if content is None:
             return {"error": "item not found"}
-        return {"item_id": item_id, "full_content": content}
+        return {
+            "item_id": item_id,
+            "full_content": redact_diagnostic_payload(content, "full_content"),
+        }
     except Exception:
         logger.exception("获取上下文项详情失败: trace_id=%s, item_id=%s", trace_id, item_id)
         raise
+
+
+@router.get("/retrieval-runs")
+def list_retrieval_runs(
+    trace_id: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """按 trace_id 获取本轮真实检索运行摘要。"""
+    runs = (
+        db.query(RetrievalRun)
+        .filter(RetrievalRun.trace_id == trace_id)
+        .order_by(RetrievalRun.created_at.desc())
+        .all()
+    )
+    return [{
+        "run_id": run.id,
+        "trace_id": run.trace_id,
+        "query": run.query,
+        "strategy": run.strategy,
+        "created_at": run.created_at.isoformat() if run.created_at else None,
+    } for run in runs]
 
 
 @router.get("/retrieval-runs/{run_id}")
@@ -122,6 +148,28 @@ def get_retrieval_run(run_id: str, db: Session = Depends(get_db)):
     except Exception:
         logger.exception("获取检索运行详情失败: run_id=%s", run_id)
         raise
+
+
+@router.get("/memory-recall-runs")
+def list_memory_recall_runs(
+    trace_id: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """按 trace_id 获取本轮真实记忆召回运行摘要。"""
+    runs = (
+        db.query(MemoryRecallRun)
+        .filter(MemoryRecallRun.trace_id == trace_id)
+        .order_by(MemoryRecallRun.created_at.desc())
+        .all()
+    )
+    return [{
+        "run_id": run.id,
+        "trace_id": run.trace_id,
+        "request_query": run.request_query,
+        "result_count": run.result_count,
+        "total_latency_ms": run.total_latency_ms,
+        "created_at": run.created_at.isoformat() if run.created_at else None,
+    } for run in runs]
 
 
 @router.get("/memory-recall-runs/{run_id}")
@@ -202,7 +250,7 @@ def inspector_events(
                 "id": e.id,
                 "trace_id": e.trace_id,
                 "event_type": e.event_type,
-                "payload": e.payload,
+                "payload": redact_diagnostic_payload(e.payload),
                 "created_at": e.created_at.isoformat(),
             }
             for e in events

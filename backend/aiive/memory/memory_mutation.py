@@ -210,9 +210,9 @@ class MemoryMutationExecutor:
         event_type: str,
         invalidate_cache: bool = False,
     ) -> None:
-        """入队异步投影 outbox job（core / vector / markdown / cache）。
+        """入队当前已支持的异步投影 outbox job（core / markdown / cache）。
 
-        每条成功生命周期动作在「同一事务」内即时刷新投影（J.5）；各投影类型均受
+        每条成功生命周期动作在「同一事务」内即时刷新投影（J.5）；可选投影类型受
         `get_projection_capabilities()` 的 capability flag 控制，未启用者不入队。
         投影 job 携带 `memory_id + record_version` 供消费端做 stale 检测。
 
@@ -223,26 +223,30 @@ class MemoryMutationExecutor:
 
         caps = get_projection_capabilities()
         base_key = f"{record.id}:{record.record_version}"
-        is_candidate = record.lifecycle_state == LifecycleState.CANDIDATE.value
 
         # core memory refresh（仅 core key，逻辑复用）
         self.enqueue_core_refresh(record)
 
-        # 写入类事件：vector upsert（candidate 不上向量库）
-        if (
-            caps.vector_projection_enabled
-            and event_type in ("memory.created", "memory.reinforced",
-                               "memory.merged", "memory.wake")
-            and not is_candidate
-        ):
-            self._db.add(OutboxJob(
-                operation_id=f"vec:{base_key}:{_uuid.uuid4().hex[:8]}",
-                job_type="memory_vector_upsert",
-                status="pending",
-                payload={"memory_id": record.id, "record_version": record.record_version},
-                trace_id=record.id,
-                max_retries=3,
-            ))
+        # 记忆向量投影：写入和下线都由同一 refresh handler 回源决定 upsert/delete。
+        from aiive.config import settings
+        if settings.aiive_memory_vector_enabled and record.lifecycle_state != LifecycleState.CANDIDATE.value:
+            op_id = f"memory_vector_refresh:{record.id}:{record.record_version}"
+            if not any(
+                isinstance(obj, OutboxJob) and obj.operation_id == op_id
+                for obj in self._db.new
+            ) and self._db.query(OutboxJob).filter_by(operation_id=op_id).first() is None:
+                self._db.add(OutboxJob(
+                    operation_id=op_id,
+                    job_type="memory_vector_refresh",
+                    status="pending",
+                    payload={
+                        "schema_version": 1,
+                        "memory_id": record.id,
+                        "record_version": record.record_version,
+                    },
+                    trace_id=record.id,
+                    max_retries=3,
+                ))
 
         # 写入类事件：markdown 投影
         if caps.markdown_projection_enabled and event_type in (
@@ -251,19 +255,6 @@ class MemoryMutationExecutor:
             self._db.add(OutboxJob(
                 operation_id=f"md:{base_key}:{_uuid.uuid4().hex[:8]}",
                 job_type="memory_markdown_project",
-                status="pending",
-                payload={"memory_id": record.id, "record_version": record.record_version},
-                trace_id=record.id,
-                max_retries=3,
-            ))
-
-        # 下线类事件：vector delete
-        if caps.vector_projection_enabled and event_type in (
-            "memory.forgotten", "memory.sleep", "memory.archived", "memory.superseded"
-        ):
-            self._db.add(OutboxJob(
-                operation_id=f"vec-del:{base_key}:{_uuid.uuid4().hex[:8]}",
-                job_type="memory_vector_delete",
                 status="pending",
                 payload={"memory_id": record.id, "record_version": record.record_version},
                 trace_id=record.id,

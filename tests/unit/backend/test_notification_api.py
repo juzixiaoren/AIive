@@ -60,43 +60,82 @@ class TestDeleteNotificationCancelsTask:
         result = delete_notification(event.id, db_session)
         assert result["ok"] is True
         assert result["task_cancelled"] is False
-        assert db_session.get(Event, event.id) is None
+        retained = db_session.get(Event, event.id)
+        assert retained is not None
+        assert retained.payload["dismissed"] is True
+
+    def test_delete_updates_all_linked_reminders_beyond_recent_fifty(self, db_session):
+        """删除通知时应由数据库定位并隐藏同一任务的全部关联提醒。"""
+        mgr = TaskManager(db_session)
+        task = mgr.create("reminder", "长期提醒")
+        db_session.flush()
+        linked = Event(
+            event_type="reminder_created",
+            thread_id="thread-1",
+            trace_id="linked",
+            payload={"task_id": task.id, "status": "pending"},
+        )
+        db_session.add(linked)
+        for index in range(60):
+            db_session.add(Event(
+                event_type="reminder_created",
+                thread_id="thread-1",
+                trace_id=f"other-{index}",
+                payload={"task_id": f"other-{index}", "status": "pending"},
+            ))
+        db_session.flush()
+
+        delete_notification(linked.id, db_session)
+        db_session.refresh(linked)
+
+        assert linked.payload["status"] == "cancelled"
+        assert linked.payload["dismissed"] is True
+
+    def test_delete_rejects_non_notification_event(self, db_session):
+        """通知接口不得成为删除任意审计事件的入口。"""
+        from fastapi import HTTPException
+
+        event = Event(
+            event_type="user_message",
+            thread_id="thread-1",
+            trace_id="trace-1",
+            payload={"content": "必须保留"},
+        )
+        db_session.add(event)
+        db_session.flush()
+
+        with pytest.raises(HTTPException) as exc_info:
+            delete_notification(event.id, db_session)
+
+        assert exc_info.value.status_code == 404
+        assert db_session.get(Event, event.id) is not None
 
 
 class TestTaskWorkerEndToEnd:
-    """真实端到端测试：创建任务 -> Worker 轮询 -> 产生通知事件。"""
+    """扫描入口测试：创建任务 -> Worker 原子入队。"""
 
-    def test_overdue_task_produces_notification_event(self, db_session, monkeypatch):
-        """过期的提醒任务经 Worker 处理后应产生通知事件并标记为完成。"""
-        # 将 SessionLocal 替换为 db_session 的工厂，避免连接外部 PostgreSQL
-        monkeypatch.setattr("aiive.worker.task_worker.SessionLocal", lambda: db_session)
-        monkeypatch.setattr("aiive.db.base.SessionLocal", lambda: db_session)
+    def test_overdue_task_enqueues_delivery(self, db_session):
+        """过期提醒只能进入 dispatching，不能由旧 Worker 伪造通知或直接完成。"""
+        from aiive.db.models import OutboxJob
 
         mgr = TaskManager(db_session)
         past = datetime.now(timezone.utc) - timedelta(minutes=5)
         task = mgr.create("reminder", "测试提醒", next_check_at=past)
         db_session.flush()
 
-        # 运行 Worker
-        worker = TaskWorker(db_session)
-        results = worker.poll_and_notify()
+        results = TaskWorker(db_session).poll_and_notify()
         db_session.flush()
 
-        # 任务应被标记为完成
         updated = mgr._db.get(type(task), task.id)
-        assert updated.status == "completed"
-
-        # Worker fallback 使用 monkeypatched SessionLocal → 写入同一个 SQLite db_session
-        notif = (
-            db_session.query(Event)
-            .filter(
-                Event.event_type == "notification_created",
-                Event.trace_id == task.id,
-            )
-            .first()
-        )
-        assert notif is not None
-        assert notif.payload["title"] == "测试提醒"
+        assert updated.status == "dispatching"
+        assert results[0]["status"] == "dispatching"
+        assert db_session.query(OutboxJob).filter(
+            OutboxJob.operation_id == f"reminder_delivery:{task.id}"
+        ).count() == 1
+        assert db_session.query(Event).filter(
+            Event.event_type == "notification_created",
+            Event.trace_id == task.id,
+        ).count() == 0
 
     def test_future_task_not_triggered(self, db_session):
         """未来的任务不应被触发。"""

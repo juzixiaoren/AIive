@@ -9,9 +9,12 @@ AgentGraph 集成测试现通过真实 TurnExecutionService（ContextAssembler +
 
 from unittest.mock import MagicMock
 
+import pytest
 from langchain_core.messages import AIMessage
+from pydantic import ValidationError
 
 from aiive.core.llm_client import FakeLLMClient
+from aiive.runtime.action_cards import ActionCard
 from aiive.runtime.tool_executor import (
     ToolCallRecord,
     build_action_cards,
@@ -39,7 +42,11 @@ class TestBuildActionCards:
         )
         cards = build_action_cards([record])
         assert len(cards) == 1
-        assert cards[0]["card_type"] == "task_created"
+        assert cards[0].card_type == "task_created"
+        assert cards[0].resource_refs == {"task_id": "t1"}
+        assert cards[0].event_ids == []
+        assert cards[0].reminder_id == ""
+        assert cards[0].payload_preview["content"] == "hi"
 
     def test_remind_alert_card(self):
         """remind_alert 完成 → reminder_alert 卡片"""
@@ -52,8 +59,10 @@ class TestBuildActionCards:
         )
         cards = build_action_cards([record])
         assert len(cards) == 1
-        assert cards[0]["card_type"] == "reminder_alert"
-        assert cards[0]["reminder_id"] == "r1"
+        assert cards[0].card_type == "reminder_alert"
+        assert cards[0].reminder_id == "r1"
+        assert cards[0].event_ids == ["r1"]
+        assert cards[0].resource_refs == {"reminder_id": "r1"}
 
     def test_blocked_card(self):
         """blocked 状态 → tool_blocked 卡片"""
@@ -67,7 +76,9 @@ class TestBuildActionCards:
         )
         cards = build_action_cards([record])
         assert len(cards) == 1
-        assert cards[0]["card_type"] == "tool_blocked"
+        assert cards[0].card_type == "tool_blocked"
+        assert cards[0].trace_id == "trace-1"
+        assert cards[0].resource_refs == {}
 
     def test_parse_error_card(self):
         """parse_error 状态 → tool_error 卡片"""
@@ -81,7 +92,7 @@ class TestBuildActionCards:
         )
         cards = build_action_cards([record])
         assert len(cards) == 1
-        assert cards[0]["card_type"] == "tool_error"
+        assert cards[0].card_type == "tool_error"
 
     def test_completed_tool_result(self):
         """completed 状态 → tool_result 卡片"""
@@ -94,7 +105,36 @@ class TestBuildActionCards:
         )
         cards = build_action_cards([record])
         assert len(cards) == 1
-        assert cards[0]["card_type"] == "tool_result"
+        assert cards[0].card_type == "tool_result"
+        assert cards[0].payload_preview["tool_name"] == "echo"
+
+    def test_pending_approval_uses_real_operation(self):
+        """待审批卡片与机器可读操作使用同一真实 approval_id。"""
+        record = ToolCallRecord(
+            name="safe_delete",
+            params={"path": "/tmp/demo"},
+            result={"ok": False, "result": "awaiting_approval"},
+            status="pending_approval",
+            trace_id="trace-1",
+        )
+        approvals = [{"name": "safe_delete", "id": "call-1", "approval_id": "approval-1"}]
+
+        cards = build_action_cards([record], approvals)
+        operations = build_pending_operations([record], approvals)
+
+        assert cards[0].resource_refs["approval_id"] == "approval-1"
+        assert operations[0].operation_id == "approval-1"
+        assert operations[0].resource_refs["tool_call_id"] == "call-1"
+
+    def test_action_card_rejects_unknown_fields(self):
+        """严格模型拒绝未声明的游离资源字段。"""
+        with pytest.raises(ValidationError):
+            ActionCard(
+                card_type="task_created",
+                title="提醒",
+                trace_id="trace-1",
+                task_id="t1",  # pyright: ignore[reportCallIssue]
+            )
 
     def test_empty_records(self):
         """空记录 → 空列表"""

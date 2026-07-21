@@ -118,14 +118,13 @@ class TestMemoryWriteService:
         store = MemoryStore(db_session)
         record = store.get_by_id(result1.memory_id)
         assert record.lifecycle_state == LifecycleState.FORGOTTEN.value
-        assert "forgotten:" in record.content
+        assert record.content == "Temp memory"
 
-    def test_event_and_outbox_written(self, db_session, monkeypatch):
-        """Phase 0.5B: capability flags control projection outbox; enable for test."""
-        from aiive.db.models import Event, OutboxJob
-        from aiive.memory.recall_config import get_projection_capabilities
-        caps = get_projection_capabilities()
-        monkeypatch.setattr(caps, "vector_projection_enabled", True)
+    def test_event_and_outbox_written(self, db_session):
+        """记忆写入应记录事件，并且只创建有生产消费者的 Outbox 任务。"""
+        from aiive.db.models import Event, OutboxJob, Thread
+        db_session.add(Thread(id="thread-1"))
+        db_session.flush()
 
         writer = MemoryWriteService(db_session)
         proposal = _make_proposal("user.preference.drink", "Tea")
@@ -147,9 +146,31 @@ class TestMemoryWriteService:
             .filter(OutboxJob.trace_id == result.memory_id)
             .all()
         )
-        assert len(jobs) >= 1, f"Expected at least 1 outbox job, got {len(jobs)}"
         job_types = {j.job_type for j in jobs}
-        assert "memory_vector_upsert" in job_types, f"Got job_types: {job_types}"
+        assert "retrieval_index_refresh" in job_types
+        assert "memory_vector_refresh" not in job_types
+
+    def test_vector_refresh_enqueued_when_enabled(self, db_session, monkeypatch):
+        """显式启用后，记忆写入必须创建有真实消费者的向量刷新任务。"""
+        from aiive.config import settings
+        from aiive.db.models import OutboxJob, Thread
+
+        monkeypatch.setattr(settings, "aiive_memory_vector_enabled", True)
+        db_session.add(Thread(id="thread-1"))
+        db_session.flush()
+
+        result = MemoryWriteService(db_session).write(
+            _make_proposal("user.preference.vector", "Semantic memory"),
+            run_context=_make_ctx(),
+        )
+        jobs = db_session.query(OutboxJob).filter(
+            OutboxJob.trace_id == result.memory_id,
+            OutboxJob.job_type == "memory_vector_refresh",
+        ).all()
+
+        assert len(jobs) == 1
+        assert jobs[0].payload["memory_id"] == result.memory_id
+        assert jobs[0].payload["record_version"] == 1
 
     def test_evidence_table_written(self, db_session):
         writer = MemoryWriteService(db_session)

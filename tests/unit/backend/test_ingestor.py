@@ -1,6 +1,8 @@
-"""测试知识摄入器——文档分块、摄入和去重功能。"""
+"""测试知识摄入器——文档分块、持久原文、摄入和去重功能。"""
+from aiive.db.models import Chunk, Document
 from aiive.knowledge.chunker import chunk_text
 from aiive.knowledge.ingestor import KnowledgeIngestor
+from aiive.storage.object_store import ObjectRef, exists
 
 
 class TestChunker:
@@ -54,3 +56,54 @@ class TestIngestor:
         assert r1["ok"] is True
         assert r2["duplicate"] is True
         assert r2["document_id"] == r1["document_id"]
+
+    def test_ingest_persists_content_addressed_source(self, db_session, tmp_path):
+        """验证摄取结果保存内容寻址对象引用及完整元数据。"""
+        source = tmp_path / "durable.md"
+        source.write_bytes("# 持久知识\n原文内容".encode("utf-8"))
+
+        result = KnowledgeIngestor(db_session).ingest(str(source))
+        document = db_session.get(Document, result["document_id"])
+
+        assert document is not None
+        assert document.object_bucket == "knowledge-documents"
+        assert document.object_key.endswith(document.content_hash)
+        assert document.content_size == len(source.read_bytes())
+        assert document.mime_type == "text/markdown"
+        assert document.status == "indexed"
+        assert exists(ObjectRef(document.object_bucket, document.object_key))
+
+    def test_read_and_reindex_survive_source_removal(self, db_session, tmp_path):
+        """验证来源文件删除后仍能读取持久原文并恢复分块。"""
+        source = tmp_path / "movable.txt"
+        original = "对象存储是知识原文的长期真相源。"
+        source.write_text(original, encoding="utf-8")
+        ingestor = KnowledgeIngestor(db_session)
+        result = ingestor.ingest(str(source))
+        document_id = result["document_id"]
+
+        source.rename(tmp_path / "moved.txt")
+        db_session.query(Chunk).filter(Chunk.document_id == document_id).delete()
+        db_session.flush()
+
+        assert ingestor.read_source(document_id).decode("utf-8") == original
+        rebuilt = ingestor.reindex(document_id)
+        chunks = db_session.query(Chunk).filter(Chunk.document_id == document_id).all()
+        assert rebuilt["chunks"] == 1
+        assert [chunk.content for chunk in chunks] == [original]
+
+    def test_same_content_uses_same_object_key(self, db_session, tmp_path):
+        """验证不同来源的相同原文幂等复用同一内容地址。"""
+        first = tmp_path / "first.txt"
+        second = tmp_path / "second.txt"
+        first.write_text("相同原文", encoding="utf-8")
+        second.write_text("相同原文", encoding="utf-8")
+        ingestor = KnowledgeIngestor(db_session)
+
+        one = ingestor.ingest(str(first))
+        two = ingestor.ingest(str(second))
+        document = db_session.get(Document, one["document_id"])
+
+        assert two["duplicate"] is True
+        assert two["document_id"] == one["document_id"]
+        assert document.object_key.endswith(one["content_hash"])

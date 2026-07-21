@@ -73,19 +73,50 @@ class ContextBudget:
                 + f"context window ({self.model_context_window})"
             )
 
-    # ── deepseek-chat (128000 上下文) 默认实例 ──
+    # ── 默认实例：窗口值取自 settings.aiive_llm_context_window ──
     DEFAULT: ClassVar["ContextBudget"]
 
     @classmethod
     def default(cls) -> "ContextBudget":
+        """构建默认预算：窗口值取自配置，recent_messages 弹性吸收剩余空间。
+
+        除 recent_messages 外的分区为固定绝对值（不随窗口缩放），
+        recent_messages 的 hard = 窗口 - 其余全部分区 hard 之和，
+        soft = hard 的约 87%。这样用户在 .env 调整 aiive_llm_context_window
+        后预算自动自洽，validate() 恒通过。
+        """
+        from aiive.config import settings
+
+        window = settings.aiive_llm_context_window
+        reserved_output_hard = settings.aiive_llm_max_output_tokens
+
+        # 固定分区（除 recent_messages）的 hard 之和，含 reserved_output
+        fixed_hard = (
+            reserved_output_hard
+            + 4000   # stable_contract
+            + 600    # core_memory
+            + 2000   # working_state
+            + 6000   # tool_definitions
+            + 1200   # retrieved_memory
+            + 8000   # tool_results
+            + 800    # epoch_checkpoint
+            + 2000   # segment_summaries
+            + 2300   # sealing_bridge
+            + 1000   # retrieved_history_summary
+            + 1500   # deep_history_raw
+        )
+        # recent_messages 吸收剩余空间；给极小窗口留一个下限兜底
+        recent_hard = max(4000, window - fixed_hard)
+        recent_soft = int(recent_hard * 0.87)
+
         return cls(
-            model_context_window=128000,
-            reserved_output=PartitionBudget("reserved_output", -1, 4096, -1, "保留输出 token"),
+            model_context_window=window,
+            reserved_output=PartitionBudget("reserved_output", -1, reserved_output_hard, -1, "保留输出 token"),
             stable_contract=PartitionBudget("stable_contract", 3500, 4000, 1, "内核契约"),
             core_memory=PartitionBudget("core_memory", 500, 600, 2, "核心记忆块"),
             working_state=PartitionBudget("working_state", 1500, 2000, 3, "结构化工作状态"),
             tool_definitions=PartitionBudget("tool_definitions", 4000, 6000, 4, "工具 Schema"),
-            recent_messages=PartitionBudget("recent_messages", 85000, 97000, 5, "近期 Turn 消息"),
+            recent_messages=PartitionBudget("recent_messages", recent_soft, recent_hard, 5, "近期 Turn 消息"),
             retrieved_memory=PartitionBudget("retrieved_memory", 1000, 1200, 6, "召回记忆"),
             tool_results=PartitionBudget("tool_results", 5000, 8000, 7, "工具结果"),
             epoch_checkpoint=PartitionBudget("epoch_checkpoint", 500, 800, 8, "最近 Epoch 检查点"),

@@ -178,9 +178,10 @@ class ChatResponse(BaseModel):
     reply: str
     thread_id: str
     trace_id: str
-    action_cards: list[ActionCard] = []
-    pending_operations: list[PendingOperation] = []
-    intent_debug: IntentDebug | None = None
+    action_cards: list[ActionCard] = Field(default_factory=list)
+    pending_operations: list[PendingOperation] = Field(default_factory=list)
+    tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+    tool_results: list[dict[str, Any]] = Field(default_factory=list)
 ```
 
 `action_cards` 类型建议：
@@ -215,11 +216,19 @@ class ActionCard(BaseModel):
     title: str
     summary: str
     trace_id: str
-    event_ids: list[str] = []
-    resource_refs: dict[str, str] = {}
-    status: Literal["pending", "completed", "failed", "needs_review"]
-    payload_preview: dict[str, Any] = {}
+    event_ids: list[str] = Field(default_factory=list)
+    resource_refs: dict[str, str] = Field(default_factory=dict)
+    status: Literal[
+        "pending", "completed", "failed", "needs_review",
+        "alerting", "blocked", "error"
+    ]
+    payload_preview: dict[str, Any] = Field(default_factory=dict)
 ```
+
+运行时必须先构造并校验 `ActionCard` / `PendingOperation`，再在持久化和 API 边界使用
+`model_dump(mode="json")` 序列化。禁止直接拼装未经模型校验的卡片字典。
+`PendingOperation` 必须从真实审批记录投影，`operation_id` 使用真实 `approval_id`，
+不得由前端或回复文本推测。
 
 ---
 

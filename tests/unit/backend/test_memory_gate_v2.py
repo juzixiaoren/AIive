@@ -36,7 +36,7 @@ class TestMemoryGateCanonical:
         )
         d = self.gate.decide(p)
         assert d.decision == "reject"
-        assert "blocked_by_trust_boundary" in d.blocked_reason
+        assert d.blocked_reason == "authority_source_forbidden"
 
     def test_external_content_cannot_write_policy(self):
         p = MemoryProposal(

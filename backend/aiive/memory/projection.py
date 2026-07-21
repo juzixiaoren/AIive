@@ -10,6 +10,7 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 
 from aiive.db.models import MemoryRecord
+from aiive.memory.memory_policy import MemoryPolicyEngine, MemoryReadChannel
 from aiive.memory.memory_types import LifecycleState
 from typing import Any
 
@@ -31,11 +32,13 @@ class MemoryProjection:
             .limit(100)
             .all()
         )
+        policy = MemoryPolicyEngine()
         lines = ["# AIive Active Memories", "", f"Generated: {len(records)} records\n"]
         for r in records:
+            content = policy.render_content(r.content, r.sensitivity, MemoryReadChannel.API)
             key_info = f"({r.canonical_key})" if r.canonical_key else ""
             lines.append(
-                f"- [{r.memory_type}] {r.content}"
+                f"- [{r.memory_type}] {content}"
                 + f" (confidence: {r.confidence:.2f}, importance: {r.importance:.2f})"
                 + f" {key_info}"
             )
@@ -50,6 +53,7 @@ class MemoryProjection:
             .limit(100)
             .all()
         )
+        policy = MemoryPolicyEngine()
         return [
             {
                 "id": r.id,
@@ -57,7 +61,10 @@ class MemoryProjection:
                 "canonical_key": r.canonical_key,
                 "scope_type": r.scope_type,
                 "scope_id": r.scope_id,
-                "content": r.content,
+                "content": policy.render_content(
+                    r.content, r.sensitivity, MemoryReadChannel.API,
+                ),
+                "sensitivity": r.sensitivity or "normal",
                 "confidence": r.confidence,
                 "importance": r.importance,
                 "lifecycle_state": r.lifecycle_state,

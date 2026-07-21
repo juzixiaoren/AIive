@@ -81,6 +81,7 @@ class TestMemoryReadModel:
         model = MemoryReadModel(store)
         identity = model.resolve_identity()
         policies = model.resolve_policies()
-        # No memories stored — identity empty, policies empty, no crash.
-        assert identity.is_empty()
+        # No memories stored — identity fields empty, policies empty, no crash.
+        assert identity.agent_display_name == ""
+        assert identity.user_display_name == ""
         assert policies == []

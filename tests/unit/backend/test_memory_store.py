@@ -36,33 +36,6 @@ class TestMemoryStore:
         assert retrieved.scope_type == "global"
         assert retrieved.cardinality == "multi"
 
-    def test_get_active_by_key(self, db_session):
-        store = MemoryStore(db_session)
-        store.create_record(
-            _make_proposal("user.display_name", "Alice"),
-            lifecycle_state=LifecycleState.ACTIVE.value,
-        )
-        store.create_record(
-            _make_proposal("user.display_name", "Bob"),
-            lifecycle_state=LifecycleState.CANDIDATE.value,
-        )
-        db_session.flush()
-
-        active = store.get_active_by_key("user.display_name")
-        assert len(active) == 1
-        assert active[0].content == "Alice"
-
-    def test_get_active_by_key_scope(self, db_session):
-        store = MemoryStore(db_session)
-        store.create_record(
-            _make_proposal("user.display_name", "Alice"),
-            lifecycle_state=LifecycleState.ACTIVE.value,
-        )
-        db_session.flush()
-
-        results = store.get_active_by_key_scope("user.display_name", "global", None)
-        assert len(results) == 1
-
     def test_get_by_context_roles(self, db_session):
         store = MemoryStore(db_session)
         p = _make_proposal("agent.display_name", "Helper", "agent_self")

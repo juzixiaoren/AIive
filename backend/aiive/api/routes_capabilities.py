@@ -7,9 +7,8 @@ from sqlalchemy.orm import Session
 
 from aiive.core.llm_client import default_llm_client
 from aiive.db.base import get_db
-from aiive.db.models import CapabilityPlan, Capability
+from aiive.db.models import CapabilityPlan
 from aiive.mcp.capability_planner import CapabilityPlanner
-from aiive.mcp.installer import install_sandbox, run_smoke
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/capabilities")
@@ -92,45 +91,16 @@ def activate_capability(plan_id: str, db: Session = Depends(get_db)):
     if not plan.selected_candidate:
         return ActivateResponse(ok=False, error="No candidate selected")
 
-    try:
-        from aiive.mcp.discovery import search_mcp_candidates
-        candidates = search_mcp_candidates(plan.selected_candidate)
-        if not candidates:
-            return ActivateResponse(ok=False, error="Candidate not found in registry")
-        c = candidates[0]
-
-        result = install_sandbox(
-            db, c.name, c.package_ref, c.version, c.transport,
-            c.declared_tools, {"name": c.name, "description": c.description},
-        )
-        if not result.get("ok"):
-            plan.status = "failed"
-            db.commit()
-            return ActivateResponse(ok=False, error=result.get("error", "Install failed"))
-
-        cap = db.query(Capability).filter(
-            Capability.capability_id == f"mcp:{c.name}"
-        ).first()
-        if cap is None:
-            plan.status = "failed"
-            db.commit()
-            return ActivateResponse(
-                ok=False,
-                error="Install succeeded but capability record not found",
-            )
-        smoke_result = run_smoke(db, cap.id, {"passed": True, "test": "basic_smoke"})
-        plan.capability_id = cap.id
-        plan.status = "activated" if smoke_result.get("ok") else "installed"
-        plan.smoke_result = {"status": plan.status}
-        db.commit()
-
-        return ActivateResponse(
-            ok=True,
-            capability_id=plan.capability_id or "",
-            smoke_result=plan.smoke_result,
-        )
-    except Exception:
-        logger.exception("capability activation failed")
-        plan.status = "failed"
-        db.commit()
-        return ActivateResponse(ok=False, error="Activation failed")
+    plan.status = "needs_user_review"
+    plan.smoke_result = {
+        "ok": False,
+        "code": "real_mcp_runtime_unavailable",
+        "message": "真实 MCP 安装、启动、tools/list、tools/call 和 ToolRegistry 注册链路尚未完成",
+    }
+    db.commit()
+    return ActivateResponse(
+        ok=False,
+        capability_id=plan.capability_id or "",
+        smoke_result=plan.smoke_result,
+        error="Real MCP runtime and smoke verification are required before activation",
+    )

@@ -1,17 +1,16 @@
-"""Automatic Recall engine — query-aware, multi-route, runs every turn.
+"""Automatic Recall 引擎：每轮执行 query-aware 的多路召回。
 
-Routes:
-  1. Exact / Structured  —— canonical_key / entity / scope-id match
-  2. PostgreSQL FTS       —— query really participates (ILIKE word overlap)
-  3. Vector               —— adapter stub (Qdrant not wired); returns []
-  4. Temporal Graph       —— adapter stub (KG not wired); returns []
-  5. Recent Episode       —— recent episodic records in scope (fallback context)
+当前生产路由：
+  1. Exact / Structured —— canonical_key / entity / scope-id 精确匹配
+  2. Lexical            —— query 参与 ILIKE 与 token overlap 匹配
+  3. Recent Episode     —— scope 内与 query 相关的近期 episodic 记录
 
-Routes never run a full `get_active()` and filter in Python; each route issues
-scope-bounded SQL. Candidates are fused by `recall_fusion.fuse_and_pack`.
+各路由均执行 scope 约束的 SQL，不先全量读取再在 Python 中过滤。候选统一由
+`recall_fusion.fuse_and_pack` 融合。
 """
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Sequence
 from datetime import datetime, timezone
@@ -48,6 +47,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from aiive.db.models import MemoryRecord
+from aiive.memory.memory_policy import MemoryPolicyEngine, MemoryReadChannel
 from aiive.memory.memory_store import MemoryStore
 from aiive.memory.memory_types import LifecycleState, ValidityState
 from aiive.memory.recall_config import RecallConfig
@@ -58,6 +58,8 @@ from aiive.memory.recall_models import (
     MemoryRecallRequest,
     RecallCandidateTrace,
 )
+
+logger = logging.getLogger(__name__)
 
 _KEYISH = re.compile(r"^[A-Za-z0-9_.]+$")
 
@@ -96,10 +98,22 @@ def _scope_score(actual_scope_type: str, actual_scope_id: str | None, chain: lis
 class AutomaticRecallEngine:
     """Runs Automatic Recall once per user turn (or per Agent memory tool call)."""
 
-    def __init__(self, db: Session, config: RecallConfig | None = None) -> None:
+    def __init__(
+        self,
+        db: Session,
+        config: RecallConfig | None = None,
+        vector_service: object | None = None,
+    ) -> None:
         self._db: Session = db
         self._store: MemoryStore = MemoryStore(db)
+        self._policy = MemoryPolicyEngine()
         self._config: RecallConfig = config or RecallConfig()
+        self._vector_service = vector_service
+        if self._vector_service is None:
+            from aiive.config import settings
+            if settings.aiive_memory_vector_enabled:
+                from aiive.memory.vector_projection import MemoryVectorProjectionService
+                self._vector_service = MemoryVectorProjectionService(db)
 
     # ------------------------------------------------------------------
     # Public API
@@ -111,17 +125,20 @@ class AutomaticRecallEngine:
     ) -> tuple[MemoryRecallPack, list[RecallCandidateTrace]]:
         """执行全部启用的召回路由并融合为一个 pack。
 
-        include_sleeping=True 时（J.5「扩大召回/高相关」），仅 exact / fts 两条
+        include_sleeping=True 时（J.5「扩大召回/高相关」），exact / lexical / vector
         高相关路由放宽到 `lifecycle_state IN (active, sleeping)`；episode 兜底路由
         始终仅 active，避免陈旧、低价值的情节记忆被重新带回上下文。
         include_archived=True 时追加 archived（仅经统一检索显式请求，不自动 wake）。
         """
         candidates: list[MemoryRecallItem] = []
         candidates += self._route_exact(request, include_sleeping, include_archived)
-        candidates += self._route_fts(request, include_sleeping, include_archived)
-        candidates += self._route_vector(request)
-        candidates += self._route_temporal_graph(request)
+        candidates += self._route_lexical(request, include_sleeping, include_archived)
+        try:
+            candidates += self._route_vector(request, include_sleeping, include_archived)
+        except Exception:
+            logger.exception("向量召回失败，降级为 exact / lexical / episode")
         candidates += self._route_recent_episode(request)
+        candidates = [item for item in candidates if item.content]
         return fuse_and_pack(candidates, request, self._config)
 
     @staticmethod
@@ -176,11 +193,11 @@ class AutomaticRecallEngine:
                 break
         return out
 
-    def _route_fts(
+    def _route_lexical(
         self, request: MemoryRecallRequest, include_sleeping: bool = False,
         include_archived: bool = False,
     ) -> list[MemoryRecallItem]:
-        """PostgreSQL/SQLite text search. query genuinely participates."""
+        """执行 PostgreSQL/SQLite 可移植的词汇检索，query 真实参与匹配。"""
         q = request.query.strip()
         if len(q) < 2:
             return []
@@ -202,21 +219,40 @@ class AutomaticRecallEngine:
                 rel = self._text_relevance(r, tokens, qlow)
                 if rel <= 0:
                     continue
-                out.append(self._to_item(r, "fts", rel, chain))
+                item = self._to_item(r, "lexical", rel, chain)
+                if item is not None:
+                    out.append(item)
         out.sort(key=lambda x: x.relevance_score, reverse=True)
         return out[: self._config.automatic_recall_top_k * 2]
 
-    def _route_vector(self, _request: MemoryRecallRequest) -> list[MemoryRecallItem]:
-        """Semantic route. Adapter not wired (Qdrant) → stub returns empty."""
-        if not self._config.vector_adapter_enabled:
+    def _route_vector(
+        self,
+        request: MemoryRecallRequest,
+        include_sleeping: bool = False,
+        include_archived: bool = False,
+    ) -> list[MemoryRecallItem]:
+        """通过已配置的 pgvector 服务执行语义召回。"""
+        if self._vector_service is None:
             return []
-        return []
-
-    def _route_temporal_graph(self, _request: MemoryRecallRequest) -> list[MemoryRecallItem]:
-        """Temporal / multi-hop KG route. Adapter not wired → stub returns empty."""
-        if not self._config.temporal_graph_adapter_enabled:
-            return []
-        return []
+        search = getattr(self._vector_service, "search", None)
+        if not callable(search):
+            raise TypeError("vector_service 必须提供 search 方法")
+        from aiive.config import settings
+        rows = search(
+            request,
+            include_sleeping=include_sleeping,
+            include_archived=include_archived,
+            limit=min(self._config.vector_top_k, settings.aiive_memory_vector_top_k),
+        )
+        chain = request.scope_context.chain()
+        out: list[MemoryRecallItem] = []
+        for record, relevance in rows:
+            if relevance <= 0:
+                continue
+            item = self._to_item(record, "vector", relevance, chain)
+            if item is not None:
+                out.append(item)
+        return out
 
     def _route_recent_episode(
         self, request: MemoryRecallRequest, limit: int = 3
@@ -262,7 +298,9 @@ class AutomaticRecallEngine:
                 rel = self._text_relevance(r, tokens, q)
                 if rel <= 0:
                     continue
-                out.append(self._to_item(r, "episode", rel, chain))
+                item = self._to_item(r, "episode", rel, chain)
+                if item is not None:
+                    out.append(item)
         out.sort(key=lambda x: x.relevance_score, reverse=True)
         return out[:limit]
 
@@ -312,15 +350,21 @@ class AutomaticRecallEngine:
         self, recs: Sequence[MemoryRecord], route: str,
         relevance: float, chain: list[tuple[str, str | None]],
     ) -> list[MemoryRecallItem]:
-        return [self._to_item(r, route, relevance, chain) for r in recs]
+        items = [self._to_item(r, route, relevance, chain) for r in recs]
+        return [item for item in items if item is not None]
 
     def _to_item(
         self, r: MemoryRecord, route: str, relevance: float,
         chain: list[tuple[str, str | None]],
-    ) -> MemoryRecallItem:
+    ) -> MemoryRecallItem | None:
+        content = self._policy.render_content(
+            r.content or "", r.sensitivity, MemoryReadChannel.LLM_CONTEXT,
+        )
+        if content is None:
+            return None
         return MemoryRecallItem(
             memory_id=r.id,
-            content=r.content or "",
+            content=content,
             memory_type=r.memory_type or "",
             canonical_key=r.canonical_key or "",
             scope_type=r.scope_type or "global",

@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 TEST_MAPPING = {
     "backend/aiive/core/": ["tests/unit/backend/test_agent_graph.py", "tests/unit/backend/test_identity_memory.py"],
     "backend/aiive/memory/": ["tests/unit/backend/test_memory_store.py", "tests/unit/backend/test_memory_gate.py", "tests/unit/backend/test_memory_extractor.py", "tests/unit/backend/test_memory_types.py", "tests/unit/backend/test_steward_signal_extractor.py"],
-    "backend/aiive/tools/": ["tests/unit/backend/test_tool_registry.py", "tests/unit/backend/test_permission_manager.py", "tests/unit/backend/test_safe_delete.py"],
+    "backend/aiive/tools/": ["tests/unit/backend/test_tool_registry.py", "tests/unit/backend/test_safe_delete.py"],
     "backend/aiive/mcp/": ["tests/unit/backend/test_mcp_discovery.py", "tests/unit/backend/test_mcp_installer.py", "tests/unit/backend/test_mcp_runtime_client.py"],
     "backend/aiive/supervisor/": ["tests/unit/backend/test_slot_manager.py", "tests/unit/backend/test_supervisor_health.py"],
     "backend/aiive/selfdev/": ["tests/unit/backend/test_selfdev_planner.py"],

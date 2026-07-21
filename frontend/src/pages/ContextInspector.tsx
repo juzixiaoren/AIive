@@ -18,9 +18,22 @@ type ContextItem = {
   token_estimate: number;
 };
 
+/** 注入记忆条目数据结构 */
+type InjectedMemory = {
+  memory_id: string;
+  canonical_key: string;
+  memory_type: string;
+};
+
 /** 上下文类型的中文标签和样式映射 */
 const KIND_META: Record<string, { label: string; bg: string; text: string; border: string }> = {
   stable_prefix:      { label: "系统前缀",  bg: "bg-accent-soft", text: "text-accent-text", border: "border-accent-border" },
+  core_memory:        { label: "核心记忆",  bg: "bg-accent-soft/70", text: "text-accent-text", border: "border-accent-border/60" },
+  working_state:      { label: "工作状态",  bg: "bg-accent-soft/50", text: "text-accent-text", border: "border-accent-border/50" },
+  epoch_checkpoint:   { label: "纪元检查点", bg: "bg-surface-muted", text: "text-code", border: "border-divider" },
+  segment_summary:    { label: "分段摘要",  bg: "bg-surface-muted", text: "text-code", border: "border-divider" },
+  sealing_bridge:     { label: "密封桥接",  bg: "bg-surface-muted", text: "text-code", border: "border-divider" },
+  history_summary:    { label: "历史摘要",  bg: "bg-surface-muted", text: "text-code", border: "border-divider" },
   tool_schemas:       { label: "工具列表",  bg: "bg-success-soft",    text: "text-success-text",    border: "border-success-border" },
   evidence_memory:    { label: "注入记忆",  bg: "bg-warning-soft",   text: "text-warning-text",   border: "border-warning-border" },
   history_user:       { label: "用户消息",  bg: "bg-primary-soft",    text: "text-primary",    border: "border-primary-border" },
@@ -89,7 +102,7 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
         if (res.error) {
           setFullContents(prev => ({ ...prev, [itemId]: `错误: ${String(res.error)}` }));
         } else {
-          setFullContents(prev => ({ ...prev, [itemId]: String(res.full_content ?? res.error ?? "(空") }));
+          setFullContents(prev => ({ ...prev, [itemId]: String(res.full_content ?? res.error ?? "(空)") }));
         }
       })
       .catch(e => {
@@ -124,7 +137,8 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
   const snapshots = (data.snapshots || []) as Array<Record<string, unknown>>;
   const items = (snapshots[0]?.context_items as ContextItem[]) || [];
   const meta = (snapshots[0]?.meta || {}) as Record<string, unknown>;
-  const injected = (meta.injected_memory_ids as string[]) || [];
+  const injected = (meta.injected_memory_ids as InjectedMemory[]) || [];
+  const tokenTotal = snapshots[0]?.token_total as number | undefined;
 
   return (
     <div>
@@ -136,7 +150,7 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
         {[
           { label: "前缀哈希", value: String(snapshots[0]?.stable_prefix_hash || "-") },
           { label: "上下文项", value: String(items.length) },
-          { label: "预估 Token", value: `~${meta.total_tokens || "-"}` },
+          { label: "预估 Token", value: tokenTotal ? `~${tokenTotal}` : "-" },
           { label: "注入记忆", value: `${injected.length} 条` },
         ].map(c => (
           <div key={c.label} className="bg-surface border border-divider rounded-lg p-3 text-center shadow-sm">
@@ -151,8 +165,15 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
         <div className="mb-4">
           <h3 className="text-sm font-medium text-code mb-2">注入的记忆</h3>
           <div className="flex flex-wrap gap-1">
-            {injected.map((id: string) => (
-              <code key={id} className="text-[11px] bg-primary-soft text-primary-hover px-2 py-0.5 rounded font-mono">{id.slice(0, 8)}</code>
+            {injected.map((m: InjectedMemory) => (
+              <span
+                key={m.memory_id}
+                title={m.memory_id}
+                className="text-[11px] bg-primary-soft text-primary-hover px-2 py-0.5 rounded font-mono inline-flex items-center gap-1"
+              >
+                {m.memory_type && <span className="opacity-70">[{m.memory_type}]</span>}
+                <span>{m.canonical_key || m.memory_id.slice(0, 8)}</span>
+              </span>
             ))}
           </div>
         </div>

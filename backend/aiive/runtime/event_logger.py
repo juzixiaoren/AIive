@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
-from aiive.db.models import Event, LLMCall
+from aiive.db.models import Event
 from typing import Any
 
 
@@ -58,38 +58,4 @@ class EventLogger:
         self._db.flush()
         return event
 
-    def log_llm_call(
-        self,
-        trace_id: str,
-        thread_id: str,
-        model: str,
-        latency_ms: float,
-        input_preview: str | None = None,
-        output_preview: str | None = None,
-    ) -> LLMCall:
-        """记录一次 LLM 调用，包含模型、延迟和输入输出预览。
 
-        Args:
-            trace_id: 链路追踪 ID
-            thread_id: 会话线程 ID
-            model: 使用的模型名称
-            latency_ms: 调用延迟（毫秒）
-            input_preview: 输入预览（可选）
-            output_preview: 输出预览（可选）
-
-        Returns:
-            已创建的 LLMCall 对象
-        """
-        call = LLMCall(
-            id=str(uuid.uuid4()),
-            trace_id=trace_id,
-            thread_id=thread_id,
-            model=model,
-            latency_ms=latency_ms,
-            input_preview=input_preview,
-            output_preview=output_preview,
-            created_at=datetime.now(timezone.utc),
-        )
-        self._db.add(call)
-        self._db.flush()
-        return call

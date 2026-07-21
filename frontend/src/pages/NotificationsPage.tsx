@@ -6,6 +6,7 @@
  */
 
 import { useEffect, useState } from "react";
+import { useNotificationListener } from "../hooks/useNotificationSocket";
 
 /** 通知数据结构 */
 interface Notif {
@@ -56,6 +57,9 @@ export default function NotificationsPage() {
   useEffect(() => {
     refresh();
   }, []);
+
+  // 后端推送通知变更时即时刷新收件箱（单次 GET，非周期轮询）
+  useNotificationListener(() => refresh());
 
   /** 切换分类 */
   const switchCategory = (cat: "pending" | "done") => {

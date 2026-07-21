@@ -14,10 +14,13 @@ from aiive.db.base import SessionLocal
 from aiive.db.models import (
     CheckpointRun,
     CompactionRun,
+    Event,
     MemoryIngestionRun,
     MemoryMaintenanceBatch,
     MemoryMaintenanceRun,
     OutboxJob,
+    Task,
+    Thread,
 )
 from aiive.memory.recall_config import ENABLED_OUTBOX_JOB_TYPES
 from aiive.worker.handler_registry import HandlerRegistry
@@ -253,12 +256,16 @@ class OutboxWorker:
                 OutboxJob.locked_by: None,
                 OutboxJob.claim_token: None,
                 OutboxJob.lease_expires_at: None,
+                OutboxJob.terminal_at: datetime.now(timezone.utc),
                 OutboxJob.updated_at: datetime.now(timezone.utc),
             }, synchronize_session=False)
             if affected != 1:
                 raise FencingViolationError(
                     f"finalize fencing: job_id={claimed.id}"
                 )
+            # Phase 6A: forget_* Job completed → 更新 ForgetStageRun
+            if claimed.job_type.startswith("forget_"):
+                _finalize_forget_stage(db, claimed)
             db.commit()
         except FencingViolationError:
             db.rollback()
@@ -419,6 +426,7 @@ class OutboxWorker:
             job.locked_by = None
             job.claim_token = None
             job.lease_expires_at = None
+            job.terminal_at = datetime.now(timezone.utc)
             job.updated_at = datetime.now(timezone.utc)
 
             # 如果有关联 IngestionRun，原子标记 deadletter
@@ -465,6 +473,58 @@ class OutboxWorker:
                         MemoryMaintenanceBatch.completed_at: datetime.now(timezone.utc),
                     }, synchronize_session=False)
 
+            # 提醒重试耗尽时，OutboxJob 与 Task 在同一事务进入失败终态。
+            if job.job_type == "reminder_delivery":
+                task_id = str((job.payload or {}).get("task_id", ""))
+                task = db.query(Task).filter(Task.id == task_id).with_for_update().first()
+                if task is not None and task.status == "dispatching":
+                    task.status = "failed"
+                    task.last_checked_at = datetime.now(timezone.utc)
+                    audit_thread_id = task.thread_id or "system"
+                    if db.get(Thread, audit_thread_id) is None:
+                        audit_thread_id = "system"
+                    db.add(Event(
+                        trace_id=job.trace_id or task.id,
+                        thread_id=audit_thread_id,
+                        event_type="reminder_delivery_failed",
+                        payload={
+                            "task_id": task.id,
+                            "title": task.title,
+                            "terminal_reason": terminal_reason or "deadletter",
+                            "error": error[:500],
+                        },
+                    ))
+
+            # Phase 5：retrieval_index_rebuild Job deadletter 时原子置 RetrievalIndexRun 为 deadletter
+            # （F 节原子契约：其 outbox_job_id 即本 Job 的 id）。
+            if job.job_type == "retrieval_index_rebuild":
+                from aiive.db.models import RetrievalIndexRun
+                rirun = db.query(RetrievalIndexRun).filter(
+                    RetrievalIndexRun.outbox_job_id == job.id,
+                ).with_for_update().first()
+                if rirun is not None and rirun.status in ("running", "failed"):
+                    rirun.status = "deadletter"
+                    rirun.execution_token = None
+                    rirun.error_message = f"Outbox deadletter: {error[:200]}"
+                    rirun.completed_at = datetime.now(timezone.utc)
+
+            # Phase 6B：retention_cleanup Job deadletter 时原子置 RetentionCleanupRun 为 deadletter
+            # （F 节原子契约：其 outbox_job_id 即本 Job 的 id）。
+            if job.job_type == "retention_cleanup":
+                from aiive.db.retention_models import RetentionCleanupRun
+                rrun = db.query(RetentionCleanupRun).filter(
+                    RetentionCleanupRun.outbox_job_id == job.id,
+                ).with_for_update().first()
+                if rrun is not None and rrun.status in ("running", "failed"):
+                    rrun.status = "deadletter"
+                    rrun.execution_token = None
+                    rrun.error_message = f"Outbox deadletter: {error[:200]}"
+                    rrun.updated_at = datetime.now(timezone.utc)
+
+            # Phase 6A：forget_* Job deadletter 时原子更新 ForgetStageRun + ForgetOperation + ForgetShield
+            if job.job_type.startswith("forget_"):
+                _deadletter_forget_stage(db, job, error)
+
             db.commit()
         except Exception:
             db.rollback()
@@ -472,3 +532,49 @@ class OutboxWorker:
             raise
         finally:
             db.close()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 6A: Forget stage 原子更新 helpers
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _deadletter_forget_stage(db: Session, job: OutboxJob, error: str) -> None:
+    """原子 deadletter：ForgetStageRun + ForgetOperation（Shield 保持 active）。"""
+    from aiive.db.forget_models import ForgetOperation, ForgetStageRun
+
+    srun = db.query(ForgetStageRun).filter(
+        ForgetStageRun.outbox_job_id == job.id,
+    ).with_for_update().first()
+    if srun is None:
+        return
+
+    srun.status = "deadletter"
+    srun.failure_count = (srun.failure_count or 0) + 1
+    srun.execution_token = None
+    srun.updated_at = datetime.now(timezone.utc)
+
+    op = db.query(ForgetOperation).filter(
+        ForgetOperation.id == srun.forget_operation_id,
+    ).with_for_update().first()
+    if op is not None and op.status != "purged":
+        op.status = "shielded_deadletter"
+        op.error_message = f"Stage {srun.stage} deadletter: {error[:400]}"
+        op.updated_at = datetime.now(timezone.utc)
+
+    # Shield 保持 active（不弱化）
+
+
+def _finalize_forget_stage(db: Session, claimed: ClaimedJob) -> None:
+    """forget_* Job completed → ForgetStageRun 标记 done。"""
+    from aiive.db.forget_models import ForgetStageRun
+
+    srun = db.query(ForgetStageRun).filter(
+        ForgetStageRun.outbox_job_id == claimed.id,
+    ).with_for_update().first()
+    if srun is None:
+        return
+
+    srun.status = "done"
+    srun.execution_token = None
+    srun.updated_at = datetime.now(timezone.utc)

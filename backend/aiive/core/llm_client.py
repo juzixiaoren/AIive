@@ -39,11 +39,74 @@ class LLMResponse:
 
 
 class LLMClientError(Exception):
-    """LLM 客户端异常，携带 HTTP 状态码和追踪 ID 便于排查。"""
-    def __init__(self, message: str, status_code: int | None = None, trace_id: str | None = None):
+    """LLM 客户端异常，携带稳定错误码、重试语义和追踪 ID。"""
+
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        trace_id: str | None = None,
+        code: str = "llm_unavailable",
+        retryable: bool = True,
+        retry_after_seconds: int | None = None,
+    ):
         super().__init__(message)
         self.status_code: int | None = status_code
         self.trace_id: str | None = trace_id
+        self.code = code
+        self.retryable = retryable
+        self.retry_after_seconds = retry_after_seconds
+
+
+def normalize_llm_error(error: Exception, trace_id: str | None = None) -> LLMClientError:
+    """将不同 LLM SDK 的异常归一化为安全、稳定的错误契约。"""
+    if isinstance(error, LLMClientError):
+        if not error.trace_id:
+            error.trace_id = trace_id
+        return error
+
+    response = getattr(error, "response", None)
+    status_code = getattr(error, "status_code", None) or getattr(response, "status_code", None)
+    error_name = type(error).__name__.lower()
+    if status_code == 429 or "ratelimit" in error_name:
+        return LLMClientError(
+            "模型服务请求过于频繁，请稍后重试",
+            status_code=429,
+            trace_id=trace_id,
+            code="llm_rate_limited",
+            retryable=True,
+        )
+    if "timeout" in error_name:
+        return LLMClientError(
+            "模型服务响应超时，请稍后重试",
+            status_code=504,
+            trace_id=trace_id,
+            code="llm_timeout",
+            retryable=True,
+        )
+    if status_code in (401, 403):
+        return LLMClientError(
+            "模型服务配置不可用",
+            status_code=503,
+            trace_id=trace_id,
+            code="llm_configuration_error",
+            retryable=False,
+        )
+    if isinstance(status_code, int) and status_code >= 500:
+        return LLMClientError(
+            "模型服务暂时不可用，请稍后重试",
+            status_code=503,
+            trace_id=trace_id,
+            code="llm_unavailable",
+            retryable=True,
+        )
+    return LLMClientError(
+        "模型调用失败，请稍后重试",
+        status_code=502,
+        trace_id=trace_id,
+        code="llm_request_failed",
+        retryable=True,
+    )
 
 
 class LLMClient:

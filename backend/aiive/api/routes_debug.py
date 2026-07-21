@@ -9,11 +9,12 @@ from fastapi import APIRouter, Depends, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
+from aiive.api.developer_security import redact_diagnostic_payload, require_local_developer
 from aiive.db.base import get_db
 from aiive.db.models import ContextSnapshot, Event, LLMCall
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/debug")
+router = APIRouter(prefix="/api/debug", dependencies=[Depends(require_local_developer)])
 
 
 @router.get("/events")
@@ -45,7 +46,7 @@ def list_events(
                 "trace_id": e.trace_id,
                 "thread_id": e.thread_id,
                 "event_type": e.event_type,
-                "payload": e.payload,
+                "payload": redact_diagnostic_payload(e.payload),
                 "created_at": e.created_at.isoformat(),
             }
             for e in events
@@ -81,8 +82,8 @@ def list_llm_calls(
                 "thread_id": c.thread_id,
                 "model": c.model,
                 "latency_ms": c.latency_ms,
-                "input_preview": c.input_preview,
-                "output_preview": c.output_preview,
+                "input_preview": redact_diagnostic_payload(c.input_preview),
+                "output_preview": redact_diagnostic_payload(c.output_preview),
                 "created_at": c.created_at.isoformat(),
             }
             for c in calls
@@ -135,13 +136,13 @@ def get_trace(trace_id: str, db: Session = Depends(get_db)):
             "thread_id": snapshot.thread_id,
             "snapshot": {
                 "stable_prefix_hash": snapshot.stable_prefix_hash,
-                "context_items": snapshot.context_items,
-                "meta": snapshot.meta,
+                "context_items": redact_diagnostic_payload(snapshot.context_items),
+                "meta": redact_diagnostic_payload(snapshot.meta),
             },
             "events": [
                 {
                     "event_type": e.event_type,
-                    "payload": e.payload,
+                    "payload": redact_diagnostic_payload(e.payload),
                     "created_at": e.created_at.isoformat(),
                 }
                 for e in events
@@ -149,8 +150,8 @@ def get_trace(trace_id: str, db: Session = Depends(get_db)):
             "llm_call": {
                 "model": llm_call.model,
                 "latency_ms": llm_call.latency_ms,
-                "input_preview": llm_call.input_preview,
-                "output_preview": llm_call.output_preview,
+                "input_preview": redact_diagnostic_payload(llm_call.input_preview),
+                "output_preview": redact_diagnostic_payload(llm_call.output_preview),
             } if llm_call else None,
         }
     except Exception:

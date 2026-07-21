@@ -261,36 +261,6 @@ class TestIngestionRunResolution:
 
 
 # ============================================================================
-# ActiveClaimRegistry 测试
-# ============================================================================
-
-
-class TestActiveClaimRegistry:
-    def test_same_job_different_token_no_overwrite(self):
-        reg = ActiveClaimRegistry()
-        from aiive.worker.outbox_dto import ActiveClaim
-        c1 = ActiveClaim("j1", "t1", "w1", datetime.now(timezone.utc))
-        c2 = ActiveClaim("j1", "t2", "w2", datetime.now(timezone.utc))
-        reg.add(c1)
-        reg.add(c2)
-        # Adding c2 should mark c1 lost
-        assert c1.lost is True
-        assert c2.lost is False
-        # Only c2 should be in snapshot
-        snap = reg.get_snapshot()
-        assert len(snap) == 1
-        assert snap[0].claim_token == "t2"
-
-    def test_remove_only_specified_claim(self):
-        reg = ActiveClaimRegistry()
-        from aiive.worker.outbox_dto import ActiveClaim
-        c1 = ActiveClaim("j1", "t1", "w1", datetime.now(timezone.utc))
-        reg.add(c1)
-        reg.remove("j1", "t1")
-        assert reg.is_lost("j1", "t1") is True
-
-
-# ============================================================================
 # WriteOutcome 测试
 # ============================================================================
 

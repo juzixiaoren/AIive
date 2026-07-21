@@ -3,7 +3,8 @@ API路由模块：知识库
 - 提供知识文件导入（ingest）接口
 - 提供知识块检索搜索接口
 """
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -31,6 +32,33 @@ def ingest(request: IngestRequest, db: Session = Depends(get_db)):
     """
     ingestor = KnowledgeIngestor(db)
     result = ingestor.ingest(request.file_path)
+    db.commit()
+    return result
+
+
+@router.get("/knowledge/{document_id}/source")
+def read_source(document_id: str, db: Session = Depends(get_db)):
+    """从对象存储读取经过哈希校验的知识原文。"""
+    from aiive.db.models import Document
+
+    document = db.get(Document, document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="知识文档不存在")
+    try:
+        content = KnowledgeIngestor(db).read_source(document_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return Response(content=content, media_type=document.mime_type)
+
+
+@router.post("/knowledge/{document_id}/reindex")
+def reindex(document_id: str, db: Session = Depends(get_db)):
+    """从持久原文重新生成知识文档分块。"""
+    try:
+        result = KnowledgeIngestor(db).reindex(document_id)
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     db.commit()
     return result
 

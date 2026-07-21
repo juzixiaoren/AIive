@@ -6,7 +6,6 @@ overridable per-process.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
 
 
 @dataclass
@@ -29,6 +28,7 @@ class RecallConfig:
     memory_tool_token_budget: int = 1000
 
     # --- Route / fusion ---
+    vector_top_k: int = 16
     route_timeout_ms: int = 500
     rrf_k: int = 60
     route_weights: dict[str, float] = field(default_factory=lambda: {
@@ -39,10 +39,6 @@ class RecallConfig:
         "importance": 0.05,
         "trust": 0.05,
     })
-
-    # --- Adapters (Qdrant / temporal KG not yet available) ---
-    vector_adapter_enabled: bool = False
-    temporal_graph_adapter_enabled: bool = False
 
     # --- Core projection refresh debounce ---
     core_projection_refresh_debounce_s: int = 5
@@ -135,12 +131,6 @@ class MaintenanceConfig:
     # --- 策略版本 ---
     policy_version: str = "phase4.v1"
 
-    def candidate_deadline(self, created_at: datetime) -> datetime:
-        """派生 candidate_due lane 的游标时间维（created_at + TTL）。"""
-        return created_at + timedelta(days=self.candidate_ttl_days)
-
-
-
 # ============================================================================
 # Phase 0.5B: Projection capability flags + Outbox allowlist
 # ============================================================================
@@ -148,11 +138,9 @@ class MaintenanceConfig:
 
 @dataclass
 class ProjectionCapabilities:
-    """Phase 0.5B 投影能力 flag。未启用时不创建对应 OutboxJob。"""
-    vector_projection_enabled: bool = False
+    """Phase 0.5B 已有生产消费者的可选投影能力开关。"""
     markdown_projection_enabled: bool = False
     cache_projection_enabled: bool = False
-    temporal_graph_projection_enabled: bool = False
 
 
 # 当前实际能力状态
@@ -166,6 +154,9 @@ def get_projection_capabilities() -> ProjectionCapabilities:
 ENABLED_OUTBOX_JOB_TYPES: frozenset[str] = frozenset({
     "memory_extraction",
     "core_memory_refresh",
+    "memory_vector_refresh",
+    # 提醒投递：到期任务必须由 Agent 生成真实回复
+    "reminder_delivery",
     # Phase 3: Segment sealing / Epoch rollover / Epoch checkpoint
     "segment_sealing",
     "epoch_rollover",
@@ -175,4 +166,14 @@ ENABLED_OUTBOX_JOB_TYPES: frozenset[str] = frozenset({
     # Phase 5: 统一检索索引刷新 / 全量重建
     "retrieval_index_refresh",
     "retrieval_index_rebuild",
+    # Phase 6A: Forget Saga
+    "forget_cascade",
+    "forget_rebuild_dependencies",
+    "forget_purge",
+    "forget_verify",
+    "forget_reconcile",
+    # Phase 6B: Retention Cleanup
+    "retention_cleanup",
+    # 持久化副作用工具统一执行
+    "tool_operation",
 })

@@ -156,9 +156,22 @@ class RawHistoryExpander:
         source_event_ids = set(summary.source_event_ids)
         events = self._load_events(db, [seg_id], limit)
 
+        # Phase 6A fail-closed：被 active Shield（含 all_user_data）或 Tombstone 屏蔽的
+        # 原始 Event 不得回源泄漏。
+        from aiive.forget.visibility_service import ForgetVisibilityService
+
+        blocked_events = ForgetVisibilityService.blocked_target_ids(
+            db, "event",
+            [(ev.id, getattr(ev, "created_at", None)) for ev in events],
+        )
+
         verified: list[Any] = []
         status = "verified"
         for ev in events:
+            if ev.id in blocked_events:
+                # 被忘来源 → 该 Segment 视为 degraded，且不返回该 raw 内容
+                status = "degraded"
+                continue
             # Event 必须属于命中 Summary 的来源集合
             if ev.id not in source_event_ids:
                 status = "degraded"

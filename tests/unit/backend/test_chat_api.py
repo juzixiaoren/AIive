@@ -13,6 +13,16 @@ from aiive.main import create_app
 from aiive.runtime.agent_graph import AgentGraph
 
 
+class FailingLLM:
+    """模拟 LangChain 调用阶段发生模型超时。"""
+
+    def bind_tools(self, tools):
+        return self
+
+    def invoke(self, messages, **kwargs):
+        raise TimeoutError("upstream secret timeout")
+
+
 class DeterministicLLM:
     """返回预设 AIMessage 的 Mock ChatOpenAI。"""
 
@@ -164,6 +174,8 @@ class TestChatAPI:
         assert data["reply"] == "API reply"
         assert data["thread_id"]
         assert data["trace_id"]
+        assert data["action_cards"] == []
+        assert data["pending_operations"] == []
 
     def test_post_chat_accepts_custom_thread_id(self, client):
         """POST /api/chat 应接受自定义 thread_id。"""
@@ -184,3 +196,19 @@ class TestChatAPI:
         """缺少 message 字段应被拒绝（422）。"""
         response = client.post("/api/chat", json={})
         assert response.status_code == 422
+
+    def test_post_chat_returns_structured_llm_timeout(self, client, monkeypatch):
+        """LangChain 超时应返回可重试且带 trace_id 的结构化错误。"""
+        monkeypatch.setattr(
+            "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
+            lambda self: FailingLLM(),
+        )
+
+        response = client.post("/api/chat", json={"message": "Hello"})
+
+        assert response.status_code == 504
+        detail = response.json()["detail"]
+        assert detail["code"] == "llm_timeout"
+        assert detail["retryable"] is True
+        assert detail["trace_id"]
+        assert "secret" not in detail["message"]

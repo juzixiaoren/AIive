@@ -5,6 +5,7 @@ Phase 1: 使用 ContextAssembler 保证有界上下文。
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json as _json
 import logging
@@ -21,9 +22,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
-from aiive.core.llm_client import LLMClient, default_llm_client
+from aiive.core.llm_client import LLMClient, LLMClientError, default_llm_client
 from aiive.db.base import SessionLocal
 from aiive.db.models import (
+    ApprovalRequest,
     ContextSnapshot,
     Epoch,
     Event,
@@ -34,7 +36,8 @@ from aiive.db.models import (
     TurnRecord,
 )
 from aiive.memory.extraction_policy import MemorySignalAction
-from aiive.runtime.agent_graph import AgentGraph, AgentGraphResult, _flatten_tool_result  # pyright: ignore[reportPrivateUsage]
+from aiive.runtime.action_cards import ChatResponse
+from aiive.runtime.agent_graph import AgentGraph, AgentGraphResult, flatten_tool_result
 from aiive.runtime.context_assembler import (
     AssembledContext,
     ContextAssembler,
@@ -47,6 +50,8 @@ from aiive.runtime.token_counter import LiteLLMTokenCounter
 from aiive.runtime.token_models import ModelProfile, TokenSafetyConfig
 from aiive.runtime.tool_normalizer import ToolResultNormalizer
 from aiive.runtime.working_state import WorkingStateService
+
+from functools import lru_cache
 
 LEASE_DURATION = timedelta(seconds=300)
 HEARTBEAT_INTERVAL = 60
@@ -159,18 +164,48 @@ class ContextBundle:
 # ============================================================================
 
 
+# 无状态共享组件缓存（卡点 4 方案 B）：
+#   token_counter / budget / profile / safety / normalizer 均为纯计算、
+#   不持有 per-request 状态，可跨请求复用，避免每次请求重建（尤其
+#   ContextBudget.from_env() 每次读环境变量）。按 model 名缓存以支持
+#   不同模型。WorkingStateService / EpochManager 仍每请求新建（见 __init__）。
+@lru_cache(maxsize=8)
+def _shared_budget() -> ContextBudget:
+    budget = ContextBudget.from_env()
+    budget.validate()
+    return budget
+
+
+_SHARED_SAFETY: TokenSafetyConfig = TokenSafetyConfig()
+
+
+@lru_cache(maxsize=8)
+def _shared_profile(model: str) -> ModelProfile:
+    return ModelProfile.from_config("deepseek", model)
+
+
+@lru_cache(maxsize=8)
+def _shared_token_counter(model: str) -> LiteLLMTokenCounter:
+    return LiteLLMTokenCounter(_SHARED_SAFETY, _shared_profile(model))
+
+
+@lru_cache(maxsize=8)
+def _shared_normalizer(model: str) -> ToolResultNormalizer:
+    return ToolResultNormalizer(_shared_token_counter(model), _shared_profile(model).full_name)
+
+
 class TurnExecutionService:
     """Unified Turn lifecycle (Phase 1: bounded context)."""
 
     def __init__(self, llm_client: LLMClient | None = None, source: str = "user_chat"):
         self._llm_client: LLMClient = llm_client or default_llm_client()
         self._source: str = source
-        self._profile: ModelProfile = ModelProfile.from_config("deepseek", self._llm_client.default_model)
-        self._safety: TokenSafetyConfig = TokenSafetyConfig()
-        self._token_counter: LiteLLMTokenCounter = LiteLLMTokenCounter(self._safety, self._profile)
-        self._budget: ContextBudget = ContextBudget.from_env()
-        self._budget.validate()
-        self._normalizer: ToolResultNormalizer = ToolResultNormalizer(self._token_counter, self._profile.full_name)
+        model = self._llm_client.default_model
+        self._profile: ModelProfile = _shared_profile(model)
+        self._safety: TokenSafetyConfig = _SHARED_SAFETY
+        self._token_counter: LiteLLMTokenCounter = _shared_token_counter(model)
+        self._budget: ContextBudget = _shared_budget()
+        self._normalizer: ToolResultNormalizer = _shared_normalizer(model)
         self._epoch_mgr: EpochManager = EpochManager()
         self._ws_service: WorkingStateService = WorkingStateService()
 
@@ -188,22 +223,170 @@ class TurnExecutionService:
         self, message: str, thread_id: str | None = None,
         turn_id: str | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
-        """流式执行 Turn：复用同一 ContextAssembler 有界上下文，产出 SSE 事件。"""
+        """流式执行 Turn：逐 token / tool_call / tool_result 产出 SSE 事件。
+
+        使用 LangGraph astream_events(v2) 实现 token 级真正流式传输，
+        替代伪流式（sync 跑完再一次性 yield done）。
+        """
+        # ── Phase 1: 抢占与上下文加载 ──
+        # 这些是同步阻塞调用（行锁、多次 DB 会话、上下文组装与 token 计数）。
+        # 若直接跑在事件循环线程上，会冻结整个 ASGI 事件循环（含 WS 通知通道），
+        # 导致并发请求被串行化。用 asyncio.to_thread 丢到线程池执行，立即让出
+        # 事件循环。每段内部各自新建并关闭 DB 会话，会话生命周期不跨线程，
+        # 满足 SQLAlchemy Session 的线程约束。
         try:
-            result = self._execute_turn_impl(message, thread_id, turn_id)
-        except ContextBudgetExceededError as e:
-            yield {"type": "error", "error": "context_budget_exceeded",
-                  "safe_tokens": e.safe_tokens, "context_window": e.context_window}
-            return
+            turn, execution_id = await asyncio.to_thread(
+                self._resolve_and_preempt, message, thread_id, turn_id,
+            )
         except TurnConflictError as e:
-            yield {"type": "error", "error": str(e)}
+            err_msg = str(e)
+            yield {"type": "error", "error": err_msg}
+            return
+
+        heartbeat = TurnHeartbeat(turn.id, execution_id)
+        heartbeat.start()
+
+        def _recover_orphaned() -> None:
+            recovery_db = SessionLocal()
+            try:
+                self._ws_service.recover_orphaned_tools(recovery_db, turn.thread_id)
+                recovery_db.commit()
+            finally:
+                recovery_db.close()
+
+        await asyncio.to_thread(_recover_orphaned)
+
+        trace_id = str(_uuid.uuid4())
+        try:
+            ctx_bundle = await asyncio.to_thread(self._load_context, message, turn, trace_id)
+        except ContextBudgetExceededError as e:
+            heartbeat.stop()
+            yield {"type": "error", "error": "context_budget_exceeded",
+                   "safe_tokens": e.safe_tokens, "context_window": e.context_window}
             return
         except Exception:
-            logger.exception("流式 Turn 执行失败")
+            heartbeat.stop()
+            logger.exception("流式 Turn 上下文加载失败: thread_id=%s", thread_id)
             yield {"type": "error", "error": "internal_error"}
             return
 
-        yield {"type": "done", **result}
+        # ── Phase 2: 流式图执行 ──
+        graph_db = SessionLocal()
+        try:
+            graph = AgentGraph(self._llm_client, graph_db)
+            ag_result: AgentGraphResult | None = None
+
+            async for event in graph._execute_graph_stream(  # pyright: ignore[reportPrivateUsage]
+                message=message, thread_id=turn.thread_id,
+                turn_id=turn.turn_id, turn_record_id=turn.id, ctx_bundle=ctx_bundle,
+                execution_id=execution_id, trace_id=trace_id,
+            ):
+                if event.get("type") == "__graph_result__":
+                    ag_result = event["result"]
+                else:
+                    yield event
+        except LLMClientError as error:
+            heartbeat.stop()
+            failed_db = SessionLocal()
+            try:
+                self._mark_interrupted(failed_db, turn.id, execution_id)
+                failed_db.commit()
+            finally:
+                failed_db.close()
+            yield {"type": "error", "error": error.code, "message": str(error),
+                   "retryable": error.retryable, "trace_id": error.trace_id,
+                   "retry_after_seconds": error.retry_after_seconds,
+                   "_status": error.status_code or 503}
+            return
+        finally:
+            graph_db.close()
+
+        if ag_result is None:
+            heartbeat.stop()
+            yield {"type": "error", "error": "internal_error"}
+            return
+
+        # LLM 返回空回复且未执行任何工具 → 异常空响应
+        if not ag_result.reply and not ag_result.tool_records:
+            logger.error(
+                "[TurnExecution] LLM 空响应（无回复且无工具调用）: "
+                + "trace_id=%s thread_id=%s message=%s",
+                ag_result.trace_id, turn.thread_id, message[:100],
+            )
+            ag_result.reply = "抱歉，模型返回了空响应。请重试或检查 API 配置。"
+            response = self._finalize_turn(turn, execution_id, ag_result, heartbeat, assembled_ctx=None)
+            response["error"] = "empty_llm_response"
+            yield {"type": "done", **response}
+            return
+
+        # ── Phase 3: 记忆抽取 ──
+        # 同步抽取发生在 finalize 之前，需提前确定 assistant 回复事件的真实
+        # Event.id，与 finalize 中持久化的 llm_response 事件共用同一 ID，
+        # 从而保证记忆的 source_event_ids 指向真实事件（而非 trace_id 兜底）。
+        sync_assistant_event_id: str | None = None
+        if ag_result.memory_signal.action == MemorySignalAction.EXTRACT_SYNC.value:
+            try:
+                from aiive.memory.memory_extractor import UnifiedMemoryExtractor
+                from aiive.memory.memory_write_service import MemoryWriteService
+                from aiive.context.run_context import RunContext
+                sync_assistant_event_id = str(_uuid.uuid4())
+                source_event_ids = [
+                    eid for eid in (turn.request_event_id, sync_assistant_event_id)
+                    if eid
+                ]
+                extractor = UnifiedMemoryExtractor(self._llm_client)
+                sync_proposals = extractor.extract(
+                    user_message=message, reply=ag_result.reply,
+                    trace_id=ag_result.trace_id, thread_id=turn.thread_id,
+                    source_event_ids=source_event_ids,
+                    assistant_event_ids=[sync_assistant_event_id],
+                )
+                if sync_proposals:
+                    writer_db = SessionLocal()
+                    try:
+                        writer = MemoryWriteService(writer_db)
+                        for proposal in sync_proposals:
+                            proposal.source_turn_id = turn.turn_id
+                            run_ctx = RunContext(
+                                thread_id=turn.thread_id, trace_id=ag_result.trace_id,
+                                source="sync_extract", turn_id=turn.turn_id,
+                                source_event_ids=source_event_ids,
+                            )
+                            writer.write(proposal, run_context=run_ctx)
+                        writer_db.commit()
+                    finally:
+                        writer_db.close()
+            except Exception:
+                logger.exception("Sync memory extraction failed (non-fatal)")
+
+        # ── Phase 4: Finalize ──
+        try:
+            assembled_ctx = ctx_bundle.assembled_ctx if ctx_bundle else None
+            response = self._finalize_turn(
+                turn, execution_id, ag_result, heartbeat, assembled_ctx,
+                assistant_event_id=sync_assistant_event_id,
+            )
+        except FencingViolationError:
+            heartbeat.stop()
+            yield {"type": "error", "error": "lease_lost"}
+            return
+        except Exception:
+            heartbeat.stop()
+            db = None
+            try:
+                db = SessionLocal()
+                self._mark_interrupted(db, turn.id, execution_id)
+                db.commit()
+            except Exception:
+                pass
+            finally:
+                if db is not None:
+                    db.close()
+            raise
+        finally:
+            heartbeat.stop()
+
+        yield {"type": "done", **response}
 
     # =====================================================================
     # Phase 1: Resolve, preempt, attribute epoch/segment
@@ -369,24 +552,37 @@ class TurnExecutionService:
         self, turn: TurnRecord, execution_id: str,
         ag_result: AgentGraphResult, heartbeat: TurnHeartbeat,
         assembled_ctx: AssembledContext | None = None,
+        assistant_event_id: str | None = None,
     ) -> dict[str, Any]:
         if heartbeat.lease_lost:
             raise FencingViolationError("lease lost")
 
+        # 同步抽取路径会提前生成 assistant 回复事件的真实 Event.id 并传入，
+        # 以保证记忆 provenance 与 finalize 持久化事件一致；其余路径在此生成。
+        if not assistant_event_id:
+            assistant_event_id = str(_uuid.uuid4())
+
         db = SessionLocal()
         try:
             now = datetime.now(timezone.utc)
-            response_dict = {
-                "reply": ag_result.reply, "thread_id": turn.thread_id,
-                "trace_id": ag_result.trace_id, "action_cards": ag_result.action_cards,
-                "intent_type": "plain_chat",
-                "tool_calls": [{"name": r.name, "params": r.params, "status": r.status} for r in ag_result.tool_records],
-                "tool_results": [
-                    {"name": r.name, "params": r.params, "result": _flatten_tool_result(r.result), "status": r.status}
-                    for r in ag_result.tool_records if r.status in ("completed", "failed")
+            response_dict = ChatResponse(
+                reply=ag_result.reply,
+                thread_id=turn.thread_id,
+                trace_id=ag_result.trace_id,
+                action_cards=ag_result.action_cards,
+                pending_operations=ag_result.pending_operations,
+                tool_calls=[
+                    {"tool_call_id": r.tool_call_id, "batch_index": r.batch_index, "order_index": r.order_index,
+                     "name": r.name, "params": r.params, "status": r.status}
+                    for r in ag_result.tool_records
                 ],
-                "parse_errors": [],
-            }
+                tool_results=[
+                    {"tool_call_id": r.tool_call_id, "batch_index": r.batch_index, "order_index": r.order_index,
+                     "name": r.name, "params": r.params, "result": flatten_tool_result(r.result), "status": r.status}
+                    for r in ag_result.tool_records if r.status in ("completed", "failed", "execution_unknown")
+                ],
+                parse_errors=[],
+            ).model_dump(mode="json", exclude_none=True)
 
             affected = db.query(TurnRecord).filter(
                 TurnRecord.id == turn.id,
@@ -404,9 +600,10 @@ class TurnExecutionService:
                 db.rollback()
                 raise FencingViolationError("fencing violation")
 
-            # Events (unchanged from 0.5A)
+            # Events：pending_approval 工具不写入 tool_call/tool_result，等待审批后补充
             idx = 1
-            for r in ag_result.tool_records:
+            executed_records = [r for r in ag_result.tool_records if r.status != "pending_approval"]
+            for r in executed_records:
                 db.add(Event(id=str(_uuid.uuid4()), trace_id=ag_result.trace_id, thread_id=turn.thread_id,
                              event_type="tool_call", turn_id=turn.turn_id, turn_event_index=idx,
                              payload={"name": r.name, "params": r.params, "tool_call_id": r.tool_call_id, "batch_index": r.batch_index}))
@@ -415,14 +612,43 @@ class TurnExecutionService:
                              event_type="tool_result", turn_id=turn.turn_id, turn_event_index=idx,
                              payload={"name": r.name, "result": r.result, "status": r.status, "tool_call_id": r.tool_call_id, "batch_index": r.batch_index}))
                 idx += 1
-            assistant_event_id = str(_uuid.uuid4())
             db.add(Event(id=assistant_event_id, trace_id=ag_result.trace_id, thread_id=turn.thread_id,
                          event_type="llm_response", turn_id=turn.turn_id, turn_event_index=idx,
-                         payload={"content": ag_result.reply, "action_cards": ag_result.action_cards}))
+                         payload={"content": ag_result.reply,
+                                  "action_cards": response_dict["action_cards"],
+                                  "pending_operations": response_dict["pending_operations"]}))
             idx += 1
+
+            for approval in ag_result.pending_approvals:
+                approval_id = str(approval.get("approval_id", "") or "")
+                tool_call_id = str(approval.get("id", "") or "")
+                tool_name = str(approval.get("name", "") or "")
+                tool_args = approval.get("args", {}) if isinstance(approval.get("args"), dict) else {}
+                if not approval_id or not tool_call_id or not tool_name:
+                    raise ValueError("待审批工具缺少稳定标识")
+                db.add(ApprovalRequest(
+                    id=approval_id,
+                    thread_id=turn.thread_id,
+                    turn_record_id=turn.id,
+                    turn_id=turn.turn_id,
+                    trace_id=ag_result.trace_id,
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                    tool_args=tool_args,
+                    tool_args_hash=str(approval.get("tool_args_hash", "") or ""),
+                    descriptor_hash=str(approval.get("descriptor_hash", "") or ""),
+                    risk_snapshot=approval.get("risk_snapshot", {}) if isinstance(approval.get("risk_snapshot"), dict) else {},
+                    status="pending",
+                ))
+                self._ws_service.add_pending_approval(
+                    db, turn.thread_id, approval_id, f"confirm:{tool_name}",
+                )
+
+            # 审批中工具计入 pending_approvals 数量
+            pending_count = sum(1 for r in ag_result.tool_records if r.status == "pending_approval")
             db.add(Event(id=str(_uuid.uuid4()), trace_id=ag_result.trace_id, thread_id=turn.thread_id,
                          event_type="chat_ended", turn_id=turn.turn_id, turn_event_index=idx,
-                         payload={"tool_calls": len(ag_result.tool_records), "tool_succeeded": sum(1 for r in ag_result.tool_records if r.status == "completed"), "tool_failed": sum(1 for r in ag_result.tool_records if r.status == "failed"), "parse_errors": 0}))
+                         payload={"tool_calls": len(ag_result.tool_records), "tool_succeeded": sum(1 for r in ag_result.tool_records if r.status == "completed"), "tool_failed": sum(1 for r in ag_result.tool_records if r.status == "failed"), "pending_approvals": pending_count, "parse_errors": 0}))
 
             # ContextSnapshot with Phase 1 rotation
             self._rotate_snapshot(db, turn, ag_result, assembled_ctx)
@@ -460,6 +686,9 @@ class TurnExecutionService:
                             turn.request_event_id,    # 用户消息真实 Event.id
                             assistant_event_id,        # Assistant 回复真实 Event.id
                         ],
+                        # 显式标注 assistant 回复事件，供 worker 区分 source_type
+                        # （标为 llm_reply）；旧任务缺此字段时 worker 用 .get() 兼容。
+                        "assistant_event_id": assistant_event_id,
                     },
                     trace_id=ag_result.trace_id, max_retries=3,
                 ))
@@ -492,7 +721,11 @@ class TurnExecutionService:
             thread_id=turn.thread_id,
             stable_prefix_hash=ag_result.context_snapshot_meta.get("stable_prefix_hash", ""),
             context_items=ag_result.context_snapshot_meta.get("context_items", []),
-            meta={"total_tool_calls": len(ag_result.tool_records)},
+            meta={
+                "total_tool_calls": len(ag_result.tool_records),
+                "full_contents": ag_result.context_snapshot_meta.get("full_contents", {}),
+                "injected_memory_ids": ag_result.context_snapshot_meta.get("injected_memory_ids", []),
+            },
             epoch_id=turn.epoch_id,
             segment_id=turn.segment_id,
             turn_sequence=seq,
@@ -572,7 +805,8 @@ class TurnExecutionService:
 
         try:
             # Phase 2: Context assembly (via ContextAssembler)
-            ctx_bundle = self._load_context(message, turn)
+            trace_id = str(_uuid.uuid4())
+            ctx_bundle = self._load_context(message, turn, trace_id)
 
             # Phase 3: AgentGraph execution
             graph_db = SessionLocal()
@@ -580,22 +814,51 @@ class TurnExecutionService:
                 graph = AgentGraph(self._llm_client, graph_db)
                 ag_result = graph._execute_graph(  # pyright: ignore[reportPrivateUsage]
                     message=message, thread_id=turn.thread_id,
-                    turn_id=turn.turn_id, ctx_bundle=ctx_bundle,
-                    execution_id=execution_id,
+                    turn_id=turn.turn_id, turn_record_id=turn.id, ctx_bundle=ctx_bundle,
+                    execution_id=execution_id, trace_id=trace_id,
                 )
             finally:
                 graph_db.close()
 
+            # LLM 返回空回复且未执行任何工具 → 异常空响应，向用户明确提示，
+            # 同时标记 turn 为 completed 避免阻塞后续消息。
+            if not ag_result.reply and not ag_result.tool_records:
+                logger.error(
+                    "[TurnExecution] LLM 空响应（无回复且无工具调用）: "
+                    + "trace_id=%s thread_id=%s message=%s",
+                    ag_result.trace_id, turn.thread_id, message[:100],
+                )
+                # 仍然走 finalize 路径以标记 turn 为 completed（避免卡住后续 turn），
+                # 但注入一条用户可见的错误回复。
+                ag_result.reply = (
+                    "抱歉，模型返回了空响应。请重试或检查 API 配置。"
+                )
+                response = self._finalize_turn(turn, execution_id, ag_result, heartbeat, assembled_ctx=None)
+                # 在最终响应中附加错误字段，便于前端展示
+                response["error"] = "empty_llm_response"
+                return response
+
             # Phase 4: Memory extraction (outside transaction)
+            # 同步抽取发生在 finalize 之前，需提前确定 assistant 回复事件的真实
+            # Event.id，与 finalize 中持久化的 llm_response 事件共用同一 ID，
+            # 从而保证记忆的 source_event_ids 指向真实事件（而非 trace_id 兜底）。
+            sync_assistant_event_id: str | None = None
             if ag_result.memory_signal.action == MemorySignalAction.EXTRACT_SYNC.value:
                 try:
                     from aiive.memory.memory_extractor import UnifiedMemoryExtractor
                     from aiive.memory.memory_write_service import MemoryWriteService
                     from aiive.context.run_context import RunContext
+                    sync_assistant_event_id = str(_uuid.uuid4())
+                    source_event_ids = [
+                        eid for eid in (turn.request_event_id, sync_assistant_event_id)
+                        if eid
+                    ]
                     extractor = UnifiedMemoryExtractor(self._llm_client)
                     sync_proposals = extractor.extract(
                         user_message=message, reply=ag_result.reply,
                         trace_id=ag_result.trace_id, thread_id=turn.thread_id,
+                        source_event_ids=source_event_ids,
+                        assistant_event_ids=[sync_assistant_event_id],
                     )
                     if sync_proposals:
                         writer_db = SessionLocal()
@@ -603,7 +866,11 @@ class TurnExecutionService:
                             writer = MemoryWriteService(writer_db)
                             for proposal in sync_proposals:
                                 proposal.source_turn_id = turn.turn_id
-                                run_ctx = RunContext(thread_id=turn.thread_id, trace_id=ag_result.trace_id, source="sync_extract", turn_id=turn.turn_id)
+                                run_ctx = RunContext(
+                                    thread_id=turn.thread_id, trace_id=ag_result.trace_id,
+                                    source="sync_extract", turn_id=turn.turn_id,
+                                    source_event_ids=source_event_ids,
+                                )
                                 writer.write(proposal, run_context=run_ctx)
                             writer_db.commit()
                         finally:
@@ -613,7 +880,10 @@ class TurnExecutionService:
 
             # Phase 5: Finalize
             assembled_ctx = ctx_bundle.assembled_ctx if ctx_bundle else None
-            response = self._finalize_turn(turn, execution_id, ag_result, heartbeat, assembled_ctx)
+            response = self._finalize_turn(
+                turn, execution_id, ag_result, heartbeat, assembled_ctx,
+                assistant_event_id=sync_assistant_event_id,
+            )
             return response
 
         except ContextBudgetExceededError as e:
@@ -642,7 +912,9 @@ class TurnExecutionService:
     # Phase 2: Context loading via ContextAssembler
     # =====================================================================
 
-    def _load_context(self, message: str, turn: TurnRecord) -> ContextBundle:
+    def _load_context(
+        self, message: str, turn: TurnRecord, trace_id: str | None = None,
+    ) -> ContextBundle:
         db = SessionLocal()
         try:
             thread = db.get(Thread, turn.thread_id)
@@ -664,7 +936,9 @@ class TurnExecutionService:
                 thread=thread,
                 _source=self._source,
                 upper_bound_sequence=(turn.turn_sequence or 1) - 1,
+                trace_id=trace_id,
             )
+            db.commit()
 
             ag_ctx = assembled.agent_ctx
             return ContextBundle(

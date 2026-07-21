@@ -38,6 +38,8 @@ from aiive.api.routes_notifications import router as notifications_router
 from aiive.api.routes_threads import router as threads_router
 from aiive.api.routes_epochs import router as epochs_router
 from aiive.api.routes_ws import router as ws_router
+from aiive.api.routes_forget import router as forget_router
+from aiive.api.routes_approval import router as approval_router
 
 logger = logging.getLogger(__name__)
 
@@ -79,25 +81,33 @@ def _ensure_retrieval_generation():
 
 
 def _ensure_schema():
-    """确保数据库 schema 完整性：创建缺失的表，执行必要的增量变更。"""
-    from aiive.db.base import create_all
+    """确保数据库 schema 完整性：以 Alembic 迁移为唯一真相源。
+
+    启动时执行 `alembic upgrade head`，将数据库 schema 推进到最新版本。
+    不再使用 create_all() + 手工 ALTER 的双轨机制（会与 Alembic 迁移历史漂移）。
+    schema 的任何变更都必须通过新增 Alembic 迁移脚本完成。
+    """
+    from pathlib import Path
+
+    from alembic import command
+    from alembic.config import Config
+
+    # alembic.ini 位于仓库根目录（backend 的上一级）
+    ini_path = Path(__file__).resolve().parent.parent.parent / "alembic.ini"
+    if not ini_path.exists():
+        logger.error("未找到 alembic.ini（预期路径 %s），跳过 schema 迁移", ini_path)
+        raise RuntimeError(f"alembic.ini not found at {ini_path}")
+
+    alembic_cfg = Config(str(ini_path))
+    # 用运行时配置的数据库 URL 覆盖 ini 中的默认值，保证与应用连接一致
+    from aiive.config import settings
+    alembic_cfg.set_main_option("sqlalchemy.url", settings.database_url)
 
     try:
-        create_all()
+        command.upgrade(alembic_cfg, "head")
     except Exception:
-        logger.exception("数据库表初始化失败")
+        logger.exception("Alembic 迁移执行失败")
         raise
-
-    # 增量迁移：为已有数据库补齐缺失列
-    from aiive.db.base import engine
-    from sqlalchemy import text
-    with engine.connect() as conn:
-        try:
-            conn.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS thread_id VARCHAR(36)"))
-            conn.commit()
-        except Exception:
-            logger.warning("执行 schema 变更失败，将跳过（可能已存在或为非致命错误）", exc_info=True)
-            conn.rollback()
 
 
 def create_app() -> FastAPI:
@@ -130,6 +140,13 @@ def create_app() -> FastAPI:
         except Exception:
             logger.exception("数据库 schema 检查失败")
         try:
+            from aiive.config import settings
+            from aiive.forget.fingerprint import configure_hmac_secret
+            configure_hmac_secret(settings.forget_hmac_secret, settings.forget_hmac_key_version)
+            logger.info("HMAC 指纹密钥已初始化 (key_version=%d)", settings.forget_hmac_key_version)
+        except Exception:
+            logger.exception("HMAC 密钥初始化失败")
+        try:
             _ensure_system_thread()
         except Exception:
             logger.exception("系统线程初始化失败")
@@ -147,6 +164,16 @@ def create_app() -> FastAPI:
             ContextBudget.default().validate()
         except Exception:
             logger.exception("ContextBudget 启动校验失败")
+        from aiive.config import settings
+        if settings.aiive_memory_vector_enabled:
+            from aiive.db.base import SessionLocal
+            from aiive.memory.vector_projection import validate_vector_runtime
+
+            vector_db = SessionLocal()
+            try:
+                validate_vector_runtime(vector_db)
+            finally:
+                vector_db.close()
         try:
             start_daemon()
         except Exception:
@@ -240,6 +267,8 @@ def create_app() -> FastAPI:
     app.include_router(threads_router)
     app.include_router(epochs_router)
     app.include_router(ws_router)
+    app.include_router(forget_router)
+    app.include_router(approval_router)
     return app
 
 

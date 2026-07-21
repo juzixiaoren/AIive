@@ -1,16 +1,7 @@
-"""
-后台调度器：基于 APScheduler 精确调度 + 并行投递到期任务。
-
-架构：
-- APScheduler BackgroundScheduler 替代 while/sleep 循环
-- 每轮查询最早到期时间，精确 schedule 到该时刻（消除盲等）
-- 多个同时到期提醒通过 ThreadPoolExecutor 并行投递
-- 每个提醒使用独立 DB 会话，线程安全
-"""
+"""后台调度器：使用 APScheduler 扫描任务并调度 Outbox 消费。"""
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -34,14 +25,12 @@ from aiive.db.models import (
 from aiive.memory.recall_config import MaintenanceConfig, RecallConfig
 from aiive.runtime.epoch_manager import EpochManager
 from aiive.runtime.task_manager import TaskManager
-from aiive.runtime.thread_bootstrap import ThreadBootstrapService
-from aiive.worker.task_worker import _wake_agent_for_reminder  # pyright: ignore[reportPrivateUsage]
+from aiive.worker.task_worker import enqueue_due_tasks
 
 logger = logging.getLogger(__name__)
 
 scheduler = BackgroundScheduler(daemon=True)
 _started = False
-_MAX_WORKERS = 5
 _MAX_POLL_INTERVAL = 60
 
 # Phase 0.5B: OutboxWorker 周期 poll 调度
@@ -51,6 +40,8 @@ _OUTBOX_INITIAL_DELAY = 3       # 秒：启动后首次 poll 延迟
 
 # Phase 3: Idle Scanner + Enqueue Reconciler
 _IDLE_SCAN_INTERVAL = 30        # 秒：idle 扫描周期
+# Phase 6B
+_RETENTION_INTERVAL = 3600     # 秒：retention 扫描周期（每小时一次）
 _RECONCILE_INTERVAL = 60        # 秒：补发缺失 Job 周期
 _MAX_SCAN_BATCH = 10
 
@@ -60,70 +51,26 @@ _MAINTENANCE_SCOPE_KEY = "all_user_memories"
 
 
 def _poll_job():
-    """单次轮询：批量标记到期任务 + 并行投递 + 自调度下一次。"""
+    """单次轮询：原子入队到期任务并自调度下一次扫描。"""
     db = SessionLocal()
-    wake_tasks: list[tuple[str, str, str, str]] = []
     try:
-        mgr = TaskManager(db)
         now = datetime.now(timezone.utc)
-        due = mgr.get_due(now)
-
-        for task in due:
-            result = mgr.check_now(task.id)
-            if result.get("action") != "notify":
-                continue
-
-            tid = task.thread_id or "system"
-            try:
-                ThreadBootstrapService.ensure_committed_thread(tid)
-            except ValueError:
-                logger.warning(
-                    "目标线程不存在，跳过提醒: task_id=%s target_thread=%s",
-                    task.id, tid,
-                )
-                continue
-
-            # event_type="reminder_triggered" 由 task_worker 在真正投递时写入，
-            # 此处只负责协调调度，不写重复事件。
-            # 传递基本值而非 ORM 对象，避免 session 关闭后 DetachedInstanceError
-            wake_tasks.append((task.id, task.title, task.task_type, tid))
-
+        enqueue_due_tasks(db, now)
         db.commit()
 
-        # 计算下次轮询时间：精确到最早到期任务
+        mgr = TaskManager(db)
         next_due = mgr.next_due_at()
         if next_due and next_due > now:
             delay = max(1, min(_MAX_POLL_INTERVAL, (next_due - now).total_seconds()))
         else:
             delay = _MAX_POLL_INTERVAL
     except Exception:
+        db.rollback()
         logger.exception("轮询检查异常，60s 后重试")
         delay = 60
     finally:
         db.close()
 
-    # 并行投递（每个提醒使用独立 DB 会话 + LLM）
-    if wake_tasks:
-        if len(wake_tasks) == 1:
-            tid_val, title, task_type, target = wake_tasks[0]
-            try:
-                _wake_agent_for_reminder(tid_val, title, task_type, target)
-            except Exception:
-                logger.exception("提醒投递异常: task_id=%s", tid_val)
-        else:
-            with ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, len(wake_tasks))) as pool:
-                futures = {
-                    pool.submit(_wake_agent_for_reminder, tid_val, title, task_type, target): (tid_val,)
-                    for tid_val, title, task_type, target in wake_tasks
-                }
-                for f in as_completed(futures):
-                    tid_val = futures[f][0]
-                    try:
-                        f.result(timeout=120)
-                    except Exception:
-                        logger.exception("提醒并行投递异常: task_id=%s", tid_val)
-
-    # 自调度下一次
     scheduler.add_job(
         _poll_job,
         DateTrigger(run_date=datetime.now(timezone.utc) + timedelta(seconds=delay)),
@@ -164,6 +111,12 @@ def start_daemon():
     scheduler.add_job(
         _maintenance_scanner_job, IntervalTrigger(seconds=_MAINTENANCE_SCAN_INTERVAL),
         id="phase4_maintenance_scanner", replace_existing=True,
+    )
+
+    # Phase 6B: 保留清理扫描器
+    scheduler.add_job(
+        _retention_scanner_job, IntervalTrigger(seconds=_RETENTION_INTERVAL),
+        id="phase6b_retention_scanner", replace_existing=True,
     )
 
 
@@ -409,6 +362,83 @@ def enqueue_maintenance_job(
             status="pending", payload={"schema_version": 1}, max_retries=3,
         ))
     return op_id
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 6B: Retention Cleanup 入队
+# ═══════════════════════════════════════════════════════════════════
+
+_RETENTION_POLICY_VERSION = 1
+
+
+def enqueue_retention_job(
+    db: Session,
+    window_bucket: str | None = None,
+    now: datetime | None = None,
+) -> str | None:
+    """入队一个 `retention_cleanup` OutboxJob。
+
+    operation_id = `retention:all:{policy_version}:{window_bucket}`
+    UNIQUE 保证同窗口幂等。
+    """
+    now = now or datetime.now(timezone.utc)
+    window_bucket = window_bucket or now.strftime("%Y-%m-%d")
+    op_id = f"retention:all:{_RETENTION_POLICY_VERSION}:{window_bucket}"
+
+    exists = db.query(OutboxJob).filter(
+        OutboxJob.operation_id == op_id,
+        OutboxJob.status.in_(["pending", "running"]),
+    ).count()
+    if exists > 0:
+        return op_id
+
+    if _outbox_worker is not None:
+        try:
+            _outbox_worker.enqueue(
+                db, "retention_cleanup",
+                {"schema_version": 1, "operation_id": op_id},
+                operation_id=op_id,
+            )
+        except ValueError:
+            logger.warning("retention_cleanup enqueue 不在 allowlist，跳过")
+            return None
+    else:
+        db.add(OutboxJob(
+            operation_id=op_id, job_type="retention_cleanup",
+            status="pending", payload={
+                "schema_version": 1, "operation_id": op_id,
+            }, max_retries=3,
+        ))
+    return op_id
+
+
+def _retention_scanner_job() -> None:
+    """Phase 6B：定期检查是否需要入队 retention_cleanup 作业。"""
+    db: Session | None = None
+    try:
+        db = SessionLocal()
+        now = datetime.now(timezone.utc)
+        bucket = now.strftime("%Y-%m-%d")
+
+        # 检查今天是否已有运行中/待处理的 job
+        op_id = f"retention:all:{_RETENTION_POLICY_VERSION}:{bucket}"
+        existing = db.query(OutboxJob).filter(
+            OutboxJob.operation_id == op_id,
+        ).count()
+        if existing > 0:
+            db.close()
+            return
+
+        enqueue_retention_job(db, window_bucket=bucket, now=now)
+        db.commit()
+    except Exception:
+        logger.exception("retention_scanner 异常")
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
 
 
 def _has_dirty_memory(db: Session, cfg: MaintenanceConfig, now: datetime) -> bool:

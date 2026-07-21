@@ -513,7 +513,7 @@ def test_memory_item_to_hit_carries_memory_type(db):
         scope_type="global",
         relevance_score=0.9,
         record_version=3,
-        route="fts",
+        route="lexical",
         fused_score=0.9,
     )
     hit = UnifiedRetriever.memory_item_to_hit(item)
@@ -1435,5 +1435,50 @@ def test_dedup_budget_stable_tie_breaker():
     # 预算截断（max_results=1）按 tie-breaker 取较小 source_id，结果确定
     out1 = ur._dedup_and_budget([b, a], max_results=1, token_budget=None)
     assert [h.source_id for h in out1] == ["a"]
+
+
+def test_rebuild_failure_attempt_count_increments(db):
+    """failure_attempt_count 在真正失败落地时累计（_mark_run_failed 每次调用 +1）。
+
+    CONTINUE 分页不调用 _mark_run_failed，故不计入；仅真正失败重试一次累计一次。
+    """
+    import uuid as _uuid
+    from aiive.retrieval.index_rebuild import _mark_run_failed
+
+    oj_id = str(_uuid.uuid4())
+    run_id = str(_uuid.uuid4())
+    token = "claim_tok_fail"
+    db.add(OutboxJob(
+        id=oj_id, operation_id=f"rebuild:fail:{_uuid.uuid4().hex[:8]}",
+        job_type="retrieval_index_rebuild", status="pending",
+        payload={}, trace_id="t1",
+    ))
+    db.add(RetrievalIndexRun(
+        id=run_id, outbox_job_id=oj_id,
+        operation_id=f"rebuild:failrun:{_uuid.uuid4().hex[:8]}",
+        status="running", execution_token=token, index_version=0,
+        batch_cursor={"source_type": "memory_record", "last_id": None},
+    ))
+    db.commit()
+    db.expire_all()
+
+    # 第一次真正失败落地：failure_attempt_count 应累计到 1
+    _mark_run_failed(run_id, token, "phase_b_boom")
+    db.expire_all()
+    run = db.get(RetrievalIndexRun, run_id)
+    assert run.status == "failed"
+    assert run.failure_attempt_count == 1
+    assert run.error_message == "phase_b_boom"
+
+    # 模拟重试接管后再次失败：恢复 running + 同 token，再 mark failed 累计到 2
+    run.status = "running"
+    run.execution_token = token
+    db.commit()
+    db.expire_all()
+    _mark_run_failed(run_id, token, "phase_b_boom_2")
+    db.expire_all()
+    run = db.get(RetrievalIndexRun, run_id)
+    assert run.status == "failed"
+    assert run.failure_attempt_count == 2
 
 

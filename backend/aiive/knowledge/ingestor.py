@@ -1,144 +1,141 @@
-"""
-知识库文档摄取模块。
+"""知识文档摄取、持久原文读取和重新索引模块。"""
 
-负责将文件读取、去重、分块后存入数据库，支持 markdown、代码和纯文本三种类型。
-同时提供基于关键词的文本检索能力。
-"""
-
-import hashlib
 import logging
+import mimetypes
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy.orm import Session
 
-from aiive.db.models import Document, Chunk
+from aiive.db.models import Chunk, Document
 from aiive.knowledge.chunker import chunk_text
-from typing import Any
+from aiive.storage.object_store import ObjectRef, get_verified, put_content_addressed
 
 logger = logging.getLogger(__name__)
+KNOWLEDGE_BUCKET = "knowledge-documents"
 
 
 class KnowledgeIngestor:
-    """知识库文档摄取器，负责将文件导入知识库。"""
+    """知识文档摄取器和持久原文访问入口。"""
 
     def __init__(self, db: Session):
-        """
-        初始化摄取器。
+        """绑定当前数据库事务。"""
+        self._db = db
 
-        参数:
-            db: SQLAlchemy 数据库会话。
-        """
-        self._db: Session = db
+    @staticmethod
+    def _document_type(path: Path) -> str:
+        """根据来源后缀推断文档类型。"""
+        suffix = path.suffix.lower()
+        if suffix in (".md", ".markdown"):
+            return "markdown"
+        if suffix in (".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs"):
+            return "code"
+        return "text"
+
+    def _replace_chunks(self, document: Document, content: str) -> int:
+        """在当前事务中用持久原文重建全部分块。"""
+        self._db.query(Chunk).filter(Chunk.document_id == document.id).delete(
+            synchronize_session=False
+        )
+        chunks = chunk_text(content)
+        for item in chunks:
+            self._db.add(Chunk(
+                document_id=document.id,
+                content=item["content"],
+                line_start=item["line_start"],
+                line_end=item["line_end"],
+                chunk_index=item["chunk_index"],
+                token_estimate=max(1, len(item["content"]) // 4),
+            ))
+        self._db.flush()
+        return len(chunks)
 
     def ingest(self, file_path: str) -> dict[str, Any]:
-        """
-        摄取单个文件：读取、去重、分块、入库。
-
-        参数:
-            file_path: 待摄取的文件路径。
-
-        返回:
-            包含 ok、document_id、chunks 等字段的结果字典。
-            如果文件已存在（基于内容哈希去重），返回 duplicate=True。
-        """
+        """持久化文件原文，并创建或复用文档及分块记录。"""
         path = Path(file_path)
-        if not path.exists():
-            return {"ok": False, "error": "File not found", "path": file_path}
-
+        if not path.is_file():
+            return {"ok": False, "error": "文件不存在", "path": file_path}
         try:
-            content = path.read_text(encoding="utf-8", errors="replace")
-            content_hash = hashlib.sha256(content.encode()).hexdigest()
-
-            # 基于内容哈希去重
-            existing = (
-                self._db.query(Document)
-                .filter(Document.content_hash == content_hash)
-                .first()
+            data = path.read_bytes()
+            mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            ref, content_hash = put_content_addressed(
+                KNOWLEDGE_BUCKET, data, {"mime_type": mime_type, "source_name": path.name}
             )
+            existing = self._db.query(Document).filter(
+                Document.content_hash == content_hash
+            ).first()
             if existing:
-                chunks = (
-                    self._db.query(Chunk)
-                    .filter(Chunk.document_id == existing.id)
-                    .order_by(Chunk.chunk_index)
-                    .all()
-                )
+                if not existing.object_bucket or not existing.object_key:
+                    existing.object_bucket = ref.bucket
+                    existing.object_key = ref.key
+                    existing.content_size = len(data)
+                    existing.mime_type = mime_type
+                    existing.status = "indexed"
+                chunks = self._db.query(Chunk).filter(Chunk.document_id == existing.id).count()
+                self._db.flush()
                 return {
                     "ok": True, "duplicate": True, "document_id": existing.id,
-                    "chunks": len(chunks),
+                    "chunks": chunks, "content_hash": content_hash,
                 }
 
-            # 根据文件后缀判断文档类型
-            suffix = path.suffix.lower()
-            if suffix in (".md", ".markdown"):
-                doc_type = "markdown"
-            elif suffix in (".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs"):
-                doc_type = "code"
-            else:
-                doc_type = "text"
-
-            doc = Document(
-                source_path=str(path.resolve()),
-                content_hash=content_hash,
-                title=path.name,
-                doc_type=doc_type,
+            document = Document(
+                source_path=str(path.resolve()), content_hash=content_hash,
+                object_bucket=ref.bucket, object_key=ref.key, content_size=len(data),
+                mime_type=mime_type, title=path.name,
+                doc_type=self._document_type(path), status="indexed",
             )
-            self._db.add(doc)
+            self._db.add(document)
             self._db.flush()
-
-            # 文本分块并入库
-            chunks_raw = chunk_text(content)
-            chunk_ids = []
-            for c in chunks_raw:
-                chunk = Chunk(
-                    document_id=doc.id,
-                    content=c["content"],
-                    line_start=c["line_start"],
-                    line_end=c["line_end"],
-                    chunk_index=c["chunk_index"],
-                    token_estimate=max(1, len(c["content"]) // 4),  # 粗略 token 估算
-                )
-                self._db.add(chunk)
-                chunk_ids.append(chunk.id)
-
-            self._db.flush()
-            return {"ok": True, "document_id": doc.id, "chunks": len(chunk_ids)}
+            count = self._replace_chunks(document, data.decode("utf-8", errors="replace"))
+            return {
+                "ok": True, "document_id": document.id, "chunks": count,
+                "content_hash": content_hash,
+            }
         except Exception:
-            logger.exception("知识库文件摄取失败: %s", file_path)
+            logger.exception("知识文档摄取失败：%s", file_path)
+            raise
+
+    def read_source(self, document_id: str) -> bytes:
+        """从对象存储读取并校验指定文档的持久原文。"""
+        document = self._db.get(Document, document_id)
+        if document is None:
+            raise LookupError("知识文档不存在")
+        if not document.object_bucket or not document.object_key:
+            raise LookupError("知识文档没有可用的持久原文")
+        return get_verified(
+            ObjectRef(bucket=document.object_bucket, key=document.object_key),
+            document.content_hash,
+        )
+
+    def reindex(self, document_id: str) -> dict[str, Any]:
+        """仅从持久原文重新生成文档分块，不依赖 source_path。"""
+        document = self._db.get(Document, document_id)
+        if document is None:
+            raise LookupError("知识文档不存在")
+        try:
+            data = self.read_source(document_id)
+            count = self._replace_chunks(document, data.decode("utf-8", errors="replace"))
+            document.status = "indexed"
+            self._db.flush()
+            return {"ok": True, "document_id": document.id, "chunks": count}
+        except Exception:
+            document.status = "index_failed"
+            logger.exception("知识文档重新索引失败：%s", document_id)
             raise
 
 
 def search_chunks(db: Session, query: str, limit: int = 5) -> list[dict[str, Any]]:
-    """
-    基于关键词在数据库中进行全文检索（ILIKE）。
-
-    参数:
-        db: SQLAlchemy 数据库会话。
-        query: 搜索关键词。
-        limit: 返回结果数量上限，默认 5。
-
-    返回:
-        匹配的块信息列表，包含 chunk_id、document_id、source_path 等字段。
-    """
-    try:
-        results = (
-            db.query(Chunk, Document)
-            .join(Document, Chunk.document_id == Document.id)
-            .filter(Chunk.content.ilike(f"%{query}%"))
-            .order_by(Chunk.chunk_index)
-            .limit(limit)
-            .all()
-        )
-        return [
-            {
-                "chunk_id": c.id,
-                "document_id": d.id,
-                "source_path": d.source_path,
-                "content_preview": c.content[:200],  # 仅返回前200字符作为预览
-                "line_start": c.line_start,
-                "line_end": c.line_end,
-            }
-            for c, d in results
-        ]
-    except Exception:
-        logger.exception("文本检索失败: query=%s", query)
-        raise
+    """基于关键词检索已生成的知识分块。"""
+    results = (
+        db.query(Chunk, Document)
+        .join(Document, Chunk.document_id == Document.id)
+        .filter(Chunk.content.ilike(f"%{query}%"))
+        .order_by(Chunk.chunk_index)
+        .limit(limit)
+        .all()
+    )
+    return [{
+        "chunk_id": chunk.id, "document_id": document.id,
+        "source_path": document.source_path, "content_preview": chunk.content[:200],
+        "line_start": chunk.line_start, "line_end": chunk.line_end,
+    } for chunk, document in results]

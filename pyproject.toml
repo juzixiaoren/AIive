@@ -10,6 +10,7 @@ dependencies = [
     "httpx>=0.28.0",
     "sqlalchemy>=2.0",
     "psycopg[binary]>=3.0",
+    "pgvector>=0.3.6",
     "alembic>=1.14",
     "langgraph>=1.0",
     "langchain-core>=0.3",
@@ -35,7 +36,7 @@ where = ["backend"]
 
 [tool.basedpyright]
 include = ["backend"]
-exclude = ["backend/alembic/versions"]
+exclude = ["backend/alembic/versions", "backend/alembic/_archive_migrations_20260717", "backend/tests", "backend/conftest.py"]
 reportImportCycles = "none"
 reportCallInDefaultInitializer = "none"
 reportUnknownMemberType = "none"

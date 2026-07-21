@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from aiive.context.run_context import RunContext
 from aiive.db.base import get_db
 from aiive.memory.memory_maintenance import MemoryMaintenance
+from aiive.memory.memory_policy import MemoryPolicyEngine, MemoryReadChannel
 from aiive.memory.memory_store import MemoryStore
 from aiive.memory.memory_types import MemoryProposal, TrustLevel
 from aiive.memory.memory_write_service import MemoryWriteService
@@ -39,14 +40,24 @@ def list_memories(db: Session = Depends(get_db)):
     Returns:
         记忆列表，包含类型、生命周期状态、内容、置信度等
     """
+    from aiive.forget.visibility_service import ForgetVisibilityService
+
     store = MemoryStore(db)
+    policy = MemoryPolicyEngine()
     records = store.list_all()
+    # Phase 6A fail-closed：过滤被 forget 屏蔽的记忆（lifecycle=forgotten 已是子集，
+    # 此处再排除被 active Shield / Tombstone 覆盖的记忆）
+    blocked = ForgetVisibilityService.blocked_target_ids(
+        db, "memory_record",
+        [(r.id, r.created_at) for r in records],
+    )
     return [
         {
             "id": r.id,
             "memory_type": r.memory_type,
             "lifecycle_state": r.lifecycle_state,
-            "content": r.content,
+            "content": policy.render_content(r.content, r.sensitivity, MemoryReadChannel.API),
+            "sensitivity": r.sensitivity or "normal",
             "source_event_id": r.source_event_id,
             "confidence": r.confidence,
             "lineage": r.lineage,
@@ -55,6 +66,7 @@ def list_memories(db: Session = Depends(get_db)):
             "updated_at": r.updated_at.isoformat(),
         }
         for r in records
+        if r.id not in blocked
     ]
 
 

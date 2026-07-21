@@ -354,29 +354,6 @@ class MemoryKeyRegistry:
                 result[key] = spec.core_memory_role
         return result
 
-    def get_context_role_types(self, role: str) -> list[str]:
-        """Return memory_types used by any key/pattern with the given context role."""
-        types: set[str] = set()
-        for ks in self._exact.values():
-            if role in ks.context_roles:
-                types.add(ks.memory_type)
-        for pat in self._patterns:
-            if role in pat.context_roles:
-                types.add(pat.memory_type)
-        return list(types)
-
-    def get_context_role_prefixes(self, role: str) -> list[str]:
-        """Return dynamic key prefixes registered for a context role."""
-        prefixes: list[str] = []
-        for pat in self._patterns:
-            if role in pat.context_roles:
-                prefixes.append(pat.prefix)
-        return prefixes
-
-    def list_exact_keys(self) -> list[str]:
-        """Return all registered exact keys."""
-        return list(self._exact.keys())
-
 
 # ============================================================================
 # Singleton
