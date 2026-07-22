@@ -79,7 +79,7 @@ def test_assemble_persists_pending_seal_after_session_close(db) -> None:
     )
 
     # 屏蔽重型私有方法（召回/检索/工作态等），只保留含修复点的核心循环
-    assembler._load_agent_context = lambda db, message, thread: {
+    assembler._load_agent_context = lambda db, message, thread, trace_id=None: {
         "system_content": "", "recall_messages": [], "recall_pack": None,
         "history_summary_text": "", "stable_contract_text": "",
         "core_memory_text": "", "recall_text": "",

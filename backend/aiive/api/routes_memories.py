@@ -15,8 +15,8 @@ from aiive.db.base import get_db
 from aiive.memory.memory_maintenance import MemoryMaintenance
 from aiive.memory.memory_policy import MemoryPolicyEngine, MemoryReadChannel
 from aiive.memory.memory_store import MemoryStore
-from aiive.memory.memory_types import MemoryProposal, TrustLevel
-from aiive.memory.memory_write_service import MemoryWriteService
+from aiive.memory.memory_types import MemoryProposal, TrustLevel, WriteOutcome
+from aiive.memory.memory_write_service import MemoryWriteService, WriteResult
 from aiive.memory.projection import MemoryProjection
 from aiive.memory.proposal_normalizer import ProposalNormalizer
 
@@ -28,6 +28,44 @@ class CreateMemoryRequest(BaseModel):
     content: str = Field(..., min_length=1)
     memory_type: str = "fact"
     pinned: bool = False
+
+
+class CreateMemoryResponse(BaseModel):
+    """手动写入记忆的结构化结果。"""
+
+    ok: bool
+    outcome: WriteOutcome
+    operation: str = ""
+    id: str = ""
+    content: str
+    lifecycle_state: str = ""
+    memory_type: str
+    canonical_key: str
+    reason: str = ""
+    idempotent: bool = False
+
+
+def _create_memory_response(
+    request: CreateMemoryRequest,
+    memory_type: str,
+    canonical_key: str,
+    result: WriteResult,
+    *,
+    idempotent: bool = False,
+) -> CreateMemoryResponse:
+    """将领域写入结果转换为稳定的 API 响应。"""
+    return CreateMemoryResponse(
+        ok=result.written,
+        outcome=result.outcome,
+        operation=result.operation,
+        id=result.memory_id,
+        content=request.content,
+        lifecycle_state=result.state,
+        memory_type=memory_type,
+        canonical_key=canonical_key,
+        reason=result.reason,
+        idempotent=idempotent,
+    )
 
 
 @router.get("/memories")
@@ -60,7 +98,6 @@ def list_memories(db: Session = Depends(get_db)):
             "sensitivity": r.sensitivity or "normal",
             "source_event_id": r.source_event_id,
             "confidence": r.confidence,
-            "lineage": r.lineage,
             "pinned": r.pinned,
             "created_at": r.created_at.isoformat(),
             "updated_at": r.updated_at.isoformat(),
@@ -70,29 +107,75 @@ def list_memories(db: Session = Depends(get_db)):
     ]
 
 
-@router.post("/memories")
+@router.post("/memories", response_model=CreateMemoryResponse)
 def create_memory(request: CreateMemoryRequest,
                    db: Session = Depends(get_db),
                    idempotency_key: str = Header(None, alias="Idempotency-Key")):
     """创建新记忆 — 走完整写入链路（ProposalNormalizer → MemoryWriteService）。
 
     支持 Idempotency-Key header 去重。
-    execution_mode = "user_required"：写入失败返回 409。
+    execution_mode = "user_required"：拒绝返回 422，失败返回 409。
     """
-    from aiive.db.models import MemoryProposal as MemoryProposalModel
+    from aiive.db.models import MemoryProposal as MemoryProposalModel, MemoryRecord
 
-    # 幂等检查：已存在相同 idempotency_key 的 proposal → 返回已有结果
+    # 幂等检查：重复请求必须重放原领域结果，不能再次执行写入链路
     if idempotency_key:
         existing = db.query(MemoryProposalModel).filter(
             MemoryProposalModel.idempotency_key == idempotency_key
         ).first()
-        if existing is not None and existing.final_memory_id:
-            return {
-                "id": existing.final_memory_id,
-                "content": request.content,
-                "lifecycle_state": "active",
-                "_idempotent": True,
-            }
+        if existing is not None:
+            final_operation = existing.final_operation or ""
+            if final_operation == "reject":
+                raise HTTPException(
+                    status_code=422,
+                    detail=existing.gate_reason or "记忆未通过写入规则",
+                )
+
+            if final_operation == "ignore" and not existing.final_memory_id:
+                return CreateMemoryResponse(
+                    ok=False,
+                    outcome=WriteOutcome.IGNORED,
+                    operation="ignore",
+                    content=existing.content or request.content,
+                    memory_type=existing.memory_type or request.memory_type,
+                    canonical_key=existing.canonical_key or "",
+                    reason=existing.gate_reason or "该请求未产生记忆变更",
+                    idempotent=True,
+                )
+
+            if not existing.final_memory_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="幂等请求没有可重放的记忆写入结果",
+                )
+
+            record = db.get(MemoryRecord, existing.final_memory_id)
+            if record is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="幂等写入记录指向的记忆不存在",
+                )
+            replay_outcome = (
+                WriteOutcome.REINFORCE_SKIPPED
+                if final_operation == "ignore"
+                else WriteOutcome.WRITTEN
+            )
+            return CreateMemoryResponse(
+                ok=replay_outcome == WriteOutcome.WRITTEN,
+                outcome=replay_outcome,
+                operation=final_operation,
+                id=record.id,
+                content=record.content,
+                lifecycle_state=record.lifecycle_state,
+                memory_type=record.memory_type,
+                canonical_key=record.canonical_key,
+                reason=(
+                    "所有 source_event 均已计入，不重复强化"
+                    if replay_outcome == WriteOutcome.REINFORCE_SKIPPED
+                    else ""
+                ),
+                idempotent=True,
+            )
 
     normalizer = ProposalNormalizer()
     result = normalizer.normalize(
@@ -129,18 +212,25 @@ def create_memory(request: CreateMemoryRequest,
     writer = MemoryWriteService(db)
     try:
         write_result = writer.write(proposal, run_context=ctx)
-    except Exception as e:
-        raise HTTPException(status_code=409, detail=f"Memory write failed: {e}")
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=f"记忆写入失败: {exc}") from exc
+
+    if write_result.outcome == WriteOutcome.GATE_REJECTED:
+        db.commit()
+        raise HTTPException(status_code=422, detail=write_result.reason or "记忆未通过写入规则")
+
+    if write_result.outcome == WriteOutcome.FAILED:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=write_result.reason or "记忆写入失败")
 
     db.commit()
-
-    return {
-        "id": write_result.memory_id,
-        "content": request.content,
-        "lifecycle_state": write_result.state,
-        "memory_type": proposal.memory_type,
-        "canonical_key": proposal.canonical_key,
-    }
+    return _create_memory_response(
+        request,
+        proposal.memory_type,
+        proposal.canonical_key,
+        write_result,
+    )
 
 
 class ForgetRequest(BaseModel):

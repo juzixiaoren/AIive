@@ -171,6 +171,100 @@ class TestThreadState:
             "status": "completed", "result": {"ok": True},
         }]
 
+    def test_list_thread_messages_page_preserves_non_completed_tool_states(self, db_session):
+        """失败、中断和在途 Turn 的工具事实必须原样进入 UI 历史。"""
+        state = ThreadState(db_session)
+        thread = state.get_or_create_thread()
+        cases = (
+            (1, "failed", "error", "failed"),
+            (2, "interrupted_unknown", "execution_unknown", "execution_unknown"),
+            (3, "running", "running", "execution_unknown"),
+            (4, "not_started", None, "execution_unknown"),
+        )
+        for sequence, turn_status, result_status, expected_status in cases:
+            turn_id = f"turn-state-{sequence}"
+            db_session.add(TurnRecord(
+                thread_id=thread.id,
+                turn_id=turn_id,
+                turn_sequence=sequence,
+                status=turn_status,
+                request_fingerprint=f"fp-state-{sequence}",
+            ))
+            db_session.add_all([
+                Event(
+                    trace_id=f"trace-state-{sequence}",
+                    thread_id=thread.id,
+                    turn_id=turn_id,
+                    turn_event_index=0,
+                    event_type="user_message",
+                    payload={"content": f"状态{sequence}"},
+                ),
+                Event(
+                    trace_id=f"trace-state-{sequence}",
+                    thread_id=thread.id,
+                    turn_id=turn_id,
+                    turn_event_index=1,
+                    event_type="tool_call",
+                    payload={
+                        "name": "demo",
+                        "params": {"sequence": sequence},
+                        "tool_call_id": f"call-state-{sequence}",
+                    },
+                ),
+            ])
+            if result_status is not None:
+                db_session.add(Event(
+                    trace_id=f"trace-state-{sequence}",
+                    thread_id=thread.id,
+                    turn_id=turn_id,
+                    turn_event_index=2,
+                    event_type="tool_result",
+                    payload={
+                        "name": "demo",
+                        "result": {"sequence": sequence},
+                        "status": result_status,
+                        "tool_call_id": f"call-state-{sequence}",
+                    },
+                ))
+        db_session.flush()
+
+        page = state.list_thread_messages_page(thread.id, page_size=50)
+        assistants = [message for message in page["messages"] if message["role"] == "assistant"]
+
+        assert len(assistants) == 4
+        assert [message["content"] for message in assistants] == ["", "", "", ""]
+        assert [message["tool_calls"][0]["status"] for message in assistants] == [
+            case[3] for case in cases
+        ]
+        assert [message["tool_calls"][0]["tool_call_id"] for message in assistants] == [
+            f"call-state-{sequence}" for sequence in range(1, 5)
+        ]
+
+    def test_list_thread_messages_page_unknown_status_fails_closed(self, db_session):
+        """历史未知工具状态必须显示待确认，不能默认完成。"""
+        state = ThreadState(db_session)
+        thread = state.get_or_create_thread()
+        db_session.add(TurnRecord(
+            thread_id=thread.id, turn_id="turn-unknown", turn_sequence=1,
+            status="completed", request_fingerprint="fp-unknown",
+        ))
+        db_session.add_all([
+            Event(trace_id="trace-unknown", thread_id=thread.id, turn_id="turn-unknown",
+                  turn_event_index=0, event_type="tool_call",
+                  payload={"name": "demo", "params": {}, "tool_call_id": "call-unknown"}),
+            Event(trace_id="trace-unknown", thread_id=thread.id, turn_id="turn-unknown",
+                  turn_event_index=1, event_type="tool_result",
+                  payload={"name": "demo", "result": {}, "status": "legacy_mystery",
+                           "tool_call_id": "call-unknown"}),
+            Event(trace_id="trace-unknown", thread_id=thread.id, turn_id="turn-unknown",
+                  turn_event_index=2, event_type="llm_response", payload={"content": "结果未知"}),
+        ])
+        db_session.flush()
+
+        page = state.list_thread_messages_page(thread.id)
+
+        assert page["messages"][0]["tool_calls"][0]["status"] == "execution_unknown"
+
     def test_list_thread_messages_page_uses_turn_cursor(self, db_session):
         """UI 历史页应使用 turn_sequence 游标向更早历史翻页。"""
         state = ThreadState(db_session)

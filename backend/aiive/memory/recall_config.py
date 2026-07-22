@@ -139,7 +139,6 @@ class MaintenanceConfig:
 @dataclass
 class ProjectionCapabilities:
     """Phase 0.5B 已有生产消费者的可选投影能力开关。"""
-    markdown_projection_enabled: bool = False
     cache_projection_enabled: bool = False
 
 
@@ -155,6 +154,7 @@ ENABLED_OUTBOX_JOB_TYPES: frozenset[str] = frozenset({
     "memory_extraction",
     "core_memory_refresh",
     "memory_vector_refresh",
+    "memory_markdown_project",
     # 提醒投递：到期任务必须由 Agent 生成真实回复
     "reminder_delivery",
     # Phase 3: Segment sealing / Epoch rollover / Epoch checkpoint

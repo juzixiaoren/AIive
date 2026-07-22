@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     aiive_embedding_timeout_seconds: int = 30
     aiive_memory_vector_top_k: int = 16
 
+    # 记忆文件投影：输出目录只能来自服务端配置，Outbox payload 不接受路径。
+    aiive_memory_file_projection_enabled: bool = True
+    aiive_memory_file_projection_dir: str = ".data/memory_projection"
+
     # 数据库连接配置
     database_url: str = "postgresql+psycopg://aiive:aiive_dev@localhost:5432/aiive"
     # 连接池配置（PostgreSQL）。单个聊天回合峰值可能同时占用约 8 个会话
@@ -79,8 +83,14 @@ class Settings(BaseSettings):
     app_version: str = "0.1.0"
 
     @model_validator(mode="after")
-    def validate_memory_vector(self) -> "Settings":
-        """显式启用时拒绝不完整或与迁移维度不一致的向量配置。"""
+    def validate_memory_features(self) -> "Settings":
+        """显式启用时拒绝不完整的记忆派生能力配置。"""
+        if self.aiive_memory_file_projection_enabled:
+            projection_dir = self.aiive_memory_file_projection_dir.strip()
+            if not projection_dir:
+                raise ValueError("启用记忆文件投影时必须配置 AIIVE_MEMORY_FILE_PROJECTION_DIR")
+            if ".." in projection_dir.replace("\\", "/").split("/"):
+                raise ValueError("AIIVE_MEMORY_FILE_PROJECTION_DIR 不允许包含父目录跳转")
         if not self.aiive_memory_vector_enabled:
             return self
         if not self.database_url.startswith("postgresql"):

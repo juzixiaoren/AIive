@@ -9,7 +9,7 @@ import pytest
 from langchain_core.messages import AIMessage
 
 from aiive.core.llm_client import FakeLLMClient
-from aiive.db.models import ContextSnapshot, Epoch, Segment, Thread, TurnRecord
+from aiive.db.models import ContextSnapshot, Epoch, Event, Segment, Thread, TurnRecord
 from aiive.runtime.turn_execution import TurnExecutionService
 
 
@@ -77,6 +77,18 @@ def test_turn_sequence_assigned_and_increments(patched):
     segments = db.query(Segment).filter(Segment.thread_id == tid).all()
     assert len(epochs) >= 1
     assert len(segments) >= 1
+
+
+def test_response_event_id_matches_persisted_llm_response(patched):
+    """最终响应的 event_id 必须等于持久化 llm_response 事件的真实 ID。"""
+    thread_id = str(uuid.uuid4())
+    response = _run_turn(patched, "检查事件标识", thread_id=thread_id)
+
+    event = patched.query(Event).filter(
+        Event.thread_id == thread_id,
+        Event.event_type == "llm_response",
+    ).one()
+    assert response["event_id"] == event.id
 
 
 def test_snapshot_retention_constraints(patched):
@@ -154,11 +166,12 @@ def test_tools_node_normalizes_and_maintains_working_state(patched, monkeypatch)
 
     graph = AgentGraph(FakeLLMClient(), db)
     normalizer = ToolResultNormalizer(_FakeTokenCounter(tokens=5000), "fake-model")
-    compiled, _records = graph._build_graph(
+    compiled, _records, pending_approvals = graph._build_graph(
         _FakeAssistant(), [tool], None,
         normalizer=normalizer, ws_service=ws,
         thread_id=tid, turn_record_id=turn_id, execution_id="exec-1",
     )
+    assert pending_approvals == []
     result = compiled.invoke({"messages": [HumanMessage(content="go")]})
 
     # 1) ToolMessage 内容被规范化为 artifact 引用

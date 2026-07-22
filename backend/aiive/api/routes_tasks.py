@@ -10,7 +10,6 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from aiive.db.base import get_db
-from aiive.db.models import Task
 from aiive.runtime.task_manager import TaskManager
 
 logger = logging.getLogger(__name__)
@@ -97,17 +96,7 @@ def check_task(task_id: str, db: Session = Depends(get_db)):
         任务执行结果
     """
     try:
-        task = db.get(Task, task_id)
-        if task is not None and task.task_type == "reminder":
-            from datetime import datetime, timezone
-            from aiive.worker.task_worker import enqueue_due_tasks
-
-            task.next_check_at = datetime.now(timezone.utc)
-            task.status = "pending"
-            results = enqueue_due_tasks(db)
-            result = results[0] if results else {"ok": False, "error": "提醒未能入队"}
-        else:
-            result = TaskManager(db).check_now(task_id)
+        result = TaskManager(db).check_now(task_id)
         db.commit()
         return result
     except Exception:

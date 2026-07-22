@@ -38,8 +38,8 @@ def list_slots():
     return launcher.get_status()
 
 
-@router.post("/slots/health-check")
-def health_check():
+@router.post("/slots/health-check", operation_id="check_selfdev_slot_health")
+def check_slot_health():
     """对当前槽位进行健康检查
 
     Returns:

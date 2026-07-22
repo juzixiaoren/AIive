@@ -1,12 +1,9 @@
 """
 运行时层 - 策略引擎。
 
-基于工具元数据的机械化安全校验引擎。不依赖自然语言关键词匹配，
-而是直接检查 AIMessage.tool_calls 与 ToolRegistry 元数据
-（风险等级、是否外部写入、是否可删除等），以决定工具调用应：
-- allowed（允许）：直接传递给 ToolNode 执行
-- blocked（阻止）：拒绝执行
-- confirm（确认）：需要用户确认后方可执行
+当前策略对所有已注册工具直接放行，仅阻止未注册工具。
+风险等级、外部写入、删除能力和确认标记仍保留在工具元数据中，
+但暂不参与运行时审批判定。
 """
 
 from __future__ import annotations
@@ -45,7 +42,8 @@ class PolicyResult:
 
 # ---- 策略规则（基于工具元数据，非关键词） ----
 
-# 工具效果类型与策略动作的映射（基于 CapabilitySafetySchema 字段）
+# TODO: 用户审批当前有意停用。恢复时必须同步启用策略判定、审批节点、前端 UI、测试和文档，禁止仅接通单层逻辑。
+# 以下规则仅保留为未来审批策略的元数据定义，当前不得参与 check_tool_calls 判定。
 EFFECT_TYPE_RULES = {
     "destructive_write": PolicyAction.CONFIRM,  # can_delete = True
     "external_communication": PolicyAction.CONFIRM,  # writes_external_world = True + 高风险
@@ -57,13 +55,10 @@ def check_tool_calls(
     tool_calls: list[dict[str, Any]],
     registry: ToolRegistry | None = None,
 ) -> PolicyResult:
-    """批量校验 AIMessage.tool_calls 是否符合安全策略。
+    """批量校验 AIMessage.tool_calls 是否已注册。
 
-    对每个工具调用依次检查：未知工具则阻止；高风险、破坏性操作、
-    外部写入和显式要求确认的工具则要求用户确认；其余默认允许。
-
-    如果同一批次中同时存在允许和需要确认的工具，为安全起见阻止整批次，
-    避免部分执行。
+    当前关闭用户审批：所有已注册工具均直接允许执行，工具风险元数据不参与
+    策略判定。批次中只要包含未注册工具，仍阻止整个批次，避免部分执行。
 
     Args:
         tool_calls: AIMessage.tool_calls 中的工具调用字典列表，
@@ -81,80 +76,24 @@ def check_tool_calls(
 
     allowed: list[str] = []
     blocked: list[str] = []
-    confirm: list[str] = []
-    block_reasons: list[str] = []
-    confirm_reasons: list[str] = []
 
     for tc in tool_calls:
         tool_name = tc.get("name", "")
-        reg = registry.get(tool_name)
-
-        # 未知工具：阻止
-        if reg is None:
+        if registry.get(tool_name) is None:
             blocked.append(tool_name)
-            block_reasons.append(f"Any tool: {tool_name}")
-            continue
+        else:
+            allowed.append(tool_name)
 
-        safety = reg.safety
-
-        # 规则 1：高风险工具需要确认
-        if safety.risk_level in ("high", "critical"):
-            confirm.append(tool_name)
-            confirm_reasons.append(f"High-risk tool ({safety.risk_level}): {tool_name}")
-            continue
-
-        # 规则 2：破坏性操作（can_delete）需要确认
-        if safety.can_delete:
-            confirm.append(tool_name)
-            confirm_reasons.append(f"Destructive operation: {tool_name}")
-            continue
-
-        # 规则 3：中风险等级的外部世界写入需要确认
-        if safety.writes_external_world and safety.risk_level == "medium":
-            confirm.append(tool_name)
-            confirm_reasons.append(f"External write (medium risk): {tool_name}")
-            continue
-
-        # 规则 4：显式要求确认的工具
-        if safety.requires_confirmation:
-            confirm.append(tool_name)
-            confirm_reasons.append(f"Requires confirmation: {tool_name}")
-            continue
-
-        # 默认：允许
-        allowed.append(tool_name)
-
-    # 确定整体策略动作
-    # 安全优先：只要存在被阻止（含未知）工具，整批次必须阻止，
-    # 无论同批是否还有允许或需确认的工具。
     if blocked:
         return PolicyResult(
             action=PolicyAction.BLOCK,
-            reason="; ".join(block_reasons),
+            reason="; ".join(f"Unknown tool: {name}" for name in blocked),
             blocked_tools=blocked,
-        )
-
-    if confirm:
-        # 同批次同时存在允许与需确认的工具：为安全起见阻止整批次，避免部分执行
-        if allowed:
-            return PolicyResult(
-                action=PolicyAction.BLOCK,
-                reason=(
-                    f"Mixed allow+confirm in same batch; "
-                    f"blocking {len(allowed)} allowed and {len(confirm)} confirm tools"
-                ),
-                blocked_tools=confirm,
-                confirm_tools=confirm,
-                allowed_tools=allowed,
-            )
-        return PolicyResult(
-            action=PolicyAction.CONFIRM,
-            reason="; ".join(confirm_reasons),
-            confirm_tools=confirm,
+            allowed_tools=allowed,
         )
 
     return PolicyResult(
         action=PolicyAction.ALLOW,
-        reason="all tools allowed",
+        reason="all registered tools allowed",
         allowed_tools=allowed,
     )

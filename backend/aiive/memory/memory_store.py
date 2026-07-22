@@ -3,8 +3,8 @@
 Provides structured CRUD for MemoryRecord, used exclusively by MemoryWriteService
 and read-side components (MemoryReadModel).
 
-Production write paths MUST NOT call create_record() / update_lifecycle() directly;
-they must go through MemoryWriteService.
+Production write paths MUST NOT call create_record() directly; they must go through
+MemoryWriteService.
 
 Read paths (get_active, get_by_id, get_by_key_scope, etc.) are safe for
 MemoryReadModel to use.
@@ -62,7 +62,6 @@ class MemoryStore:
         validity_state: str = ValidityState.VALID.value,
         supersedes: str | None = None,
         revision_of: str | None = None,
-        merged_from: list[str] | None = None,
         revision_num: int = 1,
     ) -> MemoryRecord:
         """Create a new MemoryRecord from a normalized proposal.
@@ -93,7 +92,6 @@ class MemoryStore:
             created_from=proposal.proposal_id,
             revision_of=revision_of,
             supersedes=supersedes,
-            merged_from=merged_from,
             revision_num=revision_num,
             valid_from=now,
             valid_to=proposal.valid_to,
@@ -105,14 +103,6 @@ class MemoryStore:
         self._db.add(record)
         self._db.flush()
         return record
-
-    def update_lifecycle(self, memory_id: str, state: str) -> None:
-        """Update lifecycle_state. Called only by MemoryWriteService."""
-        record = self._db.get(MemoryRecord, memory_id)
-        if record:
-            record.lifecycle_state = state
-            record.updated_at = datetime.now(timezone.utc)
-            self._db.flush()
 
     # ------------------------------------------------------------------
     # Read operations — safe for any consumer
@@ -127,15 +117,6 @@ class MemoryStore:
         MemoryRecord.lifecycle_state == LifecycleState.ACTIVE.value,
         MemoryRecord.validity_state == ValidityState.VALID.value,
     )
-
-    def get_active_valid(self) -> Sequence[MemoryRecord]:
-        """Get all active+valid records (prefer scoped queries)."""
-        return (
-            self._db.query(MemoryRecord)
-            .filter(*self._ACTIVE_VALID)
-            .order_by(MemoryRecord.updated_at.desc())
-            .all()
-        )
 
     def get_active_by_key_scope_locked(
         self, canonical_key: str, scope_type: str, scope_id: str | None

@@ -46,10 +46,13 @@ class TestTaskManager:
         db_session.flush()
 
         result = mgr.check_now(task.id)
-        assert result["action"] == "enqueue"
+        assert result["status"] == "enqueued"
 
         updated = mgr._db.get(type(task), task.id)
-        assert updated.status == "pending"
+        assert updated.status == "dispatching"
+        assert db_session.query(OutboxJob).filter(
+            OutboxJob.operation_id == f"reminder_delivery:{task.id}"
+        ).count() == 1
 
     def test_check_now_route_enqueues_reminder(self, db_session):
         """check-now 路由必须真实入队，不能只返回自然语言动作。"""
@@ -63,11 +66,47 @@ class TestTaskManager:
         result = check_task(task.id, db_session)
         db_session.expire_all()
 
-        assert result["status"] == "dispatching"
+        assert result["status"] == "enqueued"
         assert db_session.get(type(task), task.id).status == "dispatching"
         assert db_session.query(OutboxJob).filter(
             OutboxJob.operation_id == f"reminder_delivery:{task.id}"
         ).count() == 1
+
+    def test_check_now_does_not_return_another_due_task(self, db_session):
+        """立即执行必须只处理目标提醒，不能返回更早到期的其他任务。"""
+        mgr = TaskManager(db_session)
+        earlier = mgr.create(
+            "reminder", "更早提醒",
+            next_check_at=datetime.now(timezone.utc) - timedelta(hours=2),
+        )
+        target = mgr.create(
+            "reminder", "目标提醒",
+            next_check_at=datetime.now(timezone.utc) + timedelta(hours=2),
+        )
+        db_session.flush()
+
+        result = mgr.enqueue_reminder_now(target.id)
+
+        assert result["task_id"] == target.id
+        assert result["status"] == "enqueued"
+        assert earlier.status == "pending"
+        assert target.status == "dispatching"
+
+    def test_check_now_does_not_revive_terminal_reminder(self, db_session):
+        """completed/cancelled/failed 提醒不得被 check-now 复活。"""
+        mgr = TaskManager(db_session)
+        for status in ("completed", "cancelled", "failed"):
+            task = mgr.create("reminder", f"终态-{status}")
+            task.status = status
+            db_session.flush()
+
+            result = mgr.enqueue_reminder_now(task.id)
+
+            assert task.status == status
+            assert result["status"] in {"already_completed", "cancelled", "failed"}
+            assert db_session.query(OutboxJob).filter(
+                OutboxJob.operation_id == f"reminder_delivery:{task.id}"
+            ).count() == 0
 
     def test_condition_watch_skip(self, db_session):
         """条件为 false 时应跳过。"""

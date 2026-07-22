@@ -9,7 +9,7 @@ import logging
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from aiive.core.llm_client import LLMClientError, default_llm_client
 from aiive.runtime.action_cards import ChatResponse
@@ -40,15 +40,47 @@ def _raise_llm_http_error(error: LLMClientError) -> None:
     )
 
 
+def _chat_error_payload(result: dict[str, object]) -> dict[str, object]:
+    """将 TurnExecution 错误统一转换为同步与 SSE 共用契约。"""
+    code = str(result.get("error", "internal_error"))
+    payload: dict[str, object] = {
+        "code": code,
+        "message": result.get("message") or code,
+        "retryable": bool(result.get("retryable", False)),
+        "trace_id": result.get("trace_id"),
+        "retry_after_seconds": result.get("retry_after_seconds"),
+        "status": int(result.get("_status", 500) or 500),
+    }
+    for key in (
+        "safe_tokens", "context_window", "hard_input_limit",
+        "partition_reports", "partial_tool_records",
+    ):
+        if key in result:
+            payload[key] = result.get(key)
+    return payload
+
+
+def _raise_chat_result_error(result: dict[str, object]) -> None:
+    """将同步 TurnExecution 错误转换为稳定 HTTP 响应。"""
+    payload = _chat_error_payload(result)
+    raise HTTPException(status_code=int(payload["status"]), detail=payload)
+
+
 class ChatRequest(BaseModel):
-    """聊天请求体"""
+    """聊天请求体；消息来源只能由服务端路由确定。"""
+
+    model_config = ConfigDict(extra="forbid")
+
     message: str = Field(..., min_length=1)
     thread_id: str | None = None
     turn_id: str | None = None
 
 
 class SystemChatRequest(BaseModel):
-    """系统指令请求"""
+    """系统指令请求；来源固定由该服务端端点赋值。"""
+
+    model_config = ConfigDict(extra="forbid")
+
     message: str = Field(..., min_length=1)
     thread_id: str
 
@@ -59,7 +91,7 @@ class SystemChatRequest(BaseModel):
 def chat(request: ChatRequest) -> ChatResponse:
     """同步聊天接口，通过 TurnExecutionService 执行。"""
     client = default_llm_client()
-    service = TurnExecutionService(client, source="user_chat")
+    service = TurnExecutionService(client, message_source="user")
     try:
         result = service.execute_turn(
             message=request.message,
@@ -73,11 +105,8 @@ def chat(request: ChatRequest) -> ChatResponse:
         if err_msg == "turn_in_progress":
             raise HTTPException(status_code=202, detail="turn_in_progress")
         raise HTTPException(status_code=409, detail=err_msg)
-    if result.get("error") == "context_budget_exceeded":
-        raise HTTPException(status_code=413, detail=result)
     if result.get("error"):
-        status = result.get("_status", 500)
-        raise HTTPException(status_code=status, detail=result.get("error"))
+        _raise_chat_result_error(result)
     return ChatResponse.model_validate(result)
 
 
@@ -91,7 +120,7 @@ def chat_system(request: SystemChatRequest) -> ChatResponse:
     ).hexdigest()
     turn_id = "system_" + operation_id[:32]
 
-    service = TurnExecutionService(client, source="system_command")
+    service = TurnExecutionService(client, message_source="system_command")
     try:
         result = service.execute_turn(
             message=request.message,
@@ -106,8 +135,7 @@ def chat_system(request: SystemChatRequest) -> ChatResponse:
             raise HTTPException(status_code=202, detail="turn_in_progress")
         raise HTTPException(status_code=409, detail=err_msg)
     if result.get("error"):
-        status = result.get("_status", 500)
-        raise HTTPException(status_code=status, detail=result.get("error"))
+        _raise_chat_result_error(result)
     return ChatResponse.model_validate(result)
 
 
@@ -115,7 +143,7 @@ def chat_system(request: SystemChatRequest) -> ChatResponse:
 async def chat_stream(request: ChatRequest):
     """流式聊天接口，通过 TurnExecutionService 执行。"""
     client = default_llm_client()
-    service = TurnExecutionService(client, source="user_chat")
+    service = TurnExecutionService(client, message_source="user")
 
     async def generate():
         try:
@@ -126,22 +154,12 @@ async def chat_stream(request: ChatRequest):
                 turn_id=request.turn_id,
             ):
                 if event.get("type") == "error":
-                    error_payload = {
-                        "code": event.get("error", "internal_error"),
-                        "message": event.get("message", event.get("error", "请求失败")),
-                        "retryable": event.get("retryable", False),
-                        "trace_id": event.get("trace_id"),
-                        "retry_after_seconds": event.get("retry_after_seconds"),
-                        "status": event.get("_status", 500),
-                    }
-                    if event.get("error") == "context_budget_exceeded":
-                        error_payload.update({
-                            "safe_tokens": event.get("safe_tokens"),
-                            "context_window": event.get("context_window"),
-                        })
+                    error_payload = _chat_error_payload(event)
                     yield f"event: error\ndata: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
                     return
-                if event.get("type") == "token":
+                if event.get("type") == "started":
+                    yield f"event: started\ndata: {json.dumps({'thread_id': event.get('thread_id', ''), 'turn_id': event.get('turn_id', ''), 'trace_id': event.get('trace_id', '')}, ensure_ascii=False)}\n\n"
+                elif event.get("type") == "token":
                     yield f"event: token\ndata: {json.dumps({'text': event.get('text', '')}, ensure_ascii=False)}\n\n"
                 elif event.get("type") == "tool_call":
                     yield f"event: tool_call\ndata: {json.dumps({'tool_call_id': event.get('tool_call_id', ''), 'name': event.get('name', ''), 'params': event.get('params', {})}, ensure_ascii=False)}\n\n"
@@ -151,6 +169,7 @@ async def chat_stream(request: ChatRequest):
                     result = event
             response = ChatResponse.model_validate({
                 "reply": result.get("reply", ""),
+                "event_id": result.get("event_id", ""),
                 "thread_id": result.get("thread_id", ""),
                 "trace_id": result.get("trace_id", ""),
                 "action_cards": result.get("action_cards", []),

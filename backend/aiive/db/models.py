@@ -178,7 +178,7 @@ class ContextSnapshot(Base):
     __tablename__: str = "context_snapshots"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
-    trace_id: Mapped[str] = mapped_column(String(36), index=True)
+    trace_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     thread_id: Mapped[str] = mapped_column(String(36), ForeignKey("threads.id"), index=True)
     stable_prefix_hash: Mapped[str] = mapped_column(String(32))
     context_items: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
@@ -247,17 +247,12 @@ class MemoryRecord(Base):
     record_version: Mapped[int] = mapped_column(default=1)
     reinforce_count: Mapped[int] = mapped_column(default=0)
     source_event_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    lineage: Mapped[str | None] = mapped_column(String(128), nullable=True)
     pinned: Mapped[bool] = mapped_column(default=False)
-    memory_key: Mapped[str | None] = mapped_column(
-        "memory_key", String(128), nullable=True, index=True
-    )
     revision_num: Mapped[int] = mapped_column("revision_num", default=1)
     supersedes: Mapped[str | None] = mapped_column(String(36), nullable=True)
     superseded_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
     created_from: Mapped[str | None] = mapped_column(String(36), nullable=True)
     revision_of: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    merged_from: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     retention_policy: Mapped[str] = mapped_column(
@@ -555,23 +550,9 @@ class RetrievalCandidate(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     run_id: Mapped[str] = mapped_column(String(36), ForeignKey("retrieval_runs.id"), index=True)
-    chunk_id: Mapped[str] = mapped_column(String(36))
-    source: Mapped[str] = mapped_column(String(32))
+    source_id: Mapped[str] = mapped_column(String(36))
+    source_type: Mapped[str] = mapped_column(String(32))
     score: Mapped[float | None] = mapped_column(nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
-
-
-class ForgetRequest(Base):
-    """遗忘请求模型：记录用户要求删除特定记忆的请求。"""
-    __tablename__: str = "forget_requests"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
-    memory_id: Mapped[str] = mapped_column(String(36), index=True)
-    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    tombstone: Mapped[str] = mapped_column(String(256))
-    saga_state: Mapped[str] = mapped_column(
-        String(32), default="running"
-    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
@@ -780,7 +761,9 @@ class MemoryRecallCandidate(Base):
     __tablename__: str = "memory_recall_candidates"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
-    run_id: Mapped[str] = mapped_column(String(36), index=True)
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("memory_recall_runs.id", ondelete="CASCADE"), index=True,
+    )
     memory_id: Mapped[str] = mapped_column(String(36), index=True)
     route: Mapped[str] = mapped_column(String(32))
     raw_score: Mapped[float] = mapped_column(default=0.0)

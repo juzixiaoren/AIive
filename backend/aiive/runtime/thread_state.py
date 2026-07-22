@@ -14,6 +14,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from aiive.db.models import TurnRecord, Event, Thread
+from aiive.runtime.message_normalizer import normalize_tool_call, normalize_tool_result
 
 
 @dataclass
@@ -178,17 +179,25 @@ class ThreadState:
             elif etype == "assistant" and content:
                 msgs.append({"role": "assistant", "content": content})
             elif etype == "tool_call":
+                call = normalize_tool_call(d)
                 msgs.append({"role": "assistant", "tool_calls": [{
+                    "id": call["id"],
                     "type": "function",
                     "function": {
-                        "name": d.get("tool_name", ""),
-                        "arguments": _json.dumps(d.get("tool_params", {})),
+                        "name": call["name"],
+                        "arguments": _json.dumps(call["args"], ensure_ascii=False),
                     },
                 }]})
             elif etype in ("tool_result", "tool_result_ref"):
-                tr = d.get("tool_result", {})
+                normalized = normalize_tool_result(d)
+                tr = normalized["result"]
                 tr_str = tr if isinstance(tr, str) else _json.dumps(tr, ensure_ascii=False, default=str)
-                msgs.append({"role": "tool", "content": tr_str})
+                msgs.append({
+                    "role": "tool",
+                    "tool_call_id": normalized["id"],
+                    "name": normalized["name"],
+                    "content": tr_str,
+                })
         return msgs
 
     # ── 前端历史分页 ──
@@ -203,7 +212,12 @@ class ThreadState:
         size = max(1, min(page_size, 100))
         query = self._db.query(TurnRecord).filter(
             TurnRecord.thread_id == thread_id,
-            TurnRecord.status == "completed",
+            TurnRecord.status.in_([
+                "not_started", "running", "completed", "interrupted_unknown",
+                "failed", "cancelled", "preempted",
+            ]),
+            TurnRecord.turn_id.notilike("system_%"),
+            TurnRecord.turn_id.notilike("runtime_%"),
         )
         if before_sequence is not None:
             query = query.filter(TurnRecord.turn_sequence < before_sequence)
@@ -218,12 +232,15 @@ class ThreadState:
                 .filter(
                     Event.thread_id == thread_id,
                     Event.turn_id == turn.turn_id,
-                    Event.event_type.in_(["user_message", "tool_call", "tool_result", "llm_response"]),
+                    Event.event_type.in_([
+                        "user_message", "tool_call", "tool_result", "llm_response",
+                        "maintenance_report_terminal",
+                    ]),
                 )
                 .order_by(Event.turn_event_index.asc(), Event.created_at.asc(), Event.id.asc())
                 .all()
             )
-            messages.extend(self._events_to_display_messages(events))
+            messages.extend(self._events_to_display_messages(events, turn.status))
 
         # 到达新 Turn 历史末端时，继续拼接旧版 turn_id=NULL 事件。
         if not has_more:
@@ -247,20 +264,27 @@ class ThreadState:
         return {"messages": messages, "next_cursor": next_cursor, "has_more": has_more}
 
     @staticmethod
-    def _events_to_display_messages(events: list[Event]) -> list[dict[str, Any]]:
-        """把单个 Turn 的事件聚合为前端消息，并把工具事实挂到 Assistant 消息。"""
+    def _events_to_display_messages(
+        events: list[Event],
+        turn_status: str = "completed",
+    ) -> list[dict[str, Any]]:
+        """把单个 Turn 的真实事件聚合为前端消息，并规范化工具状态。"""
         messages: list[dict[str, Any]] = []
         calls: list[dict[str, Any]] = []
         call_by_id: dict[str, dict[str, Any]] = {}
+        maintenance_cards: dict[str, dict[str, Any]] = {}
+        last_tool_event: Event | None = None
+        tools_attached = False
         for event in events:
             payload = event.payload or {}
             if event.event_type == "user_message" and payload.get("content"):
                 messages.append({
                     "role": "user", "content": payload["content"],
                     "event_id": event.id, "trace_id": event.trace_id,
-                    "action_cards": [], "tool_calls": [],
+                    "action_cards": [], "pending_operations": [], "tool_calls": [],
                 })
             elif event.event_type == "tool_call":
+                last_tool_event = event
                 call = {
                     "tool_call_id": payload.get("tool_call_id", ""),
                     "name": payload.get("name", ""),
@@ -272,13 +296,32 @@ class ThreadState:
                 if call["tool_call_id"]:
                     call_by_id[str(call["tool_call_id"])] = call
             elif event.event_type == "tool_result":
+                last_tool_event = event
                 call_id = str(payload.get("tool_call_id", "") or "")
                 call = call_by_id.get(call_id)
                 if call is None:
-                    call = next((item for item in reversed(calls) if item["name"] == payload.get("name") and item["status"] == "pending"), None)
-                if call is not None:
-                    call["status"] = payload.get("status", "completed")
-                    call["result"] = payload.get("result")
+                    call = next((
+                        item for item in reversed(calls)
+                        if item["name"] == payload.get("name") and item["status"] == "pending"
+                    ), None)
+                if call is None:
+                    call = {
+                        "tool_call_id": call_id,
+                        "name": payload.get("name", ""),
+                        "params": payload.get("params", {}),
+                        "status": "execution_unknown",
+                        "result": None,
+                    }
+                    calls.append(call)
+                    if call_id:
+                        call_by_id[call_id] = call
+                call["status"] = ThreadState._normalize_tool_status(payload.get("status"))
+                call["result"] = payload.get("result")
+            elif event.event_type == "maintenance_report_terminal":
+                operation_id = str(payload.get("operation_id", "") or "")
+                card = payload.get("card")
+                if operation_id and isinstance(card, dict):
+                    maintenance_cards[operation_id] = card
             elif event.event_type == "llm_response" and payload.get("content"):
                 messages.append({
                     "role": "assistant", "content": payload["content"],
@@ -287,7 +330,45 @@ class ThreadState:
                     "pending_operations": payload.get("pending_operations", []),
                     "tool_calls": calls,
                 })
+                tools_attached = True
+
+        if maintenance_cards:
+            for message in messages:
+                cards = list(message.get("action_cards", []))
+                for index, card in enumerate(cards):
+                    if not isinstance(card, dict) or card.get("card_type") != "maintenance_report":
+                        continue
+                    operation_id = str((card.get("resource_refs") or {}).get("operation_id", "") or "")
+                    if operation_id in maintenance_cards:
+                        cards[index] = maintenance_cards[operation_id]
+                message["action_cards"] = cards
+
+        if turn_status != "running":
+            for call in calls:
+                if call["status"] == "pending":
+                    call["status"] = "execution_unknown"
+
+        if calls and not tools_attached and last_tool_event is not None:
+            messages.append({
+                "role": "assistant", "content": "",
+                "event_id": last_tool_event.id, "trace_id": last_tool_event.trace_id,
+                "action_cards": [], "pending_operations": [], "tool_calls": calls,
+            })
         return messages
+
+    @staticmethod
+    def _normalize_tool_status(status: Any) -> str:
+        """规范化历史工具状态；无法确认时不得声明完成。"""
+        value = str(status or "unknown").lower()
+        if value in {"completed", "committed", "succeeded"}:
+            return "completed"
+        if value in {"failed", "error", "execution_failed"}:
+            return "failed"
+        if value in {"pending", "pending_approval"}:
+            return "pending"
+        if value in {"cancelled", "preempted"}:
+            return "cancelled"
+        return "execution_unknown"
 
     def _query_legacy_groups(
         self, thread_id: str, overscan: int,

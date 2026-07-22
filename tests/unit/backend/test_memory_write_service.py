@@ -8,8 +8,10 @@ from aiive.memory.memory_types import (
     EvidenceItem,
     LifecycleState,
     TrustLevel,
+    WriteOutcome,
 )
-from aiive.memory.memory_write_service import MemoryWriteService
+from aiive.memory.conflict_resolver import ResolutionResult
+from aiive.memory.memory_write_service import MemoryWriteService, WriteResult
 from aiive.db.models import MemoryEvidence, MemoryLineage, MemoryProposal as MemoryProposalModel
 
 _proposal_counter = itertools.count(1)
@@ -29,6 +31,16 @@ def _make_proposal(key: str, content: str, mem_type: str = "user_profile") -> Me
     )
     p.compute_request_idempotency()
     return p
+
+
+class TestWriteResult:
+    def test_failed_outcome_cannot_be_reported_as_written(self):
+        """FAILED 结果不能被兼容字段误报为写入成功。"""
+        result = WriteResult(outcome=WriteOutcome.FAILED, reason="测试失败")
+
+        assert result.written is False
+        assert result.to_dict()["ok"] is False
+        assert result.to_dict()["outcome"] == WriteOutcome.FAILED.value
 
 
 class TestMemoryWriteService:
@@ -60,6 +72,45 @@ class TestMemoryWriteService:
 
         assert result2.operation == "reinforce"
         assert result2.memory_id == result1.memory_id
+
+    def test_ignore_resolution_is_not_reported_as_written(self, db_session, monkeypatch):
+        """ConflictResolver ignore 必须返回 IGNORED，而不是 WRITTEN。"""
+        writer = MemoryWriteService(db_session)
+        proposal = _make_proposal("user.preference.ignore", "忽略内容")
+        monkeypatch.setattr(
+            writer._resolver,
+            "resolve",
+            lambda _proposal, _existing: ResolutionResult(
+                operation="ignore",
+                reason="重复记忆",
+            ),
+        )
+
+        result = writer.write(proposal, run_context=_make_ctx())
+
+        assert result.outcome == WriteOutcome.IGNORED
+        assert result.written is False
+        assert result.operation == "ignore"
+        assert result.memory_id == ""
+
+    def test_duplicate_source_event_returns_reinforce_skipped(self, db_session):
+        """同一 source_event 重放不能被报告为成功强化。"""
+        writer = MemoryWriteService(db_session)
+        proposal = _make_proposal("user.preference.replay", "相同内容")
+        proposal.evidence[0].source_event_id = proposal.source_event_ids[0]
+        created = writer.write(proposal, run_context=_make_ctx())
+        db_session.flush()
+
+        replay = _make_proposal("user.preference.replay", "相同内容")
+        replay.source_event_ids = list(proposal.source_event_ids)
+        replay.evidence[0].source_event_id = proposal.source_event_ids[0]
+        result = writer.write(replay, run_context=_make_ctx("thread-2", "trace-2"))
+
+        assert result.outcome == WriteOutcome.REINFORCE_SKIPPED
+        assert result.written is False
+        assert result.operation == "ignore"
+        assert result.memory_id == created.memory_id
+        assert result.state == LifecycleState.ACTIVE.value
 
     def test_supersede_single_key(self, db_session):
         writer = MemoryWriteService(db_session)

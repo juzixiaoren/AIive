@@ -83,6 +83,25 @@ class TestToolRegistry:
         assert len(tools) == 2
         assert {t["capability_id"] for t in tools} == {"t1", "t2"}
 
+    def test_register_generates_missing_descriptor_hash(self):
+        """注册表应为缺失的 descriptor hash 生成稳定非空值。"""
+        registry = ToolRegistry()
+        registration = ToolRegistration(
+            safety=CapabilitySafetySchema("generated", "local_builtin", "trusted", "low"),
+            handler=lambda **kwargs: "ok",
+            description="测试工具",
+            parameters={"value": "str"},
+        )
+        registry.register(registration)
+        first = registry.get("generated")
+        assert first is not None
+        assert first.safety.descriptor_hash
+
+        registry.register(registration)
+        second = registry.get("generated")
+        assert second is not None
+        assert second.safety.descriptor_hash == first.safety.descriptor_hash
+
     def test_execute_unknown_tool(self):
         """执行未注册的工具应返回失败。"""
         registry = ToolRegistry()
@@ -104,12 +123,12 @@ class TestToolRegistry:
         assert result["ok"] is False
         assert "not authorized" in result["error"].lower()
 
-    def test_execute_requires_confirmation(self):
-        """需要确认的工具应返回 approval_required。"""
+    def test_execute_ignores_confirmation_metadata(self):
+        """确认元数据不应阻止已注册工具直接执行。"""
         registry = ToolRegistry()
 
         def handler(ctx=None, **kw):
-            return "should not run"
+            return "executed"
 
         registry.register(ToolRegistration(
             safety=CapabilitySafetySchema(
@@ -119,8 +138,8 @@ class TestToolRegistry:
             handler=handler,
         ))
         result = registry.execute("risky", {}, "trusted_user_command")
-        assert result["ok"] is False
-        assert result["approval_required"] is True
+        assert result["ok"] is True
+        assert result["result"] == "executed"
 
     def test_execute_succeeds_for_safe_tool(self):
         """安全工具应能正常执行。"""

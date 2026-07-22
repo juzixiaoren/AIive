@@ -45,7 +45,6 @@ def list_personal_signals(db: Session = Depends(get_db)):
                 "content": r.content,
                 "lifecycle_state": r.lifecycle_state,
                 "confidence": r.confidence,
-                "lineage": r.lineage,
                 "created_at": r.created_at.isoformat(),
             }
             for r in records

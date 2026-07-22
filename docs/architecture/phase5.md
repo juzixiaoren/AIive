@@ -659,7 +659,7 @@ rebuild 期间并发更新写双代、切换后不丢失新内容——均经 CO
 forgotten 所有模式禁止且索引文本已清理（#5）；旧数据库启动自动且仅一次入队 bootstrap
 rebuild（#6）；backfill_done 后不再入队（#7）；EpochCheckpoint version 相同但
 source_hashes 不同则过滤（#8）；DEEP Event 不在 manifest 中拒绝展开（#9）；
-DEEP Event hash 变化拒绝展开（#10）；Hot Summary 与 UnifiedRetriever 去重不重复（#11）；
+DEEP Event hash 变化拒绝展开（#10）；Hot Summary 与 UnifiedRetriever 去重不重复（#11，包含已有 summary 的 sealing bridge）；
 SQLite 冲突仅回滚单条插入不破坏整个事务（#12）。
 
 架构数据流详情：

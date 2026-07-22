@@ -62,7 +62,7 @@ cd frontend && npm run dev
   - 立即回复确认（不是 LLM 假装等待）
   - 消息下方出现 📌 执行卡片
 验证：
-  - 查看"工具"Tab，schedule_reminder 在列表中
+  - 查看"能力"Tab 的"已注册工具"，schedule_reminder 在列表中
   - 等待 ~70 秒，原对话中应出现 Agent 主动生成的 "hi" 回复
   - 数据库中对应 Task 应按 pending → dispatching → completed 流转；不能用固定通知代替 Agent 回复
 ```
@@ -128,7 +128,7 @@ cd frontend && npm run dev
 
 ### 4.1 查看工具列表
 ```
-操作：切换"工具"Tab
+操作：切换"能力"Tab
 期望：列出 21 个工具，每个有风险等级、描述
 验证：
   - schedule_reminder (低风险)
@@ -177,7 +177,7 @@ echo "# 测试文档\n\nAIive 是一个个人管家软件。\n\n## 功能\n- 提
 ```
 输入：把 /tmp/test_doc.md 加入知识库
 期望：回复确认已摄入
-验证：查看"工具"Tab → ingest_document 在被调用的卡片中
+验证：查看"能力"Tab → ingest_document 在被调用的卡片中
 ```
 
 ### 6.2 搜索知识库

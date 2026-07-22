@@ -248,18 +248,25 @@ class MemoryMutationExecutor:
                     max_retries=3,
                 ))
 
-        # 写入类事件：markdown 投影
-        if caps.markdown_projection_enabled and event_type in (
-            "memory.created", "memory.reinforced", "memory.merged", "memory.wake"
-        ):
-            self._db.add(OutboxJob(
-                operation_id=f"md:{base_key}:{_uuid.uuid4().hex[:8]}",
-                job_type="memory_markdown_project",
-                status="pending",
-                payload={"memory_id": record.id, "record_version": record.record_version},
-                trace_id=record.id,
-                max_retries=3,
-            ))
+        # 文件投影是全量派生视图；任何记录版本变化都按版本幂等触发重建。
+        if settings.aiive_memory_file_projection_enabled:
+            op_id = f"memory_file_projection:{base_key}"
+            if not any(
+                isinstance(obj, OutboxJob) and obj.operation_id == op_id
+                for obj in self._db.new
+            ) and self._db.query(OutboxJob).filter_by(operation_id=op_id).first() is None:
+                self._db.add(OutboxJob(
+                    operation_id=op_id,
+                    job_type="memory_markdown_project",
+                    status="pending",
+                    payload={
+                        "schema_version": 1,
+                        "memory_id": record.id,
+                        "record_version": record.record_version,
+                    },
+                    trace_id=record.id,
+                    max_retries=3,
+                ))
 
         # 缓存失效
         if caps.cache_projection_enabled and invalidate_cache:

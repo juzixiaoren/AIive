@@ -187,6 +187,97 @@ class TestChatAPI:
         data = response.json()
         assert data["thread_id"]
 
+    def test_post_chat_stream_emits_started_before_done(self, client, monkeypatch):
+        """流式接口应先发送已提交 Turn 的恢复锚点。"""
+        async def fake_execute_turn_stream(self, **_kwargs):
+            yield {
+                "type": "started",
+                "thread_id": "stream-thread",
+                "turn_id": "stream-turn",
+                "trace_id": "stream-trace",
+            }
+            yield {
+                "type": "done",
+                "reply": "流式回复",
+                "event_id": "stream-event",
+                "thread_id": "stream-thread",
+                "trace_id": "stream-trace",
+                "action_cards": [],
+                "pending_operations": [],
+                "tool_calls": [],
+                "tool_results": [],
+                "parse_errors": [],
+            }
+
+        monkeypatch.setattr(
+            "aiive.api.routes_chat.TurnExecutionService.execute_turn_stream",
+            fake_execute_turn_stream,
+        )
+
+        with client.stream("POST", "/api/chat/stream", json={"message": "Hello"}) as response:
+            body = "".join(response.iter_text())
+
+        assert response.status_code == 200
+        assert body.index("event: started") < body.index("event: done")
+        assert '"thread_id": "stream-thread"' in body
+        assert '"trace_id": "stream-trace"' in body
+
+    def test_post_chat_context_budget_error_is_structured(self, client, monkeypatch):
+        """同步预算超限应返回 413 和统一诊断字段。"""
+        monkeypatch.setattr(
+            "aiive.api.routes_chat.TurnExecutionService.execute_turn",
+            lambda self, **_kwargs: {
+                "reply": "",
+                "error": "context_budget_exceeded",
+                "message": "上下文超过模型安全预算",
+                "retryable": False,
+                "safe_tokens": 120,
+                "context_window": 100,
+                "hard_input_limit": 90,
+                "partition_reports": [{"name": "recent_messages"}],
+                "_status": 413,
+            },
+        )
+
+        response = client.post("/api/chat", json={"message": "Hello"})
+
+        assert response.status_code == 413
+        detail = response.json()["detail"]
+        assert detail["code"] == "context_budget_exceeded"
+        assert detail["status"] == 413
+        assert detail["hard_input_limit"] == 90
+        assert detail["partition_reports"] == [{"name": "recent_messages"}]
+
+    def test_post_chat_stream_context_budget_error_is_structured(self, client, monkeypatch):
+        """SSE 预算超限保持 HTTP 200，但事件业务状态必须为 413。"""
+        async def fake_execute_turn_stream(self, **_kwargs):
+            yield {
+                "type": "error",
+                "error": "context_budget_exceeded",
+                "message": "上下文超过模型安全预算",
+                "retryable": False,
+                "trace_id": "budget-trace",
+                "_status": 413,
+                "safe_tokens": 120,
+                "context_window": 100,
+                "hard_input_limit": 90,
+                "partition_reports": [{"name": "recent_messages"}],
+            }
+
+        monkeypatch.setattr(
+            "aiive.api.routes_chat.TurnExecutionService.execute_turn_stream",
+            fake_execute_turn_stream,
+        )
+
+        with client.stream("POST", "/api/chat/stream", json={"message": "Hello"}) as response:
+            body = "".join(response.iter_text())
+
+        assert response.status_code == 200
+        assert "event: error" in body
+        assert '"status": 413' in body
+        assert '"hard_input_limit": 90' in body
+        assert '"trace_id": "budget-trace"' in body
+
     def test_post_chat_empty_message_rejected(self, client):
         """空消息应被拒绝（422）。"""
         response = client.post("/api/chat", json={"message": ""})

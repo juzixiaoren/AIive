@@ -130,8 +130,7 @@
 
 | 位置 | 方式 | 是否合规 |
 |------|------|----------|
-| `MemoryStore.update_lifecycle()`（`memory_store.py:93`） | 直接赋值 + `updated_at` | ✅ 设计为唯一 sanctioned mutator，仅 `MemoryWriteService` 调用 |
-| `MemoryStore.update_validity()`（`memory_store.py:101`） | 直接赋值 | ✅ 同上 |
+| `MemoryStore.update_lifecycle()` / `update_validity()` | 旧的直接状态写入旁路已删除 | ✅ 生命周期与有效性变更统一经 `MemoryLifecycleService` 和共享 executor |
 | `MemoryWriteService.promote` / `_execute_promote_candidate` | 委托 `MemoryLifecycleService.promote` → executor 加锁 + `record_version+=1` + lineage + 投影 | ✅ 走共享 executor，带 `record_state_hash`/`decision_hash` 校验（单向依赖，不在 WriteService 内直接改 lifecycle） |
 | `MemoryWriteService.forget` | `record.lifecycle_state = FORGOTTEN` | ⚠️ 内部，Phase 4 范围之外 |
 | `MemoryWriteService.execute_maintenance` | 委托 `MemoryLifecycleService.sleep/archive/wake` → executor | ✅ 单条、带版本校验 + lineage + 投影，消除无版本校验旁路 |

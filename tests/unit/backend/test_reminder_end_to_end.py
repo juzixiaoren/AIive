@@ -101,6 +101,7 @@ def test_reminder_handler_requires_agent_success(db_session, monkeypatch):
     claimed = _claim(db_session, job)
     fake_result = {
         "reply": "该喝水了。",
+        "event_id": "assistant-event-1",
         "thread_id": task.thread_id,
         "trace_id": "agent-trace",
         "action_cards": [],
@@ -124,6 +125,7 @@ def test_reminder_handler_requires_agent_success(db_session, monkeypatch):
     assert execute_turn.call_count == 1
     assert execute_turn.call_args.kwargs["turn_id"]
     assert broadcast.call_args.args[2]["reply"] == "该喝水了。"
+    assert broadcast.call_args.args[2]["event_id"] == "assistant-event-1"
     assert db_session.query(Event).filter(Event.event_type == "reminder_triggered").count() == 1
     assert db_session.query(Event).filter(Event.event_type == "notification_created").count() == 0
 

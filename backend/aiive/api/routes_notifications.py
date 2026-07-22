@@ -7,19 +7,22 @@ API路由模块：通知管理
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from aiive.api.ws_manager import ws_manager
 from aiive.db.base import get_db
-from aiive.db.models import Event
+from aiive.db.models import Event, OutboxJob, Task
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
 
-# 未执行状态：待提醒、提醒中、已延时
+# 通知事件状态，仅用于通知读模型筛选。
 PENDING_STATUSES = ["pending", "alerting", "snoozed"]
 # 已执行状态：已确认、已取消
 DONE_STATUSES = ["confirmed", "cancelled"]
+# Task 状态机中仍可能被取消的状态。
+CANCELLABLE_TASK_STATUSES = frozenset({"pending", "dispatching"})
 
 
 def count_pending_notifications(db: Session) -> int:
@@ -110,8 +113,6 @@ def delete_notification(notification_id: str, db: Session = Depends(get_db)):
     Returns:
         ok 为 True 表示成功，False 表示通知不存在
     """
-    from aiive.db.models import Task
-
     event = (
         db.query(Event)
         .filter(
@@ -130,10 +131,18 @@ def delete_notification(notification_id: str, db: Session = Depends(get_db)):
 
     task_cancelled = False
     if task_id:
-        task = db.get(Task, task_id)
-        if task is not None and task.status in PENDING_STATUSES:
+        task = db.query(Task).filter(Task.id == str(task_id)).with_for_update().first()
+        if task is not None and task.status in CANCELLABLE_TASK_STATUSES:
             task.status = "cancelled"
             task_cancelled = True
+            db.query(OutboxJob).filter(
+                OutboxJob.operation_id == f"reminder_delivery:{task.id}",
+                OutboxJob.status == "pending",
+            ).update({
+                OutboxJob.status: "cancelled",
+                OutboxJob.terminal_reason: "task_cancelled",
+                OutboxJob.terminal_at: func.now(),
+            }, synchronize_session=False)
 
         related = (
             db.query(Event)

@@ -132,7 +132,11 @@ export default function DeveloperPage({ selectedTraceId }: { selectedTraceId?: s
         </div>
         {epoch && (
           <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
-            <div className="bg-surface-muted rounded-lg p-2"><p className="text-faint">Epoch</p><p className="font-mono text-title break-all">{epoch.active_epoch_no ?? "-"}</p></div>
+            <div className="bg-surface-muted rounded-lg p-2" title={epoch.active_epoch_id || undefined}>
+              <p className="text-faint">Epoch</p>
+              <p className="font-mono text-title break-all">{epoch.active_epoch_no == null ? "-" : `#${epoch.active_epoch_no}`}</p>
+              <p className="font-mono text-[10px] text-faint break-all">{epoch.active_epoch_id?.slice(0, 8) || "-"}</p>
+            </div>
             <div className="bg-surface-muted rounded-lg p-2"><p className="text-faint">Open Segment</p><p className="font-mono text-title break-all">{epoch.open_segment_id?.slice(0, 8) || "-"}</p></div>
             <div className="bg-surface-muted rounded-lg p-2"><p className="text-faint">Segment 状态</p><p className="font-mono text-title">{epoch.open_segment_status || "-"}</p></div>
             <div className="bg-surface-muted rounded-lg p-2"><p className="text-faint">已密封</p><p className="font-mono text-title">{epoch.sealed_segment_count}</p></div>
@@ -172,8 +176,8 @@ export default function DeveloperPage({ selectedTraceId }: { selectedTraceId?: s
             <details key={call.id} className="bg-surface border border-divider rounded-lg p-3">
               <summary className="cursor-pointer text-xs text-content">{call.model} · {call.latency_ms}ms</summary>
               <div className="mt-3 space-y-2">
-                <pre className="max-h-56 overflow-auto text-[11px] text-code bg-background rounded-lg p-3 whitespace-pre-wrap">输入预览\n{call.input_preview || "-"}</pre>
-                <pre className="max-h-56 overflow-auto text-[11px] text-code bg-background rounded-lg p-3 whitespace-pre-wrap">输出预览\n{call.output_preview || "-"}</pre>
+                <pre className="max-h-56 overflow-auto text-[11px] text-code bg-background rounded-lg p-3 whitespace-pre-wrap">输入预览{"\n"}{call.input_preview || "-"}</pre>
+                <pre className="max-h-56 overflow-auto text-[11px] text-code bg-background rounded-lg p-3 whitespace-pre-wrap">输出预览{"\n"}{call.output_preview || "-"}</pre>
               </div>
             </details>
           ))}

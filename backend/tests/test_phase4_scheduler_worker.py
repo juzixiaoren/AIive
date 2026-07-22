@@ -23,6 +23,7 @@ import pytest
 
 from aiive.db.base import SessionLocal
 from aiive.db.models import (
+    Event,
     MemoryMaintenanceBatch,
     MemoryMaintenanceRun,
     MemoryRecord,
@@ -30,9 +31,11 @@ from aiive.db.models import (
     Thread,
 )
 from aiive.memory.memory_types import LifecycleState
+from aiive.context.run_context import RunContext
 from aiive.tools.builtin_tools import _handle_run_memory_maintenance
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome
 from aiive.worker.outbox_handlers import handle_memory_maintenance
+from aiive.runtime.thread_state import ThreadState
 from aiive.worker.outbox_worker import OutboxWorker
 from aiive.worker.scheduler_daemon import (
     _maintenance_scanner_job,
@@ -97,7 +100,7 @@ def _make_running_job(db, token, op_id=None, retry_count=0):
         operation_id=op_id,
         job_type="memory_maintenance",
         status="running",
-        payload={"schema_version": 1},
+        payload={"schema_version": 1, "operation_id": op_id},
         max_retries=3,
         retry_count=retry_count,
         claim_token=token,
@@ -218,11 +221,33 @@ def test_tool_run_memory_maintenance_enqueues(db):
     """#39 工具真正 enqueue Job（而非仅返回统计）。"""
     _mk_record(db, lifecycle_state=LifecycleState.ACTIVE.value)
     db.commit()
-    result = _handle_run_memory_maintenance(db)
+    ctx = RunContext(
+        thread_id="t-maintenance",
+        trace_id="trace-maintenance",
+        turn_id="turn-maintenance",
+        turn_record_id="turn-record-maintenance",
+    )
+    original = getattr(_handle_run_memory_maintenance, "_aiive_db_handler")
+    result = original(db, ctx)
     assert result["enqueued"] is True
-    assert result["operation_id"] is not None
-    assert db.query(OutboxJob).filter(
-        OutboxJob.operation_id == result["operation_id"]).count() == 1
+    assert result["maintenance_operation_id"] is not None
+    assert result["pre_enqueue_scan"]["total_scanned"] == 1
+    job = db.query(OutboxJob).filter(
+        OutboxJob.operation_id == result["maintenance_operation_id"],
+    ).one()
+    assert job.payload["thread_id"] == "t-maintenance"
+    assert job.payload["turn_id"] == "turn-maintenance"
+    assert job.payload["trace_id"] == "trace-maintenance"
+
+
+def test_maintenance_tool_is_registered_as_persistent_side_effect():
+    """维护入队必须走 ToolOperation，不能在线程池中假装只读执行。"""
+    from aiive.tools.registry import get_tool_registry
+
+    registration = get_tool_registry().get("run_memory_maintenance")
+    assert registration is not None
+    assert registration.safety.writes_external_world is True
+    assert registration.safety.effect_mode == "db_transactional"
 
 
 # ───────────────────────── Worker：CONTINUE / deadletter / fencing ─────────────────────────
@@ -284,6 +309,72 @@ def test_deadletter_atomic_run_and_batches(db):
         assert s.get(OutboxJob, job.id).status == "deadletter"
         assert s.get(MemoryMaintenanceRun, run.id).status == "deadletter"
         assert s.get(MemoryMaintenanceBatch, batch.id).status == "deadletter"
+    finally:
+        s.close()
+
+
+def test_maintenance_deadletter_persists_terminal_card_event(db):
+    """维护 deadletter 与 failed 卡片事实必须在同一终态事务提交。"""
+    token = str(uuid.uuid4())
+    job, op_id = _make_running_job(db, token)
+    job.payload = {
+        "schema_version": 1,
+        "operation_id": op_id,
+        "thread_id": "maintenance-thread",
+        "turn_id": "maintenance-turn",
+        "trace_id": "maintenance-trace",
+    }
+    db.add(Thread(id="maintenance-thread"))
+    run = MemoryMaintenanceRun(
+        id=str(uuid.uuid4()), outbox_job_id=job.id, operation_id=op_id,
+        scope_type="all_user_memories", cutoff_updated_at=_now(),
+        status="running", execution_token=token,
+    )
+    db.add(run)
+    db.commit()
+
+    _make_worker()._deadletter_job_and_ingestion_run(
+        _claimed(job, token), ingestion_run_id=run.id,
+        error="maintenance boom", terminal_reason="test",
+    )
+
+    s = SessionLocal()
+    try:
+        event = s.query(Event).filter(
+            Event.event_type == "maintenance_report_terminal",
+            Event.turn_id == "maintenance-turn",
+        ).one()
+        assert event.payload["status"] == "failed"
+        assert event.payload["card"]["card_type"] == "maintenance_report"
+        assert event.payload["card"]["resource_refs"]["operation_id"] == op_id
+        assert event.payload["card"]["payload_preview"]["result"]["error"] == "maintenance boom"
+        llm_event = Event(
+            id="maintenance-llm-event",
+            trace_id="maintenance-trace",
+            thread_id="maintenance-thread",
+            event_type="llm_response",
+            turn_id="maintenance-turn",
+            payload={
+                "content": "维护已启动",
+                "action_cards": [{
+                    "card_type": "maintenance_report",
+                    "title": "记忆维护已入队",
+                    "summary": "后台维护正在执行",
+                    "trace_id": "maintenance-trace",
+                    "event_ids": [],
+                    "resource_refs": {"operation_id": op_id},
+                    "status": "pending",
+                    "payload_preview": {"pre_enqueue_scan": {"total_scanned": 1}},
+                    "reminder_id": "",
+                    "actions": [],
+                }],
+            },
+        )
+        events = [llm_event, event]
+        messages = ThreadState._events_to_display_messages(events)
+        card = messages[0]["action_cards"][0]
+        assert card["status"] == "failed"
+        assert card["payload_preview"]["result"]["error"] == "maintenance boom"
     finally:
         s.close()
 

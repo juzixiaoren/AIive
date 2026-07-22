@@ -110,6 +110,63 @@ class TestThreadMessagesAPI:
         assert data["messages"][1]["action_cards"] == [{"trace_id": "trace-history-1"}]
         assert data["messages"][1]["tool_calls"][0]["tool_call_id"] == "call-history-1"
 
+    def test_messages_returns_interrupted_tool_facts_without_llm_response(
+        self, client, db_session,
+    ):
+        """中断 Turn 即使没有模型回复，也应返回真实的待确认工具卡片。"""
+        thread = Thread(id="thread-history-interrupted")
+        db_session.add(thread)
+        db_session.add(TurnRecord(
+            thread_id=thread.id,
+            turn_id="turn-history-interrupted",
+            turn_sequence=1,
+            status="interrupted_unknown",
+            request_fingerprint="fp-history-interrupted",
+        ))
+        db_session.flush()
+        db_session.add_all([
+            Event(
+                trace_id="trace-history-interrupted",
+                thread_id=thread.id,
+                turn_id="turn-history-interrupted",
+                turn_event_index=0,
+                event_type="user_message",
+                payload={"content": "执行未确认任务"},
+            ),
+            Event(
+                trace_id="trace-history-interrupted",
+                thread_id=thread.id,
+                turn_id="turn-history-interrupted",
+                turn_event_index=1,
+                event_type="tool_call",
+                payload={"name": "demo", "params": {}, "tool_call_id": "call-interrupted"},
+            ),
+            Event(
+                trace_id="trace-history-interrupted",
+                thread_id=thread.id,
+                turn_id="turn-history-interrupted",
+                turn_event_index=2,
+                event_type="tool_result",
+                payload={
+                    "name": "demo",
+                    "result": {"ok": False},
+                    "status": "running",
+                    "tool_call_id": "call-interrupted",
+                },
+            ),
+        ])
+        db_session.flush()
+
+        response = client.get(f"/api/threads/{thread.id}/messages?page_size=50")
+
+        assert response.status_code == 200
+        messages = response.json()["messages"]
+        assert [message["role"] for message in messages] == ["user", "assistant"]
+        assert messages[1]["content"] == ""
+        assert messages[1]["trace_id"] == "trace-history-interrupted"
+        assert messages[1]["tool_calls"][0]["status"] == "execution_unknown"
+        assert messages[1]["tool_calls"][0]["tool_call_id"] == "call-interrupted"
+
 
 class TestSafeDeleteAPIThreadFK:
     """测试 POST /api/tools/safe-delete 的事件记录外键健壮性。"""

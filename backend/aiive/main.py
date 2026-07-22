@@ -161,7 +161,7 @@ def create_app() -> FastAPI:
             logger.exception("检索索引历史 backfill 引导失败")
         try:
             from aiive.runtime.context_budget import ContextBudget
-            ContextBudget.default().validate()
+            ContextBudget.from_env()
         except Exception:
             logger.exception("ContextBudget 启动校验失败")
         from aiive.config import settings

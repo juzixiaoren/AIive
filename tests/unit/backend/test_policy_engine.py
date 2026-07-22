@@ -1,7 +1,6 @@
 """测试 PolicyEngine（策略引擎）的批次判定逻辑。
 
-回归覆盖 P0 问题 3：被阻止（含未知）工具混入批次时，
-无论同批是否还有允许/确认工具，都必须阻止整批次。
+当前所有已注册工具直接通过；未注册工具混入批次时仍阻止整批次。
 """
 
 from aiive.runtime.policy_engine import PolicyAction, check_tool_calls
@@ -47,10 +46,9 @@ class TestPolicyBatchBlocking:
         assert result.action == PolicyAction.BLOCK
         assert "unknown_tool" in result.blocked_tools
 
-    def test_blocked_and_confirm_blocked(self):
-        """批次同时含未知工具与需确认工具时，整批次必须阻止。"""
+    def test_unknown_and_high_risk_blocked(self):
+        """高风险工具可直通，但同批未知工具仍使整批阻止。"""
         registry = ToolRegistry()
-        _register(registry, "known")
         _register(registry, "danger", risk_level="high")
         result = check_tool_calls(
             [
@@ -60,35 +58,34 @@ class TestPolicyBatchBlocking:
             registry=registry,
         )
         assert result.action == PolicyAction.BLOCK
-        assert "unknown_tool" in result.blocked_tools
+        assert result.allowed_tools == ["danger"]
+        assert result.blocked_tools == ["unknown_tool"]
 
-    def test_allowed_and_confirm_blocked(self):
-        """批次同时含允许与需确认工具时，为安全起见阻止整批次。"""
+    def test_all_registered_risk_metadata_allowed(self):
+        """所有已注册工具均应忽略风险和确认元数据直接通过。"""
         registry = ToolRegistry()
-        _register(registry, "known")
-        _register(registry, "danger", risk_level="high")
+        _register(registry, "normal")
+        _register(registry, "high_risk", risk_level="high")
+        _register(registry, "destructive", can_delete=True)
+        _register(registry, "external_write", risk_level="medium", writes_external_world=True)
+        _register(registry, "confirmation_marked", requires_confirmation=True)
+        tool_names = [
+            "normal", "high_risk", "destructive", "external_write", "confirmation_marked",
+        ]
         result = check_tool_calls(
             [
-                {"name": "known", "args": {}, "id": "1"},
-                {"name": "danger", "args": {}, "id": "2"},
+                {"name": name, "args": {}, "id": str(index)}
+                for index, name in enumerate(tool_names)
             ],
             registry=registry,
         )
-        assert result.action == PolicyAction.BLOCK
+        assert result.action == PolicyAction.ALLOW
+        assert result.allowed_tools == tool_names
+        assert result.confirm_tools == []
+        assert result.blocked_tools == []
 
-    def test_only_confirm_allowed(self):
-        """仅含确认工具（无允许、无阻止）时返回 CONFIRM。"""
-        registry = ToolRegistry()
-        _register(registry, "danger", risk_level="high")
-        result = check_tool_calls(
-            [{"name": "danger", "args": {}, "id": "1"}],
-            registry=registry,
-        )
-        assert result.action == PolicyAction.CONFIRM
-        assert "danger" in result.confirm_tools
-
-    def test_only_allowed_allowed(self):
-        """仅含允许工具时返回 ALLOW。"""
+    def test_only_registered_tool_allowed(self):
+        """仅含普通已注册工具时返回 ALLOW。"""
         registry = ToolRegistry()
         _register(registry, "known")
         result = check_tool_calls(

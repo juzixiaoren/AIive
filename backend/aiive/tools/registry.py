@@ -13,7 +13,7 @@ import hashlib
 import inspect
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 from aiive.config import settings
@@ -139,11 +139,35 @@ class ToolRegistry:
         self._tools: dict[str, ToolRegistration] = {}
 
     def register(self, reg: ToolRegistration) -> None:
-        """注册一个工具。
+        """注册工具，并为缺失的安全描述指纹生成稳定值。
 
         参数:
             reg: 工具注册条目
         """
+        if not reg.safety.descriptor_hash:
+            safety_payload = {
+                "capability_id": reg.safety.capability_id,
+                "definition_source": reg.safety.definition_source,
+                "definition_trust_level": reg.safety.definition_trust_level,
+                "risk_level": reg.safety.risk_level,
+                "requires_confirmation": reg.safety.requires_confirmation,
+                "writes_external_world": reg.safety.writes_external_world,
+                "can_access_secret": reg.safety.can_access_secret,
+                "can_delete": reg.safety.can_delete,
+                "allowed_instruction_sources": reg.safety.allowed_instruction_sources,
+                "tool_description_is_instruction": reg.safety.tool_description_is_instruction,
+                "timeout_seconds": reg.safety.timeout_seconds,
+                "effect_mode": reg.safety.effect_mode,
+                "description": reg.description,
+                "parameters": reg.parameters,
+            }
+            reg = replace(
+                reg,
+                safety=replace(
+                    reg.safety,
+                    descriptor_hash=compute_descriptor_hash(safety_payload),
+                ),
+            )
         self._tools[reg.safety.capability_id] = reg
 
     def get(self, capability_id: str) -> ToolRegistration | None:
@@ -179,34 +203,6 @@ class ToolRegistry:
             for r in self._tools.values()
         ]
 
-    def render_tool_schemas(self) -> str:
-        """生成工具 schema 文本，用于注入 system prompt。
-
-        每个工具渲染为：名称(参数)、描述、风险标签、副作用标记、确认要求。
-
-        返回:
-            格式化的工具 schema 文本
-        """
-        lines = ["## Tools"]
-        for i, reg in enumerate(self._tools.values(), 1):
-            safety = reg.safety
-            params = reg.parameters
-            param_str = ", ".join(f"{k}: {v}" for k, v in params.items()) if params else ""
-            lines.append(f"{i}. {safety.capability_id}({param_str})")
-            lines.append(f"   {reg.description}")
-            side_effect = safety.writes_external_world or safety.can_delete
-            flags = []
-            flags.append(f"risk: {safety.risk_level}")
-            if side_effect:
-                flags.append("side_effect: true")
-            else:
-                flags.append("side_effect: false")
-            if safety.requires_confirmation:
-                flags.append("requires_confirmation: true")
-            lines.append(f"   [{', '.join(flags)}]")
-            lines.append("")
-        return "\n".join(lines)
-
     def execute(
         self,
         capability_id: str,
@@ -215,11 +211,11 @@ class ToolRegistry:
         run_context: RunContext | None = None,
         tool_call_id: str = "",
     ) -> dict[str, Any]:
-        """执行工具调用，包含三道安全守卫。
+        """执行工具调用，保留来源授权、执行身份和超时守卫。
 
-        守卫 1: 检查指令来源是否被授权
-        守卫 2: 检查是否需要用户确认（需要时直接拒绝，等待确认后再调用）
-        守卫 3: 超时保护 — 工具执行超过阈值自动中断并返回超时结果给 LLM
+        当前关闭用户审批，已注册工具不会因 requires_confirmation 被拒绝。
+        工具执行仍需通过指令来源授权；副作用工具还需持久化执行身份，
+        并统一进入 operation 执行链。
 
         Args:
             capability_id: 工具能力标识符
@@ -228,7 +224,7 @@ class ToolRegistry:
             run_context: 运行时上下文（RunContext），注入到 handler 的 ctx 参数
 
         Returns:
-            包含 ok、result（或 error/approval_required/timeout）的字典
+            包含 ok、result（或 error/timeout）的字典
         """
         logger.info("[TRACE:registry] EXECUTE tool=%s params=%s source=%s", capability_id, params, instruction_source)
         reg = self.get(capability_id)
@@ -243,15 +239,6 @@ class ToolRegistry:
                 "error": "Instruction source not authorized for this tool",
                 "source": instruction_source,
                 "allowed": reg.safety.allowed_instruction_sources,
-            }
-
-        if reg.safety.requires_confirmation:
-            logger.info("[TRACE:registry] CONFIRMATION_REQUIRED tool=%s", capability_id)
-            return {
-                "ok": False,
-                "approval_required": True,
-                "tool": capability_id,
-                "params": params,
             }
 
         timeout = reg.safety.timeout_seconds or DEFAULT_TOOL_TIMEOUT
@@ -319,6 +306,12 @@ class ToolRegistry:
                 "ok": False,
                 "error": "原始用户指令无权调用该工具",
                 "error_type": "unauthorized_source",
+            }
+        if not reg.safety.descriptor_hash or not expected_descriptor_hash:
+            return {
+                "ok": False,
+                "error": "工具审批缺少有效的定义指纹",
+                "error_type": "missing_descriptor_hash",
             }
         if reg.safety.descriptor_hash != expected_descriptor_hash:
             return {

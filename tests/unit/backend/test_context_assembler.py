@@ -6,7 +6,10 @@
 - pending_seal 语义（软阈值触发，而非"发生过裁剪"）
 - ContextBudget.from_env 配置覆盖
 """
+import pytest
+
 from aiive.runtime.context_assembler import ContextAssembler
+from aiive.db.models import Epoch, Segment, SegmentSummary, Thread
 from aiive.runtime.context_budget import ContextBudget
 from aiive.runtime.token_models import TokenCount
 
@@ -81,6 +84,85 @@ def test_multiple_tool_call_ids_each_paired():
     assert set(tid_ids) == {"c1", "c2"}
 
 
+def test_collect_hot_history_ids_includes_sealing_bridge_summary(db_session):
+    """sealing bridge 已加载的 summary 必须从 UnifiedRetriever 排除。"""
+    thread = Thread(id="thread-sealing-hot")
+    epoch = Epoch(id="epoch-sealing-hot", thread_id=thread.id, epoch_no=1, status="active")
+    segment = Segment(
+        id="segment-sealing-hot",
+        thread_id=thread.id,
+        epoch_id=epoch.id,
+        segment_no=1,
+        start_turn_sequence=1,
+        status="sealing",
+        summary_id="summary-sealing-hot",
+    )
+    summary = SegmentSummary(
+        id="summary-sealing-hot",
+        segment_id=segment.id,
+        summary_version=1,
+        source_turn_ids=[],
+    )
+    db_session.add_all([thread, epoch, segment, summary])
+    db_session.flush()
+    assembler = ContextAssembler(token_counter=_FakeTokenCounter(), budget=ContextBudget.DEFAULT)
+
+    hot_ids = assembler._collect_hot_history_ids(db_session, thread)  # pyright: ignore[reportPrivateUsage]
+
+    assert summary.id in hot_ids
+
+
+def test_message_normalization_accepts_new_and_legacy_tool_formats():
+    """共享规范化应让新旧工具格式生成相同的稳定消息契约。"""
+    legacy = ContextAssembler._dicts_to_chat_messages([
+        {
+            "type": "tool_call", "tool_name": "search", "tool_params": {"q": "x"},
+            "tool_call_id": "call-1", "event_id": "event-1",
+        },
+        {
+            "type": "tool_result", "tool_name": "search", "tool_result": "ok",
+            "tool_call_id": "call-1", "event_id": "event-2",
+        },
+    ])
+    modern = ContextAssembler._dicts_to_chat_messages([
+        {
+            "type": "tool_call",
+            "id": "call-1",
+            "function": {"name": "search", "arguments": '{"q":"x"}'},
+        },
+        {
+            "type": "tool_result", "id": "call-1", "name": "search", "result": "ok",
+        },
+    ])
+
+    assert legacy == modern
+
+
+def test_langchain_conversion_tolerates_malformed_tool_arguments():
+    """畸形工具参数应保留原文，不得中断 LangChain 历史重建。"""
+    from aiive.runtime.agent_graph import AgentGraph
+
+    messages = AgentGraph._dicts_to_langchain_messages([  # pyright: ignore[reportPrivateUsage]
+        {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call-bad",
+                "type": "function",
+                "function": {"name": "search", "arguments": "{bad-json"},
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-bad",
+            "name": "search",
+            "content": "error",
+        },
+    ])
+
+    assert messages[0].tool_calls[0]["args"] == {"raw_arguments": "{bad-json"}
+    assert messages[1].tool_call_id == "call-bad"
+
+
 def test_build_reports_includes_per_partition_and_total():
     """审查项 3: _build_reports 应产出每个分区及 total 汇总。"""
     asm = ContextAssembler(token_counter=_FakeTokenCounter(), budget=ContextBudget.DEFAULT)
@@ -91,6 +173,9 @@ def test_build_reports_includes_per_partition_and_total():
         stable_contract_text="contract",
         core_memory_text="core",
         working_state_text="ws",
+        epoch_checkpoint_text="checkpoint",
+        segment_summary_text="summary",
+        sealing_bridge_text="bridge",
         recall_text="recall",
         history_msgs=[{"role": "user", "content": "hi"}],
         tools_schema=[{"type": "function", "function": {"name": "x"}}],
@@ -98,7 +183,8 @@ def test_build_reports_includes_per_partition_and_total():
     names = {r.name for r in reports}
     # 7 个分区 + total
     expected = {
-        "stable_contract", "core_memory", "working_state", "retrieved_memory",
+        "stable_contract", "core_memory", "working_state", "epoch_checkpoint",
+        "segment_summaries", "sealing_bridge", "retrieved_memory",
         "recent_messages", "tool_definitions", "tool_results", "total",
     }
     assert expected.issubset(names)
@@ -125,3 +211,25 @@ def test_context_budget_from_env_override(monkeypatch):
     assert budget.tool_results.hard_limit_tokens == 5000
     # 其他分区不受影响
     assert budget.stable_contract.soft_limit_tokens == ContextBudget.DEFAULT.stable_contract.soft_limit_tokens
+
+
+def test_context_budget_from_env_rejects_invalid_limit(monkeypatch):
+    """环境覆盖包含非整数 token 上限时必须在加载阶段明确失败。"""
+    monkeypatch.setenv(
+        "AIIVE_CONTEXT_BUDGET_JSON",
+        '{"tool_results": {"hard_limit_tokens": "invalid"}}',
+    )
+
+    with pytest.raises(ValueError, match="包含无效的 token 上限"):
+        ContextBudget.from_env()
+
+
+def test_context_budget_from_env_validates_partition_total(monkeypatch):
+    """环境覆盖使分区总额超过窗口时必须立即失败。"""
+    monkeypatch.setenv(
+        "AIIVE_CONTEXT_BUDGET_JSON",
+        '{"tool_results": {"hard_limit_tokens": 999999}}',
+    )
+
+    with pytest.raises(ValueError, match="超过"):
+        ContextBudget.from_env()
