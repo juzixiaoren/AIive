@@ -386,6 +386,22 @@ class TestGraphFlow:
 class TestToolRecordState:
     """测试同步与流式共用的 Graph 工具事实转换。"""
 
+    def test_receipt_parser_has_single_status_contract(self):
+        """统一回执解析器应覆盖成功、失败和状态未知。"""
+        from aiive.runtime.agent_graph import parse_tool_execution_receipt
+
+        completed = parse_tool_execution_receipt('{"ok": true, "result": "done"}')
+        failed = parse_tool_execution_receipt('{"ok": false, "error_type": "denied"}')
+        unknown = parse_tool_execution_receipt(
+            '{"ok": true, "execution_status": "queued", "operation_id": "op-1"}'
+        )
+        text_error = parse_tool_execution_receipt("Error: invalid arguments")
+
+        assert completed.status == "completed" and completed.ok is True
+        assert failed.status == "failed" and failed.error_type == "denied"
+        assert unknown.status == "execution_unknown" and unknown.operation_id == "op-1"
+        assert text_error.status == "failed" and text_error.ok is False
+
     def test_state_records_preserve_ids_batches_and_order(self):
         """转换器应保留调用 ID、批次并生成稳定全局顺序。"""
         from aiive.runtime.agent_graph import AgentGraph

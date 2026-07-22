@@ -168,7 +168,19 @@ def execute_phase_a_shield(
     if memory_ids:
         _tombstone_retrieval_entries(session, memory_ids, now)
 
-    # 10. enqueue Cascade OutboxJob + ForgetStageRun
+    # 10. 遗忘 Shield 生效后重建文件投影，确保宽选择器也立即从派生视图隐藏。
+    from aiive.config import settings
+    if settings.aiive_memory_file_projection_enabled:
+        session.add(OutboxJob(
+            operation_id=f"forget:{op_id}:file_projection",
+            job_type="memory_markdown_project",
+            status="pending",
+            payload={"schema_version": 1, "forget_operation_id": op_id},
+            trace_id=op_id,
+            max_retries=3,
+        ))
+
+    # 11. enqueue Cascade OutboxJob + ForgetStageRun
     cascade_op_id = f"forget:{op_id}:cascade"
     cascade_job = OutboxJob(
         operation_id=cascade_op_id,

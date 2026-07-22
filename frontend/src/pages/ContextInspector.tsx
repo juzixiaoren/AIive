@@ -25,6 +25,25 @@ type InjectedMemory = {
   memory_type: string;
 };
 
+type ContextSnapshot = {
+  stable_prefix_hash: string;
+  context_items: ContextItem[];
+  meta: Record<string, unknown>;
+  token_total?: number;
+};
+
+type ContextRunResponse = {
+  trace_id: string;
+  snapshots: ContextSnapshot[];
+};
+
+type ContextItemDetailResponse = {
+  item_id: string;
+  full_content: string;
+};
+
+type LoadState = "idle" | "loading" | "ready" | "not_found" | "error";
+
 /** 上下文类型的中文标签和样式映射 */
 const KIND_META: Record<string, { label: string; bg: string; text: string; border: string }> = {
   stable_prefix:      { label: "系统前缀",  bg: "bg-accent-soft", text: "text-accent-text", border: "border-accent-border" },
@@ -63,7 +82,8 @@ const SOURCE_LABEL: Record<string, string> = {
  * @param traceId - 要检查的 trace ID，由外部传入
  */
 export default function ContextInspector({ traceId }: { traceId?: string }) {
-  const [data, setData] = useState<Record<string, unknown> | null>(null);
+  const [data, setData] = useState<ContextRunResponse | null>(null);
+  const [loadState, setLoadState] = useState<LoadState>("idle");
   const [error, setError] = useState("");
   const [expanded, setExpanded] = useState<number | null>(null);
   const [modalItem, setModalItem] = useState<ContextItem | null>(null);
@@ -80,33 +100,60 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
 
   // 当 traceId 变化时，从后端加载上下文快照
   useEffect(() => {
-    if (traceId) {
-      setError("");
-      setExpanded(null);
-      setModalItem(null);
-      setFullContents({});
-      fetch(`/api/context-runs/${traceId}`)
-        .then(r => { if (!r.ok) throw new Error(`${r.status}`); return r.json(); })
-        .then(setData)
-        .catch(e => setError(`加载失败: ${e.message}`));
+    const controller = new AbortController();
+    setData(null);
+    setError("");
+    setExpanded(null);
+    setModalItem(null);
+    setFullContents({});
+    setLoadingItem(null);
+    if (!traceId) {
+      setLoadState("idle");
+      return () => controller.abort();
     }
+
+    setLoadState("loading");
+    fetch(`/api/context-runs/${encodeURIComponent(traceId)}`, { signal: controller.signal })
+      .then(async response => {
+        if (response.status === 404) {
+          setLoadState("not_found");
+          return null;
+        }
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json() as Promise<ContextRunResponse>;
+      })
+      .then(result => {
+        if (result) {
+          setData(result);
+          setLoadState("ready");
+        }
+      })
+      .catch(reason => {
+        if (reason instanceof DOMException && reason.name === "AbortError") return;
+        setError(`加载失败: ${reason instanceof Error ? reason.message : "未知错误"}`);
+        setLoadState("error");
+      });
+    return () => controller.abort();
   }, [traceId]);
 
   /** 懒加载某条上下文项的完整内容 */
   const fetchDetail = (itemId: string) => {
     if (fullContents[itemId] !== undefined || loadingItem) return;
     setLoadingItem(itemId);
-    fetch(`/api/context-runs/${traceId}/items/${itemId}`)
-      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
-      .then((res: Record<string, unknown>) => {
-        if (res.error) {
-          setFullContents(prev => ({ ...prev, [itemId]: `错误: ${String(res.error)}` }));
-        } else {
-          setFullContents(prev => ({ ...prev, [itemId]: String(res.full_content ?? res.error ?? "(空)") }));
-        }
+    fetch(`/api/context-runs/${encodeURIComponent(traceId || "")}/items/${encodeURIComponent(itemId)}`)
+      .then(async response => {
+        if (response.status === 404) throw new Error("上下文项不存在");
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json() as Promise<ContextItemDetailResponse>;
       })
-      .catch(e => {
-        setFullContents(prev => ({ ...prev, [itemId]: `加载失败: ${e.message}` }));
+      .then(response => {
+        setFullContents(prev => ({ ...prev, [itemId]: response.full_content || "(空)" }));
+      })
+      .catch(reason => {
+        setFullContents(prev => ({
+          ...prev,
+          [itemId]: `加载失败: ${reason instanceof Error ? reason.message : "未知错误"}`,
+        }));
       })
       .finally(() => setLoadingItem(null));
   };
@@ -128,15 +175,17 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
     </div>
   );
 
-  if (error) return <div className="text-center text-danger py-16">{error}</div>;
-  if (!data || (data as Record<string, unknown>).error) return <div className="text-center text-faint py-16">
-    <p className="text-sm">未找到 trace 记录: {traceId.slice(0, 8)}…</p>
-    <p className="text-xs mt-2 text-subtle">请确保已经产生过对话</p>
+  if (loadState === "loading") return <div className="text-center text-faint py-16">正在加载上下文快照…</div>;
+  if (loadState === "error") return <div className="text-center text-danger py-16">{error}</div>;
+  if (loadState === "not_found") return <div className="text-center text-faint py-16">
+    <p className="text-sm">未找到上下文快照: {traceId.slice(0, 8)}…</p>
+    <p className="text-xs mt-2 text-subtle">该 trace 可能不存在，或尚未生成上下文快照</p>
   </div>;
+  if (!data || data.snapshots.length === 0) return null;
 
-  const snapshots = (data.snapshots || []) as Array<Record<string, unknown>>;
-  const items = (snapshots[0]?.context_items as ContextItem[]) || [];
-  const meta = (snapshots[0]?.meta || {}) as Record<string, unknown>;
+  const snapshots = data.snapshots;
+  const items = snapshots[0].context_items || [];
+  const meta = snapshots[0].meta || {};
   const injected = (meta.injected_memory_ids as InjectedMemory[]) || [];
   const tokenTotal = snapshots[0]?.token_total as number | undefined;
 
@@ -344,16 +393,6 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
         </div>
       )}
 
-      {/* 弹窗淡入动画样式 */}
-      <style>{`
-        @keyframes fade-in {
-          from { opacity: 0; transform: scale(0.96); }
-          to   { opacity: 1; transform: scale(1); }
-        }
-        .animate-fade-in {
-          animation: fade-in 0.2s ease-out;
-        }
-      `}</style>
     </div>
   );
 }

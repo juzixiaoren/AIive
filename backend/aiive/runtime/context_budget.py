@@ -103,7 +103,6 @@ class ContextBudget:
             + 2000   # segment_summaries
             + 2300   # sealing_bridge
             + 1000   # retrieved_history_summary
-            + 1500   # deep_history_raw
         )
         # recent_messages 吸收剩余空间；给极小窗口留一个下限兜底
         recent_hard = max(4000, window - fixed_hard)
@@ -123,7 +122,7 @@ class ContextBudget:
             segment_summaries=PartitionBudget("segment_summaries", 1200, 2000, 9, "近期 Segment 摘要"),
             sealing_bridge=PartitionBudget("sealing_bridge", 1500, 2300, 10, "密封中 Segment 原始尾部桥接"),
             retrieved_history_summary=PartitionBudget("retrieved_history_summary", 800, 1000, 11, "统一检索命中的历史摘要/检查点"),
-            deep_history_raw=PartitionBudget("deep_history_raw", 0, 1500, 12, "deep 模式原始历史回溯（auto 模式不使用）"),
+            deep_history_raw=PartitionBudget("deep_history_raw", 0, 0, 12, "预留分区；deep 检索当前使用 RecallConfig 独立预算"),
         )
 
     @classmethod
@@ -136,28 +135,36 @@ class ContextBudget:
         """
         raw = os.environ.get("AIIVE_CONTEXT_BUDGET_JSON")
         if not raw:
-            return cls.default()
+            budget = cls.default()
+            budget.validate()
+            return budget
         try:
             overrides = _json.loads(raw)
         except (_json.JSONDecodeError, TypeError):
             logger.warning("AIIVE_CONTEXT_BUDGET_JSON 解析失败，使用默认预算")
-            return cls.default()
+            budget = cls.default()
+            budget.validate()
+            return budget
 
         base = cls.default()
         if not isinstance(overrides, dict):
+            base.validate()
             return base
         new_partitions = {p.name: p for p in base.all_partitions}
-        for p in base.all_partitions:
-            ov = overrides.get(p.name)
-            if isinstance(ov, dict):
-                new_partitions[p.name] = PartitionBudget(
-                    name=p.name,
-                    soft_limit_tokens=int(ov.get("soft_limit_tokens", p.soft_limit_tokens)),
-                    hard_limit_tokens=int(ov.get("hard_limit_tokens", p.hard_limit_tokens)),
-                    priority=p.priority,
-                    description=p.description,
-                )
-        return cls(
+        try:
+            for p in base.all_partitions:
+                ov = overrides.get(p.name)
+                if isinstance(ov, dict):
+                    new_partitions[p.name] = PartitionBudget(
+                        name=p.name,
+                        soft_limit_tokens=int(ov.get("soft_limit_tokens", p.soft_limit_tokens)),
+                        hard_limit_tokens=int(ov.get("hard_limit_tokens", p.hard_limit_tokens)),
+                        priority=p.priority,
+                        description=p.description,
+                    )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("AIIVE_CONTEXT_BUDGET_JSON 包含无效的 token 上限") from exc
+        budget = cls(
             model_context_window=base.model_context_window,
             reserved_output=base.reserved_output,
             stable_contract=new_partitions["stable_contract"],
@@ -173,6 +180,8 @@ class ContextBudget:
             retrieved_history_summary=new_partitions["retrieved_history_summary"],
             deep_history_raw=new_partitions["deep_history_raw"],
         )
+        budget.validate()
+        return budget
 
 
-ContextBudget.DEFAULT = ContextBudget.default()
+ContextBudget.DEFAULT = ContextBudget.from_env()

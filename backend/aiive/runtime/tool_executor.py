@@ -100,6 +100,24 @@ def build_action_cards(
                 },
                 trace_id=record.trace_id,
             ))
+        elif record.name == "run_memory_maintenance" and record.status == "completed" and record.result.get("ok"):
+            maintenance_operation_id = str(inner_raw.get("maintenance_operation_id", "") or "")
+            pre_enqueue_scan = inner_raw.get("pre_enqueue_scan", {})
+            cards.append(ActionCard(
+                card_type="maintenance_report",
+                title="记忆维护已入队",
+                summary="后台维护正在执行；以下统计为入队前诊断快照",
+                status="pending",
+                resource_refs={
+                    "operation_id": maintenance_operation_id,
+                } if maintenance_operation_id else {},
+                payload_preview={
+                    "maintenance_operation_id": maintenance_operation_id,
+                    "pre_enqueue_scan": pre_enqueue_scan,
+                    "result": None,
+                },
+                **common,
+            ))
         elif record.status == "blocked":
             cards.append(ActionCard(
                 card_type="tool_blocked", title=f"已阻止: {record.name}",

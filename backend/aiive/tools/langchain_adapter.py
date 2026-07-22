@@ -44,8 +44,6 @@ def _make_handler(registry: ToolRegistry, capability_id: str, run_context: RunCo
         _log.info("[TRACE:langchain] RESULT tool=%s ok=%s result_type=%s", capability_id, result.get("ok"), type(result).__name__)
         if not result.get("ok"):
             err = result.get("error", "Any error")
-            if result.get("approval_required"):
-                err = f"Approval required for {capability_id}"
             import json
 
             return json.dumps(

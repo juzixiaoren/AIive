@@ -83,7 +83,10 @@ def handle_forget(
 
     # 参数校验
     has_explicit = bool(memory_ids or turn_ids or event_ids)
-    has_wide = bool(thread_id or canonical_key or (scope_type and scope_id) or all_user_data)
+    has_wide = bool(
+        thread_id or canonical_key or (scope_type and scope_id)
+        or all_user_data or time_from or time_to
+    )
 
     if not has_explicit and not has_wide:
         return {"ok": False, "error": "至少需要指定目标: memory_ids / turn_ids / event_ids / thread_id / canonical_key / scope / all_user_data"}

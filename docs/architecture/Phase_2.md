@@ -88,11 +88,13 @@ created_by = "manual_memory_api"
 
 ### Idempotency-Key（强制）
 
-`Idempotency-Key` header **必须持久化并受唯一约束保护**。重复请求返回原 WriteResult，不得产生第二次 create/reinforce：
+`Idempotency-Key` header **必须持久化并受唯一约束保护**。重复请求返回原 WriteResult 对应的真实 MemoryRecord 状态，不得产生第二次 create/reinforce：
 
 ```sql
 UNIQUE(memory_proposals.idempotency_key)
 ```
+
+响应统一包含 `ok`、`outcome`、`operation`、`id`、`lifecycle_state` 和 `reason`。仅 `outcome=written` 表示发生了持久化变更；`ignored` / `reinforce_skipped` 返回 HTTP 200 的显式 no-op（`ok=false`），不得用空 `id` 冒充创建成功；`gate_rejected` 返回 422；`failed` 返回 409 并回滚事务。
 
 生产代码**不得保留可条件启用的旧旁路**（不保留 `MemoryStore.create_record()` 直接调用路径）。
 

@@ -10,7 +10,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from aiive.db.models import Task
+from aiive.db.models import OutboxJob, Task
 
 
 class TaskManager:
@@ -102,6 +102,63 @@ class TaskManager:
         )
         return task.next_check_at if task else None
 
+    def enqueue_reminder_now(self, task_id: str) -> dict[str, Any]:
+        """按任务 ID 原子入队提醒，不扫描其他任务。"""
+        task = (
+            self._db.query(Task)
+            .filter(Task.id == task_id)
+            .with_for_update()
+            .first()
+        )
+        if task is None:
+            return {"ok": False, "status": "not_found", "error": "Task not found"}
+        if task.task_type != "reminder":
+            return {"ok": False, "status": "invalid_type", "error": "Task is not a reminder"}
+        if task.status == "dispatching":
+            return {"ok": True, "status": "already_dispatching", "task_id": task.id, "title": task.title}
+        if task.status == "completed":
+            return {"ok": True, "status": "already_completed", "task_id": task.id, "title": task.title}
+        if task.status in {"cancelled", "failed"}:
+            return {"ok": False, "status": task.status, "error": f"提醒任务已处于 {task.status} 状态"}
+
+        now = datetime.now(timezone.utc)
+        operation_id = f"reminder_delivery:{task.id}"
+        existing = (
+            self._db.query(OutboxJob)
+            .filter(OutboxJob.operation_id == operation_id)
+            .with_for_update()
+            .first()
+        )
+        if existing is not None:
+            if existing.status in {"pending", "running"}:
+                task.status = "dispatching"
+                task.last_checked_at = now
+                return {"ok": True, "status": "already_dispatching", "task_id": task.id, "title": task.title}
+            return {"ok": False, "status": "stale_job", "error": "提醒任务已有终态投递记录，不能复活原任务"}
+
+        task.next_check_at = now
+        task.status = "dispatching"
+        task.last_checked_at = now
+        self._db.add(OutboxJob(
+            operation_id=operation_id,
+            job_type="reminder_delivery",
+            status="pending",
+            payload={
+                "schema_version": 1,
+                "operation_id": operation_id,
+                "task_id": task.id,
+                "task_type": task.task_type,
+                "thread_id": task.thread_id or "system",
+                "title": task.title,
+                "content": task.title,
+                "scheduled_at": task.next_check_at.isoformat() if task.next_check_at else None,
+            },
+            trace_id=task.id,
+            max_retries=3,
+        ))
+        self._db.flush()
+        return {"ok": True, "status": "enqueued", "task_id": task.id, "title": task.title, "operation_id": operation_id}
+
     def check_now(self, task_id: str) -> dict[str, Any]:
         """立即检查并处理指定任务。
 
@@ -119,14 +176,13 @@ class TaskManager:
         task = self._db.get(Task, task_id)
         if not task:
             return {"ok": False, "error": "Task not found"}
+        if task.task_type == "reminder":
+            return self.enqueue_reminder_now(task_id)
 
         now = datetime.now(timezone.utc)
         task.last_checked_at = now
 
-        if task.task_type == "reminder":
-            return {"ok": True, "action": "enqueue", "title": task.title, "description": task.description}
-
-        elif task.task_type == "condition_watch":
+        if task.task_type == "condition_watch":
             # 简单条件判断：条件为 "true" 时触发
             condition_met = task.condition and task.condition.lower() == "true"
             task.status = "completed" if condition_met else "pending"

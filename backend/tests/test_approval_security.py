@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from aiive.api import routes_approval
 from aiive.api.routes_approval import ApprovalRespondRequest
 from aiive.db.models import ApprovalRequest, Event, Thread, TurnRecord
+from aiive.runtime.policy_engine import PolicyAction, check_tool_calls
 from aiive.runtime.working_state import WorkingStateService
 from aiive.tools.registry import CapabilitySafetySchema, ToolRegistration, ToolRegistry
 
@@ -76,6 +77,25 @@ def _registry(calls: list[dict[str, str]]) -> ToolRegistry:
         handler=handler,
     ))
     return registry
+
+
+def test_registered_tool_bypasses_confirmation_while_approval_is_disabled() -> None:
+    """审批停用期间，需要确认的已注册工具也必须直接放行。"""
+    registry = _registry([])
+
+    result = check_tool_calls([{"name": "dangerous_tool", "args": {}, "id": "call-1"}], registry)
+
+    assert result.action is PolicyAction.ALLOW
+    assert result.allowed_tools == ["dangerous_tool"]
+    assert result.confirm_tools == []
+
+
+def test_unknown_tool_remains_blocked_while_approval_is_disabled() -> None:
+    """审批停用不应绕过未注册工具的注册表边界。"""
+    result = check_tool_calls([{"name": "unknown_tool", "args": {}, "id": "call-1"}], ToolRegistry())
+
+    assert result.action is PolicyAction.BLOCK
+    assert result.blocked_tools == ["unknown_tool"]
 
 
 def test_request_rejects_client_tool_payload() -> None:
@@ -148,6 +168,26 @@ def test_missing_approval_never_executes(db, monkeypatch) -> None:
         ))
 
     assert error.value.status_code == 404
+    assert calls == []
+
+
+def test_empty_descriptor_hash_never_executes() -> None:
+    """空审批定义指纹必须失败关闭，不得调用工具处理器。"""
+    calls: list[dict[str, str]] = []
+    registry = _registry(calls)
+
+    result = registry.execute_approved(
+        "dangerous_tool",
+        {"value": "server-value"},
+        expected_descriptor_hash="",
+        run_context=routes_approval.RunContext(
+            thread_id="thread-1", trace_id="trace-1", source="approval",
+        ),
+        tool_call_id="call-1",
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "missing_descriptor_hash"
     assert calls == []
 
 

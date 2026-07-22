@@ -106,6 +106,10 @@ def start_daemon():
         _enqueue_reconciler_job, IntervalTrigger(seconds=_RECONCILE_INTERVAL),
         id="phase3_enqueue_reconciler", replace_existing=True,
     )
+    scheduler.add_job(
+        _forget_reconcile_scanner_job, IntervalTrigger(seconds=_RECONCILE_INTERVAL),
+        id="phase6a_forget_reconciler", replace_existing=True,
+    )
 
     # Phase 4: 维护扫描器
     scheduler.add_job(
@@ -322,10 +326,41 @@ def _enqueue_reconciler_job() -> None:
             db.close()
 
 
+def _forget_reconcile_scanner_job() -> None:
+    """Phase 6A：周期对账并自动恢复非终态 Forget Saga。"""
+    from aiive.forget.reconcile_service import ForgetReconcileService
+
+    db: Session | None = None
+    try:
+        db = SessionLocal()
+        results = ForgetReconcileService.scan_once(db, limit=_MAX_SCAN_BATCH)
+        db.commit()
+        for operation_id, result in results:
+            if result.action in {
+                "duplicate_stage_run",
+                "outbox_job_missing",
+                "unsupported_job_status",
+            }:
+                logger.error(
+                    "forget_reconciler 无法自动恢复: operation_id=%s action=%s stage=%s",
+                    operation_id,
+                    result.action,
+                    result.stage,
+                )
+    except Exception:
+        if db is not None:
+            db.rollback()
+        logger.exception("forget_reconciler 异常")
+    finally:
+        if db is not None:
+            db.close()
+
+
 def enqueue_maintenance_job(
     db: Session,
     window_bucket: str | None = None,
     now: datetime | None = None,
+    source_context: dict[str, str] | None = None,
 ) -> str | None:
     """真正 enqueue 一个 `memory_maintenance` OutboxJob（确定性执行入口）。
 
@@ -348,10 +383,14 @@ def enqueue_maintenance_job(
     ).count()
     if exists > 0:
         return op_id
+    payload = {"schema_version": 1, "operation_id": op_id}
+    payload.update(source_context or {})
     if _outbox_worker is not None:
         try:
             _outbox_worker.enqueue(
-                db, "memory_maintenance", {"schema_version": 1}, operation_id=op_id,
+                db, "memory_maintenance", payload,
+                trace_id=payload.get("trace_id") or None,
+                operation_id=op_id,
             )
         except ValueError:
             logger.warning("maintenance enqueue 不在 allowlist，跳过")
@@ -359,7 +398,9 @@ def enqueue_maintenance_job(
     else:
         db.add(OutboxJob(
             operation_id=op_id, job_type="memory_maintenance",
-            status="pending", payload={"schema_version": 1}, max_retries=3,
+            status="pending", payload=payload,
+            trace_id=payload.get("trace_id") or None,
+            max_retries=3,
         ))
     return op_id
 

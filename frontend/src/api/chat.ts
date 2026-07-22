@@ -74,8 +74,15 @@ export async function getThreadMessages(threadId: string, beforeSequence?: numbe
 
 /** SSE 流式事件类型定义 */
 export interface StreamEvent {
-  event: "token" | "tool_call" | "tool_result" | "done" | "error";
+  event: "started" | "token" | "tool_call" | "tool_result" | "done" | "error";
   data: Record<string, unknown>;
+}
+
+/** 服务端已提交 Turn 后立即发送的流式启动信息。 */
+export interface StreamStartedEvent {
+  thread_id: string;
+  turn_id: string;
+  trace_id: string;
 }
 
 /** 后端返回的结构化 API 错误 */
@@ -93,11 +100,20 @@ export class ApiError extends Error {
   }
 }
 
+/** 流式连接未收到服务端完成事件时抛出，用于触发历史恢复。 */
+export class StreamIncompleteError extends Error {
+  constructor() {
+    super("流式连接在完成前中断，正在从服务端恢复对话状态");
+    this.name = "StreamIncompleteError";
+  }
+}
+
 /**
  * 流式发送消息并接收 SSE 事件回调
  * 返回一个 Promise，在流式传输完成时 resolve
  * @param message - 用户输入的消息文本
  * @param threadId - 可选的对话线程 ID
+ * @param onStarted - Turn 持久化后收到真实线程标识时的回调
  * @param onToken - 收到 token 时的回调
  * @param onToolCall - 检测到工具调用时的回调（工具名 + 参数）
  * @param onToolResult - 工具执行完成时的回调（工具名 + 结果 + 状态）
@@ -108,6 +124,7 @@ export class ApiError extends Error {
 export async function sendMessageStream(
   message: string,
   threadId: string | undefined,
+  onStarted: (event: StreamStartedEvent) => void,
   onToken: (text: string) => void,
   onToolCall: (toolCallId: string, name: string, params: Record<string, unknown>) => void,
   onToolResult: (toolCallId: string, name: string, result: unknown, status?: string) => void,
@@ -140,6 +157,7 @@ export async function sendMessageStream(
   const decoder = new TextDecoder();
   let buffer = "";
   let currentEvent = "";
+  let seenDone = false;
   let result = {
     thread_id: "",
     trace_id: "",
@@ -170,6 +188,13 @@ export async function sendMessageStream(
           try {
             const data = JSON.parse(dataStr);
             switch (currentEvent) {
+              case "started":
+                onStarted({
+                  thread_id: data.thread_id as string,
+                  turn_id: data.turn_id as string,
+                  trace_id: data.trace_id as string,
+                });
+                break;
               case "token":
                 // 逐 token 回调，用于打字机效果
                 onToken(data.text as string);
@@ -184,6 +209,7 @@ export async function sendMessageStream(
                 break;
               case "done":
                 // 流式传输完成，收集最终结果
+                seenDone = true;
                 result = {
                   thread_id: data.thread_id as string,
                   trace_id: data.trace_id as string,
@@ -223,6 +249,10 @@ export async function sendMessageStream(
     }
   } finally {
     reader.releaseLock();
+  }
+
+  if (!signal?.aborted && !seenDone) {
+    throw new StreamIncompleteError();
   }
 
   return result;

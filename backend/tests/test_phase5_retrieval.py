@@ -13,6 +13,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 
+from aiive.db import forget_models  # 注册 Forget Shield/Tombstone 表供 fail-closed 回源测试建表
 from aiive.db.models import (
     CompactionInput,
     Epoch,
@@ -38,6 +39,7 @@ from aiive.retrieval.retrieval_types import (
     RetrievalHit,
     RetrievalMode,
     RetrievalRequest,
+    RetrievalResult,
 )
 from aiive.retrieval.unified_retriever import UnifiedRetriever
 from aiive.memory.recall_config import RetrievalConfig
@@ -424,6 +426,44 @@ def test_unified_retriever_dedup_memory_and_index_route(db):
     assert len(mr_hits) == 1
 
 
+def test_unified_retriever_all_routes_degraded_is_observable(db, monkeypatch):
+    """全部实际启用路由失败时返回空结果和稳定聚合标记，不向调用方抛异常。"""
+    retriever = UnifiedRetriever(db)
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("route failed")
+
+    monkeypatch.setattr(retriever, "_exact_route", _boom)
+    monkeypatch.setattr(retriever, "_memory_route", _boom)
+    monkeypatch.setattr(retriever, "_index_route", _boom)
+    result = retriever.retrieve(RetrievalRequest(
+        query="Python",
+        mode=RetrievalMode.SEARCH,
+        scope_context={},
+    ))
+
+    assert result.hits == []
+    assert result.degraded is True
+    assert "all_routes_degraded" in result.notes
+    assert set(result.notes) >= {
+        "exact_route_degraded", "memory_route_degraded", "index_route_degraded",
+    }
+
+
+def test_unified_retriever_pipeline_failure_returns_fail_closed(db, monkeypatch):
+    """融合等编排阶段失败时由唯一入口返回可观测空结果。"""
+    retriever = UnifiedRetriever(db)
+    monkeypatch.setattr(retriever, "_fuse_scores", lambda *_args: (_ for _ in ()).throw(RuntimeError("fusion failed")))
+
+    result = retriever.retrieve(RetrievalRequest(
+        query="Python", mode=RetrievalMode.SEARCH, scope_context={},
+    ))
+
+    assert result.hits == []
+    assert result.degraded is True
+    assert result.notes == ["retrieval_pipeline_degraded", "all_routes_degraded"]
+
+
 def test_unified_retriever_index_route_degrade_isolated(db):
     """#45 索引路由异常被隔离：不影响整体返回与降级标记。"""
     _active_gen(db)
@@ -447,6 +487,32 @@ def test_unified_retriever_index_route_degrade_isolated(db):
     # 索引路由失败被捕获：降级标记置位，但不抛异常
     assert res.degraded is True
     assert "index_route_degraded" in res.notes
+
+
+def test_unified_retriever_deep_raw_failure_keeps_parent_hits(db, monkeypatch):
+    """DEEP 原始回溯失败时保留已验证父级命中并标记局部降级。"""
+    retriever = UnifiedRetriever(db)
+    parent = RetrievalHit(
+        source_type="segment_summary",
+        source_id="summary-parent",
+        source_version="1",
+        snippet="父级摘要",
+        token_count=3,
+    )
+    monkeypatch.setattr(
+        retriever,
+        "_retrieve_indexed",
+        lambda *_args, **_kwargs: RetrievalResult(request_id="deep-test", hits=[parent]),
+    )
+    monkeypatch.setattr(retriever._raw, "expand", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("raw failed")))
+
+    result = retriever.retrieve(RetrievalRequest(
+        request_id="deep-test", query="Python", mode=RetrievalMode.DEEP,
+    ))
+
+    assert [hit.source_id for hit in result.hits] == ["summary-parent"]
+    assert result.degraded is True
+    assert "raw_history_route_degraded" in result.notes
 
 
 # ───────────────────────── refresh operation_id 幂等 ─────────────────────────

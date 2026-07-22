@@ -9,7 +9,13 @@
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { sendMessageStream, resetThread, respondApproval, getThreadMessages, ActionCard } from "../api/chat";
+import {
+  sendMessageStream,
+  resetThread,
+  getThreadMessages,
+  ActionCard,
+  StreamIncompleteError,
+} from "../api/chat";
 import Markdown from "../components/Markdown";
 
 const STORAGE_KEY = "aiive_active_thread";
@@ -24,9 +30,9 @@ function loadStored(): { threadId: string | undefined; messages: Message[] } {
     if (raw) {
       const parsed = JSON.parse(raw) as { threadId?: string; messages?: Message[] };
       // 清理上一次未完成的空占位消息（流式被中断、刷新页面导致的残留），不影响已完成内容
-      const messages = (parsed.messages || []).filter(
-        (m) => !(m.role === "agent" && !m.content && !m.traceId)
-      );
+      const messages = (parsed.messages || [])
+        .filter((m) => !(m.role === "agent" && !m.content && !m.traceId))
+        .map((m) => (m.id ? m : { ...m, id: genMessageId() }));
       return { threadId: parsed.threadId, messages };
     }
   } catch {}
@@ -51,8 +57,46 @@ interface ToolCallItem {
   result?: string;
 }
 
+/** 将后端及历史兼容状态收敛为 UI 状态；未识别状态不得声明完成。 */
+function normalizeToolCallStatus(status?: string): ToolCallItem["status"] {
+  switch (status) {
+    case "completed":
+    case "committed":
+    case "succeeded":
+      return "completed";
+    case "failed":
+    case "error":
+    case "execution_failed":
+      return "failed";
+    case "pending":
+    case "pending_approval":
+      return "pending";
+    case "cancelled":
+    case "preempted":
+      return "cancelled";
+    case "queued":
+    case "running":
+    case "execution_unknown":
+    case "interrupted_unknown":
+    case "unknown":
+    default:
+      return "execution_unknown";
+  }
+}
+
+/** 生成消息唯一标识，作为稳定的 React 列表 key，避免头部插入更早消息时整体重挂载 */
+function genMessageId(): string {
+  try {
+    return crypto.randomUUID();
+  } catch {
+    return `m-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  }
+}
+
 /** 消息数据结构 */
 interface Message {
+  /** 稳定唯一标识：后端历史取 event_id，本地消息取 crypto.randomUUID */
+  id: string;
   role: "user" | "agent" | "action";
   content: string;
   traceId: string;
@@ -169,6 +213,10 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   /** 当前流式请求的 AbortController，用于“停止”按钮中断生成 */
   const abortRef = useRef<AbortController | null>(null);
+  /** 同步记录请求占用状态，阻止 React 状态提交前的重复发送。 */
+  const inFlightRef = useRef(false);
+  /** 当前流已收到的真实线程 ID，用于断流后不受 React 状态闭包影响地恢复历史。 */
+  const activeStreamThreadIdRef = useRef<string | undefined>(undefined);
   /** 用户是否贴近消息底部（决定自动滚动 & 是否显示回到底部按钮） */
   const atBottomRef = useRef(true);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
@@ -176,27 +224,15 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
   const [unreadCount, setUnreadCount] = useState(0);
   /** 上一轮渲染时的消息条数，用于增量计算新增消息 */
   const prevMsgCountRef = useRef(stored.messages.length);
-  /** 后端历史恢复期间不把 hydration 消息计为实时未读 */
-  const hydratingRef = useRef(false);
   const [historyCursor, setHistoryCursor] = useState<number | null>(null);
   const [hasMoreHistory, setHasMoreHistory] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
 
-  /**
-   * 更新当前正在流式输出的 agent 消息（traceId 为空的最后一条 agent 消息）。
-   * 工具调用卡片与“正在分析”状态都挂载在同一条消息上，保证反馈位置与触发控件强相关。
-   */
-  const updateStreamingAgent = useCallback((updater: (m: Message) => Message) => {
-    setMessages((prev) => {
-      const updated = [...prev];
-      for (let i = updated.length - 1; i >= 0; i--) {
-        if (updated[i].role === "agent" && updated[i].traceId === "") {
-          updated[i] = updater(updated[i]);
-          break;
-        }
-      }
-      return updated;
-    });
+  /** 按占位消息 ID 更新当前流，避免并发或线程切换时写入其他消息。 */
+  const updateStreamingAgent = useCallback((messageId: string, updater: (m: Message) => Message) => {
+    setMessages((prev) => prev.map((message) => (
+      message.id === messageId ? updater(message) : message
+    )));
   }, []);
 
   /** 滚动到消息列表底部 */
@@ -234,27 +270,18 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
   // 消息更新：贴底则自动滚动；离底时累计新增的 agent 消息数为未读
   useEffect(() => {
     const added = messages.length - prevMsgCountRef.current;
-    if (added > 0 && !atBottomRef.current && !hydratingRef.current) {
+    if (added > 0 && !atBottomRef.current) {
       const newAgent = messages.slice(prevMsgCountRef.current).filter(
         (m) => m.role === "agent" && m.content.length > 0 && m.traceId.length > 0
       ).length;
       if (newAgent > 0) setUnreadCount((c) => c + newAgent);
     }
     prevMsgCountRef.current = messages.length;
-    hydratingRef.current = false;
     if (atBottomRef.current) scrollToBottom();
   }, [messages]);
 
   // 输入框内容变化时重算高度（含清空后回弹为单行）
   useEffect(() => { autoResize(); }, [input]);
-
-  // 组件挂载时，如果本地无消息但有 threadId，从后端恢复历史消息
-  useEffect(() => {
-    const tid = stored.threadId;
-    if (tid && stored.messages.length === 0) {
-      loadRemoteMessages(tid);
-    }
-  }, []);
 
   /** 从后端加载消息（含 trace、操作卡片和工具记录） */
   const loadRemoteMessages = useCallback(async (tid: string) => {
@@ -262,6 +289,7 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
       const page = await getThreadMessages(tid);
       if (page.messages.length > 0) {
         const loaded: Message[] = page.messages.map((message) => ({
+          id: message.event_id || genMessageId(),
           role: message.role === "user" ? "user" : "agent",
           content: message.content,
           traceId: message.trace_id || "",
@@ -271,15 +299,12 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
             id: call.tool_call_id,
             name: call.name,
             params: call.params || {},
-            status: call.status === "failed"
-              ? "failed"
-              : call.status === "execution_unknown" ? "execution_unknown" : "completed",
+            status: normalizeToolCallStatus(call.status),
             result: call.result === undefined || call.result === null
               ? undefined
               : typeof call.result === "string" ? call.result : JSON.stringify(call.result),
           })),
         }));
-        hydratingRef.current = true;
         prevMsgCountRef.current = loaded.length;
         setUnreadCount(0);
         setMessages(loaded);
@@ -291,6 +316,14 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
     }
   }, []);
 
+  // 组件挂载时始终以服务端历史为准恢复已有线程，避免本地残缺流式状态覆盖真实结果。
+  useEffect(() => {
+    const tid = stored.threadId;
+    if (tid) {
+      void loadRemoteMessages(tid);
+    }
+  }, [loadRemoteMessages, stored.threadId]);
+
   const loadOlderMessages = useCallback(async () => {
     if (!threadId || historyCursor === null || loadingHistory) return;
     const el = scrollRef.current;
@@ -299,6 +332,7 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
     try {
       const page = await getThreadMessages(threadId, historyCursor);
       const older: Message[] = page.messages.map((message) => ({
+        id: message.event_id || genMessageId(),
         role: message.role === "user" ? "user" : "agent",
         content: message.content,
         traceId: message.trace_id || "",
@@ -308,15 +342,12 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
           id: call.tool_call_id,
           name: call.name,
           params: call.params || {},
-          status: call.status === "failed"
-            ? "failed"
-            : call.status === "execution_unknown" ? "execution_unknown" : "completed",
+          status: normalizeToolCallStatus(call.status),
           result: call.result === undefined || call.result === null
             ? undefined
             : typeof call.result === "string" ? call.result : JSON.stringify(call.result),
         })),
       }));
-      hydratingRef.current = true;
       setMessages((current) => {
         prevMsgCountRef.current = older.length + current.length;
         return [...older, ...current];
@@ -348,25 +379,42 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
         try {
           const msg = JSON.parse(event.data);
           if (msg.type === "new_message" && msg.data) {
-            const { reply, thread_id, trace_id, action_cards } = msg.data;
-            if (reply) {
+            const { event_id, reply, thread_id, trace_id, action_cards } = msg.data;
+            if (event_id && reply) {
               setMessages(prev => {
-                const exists = prev.some(m => m.content === reply);
-                if (exists) return prev;
+                const messageId = String(event_id);
+                if (prev.some(message => message.id === messageId)) return prev;
                 const newMsg: Message = {
+                  id: messageId,
                   role: "agent",
-                  content: reply,
-                  traceId: trace_id || "",
-                  threadId: thread_id || threadId,
-                  actionCards: action_cards || [],
+                  content: String(reply),
+                  traceId: String(trace_id || ""),
+                  threadId: String(thread_id || threadId),
+                  actionCards: Array.isArray(action_cards) ? action_cards : [],
                 };
                 if (atBottomRef.current) setTimeout(scrollToBottom, 100);
                 return [...prev, newMsg];
               });
             }
-          } else if (msg.type === "tool_operation" && msg.data?.operation_id) {
+          } else if (msg.type === "maintenance_report" && msg.data?.operation_id && msg.data?.card) {
             const operationId = String(msg.data.operation_id);
-            const status = String(msg.data.execution_status || "execution_unknown") as ToolCallItem["status"];
+            const terminalCard = msg.data.card as ActionCard;
+            setMessages(prev => prev.map(message => ({
+              ...message,
+              actionCards: message.actionCards?.map(card => (
+                card.card_type === "maintenance_report"
+                && card.resource_refs?.operation_id === operationId
+                  ? terminalCard
+                  : card
+              )),
+            })));
+          } else if (msg.type === "tool_operation" && msg.data?.operation_id && msg.data?.tool_call_id) {
+            const operationId = String(msg.data.operation_id);
+            const toolCallId = String(msg.data.tool_call_id);
+            const rawStatus = String(msg.data.execution_status || "execution_unknown");
+            const status: ToolCallItem["status"] = rawStatus === "committed"
+              ? "completed"
+              : rawStatus === "failed" ? "failed" : "execution_unknown";
             setMessages(prev => prev.map(message => ({
               ...message,
               actionCards: message.actionCards?.map(card => (
@@ -374,14 +422,15 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
                   ? { ...card, status, payload_preview: { ...card.payload_preview, result: msg.data.result } }
                   : card
               )),
-              toolCalls: message.toolCalls?.map(call => {
-                if (!call.result?.includes(operationId)) return call;
-                return {
-                  ...call,
-                  status,
-                  result: msg.data.result === undefined ? call.result : JSON.stringify(msg.data.result),
-                };
-              }),
+              toolCalls: message.toolCalls?.map(call => (
+                call.id === toolCallId
+                  ? {
+                    ...call,
+                    status,
+                    result: msg.data.result === undefined ? call.result : JSON.stringify(msg.data.result),
+                  }
+                  : call
+              )),
             })));
           }
         } catch {}
@@ -404,6 +453,11 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
 
   /** 处理提醒操作：通过系统指令让 LLM 调用 confirm_reminder / snooze_reminder */
   const handleReminderAction = async (action: "confirm" | "snooze", reminderId: string, delayMin?: number) => {
+    if (!threadId || !reminderId || inFlightRef.current) {
+      if (!threadId) setError("当前对话线程尚未建立，无法处理提醒");
+      return;
+    }
+    inFlightRef.current = true;
     setError(null);
     setLoading(true);
     const text = action === "confirm"
@@ -411,6 +465,7 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
       : `[系统指令] 请调用 snooze_reminder 工具，参数 reminder_id="${reminderId}"，delay_minutes=${delayMin ?? 5}`;
     // 不添加用户消息到聊天列表，作为系统指令隐藏发送
     const placeholderMsg: Message = {
+      id: genMessageId(),
       role: "agent", content: "", traceId: "", threadId: threadId ?? "",
       actionCards: [],
     };
@@ -421,53 +476,43 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: text, thread_id: threadId }),
       });
-      const result = await res.json();
-      setMessages(prev => {
-        const updated = [...prev];
-        for (let i = updated.length - 1; i >= 0; i--) {
-          if (updated[i].role === "agent" && updated[i].traceId === "") {
-            updated[i] = {
-              ...updated[i],
-              content: result.reply || "",
-              traceId: result.trace_id,
-              threadId: result.thread_id,
-              actionCards: result.action_cards || [],
-            };
-            break;
-          }
+      const responseText = await res.text();
+      let result: Record<string, unknown> = {};
+      if (responseText) {
+        try {
+          result = JSON.parse(responseText) as Record<string, unknown>;
+        } catch {
+          if (res.ok) throw new Error("系统指令响应格式无效");
         }
-        return updated;
-      });
+      }
+      if (!res.ok) {
+        const detail = result.detail;
+        const message = typeof detail === "string"
+          ? detail
+          : typeof detail === "object" && detail !== null && "message" in detail
+            ? String((detail as Record<string, unknown>).message)
+            : responseText || `系统指令失败 HTTP ${res.status}`;
+        throw new Error(message);
+      }
+      const reply = typeof result.reply === "string" ? result.reply : "";
+      const traceId = typeof result.trace_id === "string" ? result.trace_id : "";
+      const resultThreadId = typeof result.thread_id === "string" ? result.thread_id : (threadId || "");
+      const actionCards = Array.isArray(result.action_cards) ? result.action_cards : [];
+      if (!reply || !traceId) throw new Error("系统指令响应缺少 reply 或 trace_id");
+      setMessages(prev => prev.map(message => {
+        if (message.id === placeholderMsg.id) {
+          return { ...message, content: reply, traceId, threadId: resultThreadId, actionCards };
+        }
+        const nextCards = message.actionCards?.filter(card => card.reminder_id !== reminderId);
+        return nextCards?.length === message.actionCards?.length
+          ? message
+          : { ...message, actionCards: nextCards };
+      }));
     } catch (e: unknown) {
+      setMessages(prev => prev.filter(message => message.id !== placeholderMsg.id));
       setError(e instanceof Error ? e.message : "未知错误");
     } finally {
-      setLoading(false);
-    }
-  };
-
-  /** 处理工具审批操作：确认或拒绝 */
-  const handleApprovalAction = async (
-    action: "approve" | "deny",
-    approvalId: string,
-  ) => {
-    if (!threadId || !approvalId) return;
-    setError(null);
-    setLoading(true);
-    try {
-      const res = await respondApproval(approvalId, action);
-      const status = res.action === "succeeded" || res.action === "denied" ? "completed" : "failed";
-      setMessages((prev) => prev.map((message) => ({
-        ...message,
-        actionCards: message.actionCards?.map((card) => {
-          const matches = card.actions?.some((item) => item.approval_id === approvalId)
-            || card.resource_refs?.approval_id === approvalId;
-          return matches ? { ...card, status, actions: [] } : card;
-        }),
-      })));
-      if (!res.ok && res.error) setError(res.error);
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "审批处理失败");
-    } finally {
+      inFlightRef.current = false;
       setLoading(false);
     }
   };
@@ -480,7 +525,6 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
     } catch {}
     setThreadId(undefined);
     prevMsgCountRef.current = 0;
-    hydratingRef.current = false;
     setHistoryCursor(null);
     setHasMoreHistory(false);
     setUnreadCount(0);
@@ -491,14 +535,16 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
   /** 发送消息并处理流式响应 */
   const handleSend = async () => {
     const text = input.trim();
-    if (!text || loading) return;
+    if (!text || inFlightRef.current) return;
 
+    inFlightRef.current = true;
     setInput("");
     setError(null);
     setLoading(true);
 
     // 构造用户消息
     const userMsg: Message = {
+      id: genMessageId(),
       role: "user",
       content: text,
       traceId: "",
@@ -506,8 +552,8 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
     };
 
     // 占位消息：用于流式接收 agent 回复时的占位
-    const placeholderIdx = messages.length + 1; // 用户消息之后的索引位置
     const placeholderMsg: Message = {
+      id: genMessageId(),
       role: "agent",
       content: "",
       traceId: "",
@@ -523,40 +569,47 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
       const result = await sendMessageStream(
         text,
         threadId,
+        // onStarted：Turn 已持久化后立即记录真实线程 ID，供首次对话断流恢复。
+        (event) => {
+          activeStreamThreadIdRef.current = event.thread_id;
+          setThreadId(event.thread_id);
+          setMessages((prev) => prev.map((message) => (
+            message.id === userMsg.id || message.id === placeholderMsg.id
+              ? { ...message, threadId: event.thread_id }
+              : message
+          )));
+        },
         // onToken：逐 token 追加到占位消息中，实现打字机效果
         (token) => {
-          setMessages((prev) => {
-            const updated = [...prev];
-            if (updated.length > placeholderIdx) {
-              // 找到正在流式输出的 agent 消息（traceId 为空的最后一条 agent 消息）
-              for (let i = updated.length - 1; i >= 0; i--) {
-                if (updated[i].role === "agent" && updated[i].traceId === "") {
-                  updated[i] = { ...updated[i], content: updated[i].content + token };
-                  return updated;
-                }
-              }
-            }
-            return updated;
-          });
+          updateStreamingAgent(placeholderMsg.id, (message) => ({
+            ...message,
+            content: message.content + token,
+          }));
         },
         // onToolCall：在当前流式 agent 消息上追加一条 pending 工具卡片（即时可见反馈）
         (toolCallId, name, params) => {
-          updateStreamingAgent((m) => ({
-            ...m,
-            toolCalls: [
-              ...(m.toolCalls || []),
-              {
-                id: toolCallId,
-                name,
-                params,
-                status: "pending",
-              },
-            ],
-          }));
+          updateStreamingAgent(placeholderMsg.id, (m) => {
+            const calls = m.toolCalls || [];
+            if (toolCallId && calls.some((call) => call.id === toolCallId)) {
+              return m;
+            }
+            return {
+              ...m,
+              toolCalls: [
+                ...calls,
+                {
+                  id: toolCallId,
+                  name,
+                  params,
+                  status: "pending",
+                },
+              ],
+            };
+          });
         },
         // onToolResult：将最近一条同名 pending 工具卡片收敛为 completed / failed
         (toolCallId, name, result, status) => {
-          updateStreamingAgent((m) => {
+          updateStreamingAgent(placeholderMsg.id, (m) => {
             const calls = m.toolCalls || [];
             for (let i = calls.length - 1; i >= 0; i--) {
               if (calls[i].id === toolCallId || (!calls[i].id && calls[i].name === name && calls[i].status === "pending")) {
@@ -582,24 +635,17 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
 
       if (ac.signal.aborted) {
         // 用户主动中断：将未完成的工具调用标记为已停止，并清理空占位气泡
-        setMessages((prev) => {
-          const updated = [...prev];
-          for (let i = updated.length - 1; i >= 0; i--) {
-            if (updated[i].role === "agent" && updated[i].traceId === "") {
-              const calls = updated[i].toolCalls || [];
-              if ((updated[i].content || "").length === 0) {
-                updated.splice(i, 1);
-              } else if (calls.length) {
-                updated[i] = {
-                  ...updated[i],
-                  toolCalls: calls.map((c) => (c.status === "pending" ? { ...c, status: "cancelled" } : c)),
-                };
-              }
-              break;
-            }
-          }
-          return updated;
-        });
+        setMessages((prev) => prev.flatMap((message) => {
+          if (message.id !== placeholderMsg.id) return [message];
+          const calls = message.toolCalls || [];
+          if (!message.content) return [];
+          return [{
+            ...message,
+            toolCalls: calls.map((call) => (
+              call.status === "pending" ? { ...call, status: "cancelled" } : call
+            )),
+          }];
+        }));
       } else {
         // 首次对话时记录返回的 thread_id
         if (!threadId && result.thread_id) {
@@ -614,39 +660,50 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
           setMessages((prev) => {
             const updated = [...prev];
             for (let i = updated.length - 1; i >= 0; i--) {
-              if (updated[i].role === "agent" && updated[i].traceId === "") {
+              if (updated[i].id === placeholderMsg.id) {
                 const ex = updated[i].toolCalls || [];
                 const finals = (
                   result.tool_results && result.tool_results.length
                     ? result.tool_results
                     : (result.tool_calls || [])
                 ) as Array<{ tool_call_id: string; name: string; params?: Record<string, unknown>; result?: unknown; status?: string }>;
-                let toolCalls = ex;
-                if (ex.length === 0 && finals.length) {
-              toolCalls = finals.map((t, idx) => ({
-                id: t.tool_call_id || `${result.trace_id}-${idx}`,
-                name: t.name,
-                params: t.params || {},
-                status: t.status === "failed"
-                  ? "failed"
-                  : t.status === "execution_unknown" ? "execution_unknown" : "completed",
-                result: t.result !== undefined
-                  ? (typeof t.result === "string" ? t.result : typeof t.result === "object" && t.result !== null && "result" in t.result ? String((t.result as Record<string, unknown>).result) : JSON.stringify(t.result))
-                  : undefined,
-              }));
-            } else if (ex.length && finals.length === ex.length) {
-              toolCalls = ex.map((e, idx) => {
-                const fr = finals[idx].result;
-                return {
-                  ...e,
-                  status: finals[idx].status === "failed"
-                    ? "failed"
-                    : finals[idx].status === "execution_unknown" ? "execution_unknown" : "completed",
-                  result: fr !== undefined
-                    ? (typeof fr === "string" ? fr : typeof fr === "object" && fr !== null && "result" in fr ? String((fr as Record<string, unknown>).result) : JSON.stringify(fr))
-                    : e.result,
+                const formatResult = (value: unknown): string | undefined => {
+                  if (value === undefined) return undefined;
+                  if (typeof value === "string") return value;
+                  if (typeof value === "object" && value !== null && "result" in value) {
+                    return String((value as Record<string, unknown>).result);
+                  }
+                  return JSON.stringify(value);
                 };
-              });
+                const statusFromFinal = (status?: string): ToolCallItem["status"] => (
+                  normalizeToolCallStatus(status)
+                );
+                const finalById = new Map(
+                  finals.filter((item) => item.tool_call_id).map((item) => [item.tool_call_id, item]),
+                );
+                let unnamedFinalIndex = 0;
+                let toolCalls: ToolCallItem[] = ex.map((call): ToolCallItem => {
+                  const final = call.id ? finalById.get(call.id) : finals[unnamedFinalIndex++];
+                  if (!final) {
+                    return call.status === "pending" ? { ...call, status: "execution_unknown" } : call;
+                  }
+                  return {
+                    ...call,
+                    id: final.tool_call_id || call.id,
+                    name: final.name || call.name,
+                    params: final.params || call.params,
+                    status: statusFromFinal(final.status),
+                    result: formatResult(final.result) ?? call.result,
+                  };
+                });
+                if (ex.length === 0 && finals.length) {
+                  toolCalls = finals.map((item, index): ToolCallItem => ({
+                    id: item.tool_call_id || `${result.trace_id}-${index}`,
+                    name: item.name,
+                    params: item.params || {},
+                    status: statusFromFinal(item.status),
+                    result: formatResult(item.result),
+                  }));
                 }
                 updated[i] = {
                   ...updated[i],
@@ -666,12 +723,17 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
     } catch (e: unknown) {
       if (!abortRef.current?.signal.aborted) {
         setError(e instanceof Error ? e.message : "未知错误");
-        // 发生错误时移除占位消息（按特征匹配，避免索引漂移）
-        setMessages((prev) => prev.filter(
-          (m) => !(m.role === "agent" && m.traceId === "" && m.content === "")
-        ));
+        const recoveryThreadId = activeStreamThreadIdRef.current || threadId;
+        if (e instanceof StreamIncompleteError && recoveryThreadId) {
+          await loadRemoteMessages(recoveryThreadId);
+        } else {
+          // 发生错误时只移除当前请求的占位消息
+          setMessages((prev) => prev.filter((message) => message.id !== placeholderMsg.id));
+        }
       }
     } finally {
+      activeStreamThreadIdRef.current = undefined;
+      inFlightRef.current = false;
       setLoading(false);
       abortRef.current = null;
     }
@@ -733,8 +795,8 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
             <p className="text-sm">发送消息开始对话</p>
           </div>
         )}
-        {messages.map((msg, i) => (
-          <div key={i} className={`flex flex-col animate-fade-in ${msg.role === "user" ? "items-end" : "items-start"}`}>
+        {messages.map((msg) => (
+          <div key={msg.id} className={`flex flex-col animate-fade-in ${msg.role === "user" ? "items-end" : "items-start"}`}>
             {/* 消息气泡，根据角色不同应用不同样式 */}
             <div className={`max-w-[80%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed shadow-sm ${
               msg.role === "user"
@@ -776,7 +838,7 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
             {msg.actionCards && msg.actionCards.length > 0 && (
               <div className="flex flex-col gap-1.5 mt-2">
                 {msg.actionCards.map((card, j) => (
-                  <div key={j}>
+                  <div key={`${msg.id}-${card.card_type}-${card.reminder_id || j}`}>
                     {/* 提醒卡片：显示确认/延时按钮 */}
                     {card.card_type === "reminder_alert" && (
                       <div className="bg-gradient-to-r from-warning-soft to-warning-soft border border-warning-border rounded-xl px-4 py-3 shadow-sm">
@@ -808,7 +870,7 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
                             <input
                               type="number"
                               min={1} max={120} defaultValue={5}
-                              id={`snooze-${j}-${i}`}
+                              id={`snooze-${msg.id}-${j}`}
                               className="w-12 text-xs px-1.5 py-0.5 rounded border-0 bg-transparent text-title focus:outline-none text-center font-mono"
                             />
                             <span className="text-xs text-faint font-medium">分钟后</span>
@@ -816,7 +878,7 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
                           <button
                             disabled={loading}
                             onClick={() => {
-                              const el = document.getElementById(`snooze-${j}-${i}`) as HTMLInputElement;
+                              const el = document.getElementById(`snooze-${msg.id}-${j}`) as HTMLInputElement;
                               const mins = Math.max(1, Math.min(120, Number(el?.value) || 5));
                               handleReminderAction("snooze", card.reminder_id || "", mins);
                             }}
@@ -830,55 +892,47 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
                         </div>
                       </div>
                     )}
-                    {/* 审批卡片：显示确认/拒绝按钮 */}
-                    {card.card_type === "approval_required" && (
-                      <div className="bg-gradient-to-r from-warning-soft to-warning-soft border border-warning-border rounded-xl px-4 py-3 shadow-sm">
-                        <div className="flex items-center gap-2 mb-2">
-                          <div className="w-6 h-6 rounded-full bg-warning-soft flex items-center justify-center shrink-0">
-                            <svg className="w-3.5 h-3.5 text-warning" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                            </svg>
+                    {card.card_type === "maintenance_report" && (() => {
+                      const scan = (card.payload_preview?.pre_enqueue_scan || {}) as Record<string, unknown>;
+                      const result = (card.payload_preview?.result || {}) as Record<string, unknown>;
+                      const actionCounts = (result.action_counts || {}) as Record<string, unknown>;
+                      const isPending = card.status === "pending";
+                      const isFailed = card.status === "failed";
+                      return (
+                        <div className={`rounded-xl border px-4 py-3 shadow-sm ${
+                          isFailed ? "bg-danger-soft border-danger-border" :
+                          isPending ? "bg-warning-soft border-warning-border" :
+                          "bg-success-soft border-success-border"
+                        }`}>
+                          <div className="flex items-center justify-between gap-3">
+                            <span className="text-sm font-medium text-title">{card.title}</span>
+                            <span className="text-[11px] font-mono text-muted">
+                              {isPending ? "执行中" : isFailed ? "失败" : "已完成"}
+                            </span>
                           </div>
-                          <span className="text-sm font-medium text-warning-text">{card.summary || card.title}</span>
+                          <p className="text-xs text-muted mt-1">{card.summary}</p>
+                          {isPending ? (
+                            <div className="grid grid-cols-3 gap-2 mt-3 text-center">
+                              <div><p className="text-[10px] text-faint">扫描</p><p className="text-sm font-mono text-title">{String(scan.total_scanned ?? 0)}</p></div>
+                              <div><p className="text-[10px] text-faint">待睡眠</p><p className="text-sm font-mono text-title">{String(scan.sleep_candidates ?? 0)}</p></div>
+                              <div><p className="text-[10px] text-faint">待归档</p><p className="text-sm font-mono text-title">{String(scan.archive_candidates ?? 0)}</p></div>
+                            </div>
+                          ) : (
+                            <div className="grid grid-cols-4 gap-2 mt-3 text-center">
+                              <div><p className="text-[10px] text-faint">候选</p><p className="text-sm font-mono text-title">{String(result.candidate_count ?? 0)}</p></div>
+                              <div><p className="text-[10px] text-faint">已应用</p><p className="text-sm font-mono text-title">{String(result.applied_count ?? 0)}</p></div>
+                              <div><p className="text-[10px] text-faint">睡眠</p><p className="text-sm font-mono text-title">{String(actionCounts.sleep ?? 0)}</p></div>
+                              <div><p className="text-[10px] text-faint">归档</p><p className="text-sm font-mono text-title">{String((Number(actionCounts.archive_expired || 0) + Number(actionCounts.archive_candidate || 0)))}</p></div>
+                            </div>
+                          )}
+                          {isFailed && Boolean(result.error) && <p className="text-xs text-danger-text mt-2 break-words">{String(result.error)}</p>}
+                          <p className="text-[10px] font-mono text-faint mt-3 break-all">{card.resource_refs?.operation_id}</p>
                         </div>
-                        {card.actions && card.actions.length > 0 ? (
-                          <div className="flex items-center gap-2">
-                          <button
-                            disabled={loading}
-                            onClick={() => {
-                              const approvalId = (card.actions?.[0]?.approval_id as string) || "";
-                              handleApprovalAction("approve", approvalId);
-                            }}
-                            className="flex items-center gap-1 text-xs px-3.5 py-1.5 rounded-lg bg-success text-on-primary font-medium hover:bg-success-text active:scale-95 disabled:opacity-40 transition-all shadow-sm"
-                          >
-                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
-                            </svg>
-                            确认执行
-                          </button>
-                          <button
-                            disabled={loading}
-                            onClick={() => {
-                              const approvalId = (card.actions?.[1]?.approval_id as string) || (card.actions?.[0]?.approval_id as string) || "";
-                              handleApprovalAction("deny", approvalId);
-                            }}
-                            className="flex items-center gap-1 text-xs px-3.5 py-1.5 rounded-lg bg-danger-soft text-danger-hover border border-danger-border font-medium hover:bg-danger-border active:scale-95 disabled:opacity-40 transition-all shadow-sm"
-                          >
-                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" />
-                            </svg>
-                            拒绝
-                          </button>
-                          </div>
-                        ) : (
-                          <span className={`text-xs font-medium ${card.status === "failed" ? "text-danger" : "text-success-text"}`}>
-                            {card.status === "failed" ? "审批执行失败或状态未知" : "审批已处理"}
-                          </span>
-                        )}
-                      </div>
-                    )}
+                      );
+                    })()}
+                    {/* TODO: 用户审批当前有意停用；恢复时必须同步启用后端策略、审批节点、前端交互、测试和文档。 */}
                     {/* 其他卡片：保持原有 badge 样式 */}
-                    {card.card_type !== "reminder_alert" && card.card_type !== "approval_required" && (
+                    {card.card_type !== "reminder_alert" && card.card_type !== "approval_required" && card.card_type !== "maintenance_report" && (
                       <span className={`text-[11px] px-2 py-0.5 rounded-full border ${
                         card.card_type === "task_created" ? "bg-primary-soft text-primary-hover border-primary-border" :
                         card.card_type === "memory_revised" ? "bg-accent-soft text-accent-text border-accent-border" :
@@ -968,7 +1022,10 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
           />
           {loading ? (
             <button
-              onClick={() => abortRef.current?.abort()}
+              onClick={() => {
+                setError(null);
+                abortRef.current?.abort();
+              }}
               className="rounded-xl bg-danger px-6 py-2.5 text-sm font-medium text-on-primary hover:bg-danger-hover active:scale-95 transition-all shadow-sm"
             >
               停止

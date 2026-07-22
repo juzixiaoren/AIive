@@ -64,9 +64,14 @@ export default function MemoriesPage() {
         },
         body: JSON.stringify({ content: content.trim(), memory_type: memoryType, pinned }),
       });
-      if (!response.ok) {
-        const payload = await response.json().catch(() => ({})) as { detail?: string };
-        throw new Error(payload.detail || `HTTP ${response.status}`);
+      const payload = await response.json().catch(() => ({})) as {
+        ok?: boolean;
+        outcome?: string;
+        reason?: string;
+        detail?: string;
+      };
+      if (!response.ok || !payload.ok) {
+        throw new Error(payload.detail || payload.reason || `记忆未写入: ${payload.outcome || `HTTP ${response.status}`}`);
       }
       setContent("");
       setPinned(false);

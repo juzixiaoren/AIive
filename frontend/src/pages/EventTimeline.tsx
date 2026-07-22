@@ -80,20 +80,43 @@ const EXPANDABLE = new Set(["tool_call", "tool_result", "system_injection"]);
 export default function EventTimeline({ traceId }: { traceId?: string }) {
   const [events, setEvents] = useState<EventItem[]>([]);
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   // 根据是否有 traceId 决定请求参数，加载事件列表
   useEffect(() => {
+    const controller = new AbortController();
     const url = traceId
-      ? `/api/inspector/events?trace_id=${traceId}&limit=50`
+      ? `/api/inspector/events?trace_id=${encodeURIComponent(traceId)}&limit=50`
       : `/api/inspector/events?limit=50`;
-    fetch(url).then(r => r.json()).then(setEvents);
+    const loadEvents = async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const response = await fetch(url, { signal: controller.signal });
+        if (!response.ok) throw new Error(`事件加载失败 HTTP ${response.status}`);
+        const data: unknown = await response.json();
+        if (!Array.isArray(data)) throw new Error("事件响应格式无效");
+        setEvents(data as EventItem[]);
+      } catch (reason) {
+        if (controller.signal.aborted) return;
+        setEvents([]);
+        setError(reason instanceof Error ? reason.message : "事件加载失败");
+      } finally {
+        if (!controller.signal.aborted) setLoading(false);
+      }
+    };
+    void loadEvents();
+    return () => controller.abort();
   }, [traceId]);
 
   return (
     <div>
       <h2 className="text-lg font-semibold text-content mb-1">事件时间线</h2>
       {traceId && <p className="text-xs text-faint mb-4 font-mono">trace_id: {traceId}</p>}
-      {events.length === 0 && (
+      {loading && <div className="text-center text-faint text-sm py-12">加载中…</div>}
+      {!loading && error && <div className="text-center text-danger text-sm py-12">{error}</div>}
+      {!loading && !error && events.length === 0 && (
         <div className="text-center text-faint text-sm py-12">暂无事件</div>
       )}
       <div className="flex flex-col gap-1">

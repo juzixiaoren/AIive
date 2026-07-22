@@ -54,7 +54,7 @@ ContextAssembler  ── 有界上下文硬门（超预算抛 ContextBudgetExcee
 AgentGraph (LangGraph)
         │  START → assistant → policy_check → [tools → assistant]* → END
         │  · assistant：ChatOpenAI.bind_tools 生成原生 tool_calls
-        │  · policy_check：基于 ToolRegistry 元数据（风险/删除/外部写）判定 allow/block/confirm
+        │  · policy_check：已注册工具直接 allow；未注册工具 block（审批暂时停用）
         │  · tools：ToolNode 执行 + 工具结果规范化（大结果→Artifact 引用）+ WorkingState 生命周期维护
         ▼
 _finalize_turn  ── 事务化落库
@@ -70,8 +70,8 @@ _finalize_turn  ── 事务化落库
 
 **运行时（runtime/）**
 - `turn_execution.py`：Turn 生命周期唯一编排点，含幂等、租约、fencing、快照轮转。
-- `agent_graph.py`：LangGraph 图编排，取代已废弃的 `agent_loop.py`；结构化工具记录写入 Graph state，同步与流式最终结果使用同一事实源。
-- `context_assembler.py` / `context_budget.py` / `token_counter.py`：有界上下文与 token 预算。
+- `agent_graph.py`：LangGraph 图编排，取代已废弃的 `agent_loop.py`；结构化工具记录写入 Graph state，同步与流式最终结果使用同一事实源。`message_normalizer.py` 统一新旧工具消息的 name/params/result/tool_call_id 解析；ContextAssembler、ThreadState token counting 与 LangChain 消息转换复用同一规则，畸形 arguments 保留原文并 fail-closed，不使整轮历史重建失败。
+- `context_assembler.py` / `context_budget.py` / `token_counter.py`：有界上下文与 token 预算。同步 Chat 的预算超限返回 HTTP 413；SSE 建连后保持 HTTP 200，并通过统一 `error` 事件携带 `status=413`、trace、hard limit 和 partition reports。同步与流式共用同一错误载荷契约。
 - `policy_engine.py`：机械化工具安全校验（不做关键词匹配）。
 - `epoch_manager.py` / `compaction.py` / `working_state.py` / `thread_state.py`：Epoch/Segment 分层与工作状态。`ThreadState.load_recent_messages_bounded()` 仅服务 LLM token 上下文；`list_thread_messages_page()` 仅服务 UI 历史，以 `turn_sequence` keyset 游标分页，二者不得混用。
 
@@ -114,7 +114,9 @@ _finalize_turn  ── 事务化落库
 - 新增 `tool_operations` 唯一事实表；稳定幂等键绑定 `turn_record_id + tool_call_id + capability_id + params_hash`，同一调用重试只复用原 operation。
 - 所有 `writes_external_world/can_delete` 工具由 `ToolRegistry` 原子写入 `ToolOperation + OutboxJob`，真实 handler 只由注册在 `HandlerRegistry` 的 `tool_operation` Worker 执行；同步调用仅有限等待数据库终态。
 - 数据库 handler 由 Worker 注入业务 Session，在同一事务提交业务副作用、`status=committed` receipt 和终态 Event；失败整体回滚后以短事务记录 failed。
-- 等待超时返回 `execution_unknown + operation_id`，不得返回普通 failed；Chat、Event、WorkingState、action card 和 pending_operations 均保留 unknown 语义。后台终态通过 WebSocket 推送，亦可调用 `GET /api/tool-operations/{operation_id}` 查询。
+- 等待超时返回 `execution_unknown + operation_id + tool_call_id`，不得返回普通 failed；Chat、Event、WorkingState、action card 和 pending_operations 均保留 unknown 语义。后台终态通过 WebSocket 推送，payload 同时携带 `operation_id` 与 `tool_call_id`：前者精确更新 action card，后者精确更新工具调用卡片；亦可调用 `GET /api/tool-operations/{operation_id}` 查询。
+- WebSocket `new_message` 携带与持久化 `llm_response` Event 一致的 `event_id`；前端以该字段作为消息身份并执行幂等去重，不使用消息正文去重。
+- UI 历史分页保留 `failed`、`interrupted_unknown` 与在途 Turn 的真实工具事件；没有 `llm_response` 时仅生成空正文的结构化工具消息容器，不伪造回复。工具状态由后端统一规范化，前端对未知状态 fail-closed 为 `execution_unknown`，禁止默认显示为完成。
 - 外部不可重复工具发生进程中断或不确定异常时保持 `execution_unknown`，禁止 Worker 自动重放；确定性终态才清理 `uncommitted_side_effects`。
 - 关闭 `/api/tools/safe-delete` 直接 Service 旁路，删除必须经 Chat → ToolRegistry → 审批 → ToolOperation → Worker。
 
@@ -129,6 +131,12 @@ _finalize_turn  ── 事务化落库
 **A.5 ContextBudget 窗口值配错且不可配置 — ✅ 已修复（2026-07-17）**
 `context_budget.py` 曾硬编码 `model_context_window=128000`（老模型 `deepseek-chat` 值），且各分区 hard 之和 130496 > 128000，`validate()` 每次启动必抛 `ValueError`（被 lifespan 的 try/except 吞掉，故长期未被察觉，直到 A.4 修复后日志才显形）。而 `.env` 实际使用 `deepseek-v4-flash`（约 1M 窗口），预算严重低估模型能力。
 **处理**：新增 `.env` 可配置项 `AIIVE_LLM_CONTEXT_WINDOW`（默认 256000）与 `AIIVE_LLM_MAX_OUTPUT_TOKENS`；`ContextBudget.default()` 与 `ModelProfile` 均从配置读取窗口，`recent_messages` 分区**弹性吸收**扣除固定分区后的剩余空间（`hard = window - 固定分区和`），使 `sum(hard)` 恒等于窗口、`validate()` 恒通过。已验证 128K/256K/1M 三档均自洽，用户改一个 .env 值即整体自适应。
+
+**A.6 ContextBudget 双来源与前端流占位竞态 — ✅ 已修复（2026-07-22）**
+- `ContextBudget.from_env()` 现为预算加载与校验的统一入口：模块默认实例、`TurnExecutionService` 共享缓存、`ContextAssembler` 缺省构造和应用启动校验均复用该入口。非法 token 类型或分区 hard 总额超限会在加载阶段明确失败；环境配置属于启动期配置，运行中修改需重启进程。
+- Chat 流式 token、工具调用、工具结果、完成、中断和错误清理均按本次请求创建的占位消息 ID 精确更新，不再依赖闭包中的 `messages.length` 或“最后一条空 Agent 消息”。同步 `inFlightRef` 在 React 状态提交前阻止重复发送。
+- 提醒按钮继续遵循 `/api/chat/system → TurnExecutionService → ToolRegistry` 统一执行链。`confirm_reminder` / `snooze_reminder` 在事务内锁定目标 Event，校验 `reminder_created` 类型与 `alerting` 前置状态；重复确认或延期返回已有确定性结果，延期目标写回原事件，避免不同 tool call 创建多个后续提醒。前端成功后移除原提醒操作卡片。
+- `remember_or_update` 继续作为 `writes_external_world=True` 的事务型副作用工具走 ToolOperation/Outbox；新增真实 Worker 集成测试，验证记忆、提案与 committed receipt 的落库闭环，不改成同步旁路。
 
 ### B. 架构可优化点
 
@@ -171,11 +179,10 @@ _finalize_turn  ── 事务化落库
 
 **C.3 `MemoryStore.get_active` 标注 DEPRECATED 仍保留**
 `memory/memory_store.py` 曾保留委托 `get_active_valid` 的弃用封装。
-**状态（已修复 2026-07-17）**：经全项目检索确认 `get_active(` 零调用方（旧报告记录的 `_handle_forget_memory` scope=all/topic 调用已在 Phase 6A 重构中改为委托 `handle_forget`，调用消失）。方法已删除，头部注释同步更新。
+**状态（已修复 2026-07-21）**：经全项目检索确认 `get_active(` 与 `get_active_valid(` 均零调用方，两个无范围读取方法均已删除；仍被专用查询复用的 active+valid 过滤条件保留。`update_lifecycle()` 直写旁路也已删除，生命周期变更统一经 `MemoryLifecycleService`。
 
-**C.4 内置 `forget_memory` 工具标注 `[DEPRECATED]`（保留，需确认后再动）**
-`tools/builtin_tools.py:461-471` 的 `_handle_forget_memory` 并非纯死代码，而是**仍注册为 `forget_memory` 工具**（`:1147`）的兼容入口，内部委托新的 `forget_tool.handle_forget`。删除它会移除一个对 LLM 可见的工具、改变工具面，属行为变更而非死代码清理。
-**建议**：确认前端/提示词已完全迁移到新 `forget` 工具后再移除；本轮**未改动**。
+**C.4 内置 `forget_memory` 兼容工具已退役（2026-07-21）**
+旧 `_handle_forget_memory` 及其 ToolRegistry 注册项已删除，不再与结构化 `forget` 工具同时暴露给 LLM。遗忘请求统一使用 `forget` 的 `mode`、目标 ID、`canonical_key` 等显式参数，避免旧 `scope` 推断与风险元数据漂移；旧 HTTP 兼容端点不受影响。
 
 ### D. 安全 / 配置
 
@@ -190,38 +197,39 @@ _finalize_turn  ── 事务化落库
 - **数据库口令**：`config.py:27` 的明文口令是 pydantic 默认值，`.env` 的 `DATABASE_URL` 会覆盖且指向 localhost，属本地开发便利。只需注意勿将真实生产口令写进源码（用 `.env`/环境变量即可），当前写法**无需改动**。
 
 **D.3 清空全部记忆的确认策略需复核**
-`forget` 工具支持 `all_user_data=True`（经 `builtin_tools.py:469-470` 的 `scope="all"` 委托）。请确认该高危路径在 `policy_engine`（`can_delete` → CONFIRM）下确实强制走审批，而非 best-effort。
+`forget` 工具支持 `all_user_data=True`（经 `builtin_tools.py:469-470` 的 `scope="all"` 委托）。当前审批策略已临时停用，`can_delete` 不再触发 CONFIRM，该高危路径会直接执行；恢复安全审批时必须优先重新启用此保护。
 
 **D.4 检索可解释性闭环**
-- 每轮 Turn 在上下文装配前生成统一 `trace_id`，ContextAssembler 的真实 UnifiedRetriever 命中会写入 `retrieval_runs/retrieval_candidates` 和 `memory_recall_runs/memory_recall_candidates`，随后 AgentGraph、action card 和最终回复复用同一 trace。
+- 每轮 Turn 在上下文装配前生成统一 `trace_id`，ContextAssembler 只通过 `UnifiedRetriever` 发起检索；`AutomaticRecallEngine` 仅作为其内部 MemoryRecord 路由，不再由调用方二次 fallback。exact/memory/index/raw-history 路由独立降级并写入稳定 notes，全路由或编排失败返回 fail-closed 空结果。
+- `retrieval_runs/retrieval_candidates` 和 `memory_recall_runs/memory_recall_candidates` 使用独立短事务持久化；诊断写入失败仅影响可观测性，不污染上下文装配 Session、不触发第二次检索。随后 AgentGraph、action card 和最终回复复用同一 trace。
 - Inspector 支持按 `trace_id` 发现 run，再按 `run_id` 读取真实候选；前端“检索”页只展示这些数据库事实，不生成候选假数据。
+- Context Inspector 主接口和 item 详情接口在快照或条目不存在时统一返回 HTTP 404（稳定 `context_snapshot_not_found` / `context_item_not_found` code）；前端明确区分未找到与服务错误，并在 trace 切换时立即清理旧快照，避免展示上一 trace 的过期内容。
 
 **D.5 Chat 错误契约**
 - 同步 `/api/chat` 的 LLM 错误统一返回 `detail={code,message,retryable,trace_id,retry_after_seconds}`，并按超时、限流、配置和上游故障映射 HTTP 状态。
 - SSE 使用相同字段并增加 `status`；错误事件会终止本轮流，不会再以空回复 `done` 伪装成功。
 - 前端仅展示安全 `message`，内部 SDK 异常保留在后端日志并通过 `trace_id` 关联。
 
-### D.6 工具审批安全闭环（已修复 2026-07-20）
+### D.6 工具审批基础设施（当前停用）
 
-工具审批以 `approval_requests` 表作为服务端唯一事实源。审批创建时固化来源 Thread/Turn、`tool_call_id`、工具名、参数、参数哈希、工具描述指纹和风险快照；前端审批接口只提交 `approval_id` 与 `approve|deny` 决策。
+当前产品策略不启用用户审批：`check_tool_calls()` 对所有已注册工具统一返回 `ALLOW`，仅阻止未注册工具；`risk_level`、`requires_confirmation`、`writes_external_world` 和 `can_delete` 保留为安全元数据，但不参与运行时审批判定。Chat 不展示审批卡片，Capability Dashboard 不展示“需确认”徽标。
 
-审批状态通过数据库条件更新完成 `pending → executing → succeeded|failed|interrupted_unknown` 或 `pending → denied` 迁移，同一审批只有一个请求能够获得执行权。普通 `ToolRegistry.execute()` 仍保留确认守卫；审批服务通过 `execute_approved()` 校验原始指令权限和工具描述指纹后执行服务端冻结参数。工具事件固定写回审批来源 Turn，禁止按线程最新 Turn 关联。历史消息恢复时根据审批表终态移除原卡片动作，防止刷新后重复提交。
-
-工具超时或 handler 异常会进入 `interrupted_unknown`，不会自动重试可能已产生外部副作用的操作；重复审批请求只返回已保存结果，不再次执行。
+`approval_requests`、审批图节点和审批响应接口作为休眠基础设施保留，不属于当前可达运行链路。未来恢复审批时，必须同时启用策略判定、审批节点、前端交互、回归测试和文档，禁止只接通单层逻辑。保留基础设施原有约束：服务端冻结工具参数和风险快照、条件状态迁移、工具描述指纹校验、来源 Turn 绑定，以及外部副作用超时后不自动重试。
 
 ### E. 前端
 
 **E.0 普通用户页面与开发者边界**
 - 普通用户导航提供 Chat、Memory Dashboard、Capability Dashboard、Event/Context/Retrieval Inspector、Tools 和 Notifications。
+- 本项目定位为本地单用户个人应用。Event/Context/Retrieval Inspector 是用户观察本人 Agent 上下文、事件和检索过程的产品能力，允许返回原始上下文正文、查询和事件 payload，不经过开发者网关或诊断脱敏；若未来支持远程或多用户部署，必须先增加身份认证、资源归属校验并重新评估敏感字段边界。
 - Memory Dashboard 只展示 `GET /api/memories` 返回的最近 100 条可见记录，搜索为当前列表本地筛选；创建、sleep、archive、forget 均调用真实后端 API 并在成功后重新读取数据库状态。
-- Capability Dashboard 只读展示 `/api/mcp/capabilities` 与 `/api/tools` 的真实状态和安全声明。MCP 安装、激活、自进化和后台维护不直接调用 Service 路由，继续通过 Chat、ToolRegistry、approval 与真实 smoke 链路执行。
-- debug、outbox、epochs 等内部读取端点进入独立的 `/developer` 只读诊断页：前端构建开关 `VITE_AIIVE_DEVELOPER_UI_ENABLED` 与后端 `AIIVE_DEVELOPER_DIAGNOSTICS_ENABLED` 均默认关闭，后端启用后仍同时限制 loopback 客户端和 Host。事件 payload、LLM 预览与 Outbox 错误详情在服务端脱敏后才返回；页面不提供 seal、rollover、retry 或 requeue 操作。`POST /api/epochs/{thread_id}/seal-segment` 与 `POST /api/epochs/{thread_id}/rollover` 是现有业务写接口，不属于 Developer 只读 guard 的保护范围，继续保持兼容。
+- Capability Dashboard 只读展示 `/api/mcp/capabilities` 与 `/api/tools` 的真实状态和安全声明。MCP 安装、激活、自进化和后台维护不直接调用 Service 路由，继续通过 Chat、ToolRegistry 与真实 smoke 链路执行；当前不启用用户审批。
+- debug、outbox、epochs 等内部读取端点进入独立的 `/developer` 只读诊断页：前端构建开关 `VITE_AIIVE_DEVELOPER_UI_ENABLED` 与后端 `AIIVE_DEVELOPER_DIAGNOSTICS_ENABLED` 均默认关闭，后端启用后仍同时限制 loopback 客户端和 Host。这些内部端点的 LLM 预览与 Outbox 错误详情在服务端脱敏后才返回；该规则不适用于作为普通用户观察能力的 Inspector。页面不提供 seal、rollover、retry 或 requeue 操作。`POST /api/epochs/{thread_id}/seal-segment` 与 `POST /api/epochs/{thread_id}/rollover` 是现有业务写接口，不属于 Developer 只读 guard 的保护范围，继续保持兼容。
 - Capability activate 在真实 MCP 安装、启动、`tools/list`、`tools/call`、smoke 和 ToolRegistry 注册链路完成前保持 fail-closed，计划转为 `needs_user_review`，禁止硬编码 smoke 成功或写入不可调用的 active 状态。
 - Forget Phase A 使用 Session 同步更新：同一事务立即读取 `lifecycle_state=forgotten`；正文保留到异步 purge 阶段处理，Shield/Tombstone 在此期间保证 fail-closed。
 
 **E.1 通知实时推送（已落地）**
 已移除 `App.tsx` 的 30s 轮询。改为：后端新增全局通知通道 `ws_manager.GLOBAL_THREAD_ID = "__global__"`，前端 `useNotificationSocket` 单例连接 `/ws/__global__`，连接时即收到 pending 数量快照，之后在提醒触发（成功/回退）、确认、延时、删除等变更点通过 `broadcast_pending_count` 主动推送最新 `pending_count`。`NotificationsPage` 订阅该通道在通知变更时单次刷新收件箱（非周期轮询）。
-**结论**：通知角标与收件箱均为 WebSocket 即时更新，无 HTTP 轮询。删除通知只会将事件标记为 `payload.dismissed=true` 并从通知读模型隐藏，底层 Event 审计事实会保留；关联的未执行 Task 与同一 `task_id` 的提醒事件会在同一事务中取消。
+**结论**：通知角标与收件箱均为 WebSocket 即时更新，无 HTTP 轮询。删除通知会将事件标记为 `payload.dismissed=true` 并从通知读模型隐藏，底层 Event 审计事实保留；关联 Task 仅在 `pending/dispatching` 时转为 `cancelled`，尚未 claim 的 `reminder_delivery` Outbox 同事务取消。Handler 在 Agent 执行前后均检查取消状态；已 `completed` 的提醒只能隐藏历史通知，接口不得宣称撤回已完成投递。`POST /tasks/{id}/check-now` 通过 `TaskManager.enqueue_reminder_now()` 按 ID 锁定并入队，不扫描其他任务、不复活终态 Task。
 
 ---
 
@@ -241,7 +249,7 @@ _finalize_turn  ── 事务化落库
 | P2 | C.1 intent_router 死文件 | ✅ 已删除(2026-07-17) | 降低理解成本 |
 | P2 | C.2 围栏剥离去重 | ✅ 已修复(2026-07-17) | 抽取 `strip_code_fence` 共享函数 |
 | P2 | C.3 get_active 死方法 | ✅ 已删除(2026-07-17) | 零调用方 |
-| P2 | C.4 forget_memory 兼容入口 | 保留(需确认) | 属行为变更，非死代码 |
+| P2 | C.4 forget_memory 兼容入口 | ✅ 已移除(2026-07-21) | LLM 工具面统一为结构化 `forget` |
 | P3 | D.2 CORS/DB 凭据 | 无需处理 | 本地场景合理 |
 | P3 | E.1 前端 WebSocket 推送 | 待处理 | 体验 |
 

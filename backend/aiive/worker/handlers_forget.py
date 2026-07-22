@@ -1113,23 +1113,6 @@ def handle_forget_purge(claimed: ClaimedJob) -> HandlerResult:
             # 额外清理旧 evidence / proposals
             target_ids = []
 
-        # 清理 deprecated old forget_requests
-        from aiive.db.models import ForgetRequest as OldFR
-        old_frs = (
-            db.query(OldFR)
-            .filter(
-                OldFR.memory_id.in_(
-                    db.query(ForgetTarget.target_id).filter_by(
-                        forget_operation_id=operation_id,
-                        target_type="memory_record",
-                    )
-                )
-            )
-            .all()
-        )
-        for fr in old_frs:
-            fr.tombstone = "[purged]"
-
         if targets:
             batch.cursor_start_json = {"last_id": targets[-1].target_id}
         batch.updated_at = _utcnow()
@@ -1453,57 +1436,34 @@ def handle_forget_verify(claimed: ClaimedJob) -> HandlerResult:
 
 
 def handle_forget_reconcile(claimed: ClaimedJob) -> HandlerResult:
-    """补发遗漏的 forget stage Job（spec X）。
+    """对账单个 Forget Saga，并补发或自动恢复阻塞阶段。"""
+    from aiive.forget.reconcile_service import ForgetReconcileService
 
-    按 saga 阶段顺序（cascade → rebuild_dependencies → purge → verify）检查
-    ForgetStageRun，补发第一个缺失且前置已完成的阶段 Job。deadletter 状态需
-    人工介入，不在自动 reconcile 范围内（避免掩盖不可恢复错误）。
-    """
-    payload = claimed.payload
-    operation_id = payload.get("forget_operation_id", "")
+    operation_id = claimed.payload.get("forget_operation_id", "")
     if not operation_id:
-        return HandlerResult(HandlerOutcome.NON_RETRYABLE, "missing forget_operation_id")
+        return HandlerResult(HandlerOutcome.NON_RETRYABLE, "缺少 forget_operation_id")
 
     db = SessionLocal()
     try:
-        op = db.query(ForgetOperation).filter_by(id=operation_id).first()
-        if not op:
-            return HandlerResult(HandlerOutcome.NON_RETRYABLE, "operation not found")
-        if op.status == "shielded_deadletter":
-            # 死信不可自动恢复，需人工介入
+        result = ForgetReconcileService.reconcile_operation(db, operation_id)
+        if result.action == "operation_not_found":
+            db.rollback()
+            return HandlerResult(HandlerOutcome.NON_RETRYABLE, "遗忘操作不存在")
+        if result.action in {"duplicate_stage_run", "outbox_job_missing", "unsupported_job_status"}:
+            db.rollback()
             return HandlerResult(
-                HandlerOutcome.NON_RETRYABLE, "shielded_deadletter requires manual recovery"
+                HandlerOutcome.NON_RETRYABLE,
+                f"遗忘阶段状态无法自动恢复: {result.action}:{result.stage or ''}",
             )
-
-        # 实际阶段名（与 handle_forget_cascade / rebuild / purge / verify 一致）
-        expected_stages = ["cascade", "rebuild_dependencies", "purge", "verify"]
-        done_stages = {
-            sr.stage
-            for sr in db.query(ForgetStageRun)
-            .filter_by(forget_operation_id=operation_id)
-            .all()
-        }
-
-        # 找到第一个缺失且前置已完成的阶段
-        last_done_index = -1
-        for i, stage in enumerate(expected_stages):
-            if stage in done_stages:
-                last_done_index = i
-            else:
-                break
-        if last_done_index + 1 >= len(expected_stages):
-            return HandlerResult(HandlerOutcome.COMPLETED, "all stages present")
-
-        next_stage = expected_stages[last_done_index + 1]
-        _enqueue_next_stage(db, operation_id, f"forget_{next_stage}")
         db.commit()
         return HandlerResult(
-            HandlerOutcome.COMPLETED, f"reconciled: enqueued {next_stage}"
+            HandlerOutcome.COMPLETED,
+            f"遗忘对账完成: {result.action}:{result.stage or ''}",
         )
     except Exception as exc:
         db.rollback()
-        logger.exception("forget_reconcile failed")
-        return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, f"reconcile: {exc}")
+        logger.exception("forget_reconcile 执行失败")
+        return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, f"遗忘对账失败: {exc}")
     finally:
         db.close()
 

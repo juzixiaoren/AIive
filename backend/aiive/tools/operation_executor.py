@@ -190,6 +190,7 @@ def operation_response(operation: ToolOperation) -> dict[str, Any]:
     """将持久化状态转换为统一 Registry 响应。"""
     common = {
         "operation_id": operation.id,
+        "tool_call_id": operation.tool_call_id,
         "execution_status": operation.status,
     }
     if operation.status == "committed":

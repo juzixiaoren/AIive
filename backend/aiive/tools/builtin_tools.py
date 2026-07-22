@@ -5,7 +5,7 @@
 工具分类：
 - 基础工具：echo
 - 提醒/任务：schedule_reminder, remind_alert, confirm_reminder, snooze_reminder, list_tasks, cancel_task, show_notifications
-- 记忆管理：remember_or_update, forget_memory, run_memory_maintenance
+- 记忆管理：remember_or_update, forget, run_memory_maintenance
 - 记忆召回（V2 Agent-Initiated，只读，结果作证据返回）：memory_search, memory_timeline, memory_event_log
 - 文件操作：safe_delete, read_text_file
 - 知识库：ingest_document, reindex_document, search_knowledge
@@ -200,11 +200,18 @@ def _handle_confirm_reminder(db: Session, reminder_id: str):
         包含 ok、reminder_id、content、status 的字典
     """
     from aiive.db.models import Event
-    event = db.get(Event, reminder_id)
+    event = db.query(Event).filter(Event.id == reminder_id).with_for_update().one_or_none()
     if not event:
         return {"ok": False, "error": "Reminder not found"}
+    if event.event_type != "reminder_created":
+        return {"ok": False, "error": f"Not a reminder event (type={event.event_type})"}
 
     payload = dict(event.payload or {})
+    current_status = str(payload.get("status", ""))
+    if current_status == "confirmed":
+        return {"ok": True, "reminder_id": reminder_id, "content": payload.get("content", ""), "status": "confirmed", "already_applied": True}
+    if current_status != "alerting":
+        return {"ok": False, "error": f"Reminder status does not allow confirmation (status={current_status})"}
     payload["status"] = "confirmed"
     event.payload = payload
     db.flush()
@@ -231,12 +238,26 @@ def _handle_snooze_reminder(db: Session, ctx: RunContext | None, reminder_id: st
         包含 snoozed_reminder_id、new_reminder_id、content、delay_minutes 的字典
     """
     from aiive.db.models import Event, Task
-    event = db.get(Event, reminder_id)
+    event = db.query(Event).filter(Event.id == reminder_id).with_for_update().one_or_none()
     if not event:
         return {"ok": False, "error": "Reminder not found"}
+    if event.event_type != "reminder_created":
+        return {"ok": False, "error": f"Not a reminder event (type={event.event_type})"}
 
     payload = dict(event.payload or {})
     content = payload.get("content", "提醒")
+    current_status = str(payload.get("status", ""))
+    if current_status == "snoozed":
+        return {
+            "ok": True,
+            "snoozed_reminder_id": reminder_id,
+            "new_reminder_id": payload.get("snoozed_to"),
+            "content": content,
+            "delay_minutes": payload.get("snooze_delay_minutes", delay_minutes),
+            "already_applied": True,
+        }
+    if current_status != "alerting":
+        return {"ok": False, "error": f"Reminder status does not allow snooze (status={current_status})"}
 
     # 将当前事件标记为已延期
     payload["status"] = "snoozed"
@@ -273,6 +294,12 @@ def _handle_snooze_reminder(db: Session, ctx: RunContext | None, reminder_id: st
         },
     )
     db.add(new_event)
+    db.flush()
+    event.payload = {
+        **payload,
+        "snoozed_to": new_event.id,
+        "snooze_delay_minutes": delay_minutes,
+    }
     db.flush()
     # 延时后新增一条 pending 事件，推送最新计数
     from aiive.api.routes_notifications import broadcast_pending_count
@@ -477,36 +504,28 @@ def _handle_remember_or_update(db: Session, ctx: RunContext | None, content: str
 
 
 @_db_handler
-def _handle_forget_memory(_db: Session, ctx: RunContext | None, memory_id: str = "", reason: str = "", scope: str = "memory_id", target: str = ""):
-    """[DEPRECATED] 遗忘/删除存储的记忆。Phase 6A 后委托给 forget 工具。"""
-    from aiive.tools.forget_tool import handle_forget
-
-    if memory_id:
-        return handle_forget(mode="memory_only", memory_ids=[memory_id], reason=reason, ctx=ctx)
-    if scope == "memory_key" and target:
-        return handle_forget(mode="memory_only", canonical_key=target, reason=reason, ctx=ctx)
-    if scope == "all":
-        return handle_forget(mode="everywhere", all_user_data=True, reason=reason, ctx=ctx)
-    return {"ok": False, "error": "unknown scope; use the new 'forget' tool instead"}
-
-
-@_db_handler
-def _handle_run_memory_maintenance(db: Session):
-    """触发记忆维护（Daily Dream）：真正 enqueue `memory_maintenance` OutboxJob 执行。
-
-    同时返回只读诊断扫描结果（scan 仍作为只读统计，不替代执行）。
-    """
+def _handle_run_memory_maintenance(db: Session, ctx: RunContext | None):
+    """事务化入队一次手工记忆维护，并返回入队前只读诊断快照。"""
     from aiive.memory.memory_maintenance import MemoryMaintenance
     from aiive.worker.scheduler_daemon import enqueue_maintenance_job
 
+    run_ctx = _require_ctx(ctx, "run_memory_maintenance")
     scan = MemoryMaintenance(db).scan()
-    operation_id = enqueue_maintenance_job(db)
-    db.commit()
+    bucket_source = run_ctx.turn_record_id or run_ctx.turn_id or run_ctx.trace_id
+    maintenance_operation_id = enqueue_maintenance_job(
+        db,
+        window_bucket=f"manual-{bucket_source}",
+        source_context={
+            "thread_id": run_ctx.thread_id,
+            "turn_id": run_ctx.turn_id,
+            "trace_id": run_ctx.trace_id,
+        },
+    )
     return {
         "ok": True,
-        "enqueued": operation_id is not None,
-        "operation_id": operation_id,
-        "scan": scan,
+        "enqueued": maintenance_operation_id is not None,
+        "maintenance_operation_id": maintenance_operation_id,
+        "pre_enqueue_scan": scan,
     }
 
 
@@ -1175,13 +1194,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
              "memory_type": {"type": "str", "description": "user_profile / agent_self / project / policy / procedural / episodic / knowledge / environment"},
              "memory_key": {"type": "str", "description": "稳定键，推荐格式: user.preference.<topic> / agent.persona.<trait> / project.<name>.<topic>"},
          }, "low", True, False),
-        ("forget_memory", _handle_forget_memory,
-         "[DEPRECATED] Phase 6A 后请使用 'forget' 工具。遗忘/删除记忆，支持 memory_id / memory_key / all 范围",
-         {"memory_id": {"type": "str", "description": "scope=memory_id 时必填"},
-          "reason": {"type": "str", "description": "遗忘原因，辅助审计"},
-          "scope": {"type": "str", "description": "memory_id / memory_key / all"},
-          "target": {"type": "str", "description": "scope=memory_key 必填"}}, "medium", True, False),
-        # Phase 6A: 新 forget 工具
+        # Phase 6A: 统一 forget 工具
         ("forget", handle_forget,
          "执行 Forget Saga — Phase A 立即屏蔽。长期记忆、原始聊天、派生摘要全部清理。\n"
          + "mode: everywhere(默认/忘记一切) / memory_only(仅删记忆保留聊天) / history_only(仅删聊天及派生)",
@@ -1200,8 +1213,8 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
              "operation_key": {"type": "str", "description": "forget 工具返回的 operation_key"},
          }, "low", False, False),
         ("run_memory_maintenance", _handle_run_memory_maintenance,
-         "扫描记忆库健康状态：报告各生命周期计数、候选记忆数量、过期/冲突记录等",
-         {}, "low", False, False),
+         "扫描记忆库健康状态并启动真实后台维护；返回入队前诊断快照，最终结果稍后更新",
+         {}, "low", True, False),
         # Agent-Initiated Recall —— 只读检索（结果作为 Tool Observation 返回，不写回 System Contract）
         ("memory_search", _handle_memory_search,
          "语义搜索长期记忆（最常用的深挖工具）。根据查询语义检索所有类型记忆，" +

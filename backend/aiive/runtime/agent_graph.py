@@ -47,8 +47,9 @@ from aiive.context.run_context import RunContext
 from aiive.core.action_planner import ActionPlanner, MemorySignalDecision
 from aiive.core.llm_client import normalize_llm_error
 from aiive.core.llm_client import LLMClient
-from aiive.memory.extraction_policy import MemoryExtractionPolicy, MemorySignalAction
+from aiive.memory.extraction_policy import MessageSource, MemoryExtractionPolicy, MemorySignalAction
 from aiive.memory.memory_store import MemoryStore
+from aiive.runtime.context_assembler import ContextSnapshotData, ContextSnapshotItem
 from aiive.runtime.event_logger import EventLogger
 from aiive.runtime.policy_engine import check_tool_calls, PolicyAction
 from aiive.runtime.thread_state import ThreadState
@@ -60,6 +61,7 @@ from aiive.tools.registry import ToolRegistry, get_tool_registry
 from aiive.runtime.tool_normalizer import ToolResultNormalizer
 from aiive.runtime.token_counter import LiteLLMTokenCounter
 from aiive.runtime.working_state import WorkingStateService
+from aiive.runtime.message_normalizer import normalize_tool_call, normalize_tool_result
 
 
 def _ws_commit(mutate: "Callable[[Session], None]") -> None:
@@ -88,25 +90,114 @@ class _AgentState(TypedDict):
     tool_records: Annotated[list[dict[str, Any]], operator.add]
 
 
+@dataclass
+class _StreamToolCallMatcher:
+    """将 LangGraph 流式工具事件关联到模型生成的真实工具调用标识。"""
+
+    pending: list[dict[str, Any]] = field(default_factory=list)
+    run_ids: dict[str, str] = field(default_factory=dict)
+
+    def register_batch(self, tool_calls: list[Any]) -> None:
+        """登记一个 tools 节点即将执行的模型工具调用批次。"""
+        self.pending.extend(
+            {
+                "tool_call_id": str(call.get("id", "") or ""),
+                "name": str(call.get("name", "") or ""),
+                "params": call.get("args", {}) if isinstance(call.get("args"), dict) else {},
+            }
+            for call in tool_calls
+            if isinstance(call, dict)
+        )
+
+    def start(
+        self,
+        run_id: str,
+        name: str,
+        params: dict[str, Any],
+        event_tool_call_id: str = "",
+    ) -> str:
+        """优先按事件调用标识匹配，缺失时按名称、参数和登记顺序回退。"""
+        if event_tool_call_id:
+            for index, call in enumerate(self.pending):
+                if call["tool_call_id"] == event_tool_call_id:
+                    self.pending.pop(index)
+                    self.run_ids[run_id] = event_tool_call_id
+                    return event_tool_call_id
+        for index, call in enumerate(self.pending):
+            if call["name"] == name and call["params"] == params:
+                matched = self.pending.pop(index)
+                self.run_ids[run_id] = matched["tool_call_id"]
+                return matched["tool_call_id"]
+        return ""
+
+    def finish(self, run_id: str, fallback_id: str = "") -> str:
+        """返回工具结束事件对应的真实工具调用标识。"""
+        return self.run_ids.pop(run_id, "") or fallback_id
+
+
 # ---------------------------------------------------------------------------
 # 模块级工具函数
 # ---------------------------------------------------------------------------
 
-@dataclass
-class ContextItem:
-    """上下文项：描述注入到 LLM 上下文的单个信息块（用于 ContextSnapshot 持久化）。"""
+@dataclass(frozen=True)
+class ToolExecutionReceipt:
+    """工具返回内容解析后的统一执行回执。"""
 
-    item_id: str
-    kind: str
-    source: str
-    trust_level: str
-    content_preview: str
-    preview_length: int = field(default=0)
-    token_estimate: int = 0
+    content: str
+    ok: bool
+    status: str
+    execution_status: str = ""
+    operation_id: str = ""
+    error_type: str = ""
 
-    def __post_init__(self) -> None:
-        self.preview_length = len(self.content_preview)
-        self.token_estimate = max(1, self.preview_length // 4)
+
+def parse_tool_execution_receipt(content: str) -> ToolExecutionReceipt:
+    """将 ToolMessage 内容解析为唯一的工具执行状态契约。"""
+    is_error = content.startswith("Error:") if content else False
+    execution_status = ""
+    operation_id = ""
+    error_type = ""
+    if not is_error and content.startswith("{"):
+        try:
+            parsed = _json.loads(content)
+            if isinstance(parsed, dict):
+                execution_status = str(parsed.get("execution_status", "") or "")
+                operation_id = str(parsed.get("operation_id", "") or "")
+                error_type = str(parsed.get("error_type", "") or "")
+                if not parsed.get("ok", True):
+                    is_error = True
+        except (ValueError, TypeError):
+            pass
+    status = (
+        "execution_unknown"
+        if execution_status in ("queued", "running", "execution_unknown")
+        else ("failed" if is_error else "completed")
+    )
+    return ToolExecutionReceipt(
+        content=content,
+        ok=not is_error,
+        status=status,
+        execution_status=execution_status,
+        operation_id=operation_id,
+        error_type=error_type,
+    )
+
+
+class GraphExecutionInterrupted(Exception):
+    """流式图执行中断，并携带中断前已经确认的工具事实。"""
+
+    def __init__(
+        self,
+        error: Exception,
+        trace_id: str,
+        partial_reply: str,
+        tool_records: list["ToolRecord"],
+    ) -> None:
+        self.error: Exception = error
+        self.trace_id: str = trace_id
+        self.partial_reply: str = partial_reply
+        self.tool_records: list[ToolRecord] = tool_records
+        super().__init__(str(error))
 
 
 def _build_runtime_identity(runtime_identity: dict[str, str] | None) -> str:
@@ -177,10 +268,7 @@ class AgentGraphResult:
     action_cards: list[ActionCard] = field(default_factory=list)
     pending_operations: list[PendingOperation] = field(default_factory=list)
     pending_approvals: list[dict[str, Any]] = field(default_factory=list)
-    context_snapshot_items: list["ContextItem"] = field(default_factory=list)
-    context_snapshot_meta: dict[str, Any] = field(default_factory=dict)
-    post_context_items: list["ContextItem"] = field(default_factory=list)
-    post_full_contents: dict[str, str] = field(default_factory=dict)
+    context_snapshot: ContextSnapshotData = field(default_factory=ContextSnapshotData)
     memory_signal: Any = None  # MemorySignalDecision
 
 
@@ -318,21 +406,21 @@ Be concise by default. Provide additional detail when the task is complex, the u
     def _build_post_context_items(
         reply: str,
         records: list[dict[str, Any]],
-    ) -> tuple[list[ContextItem], dict[str, str]]:
+    ) -> tuple[list[ContextSnapshotItem], dict[str, str]]:
         """构建后执行上下文项：Agent 输出、工具调用和工具结果。
 
         返回 (context_items, full_contents)：
         - context_items: 折叠态展示的截断预览（~20 字）
         - full_contents: item_id → 完整文本的映射，供前端展开时懒加载
         """
-        items: list[ContextItem] = []
+        items: list[ContextSnapshotItem] = []
         full: dict[str, str] = {}
 
         # Agent 输出
         if reply:
             item_id = "agent_output"
             preview = reply[:20] + ("..." if len(reply) > 20 else "")
-            items.append(ContextItem(
+            items.append(ContextSnapshotItem(
                 item_id=item_id, kind="agent_output", source="agent",
                 trust_level="trusted", content_preview=preview,
                 token_estimate=max(1, len(reply) // 4),
@@ -350,7 +438,7 @@ Be concise by default. Provide additional detail when the task is complex, the u
             call_id = f"tool_call:{i}"
             params_text = _json.dumps(params, ensure_ascii=False)
             preview = f"{name}({_truncate(params_text, 20)})"
-            items.append(ContextItem(
+            items.append(ContextSnapshotItem(
                 item_id=call_id, kind="tool_call", source="tools",
                 trust_level="trusted", content_preview=preview,
                 token_estimate=max(1, len(params_text) // 4),
@@ -361,7 +449,7 @@ Be concise by default. Provide additional detail when the task is complex, the u
             result_id = f"tool_result:{i}"
             result_text = _json.dumps(result, ensure_ascii=False)
             preview = f"[{status}] {_truncate(result_text, 20)}"
-            items.append(ContextItem(
+            items.append(ContextSnapshotItem(
                 item_id=result_id, kind="tool_result", source="tools",
                 trust_level="trusted", content_preview=preview,
                 token_estimate=max(1, len(result_text) // 4),
@@ -462,17 +550,19 @@ Be concise by default. Provide additional detail when the task is complex, the u
                 tc_name = str(pa.get("name", "") or "")
                 tc_args = pa.get("args", {}) if isinstance(pa.get("args"), dict) else {}
                 reg = registry.get(tc_name)
+                if reg is None or not reg.safety.descriptor_hash:
+                    raise RuntimeError(f"工具 {tc_name} 缺少有效的 descriptor hash")
                 canonical_args = _json.dumps(
                     tc_args, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
                 )
                 pa["approval_id"] = str(_uuid.uuid4())
                 pa["tool_args_hash"] = hashlib.sha256(canonical_args.encode("utf-8")).hexdigest()
-                pa["descriptor_hash"] = reg.safety.descriptor_hash if reg is not None else ""
+                pa["descriptor_hash"] = reg.safety.descriptor_hash
                 pa["risk_snapshot"] = {
-                    "risk_level": reg.safety.risk_level if reg is not None else "unknown",
-                    "requires_confirmation": reg.safety.requires_confirmation if reg is not None else True,
-                    "writes_external_world": reg.safety.writes_external_world if reg is not None else False,
-                    "can_delete": reg.safety.can_delete if reg is not None else False,
+                    "risk_level": reg.safety.risk_level,
+                    "requires_confirmation": reg.safety.requires_confirmation,
+                    "writes_external_world": reg.safety.writes_external_world,
+                    "can_delete": reg.safety.can_delete,
                 }
             logger.info("[TRACE:graph] CONFIRM(ns): prepared %d pending approvals", len(_pending_approval_list))
             return {}
@@ -536,22 +626,9 @@ Be concise by default. Provide additional detail when the task is complex, the u
             for i, tc in enumerate(tc_list):
                 tm = tool_messages[i] if i < len(tool_messages) else None
                 raw_content = str(tm.content) if tm else ""
-                is_error = raw_content.startswith("Error:") if raw_content else False
-                execution_status = ""
-                operation_id = ""
-                if not is_error and raw_content.startswith("{"):
-                    try:
-                        parsed = _json.loads(raw_content)
-                        if isinstance(parsed, dict):
-                            execution_status = str(parsed.get("execution_status", "") or "")
-                            operation_id = str(parsed.get("operation_id", "") or "")
-                            if not parsed.get("ok", True):
-                                is_error = True
-                    except (ValueError, TypeError):
-                        pass
-                record_status = "execution_unknown" if execution_status in (
-                    "queued", "running", "execution_unknown",
-                ) else ("failed" if is_error else "completed")
+                receipt = parse_tool_execution_receipt(raw_content)
+                is_error = not receipt.ok
+                record_status = receipt.status
 
                 # ── A: 规范化（有界引用化 / 内联）──
                 artifact_ref = ""
@@ -575,8 +652,9 @@ Be concise by default. Provide additional detail when the task is complex, the u
                     "result": {
                         "ok": not is_error,
                         "result": str(tm.content) if tm else raw_content,
-                        "operation_id": operation_id,
-                        "execution_status": execution_status,
+                        "operation_id": receipt.operation_id,
+                        "execution_status": receipt.execution_status,
+                        "error_type": receipt.error_type,
                     },
                     "status": record_status,
                     "trace_id": trace_id,
@@ -635,6 +713,7 @@ Be concise by default. Provide additional detail when the task is complex, the u
         turn_id: str = "", turn_record_id: str = "", ctx_bundle: Any = None,
         execution_id: str = "", normalizer: "ToolResultNormalizer | None" = None,
         trace_id: str | None = None,
+        message_source: str | MessageSource = MessageSource.USER,
     ) -> "AgentGraphResult":
         """Execute graph inference. Uses pre-assembled context from ContextAssembler."""
         trace = Trace(trace_id=trace_id) if trace_id else Trace.new()
@@ -653,8 +732,7 @@ Be concise by default. Provide additional detail when the task is complex, the u
         chat_messages = assembled_ctx.messages
         tool_schemas = assembled_ctx.tools_schema
         initial_messages = self._dicts_to_langchain_messages(chat_messages)
-        ctx_items_data: list[ContextItem] = []
-        ctx_meta: dict[str, Any] = dict(assembled_ctx.snapshot_meta or {})
+        context_snapshot = assembled_ctx.snapshot
 
         # ── Execute graph ──
         langchain_llm = self._build_langchain_llm()
@@ -662,7 +740,7 @@ Be concise by default. Provide additional detail when the task is complex, the u
         run_ctx_exec = RunContext(
             thread_id=thread.id,
             trace_id=trace.trace_id,
-            source="user_chat",
+            source=(message_source.value if isinstance(message_source, MessageSource) else MessageSource(message_source).value),
             turn_id=turn_id,
             turn_record_id=turn_record_id,
         )
@@ -751,6 +829,12 @@ Be concise by default. Provide additional detail when the task is complex, the u
             {"name": r.name, "params": r.params, "result": r.result, "status": r.status, "trace_id": trace.trace_id}
             for r in tool_records
         ])
+        result_snapshot = ContextSnapshotData(
+            items=[*context_snapshot.items, *post_items],
+            full_contents={**context_snapshot.full_contents, **post_full},
+            stable_prefix_hash=context_snapshot.stable_prefix_hash,
+            injected_memory_ids=list(context_snapshot.injected_memory_ids),
+        )
 
         # ── 记忆信号分类（LLM，事务外）──
         signal: MemorySignalDecision = MemorySignalDecision(action=MemorySignalAction.EXTRACT_ASYNC.value, confidence=0.5, reason="default")
@@ -758,15 +842,16 @@ Be concise by default. Provide additional detail when the task is complex, the u
             signal = self._action_planner.classify_memory_signal(user_message=message, reply=reply, trace_id=trace.trace_id)
         except Exception:
             logger.warning("记忆信号分类失败（已使用默认信号）: trace_id=%s", trace.trace_id, exc_info=True)
-        signal.action = MemoryExtractionPolicy.resolve_action(signal.action, message).value
+        signal.action = MemoryExtractionPolicy.resolve_action(
+            signal.action, message, message_source,
+        ).value
 
         return AgentGraphResult(
             reply=reply, trace_id=trace.trace_id, user_message=message,
             tool_records=tool_records, action_cards=action_cards,
             pending_operations=pending_operations,
             pending_approvals=[dict(item) for item in pending_approvals],
-            context_snapshot_items=list(ctx_items_data), context_snapshot_meta=dict(ctx_meta),
-            post_context_items=post_items, post_full_contents=post_full, memory_signal=signal,
+            context_snapshot=result_snapshot, memory_signal=signal,
         )
 
     # ------------------------------------------------------------------
@@ -778,6 +863,7 @@ Be concise by default. Provide additional detail when the task is complex, the u
         turn_id: str = "", turn_record_id: str = "", ctx_bundle: Any = None,
         execution_id: str = "", normalizer: "ToolResultNormalizer | None" = None,
         trace_id: str | None = None,
+        message_source: str | MessageSource = MessageSource.USER,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """流式执行图推理，逐渐产出 token / tool_call / tool_result 事件。
 
@@ -798,15 +884,14 @@ Be concise by default. Provide additional detail when the task is complex, the u
         chat_messages = assembled_ctx.messages
         tool_schemas = assembled_ctx.tools_schema
         initial_messages = self._dicts_to_langchain_messages(chat_messages)
-        ctx_items_data: list[ContextItem] = []
-        ctx_meta: dict[str, Any] = dict(assembled_ctx.snapshot_meta or {})
+        context_snapshot = assembled_ctx.snapshot
 
         langchain_llm = self._build_langchain_llm()
         registry = get_tool_registry()
         run_ctx_exec = RunContext(
             thread_id=thread.id,
             trace_id=trace.trace_id,
-            source="user_chat",
+            source=(message_source.value if isinstance(message_source, MessageSource) else MessageSource(message_source).value),
             turn_id=turn_id,
             turn_record_id=turn_record_id,
         )
@@ -832,14 +917,26 @@ Be concise by default. Provide additional detail when the task is complex, the u
         # ── 流式执行 ──
         accumulated: list[str] = []
         final_state: dict[str, Any] | None = None
+        stream_matcher = _StreamToolCallMatcher()
+        stream_params_by_id: dict[str, dict[str, Any]] = {}
+        completed_stream_records: list[ToolRecord] = []
         input_state: dict[str, Any] = {"messages": initial_messages, "tool_records": []}
 
         try:
             async for event in compiled.astream_events(input_state, version="v2"):
                 kind = event["event"]
                 evt_name = event.get("name", "")
+                run_id = str(event.get("run_id", "") or "")
                 metadata = event.get("metadata", {})
                 node = metadata.get("langgraph_node", "")
+
+                if kind == "on_chain_start" and node == "tools":
+                    tool_calls = event.get("data", {}).get("input", {}).get("messages", [])
+                    if isinstance(tool_calls, list):
+                        for stream_message in reversed(tool_calls):
+                            if isinstance(stream_message, AIMessage) and stream_message.tool_calls:
+                                stream_matcher.register_batch(stream_message.tool_calls)
+                                break
 
                 if kind == "on_chain_end" and not event.get("parent_ids"):
                     output = event.get("data", {}).get("output")
@@ -855,10 +952,27 @@ Be concise by default. Provide additional detail when the task is complex, the u
 
                 elif kind == "on_tool_start" and node == "tools":
                     input_data = event["data"].get("input", {})
-                    tool_call_id = str(
-                        input_data.get("id", "") if isinstance(input_data, dict) else ""
+                    event_tool_call_id = ""
+                    if isinstance(input_data, dict):
+                        event_tool_call_id = str(
+                            input_data.get("tool_call_id", "")
+                            or input_data.get("id", "")
+                            or ""
+                        )
+                        tool_params = input_data.get("args", input_data)
+                    else:
+                        tool_params = {}
+                    if not isinstance(tool_params, dict):
+                        tool_params = {}
+                    tool_params = {
+                        key: value for key, value in tool_params.items()
+                        if key not in {"tool_call_id", "id"}
+                    }
+                    tool_call_id = stream_matcher.start(
+                        run_id, evt_name, tool_params, event_tool_call_id,
                     )
-                    tool_params = input_data.get("args", input_data) if isinstance(input_data, dict) else {}
+                    if tool_call_id:
+                        stream_params_by_id[tool_call_id] = tool_params
                     yield {
                         "type": "tool_call",
                         "tool_call_id": tool_call_id,
@@ -881,23 +995,26 @@ Be concise by default. Provide additional detail when the task is complex, the u
                         content = str(getattr(output, "content", ""))
                     else:
                         content = str(output)
-                    is_error = content.startswith("Error:")
-                    execution_status = ""
-                    if not is_error and content.startswith("{"):
-                        try:
-                            parsed = _json.loads(content)
-                            if isinstance(parsed, dict):
-                                execution_status = str(parsed.get("execution_status", "") or "")
-                                if not parsed.get("ok", True):
-                                    is_error = True
-                        except (ValueError, TypeError):
-                            pass
-                    result_status = "execution_unknown" if execution_status in (
-                        "queued", "running", "execution_unknown",
-                    ) else ("failed" if is_error else "completed")
+                    receipt = parse_tool_execution_receipt(content)
+                    result_status = receipt.status
                     tool_call_id = ""
                     if first is not None and hasattr(first, "tool_call_id"):
                         tool_call_id = str(getattr(first, "tool_call_id", "") or "")
+                    tool_call_id = stream_matcher.finish(run_id, tool_call_id)
+                    completed_stream_records.append(ToolRecord(
+                        tool_call_id=tool_call_id,
+                        name=evt_name,
+                        params=stream_params_by_id.get(tool_call_id, {}),
+                        result={
+                            "ok": receipt.ok,
+                            "result": content,
+                            "operation_id": receipt.operation_id,
+                            "execution_status": receipt.execution_status,
+                            "error_type": receipt.error_type,
+                        },
+                        status=result_status,
+                        order_index=len(completed_stream_records),
+                    ))
                     yield {
                         "type": "tool_result",
                         "tool_call_id": tool_call_id,
@@ -907,10 +1024,27 @@ Be concise by default. Provide additional detail when the task is complex, the u
                     }
         except Exception as error:
             logger.exception(
-                "[TRACE:graph] astream_events 异常: trace_id=%s model=%s",
-                trace.trace_id, self._llm_client.default_model,
+                "[TRACE:graph] astream_events 异常: trace_id=%s model=%s partial_tools=%d",
+                trace.trace_id, self._llm_client.default_model, len(_records_raw),
             )
-            raise normalize_llm_error(error, trace.trace_id) from error
+            normalized = normalize_llm_error(error, trace.trace_id)
+            state_records = self._tool_records_from_state(_records_raw)
+            known_ids = {record.tool_call_id for record in state_records if record.tool_call_id}
+            partial_records = [
+                *state_records,
+                *[
+                    record for record in completed_stream_records
+                    if not record.tool_call_id or record.tool_call_id not in known_ids
+                ],
+            ]
+            for index, record in enumerate(partial_records):
+                record.order_index = index
+            raise GraphExecutionInterrupted(
+                error=normalized,
+                trace_id=trace.trace_id,
+                partial_reply="".join(accumulated),
+                tool_records=partial_records,
+            ) from error
 
         reply = "".join(accumulated)
         if final_state is not None:
@@ -920,7 +1054,7 @@ Be concise by default. Provide additional detail when the task is complex, the u
                     reply = str(final_message.content)
                     break
 
-        # ── Graph state 是最终事实源；闭包仅用于异常时保留部分执行事实 ──
+        # ── Graph state 是正常完成后的唯一事实源 ──
         state_records = final_state.get("tool_records", []) if final_state is not None else _records_raw
         tool_records = self._tool_records_from_state(state_records)
 
@@ -958,13 +1092,21 @@ Be concise by default. Provide additional detail when the task is complex, the u
             {"name": r.name, "params": r.params, "result": r.result, "status": r.status, "trace_id": trace.trace_id}
             for r in tool_records
         ])
+        result_snapshot = ContextSnapshotData(
+            items=[*context_snapshot.items, *post_items],
+            full_contents={**context_snapshot.full_contents, **post_full},
+            stable_prefix_hash=context_snapshot.stable_prefix_hash,
+            injected_memory_ids=list(context_snapshot.injected_memory_ids),
+        )
 
         signal: MemorySignalDecision = MemorySignalDecision(action=MemorySignalAction.EXTRACT_ASYNC.value, confidence=0.5, reason="default")
         try:
             signal = self._action_planner.classify_memory_signal(user_message=message, reply=reply, trace_id=trace.trace_id)
         except Exception:
             logger.warning("记忆信号分类失败（已使用默认信号）: trace_id=%s", trace.trace_id, exc_info=True)
-        signal.action = MemoryExtractionPolicy.resolve_action(signal.action, message).value
+        signal.action = MemoryExtractionPolicy.resolve_action(
+            signal.action, message, message_source,
+        ).value
 
         yield {
             "type": "__graph_result__",
@@ -973,8 +1115,7 @@ Be concise by default. Provide additional detail when the task is complex, the u
                 tool_records=tool_records, action_cards=action_cards,
                 pending_operations=pending_operations,
                 pending_approvals=[dict(item) for item in pending_approvals],
-                context_snapshot_items=list(ctx_items_data), context_snapshot_meta=dict(ctx_meta),
-                post_context_items=post_items, post_full_contents=post_full, memory_signal=signal,
+                context_snapshot=result_snapshot, memory_signal=signal,
             ),
         }
 
@@ -994,43 +1135,6 @@ Be concise by default. Provide additional detail when the task is complex, the u
             for index, record in enumerate(records)
         ]
 
-    @staticmethod
-    def _extract_tool_records(all_messages: list[Any]) -> list["ToolRecord"]:
-        """从消息提取 ToolRecord，供历史兼容和测试使用。"""
-        records: list[ToolRecord] = []
-        batch_index = 0
-        order_index = 0
-        tool_results: dict[str, str] = {}
-
-        for msg in all_messages:
-            if isinstance(msg, ToolMessage):
-                tool_results[msg.tool_call_id] = str(msg.content)
-
-        for msg in all_messages:
-            if isinstance(msg, AIMessage) and msg.tool_calls:
-                for tc in msg.tool_calls:
-                    tc_id = tc.get("id", "") or ""
-                    content = tool_results.get(tc_id, "")
-                    is_error = content.startswith("Error:") if content else False
-                    if not is_error and content.startswith("{"):
-                        try:
-                            parsed = _json.loads(content)
-                            if isinstance(parsed, dict) and not parsed.get("ok", True):
-                                is_error = True
-                        except (ValueError, TypeError):
-                            pass
-                    records.append(ToolRecord(
-                        tool_call_id=tc_id, batch_index=batch_index,
-                        name=tc.get("name", ""),
-                        params=tc.get("args", {}),
-                        result={"ok": not is_error, "result": content},
-                        status="failed" if is_error else "completed",
-                        order_index=order_index,
-                    ))
-                    order_index += 1
-                batch_index += 1
-        return records
-
     # ------------------------------------------------------------------
     # 历史重建：从结构化事件重建 LangChain 消息序列
     # ------------------------------------------------------------------
@@ -1043,29 +1147,21 @@ Be concise by default. Provide additional detail when the task is complex, the u
             role = m.get("role", "")
             content = m.get("content", "")
             tool_calls = m.get("tool_calls")
-            tool_call_id = m.get("tool_call_id")
-            name = m.get("name")
             if role == "system":
                 result.append(SystemMessage(content=content))
             elif role == "user":
                 result.append(HumanMessage(content=content))
             elif role == "assistant":
                 if tool_calls:
-                    tcs = [
-                        {
-                            "id": tc.get("id", ""),
-                            "name": tc.get("function", {}).get("name", ""),
-                            "args": _json.loads(tc.get("function", {}).get("arguments", "{}")),
-                        }
-                        for tc in tool_calls
-                    ]
+                    tcs = [normalize_tool_call(tc) for tc in tool_calls]
                     result.append(AIMessage(content=content, tool_calls=tcs))
                 else:
                     result.append(AIMessage(content=content))
             elif role == "tool":
+                normalized = normalize_tool_result(m)
                 result.append(ToolMessage(
                     content=content,
-                    tool_call_id=tool_call_id or "unknown",
-                    name=name or "",
+                    tool_call_id=normalized["id"],
+                    name=normalized["name"],
                 ))
         return result

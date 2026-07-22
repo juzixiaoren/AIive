@@ -46,6 +46,59 @@ class TestDeleteNotificationCancelsTask:
         updated = db_session.get(Task, task.id)
         assert updated.status == "cancelled"
 
+    def test_delete_cancels_dispatching_task_and_pending_outbox(self, db_session):
+        """删除 dispatching 提醒必须同时取消 Task 与尚未 claim 的 Outbox。"""
+        from aiive.db.models import OutboxJob
+
+        mgr = TaskManager(db_session)
+        task = mgr.create("reminder", "投递中提醒")
+        task.status = "dispatching"
+        db_session.flush()
+        job = OutboxJob(
+            operation_id=f"reminder_delivery:{task.id}",
+            job_type="reminder_delivery",
+            status="pending",
+            payload={"task_id": task.id},
+            max_retries=3,
+        )
+        event = Event(
+            event_type="notification_created",
+            thread_id="thread-1",
+            trace_id=task.id,
+            payload={"task_id": task.id, "title": task.title, "status": "alerting"},
+        )
+        db_session.add_all([job, event])
+        db_session.flush()
+
+        result = delete_notification(event.id, db_session)
+        db_session.expire_all()
+
+        assert result["task_cancelled"] is True
+        assert db_session.get(Task, task.id).status == "cancelled"
+        assert db_session.get(OutboxJob, job.id).status == "cancelled"
+        assert db_session.get(OutboxJob, job.id).terminal_reason == "task_cancelled"
+
+    def test_delete_completed_task_only_dismisses_notification(self, db_session):
+        """已完成提醒无法撤回投递，删除只隐藏通知且不得伪称取消。"""
+        mgr = TaskManager(db_session)
+        task = mgr.create("reminder", "已完成提醒")
+        task.status = "completed"
+        db_session.flush()
+        event = Event(
+            event_type="notification_created",
+            thread_id="thread-1",
+            trace_id=task.id,
+            payload={"task_id": task.id, "title": task.title, "status": "confirmed"},
+        )
+        db_session.add(event)
+        db_session.flush()
+
+        result = delete_notification(event.id, db_session)
+
+        assert result["task_cancelled"] is False
+        assert task.status == "completed"
+        assert event.payload["dismissed"] is True
+
     def test_delete_without_task_does_not_error(self, db_session):
         """没有关联 task_id 的通知也应可正常删除。"""
         event = Event(

@@ -97,7 +97,7 @@ POST /api/chat
             │    ├─ _build_history_messages(history)
             │    ├─ initial_messages = [SystemMessage] + history + recall + [HumanMessage]
             │    ├─ compiled.invoke({"messages": initial_messages})
-            │    ├─ _extract_tool_records()
+            │    ├─ Graph state.tool_records（工具事实唯一来源）
             │    └─ _build_post_context_items()
             ├─ Phase 4: 记忆分类 (LLM，事务外)
             └─ Phase 5: _finalize_turn()                     [Fencing + Event + Snapshot + Outbox]

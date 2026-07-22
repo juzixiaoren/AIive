@@ -19,9 +19,13 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
+from fastapi.testclient import TestClient
 
 from aiive.context.run_context import RunContext
+from aiive.db.base import get_db
 from aiive.db.models import MemoryIngestionRun, MemoryRecord
+from aiive.main import create_app
+from aiive.memory.conflict_resolver import ResolutionResult
 from aiive.memory.memory_gate import MemoryGate
 from aiive.memory.memory_types import (
     EvidenceItem,
@@ -30,8 +34,9 @@ from aiive.memory.memory_types import (
     ScopeType,
     TrustLevel,
     LifecycleState,
+    WriteOutcome,
 )
-from aiive.memory.memory_write_service import MemoryWriteService
+from aiive.memory.memory_write_service import MemoryWriteService, WriteResult
 
 
 # ════════════════════════════════════════════════════
@@ -276,6 +281,126 @@ class TestExecutionMode:
         result = writer.write(proposal, run_context=ctx)
         # 不会被 reject（无证据 → candidate，非 reject）
         assert result.outcome.value != "gate_rejected"
+
+
+# ════════════════════════════════════════════════════
+# 手动记忆 API 结果契约
+# ════════════════════════════════════════════════════
+
+
+class TestManualMemoryApiContract:
+    """POST /api/memories 必须按结构化 outcome 返回真实结果。"""
+
+    @staticmethod
+    def _client(db_session) -> TestClient:
+        app = create_app()
+        app.dependency_overrides[get_db] = lambda: db_session
+        return TestClient(app)
+
+    def test_success_response_contains_structured_outcome(self, db_session):
+        """成功写入应返回 WRITTEN、非空 ID 和真实生命周期。"""
+        response = self._client(db_session).post(
+            "/api/memories",
+            headers={"Idempotency-Key": f"api-success-{_uuid.uuid4().hex}"},
+            json={"content": "我喜欢结构化响应", "memory_type": "preference"},
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["ok"] is True
+        assert payload["outcome"] == "written"
+        assert payload["id"]
+        assert payload["lifecycle_state"] in ("active", "candidate")
+
+    def test_ignore_response_is_explicit_noop(self, db_session):
+        """ignore 应返回明确 no-op，不能返回空 ID 的创建成功。"""
+        ignored = WriteResult(
+            outcome=WriteOutcome.IGNORED,
+            operation="ignore",
+            reason="重复记忆",
+        )
+        with patch(
+            "aiive.api.routes_memories.MemoryWriteService.write",
+            return_value=ignored,
+        ):
+            response = self._client(db_session).post(
+                "/api/memories",
+                headers={"Idempotency-Key": f"api-ignore-{_uuid.uuid4().hex}"},
+                json={"content": "重复内容", "memory_type": "fact"},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["ok"] is False
+        assert response.json()["outcome"] == "ignored"
+        assert response.json()["id"] == ""
+        assert response.json()["reason"] == "重复记忆"
+
+    def test_idempotent_ignore_replays_noop_without_writing_again(self, db_session):
+        """重复 ignore 请求应重放 no-op，不能再次调用写入服务。"""
+        idempotency_key = f"api-ignore-replay-{_uuid.uuid4().hex}"
+        client = self._client(db_session)
+        with patch(
+            "aiive.memory.conflict_resolver.ConflictResolver.resolve",
+            return_value=ResolutionResult(
+                operation="ignore",
+                reason="重复记忆",
+            ),
+        ) as resolve:
+            first = client.post(
+                "/api/memories",
+                headers={"Idempotency-Key": idempotency_key},
+                json={"content": "重复内容", "memory_type": "fact"},
+            )
+            second = client.post(
+                "/api/memories",
+                headers={"Idempotency-Key": idempotency_key},
+                json={"content": "重复内容", "memory_type": "fact"},
+            )
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert second.json()["ok"] is False
+        assert second.json()["outcome"] == "ignored"
+        assert second.json()["idempotent"] is True
+        assert resolve.call_count == 1
+
+    def test_gate_rejected_response_uses_422(self, db_session):
+        """规则拒绝必须返回 422，而不是 200 假成功。"""
+        rejected = WriteResult(
+            outcome=WriteOutcome.GATE_REJECTED,
+            reason="未通过写入规则",
+        )
+        with patch(
+            "aiive.api.routes_memories.MemoryWriteService.write",
+            return_value=rejected,
+        ):
+            response = self._client(db_session).post(
+                "/api/memories",
+                headers={"Idempotency-Key": f"api-reject-{_uuid.uuid4().hex}"},
+                json={"content": "拒绝内容", "memory_type": "fact"},
+            )
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == "未通过写入规则"
+
+    def test_failed_response_uses_409(self, db_session):
+        """真正失败必须回滚并返回 409。"""
+        failed = WriteResult(
+            outcome=WriteOutcome.FAILED,
+            reason="数据库写入失败",
+        )
+        with patch(
+            "aiive.api.routes_memories.MemoryWriteService.write",
+            return_value=failed,
+        ):
+            response = self._client(db_session).post(
+                "/api/memories",
+                headers={"Idempotency-Key": f"api-failed-{_uuid.uuid4().hex}"},
+                json={"content": "失败内容", "memory_type": "fact"},
+            )
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == "数据库写入失败"
 
 
 # ════════════════════════════════════════════════════

@@ -65,11 +65,22 @@ class UnifiedRetriever:
     # ── 公共入口 ──
 
     def retrieve(self, request: RetrievalRequest) -> RetrievalResult:
-        if request.mode == RetrievalMode.DEEP:
-            return self._retrieve_deep(request)
-        if request.mode == RetrievalMode.SEARCH:
-            return self._retrieve_indexed(request, include_sleeping=True)
-        return self._retrieve_auto(request)
+        """执行统一检索；编排层异常返回可观测的空降级结果，不泄漏到调用方重试。"""
+        try:
+            if request.mode == RetrievalMode.DEEP:
+                return self._retrieve_deep(request)
+            if request.mode == RetrievalMode.SEARCH:
+                return self._retrieve_indexed(request, include_sleeping=True)
+            return self._retrieve_auto(request)
+        except Exception:
+            logger.exception("UnifiedRetriever 编排流水线失败，返回 fail-closed 空结果")
+            return RetrievalResult(
+                request_id=request.request_id,
+                hits=[],
+                token_count=0,
+                degraded=True,
+                notes=["retrieval_pipeline_degraded", "all_routes_degraded"],
+            )
 
     # ── AUTO ──
 
@@ -97,27 +108,44 @@ class UnifiedRetriever:
         max_results = request.max_results or self._config.auto_max_results
         overfetch = max(1, max_results * _OVERFETCH)
 
-        # 1. 各路超取
+        # 1. 各路超取；只统计本次请求实际启用的路由。
+        allowed = set(request.source_types or [])
+        exact_enabled = bool(request.query.strip())
+        memory_enabled = request.scope_context is not None and (
+            not allowed or "memory_record" in allowed
+        )
+        index_enabled = not allowed or bool(
+            allowed.intersection({"segment_summary", "epoch_checkpoint"})
+        )
+        attempted_routes = sum((exact_enabled, memory_enabled, index_enabled))
+        degraded_routes = 0
+
         try:
-            exact_hits = self._exact_route(request)
+            exact_hits = self._exact_route(request) if exact_enabled else []
         except Exception:
             logger.exception("UnifiedRetriever exact 路由失败，降级为空")
             exact_hits = []
+            degraded_routes += 1
             notes.append("exact_route_degraded")
 
         try:
-            memory_hits = self._memory_route(request, include_sleeping, overfetch)
+            memory_hits = self._memory_route(request, include_sleeping, overfetch) if memory_enabled else []
         except Exception:
             logger.exception("UnifiedRetriever 记忆路由失败，降级为空")
             memory_hits = []
+            degraded_routes += 1
             notes.append("memory_route_degraded")
 
         try:
-            index_hits = self._index_route(request, include_sleeping, overfetch)
+            index_hits = self._index_route(request, include_sleeping, overfetch) if index_enabled else []
         except Exception:
             logger.exception("UnifiedRetriever 索引路由失败，降级为空")
             index_hits = []
+            degraded_routes += 1
             notes.append("index_route_degraded")
+
+        if attempted_routes > 0 and degraded_routes == attempted_routes:
+            notes.append("all_routes_degraded")
 
         # 1.5 K 节评分融合：先对三路命中计算 final_score（RRF + 归一化加权），
         # 再合并/回源/去重，保证跨路由融合基于各路由原始排名而非合并后状态。
@@ -147,11 +175,15 @@ class UnifiedRetriever:
 
         # 4. 最终去重 + token budget 打包
         hits = self._dedup_and_budget(validated, max_results, request.token_budget)
+        degradation_notes = {
+            "exact_route_degraded", "memory_route_degraded", "index_route_degraded",
+            "all_routes_degraded", "retrieval_pipeline_degraded",
+        }
         return RetrievalResult(
             request_id=request.request_id,
             hits=hits,
             token_count=sum(h.token_count for h in hits),
-            degraded=bool(notes),
+            degraded=any(note in degradation_notes for note in notes),
             notes=notes,
         )
 
@@ -476,20 +508,28 @@ class UnifiedRetriever:
             request_id=request.request_id,
         )
         indexed = self._retrieve_indexed(idx_req, include_sleeping=True)
-        # 二阶段原始回溯
-        raw = self._raw.expand(
-            self._db, indexed.hits, cfg,
-            deep_max_turns=cfg.deep_max_turns,
-            token_budget=cfg.deep_history_raw_token_budget,
-        )
+        notes = list(indexed.notes)
+        degraded = indexed.degraded
+        # 二阶段原始回溯独立降级，保留已成功取得的 parent 命中。
+        try:
+            raw = self._raw.expand(
+                self._db, indexed.hits, cfg,
+                deep_max_turns=cfg.deep_max_turns,
+                token_budget=cfg.deep_history_raw_token_budget,
+            )
+        except Exception:
+            logger.exception("UnifiedRetriever 原始历史回溯失败，保留父级命中")
+            raw = []
+            degraded = True
+            notes.append("raw_history_route_degraded")
         # parent 命中 + raw expansion 共同返回（保持父子 provenance）
         parent_hits = [h for h in indexed.hits if h.source_type in ("segment_summary", "epoch_checkpoint")]
         return RetrievalResult(
             request_id=request.request_id,
             hits=parent_hits + raw,
             token_count=sum(h.token_count for h in parent_hits + raw),
-            degraded=indexed.degraded,
-            notes=indexed.notes,
+            degraded=degraded,
+            notes=notes,
         )
 
     # ── K 节评分融合：RRF（跨路由排名融合）+ 归一化确定性加权 ──

@@ -147,7 +147,7 @@ class MemoryLifecycleService:
                                      payload={"loser_id": subject.id,
                                               "winner_id": winner.id if winner else None})
             # 仅 loser 改变生命周期，winner 不变；投影以 loser 为准重建
-            self._executor.enqueue_core_refresh(subject)
+            self._executor.enqueue_projection(subject, "memory.merged", invalidate_cache=True)
 
         elif action.action_type == "supersede":
             # 单基数冲突：新建一条 active winner 记录（复制 winner 内容），

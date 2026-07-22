@@ -19,7 +19,8 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     """启用 vector 扩展并创建固定 1536 维的记忆向量投影表。"""
-    op.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    if op.get_bind().dialect.name == "postgresql":
+        op.execute("CREATE EXTENSION IF NOT EXISTS vector")
     op.create_table(
         "memory_vector_projections",
         sa.Column("memory_id", sa.String(length=36), nullable=False),

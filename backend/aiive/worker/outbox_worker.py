@@ -7,7 +7,7 @@ import uuid as _uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from aiive.db.base import SessionLocal
@@ -16,6 +16,7 @@ from aiive.db.models import (
     CompactionRun,
     Event,
     MemoryIngestionRun,
+    MemoryMaintenanceAction,
     MemoryMaintenanceBatch,
     MemoryMaintenanceRun,
     OutboxJob,
@@ -242,6 +243,98 @@ class OutboxWorker:
     # finalize / retry / deadletter (all with fencing)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _maintenance_report_payload(
+        db: Session,
+        job: OutboxJob,
+        status: str,
+        error: str = "",
+    ) -> dict[str, Any] | None:
+        """从真实维护 Run 聚合可持久化、可实时推送的终态卡片。"""
+        payload = job.payload or {}
+        thread_id = str(payload.get("thread_id", "") or "")
+        turn_id = str(payload.get("turn_id", "") or "")
+        trace_id = str(payload.get("trace_id", "") or job.trace_id or job.id)
+        if not thread_id or not turn_id:
+            return None
+        run = db.query(MemoryMaintenanceRun).filter(
+            MemoryMaintenanceRun.outbox_job_id == job.id,
+        ).first()
+        action_counts: dict[str, int] = {}
+        if run is not None:
+            rows = db.query(
+                MemoryMaintenanceAction.action_type,
+                func.count(MemoryMaintenanceAction.id),
+            ).filter(
+                MemoryMaintenanceAction.run_id == run.id,
+                MemoryMaintenanceAction.status == "applied",
+            ).group_by(MemoryMaintenanceAction.action_type).all()
+            action_counts = {str(action_type): int(count) for action_type, count in rows}
+        terminal_error = error or (run.error_message if run is not None else "") or ""
+        return {
+            "operation_id": job.operation_id,
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "trace_id": trace_id,
+            "status": status,
+            "card": {
+                "card_type": "maintenance_report",
+                "title": "记忆维护已完成" if status == "completed" else "记忆维护失败",
+                "summary": (
+                    "后台维护已按真实运行记录完成"
+                    if status == "completed"
+                    else "后台维护未完成，请查看失败原因"
+                ),
+                "trace_id": trace_id,
+                "event_ids": [],
+                "resource_refs": {"operation_id": job.operation_id},
+                "status": status,
+                "payload_preview": {
+                    "maintenance_operation_id": job.operation_id,
+                    "result": {
+                        "run_id": run.id if run is not None else "",
+                        "candidate_count": run.candidate_count if run is not None else 0,
+                        "applied_count": run.applied_count if run is not None else 0,
+                        "skipped_stale_count": run.skipped_stale_count if run is not None else 0,
+                        "action_counts": action_counts,
+                        "error": terminal_error,
+                    },
+                },
+                "reminder_id": "",
+                "actions": [],
+            },
+        }
+
+    @staticmethod
+    def _persist_maintenance_report(db: Session, report: dict[str, Any]) -> None:
+        """在维护终态事务中追加卡片事实，供历史加载折叠。"""
+        db.add(Event(
+            id=str(_uuid.uuid4()),
+            trace_id=str(report["trace_id"]),
+            thread_id=str(report["thread_id"]),
+            event_type="maintenance_report_terminal",
+            turn_id=str(report["turn_id"]),
+            payload={
+                "operation_id": report["operation_id"],
+                "status": report["status"],
+                "card": report["card"],
+            },
+        ))
+
+    @staticmethod
+    def _broadcast_maintenance_report(report: dict[str, Any] | None) -> None:
+        """事务提交后按来源线程广播真实维护终态。"""
+        if report is None:
+            return
+        try:
+            from aiive.api.ws_manager import ws_manager
+
+            ws_manager.broadcast_to_thread_sync(
+                str(report["thread_id"]), "maintenance_report", report,
+            )
+        except Exception:
+            logger.exception("推送记忆维护终态失败: operation_id=%s", report["operation_id"])
+
     def _finalize_job(self, claimed: ClaimedJob, reason: str) -> None:
         db = SessionLocal()
         try:
@@ -266,7 +359,15 @@ class OutboxWorker:
             # Phase 6A: forget_* Job completed → 更新 ForgetStageRun
             if claimed.job_type.startswith("forget_"):
                 _finalize_forget_stage(db, claimed)
+            report = None
+            if claimed.job_type == "memory_maintenance":
+                job = db.get(OutboxJob, claimed.id)
+                if job is not None:
+                    report = self._maintenance_report_payload(db, job, "completed")
+                    if report is not None:
+                        self._persist_maintenance_report(db, report)
             db.commit()
+            self._broadcast_maintenance_report(report)
         except FencingViolationError:
             db.rollback()
             logger.warning("finalize fencing violation: job_id=%s", claimed.id)
@@ -525,7 +626,13 @@ class OutboxWorker:
             if job.job_type.startswith("forget_"):
                 _deadletter_forget_stage(db, job, error)
 
+            report = None
+            if job.job_type == "memory_maintenance":
+                report = self._maintenance_report_payload(db, job, "failed", error)
+                if report is not None:
+                    self._persist_maintenance_report(db, report)
             db.commit()
+            self._broadcast_maintenance_report(report)
         except Exception:
             db.rollback()
             logger.exception("_deadletter_job_and_ingestion_run DB error: job_id=%s", claimed.id)

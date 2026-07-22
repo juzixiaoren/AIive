@@ -91,6 +91,7 @@ def handle_memory_extraction(claimed: ClaimedJob) -> HandlerResult:
     """三阶段异步记忆提取 Handler。"""
     payload = claimed.payload
     user_message: str = payload.get("user_message", "")
+    message_source = payload.get("message_source")
     reply: str = payload.get("reply", "")
     thread_id: str = payload.get("thread_id", "")
     source_turn_record_id: str = payload.get("source_turn_record_id", "")
@@ -98,8 +99,8 @@ def handle_memory_extraction(claimed: ClaimedJob) -> HandlerResult:
     source_event_ids: list[str] = payload.get("source_event_ids", [])
     assistant_event_id: str = payload.get("assistant_event_id", "")
 
-    if MemoryExtractionPolicy.should_skip_system_message(user_message):
-        return HandlerResult(HandlerOutcome.COMPLETED, "system_message_skipped")
+    if MemoryExtractionPolicy.should_skip_system_message(user_message, message_source):
+        return HandlerResult(HandlerOutcome.COMPLETED, "non_user_message_skipped")
 
     # ════════════════════════════════════════════════
     # Phase A: 短事务 —— 幂等预检查 + source Turn 验证
@@ -332,6 +333,8 @@ def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
             )
         if task.status == "completed":
             return HandlerResult(HandlerOutcome.COMPLETED, "提醒已由其他执行完成")
+        if task.status == "cancelled":
+            return HandlerResult(HandlerOutcome.COMPLETED, "提醒已取消")
         if task.status != "dispatching":
             return HandlerResult(
                 HandlerOutcome.NON_RETRYABLE,
@@ -349,7 +352,7 @@ def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
         from aiive.runtime.turn_execution import TurnExecutionService
 
         result = TurnExecutionService(
-            default_llm_client(), source="runtime_event",
+            default_llm_client(), message_source="runtime_event",
         ).execute_turn(message=message, thread_id=thread_id, turn_id=turn_id)
     except Exception as exc:
         logger.exception("提醒 Agent 执行异常: task_id=%s", task_id)
@@ -361,6 +364,23 @@ def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
         return HandlerResult(
             HandlerOutcome.RETRYABLE_ERROR,
             f"提醒 Agent 执行失败: {result.get('error')}",
+        )
+    event_id = str(result.get("event_id", "") or "")
+    if not event_id:
+        db_event = SessionLocal()
+        try:
+            assistant_event = db_event.query(Event).filter(
+                Event.thread_id == thread_id,
+                Event.turn_id == turn_id,
+                Event.event_type == "llm_response",
+            ).order_by(Event.turn_event_index.desc(), Event.id.desc()).first()
+            event_id = str(assistant_event.id) if assistant_event is not None else ""
+        finally:
+            db_event.close()
+    if not event_id:
+        return HandlerResult(
+            HandlerOutcome.RETRYABLE_ERROR,
+            "提醒 Agent 响应缺少可验证的 llm_response event_id",
         )
 
     db_c = SessionLocal()
@@ -377,6 +397,9 @@ def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
                 "提醒任务不存在",
                 terminal_reason="reminder_task_not_found",
             )
+        if task.status == "cancelled":
+            db_c.commit()
+            return HandlerResult(HandlerOutcome.COMPLETED, "提醒投递期间已取消")
         if task.status == "dispatching":
             db_c.add(Event(
                 trace_id=claimed.trace_id or task_id,
@@ -409,6 +432,7 @@ def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
             thread_id,
             "new_message",
             {
+                "event_id": event_id,
                 "reply": result.get("reply", ""),
                 "thread_id": result.get("thread_id", thread_id),
                 "trace_id": result.get("trace_id", ""),
@@ -468,6 +492,39 @@ def handle_memory_vector_refresh(claimed: ClaimedJob) -> HandlerResult:
     except Exception as exc:
         db.rollback()
         logger.exception("memory_vector_refresh failed")
+        return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, str(exc))
+    finally:
+        db.close()
+
+
+def handle_memory_markdown_project(claimed: ClaimedJob) -> HandlerResult:
+    """从当前 PostgreSQL 真相源重建 Markdown 和 JSON 文件投影。"""
+    if not settings.aiive_memory_file_projection_enabled:
+        return HandlerResult(HandlerOutcome.COMPLETED, "记忆文件投影已关闭")
+    if not claimed.payload.get("memory_id") and not claimed.payload.get("forget_operation_id"):
+        return HandlerResult(
+            HandlerOutcome.NON_RETRYABLE,
+            "文件投影任务缺少触发来源",
+            terminal_reason="invalid_payload",
+        )
+
+    db = SessionLocal()
+    try:
+        from pathlib import Path
+
+        from aiive.memory.projection import MemoryProjection
+
+        result = MemoryProjection(db).write_projection(
+            Path(settings.aiive_memory_file_projection_dir),
+        )
+        db.rollback()
+        return HandlerResult(
+            HandlerOutcome.COMPLETED,
+            f"文件投影已生成 {result['record_count']} 条记录，snapshot={result['snapshot_id']}",
+        )
+    except Exception as exc:
+        db.rollback()
+        logger.exception("memory_markdown_project failed")
         return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, str(exc))
     finally:
         db.close()
@@ -1126,6 +1183,8 @@ def register_all(registry: HandlerRegistry) -> None:
     registry.register("core_memory_refresh", handle_core_memory_refresh,
                        supported_schema_versions=frozenset({1}))
     registry.register("memory_vector_refresh", handle_memory_vector_refresh,
+                       supported_schema_versions=frozenset({1}))
+    registry.register("memory_markdown_project", handle_memory_markdown_project,
                        supported_schema_versions=frozenset({1}))
     # Phase 3
     registry.register("segment_sealing", handle_segment_sealing,

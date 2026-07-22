@@ -6,10 +6,9 @@ API路由模块：诊断检查器
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from aiive.api.developer_security import redact_diagnostic_payload
 from aiive.db.base import get_db
 from aiive.db.models import (
     ContextSnapshot,
@@ -43,18 +42,25 @@ def get_context_run(trace_id: str, db: Session = Depends(get_db)):
             .limit(10)
             .all()
         )
+        if not snapshots:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "context_snapshot_not_found", "message": "未找到上下文快照"},
+            )
         return {
             "trace_id": trace_id,
             "snapshots": [
                 {
                     "stable_prefix_hash": s.stable_prefix_hash,
-                    "context_items": redact_diagnostic_payload(s.context_items),
-                    "meta": redact_diagnostic_payload(s.meta),
+                    "context_items": s.context_items,
+                    "meta": s.meta,
                     "token_total": s.token_total,
                 }
                 for s in snapshots
             ],
         }
+    except HTTPException:
+        raise
     except Exception:
         logger.exception("获取上下文构建运行详情失败: trace_id=%s", trace_id)
         raise
@@ -80,15 +86,20 @@ def get_context_item_detail(trace_id: str, item_id: str, db: Session = Depends(g
             .first()
         )
         if not snapshot:
-            return {"error": "snapshot not found"}
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "context_snapshot_not_found", "message": "未找到上下文快照"},
+            )
         full_contents: dict[str, Any] = snapshot.meta.get("full_contents", {}) if snapshot.meta else {}
         content = full_contents.get(item_id)
         if content is None:
-            return {"error": "item not found"}
-        return {
-            "item_id": item_id,
-            "full_content": redact_diagnostic_payload(content, "full_content"),
-        }
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "context_item_not_found", "message": "未找到上下文项"},
+            )
+        return {"item_id": item_id, "full_content": content}
+    except HTTPException:
+        raise
     except Exception:
         logger.exception("获取上下文项详情失败: trace_id=%s, item_id=%s", trace_id, item_id)
         raise
@@ -141,7 +152,7 @@ def get_retrieval_run(run_id: str, db: Session = Depends(get_db)):
             "query": run.query,
             "strategy": run.strategy,
             "candidates": [
-                {"chunk_id": c.chunk_id, "source": c.source, "score": c.score}
+                {"source_id": c.source_id, "source_type": c.source_type, "score": c.score}
                 for c in candidates
             ],
         }
@@ -250,7 +261,7 @@ def inspector_events(
                 "id": e.id,
                 "trace_id": e.trace_id,
                 "event_type": e.event_type,
-                "payload": redact_diagnostic_payload(e.payload),
+                "payload": e.payload,
                 "created_at": e.created_at.isoformat(),
             }
             for e in events

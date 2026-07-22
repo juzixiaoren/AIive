@@ -178,22 +178,21 @@ POST /api/chat                                                          [routes_
                  │       action ∈ { skip, extract_sync, extract_async }
                  │
                  ├─ SKIP: 不做任何提取，不 enqueue
-                 ├─ EXTRACT_SYNC: 同事务内完成提取+写入
-                 │   ├─ UnifiedMemoryExtractor.extract() → proposals (LLM 调用，事务外)
-                 │   └─ MemoryWriteService.write() (每个 proposal, 事务内短操作)
-                 ├─ EXTRACT_ASYNC: enqueue outbox job (memory_extraction)
-                 │   └─ 同请求内 _finalize 末尾调用 TaskWorker.poll_and_notify()
-                 │       → handle_memory_extraction()
-                 │           ├─ MemoryExtractionPolicy.should_skip_system_message() 结构性检查
-                 │           ├─ UnifiedMemoryExtractor.extract() LLM 提取
-                 │           └─ MemoryWriteService.write() 事务写入
+                 ├─ EXTRACT_SYNC: enqueue 高优先级 outbox job (memory_extraction)
+                 │   └─ payload.extraction_mode = priority_async
+                 ├─ EXTRACT_ASYNC: enqueue 普通 outbox job (memory_extraction)
+                 │   └─ payload.extraction_mode = async
                  │
-                 └─ 保存 ContextSnapshot → TaskWorker.poll_and_notify() → db.commit()
+                 ├─ Turn/Event/Outbox 在 _finalize_turn() 同一事务提交
+                 └─ Worker handle_memory_extraction()
+                     ├─ MemoryExtractionPolicy.should_skip_system_message() 结构性检查
+                     ├─ UnifiedMemoryExtractor.extract() LLM 提取
+                     └─ MemoryWriteService.write_batch() 事务写入
 ```
 
-> 说明：EXTRACT_ASYNC 名为"异步"，但当前实现在 `_finalize()` 的 `db.commit()` 之前显式调用
-> `TaskWorker.poll_and_notify()`，因此提取实际在**同一 HTTP 请求内**完成（架构上走 Outbox，
-> 便于未来改为独立 Worker 进程消费，无需改调用方）。
+> 说明：自动记忆提取统一由 Outbox Worker 执行。原 `EXTRACT_SYNC` 不再在
+> Turn finalize 前直接写记忆，而是保留为 `priority_async` 调度提示；因此自动提取
+> 对当前请求不承诺立即可见。显式 `remember_or_update` 工具仍同步写入。
 
 ### 2.2 显式工具调用流程
 
@@ -283,15 +282,15 @@ flowchart TD
     C -->|JSON 解析成功| P[MemorySignalDecision]
     P --> A{action}
     A -->|skip| S[不提取]
-    A -->|extract_sync| SY[同事务内提取+写入]
-    A -->|extract_async| AS[enqueue outbox]
+    A -->|extract_sync| SY[enqueue priority_async outbox]
+    A -->|extract_async| AS[enqueue async outbox]
     C -->|异常 / JSON 解析失败| D[默认 extract_async, confidence=0.3]
 ```
 
 分类提示词（节选）定义了三类动作：
 - `skip`：纯问候、简单应答、瞬时问题报告（"我代码报错了"）、闲聊、一次性事实提问 → 不提取。
 - `extract_async`：含偏好、事实、习惯、项目细节或以后可能有用的信息 → 入队后台处理。
-- `extract_sync`：含明确的身份变更、策略规则或必须立即记住的关键纠正 → 同事务内立即写入（慎用）。
+- `extract_sync`：含明确的身份变更、策略规则或关键纠正 → 作为 `priority_async` 入队优先处理，不保证当前请求内可见。
 
 `MemorySignalDecision` 字段：`action` / `confidence` / `reason`。
 与 `intent_type`、`execution_mode` **完全解耦**——分类只看对话内容语义。
@@ -495,7 +494,13 @@ COMMIT → 释放 advisory lock
 
 **candidate 记录**: 不 enqueue vector_upsert（仅在 active 时可搜索），但仍 enqueue markdown projection（供人工 review）。
 **forget**: Saga 覆盖 memory_records + evidence + event + outbox + ForgetRequest。
-**execute_maintenance**: 处理 sleep/archive/wake（受保护类型只允许 sleep）。
+**execute_maintenance**: 处理 sleep/archive/wake（受保护类型只允许 sleep）。手工 `run_memory_maintenance` 经 `ToolOperation` 事务化入队，聊天先展示 `pending maintenance_report` 与入队前诊断快照；真实 `MemoryMaintenanceRun` 完成或 deadletter 后，Worker 在终态事务中追加 `maintenance_report_terminal` Event，并通过线程 WebSocket 更新同一张卡。历史加载按维护 operation ID 折叠终态事件，禁止将入队或 scan 冒充执行完成。
+
+### 6.4.1 记忆提取消息来源契约
+
+消息来源由服务端入口固定为 `user`、`system_command` 或 `runtime_event`，客户端请求模型禁止额外字段，不能通过正文或 payload 将普通消息升级为内部来源。来源贯穿 Turn 的 request Event、AgentGraph 工具 `RunContext`、记忆信号策略与 `memory_extraction` Outbox。只有 `user` 可进入自动记忆提取；系统指令和运行时事件确定性跳过。Worker 再次校验持久化来源；仅历史 Outbox payload 缺少 `message_source` 时兼容 `[runtime event` / `[system command` / `[系统指令]` 前缀，并记录兼容命中。
+
+当前 `/api/chat/system` 是可由本地前端调用的产品端点，其 `system_command` 仅表示内部交互来源和记忆提取隔离，不代表额外权限；未来若赋予高权限，必须另加身份认证和授权边界。
 
 ### 6.5 MemoryReadModel / AutomaticRecallEngine
 
@@ -583,15 +588,12 @@ resolve_action(signal_action, user_message)
 | record_version | INT | 投影乱序检测（每次写 +1） |
 | reinforce_count | INT | 强化次数 |
 | source_event_id | VARCHAR(36) | 源事件 |
-| lineage | VARCHAR(128) | 快捷字段 |
 | pinned | BOOLEAN | 固定(不受自动清理) |
-| memory_key | VARCHAR(128) | 去重键(兼容旧) |
 | revision_num | INT | 修订版本号 |
 | supersedes | VARCHAR(36) | 替代目标 |
 | superseded_by | VARCHAR(36) | 被替代为 |
 | created_from | VARCHAR(36) | proposal_id |
 | revision_of | VARCHAR(36) | 修订自 |
-| merged_from | JSONB | 合并自(快捷) |
 | valid_from | TIMESTAMPTZ | 有效期始 |
 | valid_to | TIMESTAMPTZ | 有效期止 |
 | observed_at | TIMESTAMPTZ | 最近观测时间 |
@@ -676,15 +678,15 @@ CREATE UNIQUE INDEX ix_memory_records_single_active
 |------|--------|------|
 | 显式 `remember_or_update` | 强一致 | 同步写入，返回前 commit |
 | 用户纠正 (forget/supersede) | 强一致 | 同步写入 |
-| 关键 policy/identity | 强一致 | EXTRACT_SYNC 路径 |
-| EXTRACT_SYNC 的 MemorySignal | 强一致 | 同事务 extract + write |
-| 普通自动提取 (EXTRACT_ASYNC) | **请求内最终一致** | enqueue → 同请求内 TaskWorker 消费（架构支持独立 Worker） |
-| KG/向量/投影 | 最终一致 | outbox 异步（当前为 stub handler） |
-| Markdown Projection | 最终一致 | outbox 异步 |
-| Context Cache | 最终一致 | outbox 异步 |
+| EXTRACT_SYNC 的 MemorySignal | 最终一致（优先） | `priority_async` Outbox |
+| 普通自动提取 (EXTRACT_ASYNC) | 最终一致 | `async` Outbox |
+| KG/向量/投影 | 最终一致 | outbox 异步 |
+| Markdown/JSON 文件投影 | 最终一致 | `memory_markdown_project` Outbox Handler 从 PostgreSQL 当前真相源重建 |
+| Context Cache | 最终一致 | outbox 异步（尚未启用） |
 
 **强一致边界**: PostgreSQL 事务（含 memory_record + evidence + lineage + proposal + event + outbox）。
-**不要求**: 返回前 KG/Qdrant/Markdown 已完成（handler 目前为 stub）。
+**文件投影边界**: 输出目录仅来自 `AIIVE_MEMORY_FILE_PROJECTION_DIR`；Handler 一次查询后生成 `memories.md` 与 `memories.json`，使用同目录临时文件、`fsync` 和原子替换。JSON 携带 snapshot ID 与 Markdown SHA-256，文件是可重建派生视图，不是真相源。遗忘 Phase A 会在同一事务中触发重建，投影读取继续遵循 Shield/Tombstone 可见性规则。
+**不要求**: 返回前 KG/Qdrant/Markdown 已完成。
 
 ### 8.3 投影乱序处理
 
@@ -829,7 +831,7 @@ Tool 输出返回脱敏占位；非法非空敏感度 fail-closed。历史 `NULL
 | 5 张关键词表（_EXPLICIT_MEMORY_COMMANDS 等） | `classify_memory_signal()` 模型分类 |
 | `StewardSignalExtractor` 独立 LLM 调用 | `UnifiedMemoryExtractor` 单次提取（仍保留 `steward_signal_extractor.py` 作为 deprecated 委托） |
 | `MemoryMaintenance.forget/sleep/archive()` 直接操作 DB | `MemoryWriteService.forget/execute_maintenance()` |
-| `AgentGraph._resolve_memories_for_context()` 全量扫描 + `user_memories` 批量注入 | `AgentGraph._build_agent_context()`：Kernel Contract + Core Memory 投影 + Automatic Recall（query-aware 多路由融合） |
+| `AgentGraph._resolve_memories_for_context()` 全量扫描 + `user_memories` 批量注入 | `ContextAssembler`：Kernel Contract + Core Memory 投影 + `UnifiedRetriever` query-aware 多路由融合；`AutomaticRecallEngine` 仅作为内部 MemoryRecord 路由，不允许调用方直接 fallback |
 | `AgentGraph._get_runtime_identity()` 全量扫描 | `MemoryReadModel.resolve_identity()` |
 | `MemoryReadModel.build_context().user_memories` 批量注入普通记忆 | 已废弃：动态记忆改由 `AutomaticRecallEngine` query-aware 召回；`build_context()` 仅返回 identity + policy |
 | `search_memory` / `list_memories` 全表扫描工具 | V2 五个只读召回工具：`memory_search` / `memory_get` / `memory_timeline` / `memory_evidence` / `memory_search_events` |
@@ -886,7 +888,7 @@ Tool 输出返回脱敏占位；非法非空敏感度 fail-closed。历史 `NULL
 | 主流程 | `backend/aiive/runtime/agent_graph.py` | _build_agent_context / _finalize / EXTRACT 路由 |
 | 工具 | `backend/aiive/tools/builtin_tools.py` | remember_or_update / forget_memory / run_memory_maintenance / memory_search / memory_get / memory_timeline / memory_evidence / memory_search_events |
 | Outbox | `backend/aiive/worker/outbox_handlers.py` | handle_memory_extraction + 投影 stub handlers + handle_core_memory_refresh |
-| 模型 | `backend/aiive/db/models.py` | MemoryRecord / MemoryEvidence / MemoryLineage / MemoryProposal / OutboxJob / ForgetRequest / CoreMemoryBlock / MemoryRecallRun / MemoryRecallCandidate |
+| 模型 | `backend/aiive/db/models.py` | MemoryRecord / MemoryEvidence / MemoryLineage / MemoryProposal / OutboxJob / CoreMemoryBlock / MemoryRecallRun / MemoryRecallCandidate |
 
 ---
 

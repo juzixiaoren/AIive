@@ -1,92 +1,152 @@
-"""MemoryProjection: memory export/formatting service.
+"""记忆文件投影服务：从 PostgreSQL 真相源生成 Markdown 和 JSON 派生视图。"""
+from __future__ import annotations
 
-Exports active memory records to Markdown / JSON formats.
-Adapted for the canonical schema (canonical_key, scope_type, etc.).
-"""
+import hashlib
 import json
-import logging
+import os
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
+from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
 from aiive.db.models import MemoryRecord
 from aiive.memory.memory_policy import MemoryPolicyEngine, MemoryReadChannel
-from aiive.memory.memory_types import LifecycleState
-from typing import Any
-
-logger = logging.getLogger(__name__)
+from aiive.memory.memory_types import LifecycleState, ValidityState
 
 
 class MemoryProjection:
-    """Memory projection: export active records in human/ machine-readable formats."""
+    """将同一批 active 记忆快照导出为人类和机器可读格式。"""
 
     def __init__(self, db: Session):
         self._db: Session = db
 
-    def to_markdown(self) -> str:
-        """Export active memories as Markdown."""
+    def _load_records(self) -> list[MemoryRecord]:
+        """一次性读取确定排序的可见记录，保证两种格式来自同一快照。"""
         records = (
             self._db.query(MemoryRecord)
-            .filter(MemoryRecord.lifecycle_state == LifecycleState.ACTIVE.value)
-            .order_by(MemoryRecord.updated_at.desc())
-            .limit(100)
-            .all()
-        )
-        policy = MemoryPolicyEngine()
-        lines = ["# AIive Active Memories", "", f"Generated: {len(records)} records\n"]
-        for r in records:
-            content = policy.render_content(r.content, r.sensitivity, MemoryReadChannel.API)
-            key_info = f"({r.canonical_key})" if r.canonical_key else ""
-            lines.append(
-                f"- [{r.memory_type}] {content}"
-                + f" (confidence: {r.confidence:.2f}, importance: {r.importance:.2f})"
-                + f" {key_info}"
+            .filter(
+                MemoryRecord.lifecycle_state == LifecycleState.ACTIVE.value,
+                MemoryRecord.validity_state == ValidityState.VALID.value,
             )
-        return "\n".join(lines)
-
-    def to_json(self) -> list[dict[str, Any]]:
-        """Export active memories as JSON-serializable list."""
-        records = (
-            self._db.query(MemoryRecord)
-            .filter(MemoryRecord.lifecycle_state == LifecycleState.ACTIVE.value)
-            .order_by(MemoryRecord.updated_at.desc())
+            .order_by(MemoryRecord.updated_at.desc(), MemoryRecord.id.asc())
             .limit(100)
             .all()
         )
+        if not records:
+            return []
+        from aiive.forget.visibility_service import ForgetVisibilityService
+
+        visible_ids = set(ForgetVisibilityService.filter_memory_ids(
+            self._db, [record.id for record in records],
+        ))
+        return [record for record in records if record.id in visible_ids]
+
+    @staticmethod
+    def _render_json(records: list[MemoryRecord]) -> list[dict[str, Any]]:
+        """将记录渲染为遵循 API 敏感度策略的 JSON 数据。"""
         policy = MemoryPolicyEngine()
         return [
             {
-                "id": r.id,
-                "memory_type": r.memory_type,
-                "canonical_key": r.canonical_key,
-                "scope_type": r.scope_type,
-                "scope_id": r.scope_id,
+                "id": record.id,
+                "memory_type": record.memory_type,
+                "canonical_key": record.canonical_key,
+                "scope_type": record.scope_type,
+                "scope_id": record.scope_id,
                 "content": policy.render_content(
-                    r.content, r.sensitivity, MemoryReadChannel.API,
+                    record.content, record.sensitivity, MemoryReadChannel.API,
                 ),
-                "sensitivity": r.sensitivity or "normal",
-                "confidence": r.confidence,
-                "importance": r.importance,
-                "lifecycle_state": r.lifecycle_state,
-                "validity_state": r.validity_state,
-                "record_version": r.record_version,
-                "lineage": r.lineage,
+                "sensitivity": record.sensitivity or "normal",
+                "confidence": record.confidence,
+                "importance": record.importance,
+                "lifecycle_state": record.lifecycle_state,
+                "validity_state": record.validity_state,
+                "record_version": record.record_version,
             }
-            for r in records
+            for record in records
         ]
 
+    @staticmethod
+    def _render_markdown(records: list[MemoryRecord]) -> str:
+        """将记录渲染为遵循 API 敏感度策略的 Markdown。"""
+        policy = MemoryPolicyEngine()
+        lines = ["# AIive Active Memories", "", f"Records: {len(records)}", ""]
+        for record in records:
+            content = policy.render_content(
+                record.content, record.sensitivity, MemoryReadChannel.API,
+            )
+            key_info = f" ({record.canonical_key})" if record.canonical_key else ""
+            lines.append(
+                f"- [{record.memory_type}] {content}"
+                + f" (confidence: {record.confidence:.2f}, importance: {record.importance:.2f})"
+                + key_info
+            )
+        return "\n".join(lines)
+
+    def to_markdown(self) -> str:
+        """实时导出 active 记忆 Markdown。"""
+        return self._render_markdown(self._load_records())
+
+    def to_json(self) -> list[dict[str, Any]]:
+        """实时导出 active 记忆 JSON。"""
+        return self._render_json(self._load_records())
+
+    @staticmethod
+    def _atomic_replace(target: Path, content: str) -> None:
+        """在目标目录写临时文件并原子替换，避免读到部分内容。"""
+        data = content.encode("utf-8")
+        if target.exists() and target.read_bytes() == data:
+            return
+        temporary = target.parent / f".{target.name}.{uuid4().hex}.tmp"
+        try:
+            with temporary.open("xb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, target)
+            try:
+                directory_fd = os.open(target.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                pass
+        finally:
+            temporary.unlink(missing_ok=True)
+
     def write_projection(self, output_dir: Path) -> dict[str, Any]:
-        """Write Markdown + JSON projections to directory."""
-        output_dir.mkdir(parents=True, exist_ok=True)
-        md = self.to_markdown()
-        js = self.to_json()
+        """从同一数据库快照原子覆盖 Markdown 和 JSON 投影文件。"""
+        resolved_dir = output_dir.expanduser().resolve(strict=False)
+        if resolved_dir.exists() and not resolved_dir.is_dir():
+            raise ValueError("记忆文件投影路径必须是目录")
+        resolved_dir.mkdir(parents=True, exist_ok=True)
 
-        (output_dir / "memories.md").write_text(md)
-        (output_dir / "memories.json").write_text(
-            json.dumps(js, indent=2, ensure_ascii=False)
+        records = self._load_records()
+        markdown = self._render_markdown(records)
+        markdown_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+        snapshot_id = uuid4().hex
+        generated_at = datetime.now(timezone.utc).isoformat()
+        json_document = {
+            "schema_version": 1,
+            "snapshot_id": snapshot_id,
+            "generated_at": generated_at,
+            "record_count": len(records),
+            "markdown_sha256": markdown_hash,
+            "records": self._render_json(records),
+        }
+
+        markdown_path = resolved_dir / "memories.md"
+        json_path = resolved_dir / "memories.json"
+        self._atomic_replace(markdown_path, markdown)
+        self._atomic_replace(
+            json_path,
+            json.dumps(json_document, indent=2, ensure_ascii=False) + "\n",
         )
-
         return {
-            "markdown": str(output_dir / "memories.md"),
-            "json": str(output_dir / "memories.json"),
+            "markdown": str(markdown_path),
+            "json": str(json_path),
+            "snapshot_id": snapshot_id,
+            "record_count": len(records),
         }

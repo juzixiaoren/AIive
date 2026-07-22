@@ -810,7 +810,13 @@ class WriteResult:
     state: str = ""
     reason: str = ""       # 仅用于日志/调试，不用于逻辑判断
     superseded_ids: list[str] = field(default_factory=list)
+
+    @property
+    def written(self) -> bool:
+        return self.outcome == WriteOutcome.WRITTEN
 ```
+
+`outcome` 是唯一事实源且必须显式传入；`written` / API `ok` 仅由 `outcome == WRITTEN` 派生。禁止使用默认 `WRITTEN` 或独立布尔参数覆盖枚举，否则 no-op 和失败会被误报为成功。
 
 ### write_batch 中的使用
 

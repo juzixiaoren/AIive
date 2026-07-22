@@ -10,8 +10,8 @@ type RunSummary = {
 };
 
 type Candidate = {
-  chunk_id: string;
-  source: string;
+  source_id: string;
+  source_type: string;
   score: number | null;
 };
 
@@ -103,12 +103,12 @@ export default function RetrievalInspector({ traceId }: { traceId?: string }) {
           </div>
           <div className="space-y-2">
             {retrieval.candidates.map(candidate => (
-              <div key={`${candidate.source}:${candidate.chunk_id}`} className="border border-divider rounded-lg p-3">
+              <div key={`${candidate.source_type}:${candidate.source_id}`} className="border border-divider rounded-lg p-3">
                 <div className="flex justify-between gap-3 text-xs">
-                  <span className="text-content">{candidate.source}</span>
+                  <span className="text-content">{candidate.source_type}</span>
                   <span className="font-mono text-primary">{candidate.score?.toFixed(4) ?? "-"}</span>
                 </div>
-                <p className="text-[11px] text-faint font-mono break-all mt-1">{candidate.chunk_id}</p>
+                <p className="text-[11px] text-faint font-mono break-all mt-1">{candidate.source_id}</p>
               </div>
             ))}
           </div>

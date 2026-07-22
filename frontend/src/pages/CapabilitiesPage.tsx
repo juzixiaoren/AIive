@@ -28,6 +28,12 @@ const RISK_STYLES: Record<string, string> = {
   critical: "bg-danger-soft text-danger-text border-danger-border",
 };
 
+function formatInstalledAt(value: string): string {
+  if (!value) return "-";
+  const timestamp = new Date(value);
+  return Number.isNaN(timestamp.getTime()) ? "-" : timestamp.toLocaleString();
+}
+
 export default function CapabilitiesPage() {
   const [installed, setInstalled] = useState<InstalledCapability[]>([]);
   const [tools, setTools] = useState<RegisteredTool[]>([]);
@@ -56,7 +62,7 @@ export default function CapabilitiesPage() {
     <div className="space-y-6">
       <div>
         <h2 className="text-lg font-semibold text-content">能力</h2>
-        <p className="text-xs text-faint mt-1">只读展示已安装能力和 ToolRegistry 中的安全声明；安装与激活仍通过 Chat、审批和真实冒烟流程完成。</p>
+        <p className="text-xs text-faint mt-1">只读展示已安装能力和 ToolRegistry 中的安全声明；安装与激活通过 Chat 和真实冒烟流程完成。</p>
       </div>
       {error && <div className="bg-danger-soft border border-danger-border text-danger-text rounded-lg px-3 py-2 text-sm">{error}</div>}
       {loading && <div className="text-center text-faint py-10">正在加载能力…</div>}
@@ -79,7 +85,8 @@ export default function CapabilitiesPage() {
                       <span className="text-[11px] px-2 py-0.5 rounded-full bg-success-soft text-success-text border border-success-border">{capability.state}</span>
                     </div>
                     <p className="text-xs font-mono text-muted mt-1">{capability.capability_id}</p>
-                    <p className="text-[11px] font-mono text-faint mt-2 break-all">哈希: {capability.descriptor_hash}</p>
+                    <p className="text-[11px] text-faint mt-2" title={capability.created_at || undefined}>安装于: {formatInstalledAt(capability.created_at)}</p>
+                    <p className="text-[11px] font-mono text-faint mt-1 break-all">哈希: {capability.descriptor_hash}</p>
                   </article>
                 ))}
               </div>
@@ -97,13 +104,14 @@ export default function CapabilitiesPage() {
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="font-mono text-sm font-semibold text-content">{tool.capability_id}</span>
                     <span className={`text-[11px] px-2 py-0.5 rounded-full border ${RISK_STYLES[tool.risk_level] || "bg-surface-muted text-code border-divider"}`}>{tool.risk_level} 风险</span>
-                    {tool.requires_confirmation && <span className="text-[11px] px-2 py-0.5 rounded-full bg-accent-soft text-accent-text border border-accent-border">需确认</span>}
+                    {/* TODO: requires_confirmation 仅保留为安全元数据；用户审批恢复前不展示“需确认”状态。 */}
                     {tool.writes_external_world && <span className="text-[11px] px-2 py-0.5 rounded-full bg-warning-soft text-warning-text border border-warning-border">写外部</span>}
                   </div>
                   <div className="flex flex-wrap gap-4 text-xs text-muted mt-2">
                     <span>来源: {tool.definition_source}</span>
                     <span>信任: {tool.definition_trust_level}</span>
                   </div>
+                  <p className="text-[11px] font-mono text-faint mt-2 break-all">哈希: {tool.descriptor_hash}</p>
                 </article>
               ))}
             </div>

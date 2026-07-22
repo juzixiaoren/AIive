@@ -30,6 +30,10 @@ def _run(message, thread_id=None):
 
 
 class TestContextSnapshot:
+    def test_trace_id_metadata_is_not_nullable(self):
+        """trace_id 的 ORM 契约必须显式保持不可空。"""
+        assert ContextSnapshot.__table__.c.trace_id.nullable is False
+
     def test_snapshot_saved_on_chat(self, db_session, monkeypatch):
         monkeypatch.setattr(
             "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",

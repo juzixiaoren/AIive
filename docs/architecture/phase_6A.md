@@ -186,10 +186,10 @@ reason: str
 
 ---
 
-## H. Forget 数据模型（增量方案，新增 10 张表，不替换旧 `forget_requests`）
+## H. Forget 数据模型（新 Saga 10 张表）
 
-> **修订（§9）**：保留旧 `forget_requests` 表（只读兼容，旧 API 委托新 Operation），**不 rename/recreate**。新增 10 张表：
-> `forget_operations`、`forget_selector_manifests`、`forget_shields`、`forget_targets`、`forget_dependencies`、`forget_batches`、`forget_actions`、`forget_tombstones`、`forget_stage_runs`、`content_provenance_refs`（ORM / migration / 文档表数量必须一致，见 §10）。
+> 当前遗忘流程仅使用以下 10 张表：
+> `forget_operations`、`forget_selector_manifests`、`forget_shields`、`forget_targets`、`forget_dependencies`、`forget_batches`、`forget_actions`、`forget_tombstones`、`forget_stage_runs`、`content_provenance_refs`。旧 `forget_requests` 已由后续迁移删除，不再提供 ORM 映射。
 
 ### 不可变层级（§3）
 ```text
@@ -214,7 +214,7 @@ shielded_at     DateTime nullable
 verified_at     DateTime nullable
 purged_at       DateTime nullable
 error_message   Text nullable
-legacy_request_id String(36) nullable       # 旧 forget_requests.id（旧 API 委托时填）
+legacy_request_id String(36) nullable       # 历史导入来源标识；新流程不写入
 created_at / updated_at
 ```
 CHECK(`status IN (...)`)，UNIQUE(`operation_key`)。
@@ -548,10 +548,10 @@ enqueue retrieval refresh/tombstone（旧 entry tombstone、新 entry 写入；�
 - 使用 claim/lease/fencing（`claim_token`/`lease_expires_at`）—— 旧 execution_token 无法提交（参考 `_finalize_job` 的 `affected != 1 → FencingViolationError`）。
 - 正常分页用 `HandlerOutcome.CONTINUE`（不增加 `retry_count`/失败计数，参考 `_continue_later`）。
 - Handler 不直接 finalize OutboxJob（由 Worker 负责）。
-- deadletter 时：`ForgetOperation.status = shielded_deadletter`、`ForgetStageRun.status = deadletter`、**`ForgetShield.status` 保持 `active`**（不得解除或弱化），三者与 OutboxJob **原子**进入终态（参考 `_deadletter_job_and_ingestion_run`）；后台清理 deadletter 后可经 reconciler 恢复 `ForgetOperation` 为 `shielded` 继续执行，Shield 始终保持 `active`。
+- deadletter 时：`ForgetOperation.status = shielded_deadletter`、`ForgetStageRun.status = deadletter`、**`ForgetShield.status` 保持 `active`**（不得解除或弱化），三者与 OutboxJob **原子**进入终态（参考 `_deadletter_job_and_ingestion_run`）；后台 reconciler 按退避策略复用并重置原 Stage Job，恢复 `ForgetOperation` 到该阶段的可执行状态，Shield 始终保持 `active`。
 - 修改 `outbox_worker.py`：forget Job 在 deadletter/finalize 时联动更新 `forget_stage_runs`（status/execution_token/claim_count/failure_count）与 `forget_operations`，保证原子性；stage 状态变更通过 `forget_stage_runs` 持久化。
-- reconciler（`forget_reconcile`）补发遗漏 Job（基于 `forget_batches` 未完成项）。
-- `scheduler_daemon` 现有轮询已驱动 OutboxWorker，无需改造即可承载新 job types。
+- `ForgetReconcileService` 按 `cascade → rebuild_dependencies → purge → verify` 检查 `ForgetStageRun` 与关联 `OutboxJob` 的真实状态：补发缺失阶段，自动恢复 `failed_retryable` 与 `shielded_deadletter`，对在途 Job 不重复入队。
+- `scheduler_daemon` 每分钟分批触发 Forget Saga 对账；`forget_reconcile` Handler 复用同一服务，保留定向恢复入口。正常阶段执行仍统一由 OutboxWorker 承载。
 
 ---
 
@@ -563,19 +563,19 @@ enqueue retrieval refresh/tombstone（旧 entry tombstone、新 entry 写入；�
 - `memory_only` 明确说明原始历史是否保留（仅显式历史审计模式可见）。
 - 禁止工具名与真实行为不一致。
 - 工具经 `ToolRegistry` 注册（`risk_level`、`requires_confirmation`、`schema`、`trace_id`、`action_card` 一致现有约定）。
-- API：`POST /api/forget`（结构化 body）、`GET /api/forget/{operation_key}/status`。旧 `POST /api/memories/{id}/forget` **保留并委托**新 Operation（写入 `legacy_request_id`），不删除。
+- API：`POST /api/forget` 仅接受严格 JSON Body（`mode` 枚举、selector 组合、scope 成对及时间范围校验；敏感 ID/reason 不进入 URL），`requested_by` 由服务端生成审计请求 ID；`GET /api/forget/{operation_key}/status` 查询状态。所有遗忘入口均委托新 Operation，不写入旧表。
 
 ---
 
 ## T. Migration（增量方案，§9）
 
-- **真实 Alembic head**：实现时通过 `alembic heads` 确认当前 head revision（现有 `forget_requests` 来自 `9ce8eac83d4b`，revises `e46cc8625031`；**模型 `ForgetRequest.saga_state` 与 migration 不一致，存在 drift**）。新 migration 的 `down_revision` 指向当前 head。
-- **保留旧 `forget_requests`**：本阶段**不 rename/recreate**，旧表只读兼容；旧 API 委托新 `forget_operations`（写入 `legacy_request_id`）。
-- **新增表（10 张，与 §H / ORM / migration 一致）**：`forget_operations`、`forget_selector_manifests`、`forget_shields`、`forget_targets`、`forget_dependencies`、`forget_batches`、`forget_actions`、`forget_tombstones`、`forget_stage_runs`、`content_provenance_refs`（见 H）。
+- **Alembic 迁移链**：baseline 创建新 Saga 表及旧兼容表；后续增量迁移在当前 head 删除 `forget_requests`，不修改已发布 baseline。
+- **删除旧 `forget_requests`**：新流程已完全使用 `forget_operations` 等 Saga 表，旧开发数据不再保留；upgrade 删除旧表及索引，downgrade 只重建空表结构，无法恢复已删除数据。
+- **新 Saga 表（10 张，与 §H / ORM / migration 一致）**：`forget_operations`、`forget_selector_manifests`、`forget_shields`、`forget_targets`、`forget_dependencies`、`forget_batches`、`forget_actions`、`forget_tombstones`、`forget_stage_runs`、`content_provenance_refs`（见 H）。
 - **FK / UNIQUE / CHECK**：见 H 各表；所有子表 FK 列统一命名 `forget_operation_id` → `forget_operations.id`；唯一约束：`forget_operations.operation_key` UNIQUE、`forget_selector_manifests(forget_operation_id, selector_payload_hash)`、`forget_targets(forget_operation_id, target_type, target_id)`、`forget_dependencies(forget_operation_id, dependency_type, dependency_id)`、`forget_batches(forget_operation_id, stage, dependency_type, batch_no)`、`forget_actions.idempotency_key` UNIQUE、`forget_tombstones(forget_operation_id, target_type, target_id, canonical_key)`、`forget_stage_runs.outbox_job_id` UNIQUE、`content_provenance_refs(owner_type, owner_id, source_type, source_id)` UNIQUE。
 - **PostgreSQL 与 SQLite 兼容**：所有 DDL 用 SQLAlchemy `op.create_table` / `op.alter_column` 跨库语法；唯一部分索引保持 `postgresql_where`/`sqlite_where` 双后端写法。
-- **upgrade / downgrade**：双向实现；downgrade 删除新表，旧 `forget_requests` 不动。
-- **历史 forgotten 数据回填策略**：旧 `forget_requests` 仅有 `memory_id` + `tombstone` + `saga_state`（从未更新）。migration **不删除**旧行；可选：将旧行映射为只读归档（`legacy_request_id` 反查），新 Operation 不重建旧 saga。
+- **upgrade / downgrade**：删除旧表迁移支持双向 schema 变更；downgrade 重建空的 `forget_requests`，但不恢复历史行。
+- **历史 forgotten 数据策略**：旧 `forget_requests` 开发数据随表删除，不导入新 Operation；`memory_records` 中既有 forgotten 数据仍按下述策略处理。
 - **当前已 forgotten 但未 purge 的数据迁移策略（§8 修订）**：旧 `memory_records.lifecycle_state='forgotten'` 行内容已是 tombstone 串（无用户原文），**不得直接迁移为 `purged`**。迁移为 `shielded` 或 `legacy_unverifiable`，随后走 Cascade + Verifier 后才能真正 `purged`。
 - **不在 migration 中执行内容删除 / Summary 重建 / 索引 backfill / 修改已部署历史 migration**。
 
@@ -666,7 +666,7 @@ enqueue retrieval refresh/tombstone（旧 entry tombstone、新 entry 写入；�
 46. SQLite upgrade/downgrade；
 47. 任意阶段 crash 后不泄漏 forgotten 内容；
 48. P0.5A～P5 全量回归（6A 不引入回归）；
-49. **migration 不替换旧 forget_requests 表（§9 / §10 新增）**。
+49. **空库升级到 head 后不存在 `forget_requests`，且新遗忘流程仅写新 Saga 表**。
 
 ### Phase 6A 补充测试（§局部修订新增）
 50. selector manifest 可在进程重启后完整恢复原选择器（`selector_payload` 不可变）；
@@ -697,7 +697,7 @@ enqueue retrieval refresh/tombstone（旧 entry tombstone、新 entry 写入；�
 
 ## X. 回滚与降级方案（Phase 6A）
 
-- **Migration 回滚**：`downgrade()` 删除 10 张新表（`forget_operations`/`forget_selector_manifests`/`forget_shields`/`forget_targets`/`forget_dependencies`/`forget_batches`/`forget_actions`/`forget_tombstones`/`forget_stage_runs`/`content_provenance_refs`），**旧 `forget_requests` 不动**；旧 API 仍可工作。
+- **Migration 回滚**：删除旧表迁移的 `downgrade()` 会重建空的 `forget_requests` 结构，但不会恢复已删除数据；继续回滚 baseline 才会删除新 Saga 表。
 - **Saga 中途失败**：任何阶段失败 → Outbox 重试（fencing）→ 最终 deadletter（原子）；`forget_operations.status='shielded_deadletter'`、`forget_shields.status` 保持 `active`，内容已 shielded（fail-closed 不可见），不泄漏；可由 reconciler 恢复 `shielded` 继续执行。
 - **Verifier 失败**：不进入 `purged`；内容保持 scrubbed + shielded，可人工/定时重试 verify（legacy_unverifiable 需先粗粒度清理）。
 - **重建 LLM 失败**：旧 Summary/Checkpoint 保持不可检索（`is_searchable=False` + tombstone），不影响 fail-closed；下次 `forget_rebuild` 重试。

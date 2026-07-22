@@ -13,6 +13,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from aiive.db.base import SessionLocal
 from aiive.db.models import (
     CompactionInput,
     Epoch,
@@ -28,7 +29,6 @@ from aiive.db.models import (
 from aiive.memory.recall_config import RecallConfig
 from aiive.memory.memory_read_model import MemoryReadModel
 from aiive.memory.memory_store import MemoryStore
-from aiive.memory.automatic_recall import AutomaticRecallEngine
 from aiive.memory.core_memory_projection import load_core_memory
 from aiive.memory.context_assembly import assemble_system_content
 from aiive.memory.scope_resolver import build_scope_context
@@ -42,6 +42,7 @@ from aiive.runtime.token_models import (
 from aiive.runtime.token_counter import TokenCounter
 from aiive.runtime.tool_normalizer import ToolResultNormalizer
 from aiive.runtime.working_state import WorkingStateService
+from aiive.runtime.message_normalizer import normalize_tool_call, normalize_tool_result
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,46 @@ class PartitionReport:
 
 
 @dataclass
+class ContextSnapshotItem:
+    """上下文快照中的单个输入或输出项。"""
+
+    item_id: str
+    kind: str
+    source: str
+    trust_level: str
+    content_preview: str
+    preview_length: int = 0
+    token_estimate: int = 0
+
+    def __post_init__(self) -> None:
+        self.preview_length = len(self.content_preview)
+        if self.token_estimate <= 0:
+            self.token_estimate = max(1, self.preview_length // 4)
+
+    def to_dict(self) -> dict[str, Any]:
+        """转换为数据库和 API 使用的稳定字典结构。"""
+        return {
+            "item_id": self.item_id,
+            "kind": self.kind,
+            "source": self.source,
+            "trust_level": self.trust_level,
+            "content_preview": self.content_preview,
+            "preview_length": self.preview_length,
+            "token_estimate": self.token_estimate,
+        }
+
+
+@dataclass
+class ContextSnapshotData:
+    """一次上下文组装产生的完整强类型快照。"""
+
+    items: list[ContextSnapshotItem] = field(default_factory=list)
+    full_contents: dict[str, str] = field(default_factory=dict)
+    stable_prefix_hash: str = ""
+    injected_memory_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
 class AssembledContext:
     """完全组装并通过 hard-gate 验证的上下文，就绪可调用 LLM。"""
     messages: list[dict[str, Any]]
@@ -111,8 +152,7 @@ class AssembledContext:
     is_safe: bool
     pending_seal: bool = False
     working_state_text: str = ""
-    snapshot_items: list[dict[str, Any]] = field(default_factory=list)
-    snapshot_meta: dict[str, Any] = field(default_factory=dict)
+    snapshot: ContextSnapshotData = field(default_factory=ContextSnapshotData)
     agent_ctx: dict[str, Any] = field(default_factory=dict)
 
 
@@ -147,7 +187,7 @@ class ContextAssembler:
         normalizer: ToolResultNormalizer | None = None,
     ):
         self._token_counter: TokenCounter = token_counter
-        self._budget: ContextBudget = budget or ContextBudget.DEFAULT
+        self._budget: ContextBudget = budget if budget is not None else ContextBudget.from_env()
         self._profile: ModelProfile = profile or ModelProfile.from_config("deepseek", "deepseek-chat")
         self._normalizer: ToolResultNormalizer | None = normalizer
 
@@ -259,7 +299,7 @@ class ContextAssembler:
                 # ✓ 通过 hard gate：此处是「记忆真正被注入模型上下文」的唯一确定点，
                 # 仅此时 touch pack.items（best-effort，失败不阻断 Turn）。
                 self._touch_injected_memory(agent_ctx.get("recall_pack"))
-                snap_items, snap_full = self._build_input_snapshot(
+                snapshot = self._build_input_snapshot(
                     stable_contract_text=agent_ctx["stable_contract_text"],
                     core_memory_text=agent_ctx["core_memory_text"],
                     working_state_text=working_state_text,
@@ -272,6 +312,10 @@ class ContextAssembler:
                     tools_schema=tools_schema,
                     user_message=message,
                 )
+                snapshot.stable_prefix_hash = _hash_text(system_content)
+                snapshot.injected_memory_ids = self._collect_injected_memory_ids(
+                    agent_ctx.get("recall_pack")
+                )
                 return AssembledContext(
                     messages=messages,
                     tools_schema=tools_schema,
@@ -280,6 +324,9 @@ class ContextAssembler:
                         stable_contract_text=agent_ctx["stable_contract_text"],
                         core_memory_text=agent_ctx["core_memory_text"],
                         working_state_text=working_state_text,
+                        epoch_checkpoint_text=epoch_cp_text,
+                        segment_summary_text=seg_sum_text,
+                        sealing_bridge_text=bridge_text,
                         recall_text=agent_ctx["recall_text"],
                         history_summary_text=history_summary_text,
                         history_msgs=history_msgs,
@@ -289,15 +336,7 @@ class ContextAssembler:
                     is_safe=True,
                     pending_seal=pending_seal_triggered,
                     working_state_text=working_state_text,
-                    snapshot_items=snap_items,
-                    snapshot_meta={
-                        "stable_prefix_hash": _hash_text(system_content),
-                        "context_items": snap_items,
-                        "full_contents": snap_full,
-                        "injected_memory_ids": self._collect_injected_memory_ids(
-                            agent_ctx.get("recall_pack")
-                        ),
-                    },
+                    snapshot=snapshot,
                     agent_ctx=agent_ctx,
                 )
 
@@ -311,6 +350,9 @@ class ContextAssembler:
                 stable_contract_text=agent_ctx["stable_contract_text"],
                 core_memory_text=agent_ctx["core_memory_text"],
                 working_state_text=working_state_text,
+                epoch_checkpoint_text=epoch_cp_text,
+                segment_summary_text=seg_sum_text,
+                sealing_bridge_text=bridge_text,
                 recall_text=agent_ctx["recall_text"],
                 history_summary_text=history_summary_text,
                 history_msgs=history_msgs,
@@ -381,72 +423,83 @@ class ContextAssembler:
         recall_cfg: Any, exclude_source_ids: set[str] | None = None,
         trace_id: str | None = None,
     ) -> tuple[Any, str]:
-        """Phase 5：通过 UnifiedRetriever 取统一检索命中。
-
-        返回 (memory_recall_pack, history_summary_text)。memory 命中还原为
-        MemoryRecallItem 以复用既有渲染与 access-touch；summary/checkpoint 命中
-        渲染为独立分区文本。任何异常降级到原 AutomaticRecallEngine（revision 5）。
-        """
-        from aiive.memory.recall_models import MemoryRecallPack, MemoryRecallRequest
+        """通过唯一 UnifiedRetriever 入口召回；诊断写入失败不改变检索结果。"""
+        from aiive.memory.recall_models import MemoryRecallPack
         from aiive.memory.recall_config import RetrievalConfig
-        from aiive.retrieval.retrieval_types import (
-            RetrievalMode,
-            RetrievalRequest,
-        )
+        from aiive.retrieval.retrieval_types import RetrievalMode, RetrievalRequest
         from aiive.retrieval.unified_retriever import UnifiedRetriever
 
+        started_at = time.monotonic()
+        retrieval_cfg = RetrievalConfig()
+        request = RetrievalRequest(
+            query=message,
+            mode=RetrievalMode.AUTO,
+            scope_context=scope,
+            thread_id=thread.id,
+            exclude_source_ids=exclude_source_ids,
+        )
+        result = UnifiedRetriever(db, retrieval_cfg).retrieve(request)
+        memory_hits = [h for h in result.hits if h.source_type == "memory_record"]
+        history_hits = [
+            h for h in result.hits
+            if h.source_type in ("segment_summary", "epoch_checkpoint")
+        ]
+        items = [UnifiedRetriever.memory_hit_to_recall_item(h) for h in memory_hits]
+        pack = MemoryRecallPack(
+            request_id=result.request_id,
+            items=items,
+            token_count=sum(item.token_cost for item in items),
+        )
+        self._persist_retrieval_diagnostics(
+            result=result,
+            request=request,
+            message=message,
+            scope=scope,
+            trace_id=trace_id,
+            memory_hits=memory_hits,
+            latency_ms=round((time.monotonic() - started_at) * 1000, 2),
+            token_budget=request.token_budget or retrieval_cfg.auto_token_budget,
+        )
+        return pack, self._render_history_summary(history_hits)
+
+    @staticmethod
+    def _persist_retrieval_diagnostics(
+        *, result: Any, request: Any, message: str, scope: Any,
+        trace_id: str | None, memory_hits: list[Any], latency_ms: float,
+        token_budget: int,
+    ) -> None:
+        """独立短事务写检索诊断；失败只影响可观测性，不触发二次检索。"""
+        diagnostics_db = SessionLocal()
         try:
-            started_at = time.monotonic()
-            request = RetrievalRequest(
-                query=message,
-                mode=RetrievalMode.AUTO,
-                scope_context=scope,
-                thread_id=thread.id,
-                exclude_source_ids=exclude_source_ids,
-            )
-            retriever = UnifiedRetriever(db, RetrievalConfig())
-            result = retriever.retrieve(request)
-            memory_hits = [h for h in result.hits if h.source_type == "memory_record"]
-            history_hits = [
-                h for h in result.hits
-                if h.source_type in ("segment_summary", "epoch_checkpoint")
-            ]
-            items = [UnifiedRetriever.memory_hit_to_recall_item(h) for h in memory_hits]
-            pack = MemoryRecallPack(
-                request_id=result.request_id,
-                items=items,
-                token_count=sum(i.token_cost for i in items),
-            )
             routes = sorted({hit.route or hit.source_type for hit in result.hits})
-            retrieval_run = RetrievalRun(
+            routes.extend(note for note in result.notes if note not in routes)
+            diagnostics_db.add(RetrievalRun(
                 id=result.request_id,
                 trace_id=trace_id,
                 query=message,
-                strategy=RetrievalMode.AUTO.value,
-            )
-            db.add(retrieval_run)
-            for hit in result.hits:
-                db.add(RetrievalCandidate(
-                    run_id=retrieval_run.id,
-                    chunk_id=hit.source_id,
-                    source=hit.source_type,
-                    score=hit.final_score or hit.score,
-                ))
-
-            recall_run = MemoryRecallRun(
+                strategy=request.mode.value,
+            ))
+            diagnostics_db.add(MemoryRecallRun(
                 id=result.request_id,
                 trace_id=trace_id,
                 request_query=message,
                 scope_context=scope.model_dump() if hasattr(scope, "model_dump") else {},
                 routes_executed=routes,
-                token_budget=request.token_budget or RetrievalConfig().auto_token_budget,
+                token_budget=token_budget,
                 result_count=len(memory_hits),
-                total_latency_ms=round((time.monotonic() - started_at) * 1000, 2),
-            )
-            db.add(recall_run)
+                total_latency_ms=latency_ms,
+            ))
+            diagnostics_db.flush()
+            for hit in result.hits:
+                diagnostics_db.add(RetrievalCandidate(
+                    run_id=result.request_id,
+                    source_id=hit.source_id,
+                    source_type=hit.source_type,
+                    score=hit.final_score or hit.score,
+                ))
             for hit in memory_hits:
-                db.add(MemoryRecallCandidate(
-                    run_id=recall_run.id,
+                diagnostics_db.add(MemoryRecallCandidate(
+                    run_id=result.request_id,
                     memory_id=hit.source_id,
                     route=hit.route or "memory_record",
                     raw_score=hit.score,
@@ -455,21 +508,15 @@ class ContextAssembler:
                     exclusion_reason="",
                     token_cost=hit.token_count,
                 ))
-            db.flush()
-            history_text = self._render_history_summary(history_hits)
-            return pack, history_text
+            diagnostics_db.commit()
         except Exception:
-            logger.exception("UnifiedRetriever 自动召回失败，降级到 AutomaticRecallEngine")
-            engine = AutomaticRecallEngine(db, recall_cfg)
-            req = MemoryRecallRequest(
-                query=message,
-                active_goal=thread.title or None,
-                scope_context=scope,
-                top_k=recall_cfg.automatic_recall_top_k,
-                token_budget=recall_cfg.automatic_recall_token_budget,
+            diagnostics_db.rollback()
+            logger.exception(
+                "统一检索诊断持久化失败，不影响本轮检索结果: request_id=%s",
+                result.request_id,
             )
-            pack, _traces = engine.recall(req)
-            return pack, ""
+        finally:
+            diagnostics_db.close()
 
     def _collect_hot_history_ids(self, db: Session, thread: Thread) -> set[str]:
         """收集 legacy 热分区已加载的最近摘要/检查点 source_id。
@@ -500,6 +547,18 @@ class ContextAssembler:
         )
         if cp is not None:
             ids.add(cp.id)
+        sealing = (
+            db.query(Segment)
+            .join(Epoch, Epoch.id == Segment.epoch_id)
+            .filter(
+                Epoch.thread_id == thread.id,
+                Segment.status == "sealing",
+                Segment.summary_id.is_not(None),
+            )
+            .first()
+        )
+        if sealing is not None and sealing.summary_id:
+            ids.add(sealing.summary_id)
         return ids
 
     @staticmethod
@@ -795,21 +854,22 @@ class ContextAssembler:
                 if content:
                     result.append({"role": "user", "content": content})
             elif etype == "tool_call":
+                call = normalize_tool_call(item)
                 pending_calls.append({
-                    "tool_call_id": item.get("tool_call_id") or f"tc_{item.get('event_id', '')}",
-                    "name": item.get("tool_name", ""),
-                    "params": item.get("tool_params", {}),
+                    "tool_call_id": call["id"],
+                    "name": call["name"],
+                    "params": call["args"],
                 })
             elif etype in ("tool_result", "tool_result_ref"):
                 _flush_pending()
-                tc_id = item.get("tool_call_id") or f"tc_{item.get('event_id', '')}"
-                tool_result = item.get("tool_result", {})
+                normalized = normalize_tool_result(item)
+                tool_result = normalized["result"]
                 content = tool_result if isinstance(tool_result, str) else _json.dumps(tool_result, ensure_ascii=False, default=str)
                 result.append({
                     "role": "tool",
-                    "tool_call_id": tc_id,
+                    "tool_call_id": normalized["id"],
                     "content": content,
-                    "name": item.get("tool_name", ""),
+                    "name": normalized["name"],
                 })
             elif etype == "assistant":
                 _flush_pending()
@@ -827,6 +887,9 @@ class ContextAssembler:
         stable_contract_text: str = "",
         core_memory_text: str = "",
         working_state_text: str = "",
+        epoch_checkpoint_text: str = "",
+        segment_summary_text: str = "",
+        sealing_bridge_text: str = "",
         recall_text: str = "",
         history_summary_text: str = "",
         history_msgs: list[dict[str, Any]] | None = None,
@@ -854,6 +917,9 @@ class ContextAssembler:
             _report("stable_contract", [{"role": "system", "content": stable_contract_text}]),
             _report("core_memory", [{"role": "system", "content": core_memory_text}]),
             _report("working_state", [{"role": "system", "content": working_state_text}]),
+            _report("epoch_checkpoint", [{"role": "system", "content": epoch_checkpoint_text}]),
+            _report("segment_summaries", [{"role": "system", "content": segment_summary_text}]),
+            _report("sealing_bridge", [{"role": "system", "content": sealing_bridge_text}]),
             _report("retrieved_memory", [{"role": "system", "content": recall_text}]),
             _report("retrieved_history_summary", [{"role": "system", "content": history_summary_text}]),
             _report("recent_messages", history),
@@ -883,18 +949,9 @@ class ContextAssembler:
         history_msgs: list[dict[str, Any]] | None = None,
         tools_schema: list[dict[str, Any]] | None = None,
         user_message: str = "",
-    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
-        """构建"送入 LLM 的输入分区"快照，供前端上下文查看器展示。
-
-        返回 (context_items, full_contents)：
-        - context_items: 各输入分区的折叠态描述（预览 + token 估算），
-          顺序与实际拼装进 messages 的顺序一致；
-        - full_contents: item_id → 完整文本，供前端展开时懒加载。
-
-        token 估算使用轻量启发式（字符数 / 4），不调用 LiteLLM 计数器，
-        避免在组装热路径上重复做全量 token 编码。
-        """
-        items: list[dict[str, Any]] = []
+    ) -> ContextSnapshotData:
+        """构建送入 LLM 的输入分区强类型快照。"""
+        items: list[ContextSnapshotItem] = []
         full: dict[str, str] = {}
 
         def _add(item_id: str, kind: str, source: str, trust_level: str, text: str) -> None:
@@ -903,14 +960,15 @@ class ContextAssembler:
             preview = text[:_SNAPSHOT_PREVIEW_CHARS]
             if len(text) > _SNAPSHOT_PREVIEW_CHARS:
                 preview += "..."
-            items.append({
-                "item_id": item_id,
-                "kind": kind,
-                "source": source,
-                "trust_level": trust_level,
-                "content_preview": preview,
-                "token_estimate": max(1, len(text) // 4),
-            })
+            item = ContextSnapshotItem(
+                item_id=item_id,
+                kind=kind,
+                source=source,
+                trust_level=trust_level,
+                content_preview=preview,
+                token_estimate=max(1, len(text) // 4),
+            )
+            items.append(item)
             full[item_id] = text
 
         # 系统前缀（稳定契约）→ 核心记忆 → 工作状态 → 稳定摘要 → 历史摘要
@@ -947,17 +1005,18 @@ class ContextAssembler:
                 for s in tools_schema if isinstance(s, dict)
             ]
             preview_src = ", ".join(n for n in names if n) or tools_text
-            items.append({
-                "item_id": "tool_schemas",
-                "kind": "tool_schemas",
-                "source": "tools",
-                "trust_level": "trusted",
-                "content_preview": preview_src[:_SNAPSHOT_PREVIEW_CHARS],
-                "token_estimate": max(1, len(tools_text) // 4),
-            })
+            item = ContextSnapshotItem(
+                item_id="tool_schemas",
+                kind="tool_schemas",
+                source="tools",
+                trust_level="trusted",
+                content_preview=preview_src[:_SNAPSHOT_PREVIEW_CHARS],
+                token_estimate=max(1, len(tools_text) // 4),
+            )
+            items.append(item)
             full["tool_schemas"] = tools_text
 
         # 当前用户消息
         _add("user_message", "user_message", "user", "trusted", user_message)
 
-        return items, full
+        return ContextSnapshotData(items=items, full_contents=full)

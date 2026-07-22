@@ -61,6 +61,13 @@ def enqueue_due_tasks(db: Session, now: datetime | None = None) -> list[dict[str
                 trace_id=task.id,
                 max_retries=3,
             ))
+        elif existing.status not in {"pending", "running"}:
+            logger.error(
+                "到期提醒存在终态 Outbox，拒绝将 Task 置为 dispatching: task_id=%s job_status=%s",
+                task.id,
+                existing.status,
+            )
+            continue
 
         task.status = "dispatching"
         task.last_checked_at = now

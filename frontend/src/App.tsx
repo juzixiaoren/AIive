@@ -1,6 +1,6 @@
 /**
  * 应用根组件
- * - 管理顶部 Tab 导航栏（对话、事件、上下文、工具、通知）
+ * - 管理顶部 Tab 导航栏（对话、记忆、能力、事件、上下文、检索、通知；开发者页在构建开关开启时显示）
  * - 通过全局通知通道（WebSocket）实时同步未读通知数量并在 Tab 标签上显示角标
  * - 支持从对话页面传递 trace_id 到上下文检查器
  */
@@ -13,11 +13,10 @@ import RetrievalInspector from "./pages/RetrievalInspector";
 import MemoriesPage from "./pages/MemoriesPage";
 import CapabilitiesPage from "./pages/CapabilitiesPage";
 import DeveloperPage from "./pages/DeveloperPage";
-import ToolsPage from "./pages/ToolsPage";
 import NotificationsPage from "./pages/NotificationsPage";
 import { useNotificationCount } from "./hooks/useNotificationSocket";
 
-type Tab = "chat" | "memories" | "capabilities" | "events" | "context" | "retrieval" | "tools" | "notifs" | "developer";
+type Tab = "chat" | "memories" | "capabilities" | "events" | "context" | "retrieval" | "notifs" | "developer";
 
 const developerUiEnabled = (import.meta as ImportMeta & {
   env?: Record<string, string | undefined>;
@@ -57,8 +56,8 @@ export default function App() {
     { key: "events", label: "事件" },
     { key: "context", label: "上下文" },
     { key: "retrieval", label: "检索" },
-    { key: "tools", label: "工具" },
     { key: "notifs", label: `通知${notifCount > 0 ? ` ${notifCount}` : ""}` },
+    ...(developerUiEnabled ? [{ key: "developer" as Tab, label: "开发者" }] : []),
   ];
 
   return (
@@ -100,7 +99,6 @@ export default function App() {
             {tab === "events" && <EventTimeline traceId={inspectTraceId} />}
             {tab === "context" && <ContextInspector traceId={inspectTraceId} />}
             {tab === "retrieval" && <RetrievalInspector traceId={inspectTraceId} />}
-            {tab === "tools" && <ToolsPage />}
             {tab === "notifs" && <NotificationsPage />}
             {tab === "developer" && <DeveloperPage selectedTraceId={inspectTraceId} />}
           </div>

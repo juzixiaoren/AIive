@@ -53,11 +53,12 @@ def _utcnow() -> datetime:
 
 
 def test_phase_a_shield_creates_operation(db_session: Session):
-    """Phase A Shield 创建 ForgetOperation + Manifest + Shield + Tombstone。"""
+    """Phase A Shield 创建新 Saga 记录，且最终 schema 不含旧请求表。"""
     from aiive.forget.fingerprint import configure_hmac_secret
     from aiive.forget.phase_a_shield import execute_phase_a_shield
 
     configure_hmac_secret("test-secret", 1)
+    assert "forget_requests" not in Base.metadata.tables
 
     result = execute_phase_a_shield(
         session=db_session,
@@ -69,6 +70,9 @@ def test_phase_a_shield_creates_operation(db_session: Session):
 
     assert result["status"] == "shielded"
     assert result["target_count"] >= 2
+    assert db_session.execute(
+        sa_text("SELECT COUNT(*) FROM forget_operations")
+    ).scalar_one() == 1
 
     op = db_session.query(ForgetOperation).filter_by(id=result["operation_id"]).first()
     assert op is not None
@@ -1126,6 +1130,230 @@ def test_verify_legacy_request_ends_unverifiable(db_session: Session):
     op = db_session.query(ForgetOperation).filter_by(id=op_id).first()
     assert op.status == "legacy_unverifiable"
     assert op.verified_at is not None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Forget Saga 自动对账与恢复
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _make_reconcile_operation(
+    db_session: Session,
+    *,
+    operation_status: str = "shielded",
+    stages: tuple[tuple[str, str, str], ...] = (),
+) -> tuple[str, dict[str, str]]:
+    """构造指定 StageRun/Outbox 状态的遗忘操作。"""
+    from aiive.db.models import OutboxJob
+
+    op_id = _new_id()
+    db_session.add(ForgetOperation(
+        id=op_id,
+        operation_key=f"forget:{op_id}",
+        mode="memory_only",
+        selector_type="memory_ids",
+        selector_hash="h",
+        status=operation_status,
+        requested_by="api",
+        target_count=0,
+        shielded_at=_utcnow(),
+    ))
+    job_ids: dict[str, str] = {}
+    for stage, stage_status, job_status in stages:
+        job_id = _new_id()
+        job_ids[stage] = job_id
+        db_session.add(OutboxJob(
+            id=job_id,
+            operation_id=f"forget:{op_id}:{stage}",
+            job_type=f"forget_{stage}",
+            status=job_status,
+            payload={"forget_operation_id": op_id},
+            max_retries=3,
+            retry_count=3 if job_status == "deadletter" else 0,
+            error_message="boom" if job_status == "deadletter" else None,
+            terminal_reason="max_retries_exhausted" if job_status == "deadletter" else None,
+        ))
+        db_session.add(ForgetStageRun(
+            id=_new_id(),
+            forget_operation_id=op_id,
+            stage=stage,
+            outbox_job_id=job_id,
+            status=stage_status,
+            failure_count=1 if stage_status == "deadletter" else 0,
+        ))
+    db_session.commit()
+    return op_id, job_ids
+
+
+def test_reconcile_enqueues_first_missing_stage(db_session: Session):
+    """前置阶段完成但下一阶段缺失时，补发确定性 Job 与 StageRun。"""
+    from aiive.db.models import OutboxJob
+    from aiive.forget.reconcile_service import ForgetReconcileService
+
+    op_id, _ = _make_reconcile_operation(
+        db_session,
+        stages=(("cascade", "done", "completed"),),
+    )
+
+    result = ForgetReconcileService.reconcile_operation(db_session, op_id)
+    db_session.commit()
+
+    assert result.action == "enqueued"
+    assert result.stage == "rebuild_dependencies"
+    job = db_session.query(OutboxJob).filter_by(
+        operation_id=f"forget:{op_id}:rebuild_dependencies",
+    ).one()
+    stage_run = db_session.query(ForgetStageRun).filter_by(
+        forget_operation_id=op_id,
+        stage="rebuild_dependencies",
+    ).one()
+    assert job.status == "pending"
+    assert stage_run.outbox_job_id == job.id
+    assert stage_run.status == "pending"
+
+
+def test_reconcile_repairs_missing_stage_run_for_existing_job(db_session: Session):
+    """确定性 Job 已存在但 StageRun 缺失时，复用 Job 并补齐关联。"""
+    from aiive.db.models import OutboxJob
+    from aiive.forget.reconcile_service import ForgetReconcileService
+
+    op_id, _ = _make_reconcile_operation(
+        db_session,
+        stages=(("cascade", "done", "completed"),),
+    )
+    job = OutboxJob(
+        id=_new_id(),
+        operation_id=f"forget:{op_id}:rebuild_dependencies",
+        job_type="forget_rebuild_dependencies",
+        status="pending",
+        payload={"forget_operation_id": op_id},
+        max_retries=3,
+    )
+    db_session.add(job)
+    db_session.commit()
+
+    result = ForgetReconcileService.reconcile_operation(db_session, op_id)
+    db_session.commit()
+
+    stage_run = db_session.query(ForgetStageRun).filter_by(
+        forget_operation_id=op_id,
+        stage="rebuild_dependencies",
+    ).one()
+    assert result.action == "in_flight"
+    assert stage_run.outbox_job_id == job.id
+    assert db_session.query(OutboxJob).filter_by(
+        operation_id=f"forget:{op_id}:rebuild_dependencies",
+    ).count() == 1
+
+
+def test_reconcile_reuses_deadletter_job(db_session: Session):
+    """shielded_deadletter 自动复用原 Job，不创建重复阶段记录。"""
+    from datetime import timedelta
+
+    from aiive.db.models import OutboxJob
+    from aiive.forget.reconcile_service import ForgetReconcileService
+
+    op_id, job_ids = _make_reconcile_operation(
+        db_session,
+        operation_status="shielded_deadletter",
+        stages=(("cascade", "deadletter", "deadletter"),),
+    )
+    stage_run = db_session.query(ForgetStageRun).filter_by(
+        forget_operation_id=op_id,
+        stage="cascade",
+    ).one()
+    now = stage_run.updated_at + timedelta(hours=2)
+
+    result = ForgetReconcileService.reconcile_operation(db_session, op_id, now=now)
+    db_session.commit()
+
+    assert result.action == "reactivated"
+    job = db_session.get(OutboxJob, job_ids["cascade"])
+    operation = db_session.get(ForgetOperation, op_id)
+    assert job.status == "pending"
+    assert job.retry_count == 0
+    assert job.error_message is None
+    assert job.terminal_reason is None
+    assert stage_run.status == "pending"
+    assert operation.status == "shielded"
+    assert db_session.query(ForgetStageRun).filter_by(
+        forget_operation_id=op_id,
+        stage="cascade",
+    ).count() == 1
+
+
+def test_reconcile_failed_retryable_reactivates_verify(db_session: Session):
+    """verify 已完成但结果可重试时，复用原 verify Job 再次执行。"""
+    from aiive.db.models import OutboxJob
+    from aiive.forget.reconcile_service import ForgetReconcileService
+
+    op_id, job_ids = _make_reconcile_operation(
+        db_session,
+        operation_status="failed_retryable",
+        stages=(
+            ("cascade", "done", "completed"),
+            ("rebuild_dependencies", "done", "completed"),
+            ("purge", "done", "completed"),
+            ("verify", "done", "completed"),
+        ),
+    )
+
+    verify_run = db_session.query(ForgetStageRun).filter_by(
+        forget_operation_id=op_id,
+        stage="verify",
+    ).one()
+    from datetime import timedelta
+    now = verify_run.updated_at + timedelta(hours=2)
+    result = ForgetReconcileService.reconcile_operation(db_session, op_id, now=now)
+    db_session.commit()
+
+    verify_job = db_session.get(OutboxJob, job_ids["verify"])
+    verify_run = db_session.query(ForgetStageRun).filter_by(
+        forget_operation_id=op_id,
+        stage="verify",
+    ).one()
+    assert result.action == "reactivated"
+    assert result.stage == "verify"
+    assert verify_job.status == "pending"
+    assert verify_run.status == "pending"
+    assert db_session.get(ForgetOperation, op_id).status == "verifying"
+
+
+def test_reconcile_does_not_duplicate_in_flight_job(db_session: Session):
+    """pending/running 阶段保持在途，多次扫描不重复入队。"""
+    from aiive.db.models import OutboxJob
+    from aiive.forget.reconcile_service import ForgetReconcileService
+
+    op_id, _ = _make_reconcile_operation(
+        db_session,
+        stages=(("cascade", "pending", "pending"),),
+    )
+
+    first = ForgetReconcileService.reconcile_operation(db_session, op_id)
+    second = ForgetReconcileService.reconcile_operation(db_session, op_id)
+    db_session.commit()
+
+    assert first.action == "in_flight"
+    assert second.action == "in_flight"
+    assert db_session.query(OutboxJob).filter_by(
+        operation_id=f"forget:{op_id}:cascade",
+    ).count() == 1
+
+
+def test_reconcile_skips_terminal_operation(db_session: Session):
+    """成功终态不再创建或重置任何阶段 Job。"""
+    from aiive.db.models import OutboxJob
+    from aiive.forget.reconcile_service import ForgetReconcileService
+
+    op_id, _ = _make_reconcile_operation(db_session, operation_status="verified")
+
+    result = ForgetReconcileService.reconcile_operation(db_session, op_id)
+    db_session.commit()
+
+    assert result.action == "terminal"
+    assert db_session.query(OutboxJob).filter(
+        OutboxJob.operation_id.like(f"forget:{op_id}:%"),
+    ).count() == 0
 
 
 # ═══════════════════════════════════════════════════════════════════

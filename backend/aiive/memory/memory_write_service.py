@@ -71,8 +71,7 @@ class WriteResult:
 
     def __init__(
         self,
-        outcome: WriteOutcome = WriteOutcome.WRITTEN,
-        written: bool = False,
+        outcome: WriteOutcome,
         operation: str = "",
         memory_id: str = "",
         state: str = "",
@@ -80,7 +79,7 @@ class WriteResult:
         superseded_ids: list[str] | None = None,
     ) -> None:
         self.outcome = outcome
-        self.written = written or outcome == WriteOutcome.WRITTEN
+        self.written = outcome == WriteOutcome.WRITTEN
         self.operation = operation
         self.memory_id = memory_id
         self.state = state
@@ -90,6 +89,7 @@ class WriteResult:
     def to_dict(self) -> dict[str, Any]:
         return {
             "ok": self.written,
+            "outcome": self.outcome.value,
             "operation": self.operation,
             "memory_id": self.memory_id,
             "state": self.state,
@@ -329,7 +329,7 @@ class MemoryWriteService:
         self._persist_proposal(proposal, gate_decision, final_op="reinforce", final_memory_id=existing.id)
         self._log_event(thread_id, proposal, "memory.reinforced", existing.id)
         self._enqueue_projection(existing, "memory.reinforced", invalidate_cache=True)
-        return WriteResult(outcome=WriteOutcome.WRITTEN, written=True, operation="reinforce",
+        return WriteResult(outcome=WriteOutcome.WRITTEN, operation="reinforce",
                            memory_id=existing.id, state=LifecycleState.ACTIVE.value)
 
     # ------------------------------------------------------------------
@@ -416,7 +416,8 @@ class MemoryWriteService:
             elif resolution.operation == "ignore":
                 self._persist_proposal(proposal, gate_decision, final_op="ignore")
                 result = WriteResult(
-                    written=False,
+                    outcome=WriteOutcome.IGNORED,
+                    operation="ignore",
                     reason=resolution.reason,
                 )
             else:
@@ -439,7 +440,7 @@ class MemoryWriteService:
                 self._log_event(tid, proposal, "memory.created", record.id)
                 self._enqueue_projection(record, "memory.created")
                 result = WriteResult(
-                    written=True,
+                    outcome=WriteOutcome.WRITTEN,
                     operation="create",
                     memory_id=record.id,
                     state=target_state,
@@ -468,30 +469,51 @@ class MemoryWriteService:
         target_memory_id: str = proposal.source_event_ids[0] if proposal.source_event_ids else ""
 
         if not target_memory_id:
-            return WriteResult(written=False, reason="No target memory_id in maintenance proposal")
+            return WriteResult(
+                outcome=WriteOutcome.FAILED,
+                reason="维护 Proposal 中缺少目标 memory_id",
+            )
 
         record: MemoryRecord | None = self._store.get_by_id(target_memory_id)
         if record is None:
-            return WriteResult(written=False, reason=f"Memory {target_memory_id} not found")
+            return WriteResult(
+                outcome=WriteOutcome.FAILED,
+                reason=f"记忆不存在: {target_memory_id}",
+            )
 
         op: str = proposal.proposed_operation
 
         if op == "sleep":
             ok, reason = self._lifecycle.sleep(record.id, trace_id=trace, thread_id=tid)
-            return WriteResult(written=ok, operation="sleep", memory_id=record.id,
-                               reason="" if ok else reason)
+            return WriteResult(
+                outcome=WriteOutcome.WRITTEN if ok else WriteOutcome.FAILED,
+                operation="sleep",
+                memory_id=record.id,
+                reason="" if ok else reason,
+            )
 
         if op == "archive":
             ok, reason = self._lifecycle.archive(record.id, trace_id=trace, thread_id=tid)
-            return WriteResult(written=ok, operation="archive", memory_id=record.id,
-                               reason="" if ok else reason)
+            return WriteResult(
+                outcome=WriteOutcome.WRITTEN if ok else WriteOutcome.FAILED,
+                operation="archive",
+                memory_id=record.id,
+                reason="" if ok else reason,
+            )
 
         if op == "wake":
             ok = self._lifecycle.wake(record.id, trace_id=trace, thread_id=tid)
-            return WriteResult(written=ok, operation="wake", memory_id=record.id,
-                               reason="" if ok else "Cannot wake: record is not sleeping")
+            return WriteResult(
+                outcome=WriteOutcome.WRITTEN if ok else WriteOutcome.FAILED,
+                operation="wake",
+                memory_id=record.id,
+                reason="" if ok else "无法唤醒：记忆当前不是 sleeping 状态",
+            )
 
-        return WriteResult(written=False, reason=f"Unknown maintenance operation: {op}")
+        return WriteResult(
+            outcome=WriteOutcome.FAILED,
+            reason=f"未知的维护操作: {op}",
+        )
 
     # ------------------------------------------------------------------
     # Forget (Saga — covers all layers)
@@ -532,7 +554,10 @@ class MemoryWriteService:
         if not memory_ids and not turn_ids and not event_ids and not thread_id \
                 and not canonical_key and not all_user_data \
                 and not (scope_type and scope_id):
-            return WriteResult(written=False, reason="No targets specified for forget")
+            return WriteResult(
+                outcome=WriteOutcome.FAILED,
+                reason="遗忘操作未指定目标",
+            )
 
         try:
             result = execute_phase_a_shield(
@@ -570,14 +595,17 @@ class MemoryWriteService:
                     pass  # 隔离写入
 
             return WriteResult(
-                written=True,
+                outcome=WriteOutcome.WRITTEN,
                 operation="forget",
                 memory_id=memory_ids[0] if memory_ids else "",
-                reason=f"Phase A shielded: {result['operation_key']}",
+                reason=f"Phase A 已完成屏蔽: {result['operation_key']}",
             )
         except Exception as exc:
-            logger.exception("Phase A shield failed")
-            return WriteResult(written=False, reason=f"Forget failed: {exc}")
+            logger.exception("Phase A 屏蔽失败")
+            return WriteResult(
+                outcome=WriteOutcome.FAILED,
+                reason=f"遗忘失败: {exc}",
+            )
 
     # ------------------------------------------------------------------
     # Promotion: candidate → active
@@ -596,8 +624,12 @@ class MemoryWriteService:
             reason="Candidate promoted to active",
         )
         if not ok:
-            return WriteResult(written=False, reason=reason)
-        return WriteResult(written=True, operation="promote", memory_id=memory_id)
+            return WriteResult(outcome=WriteOutcome.FAILED, reason=reason)
+        return WriteResult(
+            outcome=WriteOutcome.WRITTEN,
+            operation="promote",
+            memory_id=memory_id,
+        )
 
     # ------------------------------------------------------------------
     # Internal execution helpers
@@ -613,7 +645,10 @@ class MemoryWriteService:
         """Promote candidate → active with lineage."""
         candidate = resolution.candidate_record
         if candidate is None:
-            return WriteResult(written=False, reason="No candidate to promote")
+            return WriteResult(
+                outcome=WriteOutcome.FAILED,
+                reason="没有可提升的 candidate 记忆",
+            )
 
         self._db.add(MemoryLineage(
             predecessor_id=candidate.id,
@@ -637,8 +672,10 @@ class MemoryWriteService:
         self._enqueue_projection(candidate, "memory.promoted")
 
         return WriteResult(
-            written=True, operation="promote",
-            memory_id=candidate.id, state=LifecycleState.ACTIVE.value,
+            outcome=WriteOutcome.WRITTEN,
+            operation="promote",
+            memory_id=candidate.id,
+            state=LifecycleState.ACTIVE.value,
         )
 
     def _execute_reinforce(
@@ -667,8 +704,11 @@ class MemoryWriteService:
                     final_op="ignore", final_memory_id=existing.id,
                 )
                 return WriteResult(
-                    written=False, operation="ignore",
-                    reason="All source_events already counted",
+                    outcome=WriteOutcome.REINFORCE_SKIPPED,
+                    operation="ignore",
+                    memory_id=existing.id,
+                    state=existing.lifecycle_state,
+                    reason="所有 source_event 均已计入，不重复强化",
                 )
         else:
             new_count = 1
@@ -691,8 +731,10 @@ class MemoryWriteService:
         self._enqueue_projection(existing, "memory.reinforced", invalidate_cache=True)
 
         return WriteResult(
-            written=True, operation="reinforce",
-            memory_id=existing.id, state=LifecycleState.ACTIVE.value,
+            outcome=WriteOutcome.WRITTEN,
+            operation="reinforce",
+            memory_id=existing.id,
+            state=LifecycleState.ACTIVE.value,
         )
 
     def _execute_supersede_or_revise(
@@ -705,7 +747,10 @@ class MemoryWriteService:
         """Supersede or revise: create new record, mark old as superseded, write lineage."""
         old: MemoryRecord | None = resolution.existing_record
         if old is None:
-            return WriteResult(written=False, reason="No existing record to supersede/revise")
+            return WriteResult(
+                outcome=WriteOutcome.FAILED,
+                reason="没有可 supersede 或 revise 的现有记忆",
+            )
 
         # Mark old validity as superseded, keep lifecycle as-is
         old.validity_state = ValidityState.SUPERSEDED.value
@@ -744,7 +789,7 @@ class MemoryWriteService:
         self._enqueue_projection(old, "memory.superseded", invalidate_cache=True)
 
         return WriteResult(
-            written=True,
+            outcome=WriteOutcome.WRITTEN,
             operation=resolution.operation,
             memory_id=new_record.id,
             state=LifecycleState.ACTIVE.value,
@@ -769,7 +814,6 @@ class MemoryWriteService:
             proposal=proposal,
             lifecycle_state=LifecycleState.ACTIVE.value,
             validity_state=ValidityState.VALID.value,
-            merged_from=old_ids,
         )
 
         # Update bidirectional links
@@ -791,7 +835,7 @@ class MemoryWriteService:
         self._enqueue_projection(new_record, "memory.merged", invalidate_cache=True)
 
         return WriteResult(
-            written=True,
+            outcome=WriteOutcome.WRITTEN,
             operation="merge",
             memory_id=new_record.id,
             state=LifecycleState.ACTIVE.value,
