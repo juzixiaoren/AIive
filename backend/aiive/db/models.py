@@ -119,6 +119,9 @@ class TurnRecord(Base):
     request_event_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     response_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # 结构化消息来源：user / system_command / runtime_event。
+    # 取代 turn_id 前缀命名约定，作为前端展示与上下文注入的统一判定依据。
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="user")
     # Phase 1: immutable epoch/segment attribution (nullable for legacy, enforced by app)
     epoch_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     segment_id: Mapped[str | None] = mapped_column(String(36), nullable=True)

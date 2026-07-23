@@ -12,7 +12,7 @@ from typing import Any
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from aiive.context.run_context import RunContext
+from aiive.context.run_context import RunContext, RUN_CTX_OUTBOX_WORKER
 from aiive.db.base import SessionLocal
 from aiive.db.models import Event, OutboxJob, ToolOperation
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome, HandlerResult
@@ -263,7 +263,7 @@ def handle_tool_operation(claimed: ClaimedJob) -> HandlerResult:
         context = RunContext(
             thread_id=operation.thread_id,
             trace_id=operation.trace_id,
-            source="outbox_worker",
+            source=RUN_CTX_OUTBOX_WORKER,
             turn_id=operation.turn_id,
             turn_record_id=operation.turn_record_id,
         )

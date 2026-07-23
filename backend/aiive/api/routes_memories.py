@@ -10,7 +10,11 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from aiive.context.run_context import RunContext
+from aiive.context.run_context import (
+    RunContext,
+    RUN_CTX_API,
+    RUN_CTX_MANUAL_MEMORY_API,
+)
 from aiive.db.base import get_db
 from aiive.memory.memory_maintenance import MemoryMaintenance
 from aiive.memory.memory_policy import MemoryPolicyEngine, MemoryReadChannel
@@ -205,7 +209,7 @@ def create_memory(request: CreateMemoryRequest,
     ctx = RunContext(
         thread_id="manual_api",
         trace_id=str(_uuid.uuid4()),
-        source="manual_memory_api",
+        source=RUN_CTX_MANUAL_MEMORY_API,
         execution_mode="user_required",
     )
 
@@ -274,7 +278,7 @@ def sleep_memory(memory_id: str, db: Session = Depends(get_db)):
         canonical_key="",
         proposed_operation="sleep",
     )
-    ctx = RunContext(thread_id="api", trace_id=memory_id, source="api")
+    ctx = RunContext(thread_id="api", trace_id=memory_id, source=RUN_CTX_API)
     result = writer.execute_maintenance(proposal, ctx)
     db.commit()
     return {"ok": result.written, "memory_id": result.memory_id, "reason": result.reason}
@@ -298,7 +302,7 @@ def archive_memory(memory_id: str, db: Session = Depends(get_db)):
         canonical_key="",
         proposed_operation="archive",
     )
-    ctx = RunContext(thread_id="api", trace_id=memory_id, source="api")
+    ctx = RunContext(thread_id="api", trace_id=memory_id, source=RUN_CTX_API)
     result = writer.execute_maintenance(proposal, ctx)
     db.commit()
     return {"ok": result.written, "memory_id": result.memory_id, "reason": result.reason}

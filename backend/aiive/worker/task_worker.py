@@ -7,10 +7,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from aiive.db.base import SessionLocal
 from aiive.db.models import OutboxJob, Task
-from aiive.runtime.task_manager import TaskManager
-from aiive.runtime.thread_bootstrap import ThreadBootstrapService
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +15,7 @@ logger = logging.getLogger(__name__)
 def enqueue_due_tasks(db: Session, now: datetime | None = None) -> list[dict[str, Any]]:
     """原子认领到期任务并创建唯一的提醒投递 OutboxJob。
 
-    Scheduler 与手动 run_once 共用此入口。该函数只 flush，不提交事务；
+    Scheduler 使用此入口。该函数只 flush，不提交事务；
     调用方负责提交，使 Task 状态和 OutboxJob 创建保持原子。
     """
     now = now or datetime.now(timezone.utc)
@@ -80,32 +77,3 @@ def enqueue_due_tasks(db: Session, now: datetime | None = None) -> list[dict[str
 
     db.flush()
     return results
-
-
-class TaskWorker:
-    """兼容旧调用方的任务扫描入口，不再直接执行提醒。"""
-
-    def __init__(self, db: Session):
-        self._db = db
-
-    def poll_and_notify(self) -> list[dict[str, Any]]:
-        """扫描到期任务并入队，投递由 reminder_delivery Handler 完成。"""
-        results = enqueue_due_tasks(self._db)
-        self._db.commit()
-        return results
-
-
-def run_once() -> list[dict[str, Any]]:
-    """手动执行一次与生产一致的到期任务扫描。"""
-    db = SessionLocal()
-    try:
-        results = enqueue_due_tasks(db)
-        db.commit()
-        for result in results:
-            print(f"[TASK] Enqueued: {result['title'][:50]}")
-        return results
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()

@@ -39,11 +39,6 @@ class TestContextSnapshot:
             "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
             lambda self: DeterministicLLM(content="Hello!"),
         )
-        # 防止 TaskWorker 连接外部 PostgreSQL（execute_turn 不再调用它，保留以防万一）
-        monkeypatch.setattr(
-            "aiive.worker.task_worker.SessionLocal",
-            lambda: db_session,
-        )
         result = _run(message="Hi")
         trace_id = result["trace_id"]
 
@@ -61,10 +56,6 @@ class TestContextSnapshot:
         monkeypatch.setattr(
             "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
             lambda self: DeterministicLLM(content="Hi!"),
-        )
-        monkeypatch.setattr(
-            "aiive.worker.task_worker.SessionLocal",
-            lambda: db_session,
         )
         result = _run(message="Hello")
 
@@ -84,10 +75,6 @@ class TestContextSnapshot:
         monkeypatch.setattr(
             "aiive.runtime.thread_bootstrap.ThreadBootstrapService.ensure_committed_thread",
             staticmethod(lambda tid=None: tid if tid else str(uuid.uuid4())),
-        )
-        monkeypatch.setattr(
-            "aiive.worker.task_worker.SessionLocal",
-            lambda: db_session,
         )
 
         r1 = _run(message="First")
@@ -112,10 +99,6 @@ class TestContextSnapshot:
             "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
             lambda self: DeterministicLLM(content="Reply"),
         )
-        monkeypatch.setattr(
-            "aiive.worker.task_worker.SessionLocal",
-            lambda: db_session,
-        )
         result = _run(message="Test")
 
         snapshot = (
@@ -129,10 +112,6 @@ class TestContextSnapshot:
         monkeypatch.setattr(
             "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
             lambda self: DeterministicLLM(content="Reply"),
-        )
-        monkeypatch.setattr(
-            "aiive.worker.task_worker.SessionLocal",
-            lambda: db_session,
         )
         result = _run(message="Test")
 

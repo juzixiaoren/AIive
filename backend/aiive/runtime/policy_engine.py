@@ -40,13 +40,11 @@ class PolicyResult:
     allowed_tools: list[str] = field(default_factory=list)
 
 
-# ---- 策略规则（基于工具元数据，非关键词） ----
-
 # TODO: 用户审批当前有意停用。恢复时必须同步启用策略判定、审批节点、前端 UI、测试和文档，禁止仅接通单层逻辑。
 # 以下规则仅保留为未来审批策略的元数据定义，当前不得参与 check_tool_calls 判定。
 EFFECT_TYPE_RULES = {
-    "destructive_write": PolicyAction.CONFIRM,  # can_delete = True
-    "external_communication": PolicyAction.CONFIRM,  # writes_external_world = True + 高风险
+    "destructive_write": PolicyAction.CONFIRM,
+    "external_communication": PolicyAction.CONFIRM,
     "shell_execution": PolicyAction.CONFIRM,
 }
 

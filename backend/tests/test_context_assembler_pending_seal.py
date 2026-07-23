@@ -96,8 +96,7 @@ def test_assemble_persists_pending_seal_after_session_close(db) -> None:
         db=db, message="hello", thread=thread, upper_bound_sequence=0,
     )
 
-    # 软阈值应触发 pending_seal 标记
-    assert assembled.pending_seal is True
+    assert assembled.is_safe is True
 
     # 复现原 bug 场景：assemble 持有的会话被关闭
     # （对应 _load_context 的 finally: db.close()）

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from sqlalchemy import and_, or_, text
+from sqlalchemy import and_, delete, or_, text
 from sqlalchemy.orm import Session
 
 from aiive.config import settings
@@ -65,8 +65,8 @@ class MemoryVectorProjectionService:
         if record.record_version != expected_version:
             return "stale_version_skipped"
         if not self._is_indexable(record):
-            self._db.query(MemoryVectorProjection).filter_by(memory_id=memory_id).delete()
-            return "inactive_deleted"
+            delete_result = self.delete(memory_id, expected_version)
+            return "inactive_deleted" if delete_result == "deleted" else delete_result
 
         provider = self._provider_factory()
         vector = provider.embed(self._embedding_text(record))
@@ -81,14 +81,26 @@ class MemoryVectorProjectionService:
         return "upserted"
 
     def delete(self, memory_id: str, expected_version: int) -> str:
-        """删除不高于当前事件版本的投影，防止旧删除任务移除新版本。"""
-        projection = self._db.get(MemoryVectorProjection, memory_id)
-        if projection is None:
+        """原子删除不高于事件版本的投影，防止旧任务移除新版本。"""
+        deleted_count = self._db.execute(
+            delete(MemoryVectorProjection).where(
+                MemoryVectorProjection.memory_id == memory_id,
+                MemoryVectorProjection.record_version <= expected_version,
+            )
+        ).rowcount
+        if deleted_count:
+            return "deleted"
+
+        current_version = self._db.execute(
+            text(
+                "SELECT record_version FROM memory_vector_projections "
+                "WHERE memory_id = :memory_id"
+            ),
+            {"memory_id": memory_id},
+        ).scalar_one_or_none()
+        if current_version is None:
             return "already_absent"
-        if projection.record_version > expected_version:
-            return "stale_delete_skipped"
-        self._db.delete(projection)
-        return "deleted"
+        return "stale_delete_skipped"
 
     def search(
         self,

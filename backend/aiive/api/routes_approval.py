@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import func
 
-from aiive.context.run_context import RunContext
+from aiive.context.run_context import RunContext, RUN_CTX_TRUSTED_APPROVAL
 from aiive.db.base import SessionLocal
 from aiive.db.models import ApprovalRequest, Event, Thread, TurnRecord
 from aiive.runtime.working_state import WorkingStateService
@@ -150,7 +150,7 @@ def respond_approval(request: ApprovalRespondRequest) -> dict[str, Any]:
         RunContext(
             thread_id=thread_id,
             trace_id=trace_id,
-            source="trusted_approval",
+            source=RUN_CTX_TRUSTED_APPROVAL,
             turn_id=turn_id,
             turn_record_id=turn_record_id,
         ),

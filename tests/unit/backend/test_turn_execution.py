@@ -51,7 +51,7 @@ def patched(monkeypatch, db_session):
 
 
 def _run_turn(patched, message, thread_id=None):
-    svc = TurnExecutionService(llm_client=FakeLLMClient(), source="user_chat")
+    svc = TurnExecutionService(llm_client=FakeLLMClient(), message_source="user")
     return svc.execute_turn(message, thread_id=thread_id)
 
 

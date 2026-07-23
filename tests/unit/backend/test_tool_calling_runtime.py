@@ -18,6 +18,7 @@ from aiive.runtime.action_cards import ActionCard
 from aiive.runtime.tool_executor import (
     ToolCallRecord,
     build_action_cards,
+    build_pending_operations,
 )
 
 # V2: context assembly happens in ContextAssembler. The integration tests

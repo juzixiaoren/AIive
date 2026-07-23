@@ -84,6 +84,24 @@ def list_tasks(status: str | None = Query(None), db: Session = Depends(get_db)):
         raise
 
 
+@router.post("/tasks/{task_id}/cancel")
+def cancel_task(task_id: str, db: Session = Depends(get_db)):
+    """取消指定任务及其尚未投递的提醒。"""
+    try:
+        result = TaskManager(db).cancel(task_id)
+        if result["status"] == "not_found":
+            raise HTTPException(status_code=404, detail="任务不存在")
+        db.commit()
+        return result
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        logger.exception("取消任务失败: task_id=%s", task_id)
+        db.rollback()
+        raise
+
+
 @router.post("/tasks/{task_id}/check-now")
 def check_task(task_id: str, db: Session = Depends(get_db)):
     """立即执行指定任务

@@ -296,11 +296,11 @@ class RecallConfig:
 
 ## 八、RunContext 注入链路
 
-`RunContext`（thread_id、trace_id、source、memory_tool_calls 计数器）全程对 LLM 不可见：
+`RunContext`（thread_id、trace_id、source、memory_tool_calls 计数器）全程对 LLM 不可见。`source` 是**调用执行者标签**（见 `run_context.py` 的 `RUN_CTX_*` 常量），与 `MessageSource`（会话回合消息来源）不同轴；默认值为 `RUN_CTX_USER_CHAT`，当执行者就是会话回合时复用其 `MessageSource.value`。
 
 ```
 agent_graph.run()
-  → RunContext(thread_id, trace_id, "user_chat")
+  → RunContext(thread_id, trace_id, source=exec_ctx.message_source.value)
   → build_langchain_tools(registry, run_ctx)
       → _make_handler(registry, cap_id, run_ctx)
           → 闭包捕获 run_ctx

@@ -131,25 +131,6 @@ class MaintenanceConfig:
     # --- 策略版本 ---
     policy_version: str = "phase4.v1"
 
-# ============================================================================
-# Phase 0.5B: Projection capability flags + Outbox allowlist
-# ============================================================================
-
-
-@dataclass
-class ProjectionCapabilities:
-    """Phase 0.5B 已有生产消费者的可选投影能力开关。"""
-    cache_projection_enabled: bool = False
-
-
-# 当前实际能力状态
-_projection_capabilities = ProjectionCapabilities()
-
-
-def get_projection_capabilities() -> ProjectionCapabilities:
-    return _projection_capabilities
-
-
 ENABLED_OUTBOX_JOB_TYPES: frozenset[str] = frozenset({
     "memory_extraction",
     "core_memory_refresh",

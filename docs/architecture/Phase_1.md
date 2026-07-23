@@ -1324,16 +1324,17 @@ def make_runtime_turn_id(task_id: str, occurrence_id: str) -> str:
 |------|---------------|---------------------------|
 | `source` | `"system_command"` | `"runtime_event"` |
 | `operation_id` | `sha256(source, thread_id, request_id, payload)` | `sha256(task_id, occurrence_id)` |
-| `turn_id` | `"system_" + operation_id[:32]` | `"runtime_" + operation_id[:32]` |
-| 进入用户可见历史 | 否 | 否 |
-| 参与 recent completed turns | 否 | 否 |
+| `turn_id` | `operation_id[:32]`（不再带 `system_` 前缀） | `uuid5(task_id, occurrence_id)`（不携带前缀） |
+| 进入用户可见历史 | 仅展示 agent 回复，触发输入隐藏 | 仅展示 agent 回复，触发输入隐藏 |
+| 参与 recent completed turns | 是（触发输入以 `system` 角色注入上下文） | 是（触发输入以 `system` 角色注入上下文） |
 | 重试幂等 | 是 (TurnRecord + fingerprint + operation_id) | 是 (TurnRecord + fingerprint + operation_id) |
 
 ### 15.4 防止污染
 
-- 系统事件不创建 `event_type="user_message"` Event
-- 系统提示追加明确的 `## System Command (backend — NOT user input)` / `## Runtime Event (backend-scheduled — NOT user input)` 标记
-- `get_recent_messages` 默认不返回系统 Turn（通过 `turn_id LIKE 'system_%'` 或 `turn_id LIKE 'runtime_%'` 过滤）
+- 系统事件仍创建 `event_type="user_message"` Event，但其 payload 携带 `message_source`，且 `TurnRecord.source` 记录结构化来源（user / system_command / runtime_event）。
+- 前端展示（`ThreadState.list_thread_messages_page`）依据 `TurnRecord.source` 隐藏 system 类触发输入、仅展示 agent 回复；用户看到的是智能体主动发来的消息。
+- LLM 上下文（`ThreadState.load_recent_messages_bounded` + `ContextAssembler`）依据 `TurnRecord.source` 将 system 类触发输入以 `role="system"` 注入，模型明确其为系统消息而非用户输入；当前轮次消息也按同一来源决定角色。
+- 消息来源统一由 `TurnRecord.source` 结构化判定，**废除 turn_id 前缀命名约定**（原 `turn_id LIKE 'system_%' / 'runtime_%'` 过滤已删除）。
 
 ---
 

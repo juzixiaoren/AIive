@@ -1,8 +1,8 @@
-"""Tests for AgentDecision model."""
+"""记忆提取信号与提取策略测试。"""
 
 import pytest
 
-from aiive.core.action_planner import ActionPlanner, AgentDecision
+from aiive.core.action_planner import ActionPlanner
 from aiive.core.llm_client import FakeLLMClient
 from aiive.memory.extraction_policy import MemoryExtractionPolicy, MemorySignalAction
 
@@ -78,22 +78,3 @@ class TestMemoryExtractionPolicy:
         resolved = MemoryExtractionPolicy.resolve_action(action, "普通用户消息")  # type: ignore[arg-type]
 
         assert resolved == MemorySignalAction.EXTRACT_ASYNC
-
-
-class TestAgentDecisionModel:
-    def test_default_fields(self):
-        d = AgentDecision()
-        assert d.decision_type == "final_response"
-        assert d.execution_mode == "explain_only"
-        assert d.should_execute is False
-
-    def test_validation_rejects_invalid_confidence(self):
-        with pytest.raises(Exception):
-            AgentDecision(
-                decision_type="tool_call",
-                execution_mode="execute",
-                intent_type="command",
-                should_execute=True,
-                confidence=2.0,
-                reason="bad",
-            )

@@ -1,4 +1,4 @@
-"""测试 TaskWorker 的端到端提醒通知功能。
+"""测试提醒通知与到期任务入队功能。
 
 验证从任务创建到 Worker 轮询再产生通知事件的完整流程。
 """
@@ -7,11 +7,41 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from aiive.api.routes_notifications import delete_notification
-from aiive.db.base import SessionLocal
-from aiive.db.models import Event, Task
+from aiive.api.routes_notifications import delete_notification, list_notifications
+from aiive.context.run_context import RunContext
+from aiive.db.models import Event, Task, Thread
+from aiive.tools.builtin_tools import _handle_schedule_reminder
 from aiive.runtime.task_manager import TaskManager
-from aiive.worker.task_worker import TaskWorker
+from aiive.worker.task_worker import enqueue_due_tasks
+
+
+class TestReminderNotificationInbox:
+    """提醒创建后应立即进入通知收件箱。"""
+
+    def test_schedule_reminder_is_listed_as_pending_notification(self, db_session, monkeypatch):
+        """创建提醒必须同时创建可被未执行列表读取的通知事件。"""
+        import aiive.api.routes_notifications as notifications
+
+        thread = Thread(id="reminder-notification-thread", title="通知测试")
+        db_session.add(thread)
+        db_session.flush()
+        monkeypatch.setattr(notifications, "broadcast_pending_count", lambda db: None)
+
+        result = _handle_schedule_reminder._aiive_db_handler(
+            db_session,
+            RunContext(thread_id=thread.id, trace_id="notification-trace", source="test"),
+            content="喝水",
+            delay_minutes=15,
+        )
+        db_session.flush()
+
+        notifications = list_notifications(category="pending", db=db_session)
+
+        assert result["reminder_set"] is True
+        assert len(notifications) == 1
+        assert notifications[0]["event_type"] == "reminder_created"
+        assert notifications[0]["status"] == "pending"
+        assert notifications[0]["title"] == "喝水"
 
 
 class TestDeleteNotificationCancelsTask:
@@ -164,8 +194,8 @@ class TestDeleteNotificationCancelsTask:
         assert db_session.get(Event, event.id) is not None
 
 
-class TestTaskWorkerEndToEnd:
-    """扫描入口测试：创建任务 -> Worker 原子入队。"""
+class TestDueTaskEnqueue:
+    """扫描入口测试：创建任务后由生产入口原子入队。"""
 
     def test_overdue_task_enqueues_delivery(self, db_session):
         """过期提醒只能进入 dispatching，不能由旧 Worker 伪造通知或直接完成。"""
@@ -176,7 +206,7 @@ class TestTaskWorkerEndToEnd:
         task = mgr.create("reminder", "测试提醒", next_check_at=past)
         db_session.flush()
 
-        results = TaskWorker(db_session).poll_and_notify()
+        results = enqueue_due_tasks(db_session)
         db_session.flush()
 
         updated = mgr._db.get(type(task), task.id)
@@ -197,8 +227,7 @@ class TestTaskWorkerEndToEnd:
         mgr.create("reminder", "未来提醒", next_check_at=future)
         db_session.flush()
 
-        worker = TaskWorker(db_session)
-        results = worker.poll_and_notify()
+        results = enqueue_due_tasks(db_session)
 
         assert len(results) == 0
 
@@ -209,7 +238,6 @@ class TestTaskWorkerEndToEnd:
         mgr.create("condition_watch", "条件检查", condition="false", next_check_at=past)
         db_session.flush()
 
-        worker = TaskWorker(db_session)
-        results = worker.poll_and_notify()
+        results = enqueue_due_tasks(db_session)
 
         assert len(results) == 0

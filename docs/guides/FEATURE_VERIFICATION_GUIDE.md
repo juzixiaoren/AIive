@@ -64,7 +64,9 @@ cd frontend && npm run dev
 验证：
   - 查看"能力"Tab 的"已注册工具"，schedule_reminder 在列表中
   - 等待 ~70 秒，原对话中应出现 Agent 主动生成的 "hi" 回复
-  - 数据库中对应 Task 应按 pending → dispatching → completed 流转；不能用固定通知代替 Agent 回复
+  - 前端不得显示内部 `[Reminder triggered]` 运行时消息，只显示 Agent 回复
+  - Agent 必须真实调用 `remind_alert`，回复下方出现确认/延时操作卡片
+  - 数据库中对应 Task 应仅在 `remind_alert` 成功后按 pending → dispatching → completed 流转；不能用固定通知或固定卡片代替 Agent 回复
 ```
 
 ### 2.2 查看提醒列表

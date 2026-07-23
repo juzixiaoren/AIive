@@ -140,7 +140,10 @@ def get_retrieval_run(run_id: str, db: Session = Depends(get_db)):
     try:
         run = db.get(RetrievalRun, run_id)
         if not run:
-            return {"error": "not found"}
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "retrieval_run_not_found", "message": "未找到检索运行记录"},
+            )
 
         candidates = (
             db.query(RetrievalCandidate)

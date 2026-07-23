@@ -122,11 +122,7 @@ def _require_ctx(ctx: RunContext | None, tool_name: str) -> RunContext:
 
 @_db_handler
 def _handle_schedule_reminder(db: Session, ctx: RunContext | None, content: str, delay_minutes: int = 1):
-    """创建定时提醒，只负责写入 Task 记录。
-
-    本工具在自有 @_db_handler 会话中仅持久化 Task 并 flush，不在此处写入
-    reminder_created Event，避免工具会话与 Turn 主会话之间的 FK 约束冲突。
-    reminder_created Event 由提醒相关流程（如延期）在独立会话中写入。
+    """创建定时提醒及其通知收件箱事件。
 
     参数:
         content: 提醒内容
@@ -135,7 +131,10 @@ def _handle_schedule_reminder(db: Session, ctx: RunContext | None, content: str,
     返回:
         包含 reminder_set、task_id、content、delay_minutes 等字段的字典
     """
+    from aiive.db.models import Event
     from aiive.runtime.task_manager import TaskManager
+
+    ctx = _require_ctx(ctx, "schedule_reminder")
     next_check = datetime.now(timezone.utc) + timedelta(minutes=delay_minutes)
     task = TaskManager(db).create(
         task_type="reminder",
@@ -143,8 +142,20 @@ def _handle_schedule_reminder(db: Session, ctx: RunContext | None, content: str,
         description=f"延迟{delay_minutes}分钟",
         next_check_at=next_check,
     )
-    ctx = _require_ctx(ctx, "schedule_reminder")
     task.thread_id = ctx.thread_id
+    db.flush()
+    db.add(Event(
+        trace_id=task.id,
+        thread_id=ctx.thread_id,
+        event_type="reminder_created",
+        payload={
+            "task_id": task.id,
+            "title": content,
+            "content": content,
+            "status": "pending",
+            "scheduled_at": next_check.isoformat(),
+        },
+    ))
     db.flush()
     # 提醒创建后推送最新 pending 数量，保持前端角标即时更新
     from aiive.api.routes_notifications import broadcast_pending_count
@@ -1104,10 +1115,12 @@ def _handle_query_rhythm(db: Session):
 
 
 @_db_handler
-def _handle_query_attention(db: Session, thread_id: str = ""):
-    """获取当前注意力状态。"""
+def _handle_query_attention(db: Session, ctx: RunContext | None, thread_id: str = ""):
+    """只读查询当前注意力状态与空闲评估，不写入新的 AttentionState。"""
     from aiive.runtime.attention_manager import AttentionManager
-    return AttentionManager(db).recompute(thread_id, "query")
+    effective_thread_id = thread_id or (ctx.thread_id if ctx else "")
+    exclude_turn_id = ctx.turn_id if ctx else ""
+    return AttentionManager(db).inspect(effective_thread_id, exclude_turn_id=exclude_turn_id)
 
 
 # ── Working State（显式语义字段维护）──
@@ -1276,7 +1289,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         ("rollback_slot", _handle_rollback_slot, "回滚到上一个活跃槽位", {}, "high", True, False),
         # 节奏 / 注意力
         ("query_rhythm", _handle_query_rhythm, "获取每日节奏摘要", {}, "low", False, False),
-        ("query_attention", _handle_query_attention, "获取当前注意力状态",
+        ("query_attention", _handle_query_attention, "只读查询当前注意力状态与空闲评估",
          {"thread_id": {"type": "str", "description": "可选, 默认当前线程"}}, "low", False, False),
         # Working State（仅显式语义字段）
         ("update_working_state", _handle_update_working_state,

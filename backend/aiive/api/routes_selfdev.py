@@ -119,7 +119,7 @@ def get_request(request_id: str, db: Session = Depends(get_db)):
     """
     req = db.get(SelfDevRequest, request_id)
     if not req:
-        return {"error": "not found"}
+        raise HTTPException(status_code=404, detail="请求不存在")
 
     ops = (
         db.query(PatchOperation)
@@ -169,7 +169,7 @@ def apply_inactive(request_id: str, req: ApplyRequest, db: Session = Depends(get
     """
     sreq = db.get(SelfDevRequest, request_id)
     if not sreq:
-        return {"ok": False, "error": "Request not found"}
+        raise HTTPException(status_code=404, detail="请求不存在")
 
     from aiive.selfdev.patch_executor import PatchExecutor
 
@@ -201,7 +201,7 @@ def promote(request_id: str, req: PromoteRequest, db: Session = Depends(get_db))
     """
     sreq = db.get(SelfDevRequest, request_id)
     if not sreq:
-        return {"ok": False, "error": "Request not found"}
+        raise HTTPException(status_code=404, detail="请求不存在")
 
     from aiive.selfdev.promote_rollback import PromoteRollback
 
@@ -227,7 +227,7 @@ def rollback(request_id: str, db: Session = Depends(get_db)):
     """
     sreq = db.get(SelfDevRequest, request_id)
     if not sreq:
-        return {"ok": False, "error": "Request not found"}
+        raise HTTPException(status_code=404, detail="请求不存在")
 
     from aiive.selfdev.promote_rollback import PromoteRollback
 

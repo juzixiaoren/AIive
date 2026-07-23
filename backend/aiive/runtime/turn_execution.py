@@ -51,6 +51,7 @@ from aiive.runtime.context_assembler import (
 )
 from aiive.runtime.context_budget import ContextBudget
 from aiive.runtime.epoch_manager import EpochManager
+from aiive.runtime.execution_context import TurnExecutionContext
 from aiive.runtime.thread_bootstrap import ThreadBootstrapService
 from aiive.runtime.token_counter import LiteLLMTokenCounter
 from aiive.runtime.token_models import ModelProfile, TokenSafetyConfig
@@ -250,6 +251,14 @@ class TurnExecutionService:
         heartbeat = TurnHeartbeat(turn.id, execution_id)
         heartbeat.start()
         trace_id = str(_uuid.uuid4())
+        exec_ctx = TurnExecutionContext(
+            message_source=self._message_source,
+            thread_id=turn.thread_id,
+            turn_id=turn.turn_id,
+            turn_record_id=turn.id,
+            execution_id=execution_id,
+            trace_id=trace_id,
+        )
         try:
             yield {
                 "type": "started",
@@ -277,7 +286,7 @@ class TurnExecutionService:
         await asyncio.to_thread(_recover_orphaned)
 
         try:
-            ctx_bundle = await asyncio.to_thread(self._load_context, message, turn, trace_id)
+            ctx_bundle = await asyncio.to_thread(self._load_context, message, turn, exec_ctx)
         except asyncio.CancelledError:
             heartbeat.stop()
             self._mark_turn_interrupted_safely(turn.id, execution_id, "context_loading_cancelled")
@@ -312,9 +321,7 @@ class TurnExecutionService:
             ag_result: AgentGraphResult | None = None
 
             async for event in graph._execute_graph_stream(  # pyright: ignore[reportPrivateUsage]
-                message=message, thread_id=turn.thread_id,
-                turn_id=turn.turn_id, turn_record_id=turn.id, ctx_bundle=ctx_bundle,
-                execution_id=execution_id, trace_id=trace_id,
+                message=message, exec_ctx=exec_ctx, ctx_bundle=ctx_bundle,
             ):
                 if event.get("type") == "__graph_result__":
                     ag_result = event["result"]
@@ -554,6 +561,7 @@ class TurnExecutionService:
                 execution_id=turn.execution_id, request_event_id=turn.request_event_id,
                 request_fingerprint=turn.request_fingerprint,
                 epoch_id=turn.epoch_id, segment_id=turn.segment_id,
+                source=turn.source,
             )
             return result, execution_id
         finally:
@@ -920,16 +928,22 @@ class TurnExecutionService:
         try:
             # Phase 2: Context assembly (via ContextAssembler)
             trace_id = str(_uuid.uuid4())
-            ctx_bundle = self._load_context(message, turn, trace_id)
+            exec_ctx = TurnExecutionContext(
+                message_source=self._message_source,
+                thread_id=turn.thread_id,
+                turn_id=turn.turn_id,
+                turn_record_id=turn.id,
+                execution_id=execution_id,
+                trace_id=trace_id,
+            )
+            ctx_bundle = self._load_context(message, turn, exec_ctx)
 
             # Phase 3: AgentGraph execution
             graph_db = SessionLocal()
             try:
                 graph = AgentGraph(self._llm_client, graph_db)
                 ag_result = graph._execute_graph(  # pyright: ignore[reportPrivateUsage]
-                    message=message, thread_id=turn.thread_id,
-                    turn_id=turn.turn_id, turn_record_id=turn.id, ctx_bundle=ctx_bundle,
-                    execution_id=execution_id, trace_id=trace_id,
+                    message=message, exec_ctx=exec_ctx, ctx_bundle=ctx_bundle,
                 )
             finally:
                 graph_db.close()
@@ -996,7 +1010,7 @@ class TurnExecutionService:
     # =====================================================================
 
     def _load_context(
-        self, message: str, turn: TurnRecord, trace_id: str | None = None,
+        self, message: str, turn: TurnRecord, exec_ctx: TurnExecutionContext,
     ) -> ContextBundle:
         db = SessionLocal()
         try:
@@ -1017,9 +1031,10 @@ class TurnExecutionService:
                 db=db,
                 message=message,
                 thread=thread,
-                _source=self._message_source.value,
+                _source=exec_ctx.message_source.value,
                 upper_bound_sequence=(turn.turn_sequence or 1) - 1,
-                trace_id=trace_id,
+                trace_id=exec_ctx.trace_id,
+                current_turn_id=turn.turn_id,
             )
             db.commit()
 
