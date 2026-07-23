@@ -7,12 +7,12 @@ API路由模块：通知管理
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from aiive.api.ws_manager import ws_manager
 from aiive.db.base import get_db
-from aiive.db.models import Event, OutboxJob, Task
+from aiive.db.models import Event
+from aiive.runtime.task_manager import TaskManager
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
@@ -21,8 +21,6 @@ router = APIRouter(prefix="/api")
 PENDING_STATUSES = ["pending", "alerting", "snoozed"]
 # 已执行状态：已确认、已取消
 DONE_STATUSES = ["confirmed", "cancelled"]
-# Task 状态机中仍可能被取消的状态。
-CANCELLABLE_TASK_STATUSES = frozenset({"pending", "dispatching"})
 
 
 def count_pending_notifications(db: Session) -> int:
@@ -131,32 +129,8 @@ def delete_notification(notification_id: str, db: Session = Depends(get_db)):
 
     task_cancelled = False
     if task_id:
-        task = db.query(Task).filter(Task.id == str(task_id)).with_for_update().first()
-        if task is not None and task.status in CANCELLABLE_TASK_STATUSES:
-            task.status = "cancelled"
-            task_cancelled = True
-            db.query(OutboxJob).filter(
-                OutboxJob.operation_id == f"reminder_delivery:{task.id}",
-                OutboxJob.status == "pending",
-            ).update({
-                OutboxJob.status: "cancelled",
-                OutboxJob.terminal_reason: "task_cancelled",
-                OutboxJob.terminal_at: func.now(),
-            }, synchronize_session=False)
-
-        related = (
-            db.query(Event)
-            .filter(
-                Event.event_type == "reminder_created",
-                Event.payload["task_id"].as_string() == str(task_id),
-            )
-            .all()
-        )
-        for related_event in related:
-            related_payload = dict(related_event.payload or {})
-            related_payload["status"] = "cancelled"
-            related_payload["dismissed"] = True
-            related_event.payload = related_payload
+        cancellation = TaskManager(db).cancel(str(task_id))
+        task_cancelled = bool(cancellation.get("task_cancelled"))
 
     db.commit()
     broadcast_pending_count(db)

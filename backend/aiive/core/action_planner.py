@@ -1,13 +1,4 @@
-"""
-ActionPlanner: lightweight structured decision extraction.
-
-- AgentDecision: the main agent's structured output (logging + memory signal)
-- classify_memory_signal(): cheap model call for memory extraction signal
-  (SKIP / EXTRACT_ASYNC / EXTRACT_SYNC). Replaces keyword-based heuristics.
-
-MemorySignalDecision is independent of intent_type and execution_mode.
-Produced by a cheap model call after the main LLM reply.
-"""
+"""基于模型的记忆提取信号分类。"""
 
 from __future__ import annotations
 
@@ -60,33 +51,6 @@ User: {user_message}
 Assistant: {reply}
 
 Output ONLY valid JSON, no markdown:"""
-
-
-# ============================================================================
-# AgentDecision — lightweight structured output (logging only)
-# ============================================================================
-
-
-class AgentDecision(BaseModel):
-    """Structured decision output — used for logging, NOT for tool dispatch.
-
-    Tool dispatch is handled by LangGraph native tool_calls + policy_check.
-    memory_signal is produced by classify_memory_signal() after main LLM reply.
-    """
-    decision_type: str = "final_response"
-    execution_mode: str = "explain_only"
-    intent_type: str = "normal_chat"
-    should_execute: bool = False
-    tool_name: str | None = None
-    tool_params: dict[str, Any] = Field(default_factory=dict)
-    args: dict[str, Any] = Field(default_factory=dict)
-    requires_confirmation: bool = False
-    confidence: float = Field(ge=0.0, le=1.0, default=0.5)
-    parse_failed: bool = False
-    reason: str = ""
-    # Memory extraction signal (model-classified, NOT keyword-based)
-    memory_signal: MemorySignalDecision | None = None
-
 
 
 # ============================================================================

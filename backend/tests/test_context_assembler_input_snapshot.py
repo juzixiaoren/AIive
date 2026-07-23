@@ -156,7 +156,7 @@ def test_assemble_populates_input_snapshot(db) -> None:
 
     # 快照非空，且覆盖关键输入分区
     assert items, "输入分区快照不应为空"
-    assert {"stable_prefix", "core_memory", "working_state", "epoch_checkpoint",
+    assert {"stable_prefix", "core_memory", "attention", "working_state", "epoch_checkpoint",
             "segment_summary", "history_summary", "history_user",
             "history_assistant", "recall_memory", "tool_schemas",
             "user_message"} <= kinds
@@ -174,8 +174,45 @@ def test_assemble_populates_input_snapshot(db) -> None:
     assert ids <= set(full.keys())
     assert full["user_message"] == "当前用户消息"
 
+    # 注意力上下文已注入模型消息与快照
+    assert any("注意力上下文" in message.get("content", "") for message in assembled.messages)
+    assert "当前用户消息" in full["attention"]
+
     # stable_prefix_hash 已计算
     assert assembled.snapshot.stable_prefix_hash
+
+
+def test_attention_failure_is_fail_open(db, monkeypatch) -> None:
+    """注意力解析失败不得阻断上下文组装或污染当前会话。"""
+    import aiive.runtime.context_assembler as ca_mod
+
+    thread = new_thread(db)
+    db.commit()
+    assembler = _make_assembler()
+    assembler._load_agent_context = lambda db, message, thread, trace_id=None: {
+        "system_content": "系统前缀", "recall_messages": [], "recall_pack": None,
+        "history_summary_text": "", "stable_contract_text": "系统前缀",
+        "core_memory_text": "", "recall_text": "",
+    }
+    assembler._load_history_bounded = lambda *a, **k: []
+    assembler._dicts_to_chat_messages = lambda events: list(events)
+    assembler._load_epoch_checkpoint = lambda *a, **k: ""
+    assembler._load_segment_summaries = lambda *a, **k: ""
+    assembler._load_sealing_bridge = lambda *a, **k: ""
+    assembler._build_tools_schema_list = lambda *a, **k: []
+    assembler._touch_injected_memory = lambda *a, **k: None
+    ca_mod.WorkingStateService = _StubWorkingStateService
+    monkeypatch.setattr(
+        ca_mod.AttentionManager,
+        "resolve_for_turn",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("attention unavailable")),
+    )
+
+    assembled = assembler.assemble(db=db, message="继续工作", thread=thread)
+
+    assert assembled.is_safe is True
+    assert all(item.kind != "attention" for item in assembled.snapshot.items)
+    assert db.is_active is True
 
 
 def test_input_snapshot_skips_empty_partitions(db) -> None:

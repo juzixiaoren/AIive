@@ -175,12 +175,10 @@ class ConflictResolver:
     def _find_matching_candidate(
         candidates: list[MemoryRecord],
         content_hash: str,
-        _structured_hash: str,
+        structured_hash: str,
     ) -> MemoryRecord | None:
         for rec in candidates:
-            rec_hash = (rec.content_hash or
-                        hashlib.sha256((rec.content or "").encode()).hexdigest()[:16])
-            if rec_hash == content_hash:
+            if ConflictResolver._hash_matches(rec, content_hash, structured_hash):
                 return rec
         return None
 

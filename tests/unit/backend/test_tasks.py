@@ -5,7 +5,7 @@
 
 from datetime import datetime, timedelta, timezone
 
-from aiive.api.routes_tasks import check_task
+from aiive.api.routes_tasks import cancel_task, check_task
 from aiive.db.models import OutboxJob, Thread
 from aiive.runtime.task_manager import TaskManager
 

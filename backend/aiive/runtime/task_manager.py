@@ -8,9 +8,10 @@ from datetime import datetime, timedelta, timezone
 from collections.abc import Sequence
 from typing import Any
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from aiive.db.models import OutboxJob, Task
+from aiive.db.models import Event, OutboxJob, Task
 
 
 class TaskManager:
@@ -158,6 +159,50 @@ class TaskManager:
         ))
         self._db.flush()
         return {"ok": True, "status": "enqueued", "task_id": task.id, "title": task.title, "operation_id": operation_id}
+
+    def cancel(self, task_id: str) -> dict[str, Any]:
+        """取消尚未完成的任务，并终止未领取的提醒投递。"""
+        task = (
+            self._db.query(Task)
+            .filter(Task.id == task_id)
+            .with_for_update()
+            .first()
+        )
+        if task is None:
+            return {"ok": False, "status": "not_found", "error": "任务不存在"}
+
+        cancelled = task.status in {"pending", "dispatching"}
+        if cancelled:
+            task.status = "cancelled"
+            self._db.query(OutboxJob).filter(
+                OutboxJob.operation_id == f"reminder_delivery:{task.id}",
+                OutboxJob.status == "pending",
+            ).update({
+                OutboxJob.status: "cancelled",
+                OutboxJob.terminal_reason: "task_cancelled",
+                OutboxJob.terminal_at: func.now(),
+            }, synchronize_session=False)
+
+        related = (
+            self._db.query(Event)
+            .filter(
+                Event.event_type == "reminder_created",
+                Event.payload["task_id"].as_string() == task.id,
+            )
+            .all()
+        )
+        for event in related:
+            payload = dict(event.payload or {})
+            payload["status"] = "cancelled"
+            payload["dismissed"] = True
+            event.payload = payload
+
+        return {
+            "ok": True,
+            "task_id": task.id,
+            "status": task.status,
+            "task_cancelled": cancelled,
+        }
 
     def check_now(self, task_id: str) -> dict[str, Any]:
         """立即检查并处理指定任务。

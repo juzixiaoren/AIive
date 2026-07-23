@@ -82,7 +82,7 @@ class TestFaithfulTracing:
         tool_list.name = "list_tasks"
         tools = [tool_echo, tool_list]
 
-        with patch("aiive.worker.task_worker.TaskWorker"), patch(
+        with patch(
             "aiive.runtime.agent_graph.build_langchain_tools", return_value=tools
         ), patch("aiive.runtime.agent_graph.get_tool_registry") as mock_reg:
             mock_reg.return_value.list_all.return_value = []

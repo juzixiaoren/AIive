@@ -106,7 +106,7 @@ class MemoryLifecycleService:
                 action.reason_code or "candidate_promoted",
             )
             self._executor.log_event(trace_id, "memory.promoted", subject.id)
-            self._executor.enqueue_core_refresh(subject)
+            self._executor.enqueue_projection(subject, "memory.promoted")
 
         elif action.action_type in ("archive_expired", "archive_candidate"):
             subject.lifecycle_state = LifecycleState.ARCHIVED.value
@@ -118,7 +118,7 @@ class MemoryLifecycleService:
                 action.reason_code or "archived",
             )
             self._executor.log_event(trace_id, "memory.archived", subject.id)
-            self._executor.enqueue_core_refresh(subject)
+            self._executor.enqueue_projection(subject, "memory.archived")
 
         elif action.action_type == "sleep":
             subject.lifecycle_state = LifecycleState.SLEEPING.value
@@ -129,7 +129,7 @@ class MemoryLifecycleService:
                 action.reason_code or "cooled_to_sleeping",
             )
             self._executor.log_event(trace_id, "memory.sleep", subject.id)
-            self._executor.enqueue_core_refresh(subject)
+            self._executor.enqueue_projection(subject, "memory.sleep")
 
         elif action.action_type == "merge_exact_duplicate":
             winner = locked.get(action.related_record_ids[0]) if action.related_record_ids else None
@@ -147,7 +147,7 @@ class MemoryLifecycleService:
                                      payload={"loser_id": subject.id,
                                               "winner_id": winner.id if winner else None})
             # 仅 loser 改变生命周期，winner 不变；投影以 loser 为准重建
-            self._executor.enqueue_projection(subject, "memory.merged", invalidate_cache=True)
+            self._executor.enqueue_projection(subject, "memory.merged")
 
         elif action.action_type == "supersede":
             # 单基数冲突：新建一条 active winner 记录（复制 winner 内容），
@@ -198,10 +198,8 @@ class MemoryLifecycleService:
                     old.id, new_record.id, LineageOperation.SUPERSEDE.value,
                     action.reason_code or "single_cardinality_superseded",
                 )
-                self._executor.enqueue_projection(
-                    old, "memory.superseded", invalidate_cache=True,
-                )
-            self._executor.enqueue_projection(new_record, "memory.created", invalidate_cache=True)
+                self._executor.enqueue_projection(old, "memory.superseded")
+            self._executor.enqueue_projection(new_record, "memory.created")
 
         # 写 after_hash（动作完成后主记录态哈希）
         try:
@@ -286,7 +284,7 @@ class MemoryLifecycleService:
             record.id, record.id, LineageOperation.SLEEP.value, reason
         )
         self._executor.log_event(trace_id, "memory.sleep", record.id, thread_id=thread_id)
-        self._executor.enqueue_projection(record, "memory.sleep", invalidate_cache=True)
+        self._executor.enqueue_projection(record, "memory.sleep")
         return True, reason
 
     def archive(
@@ -307,5 +305,5 @@ class MemoryLifecycleService:
             record.id, record.id, LineageOperation.ARCHIVE.value, reason
         )
         self._executor.log_event(trace_id, "memory.archived", record.id, thread_id=thread_id)
-        self._executor.enqueue_projection(record, "memory.archived", invalidate_cache=True)
+        self._executor.enqueue_projection(record, "memory.archived")
         return True, reason

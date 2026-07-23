@@ -208,20 +208,15 @@ class MemoryMutationExecutor:
         self,
         record: MemoryRecord,
         event_type: str,
-        invalidate_cache: bool = False,
     ) -> None:
-        """入队当前已支持的异步投影 outbox job（core / markdown / cache）。
+        """入队当前已支持的异步投影 outbox job。
 
-        每条成功生命周期动作在「同一事务」内即时刷新投影（J.5）；可选投影类型受
-        `get_projection_capabilities()` 的 capability flag 控制，未启用者不入队。
-        投影 job 携带 `memory_id + record_version` 供消费端做 stale 检测。
+        每条成功生命周期动作在同一事务内触发投影刷新；投影 job 携带
+        `memory_id + record_version` 供消费端做 stale 检测。
 
         本方法是投影入队的**唯一共享入口**，`MemoryLifecycleService` 与
         `MemoryWriteService` 共用，避免出现两套投影语义。
         """
-        from aiive.memory.recall_config import get_projection_capabilities
-
-        caps = get_projection_capabilities()
         base_key = f"{record.id}:{record.record_version}"
 
         # core memory refresh（仅 core key，逻辑复用）
@@ -267,17 +262,6 @@ class MemoryMutationExecutor:
                     trace_id=record.id,
                     max_retries=3,
                 ))
-
-        # 缓存失效
-        if caps.cache_projection_enabled and invalidate_cache:
-            self._db.add(OutboxJob(
-                operation_id=f"cache:{base_key}:{_uuid.uuid4().hex[:8]}",
-                job_type="memory_cache_invalidate",
-                status="pending",
-                payload={"memory_id": record.id, "record_version": record.record_version},
-                trace_id=record.id,
-                max_retries=3,
-            ))
 
         # Phase 5: 统一检索索引刷新（memory_record）—— candidate 不进入索引
         self._enqueue_retrieval_refresh(record, event_type)

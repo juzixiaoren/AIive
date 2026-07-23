@@ -15,7 +15,7 @@ from aiive.db import models  # noqa: F401  ensure all Phase 1 models are importe
 def _patch_sessionlocal_to_sqlite(monkeypatch, db_session):
     """Redirect ALL SessionLocal() calls to the test SQLite session.
 
-    This prevents TaskWorker / Heartbeat / ContextAssembler from connecting
+    This prevents background services and ContextAssembler from connecting
     to PostgreSQL when running tests.
     """
     def _test_session():
@@ -27,6 +27,9 @@ def _patch_sessionlocal_to_sqlite(monkeypatch, db_session):
     monkeypatch.setattr(te, "SessionLocal", _test_session)
     import aiive.runtime.tool_normalizer as tn
     monkeypatch.setattr(tn, "SessionLocal", _test_session)
+    # 也覆盖 builtin_tools（直接 `from aiive.db.base import SessionLocal` 绑定到模块属性）
+    import aiive.tools.builtin_tools as bt
+    monkeypatch.setattr(bt, "SessionLocal", _test_session)
 
 
 @pytest.fixture

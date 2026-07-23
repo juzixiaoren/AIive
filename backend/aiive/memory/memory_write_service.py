@@ -328,7 +328,7 @@ class MemoryWriteService:
         self._write_evidence_batch(existing.id, proposal.evidence)
         self._persist_proposal(proposal, gate_decision, final_op="reinforce", final_memory_id=existing.id)
         self._log_event(thread_id, proposal, "memory.reinforced", existing.id)
-        self._enqueue_projection(existing, "memory.reinforced", invalidate_cache=True)
+        self._enqueue_projection(existing, "memory.reinforced")
         return WriteResult(outcome=WriteOutcome.WRITTEN, operation="reinforce",
                            memory_id=existing.id, state=LifecycleState.ACTIVE.value)
 
@@ -728,7 +728,7 @@ class MemoryWriteService:
             final_op="reinforce", final_memory_id=existing.id,
         )
         self._log_event(thread_id, proposal, "memory.reinforced", existing.id)
-        self._enqueue_projection(existing, "memory.reinforced", invalidate_cache=True)
+        self._enqueue_projection(existing, "memory.reinforced")
 
         return WriteResult(
             outcome=WriteOutcome.WRITTEN,
@@ -754,6 +754,7 @@ class MemoryWriteService:
 
         # Mark old validity as superseded, keep lifecycle as-is
         old.validity_state = ValidityState.SUPERSEDED.value
+        old.record_version += 1
         old.updated_at = datetime.now(timezone.utc)
 
         # Create new
@@ -784,9 +785,9 @@ class MemoryWriteService:
         )
         self._log_event(thread_id, proposal, "memory.superseded", new_record.id)
         # 新记录作为 active 记忆写入向量库（upsert，不删除）
-        self._enqueue_projection(new_record, "memory.created", invalidate_cache=True)
+        self._enqueue_projection(new_record, "memory.created")
         # 旧记录已失效，从向量库移除其旧向量（delete only）
-        self._enqueue_projection(old, "memory.superseded", invalidate_cache=True)
+        self._enqueue_projection(old, "memory.superseded")
 
         return WriteResult(
             outcome=WriteOutcome.WRITTEN,
@@ -808,6 +809,7 @@ class MemoryWriteService:
 
         for old in resolution.existing_records:
             old.validity_state = ValidityState.SUPERSEDED.value
+            old.record_version += 1
             old.updated_at = datetime.now(timezone.utc)
 
         new_record: MemoryRecord = self._store.create_record(
@@ -832,7 +834,9 @@ class MemoryWriteService:
             final_op="merge", final_memory_id=new_record.id,
         )
         self._log_event(thread_id, proposal, "memory.merged", new_record.id)
-        self._enqueue_projection(new_record, "memory.merged", invalidate_cache=True)
+        self._enqueue_projection(new_record, "memory.merged")
+        for old in resolution.existing_records:
+            self._enqueue_projection(old, "memory.merged")
 
         return WriteResult(
             outcome=WriteOutcome.WRITTEN,
@@ -966,14 +970,13 @@ class MemoryWriteService:
         self,
         record: MemoryRecord,
         event_type: str,
-        invalidate_cache: bool = False,
     ) -> None:
         """Enqueue async projection outbox jobs.
 
         委托到共享的 `MemoryMutationExecutor.enqueue_projection`（唯一投影入队入口），
         与生命周期维护路径复用同一套投影语义，避免出现两份逻辑（L 节）。
         """
-        self._executor.enqueue_projection(record, event_type, invalidate_cache)
+        self._executor.enqueue_projection(record, event_type)
 
     # ------------------------------------------------------------------
     # Advisory lock helpers

@@ -265,6 +265,68 @@ class TestThreadState:
 
         assert page["messages"][0]["tool_calls"][0]["status"] == "execution_unknown"
 
+    def test_list_thread_messages_hides_runtime_event_source(self, db_session):
+        """内部 runtime_event / system_command 不得投影为前端用户消息。"""
+        state = ThreadState(db_session)
+        thread = state.get_or_create_thread()
+        db_session.add(TurnRecord(
+            thread_id=thread.id, turn_id="turn-runtime", turn_sequence=1,
+            status="completed", request_fingerprint="fp-runtime",
+        ))
+        db_session.add_all([
+            Event(trace_id="trace-runtime", thread_id=thread.id, turn_id="turn-runtime",
+                  turn_event_index=0, event_type="user_message",
+                  payload={"content": "[Reminder triggered]\nreminder_id: x\n请喝水", "message_source": "runtime_event"}),
+            Event(trace_id="trace-runtime", thread_id=thread.id, turn_id="turn-runtime",
+                  turn_event_index=1, event_type="llm_response",
+                  payload={"content": "该喝水了。"}),
+        ])
+        db_session.add(TurnRecord(
+            thread_id=thread.id, turn_id="turn-system", turn_sequence=2,
+            status="completed", request_fingerprint="fp-system",
+        ))
+        db_session.add(Event(
+            trace_id="trace-system", thread_id=thread.id, turn_id="turn-system",
+            turn_event_index=0, event_type="user_message",
+            payload={"content": "/api/chat/system 指令", "message_source": "system_command"},
+        ))
+        db_session.add(TurnRecord(
+            thread_id=thread.id, turn_id="turn-user", turn_sequence=3,
+            status="completed", request_fingerprint="fp-user",
+        ))
+        db_session.add(Event(
+            trace_id="trace-user", thread_id=thread.id, turn_id="turn-user",
+            turn_event_index=0, event_type="user_message", payload={"content": "真实用户输入"},
+        ))
+        db_session.flush()
+
+        page = state.list_thread_messages_page(thread.id, page_size=50)
+        user_messages = [m for m in page["messages"] if m["role"] == "user"]
+
+        assert [m["content"] for m in user_messages] == ["真实用户输入"]
+        # 内部运行时事件与系统指令不进入前端历史，但 Agent 回复仍在
+        assistant_replies = [m["content"] for m in page["messages"] if m["role"] == "assistant"]
+        assert assistant_replies == ["该喝水了。"]
+
+    def test_list_thread_messages_legacy_user_event_compat(self, db_session):
+        """旧事件缺少 message_source 时按用户消息展示，保证历史兼容。"""
+        state = ThreadState(db_session)
+        thread = state.get_or_create_thread()
+        db_session.add(TurnRecord(
+            thread_id=thread.id, turn_id="turn-legacy", turn_sequence=1,
+            status="completed", request_fingerprint="fp-legacy",
+        ))
+        db_session.add(Event(
+            trace_id="trace-legacy", thread_id=thread.id, turn_id="turn-legacy",
+            turn_event_index=0, event_type="user_message", payload={"content": "旧版用户输入"},
+        ))
+        db_session.flush()
+
+        page = state.list_thread_messages_page(thread.id, page_size=50)
+        user_messages = [m["content"] for m in page["messages"] if m["role"] == "user"]
+
+        assert user_messages == ["旧版用户输入"]
+
     def test_list_thread_messages_page_uses_turn_cursor(self, db_session):
         """UI 历史页应使用 turn_sequence 游标向更早历史翻页。"""
         state = ThreadState(db_session)

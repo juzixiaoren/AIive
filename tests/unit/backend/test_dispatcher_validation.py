@@ -4,12 +4,7 @@ _validate_against_decision 已随 ToolExecutor 旧路径移除，
 策略校验现由 runtime/policy_engine.py 的 check_tool_calls() 和
 agent_graph.py 的 _policy_check 处理。
 """
-from unittest.mock import MagicMock
-
-import pytest
-
-from aiive.core.action_planner import AgentDecision
-from aiive.runtime.policy_engine import check_tool_calls, PolicyResult
+from aiive.runtime.policy_engine import check_tool_calls
 
 
 def _make_tool_calls(tool_name: str = "forget_memory") -> list[dict]:

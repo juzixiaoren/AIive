@@ -10,6 +10,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 
+from aiive.config import settings
 from aiive.db.base import SessionLocal
 from aiive.db.models import (
     Event,
@@ -98,7 +99,8 @@ def _freeze_action(subject, action_type, related=None, reason=None, run_id="r-te
 # ───────────────────────── MemoryLifecycleService ─────────────────────────
 
 
-def test_lifecycle_archive_expired_ephemeral(db):
+def test_lifecycle_archive_expired_ephemeral(db, monkeypatch):
+    monkeypatch.setattr(settings, "aiive_memory_vector_enabled", True)
     now = _now()
     rec = _mk_record(
         db, lifecycle_state=LifecycleState.ACTIVE.value, retention_policy="ephemeral",
@@ -112,9 +114,31 @@ def test_lifecycle_archive_expired_ephemeral(db):
     fresh = db.get(MemoryRecord, rec.id)
     assert fresh.lifecycle_state == LifecycleState.ARCHIVED.value
     assert fresh.validity_state == "expired"
+    assert db.query(OutboxJob).filter_by(
+        job_type="memory_vector_refresh",
+        operation_id=f"memory_vector_refresh:{rec.id}:2",
+    ).count() == 1
 
 
-def test_lifecycle_sleep_low_importance_old(db):
+def test_lifecycle_promote_enqueues_vector_refresh(db, monkeypatch):
+    monkeypatch.setattr(settings, "aiive_memory_vector_enabled", True)
+    rec = _mk_record(db)
+    db.commit()
+
+    status = MemoryLifecycleService(db).apply_maintenance_action(
+        _freeze_action(rec, "promote", reason="candidate_promoted")
+    )
+    db.commit()
+
+    assert status == "applied"
+    assert db.query(OutboxJob).filter_by(
+        job_type="memory_vector_refresh",
+        operation_id=f"memory_vector_refresh:{rec.id}:2",
+    ).count() == 1
+
+
+def test_lifecycle_sleep_low_importance_old(db, monkeypatch):
+    monkeypatch.setattr(settings, "aiive_memory_vector_enabled", True)
     now = _now()
     old = now - timedelta(days=60)
     rec = _mk_record(
@@ -128,9 +152,14 @@ def test_lifecycle_sleep_low_importance_old(db):
     assert status == "applied"
     fresh = db.get(MemoryRecord, rec.id)
     assert fresh.lifecycle_state == LifecycleState.SLEEPING.value
+    assert db.query(OutboxJob).filter_by(
+        job_type="memory_vector_refresh",
+        operation_id=f"memory_vector_refresh:{rec.id}:2",
+    ).count() == 1
 
 
-def test_lifecycle_merge_exact_duplicate(db):
+def test_lifecycle_merge_exact_duplicate(db, monkeypatch):
+    monkeypatch.setattr(settings, "aiive_memory_vector_enabled", True)
     now = _now()
     r1 = _mk_record(db, lifecycle_state=LifecycleState.CANDIDATE.value, content="dup",
                     content_hash="h-dup", canonical_key="dup.key", created_at=now - timedelta(days=2))
@@ -150,6 +179,10 @@ def test_lifecycle_merge_exact_duplicate(db):
     assert fresh_loser.validity_state == "superseded"
     fresh_winner = db.get(MemoryRecord, winner.id)
     assert fresh_winner.lifecycle_state == LifecycleState.CANDIDATE.value
+    assert db.query(OutboxJob).filter_by(
+        job_type="memory_vector_refresh",
+        operation_id=f"memory_vector_refresh:{loser.id}:2",
+    ).count() == 1
 
 
 def test_lifecycle_skip_stale_on_version_mismatch(db):

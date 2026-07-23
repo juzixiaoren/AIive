@@ -1,7 +1,7 @@
 """
 模块功能说明：
 - LLM 客户端模块，封装与 OpenAI 兼容的大模型 API 的通信
-- 提供同步聊天（chat）和流式聊天（chat_stream）两种调用方式
+- 提供同步聊天（chat）调用
 - 包含 LLMClient（生产客户端）、FakeLLMClient（测试替身）和 LLMResponse（响应模型）
 - 通过 default_llm_client() 工厂函数从项目配置创建统一的客户端实例
 """
@@ -228,97 +228,6 @@ class LLMClient:
         except Exception as e:
             raise LLMClientError(
                 message=f"LLM request failed: {e}",
-                status_code=None,
-                trace_id=trace_id,
-            )
-
-    def chat_stream(
-        self,
-        messages: Sequence[dict[str, Any]],
-        model: str | None = None,
-        temperature: float | None = None,
-        timeout: int | None = None,
-        trace_id: str | None = None,
-    ):
-        """流式聊天完成请求，逐块 yield 文本内容。
-
-        参数:
-            messages: 对话消息列表，每条消息包含 role 和 content
-            model: 指定模型名称，为 None 时使用默认模型
-            temperature: 生成温度参数
-            timeout: 超时时间（秒）
-            trace_id: 追踪 ID
-
-        Yields:
-            str: 每次 yield 一段文本增量
-
-        异常:
-            LLMClientError: API 错误、超时或网络异常
-        """
-        if trace_id is None:
-            trace_id = str(uuid.uuid4())
-
-        model = model or self._default_model
-        timeout_s = timeout or self._timeout_seconds
-
-        payload: dict[str, Any] = {
-            "model": model,
-            "messages": list(messages),
-            "stream": True,
-        }
-        if temperature is not None:
-            payload["temperature"] = temperature
-
-        headers = {
-            "Authorization": f"Bearer {self._api_key}",
-            "Content-Type": "application/json",
-        }
-
-        url = f"{self._base_url}/chat/completions"
-
-        try:
-            with httpx.stream(
-                "POST",
-                url,
-                json=payload,
-                headers=headers,
-                timeout=httpx.Timeout(timeout_s, connect=10.0),
-            ) as response:
-                if response.status_code != 200:
-                    response.read()
-                    raise LLMClientError(
-                        message=f"LLM API error: {response.status_code} - {response.text[:500]}",
-                        status_code=response.status_code,
-                        trace_id=trace_id,
-                    )
-                # 逐行解析 SSE 流
-                for line in response.iter_lines():
-                    if line.startswith("data: "):
-                        data_str = line[6:]
-                        if data_str == "[DONE]":
-                            break
-                        try:
-                            data = json.loads(data_str)
-                        except json.JSONDecodeError:
-                            logger.warning("流式响应 JSON 解析失败: trace_id=%s line=%s", trace_id, data_str[:200])
-                            continue
-                        choices = data.get("choices", [])
-                        if choices:
-                            delta = choices[0].get("delta", {})
-                            content = delta.get("content", "")
-                            if content:
-                                yield content
-        except httpx.TimeoutException:
-            raise LLMClientError(
-                message=f"LLM request timed out after {timeout_s}s",
-                status_code=None,
-                trace_id=trace_id,
-            )
-        except LLMClientError:
-            raise
-        except Exception as e:
-            raise LLMClientError(
-                message=f"LLM stream failed: {e}",
                 status_code=None,
                 trace_id=trace_id,
             )

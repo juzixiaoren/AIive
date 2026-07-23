@@ -13,7 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from aiive.config import settings
-from aiive.context.run_context import RunContext
+from aiive.context.run_context import RunContext, RUN_CTX_OUTBOX_WORKER
 from aiive.core.llm_client import LLMClient
 from aiive.db.base import SessionLocal
 from aiive.db.models import (
@@ -223,7 +223,7 @@ def handle_memory_extraction(claimed: ClaimedJob) -> HandlerResult:
         run_ctx = RunContext(
             thread_id=validated_source.thread_id,
             trace_id=claimed.trace_id or "",
-            source="outbox_worker",
+            source=RUN_CTX_OUTBOX_WORKER,
             turn_id=validated_source.turn_id,
             turn_record_id=source_turn_record_id,
             execution_mode="system_best_effort",
@@ -302,6 +302,35 @@ def handle_memory_extraction(claimed: ClaimedJob) -> HandlerResult:
 # ============================================================================
 
 
+def _remind_alert_succeeded(db: Session, turn_id: str, expected_reminder_id: str) -> bool:
+    """校验当前提醒 Turn 是否真实成功调用了 remind_alert 且目标 ID 匹配。
+
+    只有 LLM 实际执行该工具（tool_call 与 completed 的 tool_result 成对出现、
+    且参数中的 reminder_id 与本次到期事件一致）才视为已警报，禁止伪造卡片或状态。
+    """
+    calls: dict[str, tuple[str, dict[str, Any]]] = {}
+    results: dict[str, str] = {}
+    events = db.query(Event).filter(
+        Event.turn_id == turn_id,
+        Event.event_type.in_(["tool_call", "tool_result"]),
+    ).all()
+    for event in events:
+        payload = event.payload or {}
+        tool_call_id = str(payload.get("tool_call_id", "") or "")
+        if event.event_type == "tool_call":
+            calls[tool_call_id] = (str(payload.get("name", "")), payload.get("params") or {})
+        else:
+            results[tool_call_id] = str(payload.get("status", ""))
+    for tool_call_id, (name, params) in calls.items():
+        if name != "remind_alert":
+            continue
+        if str(params.get("reminder_id", "")) != str(expected_reminder_id):
+            continue
+        if results.get(tool_call_id) == "completed":
+            return True
+    return False
+
+
 def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
     """投递到期提醒：使用确定性 Turn 唤醒 Agent，成功后完成 Task。"""
     import uuid as _uuid
@@ -341,12 +370,30 @@ def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
                 f"提醒任务状态无效: {task.status}",
                 terminal_reason="invalid_reminder_task_status",
             )
+        reminder_event = db_a.query(Event).filter(
+            Event.event_type == "reminder_created",
+            Event.trace_id == task_id,
+        ).order_by(Event.created_at.desc()).first()
+        if reminder_event is None:
+            return HandlerResult(
+                HandlerOutcome.NON_RETRYABLE,
+                "提醒缺少关联的 reminder_created 事件",
+                terminal_reason="reminder_event_not_found",
+            )
+        reminder_id = reminder_event.id
         db_a.commit()
     finally:
         db_a.close()
 
     turn_id = str(_uuid.uuid5(_uuid.NAMESPACE_URL, operation_id))
-    message = f"[Reminder triggered]\n{title}\nContent: {content}"
+    message = (
+        "[Reminder triggered]\n"
+        f"reminder_id: {reminder_id}\n"
+        f"title: {title}\n"
+        f"content: {content}\n"
+        "这是已到期的真实提醒。你必须先调用 remind_alert，"
+        f"并且 reminder_id 必须严格使用 {reminder_id}；工具成功后再向用户回复提醒内容。"
+    )
     try:
         from aiive.core.llm_client import default_llm_client
         from aiive.runtime.turn_execution import TurnExecutionService
@@ -401,6 +448,36 @@ def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
             db_c.commit()
             return HandlerResult(HandlerOutcome.COMPLETED, "提醒投递期间已取消")
         if task.status == "dispatching":
+            if not _remind_alert_succeeded(db_c, turn_id, reminder_id):
+                # 校验前 db_c 仅做过读操作、无待写数据，提交空事务与回滚等价，
+                # 同时释放行锁以便后续重试。
+                db_c.commit()
+                return HandlerResult(
+                    HandlerOutcome.RETRYABLE_ERROR,
+                    "提醒 Turn 未真实调用 remind_alert 或目标 reminder_id 不匹配，不完成任务",
+                    terminal_reason="remind_alert_not_invoked",
+                )
+            reminder_event = db_c.query(Event).filter(
+                Event.event_type == "reminder_created",
+                Event.trace_id == task_id,
+            ).order_by(Event.created_at.desc()).first()
+            if reminder_event is None:
+                reminder_event = Event(
+                    trace_id=task_id,
+                    thread_id=thread_id,
+                    event_type="reminder_created",
+                    payload={
+                        "task_id": task_id,
+                        "title": title,
+                        "content": content,
+                        "status": "alerting",
+                    },
+                )
+                db_c.add(reminder_event)
+            else:
+                reminder_payload = dict(reminder_event.payload or {})
+                reminder_payload["status"] = "alerting"
+                reminder_event.payload = reminder_payload
             db_c.add(Event(
                 trace_id=claimed.trace_id or task_id,
                 thread_id=thread_id,
@@ -424,6 +501,17 @@ def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
         return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, f"提醒完成状态持久化失败: {exc}")
     finally:
         db_c.close()
+
+    try:
+        from aiive.api.routes_notifications import broadcast_pending_count
+
+        db_notification = SessionLocal()
+        try:
+            broadcast_pending_count(db_notification)
+        finally:
+            db_notification.close()
+    except Exception:
+        logger.exception("提醒通知状态推送失败: task_id=%s", task_id)
 
     try:
         from aiive.api.ws_manager import ws_manager

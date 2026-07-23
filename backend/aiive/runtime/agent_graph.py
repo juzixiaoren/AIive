@@ -47,9 +47,10 @@ from aiive.context.run_context import RunContext
 from aiive.core.action_planner import ActionPlanner, MemorySignalDecision
 from aiive.core.llm_client import normalize_llm_error
 from aiive.core.llm_client import LLMClient
-from aiive.memory.extraction_policy import MessageSource, MemoryExtractionPolicy, MemorySignalAction
+from aiive.memory.extraction_policy import MemoryExtractionPolicy, MemorySignalAction
 from aiive.memory.memory_store import MemoryStore
 from aiive.runtime.context_assembler import ContextSnapshotData, ContextSnapshotItem
+from aiive.runtime.execution_context import TurnExecutionContext
 from aiive.runtime.event_logger import EventLogger
 from aiive.runtime.policy_engine import check_tool_calls, PolicyAction
 from aiive.runtime.thread_state import ThreadState
@@ -709,13 +710,17 @@ Be concise by default. Provide additional detail when the task is complex, the u
     # ------------------------------------------------------------------
 
     def _execute_graph(
-        self, message: str, thread_id: str,
-        turn_id: str = "", turn_record_id: str = "", ctx_bundle: Any = None,
-        execution_id: str = "", normalizer: "ToolResultNormalizer | None" = None,
-        trace_id: str | None = None,
-        message_source: str | MessageSource = MessageSource.USER,
+        self, message: str, exec_ctx: TurnExecutionContext,
+        ctx_bundle: Any = None,
+        normalizer: "ToolResultNormalizer | None" = None,
     ) -> "AgentGraphResult":
         """Execute graph inference. Uses pre-assembled context from ContextAssembler."""
+        thread_id = exec_ctx.thread_id
+        turn_id = exec_ctx.turn_id
+        turn_record_id = exec_ctx.turn_record_id
+        execution_id = exec_ctx.execution_id
+        trace_id = exec_ctx.trace_id
+        message_source = exec_ctx.message_source
         trace = Trace(trace_id=trace_id) if trace_id else Trace.new()
         thread = self._thread_state.get_or_create_thread(thread_id)
 
@@ -740,7 +745,9 @@ Be concise by default. Provide additional detail when the task is complex, the u
         run_ctx_exec = RunContext(
             thread_id=thread.id,
             trace_id=trace.trace_id,
-            source=(message_source.value if isinstance(message_source, MessageSource) else MessageSource(message_source).value),
+            # 执行者即当前会话回合：复用其 MessageSource.value（user /
+            # system_command / runtime_event），与 RunContext.source 词汇表兼容。
+            source=exec_ctx.message_source.value,
             turn_id=turn_id,
             turn_record_id=turn_record_id,
         )
@@ -859,17 +866,21 @@ Be concise by default. Provide additional detail when the task is complex, the u
     # ------------------------------------------------------------------
 
     async def _execute_graph_stream(
-        self, message: str, thread_id: str,
-        turn_id: str = "", turn_record_id: str = "", ctx_bundle: Any = None,
-        execution_id: str = "", normalizer: "ToolResultNormalizer | None" = None,
-        trace_id: str | None = None,
-        message_source: str | MessageSource = MessageSource.USER,
+        self, message: str, exec_ctx: TurnExecutionContext,
+        ctx_bundle: Any = None,
+        normalizer: "ToolResultNormalizer | None" = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """流式执行图推理，逐渐产出 token / tool_call / tool_result 事件。
 
         最后一个事件固定为 {"type": "__graph_result__", "result": AgentGraphResult}。
         利用 LangGraph astream_events(v2) 实现 token 级真正流式传输。
         """
+        thread_id = exec_ctx.thread_id
+        turn_id = exec_ctx.turn_id
+        turn_record_id = exec_ctx.turn_record_id
+        execution_id = exec_ctx.execution_id
+        trace_id = exec_ctx.trace_id
+        message_source = exec_ctx.message_source
         trace = Trace(trace_id=trace_id) if trace_id else Trace.new()
         thread = self._thread_state.get_or_create_thread(thread_id)
 
@@ -891,7 +902,9 @@ Be concise by default. Provide additional detail when the task is complex, the u
         run_ctx_exec = RunContext(
             thread_id=thread.id,
             trace_id=trace.trace_id,
-            source=(message_source.value if isinstance(message_source, MessageSource) else MessageSource(message_source).value),
+            # 执行者即当前会话回合：复用其 MessageSource.value（user /
+            # system_command / runtime_event），与 RunContext.source 词汇表兼容。
+            source=exec_ctx.message_source.value,
             turn_id=turn_id,
             turn_record_id=turn_record_id,
         )

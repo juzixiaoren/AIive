@@ -118,7 +118,8 @@ def chat_system(request: SystemChatRequest) -> ChatResponse:
     operation_id = hashlib.sha256(
         _json.dumps({"source": "system_command", "thread_id": request.thread_id, "message": request.message}, sort_keys=True).encode()
     ).hexdigest()
-    turn_id = "system_" + operation_id[:32]
+    # 废除 turn_id 前缀命名约定：消息来源改由 TurnRecord.source 结构化承载。
+    turn_id = operation_id[:32]
 
     service = TurnExecutionService(client, message_source="system_command")
     try:

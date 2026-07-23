@@ -33,6 +33,7 @@ from aiive.memory.core_memory_projection import load_core_memory
 from aiive.memory.context_assembly import assemble_system_content
 from aiive.memory.scope_resolver import build_scope_context
 from aiive.runtime.context_budget import ContextBudget
+from aiive.runtime.attention_manager import AttentionManager
 from aiive.runtime.epoch_manager import EpochManager
 from aiive.runtime.thread_state import ThreadState
 from aiive.runtime.token_models import (
@@ -150,7 +151,6 @@ class AssembledContext:
     partition_reports: list[PartitionReport]
     total_token_count: TokenCount
     is_safe: bool
-    pending_seal: bool = False
     working_state_text: str = ""
     snapshot: ContextSnapshotData = field(default_factory=ContextSnapshotData)
     agent_ctx: dict[str, Any] = field(default_factory=dict)
@@ -196,10 +196,11 @@ class ContextAssembler:
         db: Session,
         message: str,
         thread: Thread,
-        _source: str = "user_chat",
+        _source: str = "user",
         requested_output_tokens: int | None = None,
         upper_bound_sequence: int | None = None,
         trace_id: str | None = None,
+        current_turn_id: str = "",
     ) -> AssembledContext:
         """组装有界上下文并通过 hard-gate 验证。
 
@@ -215,6 +216,18 @@ class ContextAssembler:
         system_content = agent_ctx["system_content"]
         recall_msgs_raw = agent_ctx.get("recall_messages") or []
 
+        attention_text = ""
+        try:
+            with db.begin_nested():
+                attention = AttentionManager(db).resolve_for_turn(
+                    thread_id=thread.id,
+                    current_turn_id=current_turn_id,
+                    current_topic=message,
+                )
+                attention_text = AttentionManager.render_for_context(attention)
+        except Exception:
+            logger.warning("注意力状态计算失败，跳过本轮注意力上下文", exc_info=True)
+
         # ── WorkingState ──
         working_state_text = ws_service.render_for_context(
             db, thread.id, self._budget.working_state.hard_limit_tokens,
@@ -222,7 +235,6 @@ class ContextAssembler:
 
         # ── 组装循环 ──
         assembly_started_at_seq = upper_bound_sequence
-        pending_seal_triggered = False
         final_safe = 0
         trim_plan: TrimPlan | None = None
         total_count: TokenCount | None = None
@@ -245,6 +257,8 @@ class ContextAssembler:
             history_msgs = self._dicts_to_chat_messages(history_events)
             messages: list[dict[str, Any]] = []
             messages.append({"role": "system", "content": system_content})
+            if attention_text:
+                messages.append({"role": "system", "content": attention_text})
             if working_state_text:
                 messages.append({"role": "system", "content": working_state_text})
             # ── Phase 3: 稳定摘要上下文（在原始历史之前）──
@@ -265,7 +279,10 @@ class ContextAssembler:
                 content = rm.get("content", "") if isinstance(rm, dict) else str(rm)
                 if content:
                     messages.append({"role": "system", "content": content})
-            messages.append({"role": "user", "content": message})
+            # 当前轮次的消息角色由来源决定：system 类来源（system_command /
+            # runtime_event）以 system 角色注入，让模型明确其为系统消息而非用户输入。
+            current_role = "user" if _source in (None, "user") else "system"
+            messages.append({"role": current_role, "content": message})
 
             # 构建有界工具 schema
             tools_schema = self._build_tools_schema_list(
@@ -284,7 +301,6 @@ class ContextAssembler:
             if soft_exceeded and attempt == 0:
                 # 软阈值触发 → 标记待密封（pending_seal 语义与软阈值一致，而非“发生过裁剪”）
                 epoch_mgr.mark_pending_seal(db, thread.id, assembly_started_at_seq or 0)
-                pending_seal_triggered = True
                 # mark_pending_seal 仅做 db.flush()（未提交）。作为调用方必须在此提交，
                 # 否则该 flush 会随 _load_context 的 db.close() 回滚丢弃，
                 # 导致软阈值密封信号（Segment.pending_seal_at）永远无法落库，
@@ -302,6 +318,7 @@ class ContextAssembler:
                 snapshot = self._build_input_snapshot(
                     stable_contract_text=agent_ctx["stable_contract_text"],
                     core_memory_text=agent_ctx["core_memory_text"],
+                    attention_text=attention_text,
                     working_state_text=working_state_text,
                     epoch_checkpoint_text=epoch_cp_text,
                     segment_summary_text=seg_sum_text,
@@ -323,6 +340,7 @@ class ContextAssembler:
                         trim_plan, total_count,
                         stable_contract_text=agent_ctx["stable_contract_text"],
                         core_memory_text=agent_ctx["core_memory_text"],
+                        attention_text=attention_text,
                         working_state_text=working_state_text,
                         epoch_checkpoint_text=epoch_cp_text,
                         segment_summary_text=seg_sum_text,
@@ -334,7 +352,6 @@ class ContextAssembler:
                     ),
                     total_token_count=total_count,
                     is_safe=True,
-                    pending_seal=pending_seal_triggered,
                     working_state_text=working_state_text,
                     snapshot=snapshot,
                     agent_ctx=agent_ctx,
@@ -349,6 +366,7 @@ class ContextAssembler:
                 trim_plan, total_count,
                 stable_contract_text=agent_ctx["stable_contract_text"],
                 core_memory_text=agent_ctx["core_memory_text"],
+                attention_text=attention_text,
                 working_state_text=working_state_text,
                 epoch_checkpoint_text=epoch_cp_text,
                 segment_summary_text=seg_sum_text,
@@ -779,10 +797,10 @@ class ContextAssembler:
         """构建工具 schema 列表，按预算限制。priority DESC 剪裁。"""
         from aiive.tools.registry import get_tool_registry
         from aiive.tools.langchain_adapter import build_langchain_tools
-        from aiive.context.run_context import RunContext
+        from aiive.context.run_context import RunContext, RUN_CTX_USER_CHAT
 
         registry = get_tool_registry()
-        run_ctx = RunContext(thread_id=thread_id, trace_id="assembler", source="user_chat")
+        run_ctx = RunContext(thread_id=thread_id, trace_id="assembler", source=RUN_CTX_USER_CHAT)
         langchain_tools = build_langchain_tools(registry, run_context=run_ctx)
 
         schemas: list[dict[str, Any]] = []
@@ -853,6 +871,11 @@ class ContextAssembler:
                 content = item.get("content", "")
                 if content:
                     result.append({"role": "user", "content": content})
+            elif etype == "system":
+                _flush_pending()
+                content = item.get("content", "")
+                if content:
+                    result.append({"role": "system", "content": content})
             elif etype == "tool_call":
                 call = normalize_tool_call(item)
                 pending_calls.append({
@@ -886,6 +909,7 @@ class ContextAssembler:
         total: TokenCount,
         stable_contract_text: str = "",
         core_memory_text: str = "",
+        attention_text: str = "",
         working_state_text: str = "",
         epoch_checkpoint_text: str = "",
         segment_summary_text: str = "",
@@ -916,6 +940,7 @@ class ContextAssembler:
         reports = [
             _report("stable_contract", [{"role": "system", "content": stable_contract_text}]),
             _report("core_memory", [{"role": "system", "content": core_memory_text}]),
+            _report("attention", [{"role": "system", "content": attention_text}]),
             _report("working_state", [{"role": "system", "content": working_state_text}]),
             _report("epoch_checkpoint", [{"role": "system", "content": epoch_checkpoint_text}]),
             _report("segment_summaries", [{"role": "system", "content": segment_summary_text}]),
@@ -940,6 +965,7 @@ class ContextAssembler:
         self,
         stable_contract_text: str = "",
         core_memory_text: str = "",
+        attention_text: str = "",
         working_state_text: str = "",
         epoch_checkpoint_text: str = "",
         segment_summary_text: str = "",
@@ -974,6 +1000,7 @@ class ContextAssembler:
         # 系统前缀（稳定契约）→ 核心记忆 → 工作状态 → 稳定摘要 → 历史摘要
         _add("stable_prefix", "stable_prefix", "system", "trusted", stable_contract_text)
         _add("core_memory", "core_memory", "system", "trusted", core_memory_text)
+        _add("attention", "attention", "attention", "untrusted", attention_text)
         _add("working_state", "working_state", "system", "trusted", working_state_text)
         _add("epoch_checkpoint", "epoch_checkpoint", "system", "trusted", epoch_checkpoint_text)
         _add("segment_summary", "segment_summary", "system", "trusted", segment_summary_text)

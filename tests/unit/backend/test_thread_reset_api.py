@@ -183,7 +183,7 @@ class TestSafeDeleteAPIThreadFK:
                 "thread_id": "unpersisted-thread",
             },
         )
-        assert resp.status_code == 200
+        assert resp.status_code == 409
 
         events = (
             db_session.query(Event)

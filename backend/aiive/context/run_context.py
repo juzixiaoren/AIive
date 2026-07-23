@@ -11,6 +11,17 @@ from dataclasses import dataclass, field
 
 from aiive.memory.recall_models import ScopeContext
 
+# RunContext.source 取值（调用执行者标签）。
+# 注意：它与 MessageSource（会话回合消息来源：user / system_command /
+# runtime_event）是不同维度——前者标识「是谁/什么路径触发了这次工具执行」，
+# 后者标识「这一回合的消息从哪来」。二者不可混用，亦不可合并到同一枚举。
+# 当执行者恰好就是某个会话回合时，source 复用该回合的 MessageSource.value。
+RUN_CTX_USER_CHAT = "user_chat"  # 用户聊天入口触发的工具执行
+RUN_CTX_OUTBOX_WORKER = "outbox_worker"  # Outbox 异步作业（记忆抽取/遗忘等）触发
+RUN_CTX_API = "api"  # 记忆维护类 API 直接触发（archive/sleep 等）
+RUN_CTX_TRUSTED_APPROVAL = "trusted_approval"  # 已服务端审批的可信工具执行
+RUN_CTX_MANUAL_MEMORY_API = "manual_memory_api"  # 手动记忆写入 API 触发
+
 
 @dataclass
 class RunContext:
@@ -19,7 +30,10 @@ class RunContext:
     Attributes:
         thread_id: 已 committed 的会话线程 ID
         trace_id: 链路追踪 ID
-        source: 调用来源（"user_chat"、"system_reminder"、"outbox_worker" 等）
+        source: 调用执行者标签（见上方 RUN_CTX_* 常量）。与 MessageSource
+            （会话回合消息来源）不同轴：本字段标识「谁触发了这次工具执行」，
+            仅作审计/诊断用途，不参与任何分支逻辑；为会话回合触发时复用
+            其 MessageSource.value。
         turn_id: 当前轮次业务 turn_id（稳定审计标识，非 DB 主键）
         turn_record_id: 当前 TurnRecord 数据库主键（用于 FK 关联）
         execution_mode: 记忆写入失败语义控制（"user_required" | "system_best_effort"）
@@ -33,7 +47,7 @@ class RunContext:
     """
     thread_id: str
     trace_id: str
-    source: str = "user_chat"
+    source: str = RUN_CTX_USER_CHAT
     turn_id: str = ""  # 当前轮次业务 turn_id
     turn_record_id: str = ""  # TurnRecord 数据库主键
     execution_mode: str = "system_best_effort"  # "user_required" | "system_best_effort"

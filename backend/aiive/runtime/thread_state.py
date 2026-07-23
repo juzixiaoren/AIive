@@ -76,8 +76,6 @@ class ThreadState:
                 .filter(
                     TurnRecord.thread_id == thread_id,
                     TurnRecord.status == "completed",
-                    TurnRecord.turn_id.notilike("system_%"),
-                    TurnRecord.turn_id.notilike("runtime_%"),
                 )
             )
             if last_sequence is not None:
@@ -117,7 +115,7 @@ class ThreadState:
                     stopped_by = "max_events"
                     break
 
-                turn_dicts = self._events_to_dicts(events)
+                turn_dicts = self._events_to_dicts(events, turn.source)
                 turn_bytes = sum(len(_json.dumps(d, ensure_ascii=False, default=str).encode()) for d in turn_dicts)
                 total_bytes += turn_bytes
                 if total_bytes > max_raw_bytes:
@@ -176,6 +174,8 @@ class ThreadState:
             content = d.get("content", "")
             if etype == "user" and content:
                 msgs.append({"role": "user", "content": content})
+            elif etype == "system" and content:
+                msgs.append({"role": "system", "content": content})
             elif etype == "assistant" and content:
                 msgs.append({"role": "assistant", "content": content})
             elif etype == "tool_call":
@@ -216,8 +216,6 @@ class ThreadState:
                 "not_started", "running", "completed", "interrupted_unknown",
                 "failed", "cancelled", "preempted",
             ]),
-            TurnRecord.turn_id.notilike("system_%"),
-            TurnRecord.turn_id.notilike("runtime_%"),
         )
         if before_sequence is not None:
             query = query.filter(TurnRecord.turn_sequence < before_sequence)
@@ -240,7 +238,7 @@ class ThreadState:
                 .order_by(Event.turn_event_index.asc(), Event.created_at.asc(), Event.id.asc())
                 .all()
             )
-            messages.extend(self._events_to_display_messages(events, turn.status))
+            messages.extend(self._events_to_display_messages(events, turn.status, turn.source))
 
         # 到达新 Turn 历史末端时，继续拼接旧版 turn_id=NULL 事件。
         if not has_more:
@@ -267,8 +265,14 @@ class ThreadState:
     def _events_to_display_messages(
         events: list[Event],
         turn_status: str = "completed",
+        turn_source: str | None = None,
     ) -> list[dict[str, Any]]:
-        """把单个 Turn 的真实事件聚合为前端消息，并规范化工具状态。"""
+        """把单个 Turn 的真实事件聚合为前端消息，并规范化工具状态。
+
+        turn_source 为结构化消息来源（TurnRecord.source）；为 None 时
+        回退到事件 payload 的 message_source（兼容旧数据）。
+        system 类来源只展示 agent 回复，隐藏其触发输入。
+        """
         messages: list[dict[str, Any]] = []
         calls: list[dict[str, Any]] = []
         call_by_id: dict[str, dict[str, Any]] = {}
@@ -278,11 +282,13 @@ class ThreadState:
         for event in events:
             payload = event.payload or {}
             if event.event_type == "user_message" and payload.get("content"):
-                messages.append({
-                    "role": "user", "content": payload["content"],
-                    "event_id": event.id, "trace_id": event.trace_id,
-                    "action_cards": [], "pending_operations": [], "tool_calls": [],
-                })
+                message_source = turn_source or payload.get("message_source")
+                if message_source in (None, "user"):
+                    messages.append({
+                        "role": "user", "content": payload["content"],
+                        "event_id": event.id, "trace_id": event.trace_id,
+                        "action_cards": [], "pending_operations": [], "tool_calls": [],
+                    })
             elif event.event_type == "tool_call":
                 last_tool_event = event
                 call = {
@@ -413,7 +419,10 @@ class ThreadState:
         return result
 
     @staticmethod
-    def _events_to_dicts(events: list[Event]) -> list[dict[str, Any]]:
+    def _events_to_dicts(
+        events: list[Event],
+        turn_source: str | None = None,
+    ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         for event in events:
             p = event.payload or {}
@@ -421,7 +430,9 @@ class ThreadState:
             if etype == "user_message":
                 content = p.get("content", "")
                 if content:
-                    messages.append({"type": "user", "content": content, "event_id": event.id, "trace_id": event.trace_id})
+                    source_val = turn_source or p.get("message_source")
+                    msg_type = "user" if source_val in (None, "user") else "system"
+                    messages.append({"type": msg_type, "content": content, "event_id": event.id, "trace_id": event.trace_id})
             elif etype == "tool_call":
                 messages.append({"type": "tool_call", "tool_name": p.get("name", ""), "tool_params": p.get("params", {}), "event_id": event.id, "trace_id": event.trace_id, "tool_call_id": p.get("tool_call_id", ""), "batch_index": p.get("batch_index", 0)})
             elif etype == "tool_result":

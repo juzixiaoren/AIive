@@ -71,7 +71,7 @@ class ThreadBootstrapService:
     def ensure_system_thread() -> str:
         """确保系统线程存在（如不存在则创建并提交）。
 
-        用于启动时初始化，以及 TaskWorker 等系统级事件的 thread 关联。
+        用于启动时初始化，以及系统级事件的 thread 关联。
 
         Returns:
             "system" (系统线程 ID)

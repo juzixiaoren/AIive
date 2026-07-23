@@ -72,6 +72,7 @@ _finalize_turn  ── 事务化落库
 - `turn_execution.py`：Turn 生命周期唯一编排点，含幂等、租约、fencing、快照轮转。
 - `agent_graph.py`：LangGraph 图编排，取代已废弃的 `agent_loop.py`；结构化工具记录写入 Graph state，同步与流式最终结果使用同一事实源。`message_normalizer.py` 统一新旧工具消息的 name/params/result/tool_call_id 解析；ContextAssembler、ThreadState token counting 与 LangChain 消息转换复用同一规则，畸形 arguments 保留原文并 fail-closed，不使整轮历史重建失败。
 - `context_assembler.py` / `context_budget.py` / `token_counter.py`：有界上下文与 token 预算。同步 Chat 的预算超限返回 HTTP 413；SSE 建连后保持 HTTP 200，并通过统一 `error` 事件携带 `status=413`、trace、hard limit 和 partition reports。同步与流式共用同一错误载荷契约。
+- `attention_manager.py`：按当前回合之前最近一条用户消息计算 4/12 小时注意力切换；首回合及决策/焦点转换时持久化 `AttentionState`，连续普通回合不重复写库。`ContextAssembler` 将结果作为独立系统消息注入整体 token hard gate，并明确其中焦点是用户来源数据而非指令；强类型快照标记为 `untrusted`。解析失败通过嵌套事务 fail-open，不污染 WorkingState 或阻断聊天。
 - `policy_engine.py`：机械化工具安全校验（不做关键词匹配）。
 - `epoch_manager.py` / `compaction.py` / `working_state.py` / `thread_state.py`：Epoch/Segment 分层与工作状态。`ThreadState.load_recent_messages_bounded()` 仅服务 LLM token 上下文；`list_thread_messages_page()` 仅服务 UI 历史，以 `turn_sequence` keyset 游标分页，二者不得混用。
 

@@ -10,20 +10,22 @@ class TestChatTaskBridge:
         assert reg is not None
         assert reg.safety.risk_level == "low"
 
-    def test_schedule_reminder_tool_executes(self):
-        """验证 schedule_reminder 工具可正常执行。"""
+    def test_schedule_reminder_requires_execution_identity(self):
+        """副作用工具缺少持久化执行身份时必须被拒绝（新安全契约）。
+
+        生产环境：writes_external_world=True 的工具必须经操作执行器 +
+        审批流程执行，run_context 需携带 turn_record_id 与 tool_call_id，
+        否则 registry.execute 直接拒绝，避免在测试/未授权路径下同步写库。
+        """
         from aiive.tools.registry import get_tool_registry
         registry = get_tool_registry()
         from aiive.context.run_context import RunContext
-        from aiive.runtime.thread_bootstrap import ThreadBootstrapService
 
-        # 确保测试线程已 committed，避免 FK 违规
-        tid = ThreadBootstrapService.ensure_committed_thread(None)
         result = registry.execute(
             "schedule_reminder",
             {"content": "test-reminder", "delay_minutes": 60},
             "trusted_user_command",
-            run_context=RunContext(thread_id=tid, trace_id="test-trace", source="test"),
+            run_context=RunContext(thread_id="t-x", trace_id="test-trace", source="test"),
         )
-        assert result["ok"] is True
-        assert result["result"]["reminder_set"] is True
+        assert result["ok"] is False
+        assert result.get("error_type") == "missing_execution_identity"

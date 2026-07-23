@@ -72,3 +72,32 @@ def test_refresh_deletes_projection_after_lifecycle_change(db_session):
 
     assert service.refresh(record.id, 2) == "inactive_deleted"
     assert db_session.get(MemoryVectorProjection, record.id) is None
+
+
+def test_delete_does_not_remove_newer_projection(db_session):
+    record = _record(db_session)
+    service = MemoryVectorProjectionService(
+        db_session, provider_factory=StubEmbeddingProvider,
+    )
+    assert service.refresh(record.id, 1) == "upserted"
+
+    projection = db_session.get(MemoryVectorProjection, record.id)
+    assert projection is not None
+    projection.record_version = 2
+    db_session.flush()
+
+    assert service.delete(record.id, 1) == "stale_delete_skipped"
+    remaining = db_session.get(MemoryVectorProjection, record.id)
+    assert remaining is not None
+    assert remaining.record_version == 2
+
+
+def test_delete_removes_projection_at_expected_version(db_session):
+    record = _record(db_session)
+    service = MemoryVectorProjectionService(
+        db_session, provider_factory=StubEmbeddingProvider,
+    )
+    assert service.refresh(record.id, 1) == "upserted"
+
+    assert service.delete(record.id, 1) == "deleted"
+    assert db_session.get(MemoryVectorProjection, record.id) is None
