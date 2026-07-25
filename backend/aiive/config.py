@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     # LLM 大模型配置（兼容 OpenAI 接口）
     aiive_llm_api_key: str = ""
     aiive_llm_base_url: str = "https://api.deepseek.com/v1"
-    aiive_llm_model: str = "deepseek-chat"
+    aiive_llm_model: str = "deepseek-v4-flash"
     aiive_llm_timeout_seconds: int = 30
     # 模型上下文窗口（token）：按所用模型的真实能力配置。
     # 上下文预算（ContextBudget）与 token 安全校验（ModelProfile）均以此为基准，

@@ -14,6 +14,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy import cast
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session
 
 from aiive.db.base import SessionLocal
@@ -509,7 +511,7 @@ def _discover_for_target(
             for ev_id in src_event_ids:
                 summaries = (
                     db.query(SegmentSummary)
-                    .filter(SegmentSummary.source_event_ids.contains([ev_id]))
+                    .filter(cast(SegmentSummary.source_event_ids, JSONB).contains([ev_id]))
                     .all()
                 )
                 for summary in summaries:

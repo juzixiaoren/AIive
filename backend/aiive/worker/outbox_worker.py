@@ -66,15 +66,21 @@ class OutboxWorker:
     # claim_one
     # ------------------------------------------------------------------
 
-    def claim_one(self) -> ClaimedJob | None:
-        """原子 claim 一个 pending 或 lease 过期的 Job。"""
+    def claim_one(self, types: frozenset[str] | None = None) -> ClaimedJob | None:
+        """原子 claim 一个 pending 或 lease 过期的 Job。
+
+        types 用于在单实例 Worker 内对作业类型分片（例如 tool_operation
+        单独一条 poll 线程处理，避免被 reminder_delivery 等长阻塞 turn 饿死）。
+        为 None 时退化为全部 enabled_types。
+        """
         db = SessionLocal()
         try:
             now = datetime.now(timezone.utc)
+            allowed = types if types is not None else self._enabled_types
             job = (
                 db.query(OutboxJob)
                 .filter(
-                    OutboxJob.job_type.in_(self._enabled_types),
+                    OutboxJob.job_type.in_(allowed),
                     or_(
                         OutboxJob.status == "pending",
                         OutboxJob.status == "running",
@@ -160,11 +166,20 @@ class OutboxWorker:
     # poll: main loop
     # ------------------------------------------------------------------
 
-    def poll(self, max_jobs: int = MAX_JOBS_PER_POLL) -> int:
-        """单次 poll：claim 并分派最多 max_jobs 个 Job。"""
+    def poll(
+        self,
+        max_jobs: int = MAX_JOBS_PER_POLL,
+        only_types: frozenset[str] | None = None,
+    ) -> int:
+        """单次 poll：claim 并分派最多 max_jobs 个 Job。
+
+        only_types 限定本次 poll 只处理指定 job_type（分片调度用），
+        例如 tool_operation 走独立 poll 线程，避免主 poll 被长阻塞 turn 占用时
+        嵌套副作用工具提交被饿死。
+        """
         processed = 0
         for _ in range(max_jobs):
-            claimed = self.claim_one()
+            claimed = self.claim_one(only_types)
             if claimed is None:
                 break
 

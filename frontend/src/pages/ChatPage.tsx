@@ -379,7 +379,7 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
         try {
           const msg = JSON.parse(event.data);
           if (msg.type === "new_message" && msg.data) {
-            const { event_id, reply, thread_id, trace_id, action_cards } = msg.data;
+            const { event_id, reply, thread_id, trace_id, action_cards, tool_calls } = msg.data;
             if (event_id && reply) {
               setMessages(prev => {
                 const messageId = String(event_id);
@@ -391,6 +391,18 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
                   traceId: String(trace_id || ""),
                   threadId: String(thread_id || threadId),
                   actionCards: Array.isArray(action_cards) ? action_cards : [],
+                  // 后台提醒等推送 turn 携带的工具调用记录（如 remind_alert），映射逻辑与历史加载一致
+                  toolCalls: Array.isArray(tool_calls)
+                    ? tool_calls.map((call: { tool_call_id: string; name: string; params?: Record<string, unknown>; status?: string; result?: unknown }) => ({
+                      id: call.tool_call_id,
+                      name: call.name,
+                      params: call.params || {},
+                      status: normalizeToolCallStatus(call.status),
+                      result: call.result === undefined || call.result === null
+                        ? undefined
+                        : typeof call.result === "string" ? call.result : JSON.stringify(call.result),
+                    }))
+                    : [],
                 };
                 if (atBottomRef.current) setTimeout(scrollToBottom, 100);
                 return [...prev, newMsg];

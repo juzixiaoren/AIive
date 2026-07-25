@@ -21,6 +21,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy import cast
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session
 
 from aiive.db.forget_models import (
@@ -540,9 +542,12 @@ def _delete_core_memory_blocks(
     if not memory_ids:
         return
     for mid in memory_ids:
+        # source_memory_ids 是 JSON 列；PostgreSQL 的 json 类型不支持 @> 包含
+        # 运算，需先 cast 成 jsonb。直接用 .contains() 会退化成 LIKE 报
+        # 「operator does not exist: json ~~ text」。
         blocks = (
             session.query(CoreMemoryBlock)
-            .filter(CoreMemoryBlock.source_memory_ids.contains([mid]))
+            .filter(cast(CoreMemoryBlock.source_memory_ids, JSONB).contains([mid]))
             .all()
         )
         for block in blocks:

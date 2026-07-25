@@ -722,6 +722,12 @@ class MemoryWriteService:
         existing.record_version += 1
         existing.updated_at = datetime.now(timezone.utc)
 
+        # 合并检索关键词：reinforce 走轻量更新，新关键词应并入而非覆盖旧值
+        if proposal.keywords:
+            merged_keywords = set(existing.keywords or [])
+            merged_keywords.update(proposal.keywords)
+            existing.keywords = sorted(merged_keywords)
+
         self._write_evidence_batch(existing.id, proposal.evidence)
         self._persist_proposal(
             proposal, gate_decision,
