@@ -272,6 +272,9 @@ class MemoryRecord(Base):
     last_accessed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # 显式检索关键词（同义词/上位词）。参与词汇召回（lexical / MemorySearch）
+    # 匹配，使「记下霸王茶姬 + 关键词奶茶」能被「想喝奶茶」召回。
+    keywords: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )

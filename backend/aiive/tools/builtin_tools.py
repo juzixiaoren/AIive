@@ -3,7 +3,7 @@
 每个工具映射到一个真实的服务或操作，涵盖提醒、记忆、文件、知识库、MCP、自进化等功能。
 
 工具分类：
-- 基础工具：echo
+- 基础工具：echo, get_current_time
 - 提醒/任务：schedule_reminder, remind_alert, confirm_reminder, snooze_reminder, list_tasks, cancel_task, show_notifications
 - 记忆管理：remember_or_update, forget, run_memory_maintenance
 - 记忆召回（V2 Agent-Initiated，只读，结果作证据返回）：memory_search, memory_timeline, memory_event_log
@@ -106,6 +106,40 @@ def _db_handler(fn: Callable[..., Any]):
 def _handle_echo(message: str = "") -> str:
     """回显工具：原样返回输入消息。"""
     return message
+
+
+# ── 当前时间（只读，供绝对时间点换算 delay_minutes）──
+def _handle_get_current_time() -> dict[str, Any]:
+    """获取当前时间（UTC 与服务器本地时区）。
+
+    用途：用户给的是绝对时间点（如“14点提醒我”），但 schedule_reminder 只接受
+    delay_minutes（相对分钟数）。Agent 先调用本工具拿到“现在几点”，再自行换算出
+    到目标时间还有多少分钟，传给 schedule_reminder，避免乱填 delay。
+
+    返回:
+        utc:            当前 UTC 时间（ISO 8601，含 +00:00）
+        local:          当前服务器本地时间（ISO 8601，含时区偏移）
+        timezone_name:  本地时区名（未知时用 UTC±HH:MM 表示）
+        offset_seconds: 本地相对 UTC 的偏移秒数（东八区为 28800）
+        unix_timestamp: 当前 Unix 时间戳（秒）
+    """
+    now_utc = datetime.now(timezone.utc)
+    now_local = datetime.now(timezone.utc).astimezone()
+    offset = now_local.utcoffset()
+    offset_seconds = int(offset.total_seconds()) if offset is not None else 0
+    if now_local.tzname():
+        tz_name = now_local.tzname()
+    else:
+        sign = "+" if offset_seconds >= 0 else "-"
+        abs_off = abs(offset_seconds)
+        tz_name = f"UTC{sign}{abs_off // 3600:02d}:{(abs_off % 3600) // 60:02d}"
+    return {
+        "utc": now_utc.isoformat(),
+        "local": now_local.isoformat(),
+        "timezone_name": tz_name,
+        "offset_seconds": offset_seconds,
+        "unix_timestamp": int(now_utc.timestamp()),
+    }
 
 
 # ── Reminder / Task（提醒与任务）──
@@ -445,7 +479,7 @@ def _handle_show_notifications(db: Session):
 
 # ── Memory（记忆管理）──
 @_db_handler
-def _handle_remember_or_update(db: Session, ctx: RunContext | None, content: str, memory_type: str = "fact", memory_key: str = ""):
+def _handle_remember_or_update(db: Session, ctx: RunContext | None, content: str, memory_type: str = "fact", memory_key: str = "", keywords: list[str] | None = None):
     """创建或更新记忆，通过 MemoryWriteService 统一写入（查重下沉到服务层）。
 
     execution_mode = "user_required"：写入失败时本工具返回 error，Turn 不得声称成功。
@@ -483,6 +517,7 @@ def _handle_remember_or_update(db: Session, ctx: RunContext | None, content: str
         extractor_name="remember_or_update_tool",
         extractor_version="1.0",
         thread_id=ctx.thread_id,
+        keywords=keywords,
     )
 
     if result.error or result.proposal is None:
@@ -509,6 +544,7 @@ def _handle_remember_or_update(db: Session, ctx: RunContext | None, content: str
         "content": content,
         "memory_type": result.proposal.memory_type,
         "canonical_key": result.proposal.canonical_key,
+        "keywords": result.proposal.keywords,
         "state": write_result.state,
         "operation": write_result.operation,
     }
@@ -1183,9 +1219,16 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
     tools = [
         # 基础工具
         ("echo", _handle_echo, "回显输入消息", {"message": "str"}, "low", False, False),
+        ("get_current_time", _handle_get_current_time,
+         "获取当前时间（UTC 与本地时区）。用户给的是绝对时间点（如“14点提醒我”）时，"
+         "Agent 先调用本工具拿到现在几点，再换算成 schedule_reminder 所需的 delay_minutes，避免乱填。",
+         {}, "low", False, False),
         # 提醒 / 任务
-        ("schedule_reminder", _handle_schedule_reminder, "创建定时提醒并写入 Task 表，由后台可靠投递",
-         {"content": "str", "delay_minutes": {"type": "int", "description": "默认 1"}}, "low", True, False),
+        ("schedule_reminder", _handle_schedule_reminder,
+         "创建定时提醒并写入 Task 表，由后台可靠投递。注意：本工具只接受相对延迟 delay_minutes。"
+         "若用户给的是绝对时间点（如“14点提醒我”“下午3点做某事”），必须先调用 get_current_time 获取当前时间，"
+         "由你自行换算出到目标时间还剩多少分钟，再传入 delay_minutes，切勿凭空乱填。",
+         {"content": "str", "delay_minutes": {"type": "int", "description": "相对当前时间的延迟分钟数；用户给绝对时间时需先用 get_current_time 换算，默认 1"}}, "low", True, False),
         ("remind_alert", _handle_remind_alert, "激活到期提醒警报，前端显示确认/延期操作按钮",
          {"reminder_id": "str"}, "low", True, False),
         ("confirm_reminder", _handle_confirm_reminder, "确认提醒已完成",
@@ -1206,6 +1249,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
              "content": {"type": "str", "description": "记忆内容文本；身份键只填纯值"},
              "memory_type": {"type": "str", "description": "user_profile / agent_self / project / policy / procedural / episodic / knowledge / environment"},
              "memory_key": {"type": "str", "description": "稳定键，推荐格式: user.preference.<topic> / agent.persona.<trait> / project.<name>.<topic>"},
+             "keywords": {"type": "list", "description": "可选检索关键词（同义词/上位词）。用于词汇召回命中；例如记「喜欢霸王茶姬」附 ['奶茶','茶饮']，查询「想喝奶茶」即可召回。不写入 content 文本"},
          }, "low", True, False),
         # Phase 6A: 统一 forget 工具
         ("forget", handle_forget,

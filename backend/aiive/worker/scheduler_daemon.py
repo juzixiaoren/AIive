@@ -22,7 +22,11 @@ from aiive.db.models import (
     Thread,
     TurnRecord,
 )
-from aiive.memory.recall_config import MaintenanceConfig, RecallConfig
+from aiive.memory.recall_config import (
+    ENABLED_OUTBOX_JOB_TYPES,
+    MaintenanceConfig,
+    RecallConfig,
+)
 from aiive.runtime.epoch_manager import EpochManager
 from aiive.runtime.task_manager import TaskManager
 from aiive.worker.task_worker import enqueue_due_tasks
@@ -37,6 +41,11 @@ _MAX_POLL_INTERVAL = 60
 _outbox_worker = None  # 由 main.py lifespan 注册，避免循环依赖
 _OUTBOX_POLL_INTERVAL = 5       # 秒：poll 之间的间隔
 _OUTBOX_INITIAL_DELAY = 3       # 秒：启动后首次 poll 延迟
+
+# 嵌套副作用工具（tool_operation）专用 poll：与主 poll 分片，避免 Worker 自我饿死
+_TOOL_OP_TYPES = frozenset({"tool_operation"})
+_MAIN_POLL_TYPES = ENABLED_OUTBOX_JOB_TYPES - _TOOL_OP_TYPES
+_TOOL_OP_POLL_INTERVAL = 2      # 秒：tool_operation 专用 poll 间隔（快于主 poll）
 
 # Phase 3: Idle Scanner + Enqueue Reconciler
 _IDLE_SCAN_INTERVAL = 30        # 秒：idle 扫描周期
@@ -133,7 +142,7 @@ def set_outbox_worker(worker: Any) -> None:
 def schedule_outbox_poll() -> None:
     """将 outbox poll 加入 APScheduler（首次延迟 _OUTBOX_INITIAL_DELAY 秒）。
 
-    幂等：若已存在同名 job 则替换。
+    幂等：若已存在同名 job 则替换。同时注册 tool_operation 专用 poll。
     """
     if _outbox_worker is None:
         logger.warning("OutboxWorker 未注册，跳过 outbox poll 调度")
@@ -144,14 +153,25 @@ def schedule_outbox_poll() -> None:
         id="outbox_poll",
         replace_existing=True,
     )
+    # 嵌套副作用 tool_operation 专用 poll：独立于主 poll，避免主 poll 被
+    # reminder_delivery 等长阻塞 turn 占用时嵌套副作用提交被饿死。
+    scheduler.add_job(
+        _poll_tool_operations,
+        DateTrigger(run_date=datetime.now(timezone.utc) + timedelta(seconds=1)),
+        id="tool_operation_poll",
+        replace_existing=True,
+    )
 
 
 def _poll_outbox() -> None:
-    """单次 outbox poll：claim 并分派待处理作业，随后自调度下一次。"""
+    """单次 outbox poll：claim 并分派待处理作业，随后自调度下一次。
+
+    仅处理 _MAIN_POLL_TYPES（不含 tool_operation），tool_operation 由专用 poll 处理。
+    """
     if _outbox_worker is None:
         return
     try:
-        _outbox_worker.poll()
+        _outbox_worker.poll(only_types=_MAIN_POLL_TYPES)
     except Exception:
         logger.exception("Outbox poll 异常")
     finally:
@@ -159,6 +179,29 @@ def _poll_outbox() -> None:
             _poll_outbox,
             DateTrigger(run_date=datetime.now(timezone.utc) + timedelta(seconds=_OUTBOX_POLL_INTERVAL)),
             id="outbox_poll",
+            replace_existing=True,
+        )
+
+
+def _poll_tool_operations() -> None:
+    """专用 poll：仅处理 tool_operation（嵌套副作用工具提交）。
+
+    单独一条 APScheduler 线程运行，与主 outbox poll 解耦。主 poll 被
+    reminder_delivery 等长阻塞 turn 占用时，本 poll 仍可及时领取并提交
+    remind_alert 等副作用工具的 tool_operation，避免 Worker 自我饿死导致
+    status=execution_unknown（进而 WS 不刷新、提醒卡片不显示）。
+    """
+    if _outbox_worker is None:
+        return
+    try:
+        _outbox_worker.poll(only_types=_TOOL_OP_TYPES)
+    except Exception:
+        logger.exception("Tool operation poll 异常")
+    finally:
+        scheduler.add_job(
+            _poll_tool_operations,
+            DateTrigger(run_date=datetime.now(timezone.utc) + timedelta(seconds=_TOOL_OP_POLL_INTERVAL)),
+            id="tool_operation_poll",
             replace_existing=True,
         )
 

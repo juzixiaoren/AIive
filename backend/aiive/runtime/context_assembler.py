@@ -188,7 +188,7 @@ class ContextAssembler:
     ):
         self._token_counter: TokenCounter = token_counter
         self._budget: ContextBudget = budget if budget is not None else ContextBudget.from_env()
-        self._profile: ModelProfile = profile or ModelProfile.from_config("deepseek", "deepseek-chat")
+        self._profile: ModelProfile = profile or ModelProfile.from_config("deepseek", "deepseek-v4-flash")
         self._normalizer: ToolResultNormalizer | None = normalizer
 
     def assemble(
@@ -328,6 +328,7 @@ class ContextAssembler:
                     history_msgs=history_msgs,
                     tools_schema=tools_schema,
                     user_message=message,
+                    _source=_source,
                 )
                 snapshot.stable_prefix_hash = _hash_text(system_content)
                 snapshot.injected_memory_ids = self._collect_injected_memory_ids(
@@ -975,6 +976,7 @@ class ContextAssembler:
         history_msgs: list[dict[str, Any]] | None = None,
         tools_schema: list[dict[str, Any]] | None = None,
         user_message: str = "",
+        _source: str = "user",
     ) -> ContextSnapshotData:
         """构建送入 LLM 的输入分区强类型快照。"""
         items: list[ContextSnapshotItem] = []
@@ -1043,7 +1045,8 @@ class ContextAssembler:
             items.append(item)
             full["tool_schemas"] = tools_text
 
-        # 当前用户消息
-        _add("user_message", "user_message", "user", "trusted", user_message)
+        # 当前用户消息：来源使用真实 _source（runtime_event / system_command 等），
+        # 不再写死为 "user"，使上下文检视器能正确标注来源而非误显示为用户输入。
+        _add("user_message", "user_message", _source, "trusted", user_message)
 
         return ContextSnapshotData(items=items, full_contents=full)

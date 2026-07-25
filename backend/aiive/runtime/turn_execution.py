@@ -483,6 +483,9 @@ class TurnExecutionService:
                     request_fingerprint=fingerprint,
                     epoch_id=epoch.id if epoch else None,
                     segment_id=segment.id if segment else None,
+                    # 显式记录消息来源，避免取默认 'user' 后与 user_message 事件的
+                    # message_source 不一致（runtime_event 提醒被误判为普通用户消息）。
+                    source=self._message_source.value,
                 )
                 event_id = str(_uuid.uuid4())
                 event = Event(

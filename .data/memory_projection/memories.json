@@ -1,17 +1,17 @@
 {
   "schema_version": 1,
-  "snapshot_id": "980dc0bb32af401d88da4f4a562c6f14",
-  "generated_at": "2026-07-22T10:40:17.047129+00:00",
-  "record_count": 4,
-  "markdown_sha256": "376b92ddb19c7a9debbe806cccb0e60ca7e06524280501cf4dfae0d972d973be",
+  "snapshot_id": "71e2f538637748aeabd316d1198b3d14",
+  "generated_at": "2026-07-25T08:28:33.699636+00:00",
+  "record_count": 5,
+  "markdown_sha256": "611065d050d76c78d5c644ae39c28599587af429a500fb2194137d3af395765f",
   "records": [
     {
-      "id": "ef56efd3-717f-4b67-9d4c-b7f5299d56d3",
+      "id": "ba190e0e-211b-4750-8831-1e2b21cd866c",
       "memory_type": "user_profile",
-      "canonical_key": "user.preference.coffee",
+      "canonical_key": "user.preference.drink",
       "scope_type": "global",
       "scope_id": null,
-      "content": "肯德基气泡美式，博士觉得好喝又实惠",
+      "content": "花田乌龙",
       "sensitivity": "normal",
       "confidence": 0.95,
       "importance": 0.8,
@@ -20,12 +20,26 @@
       "record_version": 1
     },
     {
-      "id": "3ec4d24c-885b-4c6c-b004-61e865138444",
+      "id": "22d3b41b-0b56-4d44-a5f4-e42c714ee34b",
+      "memory_type": "user_profile",
+      "canonical_key": "user.preference.beverage",
+      "scope_type": "global",
+      "scope_id": null,
+      "content": "博士喜欢喝霸王茶姬的伯牙绝弦",
+      "sensitivity": "normal",
+      "confidence": 0.95,
+      "importance": 0.8,
+      "lifecycle_state": "active",
+      "validity_state": "valid",
+      "record_version": 1
+    },
+    {
+      "id": "f7bc9202-921f-42d4-ad28-7ba025f5524f",
       "memory_type": "agent_self",
       "canonical_key": "agent.persona.tone",
       "scope_type": "global",
       "scope_id": null,
-      "content": "明日方舟斯卡蒂风格：话少、冷静、利落、带着一丝深海猎人的孤独感和压迫感，偶尔流露出对博士的关切",
+      "content": "热情一些，温暖亲切，像朋友一样自然",
       "sensitivity": "normal",
       "confidence": 0.95,
       "importance": 0.8,
@@ -34,7 +48,7 @@
       "record_version": 1
     },
     {
-      "id": "16e76936-57b4-4ebe-a826-18af1780a228",
+      "id": "44b7c8ba-e400-43d9-b569-1e50ece7a14e",
       "memory_type": "user_profile",
       "canonical_key": "user.display_name",
       "scope_type": "global",
@@ -48,7 +62,7 @@
       "record_version": 1
     },
     {
-      "id": "c8aabea5-dccd-46da-b321-8ee71ba9197f",
+      "id": "679f8054-caa4-4c24-98e3-d00feb57ae5d",
       "memory_type": "agent_self",
       "canonical_key": "agent.display_name",
       "scope_type": "global",

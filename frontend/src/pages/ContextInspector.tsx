@@ -75,6 +75,9 @@ const SOURCE_LABEL: Record<string, string> = {
   system: "系统",
   thread: "对话",
   memory_store: "记忆库",
+  user: "用户",
+  runtime_event: "运行时事件",
+  system_command: "系统指令",
 };
 
 /**

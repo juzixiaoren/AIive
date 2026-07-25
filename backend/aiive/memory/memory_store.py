@@ -78,6 +78,7 @@ class MemoryStore:
             scope_id=proposal.scope_id,
             content=proposal.content,
             structured_value=proposal.structured_value,
+            keywords=proposal.keywords or None,
             lifecycle_state=lifecycle_state,
             validity_state=validity_state,
             trust_level=proposal.trust_level,

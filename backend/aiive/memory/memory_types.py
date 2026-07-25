@@ -289,6 +289,10 @@ class MemoryProposal(BaseModel):
     content: str = ""
     structured_value: dict[str, object] | None = None
 
+    # --- 检索关键词（同义词/上位词）---
+    # agent 显式附加，用于词汇召回命中同义/上位查询。不进入 content 文本。
+    keywords: list[str] = Field(default_factory=list)
+
     # --- evidence ---
     evidence: list[EvidenceItem] = Field(default_factory=list)
     trust_level: str = TrustLevel.SEMI_TRUSTED.value

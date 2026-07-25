@@ -54,7 +54,7 @@ class LiteLLMTokenCounter:
 
     def __init__(self, safety: TokenSafetyConfig | None = None, profile: ModelProfile | None = None):
         self._safety: TokenSafetyConfig = safety or TokenSafetyConfig()
-        self._profile: ModelProfile = profile or ModelProfile.from_config("deepseek", "deepseek-chat")
+        self._profile: ModelProfile = profile or ModelProfile.from_config("deepseek", "deepseek-v4-flash")
         self._fallback: _ConservativeFallbackEstimator = _ConservativeFallbackEstimator(self._safety, self._profile)
         # 内容 hash → TokenCount 的有界缓存。counter 通常以单例跨请求共享，
         # 故缓存需线程安全（并发 turn 可能同时调用）。
@@ -120,7 +120,7 @@ class LiteLLMTokenCounter:
     # ── 单段文本 token 计数（Phase 5 统一检索 token budget 打包）──
 
     @staticmethod
-    def count_text(text: str, model: str = "deepseek/deepseek-chat") -> int:
+    def count_text(text: str, model: str = "deepseek/deepseek-v4-flash") -> int:
         """对单段文本做真实 token 计数（返回 safe_tokens）。
 
         内部走 LiteLLM 真实计数 + fallback 保守估算；

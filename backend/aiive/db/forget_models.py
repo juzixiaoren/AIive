@@ -261,7 +261,7 @@ class ForgetBatch(Base):
     forget_operation_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("forget_operations.id"), nullable=False,
     )
-    stage: Mapped[str] = mapped_column(String(16), nullable=False)
+    stage: Mapped[str] = mapped_column(String(32), nullable=False)
     dependency_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     batch_no: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     cursor_lane: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -376,7 +376,7 @@ class ForgetStageRun(Base):
     forget_operation_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("forget_operations.id"), nullable=False,
     )
-    stage: Mapped[str] = mapped_column(String(16), nullable=False)
+    stage: Mapped[str] = mapped_column(String(32), nullable=False)
     outbox_job_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("outbox_jobs.id"), nullable=False, unique=True,
     )

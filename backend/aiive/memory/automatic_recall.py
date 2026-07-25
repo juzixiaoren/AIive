@@ -43,7 +43,7 @@ def tokenize_cjk_aware(text: str, min_len: int = 2) -> list[str]:
                 tokens.append(cjk[i:i + min_len])
     return tokens
 
-from sqlalchemy import or_
+from sqlalchemy import cast, or_, Text
 from sqlalchemy.orm import Session
 
 from aiive.db.models import MemoryRecord
@@ -324,12 +324,16 @@ class AutomaticRecallEngine:
         else:
             q = q.filter(MemoryRecord.scope_id.is_(None))
         # Match any individual token (or the full query) as a substring, so
-        # token-based relevance scoring has candidates to score.
+        # token-based relevance scoring has candidates to score. keywords(JSON)
+        # 是显式检索词，cast 成 Text 后做 ILIKE 子串匹配，使「奶茶」能命中带
+        # ['奶茶','霸王茶姬'] 关键词的记忆。
         text_conds = [or_(MemoryRecord.content.ilike(f"%{t}%"),
-                           MemoryRecord.canonical_key.ilike(f"%{t}%"))
+                           MemoryRecord.canonical_key.ilike(f"%{t}%"),
+                           cast(MemoryRecord.keywords, Text).ilike(f"%{t}%"))
                       for t in tokens]
         text_conds.append(or_(MemoryRecord.content.ilike(f"%{qlow}%"),
-                               MemoryRecord.canonical_key.ilike(f"%{qlow}%")))
+                               MemoryRecord.canonical_key.ilike(f"%{qlow}%"),
+                               cast(MemoryRecord.keywords, Text).ilike(f"%{qlow}%")))
         q = q.filter(or_(*text_conds))
         return q.order_by(MemoryRecord.importance.desc()).limit(
             self._config.automatic_recall_top_k * 2
@@ -339,7 +343,15 @@ class AutomaticRecallEngine:
     def _text_relevance(r: MemoryRecord, tokens: list[str], _qlow: str) -> float:
         content_low = (r.content or "").lower()
         key_low = (r.canonical_key or "").lower()
-        matched = sum(1 for t in tokens if t in content_low or t in key_low)
+        kw_lows = [k.lower() for k in (r.keywords or [])]
+        matched = 0
+        for t in tokens:
+            if t in content_low or t in key_low:
+                matched += 1
+                continue
+            # 关键词双向命中：token 包含关键词、或关键词包含 token（同义/上位）
+            if any(t in kw or kw in t for kw in kw_lows):
+                matched += 1
         if matched == 0:
             return 0.0
         frac = matched / len(tokens)

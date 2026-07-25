@@ -391,8 +391,11 @@ def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
         f"reminder_id: {reminder_id}\n"
         f"title: {title}\n"
         f"content: {content}\n"
-        "这是已到期的真实提醒。你必须先调用 remind_alert，"
-        f"并且 reminder_id 必须严格使用 {reminder_id}；工具成功后再向用户回复提醒内容。"
+        "这是一条到期提醒，需要你主动转达给用户，用户此刻并不知道提醒已到期。\n"
+        "请按以下步骤处理：\n"
+        f"1. 先调用 remind_alert 激活提醒，reminder_id 必须严格使用 {reminder_id}；\n"
+        "2. 工具成功后，用你自己的语气主动把这条提醒的内容告知用户（例如提醒他现在该去做这件事），"
+        "不要表现得像提醒是系统自动弹出的，而是由你主动转达。"
     )
     try:
         from aiive.core.llm_client import default_llm_client
@@ -525,6 +528,8 @@ def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
                 "thread_id": result.get("thread_id", thread_id),
                 "trace_id": result.get("trace_id", ""),
                 "action_cards": result.get("action_cards", []),
+                # 后台提醒 turn 同样带上工具调用记录，使前端能显示 remind_alert 等工具调用框
+                "tool_calls": result.get("tool_calls", []),
             },
         )
     except Exception:
