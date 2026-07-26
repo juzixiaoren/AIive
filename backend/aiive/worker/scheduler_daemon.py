@@ -228,13 +228,12 @@ def _idle_scanner_job() -> None:
     """
     cfg = RecallConfig()
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=cfg.idle_threshold_seconds)
+    db = SessionLocal()
     try:
-        db = SessionLocal()
         thread_ids = db.execute(
             select(Thread.id).where(Thread.last_activity_at <= cutoff)
         ).scalars().all()
         if not thread_ids:
-            db.close()
             return
         candidates = (
             db.query(Segment)
@@ -243,12 +242,13 @@ def _idle_scanner_job() -> None:
             .limit(_MAX_SCAN_BATCH)
             .all()
         )
-        # 物化候选 id 列表后关闭读会话
+        # 物化候选 id 列表后关闭读会话（finally 统一 close，异常路径不泄漏连接）
         cand = [(s.thread_id, s.id, s.pending_seal_at) for s in candidates]
-        db.close()
     except Exception:
         logger.exception("idle_scanner 查询异常")
         return
+    finally:
+        db.close()
 
     mgr = EpochManager()
     for thread_id, seg_id, pending_seal_at in cand:
@@ -591,13 +591,12 @@ def _maintenance_scanner_job() -> None:
     - 无 dirty memory 不创建空 Run/Job（测试 #3）。
     """
     cfg = MaintenanceConfig()
+    db = SessionLocal()
     try:
-        db = SessionLocal()
         now = datetime.now(timezone.utc)
 
         has_dirty = _has_dirty_memory(db, cfg, now)
         if not has_dirty:
-            db.close()
             return
 
         last_ok = _last_successful_maintenance_at(db)
@@ -618,7 +617,6 @@ def _maintenance_scanner_job() -> None:
         if daily_due and pending == 0:
             enqueue_maintenance_job(db, window_bucket=now.strftime("%Y-%m-%d"), now=now)
             db.commit()
-            db.close()
             return
 
         # Idle 条件：存在空闲线程 + idle window 未执行过
@@ -635,9 +633,11 @@ def _maintenance_scanner_job() -> None:
             if exists == 0:
                 enqueue_maintenance_job(db, window_bucket=idle_bucket, now=now)
                 db.commit()
-        db.close()
     except Exception:
         logger.exception("maintenance_scanner 异常")
+    finally:
+        # 统一在 finally 关闭会话，异常路径不再泄漏连接
+        db.close()
 
 
 def stop_daemon() -> None:

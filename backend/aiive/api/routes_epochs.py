@@ -19,7 +19,12 @@ from aiive.db.models import Epoch, Segment
 from aiive.runtime.epoch_manager import EpochManager
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/epochs")
+# 守卫提升到 router 级：GET 状态查询与 POST seal-segment / rollover
+# 三个端点统一要求 local developer（此前只有 GET 带守卫，写端点反而裸露）。
+router = APIRouter(
+    prefix="/api/epochs",
+    dependencies=[Depends(require_local_developer)],
+)
 
 
 class EpochStatus(BaseModel):
@@ -69,7 +74,7 @@ def _current_status(db: Session, thread_id: str) -> EpochStatus:
     )
 
 
-@router.get("/{thread_id}", dependencies=[Depends(require_local_developer)])
+@router.get("/{thread_id}")
 def get_epoch_status(thread_id: str, db: Session = Depends(get_db)) -> EpochStatus:
     """查询 Thread 当前 Epoch 与 Segment 状态。"""
     return _current_status(db, thread_id)

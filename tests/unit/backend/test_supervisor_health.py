@@ -40,6 +40,54 @@ class TestHealthProbe:
         checks_by_name = {c["name"]: c["ok"] for c in result.checks}
         assert checks_by_name["manifest_exists"] is False
 
+    def test_missing_app_dir_unhealthy(self, tmp_path):
+        """缺少 app 目录的槽位应为不健康（该检查必须影响结论）。"""
+        slot_dir = tmp_path / "A"
+        slot_dir.mkdir()
+        (slot_dir / "version_manifest.json").write_text(
+            json.dumps(create_version_manifest("A"))
+        )
+
+        probe = HealthProbe()
+        result = probe.check("A", str(slot_dir))
+        checks_by_name = {c["name"]: c["ok"] for c in result.checks}
+        assert checks_by_name["app_dir_exists"] is False
+        assert result.healthy is False
+
+    def test_placeholder_slot_skips_backend_import(self, tmp_path):
+        """无后端代码副本的占位槽位应跳过导入检查并保持健康。"""
+        slot_dir = tmp_path / "A"
+        slot_dir.mkdir()
+        (slot_dir / "app").mkdir()
+        (slot_dir / "version_manifest.json").write_text(
+            json.dumps(create_version_manifest("A"))
+        )
+
+        probe = HealthProbe()
+        result = probe.check("A", str(slot_dir))
+        backend_check = next(c for c in result.checks if c["name"] == "backend_import")
+        assert backend_check.get("skipped") is True
+        assert result.healthy is True
+
+    def test_broken_backend_payload_unhealthy(self, tmp_path):
+        """槽位内存在 backend/aiive 但无法导入时，应判定为不健康。"""
+        slot_dir = tmp_path / "A"
+        (slot_dir / "app" / "backend" / "aiive").mkdir(parents=True)
+        # 制造一个导入即失败的槽位副本
+        (slot_dir / "app" / "backend" / "aiive" / "__init__.py").write_text("")
+        (slot_dir / "app" / "backend" / "aiive" / "main.py").write_text(
+            "raise RuntimeError('broken slot payload')"
+        )
+        (slot_dir / "version_manifest.json").write_text(
+            json.dumps(create_version_manifest("A"))
+        )
+
+        probe = HealthProbe()
+        result = probe.check("A", str(slot_dir))
+        backend_check = next(c for c in result.checks if c["name"] == "backend_import")
+        assert backend_check["ok"] is False
+        assert result.healthy is False
+
     def test_returns_health_result(self, tmp_path):
         """健康检查应返回包含 healthy 属性和 slot 名称的结果。"""
         slot_dir = tmp_path / "A"

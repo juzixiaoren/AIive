@@ -134,11 +134,14 @@ class ProposalNormalizer:
             for seid in source_event_ids:
                 # 用户消息事件保留 trusted 的 user_message；assistant 回复事件
                 # 标记为 llm_reply（外部/不可信来源），使 provenance 语义精确。
-                source_type = "llm_reply" if seid in assistant_set else "user_message"
+                # llm_reply 证据 relation=derived_from：仅作 provenance，
+                # 不参与 Gate 的写入权威判定。
+                is_assistant = seid in assistant_set
                 evidence_items.append(EvidenceItem(
                     source_event_id=seid,
-                    source_type=source_type,
+                    source_type="llm_reply" if is_assistant else "user_message",
                     trust_level=trust_level,
+                    relation="derived_from" if is_assistant else "supports",
                 ))
 
         # 6. Build proposal

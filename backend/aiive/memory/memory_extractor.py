@@ -224,11 +224,14 @@ class UnifiedMemoryExtractor:
                 span_attached = False
                 for seid in source_event_ids:
                     is_assistant = seid in assistant_set
+                    # assistant 回复事件仅作 provenance（relation=derived_from），
+                    # 不参与写入权威判定 —— 否则 llm_derivation 不在任何类型的
+                    # AUTHORITY_RULES 中，带 assistant 证据的提案会被 Gate 全拒。
                     item: dict[str, Any] = {
                         "source_event_id": seid,
                         "source_type": "llm_reply" if is_assistant else "user_message",
                         "trust_level": TrustLevel.TRUSTED.value,
-                        "relation": "supports",
+                        "relation": "derived_from" if is_assistant else "supports",
                     }
                     if em.source_span and not is_assistant and not span_attached:
                         item["content_span"] = em.source_span

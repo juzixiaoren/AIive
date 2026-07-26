@@ -66,6 +66,20 @@ def _raise_chat_result_error(result: dict[str, object]) -> None:
     raise HTTPException(status_code=int(payload["status"]), detail=payload)
 
 
+def _raise_turn_conflict_error(error: TurnConflictError) -> None:
+    """将 TurnConflictError 转换为与 SSE error payload 相同的结构化 detail。"""
+    message = str(error)
+    status = 202 if message == "turn_in_progress" else 409
+    raise HTTPException(status_code=status, detail={
+        "code": message,
+        "message": message,
+        "retryable": True,
+        "trace_id": None,
+        "retry_after_seconds": None,
+        "status": status,
+    })
+
+
 class ChatRequest(BaseModel):
     """聊天请求体；消息来源只能由服务端路由确定。"""
 
@@ -101,10 +115,7 @@ def chat(request: ChatRequest) -> ChatResponse:
     except LLMClientError as error:
         _raise_llm_http_error(error)
     except TurnConflictError as e:
-        err_msg = str(e)
-        if err_msg == "turn_in_progress":
-            raise HTTPException(status_code=202, detail="turn_in_progress")
-        raise HTTPException(status_code=409, detail=err_msg)
+        _raise_turn_conflict_error(e)
     if result.get("error"):
         _raise_chat_result_error(result)
     return ChatResponse.model_validate(result)
@@ -131,10 +142,7 @@ def chat_system(request: SystemChatRequest) -> ChatResponse:
     except LLMClientError as error:
         _raise_llm_http_error(error)
     except TurnConflictError as e:
-        err_msg = str(e)
-        if err_msg == "turn_in_progress":
-            raise HTTPException(status_code=202, detail="turn_in_progress")
-        raise HTTPException(status_code=409, detail=err_msg)
+        _raise_turn_conflict_error(e)
     if result.get("error"):
         _raise_chat_result_error(result)
     return ChatResponse.model_validate(result)
@@ -178,6 +186,8 @@ async def chat_stream(request: ChatRequest):
                 "tool_calls": result.get("tool_calls", []),
                 "tool_results": result.get("tool_results", []),
                 "parse_errors": result.get("parse_errors", []),
+                # 透传降级标记（如 empty_llm_response），避免前端误判为正常回复
+                "error": result.get("error"),
             })
             yield f"event: done\ndata: {response.model_dump_json(exclude_none=True)}\n\n"
         except TurnConflictError as error:

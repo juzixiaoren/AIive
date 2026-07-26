@@ -464,27 +464,41 @@ def test_forget_operation_requested_by_accepted_without_runcontext(db_session: S
 
 
 def test_blocked_target_ids_all_user_data_global(db_session: Session):
-    """#2/#3: all_user_data Shield 经 blocked_target_ids 全局 fail-closed 屏蔽。"""
+    """#2/#3: all_user_data Shield 经 blocked_target_ids 全局 fail-closed 屏蔽。
+
+    cutoff 语义：仅屏蔽 cutoff 之前创建的数据；遗忘之后的新数据不受屏蔽；
+    创建时间未知则 fail-closed 屏蔽。
+    """
+    from datetime import timedelta
     from aiive.forget.visibility_service import ForgetVisibilityService
 
+    now = _utcnow()
+    before = now - timedelta(minutes=1)
+    after = now + timedelta(minutes=1)
     op = ForgetOperation(
         id=_new_id(), operation_key="forget:global", mode="everywhere",
         selector_type="all_user_data", selector_hash="h", status="shielded",
-        requested_by="api", target_count=0, shielded_at=_utcnow(),
+        requested_by="api", target_count=0, shielded_at=now,
     )
     db_session.add(op)
     db_session.add(ForgetShield(
         id=_new_id(), forget_operation_id=op.id, selector_type="all_user_data",
-        all_user_data=True, cutoff_created_at=_utcnow(), status="active",
+        all_user_data=True, cutoff_created_at=now, status="active",
         normalized_shield_key="k",
     ))
     db_session.commit()
 
+    id_old, id_old2, id_new, id_unknown = _new_id(), _new_id(), _new_id(), _new_id()
     blocked = ForgetVisibilityService.blocked_target_ids(
         db_session, "memory_record",
-        [(_new_id(), _utcnow()), (_new_id(), _utcnow())],
+        [(id_old, before), (id_old2, before), (id_new, after), (id_unknown, None)],
     )
-    assert len(blocked) == 2  # 全部屏蔽
+    # cutoff 之前创建的数据 + 创建时间未知（fail-closed）→ 屏蔽
+    assert id_old in blocked
+    assert id_old2 in blocked
+    assert id_unknown in blocked
+    # 遗忘之后新产生的数据不受该 Shield 永久屏蔽
+    assert id_new not in blocked
 
 
 def test_is_shielded_entity_match_only(db_session: Session):
@@ -694,32 +708,35 @@ def test_blocked_target_ids_selector_scope(db_session: Session):
     from aiive.db.models import MemoryRecord
     from aiive.db.forget_models import ForgetShield, ForgetOperation
 
+    from datetime import timedelta
+    now = _utcnow()
+    earlier = now - timedelta(minutes=1)  # cutoff 语义：目标须早于 shield cutoff
     op = ForgetOperation(
         id=_new_id(), operation_key="f:scope", mode="everywhere",
         selector_type="scope", selector_hash="h", status="shielded",
-        requested_by="api", target_count=0, shielded_at=_utcnow(),
+        requested_by="api", target_count=0, shielded_at=now,
     )
     db_session.add(op)
     db_session.add(ForgetShield(
         id=_new_id(), forget_operation_id=op.id, selector_type="scope",
         scope_type="project", scope_id="p1",
-        cutoff_created_at=_utcnow(), status="active", normalized_shield_key="ks",
+        cutoff_created_at=now, status="active", normalized_shield_key="ks",
     ))
     m_match, m_other = _new_id(), _new_id()
     db_session.add(MemoryRecord(
         id=m_match, memory_type="fact", canonical_key="k:m",
         scope_type="project", scope_id="p1", content="x",
         lifecycle_state="active", validity_state="valid", confidence=0.5,
-        created_at=_utcnow()))
+        created_at=earlier))
     db_session.add(MemoryRecord(
         id=m_other, memory_type="fact", canonical_key="k:o",
         scope_type="project", scope_id="p2", content="y",
         lifecycle_state="active", validity_state="valid", confidence=0.5,
-        created_at=_utcnow()))
+        created_at=earlier))
     db_session.commit()
 
     blocked = ForgetVisibilityService.blocked_target_ids(
-        db_session, "memory_record", [(m_match, _utcnow()), (m_other, _utcnow())])
+        db_session, "memory_record", [(m_match, earlier), (m_other, earlier)])
     assert m_match in blocked
     assert m_other not in blocked
 
@@ -730,30 +747,40 @@ def test_blocked_target_ids_selector_thread(db_session: Session):
     from aiive.db.models import Event
     from aiive.db.forget_models import ForgetShield, ForgetOperation
 
+    from datetime import timedelta
+    now = _utcnow()
+    earlier = now - timedelta(minutes=1)
     op = ForgetOperation(
         id=_new_id(), operation_key="f:thread", mode="everywhere",
         selector_type="thread", selector_hash="h", status="shielded",
-        requested_by="api", target_count=0, shielded_at=_utcnow(),
+        requested_by="api", target_count=0, shielded_at=now,
     )
     db_session.add(op)
     db_session.add(ForgetShield(
         id=_new_id(), forget_operation_id=op.id, selector_type="thread",
-        thread_id="t1", cutoff_created_at=_utcnow(), status="active",
+        thread_id="t1", cutoff_created_at=now, status="active",
         normalized_shield_key="kt",
     ))
-    e_match, e_other = _new_id(), _new_id()
+    e_match, e_other, e_future = _new_id(), _new_id(), _new_id()
     db_session.add(Event(
         id=e_match, trace_id=_new_id(), thread_id="t1",
-        event_type="user_message", payload={}, created_at=_utcnow()))
+        event_type="user_message", payload={}, created_at=earlier))
     db_session.add(Event(
         id=e_other, trace_id=_new_id(), thread_id="t2",
-        event_type="user_message", payload={}, created_at=_utcnow()))
+        event_type="user_message", payload={}, created_at=earlier))
+    # cutoff 之后同 thread 的新事件不受该 Shield 屏蔽
+    db_session.add(Event(
+        id=e_future, trace_id=_new_id(), thread_id="t1",
+        event_type="user_message", payload={},
+        created_at=now + timedelta(minutes=1)))
     db_session.commit()
 
     blocked = ForgetVisibilityService.blocked_target_ids(
-        db_session, "event", [(e_match, _utcnow()), (e_other, _utcnow())])
+        db_session, "event",
+        [(e_match, earlier), (e_other, earlier), (e_future, None)])
     assert e_match in blocked
     assert e_other not in blocked
+    assert e_future not in blocked
 
 
 def test_blocked_target_ids_selector_canonical_key(db_session: Session):
@@ -762,15 +789,18 @@ def test_blocked_target_ids_selector_canonical_key(db_session: Session):
     from aiive.db.models import MemoryRecord
     from aiive.db.forget_models import ForgetShield, ForgetOperation
 
+    from datetime import timedelta
+    now = _utcnow()
+    earlier = now - timedelta(minutes=1)
     op = ForgetOperation(
         id=_new_id(), operation_key="f:ck", mode="everywhere",
         selector_type="canonical_key", selector_hash="h", status="shielded",
-        requested_by="api", target_count=0, shielded_at=_utcnow(),
+        requested_by="api", target_count=0, shielded_at=now,
     )
     db_session.add(op)
     db_session.add(ForgetShield(
         id=_new_id(), forget_operation_id=op.id, selector_type="canonical_key",
-        canonical_key="user.secret", cutoff_created_at=_utcnow(), status="active",
+        canonical_key="user.secret", cutoff_created_at=now, status="active",
         normalized_shield_key="kc",
     ))
     m_match, m_other = _new_id(), _new_id()
@@ -778,16 +808,16 @@ def test_blocked_target_ids_selector_canonical_key(db_session: Session):
         id=m_match, memory_type="fact", canonical_key="user.secret",
         scope_type="global", scope_id=None, content="x",
         lifecycle_state="active", validity_state="valid", confidence=0.5,
-        created_at=_utcnow()))
+        created_at=earlier))
     db_session.add(MemoryRecord(
         id=m_other, memory_type="fact", canonical_key="user.other",
         scope_type="global", scope_id=None, content="y",
         lifecycle_state="active", validity_state="valid", confidence=0.5,
-        created_at=_utcnow()))
+        created_at=earlier))
     db_session.commit()
 
     blocked = ForgetVisibilityService.blocked_target_ids(
-        db_session, "memory_record", [(m_match, _utcnow()), (m_other, _utcnow())])
+        db_session, "memory_record", [(m_match, earlier), (m_other, earlier)])
     assert m_match in blocked
     assert m_other not in blocked
 

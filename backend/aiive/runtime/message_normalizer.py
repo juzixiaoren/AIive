@@ -3,16 +3,32 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def stable_tool_call_id(data: dict[str, Any]) -> str:
-    """从新旧消息格式中提取稳定 tool_call_id。"""
+    """从新旧消息格式中提取稳定 tool_call_id。
+
+    回退键必须对 tool_call / tool_result 两侧一致，否则历史重建配对断裂
+    （旧实现用各自的 event_id 派生，两事件必然不同 → LLM API 400）。
+    回退使用双方共享的 (turn_id, batch_index)；仍无法确定时返回空串，
+    由 ContextAssembler._repair_tool_pairing 丢弃整对。
+    """
     value = data.get("tool_call_id") or data.get("id")
     if value:
         return str(value)
-    event_id = str(data.get("event_id", "") or "")
-    return f"tc_{event_id}" if event_id else "unknown"
+    turn_id = str(data.get("turn_id", "") or "")
+    batch_index = data.get("batch_index", None)
+    if turn_id and batch_index is not None:
+        return f"tc_{turn_id}_{batch_index}"
+    logger.warning(
+        "工具事件缺少 tool_call_id 且无 (turn_id, batch_index) 回退键，"
+        "该事件将无法配对并被丢弃: event_id=%s", data.get("event_id"),
+    )
+    return ""
 
 
 def normalize_tool_call(data: dict[str, Any]) -> dict[str, Any]:

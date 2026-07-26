@@ -8,10 +8,15 @@
 
 import logging
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# 仓库根：本文件位于 backend/aiive/selfdev/targeted_test_runner.py
+# parents[3] = selfdev -> aiive -> backend -> 仓库根
+_DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # 源代码目录 → 测试文件映射表
 # 当某目录下的文件发生变更时，自动运行对应的测试文件
@@ -36,7 +41,11 @@ class TargetedTestRunner:
         参数:
             repo_root: 项目根目录路径，默认从当前文件向上推导。
         """
-        self._repo_root: Path = repo_root or Path(__file__).resolve().parent.parent.parent.parent.parent
+        self._repo_root: Path = repo_root or _DEFAULT_REPO_ROOT
+        if repo_root is None and not (self._repo_root / "backend" / "aiive").is_dir():
+            logger.warning(
+                "推导的仓库根疑似不正确（缺少 backend/aiive）: %s", self._repo_root
+            )
 
     def run_for_changed_files(
         self, changed_files: list[str], artifact_dir: Path | None = None
@@ -99,8 +108,9 @@ class TargetedTestRunner:
                 continue
 
             try:
+                # 用当前解释器（sys.executable）而非硬编码 "python3"（Windows 不存在）
                 proc = subprocess.run(
-                    ["python3", "-m", "pytest", str(test_path), "-q", "--tb=no"],
+                    [sys.executable, "-m", "pytest", str(test_path), "-q", "--tb=no"],
                     cwd=str(self._repo_root),
                     capture_output=True,
                     text=True,
@@ -125,8 +135,11 @@ class TargetedTestRunner:
                 failed += 1
                 results.append({"file": tf, "result": "error", "error": str(e)})
 
+        executed = passed + failed
+        # 全部 skipped（未真正执行任何测试）不能算成功：ok=False 并标记 degraded
         report = {
-            "ok": failed == 0,  # 全部通过才算成功
+            "ok": failed == 0 and executed > 0,
+            "degraded": executed == 0,
             "total": len(test_files),
             "passed": passed,
             "failed": failed,

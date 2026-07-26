@@ -159,10 +159,16 @@ def enqueue_tool_operation(
 def wait_for_tool_operation(operation_id: str, timeout_seconds: float) -> dict[str, Any]:
     """有限等待持久化终态；超时只报告未知，不取消或重复执行。"""
     event = _waiter(operation_id)
-    operation = _load_operation(operation_id)
-    if operation is not None and operation.status not in _TERMINAL_STATUSES:
-        event.wait(timeout=max(0.0, timeout_seconds))
+    try:
         operation = _load_operation(operation_id)
+        if operation is not None and operation.status not in _TERMINAL_STATUSES:
+            event.wait(timeout=max(0.0, timeout_seconds))
+            operation = _load_operation(operation_id)
+    finally:
+        # 防止 _waiters 泄漏：无论 _notify 是否发生，等待结束后移除自己创建的 waiter
+        with _waiters_lock:
+            if _waiters.get(operation_id) is event:
+                _waiters.pop(operation_id, None)
     if operation is None:
         return {
             "ok": False,
@@ -303,6 +309,10 @@ def _execute_db_transactional(
         result = original(db, context, **params) if accepts_ctx else original(db, **params)
         if isinstance(result, dict) and result.get("ok") is False:
             raise RuntimeError(str(result.get("error", "工具返回失败")))
+        # handler 通过标记声明需要通知广播；广播必须在 commit 成功后执行
+        needs_broadcast = bool(
+            isinstance(result, dict) and result.pop("needs_notification_broadcast", False)
+        )
         operation.status = "committed"
         operation.result_payload = _json_value(result)
         operation.effect_receipt = {"transactional": True, "committed": True}
@@ -311,6 +321,8 @@ def _execute_db_transactional(
         operation.updated_at = operation.completed_at
         db.add(_build_terminal_event(operation, "committed"))
         db.commit()
+        if needs_broadcast:
+            _broadcast_pending_count_after_commit()
         _notify(operation_id)
         return HandlerResult(HandlerOutcome.COMPLETED, "工具副作用与回执已原子提交")
     except Exception as error:
@@ -332,9 +344,25 @@ def _execute_external(
     try:
         import inspect
 
+        # 执行前 fencing 预校验：确认自己仍持有 running + execution_token，
+        # 缩小双执行窗口；已被他人接管则直接按 CLAIM_LOST 处理，不执行 handler。
+        pre_db = SessionLocal()
+        try:
+            claimed_operation = pre_db.query(ToolOperation).filter(
+                ToolOperation.id == operation_id,
+                ToolOperation.status == "running",
+                ToolOperation.execution_token == execution_token,
+            ).one_or_none()
+        finally:
+            pre_db.close()
+        if claimed_operation is None:
+            return HandlerResult(HandlerOutcome.CLAIM_LOST, "operation fencing 失败（执行前预校验）")
+
         result = handler(ctx=context, **params) if "ctx" in inspect.signature(handler).parameters else handler(**params)
-        if isinstance(result, dict) and result.get("ok") is False:
-            raise RuntimeError(str(result.get("error", "工具返回失败")))
+        if isinstance(result, dict) and (result.get("ok") is False or result.get("allowed") is False):
+            # handler 明确拒绝/失败且未产生副作用：记录确定性失败，而非 unknown
+            denial = str(result.get("error") or result.get("reason") or _canonical_json(result)[:500] or "工具返回失败")
+            return _record_failure(operation_id, execution_token, denial, "handler_denied")
         db = SessionLocal()
         try:
             operation = db.query(ToolOperation).filter(
@@ -361,6 +389,19 @@ def _execute_external(
         if operation is not None and operation.effect_mode == "non_repeatable_external":
             return _record_unknown(operation_id, execution_token, str(error))
         return _record_failure(operation_id, execution_token, str(error), "handler_failed")
+
+
+def _broadcast_pending_count_after_commit() -> None:
+    """在业务事务 commit 成功后，用独立会话推送最新 pending 通知计数。"""
+    db = SessionLocal()
+    try:
+        from aiive.api.routes_notifications import broadcast_pending_count
+
+        broadcast_pending_count(db)
+    except Exception:
+        logger.exception("commit 后广播通知计数失败")
+    finally:
+        db.close()
 
 
 def _build_terminal_event(operation: ToolOperation, status: str) -> Event:

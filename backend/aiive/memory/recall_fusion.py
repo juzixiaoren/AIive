@@ -38,6 +38,14 @@ def fuse_and_pack(
 
     Returns (MemoryRecallPack, candidate_traces).
     """
+    # --- Per-route ranks for RRF ---
+    # 必须先于 dedup 分桶：dedup 会把候选对象的 route 就地改写为 "a|b" 联合串，
+    # 若在 dedup 之后按 route 分桶，会产生 "lexical|vector" 之类的伪桶，
+    # 使 RRF 排名漂移（同一记忆从原路由桶中消失）。
+    route_ids: dict[str, list[str]] = {}
+    for c in candidates:
+        route_ids.setdefault(c.route, []).append(c.memory_id)
+
     # --- Dedup by memory_id: keep max relevance, union routes ---
     by_id: dict[str, MemoryRecallItem] = {}
     for c in candidates:
@@ -51,11 +59,6 @@ def fuse_and_pack(
                 existing.route = f"{existing.route}|{c.route}"
 
     items = list(by_id.values())
-
-    # --- Per-route ranks for RRF ---
-    route_ids: dict[str, list[str]] = {}
-    for c in candidates:
-        route_ids.setdefault(c.route, []).append(c.memory_id)
 
     k = config.rrf_k
     weights = config.route_weights

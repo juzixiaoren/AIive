@@ -161,7 +161,11 @@ def test_reminder_handler_requires_agent_success(db_session, monkeypatch):
 
 
 def test_reminder_handler_requires_remind_alert_call(db_session, monkeypatch):
-    """未真实调用 remind_alert 时，Task 不完成，状态保持 dispatching 可重试。"""
+    """未真实调用 remind_alert 时降级为兜底通知（COMPLETED），不再无效重试。
+
+    旧行为返回 RETRYABLE_ERROR，但 turn_id 是确定性的：重试只会命中已完成
+    Turn 的缓存，「未调工具」的状态永远不会改变，最终空转到 deadletter 且用户
+    毫无感知。现改为写 notification_created 兜底事件并推进 Task 终态。"""
     import aiive.worker.outbox_handlers as handlers
     from sqlalchemy.orm import sessionmaker
 
@@ -193,17 +197,21 @@ def test_reminder_handler_requires_remind_alert_call(db_session, monkeypatch):
 
     result = handle_reminder_delivery(claimed)
 
-    assert result.outcome == HandlerOutcome.RETRYABLE_ERROR
-    assert result.terminal_reason == "remind_alert_not_invoked"
+    assert result.outcome == HandlerOutcome.COMPLETED
     task_row = db_session.query(Task.id, Task.status).filter(Task.id == task_id).first()
     assert task_row is not None
-    assert task_row.status == "dispatching"
+    assert task_row.status == "completed"
+    # 不伪造 reminder_triggered，而是写降级兜底通知
     assert db_session.query(Event).filter(Event.event_type == "reminder_triggered").count() == 0
+    fallback = db_session.query(Event).filter(
+        Event.event_type == "notification_created",
+    ).all()
+    assert any((e.payload or {}).get("degraded") for e in fallback)
     reminder_row = db_session.query(Event.id, Event.payload).filter(
         Event.event_type == "reminder_created", Event.trace_id == task_id,
     ).first()
     assert reminder_row is not None
-    assert reminder_row.payload["status"] == "pending"
+    assert reminder_row.payload["status"] == "alerting"
 
 
 def test_agent_failure_retries_without_fake_reply(db_session, monkeypatch):

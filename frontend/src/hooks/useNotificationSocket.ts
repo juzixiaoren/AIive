@@ -44,7 +44,12 @@ function ensureSocket() {
   socket.onclose = () => {
     socket = null;
     if (reconnectTimer === null) {
-      reconnectTimer = setTimeout(ensureSocket, 3000);
+      // 触发时必须先复位 reconnectTimer，否则它永远持有旧句柄，
+      // 后续断线时 `reconnectTimer === null` 恒不成立，通道从此不再重连
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        ensureSocket();
+      }, 3000);
     }
   };
 

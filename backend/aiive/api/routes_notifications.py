@@ -7,6 +7,7 @@ API路由模块：通知管理
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from aiive.api.ws_manager import ws_manager
@@ -22,9 +23,37 @@ PENDING_STATUSES = ["pending", "alerting", "snoozed"]
 # 已执行状态：已确认、已取消
 DONE_STATUSES = ["confirmed", "cancelled"]
 
+NOTIFICATION_EVENT_TYPES = ["notification_created", "reminder_created"]
+
+
+def _not_dismissed_criterion():
+    """SQL 侧「未被 dismissed」条件。
+
+    payload 为 JSON 列；SQLAlchemy 的 JSON 路径操作在两种方言下均可下推：
+    - PostgreSQL: CAST(payload ->> 'dismissed' AS BOOLEAN)（缺失键 → SQL NULL）
+    - SQLite:     JSON_EXTRACT(payload, '$."dismissed"')（缺失键 → SQL NULL）
+    注意 IS NULL 判断必须作用在 as_boolean() 的 CAST 结果上：直接对 JSON
+    索引表达式 .is_(None) 在部分方言会按「JSON null 字面量」比较而非 SQL NULL，
+    导致缺失键的行被漏掉。此处「键缺失(IS NULL) 或 显式为 false」视为未删除，
+    与旧内存过滤 `not payload.get("dismissed")` 语义一致（写入侧只会写布尔值）。
+    """
+    dismissed = Event.payload["dismissed"].as_boolean()
+    return or_(
+        dismissed.is_(None),
+        dismissed == False,  # noqa: E712
+    )
+
+
+def _status_criterion(statuses: list[str]):
+    """SQL 侧 payload.status ∈ statuses 条件（兼容 PostgreSQL 与 SQLite）。"""
+    return Event.payload["status"].as_string().in_(statuses)
+
 
 def count_pending_notifications(db: Session) -> int:
     """统计当前处于 pending 状态的通知数量。
+
+    过滤全部下推到 SQL（只做 COUNT，不再全表拉取到内存计数），
+    随事件表增长保持稳定开销。
 
     Args:
         db: 数据库会话
@@ -32,15 +61,15 @@ def count_pending_notifications(db: Session) -> int:
     Returns:
         pending 状态的通知数量
     """
-    events = (
-        db.query(Event)
-        .filter(Event.event_type.in_(["notification_created", "reminder_created"]))
-        .all()
-    )
-    return sum(
-        1 for e in events
-        if not (e.payload or {}).get("dismissed")
-        and (e.payload or {}).get("status") in PENDING_STATUSES
+    return int(
+        db.query(func.count(Event.id))
+        .filter(
+            Event.event_type.in_(NOTIFICATION_EVENT_TYPES),
+            _not_dismissed_criterion(),
+            _status_criterion(PENDING_STATUSES),
+        )
+        .scalar()
+        or 0
     )
 
 
@@ -67,19 +96,21 @@ def list_notifications(
     Returns:
         通知和提醒列表，按创建时间降序排列，最多50条
     """
-    events = (
+    # dismissed / status 过滤下推到 SQL 后再 limit(50)：
+    # 旧实现先 limit(50) 再内存过滤，一旦最近 50 条全被 dismissed，
+    # 接口恒返回空列表（更早的有效通知永远取不到）。
+    query = (
         db.query(Event)
-        .filter(Event.event_type.in_(["notification_created", "reminder_created"]))
-        .order_by(Event.created_at.desc())
-        .limit(50)
-        .all()
+        .filter(
+            Event.event_type.in_(NOTIFICATION_EVENT_TYPES),
+            _not_dismissed_criterion(),
+        )
     )
-
-    events = [e for e in events if not (e.payload or {}).get("dismissed")]
     if category == "pending":
-        events = [e for e in events if (e.payload or {}).get("status") in PENDING_STATUSES]
+        query = query.filter(_status_criterion(PENDING_STATUSES))
     elif category == "done":
-        events = [e for e in events if (e.payload or {}).get("status") in DONE_STATUSES]
+        query = query.filter(_status_criterion(DONE_STATUSES))
+    events = query.order_by(Event.created_at.desc()).limit(50).all()
 
     result = []
     for e in events:
@@ -115,7 +146,7 @@ def delete_notification(notification_id: str, db: Session = Depends(get_db)):
         db.query(Event)
         .filter(
             Event.id == notification_id,
-            Event.event_type.in_(["notification_created", "reminder_created"]),
+            Event.event_type.in_(NOTIFICATION_EVENT_TYPES),
         )
         .first()
     )

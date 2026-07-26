@@ -73,6 +73,20 @@ def _claim_matches(outbox: "OutboxJob", claimed: "ClaimedJob", now: datetime) ->
     )
 
 
+def _lease_active(lease_expires_at: datetime | None, now: datetime) -> bool:
+    """租约是否仍有效（时区安全比较，与 _claim_matches 同口径）。
+
+    SQLite 不保留时区信息，读回的 lease_expires_at 为 naive datetime；
+    与 Postgres（aware）统一按 UTC 比较，避免 TypeError。
+    """
+    if lease_expires_at is None:
+        return False
+    lease = lease_expires_at
+    if lease.tzinfo is None:
+        lease = lease.replace(tzinfo=timezone.utc)
+    return lease > now
+
+
 def _get_llm_client() -> LLMClient:
     return LLMClient(
         base_url=settings.aiive_llm_base_url,
@@ -399,21 +413,35 @@ def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
     )
     try:
         from aiive.core.llm_client import default_llm_client
-        from aiive.runtime.turn_execution import TurnExecutionService
+        from aiive.runtime.turn_execution import TurnConflictError, TurnExecutionService
 
         result = TurnExecutionService(
             default_llm_client(), message_source="runtime_event",
         ).execute_turn(message=message, thread_id=thread_id, turn_id=turn_id)
+    except TurnConflictError as exc:
+        # turn_id 由 operation_id 确定性生成：Turn 已 completed 时重跑只会命中
+        # 缓存（turn_cached）。不重跑 Turn，直接进入下方校验阶段读缓存 Turn 的
+        # 事件流校验 _remind_alert_succeeded，由其决定完成或降级。
+        if str(exc) == "turn_cached":
+            result = {}
+        else:
+            logger.exception("提醒 Agent Turn 冲突: task_id=%s", task_id)
+            return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, f"提醒 Agent Turn 冲突: {exc}")
     except Exception as exc:
         logger.exception("提醒 Agent 执行异常: task_id=%s", task_id)
         return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, f"提醒 Agent 执行异常: {exc}")
 
-    if result.get("error"):
-        if result.get("error") == "turn_in_progress":
-            return HandlerResult(HandlerOutcome.RETRY_LATER, "提醒 Turn 正在执行")
+    turn_error = str(result.get("error") or "")
+    if turn_error == "turn_in_progress":
+        return HandlerResult(HandlerOutcome.RETRY_LATER, "提醒 Turn 正在执行")
+    if turn_error == "turn_cached_no_payload":
+        # Turn 已 completed 但缓存无 payload：重试不可能改变结果，
+        # 继续进入校验/降级路径（event_id 由下方 DB 回查兜底）。
+        result = {}
+    elif turn_error:
         return HandlerResult(
             HandlerOutcome.RETRYABLE_ERROR,
-            f"提醒 Agent 执行失败: {result.get('error')}",
+            f"提醒 Agent 执行失败: {turn_error}",
         )
     event_id = str(result.get("event_id", "") or "")
     if not event_id:
@@ -428,11 +456,14 @@ def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
         finally:
             db_event.close()
     if not event_id:
-        return HandlerResult(
-            HandlerOutcome.RETRYABLE_ERROR,
-            "提醒 Agent 响应缺少可验证的 llm_response event_id",
+        # Turn 已 completed（确定性 turn_id），缺 llm_response 同样不会因重试改变；
+        # 继续进入校验阶段，由 remind_alert 校验决定完成或降级，不再空转重试。
+        logger.warning(
+            "提醒 Turn 缺少可验证的 llm_response event_id，进入校验/降级路径: task_id=%s",
+            task_id,
         )
 
+    degraded = False
     db_c = SessionLocal()
     try:
         outbox = db_c.query(OutboxJob).filter(OutboxJob.id == claimed.id).with_for_update().first()
@@ -451,15 +482,29 @@ def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
             db_c.commit()
             return HandlerResult(HandlerOutcome.COMPLETED, "提醒投递期间已取消")
         if task.status == "dispatching":
-            if not _remind_alert_succeeded(db_c, turn_id, reminder_id):
-                # 校验前 db_c 仅做过读操作、无待写数据，提交空事务与回滚等价，
-                # 同时释放行锁以便后续重试。
-                db_c.commit()
-                return HandlerResult(
-                    HandlerOutcome.RETRYABLE_ERROR,
-                    "提醒 Turn 未真实调用 remind_alert 或目标 reminder_id 不匹配，不完成任务",
-                    terminal_reason="remind_alert_not_invoked",
-                )
+            alert_verified = _remind_alert_succeeded(db_c, turn_id, reminder_id)
+            if not alert_verified:
+                # 「LLM 未调用 remind_alert」对确定性 turn_id 是重试不可改变的
+                # 终态（重跑只会命中 turn 缓存）。不再空转重试直至 deadletter
+                # （用户全程无感知），降级为兜底通知：写 notification_created
+                # 事件（含 task 信息）并完成任务，保证用户可感知提醒已到期。
+                degraded = True
+                db_c.add(Event(
+                    trace_id=claimed.trace_id or task_id,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    event_type="notification_created",
+                    payload={
+                        "task_id": task_id,
+                        "task_type": task.task_type,
+                        "title": title,
+                        "content": content,
+                        "message": content,
+                        "status": "alerting",
+                        "degraded": True,
+                        "degraded_reason": "remind_alert_not_invoked",
+                    },
+                ))
             reminder_event = db_c.query(Event).filter(
                 Event.event_type == "reminder_created",
                 Event.trace_id == task_id,
@@ -481,18 +526,19 @@ def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
                 reminder_payload = dict(reminder_event.payload or {})
                 reminder_payload["status"] = "alerting"
                 reminder_event.payload = reminder_payload
-            db_c.add(Event(
-                trace_id=claimed.trace_id or task_id,
-                thread_id=thread_id,
-                turn_id=turn_id,
-                event_type="reminder_triggered",
-                payload={
-                    "task_id": task_id,
-                    "task_type": task.task_type,
-                    "title": title,
-                    "turn_id": turn_id,
-                },
-            ))
+            if alert_verified:
+                db_c.add(Event(
+                    trace_id=claimed.trace_id or task_id,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    event_type="reminder_triggered",
+                    payload={
+                        "task_id": task_id,
+                        "task_type": task.task_type,
+                        "title": title,
+                        "turn_id": turn_id,
+                    },
+                ))
             task.status = "completed"
         elif task.status != "completed":
             db_c.rollback()
@@ -515,6 +561,30 @@ def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
             db_notification.close()
     except Exception:
         logger.exception("提醒通知状态推送失败: task_id=%s", task_id)
+
+    if degraded:
+        # 降级路径：无有效 Agent 回复可推送，改为向来源线程广播兜底通知，
+        # 前端据此提示提醒已到期。返回 COMPLETED（降级成功），不再重试。
+        try:
+            from aiive.api.ws_manager import ws_manager
+
+            ws_manager.broadcast_to_thread_sync(
+                thread_id,
+                "reminder_fallback_notification",
+                {
+                    "task_id": task_id,
+                    "title": title,
+                    "content": content,
+                    "thread_id": thread_id,
+                    "degraded_reason": "remind_alert_not_invoked",
+                },
+            )
+        except Exception:
+            logger.exception("提醒降级通知 WebSocket 推送失败: task_id=%s", task_id)
+        return HandlerResult(
+            HandlerOutcome.COMPLETED,
+            "提醒 Turn 未调用 remind_alert，已降级为兜底通知",
+        )
 
     try:
         from aiive.api.ws_manager import ws_manager
@@ -1074,7 +1144,7 @@ def _resolve_maintenance_run(
             )
             .first()
         )
-        if ob and ob.lease_expires_at and ob.lease_expires_at > now:
+        if ob is not None and _lease_active(ob.lease_expires_at, now):
             return "busy", run.id
         was_running = True
     else:
@@ -1474,7 +1544,7 @@ def _resolve_phase3_run(
             OutboxJob.claim_token == run.execution_token,
             OutboxJob.status == "running",
         ).first()
-        if ob and ob.lease_expires_at and ob.lease_expires_at > datetime.now(timezone.utc):
+        if ob is not None and _lease_active(ob.lease_expires_at, datetime.now(timezone.utc)):
             return "busy", run.id
         was_running = True  # 旧持锁者租约已失效 → 接管
     else:
@@ -2046,18 +2116,20 @@ def _resolve_ingestion_run(
 ):
     """Phase A：创建/读取 IngestionRun 并决定执行权。"""
     from aiive.worker.outbox_dto import IngestionRunResolution
-    from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-    stmt = pg_insert(MemoryIngestionRun).values(
-        id=str(__import__("uuid").uuid4()),
-        source_turn_record_id=source_turn_record_id,
-        extractor_name="UnifiedMemoryExtractor",
-        extractor_version="1.0",
-        status="pending",
-    ).on_conflict_do_nothing(
-        index_elements=["source_turn_record_id", "extractor_name", "extractor_version"]
+    # 可移植 upsert：PostgreSQL 走 ON CONFLICT DO NOTHING，SQLite 走 try/except
+    # （此前无条件使用 postgresql 方言的 pg_insert，SQLite 下直接崩溃）。
+    _insert_conflict_do_nothing(
+        db, MemoryIngestionRun,
+        {
+            "id": str(__import__("uuid").uuid4()),
+            "source_turn_record_id": source_turn_record_id,
+            "extractor_name": "UnifiedMemoryExtractor",
+            "extractor_version": "1.0",
+            "status": "pending",
+        },
+        conflict_columns=["source_turn_record_id", "extractor_name", "extractor_version"],
     )
-    db.execute(stmt)
 
     run = db.query(MemoryIngestionRun).filter(
         MemoryIngestionRun.source_turn_record_id == source_turn_record_id,
@@ -2080,12 +2152,13 @@ def _resolve_ingestion_run(
             OutboxJob.status == "running",
         ).first()
 
-        if outbox_job and outbox_job.lease_expires_at:
-            if outbox_job.lease_expires_at > datetime.now(timezone.utc):
-                return IngestionRunResolution(
-                    decision="busy",
-                    lease_expires_at=outbox_job.lease_expires_at,
-                )
+        if outbox_job is not None and _lease_active(
+            outbox_job.lease_expires_at, datetime.now(timezone.utc),
+        ):
+            return IngestionRunResolution(
+                decision="busy",
+                lease_expires_at=outbox_job.lease_expires_at,
+            )
 
     was_running = (run.status == "running")
     previous_status = run.status

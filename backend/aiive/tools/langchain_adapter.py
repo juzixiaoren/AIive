@@ -152,12 +152,6 @@ def _type_str_to_python(type_str: str) -> type:
     return mapping.get(type_str, str)
 
 
-def _build_empty_args_schema(name: str) -> type:
-    """为无参数工具创建一个空的 Pydantic 模型，明确告知 LLM 无需传参。"""
-    from pydantic import BaseModel, create_model
-    return create_model(f"{name}_args", __base__=BaseModel)
-
-
 def _build_args_schema(
     name: str,
     fields: dict[str, tuple[type, str]],

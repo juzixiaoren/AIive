@@ -7,10 +7,26 @@ import json
 from pathlib import Path
 
 from aiive.supervisor.slot_manager import (
+    ACTIVE_SLOT_FILE,
+    SLOTS_ROOT,
     SlotManager,
     _compute_manifest_checksum,
     create_version_manifest,
 )
+
+
+class TestDefaultPaths:
+    """回归：SLOTS_ROOT/ACTIVE_SLOT_FILE 必须位于仓库根下（曾多算一层 parent）。"""
+
+    def test_slots_root_inside_repo(self):
+        repo_root = SLOTS_ROOT.parent
+        assert (repo_root / "backend" / "aiive").is_dir()
+        assert SLOTS_ROOT.name == "slots"
+
+    def test_active_slot_file_inside_repo(self):
+        repo_root = ACTIVE_SLOT_FILE.parent.parent
+        assert (repo_root / "backend" / "aiive").is_dir()
+        assert ACTIVE_SLOT_FILE.parent.name == "runtime"
 
 
 class TestSlotManager:

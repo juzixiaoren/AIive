@@ -6,7 +6,7 @@
  * - 支持弹窗查看完整内容
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 /** 上下文项数据结构 */
 type ContextItem = {
@@ -92,11 +92,14 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
   const [modalItem, setModalItem] = useState<ContextItem | null>(null);
   /** 懒加载的完整内容缓存: item_id → full_content */
   const [fullContents, setFullContents] = useState<Record<string, string>>({});
-  const [loadingItem, setLoadingItem] = useState<string | null>(null);
+  /** 正在加载的项集合（按项而非全局互斥，避免一个在途请求阻塞其他项的加载） */
+  const [loadingItems, setLoadingItems] = useState<Set<string>>(new Set());
+  /** 当前 traceId 的引用：用于丢弃旧 trace 在途请求的迟到响应（item_id 跨 trace 重复） */
+  const traceIdRef = useRef(traceId);
 
   // "查看更多" modal 打开时触发懒加载完整内容
   useEffect(() => {
-    if (modalItem && !fullContents[modalItem.item_id]) {
+    if (modalItem && fullContents[modalItem.item_id] === undefined) {
       fetchDetail(modalItem.item_id);
     }
   }, [modalItem?.item_id]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -104,12 +107,13 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
   // 当 traceId 变化时，从后端加载上下文快照
   useEffect(() => {
     const controller = new AbortController();
+    traceIdRef.current = traceId;
     setData(null);
     setError("");
     setExpanded(null);
     setModalItem(null);
     setFullContents({});
-    setLoadingItem(null);
+    setLoadingItems(new Set());
     if (!traceId) {
       setLoadState("idle");
       return () => controller.abort();
@@ -141,24 +145,32 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
 
   /** 懒加载某条上下文项的完整内容 */
   const fetchDetail = (itemId: string) => {
-    if (fullContents[itemId] !== undefined || loadingItem) return;
-    setLoadingItem(itemId);
-    fetch(`api/context-runs/${encodeURIComponent(traceId || "")}/items/${encodeURIComponent(itemId)}`)
+    if (fullContents[itemId] !== undefined || loadingItems.has(itemId)) return;
+    const requestTraceId = traceId || "";
+    setLoadingItems(prev => new Set(prev).add(itemId));
+    fetch(`api/context-runs/${encodeURIComponent(requestTraceId)}/items/${encodeURIComponent(itemId)}`)
       .then(async response => {
         if (response.status === 404) throw new Error("上下文项不存在");
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         return response.json() as Promise<ContextItemDetailResponse>;
       })
       .then(response => {
+        // trace 已切换时丢弃迟到响应，避免旧 trace 内容串进新 trace 的缓存
+        if (traceIdRef.current !== requestTraceId) return;
         setFullContents(prev => ({ ...prev, [itemId]: response.full_content || "(空)" }));
       })
       .catch(reason => {
-        setFullContents(prev => ({
-          ...prev,
-          [itemId]: `加载失败: ${reason instanceof Error ? reason.message : "未知错误"}`,
-        }));
+        if (traceIdRef.current !== requestTraceId) return;
+        // 失败结果不写入缓存：关闭后重新打开即可重试
+        setError(`内容加载失败: ${reason instanceof Error ? reason.message : "未知错误"}`);
       })
-      .finally(() => setLoadingItem(null));
+      .finally(() => {
+        setLoadingItems(prev => {
+          const next = new Set(prev);
+          next.delete(itemId);
+          return next;
+        });
+      });
   };
 
   /** 展开项的处理：展开不自动加载，点击"查看更多"才触发懒加载 */
@@ -301,7 +313,7 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
                     <div className="mb-0.5">
                       <div className="text-[10px] text-faint uppercase mb-1">
                         {fullContents[item.item_id] !== undefined ? "完整内容" : "内容预览"}
-                        {loadingItem === item.item_id && <span className="ml-1 animate-pulse">加载中...</span>}
+                        {loadingItems.has(item.item_id) && <span className="ml-1 animate-pulse">加载中...</span>}
                       </div>
                       <pre className="text-xs text-code bg-surface/70 rounded-lg px-3 py-2 whitespace-pre-wrap break-all font-mono leading-relaxed max-h-60 overflow-auto">
                         {fullContents[item.item_id] !== undefined
@@ -378,14 +390,10 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
 
             {/* 可滚动的完整内容区域 */}
             <div className="flex-1 overflow-y-auto px-5 pb-6">
-              {loadingItem === modalItem.item_id ? (
+              {loadingItems.has(modalItem.item_id) ? (
                 <div className="text-sm text-faint py-8 text-center animate-pulse">加载中...</div>
               ) : (
-                <pre className={`text-xs whitespace-pre-wrap break-all font-mono leading-relaxed ${
-                  (fullContents[modalItem.item_id] || "").startsWith("错误") || (fullContents[modalItem.item_id] || "").startsWith("加载失败")
-                    ? "text-danger"
-                    : "text-title"
-                }`}>
+                <pre className="text-xs whitespace-pre-wrap break-all font-mono leading-relaxed text-title">
                   {fullContents[modalItem.item_id] !== undefined
                     ? fullContents[modalItem.item_id]
                     : modalItem.content_preview || "(空)"}

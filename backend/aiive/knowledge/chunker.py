@@ -29,8 +29,35 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE) -> list[dict[str, Any]]:
     chunk_idx = 0  # 块索引计数器
 
     for i, line in enumerate(lines):
-        # 如果当前块已有内容，且加入下一行会超出限制，则保存当前块并开始新块
-        if current and len(current) + len(line) > chunk_size:
+        # 单行超长：先冲刷当前累积块，再把该行按 chunk_size 字符级切分，
+        # 避免产生任意大的块。
+        if len(line) > chunk_size:
+            if current.strip():
+                chunks.append({
+                    "content": current.rstrip(),
+                    "line_start": start_line,
+                    "line_end": i - 1,
+                    "chunk_index": chunk_idx,
+                })
+                chunk_idx += 1
+            current = ""
+            for pos in range(0, len(line), chunk_size):
+                piece = line[pos : pos + chunk_size]
+                if not piece.strip():
+                    continue
+                chunks.append({
+                    "content": piece,
+                    "line_start": i,
+                    "line_end": i,
+                    "chunk_index": chunk_idx,
+                })
+                chunk_idx += 1
+            start_line = i + 1
+            continue
+
+        # 如果当前块已有内容，且加入下一行（含换行符）会超出限制，
+        # 则保存当前块并开始新块。
+        if current and len(current) + len(line) + 1 > chunk_size:
             chunks.append({
                 "content": current.rstrip(),
                 "line_start": start_line,

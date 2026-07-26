@@ -46,7 +46,6 @@ from aiive.forget.selector_normalizer import (
     MAX_INLINE_SHIELD_TARGETS,
     compute_normalized_shield_key,
     compute_selector_hash,
-    is_inline_shield_candidate,
     normalize_selector,
 )
 
@@ -324,21 +323,11 @@ def _materialize_selector_shields(
         session.add(shield)
         return
 
-    # memory_ids / turn_ids / event_ids: only selector-level if exceeds inline limit
-    if not is_inline_shield_candidate(selector_payload):
-        shield = ForgetShield(
-            id=_new_id(),
-            forget_operation_id=operation_id,
-            selector_type=selector_type,
-            cutoff_created_at=cutoff,
-            status="active",
-            normalized_shield_key=compute_normalized_shield_key(
-                operation_id, selector_type,
-                cutoff_created_at=cutoff,
-            ),
-            created_at=now,
-        )
-        session.add(shield)
+    # memory_ids / turn_ids / event_ids：无论是否超过内联上限，均由
+    # _materialize_entity_shields 写实体级 Shield（超限时同事务分批写入），
+    # 保证 Phase A「已屏蔽」承诺对每个显式 ID 均可匹配。
+    # 此处不再写无任何可匹配字段的选择器级 Shield（该 Shield 永不命中）。
+    return
 
 
 def _materialize_entity_shields(
@@ -347,15 +336,16 @@ def _materialize_entity_shields(
     selector_payload: dict[str, Any],
     now: datetime,
 ) -> None:
-    """微信 bounded explicit IDs 写实体级 Shield。
+    """为 bounded explicit IDs 写实体级 Shield。
 
-    仅 memory_ids / turn_ids / event_ids（≤MAX_INLINE_SHIELD_TARGETS）。
-    canonical_key / thread / time_range / scope / all_user_data / 超限 ID 不写实体级。
+    memory_ids / turn_ids / event_ids 选择器均写实体级 Shield；超过
+    MAX_INLINE_SHIELD_TARGETS 时同样逐条写入（同事务分批），保证 Phase A
+    的立即屏蔽承诺（此前超限时 Shield 不携带任何可匹配字段 → 承诺落空）。
+    canonical_key / thread / time_range / scope / all_user_data 不写实体级。
     """
-    if not is_inline_shield_candidate(selector_payload):
-        return
-
     selector_type = selector_payload["selector_type"]
+    if selector_type not in ("memory_ids", "turn_ids", "event_ids"):
+        return
     if selector_type == "memory_ids":
         for mid in selector_payload.get("memory_ids", []):
             shield = ForgetShield(
@@ -541,15 +531,26 @@ def _delete_core_memory_blocks(
     """
     if not memory_ids:
         return
+    dialect = session.get_bind().dialect.name
     for mid in memory_ids:
         # source_memory_ids 是 JSON 列；PostgreSQL 的 json 类型不支持 @> 包含
         # 运算，需先 cast 成 jsonb。直接用 .contains() 会退化成 LIKE 报
         # 「operator does not exist: json ~~ text」。
-        blocks = (
-            session.query(CoreMemoryBlock)
-            .filter(cast(CoreMemoryBlock.source_memory_ids, JSONB).contains([mid]))
-            .all()
-        )
+        # SQLite 等其他方言无 JSONB 类型：先 LIKE 预筛，再 Python 精确过滤。
+        if dialect == "postgresql":
+            blocks = (
+                session.query(CoreMemoryBlock)
+                .filter(cast(CoreMemoryBlock.source_memory_ids, JSONB).contains([mid]))
+                .all()
+            )
+        else:
+            from sqlalchemy import String as _SAString
+            candidates = (
+                session.query(CoreMemoryBlock)
+                .filter(cast(CoreMemoryBlock.source_memory_ids, _SAString).like(f"%{mid}%"))
+                .all()
+            )
+            blocks = [b for b in candidates if mid in (b.source_memory_ids or [])]
         for block in blocks:
             remaining = [m for m in (block.source_memory_ids or []) if m != mid]
             if not remaining:

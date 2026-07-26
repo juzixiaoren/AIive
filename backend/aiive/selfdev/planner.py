@@ -39,6 +39,7 @@ PLAN_PROMPT = (
     '    {{\n'
     '      "operation": "add_file | modify_file | delete_file",\n'
     '      "target_file": "path/to/file.py",\n'
+    '      "content": "REQUIRED for add_file/modify_file: the COMPLETE final file content (not a diff, not a summary). Omit only for delete_file.",\n'
     '      "reason": "why this change is needed",\n'
     '      "risk_notes": "potential risks if any",\n'
     '      "requires_schema_change": false,\n'
@@ -155,6 +156,16 @@ class SelfDevPlanner:
             # 修正不在白名单中的操作类型
             if op["operation"] not in ALLOWED_OPERATIONS:
                 op["operation"] = "add_file"
+
+            # 契约校验：add_file / modify_file 必须携带非空完整 content，
+            # 否则执行阶段会把文件写空。缺失时标记为不可执行。
+            if op["operation"] in ("add_file", "modify_file"):
+                content = op.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    op["not_allowed_yet"] = True
+                    op["risk_notes"] = (op.get("risk_notes", "") +
+                        " MISSING_CONTENT: add_file/modify_file requires full non-empty content; "
+                        "operation blocked to avoid writing empty files.")
 
             # 标记禁止修改的核心文件路径
             for forbidden in FORBIDDEN_PATHS:

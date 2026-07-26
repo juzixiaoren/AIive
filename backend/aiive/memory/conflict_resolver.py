@@ -158,18 +158,22 @@ class ConflictResolver:
 
     @staticmethod
     def _is_minor_change(proposal: MemoryProposal, existing: MemoryRecord) -> bool:
-        """Minor change = same key, similar content (e.g., phrasing change)."""
+        """Minor change = same key, similar content (e.g., phrasing change).
+
+        长度相近 AND 词重叠 > 60% 才判 minor：仅凭长度相近短路会把
+        语义相反但同长的内容误判为 minor（revise 而非 supersede）。
+        """
         old = (existing.content or "").lower()
         new = proposal.content.lower()
-        if abs(len(new) - len(old)) < max(len(old), 1) * 0.3:
-            return True
-        # Shared word ratio > 60% → minor
+        length_similar = abs(len(new) - len(old)) < max(len(old), 1) * 0.3
+        if not length_similar:
+            return False
         old_words = set(old.split())
         new_words = set(new.split())
-        if old_words and new_words:
-            overlap = len(old_words & new_words) / max(len(old_words), len(new_words))
-            return overlap > 0.6
-        return False
+        if not old_words or not new_words:
+            return False
+        overlap = len(old_words & new_words) / max(len(old_words), len(new_words))
+        return overlap > 0.6
 
     @staticmethod
     def _find_matching_candidate(

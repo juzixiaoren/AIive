@@ -20,6 +20,7 @@ class TestSelfDevPlanner:
                 {
                     "operation": "add_file",
                     "target_file": "backend/aiive/tools/weather.py",
+                    "content": "def get_weather():\n    return 'sunny'\n",
                     "reason": "User wants weather capability",
                     "risk_notes": "External API call",
                     "requires_schema_change": False,
@@ -46,6 +47,7 @@ class TestSelfDevPlanner:
                 {
                     "operation": "modify_file",
                     "target_file": "frontend/src/App.tsx",
+                    "content": "export default function App() { return null; }\n",
                     "reason": "Update layout",
                 }
             ],
@@ -79,6 +81,28 @@ class TestSelfDevPlanner:
         for op in plan["operations"]:
             # CORE_FILE_PROTECTED 仍在 risk_notes 中体现
             assert "CORE_FILE_PROTECTED" in op.get("risk_notes", "")
+
+    def test_add_file_without_content_blocked(self):
+        """add_file/modify_file 缺失非空 content 时应被标记 not_allowed_yet。"""
+        fake = FakeLLMClient(fixed_content=json.dumps({
+            "goal_summary": "Add tool without content",
+            "operations": [
+                {"operation": "add_file", "target_file": "backend/aiive/tools/x.py"},
+                {"operation": "modify_file", "target_file": "backend/aiive/tools/y.py", "content": "   "},
+                {"operation": "delete_file", "target_file": "backend/aiive/tools/z.py"},
+            ],
+            "test_plan": "",
+            "requires_schema_change": False,
+        }))
+        planner = SelfDevPlanner(fake)
+        plan = planner.plan("add x")
+
+        ops = plan["operations"]
+        assert ops[0]["not_allowed_yet"] is True
+        assert "MISSING_CONTENT" in ops[0]["risk_notes"]
+        assert ops[1]["not_allowed_yet"] is True
+        # delete_file 不需要 content
+        assert ops[2]["not_allowed_yet"] is False
 
     def test_handles_invalid_json(self):
         """无效 JSON 应被优雅处理，返回失败占位结果。"""

@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from collections.abc import Sequence
 from typing import Any
 
-from sqlalchemy import and_, func, or_
+from sqlalchemy import and_, case, func, or_
 from sqlalchemy.orm import Session
 
 from aiive.db.models import (
@@ -69,6 +69,17 @@ class MemoryStore:
         Called ONLY by MemoryWriteService.
         """
         now = datetime.now(timezone.utc)
+        # 语义去重 hash 落库：content_hash 与 ConflictResolver._hash_matches 的
+        # 回退算法一致（sha256[:16]）；structured_value_hash 与
+        # ConflictResolver._hash_structured 一致。不落库会导致 maintenance
+        # planner 的 merge_exact_duplicate 桶永不触发、resolver 的
+        # structured_value_hash 分支不可达。
+        from aiive.memory.conflict_resolver import ConflictResolver
+        content_hash = proposal.content_hash or proposal.compute_content_hash()
+        structured_value_hash = (
+            ConflictResolver._hash_structured(proposal.structured_value)
+            if proposal.structured_value else None
+        ) or None
         record = MemoryRecord(
             id=str(uuid.uuid4()),
             memory_type=proposal.memory_type,
@@ -78,6 +89,8 @@ class MemoryStore:
             scope_id=proposal.scope_id,
             content=proposal.content,
             structured_value=proposal.structured_value,
+            content_hash=content_hash,
+            structured_value_hash=structured_value_hash,
             keywords=proposal.keywords or None,
             lifecycle_state=lifecycle_state,
             validity_state=validity_state,
@@ -139,15 +152,20 @@ class MemoryStore:
             query = query.filter(MemoryRecord.scope_id == scope_id)
         else:
             query = query.filter(MemoryRecord.scope_id.is_(None))
+        # active 排在 candidate 之前（显式 CASE；字符串 desc 会把 candidate 排前）
+        state_order = case(
+            (MemoryRecord.lifecycle_state == LifecycleState.ACTIVE.value, 0),
+            else_=1,
+        )
         try:
             return query.order_by(
-                MemoryRecord.lifecycle_state.desc(),  # active before candidate
+                state_order.asc(),  # active before candidate
                 MemoryRecord.updated_at.desc(),
             ).with_for_update().all()
         except Exception:
             logger.warning("记忆查询加锁失败，回退非锁定查询（并发风险）", exc_info=True)
             return query.order_by(
-                MemoryRecord.lifecycle_state.desc(),
+                state_order.asc(),
                 MemoryRecord.updated_at.desc(),
             ).all()
 

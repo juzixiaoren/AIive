@@ -93,6 +93,8 @@ class UnifiedRetriever:
             thread_id=request.thread_id,
             source_types=request.source_types,
             include_sleeping=cfg.include_sleeping_auto,
+            # #10：装配去重的排除集必须透传，否则热分区已加载的摘要重复注入
+            exclude_source_ids=request.exclude_source_ids,
             max_results=cfg.auto_max_results,
             token_budget=cfg.auto_token_budget,
             request_id=request.request_id,
@@ -195,11 +197,20 @@ class UnifiedRetriever:
         gen = self._index.get_active_generation(self._db)
         if gen is None:
             return []
-        scope_id = None
-        if request.scope_context and hasattr(request.scope_context, "scope_id"):
-            scope_id = getattr(request.scope_context, "scope_id", None)
+        # #11：由 ScopeContext.chain() 构造允许的 (scope_type, scope_id) 集合
+        # 传入 query_exact 过滤（ScopeContext 无 scope_id 属性，此前的
+        # hasattr 判定恒假 → exact 路由无 scope 过滤，跨 scope 泄漏）。
+        allowed_scopes: set[tuple[str, str | None]] | None = None
+        sc = request.scope_context
+        if sc is not None and hasattr(sc, "chain") and callable(sc.chain):
+            try:
+                allowed_scopes = {(st, si) for st, si in sc.chain()}
+            except Exception:
+                logger.warning("ScopeContext.chain() 失败，exact 路由降级为无 scope 过滤")
+                allowed_scopes = None
         entries = self._index.query_exact(
-            self._db, gen.index_version, request.query.strip(), scope_id,
+            self._db, gen.index_version, request.query.strip(), None,
+            allowed_scopes=allowed_scopes,
         )
         return [self._entry_to_hit(e, lexical=1.0) for e in entries]
 
@@ -379,7 +390,14 @@ class UnifiedRetriever:
                     stale.append(("memory_record", h.source_id, ""))
                     continue
                 lifecycle: str = src[1] or ""
-                if lifecycle in ("forgotten", "superseded", "expired"):
+                validity: str = src[2] or ""
+                # #9：validity_state 是记录有效性的权威字段（superseded/
+                # contradicted/expired 均为 validity 值而非 lifecycle 值——
+                # 原 lifecycle 分支中的 "superseded"/"expired" 是死条件）。
+                if validity in ("superseded", "contradicted", "expired"):
+                    stale.append(("memory_record", h.source_id, str(src[3])))
+                    continue
+                if lifecycle in ("forgotten",):
                     stale.append(("memory_record", h.source_id, str(src[3])))
                     continue
                 if lifecycle == "archived" and not include_archived:

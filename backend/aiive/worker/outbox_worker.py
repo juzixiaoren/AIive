@@ -7,7 +7,7 @@ import uuid as _uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import func, or_
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from aiive.db.base import SessionLocal
@@ -81,9 +81,21 @@ class OutboxWorker:
                 db.query(OutboxJob)
                 .filter(
                     OutboxJob.job_type.in_(allowed),
+                    # 租约判断并入 SQL：租约仍有效的 running 行不进入候选，
+                    # 避免队头是有效租约 running 时直接返回 None 导致队头阻塞
+                    # （重启后主分片停摆至租约过期）。
+                    # SQLite 的 DateTime 存储为无时区文本，SQLAlchemy 绑定参数时
+                    # 会以相同格式（UTC、无 offset）序列化 aware 的 now，比较语义
+                    # 与 Postgres（timestamptz）一致，无需额外 naive/aware 归一。
                     or_(
                         OutboxJob.status == "pending",
-                        OutboxJob.status == "running",
+                        and_(
+                            OutboxJob.status == "running",
+                            or_(
+                                OutboxJob.lease_expires_at.is_(None),
+                                OutboxJob.lease_expires_at <= now,
+                            ),
+                        ),
                     ),
                     or_(
                         OutboxJob.available_at.is_(None),
@@ -99,7 +111,8 @@ class OutboxWorker:
                 db.rollback()
                 return None
 
-            # 如果是 running，检查 lease 是否过期
+            # 双重防御：SQL 已排除有效租约的 running 行，此处再校验一次
+            # （并发窗口内租约可能刚被续期），无效则放弃本次 claim。
             if job.status == "running":
                 if job.lease_expires_at:
                     lease = job.lease_expires_at

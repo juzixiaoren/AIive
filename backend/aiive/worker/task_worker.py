@@ -59,11 +59,21 @@ def enqueue_due_tasks(db: Session, now: datetime | None = None) -> list[dict[str
                 max_retries=3,
             ))
         elif existing.status not in {"pending", "running"}:
+            # 终态 OutboxJob + pending Task：若只 log+continue，Task 永远满足扫描
+            # 条件，每轮无限重复。按 Job 终态收敛 Task 状态，保证不再重复扫描：
+            # completed→completed、cancelled→cancelled、其余终态（deadletter 等）→failed。
+            converged = {
+                "completed": "completed",
+                "cancelled": "cancelled",
+            }.get(existing.status, "failed")
             logger.error(
-                "到期提醒存在终态 Outbox，拒绝将 Task 置为 dispatching: task_id=%s job_status=%s",
+                "到期提醒存在终态 Outbox，按 Job 终态收敛 Task: task_id=%s job_status=%s task_status=%s",
                 task.id,
                 existing.status,
+                converged,
             )
+            task.status = converged
+            task.last_checked_at = now
             continue
 
         task.status = "dispatching"

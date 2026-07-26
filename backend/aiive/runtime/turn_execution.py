@@ -245,6 +245,16 @@ class TurnExecutionService:
             )
         except TurnConflictError as e:
             err_msg = str(e)
+            if err_msg == "turn_cached":
+                # 与同步路径行为一致：重放已完成 Turn 的缓存回复而非报错。
+                cached = await asyncio.to_thread(
+                    self._load_cached_response, thread_id, turn_id,
+                )
+                if cached is not None:
+                    yield {"type": "done", **cached}
+                else:
+                    yield {"type": "error", "error": "turn_cached_no_payload"}
+                return
             yield {"type": "error", "error": err_msg}
             return
 
@@ -283,11 +293,22 @@ class TurnExecutionService:
             finally:
                 recovery_db.close()
 
-        await asyncio.to_thread(_recover_orphaned)
+        try:
+            await asyncio.to_thread(_recover_orphaned)
+        except (asyncio.CancelledError, GeneratorExit):
+            heartbeat.stop()
+            self._mark_turn_interrupted_safely(turn.id, execution_id, "orphan_recovery_cancelled")
+            raise
+        except Exception:
+            heartbeat.stop()
+            self._mark_turn_interrupted_safely(turn.id, execution_id, "orphan_recovery_failed")
+            logger.exception("流式 Turn 孤立工具恢复失败: thread_id=%s", turn.thread_id)
+            yield {"type": "error", "error": "internal_error", "trace_id": trace_id}
+            return
 
         try:
             ctx_bundle = await asyncio.to_thread(self._load_context, message, turn, exec_ctx)
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, GeneratorExit):
             heartbeat.stop()
             self._mark_turn_interrupted_safely(turn.id, execution_id, "context_loading_cancelled")
             raise
@@ -327,7 +348,7 @@ class TurnExecutionService:
                     ag_result = event["result"]
                 else:
                     yield event
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, GeneratorExit):
             heartbeat.stop()
             self._mark_turn_interrupted_safely(turn.id, execution_id, "graph_execution_cancelled")
             raise
@@ -378,7 +399,9 @@ class TurnExecutionService:
             yield {"type": "error", "error": "internal_error", "trace_id": trace_id}
             return
 
-        # LLM 返回空回复且未执行任何工具 → 异常空响应
+        # LLM 返回空回复且未执行任何工具 → 异常空响应（仍走统一 finalize 路径，
+        # 保证 heartbeat 泄漏防护与取消处理一致）。
+        empty_llm_response = False
         if not ag_result.reply and not ag_result.tool_records:
             logger.error(
                 "[TurnExecution] LLM 空响应（无回复且无工具调用）: "
@@ -386,22 +409,22 @@ class TurnExecutionService:
                 ag_result.trace_id, turn.thread_id, message[:100],
             )
             ag_result.reply = "抱歉，模型返回了空响应。请重试或检查 API 配置。"
-            response = self._finalize_turn(turn, execution_id, ag_result, heartbeat, assembled_ctx=None)
-            response["error"] = "empty_llm_response"
-            yield {"type": "done", **response}
-            return
+            empty_llm_response = True
 
         # ── Phase 3: Finalize + 记忆提取 Outbox ──
         try:
-            assembled_ctx = ctx_bundle.assembled_ctx if ctx_bundle else None
-            response = self._finalize_turn(
-                turn, execution_id, ag_result, heartbeat, assembled_ctx,
+            assembled_ctx = None
+            if not empty_llm_response and ctx_bundle:
+                assembled_ctx = ctx_bundle.assembled_ctx
+            # _finalize_turn 是同步 DB 事务，避免阻塞事件循环
+            response = await asyncio.to_thread(
+                self._finalize_turn, turn, execution_id, ag_result, heartbeat, assembled_ctx,
             )
         except FencingViolationError:
             heartbeat.stop()
             yield {"type": "error", "error": "lease_lost"}
             return
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, GeneratorExit):
             heartbeat.stop()
             self._mark_turn_interrupted_safely(turn.id, execution_id, "stream_cancelled")
             logger.warning(
@@ -416,6 +439,8 @@ class TurnExecutionService:
         finally:
             heartbeat.stop()
 
+        if empty_llm_response:
+            response["error"] = "empty_llm_response"
         yield {"type": "done", **response}
 
     # =====================================================================
@@ -441,7 +466,10 @@ class TurnExecutionService:
                 db.add(existing_thread)
                 db.flush()
             # Lock Thread row for epoch/segment serialization
-            db.query(Thread).with_for_update().filter(Thread.id == committed_tid).one()
+            locked_thread = db.query(Thread).with_for_update().filter(Thread.id == committed_tid).one()
+            # 记录线程活动时间：Idle Scanner / epoch_manager 依赖该字段判定空闲。
+            # 与 Turn 创建同一事务提交（_finalize_turn 也会再次更新，双保险）。
+            locked_thread.last_activity_at = datetime.now(timezone.utc)
 
             existing = db.query(TurnRecord).filter(
                 TurnRecord.thread_id == committed_tid,
@@ -456,23 +484,23 @@ class TurnExecutionService:
                         db, committed_tid, next_seq,
                     )
                 except IntegrityError:
+                    # 并发请求已创建 epoch/segment：回滚后在新事务中重读；
+                    # 若重读不到（并发方又回滚等极端情况），重新走
+                    # ensure_epoch_and_segment，保证新 Turn 必有 epoch/segment 归属。
                     db.rollback()
                     db.close()
-                    # Re-read: another concurrent request created epoch/segment
-                    db2 = SessionLocal()
-                    try:
-                        db2.query(Thread).with_for_update().filter(Thread.id == committed_tid).one()
-                        next_seq = _next_turn_sequence(db2, committed_tid)
-                        epoch, segment = self._epoch_mgr.ensure_epoch_and_segment(db2, committed_tid, next_seq)
-                    finally:
-                        db2.close()
                     db = SessionLocal()
-                    db.query(Thread).with_for_update().filter(Thread.id == committed_tid).one()
+                    locked_thread = db.query(Thread).with_for_update().filter(Thread.id == committed_tid).one()
+                    locked_thread.last_activity_at = datetime.now(timezone.utc)
+                    next_seq = _next_turn_sequence(db, committed_tid)
                     epoch = db.query(Epoch).filter(Epoch.thread_id == committed_tid, Epoch.status == "active").first()
+                    segment = None
                     if epoch is not None:
                         segment = db.query(Segment).filter(Segment.epoch_id == epoch.id, Segment.status == "open").first()
-                    else:
-                        segment = None
+                    if epoch is None or segment is None:
+                        epoch, segment = self._epoch_mgr.ensure_epoch_and_segment(
+                            db, committed_tid, next_seq,
+                        )
 
                 turn = TurnRecord(
                     thread_id=committed_tid,
@@ -508,8 +536,6 @@ class TurnExecutionService:
                 if existing.status == "completed":
                     if existing.request_fingerprint != fingerprint:
                         raise TurnConflictError("idempotency_key_mismatch")
-                    cached = existing.response_payload or {}
-                    cached["_turn_cached"] = True
                     raise TurnConflictError("turn_cached")
                 if existing.status == "running":
                     if existing.lease_expires_at and existing.lease_expires_at > datetime.now(timezone.utc):
@@ -569,6 +595,22 @@ class TurnExecutionService:
             return result, execution_id
         finally:
             db3.close()
+
+    def _load_cached_response(
+        self, thread_id: str | None, turn_id: str | None,
+    ) -> dict[str, Any] | None:
+        """加载已完成 Turn 的缓存响应载荷（幂等重放）。"""
+        db = SessionLocal()
+        try:
+            existing = db.query(TurnRecord).filter(
+                TurnRecord.thread_id == ThreadBootstrapService.ensure_committed_thread(thread_id),
+                TurnRecord.turn_id == (turn_id or ""),
+            ).first()
+            if existing is not None and existing.response_payload:
+                return existing.response_payload
+            return None
+        finally:
+            db.close()
 
     def _mark_interrupted(self, db: Session, turn_record_id: str, execution_id: str) -> None:
         db.query(TurnRecord).filter(
@@ -712,9 +754,19 @@ class TurnExecutionService:
                 db.rollback()
                 raise FencingViolationError("fencing violation")
 
-            # Events：pending_approval 工具不写入 tool_call/tool_result，等待审批后补充
+            # 记录线程活动时间（Idle Scanner / 自动压缩链路依赖，见 Thread 模型注释）
+            db.query(Thread).filter(Thread.id == turn.thread_id).update(
+                {Thread.last_activity_at: now}, synchronize_session=False,
+            )
+
+            # Events：pending_approval 工具不写入 tool_call/tool_result，等待审批后补充；
+            # blocked 工具从未执行，也不写入（避免孤儿 tool_call 破坏历史配对），
+            # 其事实由 llm_response 事件内的 tool_blocked action card 承载。
             idx = 1
-            executed_records = [r for r in ag_result.tool_records if r.status != "pending_approval"]
+            executed_records = [
+                r for r in ag_result.tool_records
+                if r.status not in ("pending_approval", "blocked")
+            ]
             for r in executed_records:
                 db.add(Event(id=str(_uuid.uuid4()), trace_id=ag_result.trace_id, thread_id=turn.thread_id,
                              event_type="tool_call", turn_id=turn.turn_id, turn_event_index=idx,
@@ -902,16 +954,9 @@ class TurnExecutionService:
         except TurnConflictError as e:
             err_msg = str(e)
             if err_msg == "turn_cached":
-                db = SessionLocal()
-                try:
-                    existing = db.query(TurnRecord).filter(
-                        TurnRecord.thread_id == ThreadBootstrapService.ensure_committed_thread(thread_id),
-                        TurnRecord.turn_id == (turn_id or ""),
-                    ).first()
-                    if existing and existing.response_payload:
-                        return existing.response_payload
-                finally:
-                    db.close()
+                cached = self._load_cached_response(thread_id, turn_id)
+                if cached is not None:
+                    return cached
                 return {"reply": "", "error": "turn_cached_no_payload"}
             if err_msg == "turn_in_progress":
                 return {"reply": "", "error": "turn_in_progress", "_status": 202}
@@ -920,15 +965,17 @@ class TurnExecutionService:
         heartbeat = TurnHeartbeat(turn.id, execution_id)
         heartbeat.start()
 
-        # Crash recovery: clean orphaned running tools
-        recovery_db = SessionLocal()
         try:
-            self._ws_service.recover_orphaned_tools(recovery_db, turn.thread_id)
-            recovery_db.commit()
-        finally:
-            recovery_db.close()
+            # Crash recovery: clean orphaned running tools。
+            # 必须在 heartbeat.start() 之后的统一 try 内执行，否则此处抛异常会
+            # 泄漏心跳线程且 Turn 永久停留在 running。
+            recovery_db = SessionLocal()
+            try:
+                self._ws_service.recover_orphaned_tools(recovery_db, turn.thread_id)
+                recovery_db.commit()
+            finally:
+                recovery_db.close()
 
-        try:
             # Phase 2: Context assembly (via ContextAssembler)
             trace_id = str(_uuid.uuid4())
             exec_ctx = TurnExecutionContext(

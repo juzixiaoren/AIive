@@ -15,12 +15,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+# 仓库根：本文件位于 backend/aiive/supervisor/slot_manager.py
+# parents[3] = supervisor -> aiive -> backend -> 仓库根（与 manifest excludes
+# 中 slots/、runtime/ 的相对目录约定一致，且已被 .gitignore 覆盖）
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 # 槽位根目录
-SLOTS_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent / "slots"
+SLOTS_ROOT = _REPO_ROOT / "slots"
 # 活跃槽位标记文件
-ACTIVE_SLOT_FILE = (
-    Path(__file__).resolve().parent.parent.parent.parent.parent / "runtime" / "active_slot"
-)
+ACTIVE_SLOT_FILE = _REPO_ROOT / "runtime" / "active_slot"
 
 
 @dataclass

@@ -110,7 +110,14 @@ class MemoryVectorProjectionService:
         include_archived: bool,
         limit: int,
     ) -> list[tuple[MemoryRecord, float]]:
-        """向量搜索后按 scope、生命周期、版本与 Forget 状态 fail-closed 回源。"""
+        """向量搜索后按 scope、生命周期、版本与 Forget 状态 fail-closed 回源。
+
+        include_sleeping / include_archived 仅为召回接口的透传参数：向量投影
+        按现状设计只为 active+valid 记录维护向量（`_is_indexable`），记录进入
+        sleeping / archived / 失效时其向量即被删除，且本查询恒过滤
+        validity=valid。因此这两个参数在现状下不会带回额外结果——sleeping /
+        archived 记忆的召回由 exact / lexical 路由承担。
+        """
         query = request.query.strip()
         if not query or limit <= 0:
             return []

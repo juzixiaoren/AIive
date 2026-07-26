@@ -267,15 +267,35 @@ class MemoryLifecycleService:
         self._executor.enqueue_projection(record, "memory.promoted")
         return True, reason
 
+    # sleep / archive 的合法前置状态（状态机校验）：forgotten 一律拒绝，
+    # 否则 forgotten 记忆可经 sleep → wake 复活，破坏遗忘承诺。
+    _SLEEP_ALLOWED_STATES: frozenset[str] = frozenset({
+        LifecycleState.ACTIVE.value,
+        LifecycleState.SLEEPING.value,
+    })
+    _ARCHIVE_ALLOWED_STATES: frozenset[str] = frozenset({
+        LifecycleState.ACTIVE.value,
+        LifecycleState.SLEEPING.value,
+        LifecycleState.CANDIDATE.value,
+    })
+
     def sleep(
         self, memory_id: str, trace_id: str = "", thread_id: str = "",
         reason: str = "sleep",
     ) -> tuple[bool, str]:
-        """将记忆置为 sleeping。走共享 executor（bump version + lineage + 投影）。"""
+        """将记忆置为 sleeping。走共享 executor（bump version + lineage + 投影）。
+
+        仅允许 active / sleeping 进入 sleeping；forgotten 记忆一律拒绝
+        （防止经 sleep → wake 复活），archived 也不允许直接转 sleeping。
+        """
         locked = self._executor.lock_records([memory_id])
         record = locked.get(memory_id)
         if record is None:
             return False, "Memory not found"
+        if record.lifecycle_state == LifecycleState.FORGOTTEN.value:
+            return False, "Cannot sleep: memory is forgotten (terminal state)"
+        if record.lifecycle_state not in self._SLEEP_ALLOWED_STATES:
+            return False, f"Cannot sleep: current state is {record.lifecycle_state}"
         now = datetime.now(timezone.utc)
         record.lifecycle_state = LifecycleState.SLEEPING.value
         record.record_version += 1
@@ -291,11 +311,19 @@ class MemoryLifecycleService:
         self, memory_id: str, trace_id: str = "", thread_id: str = "",
         reason: str = "archived",
     ) -> tuple[bool, str]:
-        """将记忆归档并置 validity=expired。走共享 executor。"""
+        """将记忆归档并置 validity=expired。走共享 executor。
+
+        仅允许 active / sleeping / candidate 进入 archived；forgotten 记忆
+        一律拒绝（终态，不得被任何生命周期动作触碰）。
+        """
         locked = self._executor.lock_records([memory_id])
         record = locked.get(memory_id)
         if record is None:
             return False, "Memory not found"
+        if record.lifecycle_state == LifecycleState.FORGOTTEN.value:
+            return False, "Cannot archive: memory is forgotten (terminal state)"
+        if record.lifecycle_state not in self._ARCHIVE_ALLOWED_STATES:
+            return False, f"Cannot archive: current state is {record.lifecycle_state}"
         now = datetime.now(timezone.utc)
         record.lifecycle_state = LifecycleState.ARCHIVED.value
         record.validity_state = ValidityState.EXPIRED.value

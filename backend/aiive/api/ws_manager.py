@@ -52,7 +52,9 @@ class ConnectionManager:
             return
         payload = json.dumps({"type": event_type, "data": data}, ensure_ascii=False)
         dead: list[WebSocket] = []
-        for ws in self._connections.get(thread_id, set()):
+        # 迭代副本：send_text 是 await 点，期间并发 connect/disconnect 会修改
+        # 活集合，直接迭代原集合会抛 RuntimeError 导致本次广播静默丢失。
+        for ws in list(self._connections.get(thread_id, set())):
             try:
                 await ws.send_text(payload)
             except Exception:

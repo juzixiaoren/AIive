@@ -24,6 +24,8 @@ class MCPServerCandidate:
         risk_notes: 风险提示
         definition_trust_level: 信任等级（semi_trusted | untrusted）
         descriptor_hash: 描述符哈希
+        required_env: 该 server 运行所需的环境变量名列表（如 API key）
+        match_score: 与搜索目标的关键词匹配得分（搜索时填充）
     """
     name: str
     source: str  # 来源：official_registry | community | user_config
@@ -35,6 +37,8 @@ class MCPServerCandidate:
     risk_notes: str = ""
     definition_trust_level: str = "untrusted"
     descriptor_hash: str = ""
+    required_env: list[str] = field(default_factory=list)
+    match_score: int = 0
 
 
 def _compute_hash(candidate: dict[str, Any]) -> str:
@@ -71,6 +75,7 @@ _BUILTIN_CATALOG: list[dict[str, Any]] = [
         "package_ref": "npm:@modelcontextprotocol/server-github",
         "declared_tools": ["create_or_update_file", "search_repositories", "create_repository", "get_file_contents", "create_issue", "create_pull_request", "list_commits"],
         "risk_notes": "GitHub API access: can read/write repositories. Requires token.",
+        "required_env": ["GITHUB_PERSONAL_ACCESS_TOKEN"],
     },
     {
         "name": "@modelcontextprotocol/server-postgres",
@@ -91,6 +96,7 @@ _BUILTIN_CATALOG: list[dict[str, Any]] = [
         "package_ref": "npm:@modelcontextprotocol/server-brave-search",
         "declared_tools": ["brave_web_search", "brave_local_search"],
         "risk_notes": "External web search: sends queries to Brave API. Requires API key. Low write risk.",
+        "required_env": ["BRAVE_API_KEY"],
     },
     {
         "name": "@modelcontextprotocol/server-memory",
@@ -123,11 +129,14 @@ def search_mcp_candidates(goal: str) -> list[MCPServerCandidate]:
     - 命中描述：+2 分
     - 命中工具名：+1 分
 
+    结果按匹配得分降序排列（历史缺陷：曾计算 score 却未排序，
+    调用方盲取第一个会拿到目录顺序而非最佳匹配）。
+
     参数:
         goal: 用户目标描述文本
 
     返回:
-        匹配的 MCPServerCandidate 列表
+        按 match_score 降序排列的 MCPServerCandidate 列表
     """
     goal_lower = goal.lower()
     results: list[MCPServerCandidate] = []
@@ -168,6 +177,31 @@ def search_mcp_candidates(goal: str) -> list[MCPServerCandidate]:
                 risk_notes=entry["risk_notes"],
                 definition_trust_level=candidate_data["definition_trust_level"],
                 descriptor_hash=descriptor_hash,
+                required_env=list(entry.get("required_env", [])),
+                match_score=score,
             ))
 
+    # 按得分降序，得分相同保持目录顺序（sorted 稳定）
+    results.sort(key=lambda c: c.match_score, reverse=True)
     return results
+
+
+def get_candidate_by_name(name: str) -> MCPServerCandidate | None:
+    """按精确名称从目录中取出候选（不存在返回 None）。"""
+    for candidate in search_mcp_candidates(""):
+        if candidate.name == name:
+            return candidate
+    return None
+
+
+def allowed_npm_packages() -> set[str]:
+    """返回允许通过 npm 安装的包名白名单（来自内置目录）。
+
+    installer 只接受该白名单内的包名，防止任意包安装。
+    """
+    packages: set[str] = set()
+    for entry in _BUILTIN_CATALOG:
+        ref = str(entry.get("package_ref", ""))
+        if ref.startswith("npm:"):
+            packages.add(ref[len("npm:"):])
+    return packages

@@ -84,13 +84,25 @@ def get_scope_registry() -> SafeDeleteScopeRegistry:
     return _default_registry
 
 
-# 危险路径集合：这些路径及其子路径不允许删除
+# 危险路径集合：这些路径本身永远不允许删除；其子路径仅在
+# 未落入已注册 scope 时被拒绝（scope 是显式白名单，优先于危险前缀检查）。
 DANGEROUS_PATHS = frozenset({
     "/",
     str(Path.home()),
     str(REPO_ROOT),
     str(REPO_ROOT / "backend"),
 })
+
+
+def _is_within(path: Path | str, root: Path | str) -> bool:
+    """判断 path 是否等于 root 或位于 root 之下（大小写按平台规范化，跨盘符安全）。"""
+    try:
+        p = os.path.normcase(os.path.normpath(str(path)))
+        r = os.path.normcase(os.path.normpath(str(root)))
+        return os.path.commonpath([p, r]) == r
+    except ValueError:
+        # 不同盘符/无公共前缀
+        return False
 
 
 @dataclass
@@ -166,15 +178,14 @@ def safe_delete(
 
     resolved_str = str(resolved)
 
-    # 拒绝危险路径
-    for dangerous in DANGEROUS_PATHS:
-        dangerous_resolved = str(Path(dangerous).resolve())
-        if resolved_str == dangerous_resolved or resolved_str.startswith(
-            dangerous_resolved + os.sep
-        ):
+    # 危险路径本身（精确匹配）永远拒绝，即使 scope 覆盖到它
+    dangerous_resolved = {str(Path(d).resolve()): d for d in DANGEROUS_PATHS}
+    normcased_resolved = os.path.normcase(os.path.normpath(resolved_str))
+    for dr, original in dangerous_resolved.items():
+        if normcased_resolved == os.path.normcase(os.path.normpath(dr)):
             return DeleteDecision(
                 allowed=False,
-                reason=f"Path is within dangerous area: {dangerous}",
+                reason=f"Path is within dangerous area: {original}",
                 resolved_path=resolved_str,
             )
 
@@ -187,7 +198,19 @@ def safe_delete(
             resolved_path=resolved_str,
         )
 
-    if not resolved_str.startswith(str(scope_root)):
+    in_scope = _is_within(resolved, scope_root)
+
+    # 危险路径子路径检查：仅保护未落入已注册 scope 的路径。
+    # 已注册 scope（如仓库内的 tests/artifacts、.data/object_store）是显式白名单，
+    # 其内部路径豁免此项检查，否则默认 scope 会被仓库根危险前缀整体封死。
+    if not in_scope:
+        for dr, original in dangerous_resolved.items():
+            if _is_within(resolved, dr):
+                return DeleteDecision(
+                    allowed=False,
+                    reason=f"Path is within dangerous area: {original}",
+                    resolved_path=resolved_str,
+                )
         return DeleteDecision(
             allowed=False,
             reason=f"Path outside scope '{scope_id}': {scope_root}",

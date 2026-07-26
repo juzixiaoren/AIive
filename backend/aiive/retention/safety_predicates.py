@@ -99,25 +99,46 @@ PROTECTED_FORGET_STATUSES: frozenset[str] = frozenset({
 
 def has_pending_outbox_jobs(session: Session, table_name: str, row_id: str) -> bool:
     """无 pending OutboxJob 引用该对象。"""
-    from sqlalchemy import cast
-    from sqlalchemy.dialects.postgresql import JSONB
+    from sqlalchemy import String, cast
 
     from aiive.db.models import OutboxJob
 
-    pending = (
+    dialect = session.get_bind().dialect.name
+    if dialect == "postgresql":
+        from sqlalchemy.dialects.postgresql import JSONB
+
+        pending = (
+            session.query(OutboxJob)
+            .filter(
+                OutboxJob.status.in_(["pending", "running"]),
+                # payload 是 JSON 列，PostgreSQL 的 json 不支持 @> 包含运算，
+                # 需先 cast 成 jsonb（直接用 .contains 会退化成 LIKE 报
+                # 「operator does not exist: json ~~ text」）。
+                cast(OutboxJob.payload, JSONB).contains(
+                    {"target_table": table_name, "target_id": row_id}
+                ),
+            )
+            .count()
+        )
+        return pending > 0
+
+    # SQLite 等其他方言无 JSONB：LIKE 预筛后 Python 精确判定。
+    candidates = (
         session.query(OutboxJob)
         .filter(
             OutboxJob.status.in_(["pending", "running"]),
-            # payload 是 JSON 列，PostgreSQL 的 json 不支持 @> 包含运算，
-            # 需先 cast 成 jsonb（直接用 .contains 会退化成 LIKE 报
-            # 「operator does not exist: json ~~ text」）。
-            cast(OutboxJob.payload, JSONB).contains(
-                {"target_table": table_name, "target_id": row_id}
-            ),
+            cast(OutboxJob.payload, String).like(f"%{row_id}%"),
         )
-        .count()
+        .all()
     )
-    return pending > 0
+    for job in candidates:
+        payload = job.payload or {}
+        if (
+            payload.get("target_table") == table_name
+            and payload.get("target_id") == row_id
+        ):
+            return True
+    return False
 
 
 def is_beyond_retention(cutoff_at: datetime, record_time: datetime | None) -> bool:

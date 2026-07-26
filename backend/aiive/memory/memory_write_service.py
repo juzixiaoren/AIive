@@ -298,6 +298,17 @@ class MemoryWriteService:
         thread_id: str,
     ) -> WriteResult:
         """Reinforce variant for batch writes。"""
+        # 幂等前置检查：同 idempotency_key 的 proposal 已持久化 → 整个重复请求
+        # 直接跳过，绝不能先 bump confidence 再在 _persist_proposal 阶段发现重复。
+        if self._proposal_already_persisted(proposal):
+            return WriteResult(
+                outcome=WriteOutcome.REINFORCE_SKIPPED,
+                operation="ignore",
+                memory_id=existing.id,
+                state=existing.lifecycle_state,
+                reason="重复请求（幂等键已存在），跳过强化",
+            )
+
         new_event_ids = set(proposal.source_event_ids or [])
         if new_event_ids:
             existing_event_ids = {
@@ -325,6 +336,7 @@ class MemoryWriteService:
         existing.record_version += 1
         existing.updated_at = datetime.now(timezone.utc)
 
+        self._merge_reinforce_keywords(proposal, existing)
         self._write_evidence_batch(existing.id, proposal.evidence)
         self._persist_proposal(proposal, gate_decision, final_op="reinforce", final_memory_id=existing.id)
         self._log_event(thread_id, proposal, "memory.reinforced", existing.id)
@@ -602,6 +614,12 @@ class MemoryWriteService:
             )
         except Exception as exc:
             logger.exception("Phase A 屏蔽失败")
+            # 回滚半成品写入：调用方通常在返回后无条件 commit，若不回滚会把
+            # 失败路径上已 flush 的部分屏蔽状态提交为半成品。
+            try:
+                self._db.rollback()
+            except Exception:
+                logger.exception("遗忘失败后回滚异常")
             return WriteResult(
                 outcome=WriteOutcome.FAILED,
                 reason=f"遗忘失败: {exc}",
@@ -686,6 +704,17 @@ class MemoryWriteService:
         thread_id: str,
     ) -> WriteResult:
         """Reinforce: update existing record. Skip if source_event already exists."""
+        # 幂等前置检查：同 idempotency_key 的 proposal 已持久化 → 整个重复请求
+        # 直接跳过（防同 Turn 内重复调用工具重复强化）。必须先于任何记录修改。
+        if self._proposal_already_persisted(proposal):
+            return WriteResult(
+                outcome=WriteOutcome.REINFORCE_SKIPPED,
+                operation="ignore",
+                memory_id=existing.id,
+                state=existing.lifecycle_state,
+                reason="重复请求（幂等键已存在），跳过强化",
+            )
+
         # 检查 source_event 是否已被计算过（防重复强化）
         new_event_ids = set(proposal.source_event_ids or [])
         if new_event_ids:
@@ -722,12 +751,7 @@ class MemoryWriteService:
         existing.record_version += 1
         existing.updated_at = datetime.now(timezone.utc)
 
-        # 合并检索关键词：reinforce 走轻量更新，新关键词应并入而非覆盖旧值
-        if proposal.keywords:
-            merged_keywords = set(existing.keywords or [])
-            merged_keywords.update(proposal.keywords)
-            existing.keywords = sorted(merged_keywords)
-
+        self._merge_reinforce_keywords(proposal, existing)
         self._write_evidence_batch(existing.id, proposal.evidence)
         self._persist_proposal(
             proposal, gate_decision,
@@ -743,6 +767,24 @@ class MemoryWriteService:
             state=LifecycleState.ACTIVE.value,
         )
 
+    def _merge_reinforce_keywords(
+        self, proposal: MemoryProposal, existing: MemoryRecord,
+    ) -> None:
+        """合并检索关键词：reinforce 走轻量更新，新关键词并入而非覆盖旧值。"""
+        if proposal.keywords:
+            merged_keywords = set(existing.keywords or [])
+            merged_keywords.update(proposal.keywords)
+            existing.keywords = sorted(merged_keywords)
+
+    def _proposal_already_persisted(self, proposal: MemoryProposal) -> bool:
+        """同 idempotency_key 的 proposal 是否已持久化（重复请求判定）。"""
+        ikey = proposal.idempotency_key
+        if not ikey:
+            return False
+        return self._db.query(MemoryProposalModel).filter(
+            MemoryProposalModel.idempotency_key == ikey
+        ).first() is not None
+
     def _execute_supersede_or_revise(
         self,
         proposal: MemoryProposal,
@@ -750,12 +792,41 @@ class MemoryWriteService:
         gate_decision: GateDecision,
         thread_id: str,
     ) -> WriteResult:
-        """Supersede or revise: create new record, mark old as superseded, write lineage."""
+        """Supersede or revise: create new record, mark old as superseded, write lineage.
+
+        Gate 判定为 candidate（低置信）的提案不允许顶掉现有 active 记忆：
+        降级为 create-as-candidate（不动旧记录）。
+        """
         old: MemoryRecord | None = resolution.existing_record
         if old is None:
             return WriteResult(
                 outcome=WriteOutcome.FAILED,
                 reason="没有可 supersede 或 revise 的现有记忆",
+            )
+
+        if gate_decision.decision == "candidate":
+            # 低置信提案不得 supersede 高置信 active 记忆：仅新建 candidate。
+            record: MemoryRecord = self._store.create_record(
+                proposal=proposal,
+                lifecycle_state=LifecycleState.CANDIDATE.value,
+                validity_state=ValidityState.VALID.value,
+            )
+            self._write_evidence_batch(record.id, proposal.evidence)
+            self._persist_proposal(
+                proposal, gate_decision,
+                final_op="create", final_memory_id=record.id,
+            )
+            self._log_event(thread_id, proposal, "memory.created", record.id)
+            self._enqueue_projection(record, "memory.created")
+            return WriteResult(
+                outcome=WriteOutcome.WRITTEN,
+                operation="create",
+                memory_id=record.id,
+                state=LifecycleState.CANDIDATE.value,
+                reason=(
+                    f"低置信提案不执行 {resolution.operation}，"
+                    "降级为 candidate 新建，保留原 active 记忆"
+                ),
             )
 
         # Mark old validity as superseded, keep lifecycle as-is
@@ -921,7 +992,10 @@ class MemoryWriteService:
                 self._db.add(mp)
                 self._db.flush()
         except IntegrityError:
-            self._db.expunge(mp)
+            # SAVEPOINT 回滚已自动 expunge 保存点内新增对象；仅当对象仍在
+            # session 中才显式 expunge，避免 InvalidRequestError。
+            if mp in self._db:
+                self._db.expunge(mp)
             if ikey:
                 recheck = self._db.query(MemoryProposalModel).filter(
                     MemoryProposalModel.idempotency_key == ikey
@@ -1001,16 +1075,22 @@ class MemoryWriteService:
     def _acquire_lock(self, lock_id: int) -> None:
         """Acquire pg_advisory_xact_lock (released at transaction end).
 
-        On SQLite (tests): advisory lock is silently skipped (no-op).
+        On non-PostgreSQL backends (SQLite tests): advisory lock is silently
+        skipped (no-op). On PostgreSQL, failures propagate — silently swallowing
+        a lock failure would break the concurrency guarantee.
         """
         try:
-            self._db.execute(
-                __import__("sqlalchemy").text("SELECT pg_advisory_xact_lock(:id)"),
-                {"id": lock_id},
-            )
+            bind = self._db.get_bind()
+            dialect_name = bind.dialect.name if bind is not None else ""
         except Exception:
-            # SQLite or non-PostgreSQL backend → skip advisory lock
-            logger.debug("Advisory lock not available (non-PostgreSQL backend)")
+            dialect_name = ""
+        if dialect_name != "postgresql":
+            logger.debug("Advisory lock skipped (non-PostgreSQL backend: %s)", dialect_name or "unknown")
+            return
+        self._db.execute(
+            __import__("sqlalchemy").text("SELECT pg_advisory_xact_lock(:id)"),
+            {"id": lock_id},
+        )
 
     def _release_lock(self, _lock_id: int) -> None:
         """pg_advisory_xact_lock is auto-released at transaction end.

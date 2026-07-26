@@ -34,7 +34,6 @@ from aiive.tools.registry import (
     CapabilitySafetySchema,
     ToolRegistration,
     ToolRegistry,
-    compute_descriptor_hash,
 )
 from aiive.tools.forget_tool import handle_forget, handle_forget_status
 
@@ -62,7 +61,8 @@ def _build_safety(capability_id: str, **overrides: Any) -> CapabilitySafetySchem
         can_delete=False,
     )
     base.update(overrides)
-    base["descriptor_hash"] = compute_descriptor_hash(base)
+    # 不在此处预计算 descriptor_hash：交由 registry.register 统一补算，
+    # 使指纹覆盖 description/parameters，让 descriptor_changed 防护对内置工具生效。
     fields = CapabilitySafetySchema.__dataclass_fields__
     return CapabilitySafetySchema(**{k: v for k, v in base.items() if k in fields})
 
@@ -191,14 +191,14 @@ def _handle_schedule_reminder(db: Session, ctx: RunContext | None, content: str,
         },
     ))
     db.flush()
-    # 提醒创建后推送最新 pending 数量，保持前端角标即时更新
-    from aiive.api.routes_notifications import broadcast_pending_count
-    broadcast_pending_count(db)
+    # 提醒创建后需要推送最新 pending 数量；广播由 operation_executor 在事务
+    # commit 成功后统一执行（避免事务提交前广播造成幻影计数）。
     return {
         "reminder_set": True,
         "task_id": task.id,
         "content": content,
         "delay_minutes": delay_minutes,
+        "needs_notification_broadcast": True,
     }
 
 
@@ -260,10 +260,8 @@ def _handle_confirm_reminder(db: Session, reminder_id: str):
     payload["status"] = "confirmed"
     event.payload = payload
     db.flush()
-    # 确认后 pending 数量减少，推送最新计数
-    from aiive.api.routes_notifications import broadcast_pending_count
-    broadcast_pending_count(db)
-    return {"ok": True, "reminder_id": reminder_id, "content": payload.get("content", ""), "status": "confirmed"}
+    # 确认后 pending 数量减少；广播延迟到 commit 成功后统一执行
+    return {"ok": True, "reminder_id": reminder_id, "content": payload.get("content", ""), "status": "confirmed", "needs_notification_broadcast": True}
 
 
 @_db_handler
@@ -323,12 +321,12 @@ def _handle_snooze_reminder(db: Session, ctx: RunContext | None, reminder_id: st
     db.add(task)
     db.flush()
 
-    # 创建新的 pending 事件
+    # 创建新的 pending 事件（thread_id 统一沿用原提醒事件的线程，与新 Task 一致）
     ctx = _require_ctx(ctx, "snooze_reminder")
     new_event = Event(
         id=str(_uuid.uuid4()),
         trace_id=task.id,
-        thread_id=ctx.thread_id,
+        thread_id=event.thread_id,
         event_type="reminder_created",
         payload={
             "task_id": task.id,
@@ -346,9 +344,7 @@ def _handle_snooze_reminder(db: Session, ctx: RunContext | None, reminder_id: st
         "snooze_delay_minutes": delay_minutes,
     }
     db.flush()
-    # 延时后新增一条 pending 事件，推送最新计数
-    from aiive.api.routes_notifications import broadcast_pending_count
-    broadcast_pending_count(db)
+    # 延时后新增一条 pending 事件；广播延迟到 commit 成功后统一执行
 
     return {
         "ok": True,
@@ -356,6 +352,7 @@ def _handle_snooze_reminder(db: Session, ctx: RunContext | None, reminder_id: st
         "new_reminder_id": new_event.id,
         "content": content,
         "delay_minutes": delay_minutes,
+        "needs_notification_broadcast": True,
     }
 
 
@@ -397,42 +394,47 @@ def _handle_cancel_task(db: Session, task_id: str):
 
     task.status = "cancelled"
 
-    # 同步取消关联的 reminder_created 事件（通知也会消失）
+    # 同步取消关联的 reminder_created 事件（通知也会消失）。
+    # 不用 limit(50) + 内存过滤（会漏掉较旧事件）；为避免 JSON 查询方言差异，
+    # 按 event_type 全量查询后在 Python 侧按 payload.task_id 过滤。
     related_events = (
         db.query(Event)
         .filter(Event.event_type == "reminder_created")
-        .order_by(Event.created_at.desc())
-        .limit(50)
         .all()
     )
+    updated = 0
     for e in related_events:
         if (e.payload or {}).get("task_id") == task_id:
             p = dict(e.payload or {})
             p["status"] = "cancelled"
             e.payload = p
+            updated += 1
 
-    return {"cancelled": True, "task_id": task_id, "events_updated": True}
+    return {"cancelled": True, "task_id": task_id, "events_updated": updated > 0, "events_cancelled": updated}
 
 
 @_db_handler
-def _handle_dismiss_notifications(db: Session):
+def _handle_dismiss_notifications(db: Session, ctx: RunContext | None, scope: str = "thread"):
     """清除未执行的通知：将待提醒/提醒中/已延时的通知标记为 cancelled。
 
     已确认（confirmed）和已取消（cancelled）的通知不受影响，
     它们已属于"已执行"类别。
+
+    参数:
+        scope: "thread"（默认，仅当前线程）或 "all"（显式跨线程清除）
 
     返回:
         包含 dismissed_count 的字典
     """
     from aiive.db.models import Event
     pending_statuses = ["pending", "alerting", "snoozed"]
-    events = (
-        db.query(Event)
-        .filter(Event.event_type.in_(["notification_created", "reminder_created"]))
-        .order_by(Event.created_at.desc())
-        .limit(200)
-        .all()
+    query = db.query(Event).filter(
+        Event.event_type.in_(["notification_created", "reminder_created"])
     )
+    # 写操作默认限定当前线程（与 list_tasks 一致），scope="all" 显式跨线程
+    if scope != "all" and ctx is not None and ctx.thread_id:
+        query = query.filter(Event.thread_id == ctx.thread_id)
+    events = query.order_by(Event.created_at.desc()).limit(200).all()
     count = 0
     for e in events:
         status = (e.payload or {}).get("status", "")
@@ -498,6 +500,8 @@ def _handle_remember_or_update(db: Session, ctx: RunContext | None, content: str
     source_event_ids = list(ctx.source_event_ids) or ([ctx.trace_id] if ctx.trace_id else [])
 
     evidence = [EvidenceItem(
+        # source_event_id 用于 reinforce 防重（同一来源事件不重复强化）
+        source_event_id=source_event_ids[0] if source_event_ids else None,
         source_type="user_message",
         trust_level=TrustLevel.TRUSTED.value,
         relation="supports",
@@ -946,7 +950,14 @@ def _handle_safe_delete(path: str, scope_id: str = "test_artifacts", mode: str =
     """
     from aiive.tools.safe_delete import safe_delete as do_safe_delete
     decision = do_safe_delete(path, scope_id, mode)
-    return {"allowed": decision.allowed, "reason": decision.reason, "resolved_path": decision.resolved_path}
+    # 关键：必须带 ok 键。operation_executor 依赖 ok/allowed 判定失败，
+    # 否则删除被拒绝时会被记成 committed 成功（审计假成功）。
+    return {
+        "ok": decision.allowed,
+        "allowed": decision.allowed,
+        "reason": decision.reason,
+        "resolved_path": decision.resolved_path,
+    }
 
 
 def _handle_read_text_file(path: str, max_lines: int = 50):
@@ -961,9 +972,17 @@ def _handle_read_text_file(path: str, max_lines: int = 50):
     返回:
         包含 lines 和 total_read 的字典，或包含 error 的错误字典
     """
-    allowed_dir = os.path.expanduser("~/Documents")
+    allowed_dir = os.path.realpath(os.path.expanduser("~/Documents"))
     real_path = os.path.realpath(path)
-    if not real_path.startswith(allowed_dir):
+    # 用 normcase + commonpath 校验目录包含关系：
+    # 避免裸 startswith 被兄弟目录（如 ~/Documents2）绕过，且兼容 Windows 大小写
+    try:
+        allowed_nc = os.path.normcase(allowed_dir)
+        real_nc = os.path.normcase(real_path)
+        within_allowed = os.path.commonpath([real_nc, allowed_nc]) == allowed_nc
+    except ValueError:
+        within_allowed = False
+    if not within_allowed:
         return {"error": "Access denied", "path": path}
     if not os.path.isfile(real_path):
         return {"error": "File not found", "path": path}
@@ -1187,7 +1206,11 @@ def _handle_update_working_state(
 
     if field == "current_objective":
         ws.current_objective = payload.get("value", "")
+        # 统一版本簿记：current_objective 分支也 bump version/updated_at
+        ws.version = (ws.version or 0) + 1
+        ws.updated_at = datetime.now(timezone.utc)
     elif field in ("open_loops", "active_constraints"):
+        # update_semantic_field 内部已 bump version/updated_at，此处不再重复
         ws_service.update_semantic_field(
             db, ctx.thread_id, field, operation, payload,
             ctx.turn_id or "", idempotency_key or "",
@@ -1197,9 +1220,10 @@ def _handle_update_working_state(
 
     if idempotency_key:
         applied_keys.append(idempotency_key)
+        # 滑动窗口上限：仅保留最近 200 个幂等键，防止无限增长
+        if len(applied_keys) > 200:
+            applied_keys = applied_keys[-200:]
         ws.applied_idempotency_keys = applied_keys
-        ws.version = (ws.version or 0) + 1
-        ws.updated_at = datetime.now(timezone.utc)
 
     return {"ok": True, "applied": True, "field": field}
 
@@ -1239,7 +1263,9 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
          {"status": {"type": "str", "description": "空或 all=全部; pending/completed 可选"}}, "low", False, False),
         ("cancel_task", _handle_cancel_task, "按 ID 取消任务",
          {"task_id": "str"}, "low", True, False),
-        ("dismiss_notifications", _handle_dismiss_notifications, "清除未执行的通知（待提醒/提醒中/已延时），将其标记为已取消。已确认和已取消的不受影响", {}, "low", True, False),
+        ("dismiss_notifications", _handle_dismiss_notifications,
+         "清除未执行的通知（待提醒/提醒中/已延时），将其标记为已取消。已确认和已取消的不受影响。默认仅当前线程",
+         {"scope": {"type": "str", "description": "thread(默认，仅当前线程) / all(跨线程清除)"}}, "low", True, False),
         ("show_notifications", _handle_show_notifications, "显示已触发的通知", {}, "low", False, False),
         # 记忆管理 —— 写入
         ("remember_or_update", _handle_remember_or_update,

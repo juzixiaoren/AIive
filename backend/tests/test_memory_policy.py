@@ -93,6 +93,57 @@ def test_canonical_user_assertion_is_accepted_by_unified_gate():
     assert decision.decision == "active"
 
 
+def test_dual_event_evidence_user_profile_passes_gate():
+    """端到端回归：user_message + llm_reply 双事件 evidence 的 user_profile 提案应通过 gate。
+
+    修复前：assistant 事件 evidence 的 llm_reply 归一化为 llm_derivation，而任何
+    类型的 AUTHORITY_RULES 都不含 llm_derivation → 自动提取（双事件 provenance）
+    的提案 100% 被 Gate 拒绝。修复后 assistant 证据 relation=derived_from，
+    仅作 provenance、不参与权威判定。
+    """
+    import json
+
+    from aiive.core.llm_client import FakeLLMClient
+    from aiive.memory.memory_extractor import UnifiedMemoryExtractor
+
+    fixed = json.dumps([{
+        "content": "橘子",
+        "memory_type": "user_profile",
+        "memory_key": "user.display_name",
+        "confidence": 0.95,
+        "importance": 0.8,
+        "source_span": "以后叫我橘子",
+        "durable": True,
+    }])
+    extractor = UnifiedMemoryExtractor(FakeLLMClient(fixed_content=fixed))
+    proposals = extractor.extract(
+        user_message="以后叫我橘子",
+        reply="好的，橘子！",
+        trace_id="trace-gate",
+        thread_id="thread-gate",
+        source_event_ids=["ev_user", "ev_assistant"],
+        assistant_event_ids=["ev_assistant"],
+    )
+    assert len(proposals) == 1
+    proposal = proposals[0]
+    by_id = {e.source_event_id: e for e in proposal.evidence}
+    assert by_id["ev_user"].source_type == "user_message"
+    assert by_id["ev_user"].relation == "supports"
+    assert by_id["ev_assistant"].source_type == "llm_reply"
+    assert by_id["ev_assistant"].relation == "derived_from"
+
+    decision = MemoryGate().decide(proposal)
+    assert decision.decision == "active", f"gate rejected: {decision.reason}"
+
+
+def test_all_derived_from_evidence_is_still_rejected():
+    """全部证据均为 provenance-only（derived_from）→ 无任何权威证据 → 维持拒绝。"""
+    proposal = _proposal("user_profile", "llm_reply")
+    proposal.evidence[0].relation = "derived_from"
+    decision = MemoryGate().decide(proposal)
+    assert decision.decision == "reject"
+
+
 def test_legacy_null_sensitivity_is_read_as_normal():
     policy = MemoryPolicyEngine()
     decision = policy.decide_read(None, MemoryReadChannel.LLM_CONTEXT)

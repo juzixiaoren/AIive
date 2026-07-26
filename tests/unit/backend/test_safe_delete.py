@@ -143,7 +143,11 @@ class TestSafeDelete:
 
         decision = safe_delete(str(outside_file), "sandbox", "trash", registry)
         assert decision.allowed is False
-        assert "outside scope" in decision.reason.lower()
+        # Windows 上 pytest tmp 目录位于用户主目录（危险路径）之下，
+        # scope 外路径可能命中危险区域拒绝；两种拒绝理由均可接受
+        reason = decision.reason.lower()
+        assert "outside scope" in reason or "dangerous" in reason
+        assert outside_file.exists()
 
     def test_denies_unknown_scope(self, tmp_path):
         """未知范围的删除应被拒绝。"""

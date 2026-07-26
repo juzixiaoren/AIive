@@ -9,7 +9,7 @@ import json as _json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 from sqlalchemy.orm import Session
 
@@ -62,30 +62,36 @@ def _hash_text(text: str) -> str:
 
 @dataclass(frozen=True)
 class TrimPlan:
-    """每次 assemble 独立的不可变裁剪计划，不修改共享 ContextBudget。"""
+    """每次 assemble 独立的不可变裁剪计划，不修改共享 ContextBudget。
+
+    round 递增时各分区预算单调收紧（从 soft limit 向下阶梯递减），
+    保证超限时后续轮次组装结果确实变小，裁剪循环能够收敛。
+    """
     _budget: ContextBudget
     _round: int
     _hard_limits: dict[str, int] = field(default_factory=dict)
 
+    # round → recent_messages / tool_definitions 相对 soft limit 的收紧系数
+    _ROUND_FACTORS: ClassVar[dict[int, float]] = {
+        0: 1.0, 1: 0.8, 2: 0.6, 3: 0.4, 4: 0.25,
+    }
+
     @classmethod
     def from_budget(cls, budget: ContextBudget, round_num: int = 0) -> "TrimPlan":
-        limits: dict[str, int] = {}
-        if round_num == 0:
-            limits = {p.name: p.soft_limit_tokens for p in budget.all_partitions}
-        elif round_num == 1:
-            limits = {p.name: p.hard_limit_tokens for p in budget.all_partitions}
-        elif round_num == 2:
-            limits = {p.name: p.hard_limit_tokens for p in budget.all_partitions}
-            limits["tool_results"] = 2000
-        elif round_num == 3:
-            limits = {p.name: p.hard_limit_tokens for p in budget.all_partitions}
-            limits["tool_results"] = 1000
-            limits["retrieved_memory"] = 400
-        else:
-            limits = {p.name: p.hard_limit_tokens for p in budget.all_partitions}
-            limits["tool_results"] = 500
-            limits["retrieved_memory"] = 200
-            limits["working_state"] = 500
+        factor = cls._ROUND_FACTORS.get(round_num, 0.25)
+        limits: dict[str, int] = {p.name: p.soft_limit_tokens for p in budget.all_partitions}
+        if round_num > 0:
+            for name in ("recent_messages", "tool_definitions"):
+                limits[name] = max(1, int(limits[name] * factor))
+            if round_num >= 2:
+                limits["tool_results"] = min(limits["tool_results"], 2000)
+            if round_num >= 3:
+                limits["tool_results"] = min(limits["tool_results"], 1000)
+                limits["retrieved_memory"] = min(limits["retrieved_memory"], 400)
+            if round_num >= 4:
+                limits["tool_results"] = min(limits["tool_results"], 500)
+                limits["retrieved_memory"] = min(limits["retrieved_memory"], 200)
+                limits["working_state"] = min(limits["working_state"], 500)
         return cls(_budget=budget, _round=round_num, _hard_limits=limits)
 
     def limit(self, name: str) -> int:
@@ -210,9 +216,12 @@ class ContextAssembler:
         ws_service = WorkingStateService()
         epoch_mgr = EpochManager()
         thread_state = ThreadState(db)
+        # 入口处一次性取标量 id：组装过程中可能有子步骤借用/关闭 Session
+        # （如诊断短事务），之后再解引用 ORM 对象会 DetachedInstanceError
+        thread_id = thread.id
 
         # ── 加载稳定分区（session 内，不受 token 预算影响）──
-        agent_ctx = self._load_agent_context(db, message, thread, trace_id)
+        agent_ctx = self._load_agent_context(db, message, thread_id, trace_id)
         system_content = agent_ctx["system_content"]
         recall_msgs_raw = agent_ctx.get("recall_messages") or []
 
@@ -220,18 +229,13 @@ class ContextAssembler:
         try:
             with db.begin_nested():
                 attention = AttentionManager(db).resolve_for_turn(
-                    thread_id=thread.id,
+                    thread_id=thread_id,
                     current_turn_id=current_turn_id,
                     current_topic=message,
                 )
                 attention_text = AttentionManager.render_for_context(attention)
         except Exception:
             logger.warning("注意力状态计算失败，跳过本轮注意力上下文", exc_info=True)
-
-        # ── WorkingState ──
-        working_state_text = ws_service.render_for_context(
-            db, thread.id, self._budget.working_state.hard_limit_tokens,
-        )
 
         # ── 组装循环 ──
         assembly_started_at_seq = upper_bound_sequence
@@ -244,12 +248,18 @@ class ContextAssembler:
         epoch_cp_text: str = ""
         seg_sum_text: str = ""
         bridge_text: str = ""
+        working_state_text: str = ""
         for attempt in range(MAX_TRIM_ROUNDS):
             trim_plan = TrimPlan.from_budget(self._budget, attempt)
 
+            # ── WorkingState（按当前裁剪轮次预算渲染，round 4 起收紧）──
+            working_state_text = ws_service.render_for_context(
+                db, thread_id, trim_plan.limit("working_state"),
+            )
+
             # 有界历史读取
             history_events = self._load_history_bounded(
-                db, thread_state, thread.id, trim_plan.limit("recent_messages"),
+                db, thread_state, thread_id, trim_plan.limit("recent_messages"),
                 upper_bound=assembly_started_at_seq,
             )
 
@@ -262,22 +272,28 @@ class ContextAssembler:
             if working_state_text:
                 messages.append({"role": "system", "content": working_state_text})
             # ── Phase 3: 稳定摘要上下文（在原始历史之前）──
-            epoch_cp_text = self._load_epoch_checkpoint(db, thread)
+            epoch_cp_text = self._load_epoch_checkpoint(db, thread_id)
             if epoch_cp_text:
                 messages.append({"role": "system", "content": epoch_cp_text})
-            seg_sum_text = self._load_segment_summaries(db, thread)
+            seg_sum_text = self._load_segment_summaries(db, thread_id)
             if seg_sum_text:
                 messages.append({"role": "system", "content": seg_sum_text})
-            bridge_text = self._load_sealing_bridge(db, thread)
+            bridge_text = self._load_sealing_bridge(db, thread_id)
             if bridge_text:
                 messages.append({"role": "system", "content": bridge_text})
             history_summary_text = agent_ctx.get("history_summary_text") or ""
             if history_summary_text:
                 messages.append({"role": "system", "content": history_summary_text})
             messages.extend(history_msgs)
+            # 召回记忆注入按 retrieved_memory 预算截断（round 3 起收紧）
+            recall_budget_left = trim_plan.limit("retrieved_memory")
             for rm in recall_msgs_raw:
                 content = rm.get("content", "") if isinstance(rm, dict) else str(rm)
+                if not content or recall_budget_left <= 0:
+                    continue
+                content, used = self._trim_text_to_tokens(content, recall_budget_left)
                 if content:
+                    recall_budget_left -= used
                     messages.append({"role": "system", "content": content})
             # 当前轮次的消息角色由来源决定：system 类来源（system_command /
             # runtime_event）以 system 角色注入，让模型明确其为系统消息而非用户输入。
@@ -286,7 +302,7 @@ class ContextAssembler:
 
             # 构建有界工具 schema
             tools_schema = self._build_tools_schema_list(
-                db, thread.id, trim_plan.limit("tool_definitions"),
+                db, thread_id, trim_plan.limit("tool_definitions"),
             )
 
             # ── Phase II: 最终整体 hard gate ──
@@ -300,7 +316,7 @@ class ContextAssembler:
             soft_exceeded = final_safe > self._budget.soft_input_limit
             if soft_exceeded and attempt == 0:
                 # 软阈值触发 → 标记待密封（pending_seal 语义与软阈值一致，而非“发生过裁剪”）
-                epoch_mgr.mark_pending_seal(db, thread.id, assembly_started_at_seq or 0)
+                epoch_mgr.mark_pending_seal(db, thread_id, assembly_started_at_seq or 0)
                 # mark_pending_seal 仅做 db.flush()（未提交）。作为调用方必须在此提交，
                 # 否则该 flush 会随 _load_context 的 db.close() 回滚丢弃，
                 # 导致软阈值密封信号（Segment.pending_seal_at）永远无法落库，
@@ -383,7 +399,7 @@ class ContextAssembler:
     # ── 私有辅助方法 ──
 
     def _load_agent_context(
-        self, db: Session, message: str, thread: Thread,
+        self, db: Session, message: str, thread_id: str,
         trace_id: str | None = None,
     ) -> dict[str, Any]:
         """加载 Stable Contract + Core Memory + Automatic Recall。"""
@@ -397,12 +413,12 @@ class ContextAssembler:
         stable_contract = AG._build_stable_contract(identity.to_dict(), policies)  # pyright: ignore[reportPrivateUsage]
         core_blocks = load_core_memory(db, config)
 
-        scope = build_scope_context(db, None, thread.id)
+        scope = build_scope_context(db, None, thread_id)
         # Phase 5：统一检索编排（memory + summary + checkpoint），失败降级原 AutomaticRecall
         # 收集 legacy 热分区已加载的最近摘要/检查点，避免与 UnifiedRetriever 结果重复注入
-        hot_ids = self._collect_hot_history_ids(db, thread)
+        hot_ids = self._collect_hot_history_ids(db, thread_id)
         pack, history_summary_text = self._unified_recall(
-            db, message, scope, thread, config, exclude_source_ids=hot_ids,
+            db, message, scope, thread_id, config, exclude_source_ids=hot_ids,
             trace_id=trace_id,
         )
 
@@ -438,7 +454,7 @@ class ContextAssembler:
         }
 
     def _unified_recall(
-        self, db: Session, message: str, scope: Any, thread: Thread,
+        self, db: Session, message: str, scope: Any, thread_id: str,
         recall_cfg: Any, exclude_source_ids: set[str] | None = None,
         trace_id: str | None = None,
     ) -> tuple[Any, str]:
@@ -454,7 +470,7 @@ class ContextAssembler:
             query=message,
             mode=RetrievalMode.AUTO,
             scope_context=scope,
-            thread_id=thread.id,
+            thread_id=thread_id,
             exclude_source_ids=exclude_source_ids,
         )
         result = UnifiedRetriever(db, retrieval_cfg).retrieve(request)
@@ -537,7 +553,7 @@ class ContextAssembler:
         finally:
             diagnostics_db.close()
 
-    def _collect_hot_history_ids(self, db: Session, thread: Thread) -> set[str]:
+    def _collect_hot_history_ids(self, db: Session, thread_id: str) -> set[str]:
         """收集 legacy 热分区已加载的最近摘要/检查点 source_id。
 
         AUTO 模式统一检索排除这些 source，避免与 legacy 加载的最近摘要/检查点
@@ -550,7 +566,7 @@ class ContextAssembler:
             db.query(SegmentSummary)
             .join(Segment, Segment.id == SegmentSummary.segment_id)
             .join(Epoch, Epoch.id == Segment.epoch_id)
-            .filter(Epoch.thread_id == thread.id, Segment.status == "sealed")
+            .filter(Epoch.thread_id == thread_id, Segment.status == "sealed")
             .order_by(Segment.start_turn_sequence.desc())
             .limit(limit)
             .all()
@@ -560,7 +576,7 @@ class ContextAssembler:
         cp = (
             db.query(EpochCheckpoint)
             .join(Epoch, Epoch.id == EpochCheckpoint.epoch_id)
-            .filter(Epoch.thread_id == thread.id)
+            .filter(Epoch.thread_id == thread_id)
             .order_by(EpochCheckpoint.created_at.desc())
             .first()
         )
@@ -570,7 +586,7 @@ class ContextAssembler:
             db.query(Segment)
             .join(Epoch, Epoch.id == Segment.epoch_id)
             .filter(
-                Epoch.thread_id == thread.id,
+                Epoch.thread_id == thread_id,
                 Segment.status == "sealing",
                 Segment.summary_id.is_not(None),
             )
@@ -635,6 +651,27 @@ class ContextAssembler:
             logger.exception("收集注入记忆快照失败")
             return []
 
+    def _trim_text_to_tokens(self, text: str, token_budget: int) -> tuple[str, int]:
+        """将文本裁剪到给定 token 预算内，返回 (文本, 估算消耗 tokens)。
+
+        超出预算时按比例截断字符并附截断标记；预算极小时返回空串。
+        """
+        if not text:
+            return "", 0
+        tc = self._token_counter.count_messages(
+            self._profile.full_name, [{"role": "system", "content": text}],
+        )
+        if tc.safe_tokens <= token_budget:
+            return text, tc.safe_tokens
+        if token_budget <= 0:
+            return "", 0
+        ratio = token_budget / max(1, tc.safe_tokens)
+        cut = int(len(text) * ratio * 0.9)
+        if cut <= 0:
+            return "", 0
+        trimmed = text[:cut] + "\n…[已按预算截断]"
+        return trimmed, token_budget
+
     def _load_history_bounded(
         self, db: Session, thread_state: ThreadState,
         thread_id: str, token_budget: int,
@@ -661,12 +698,12 @@ class ContextAssembler:
 
     # ── Phase 3: 稳定摘要上下文加载（K 节）──
 
-    def _load_epoch_checkpoint(self, db: Session, thread: Thread) -> str:
+    def _load_epoch_checkpoint(self, db: Session, thread_id: str) -> str:
         """加载该 Thread 最近有效的 EpochCheckpoint（仅确定性聚合，不含 LLM）。"""
         cp = (
             db.query(EpochCheckpoint)
             .join(Epoch, Epoch.id == EpochCheckpoint.epoch_id)
-            .filter(Epoch.thread_id == thread.id)
+            .filter(Epoch.thread_id == thread_id)
             .order_by(EpochCheckpoint.created_at.desc())
             .first()
         )
@@ -697,7 +734,7 @@ class ContextAssembler:
             lines.append(f"- 来源 Segment 数: {len(segs)}")
         return "\n".join(lines)
 
-    def _load_segment_summaries(self, db: Session, thread: Thread) -> str:
+    def _load_segment_summaries(self, db: Session, thread_id: str) -> str:
         """加载最近 N 个已 sealed Segment 的 Summary（N = budget.max_segment_summaries）。"""
         cfg = RecallConfig()
         limit = max(1, getattr(cfg, "max_segment_summaries", 5))
@@ -705,7 +742,7 @@ class ContextAssembler:
             db.query(SegmentSummary)
             .join(Segment, Segment.id == SegmentSummary.segment_id)
             .join(Epoch, Epoch.id == Segment.epoch_id)
-            .filter(Epoch.thread_id == thread.id, Segment.status == "sealed")
+            .filter(Epoch.thread_id == thread_id, Segment.status == "sealed")
             .order_by(Segment.start_turn_sequence.desc())
             .limit(limit)
             .all()
@@ -734,7 +771,7 @@ class ContextAssembler:
                     blocks.append(f"  - {d.get('what') if isinstance(d, dict) else d}")
         return "\n".join(blocks)
 
-    def _load_sealing_bridge(self, db: Session, thread: Thread) -> str:
+    def _load_sealing_bridge(self, db: Session, thread_id: str) -> str:
         """加载最多 1 个 sealing Segment 的桥接内容（K.2）。
 
         - 已有 Summary → 加载 Summary（即将 sealed，不读 raw）
@@ -744,7 +781,7 @@ class ContextAssembler:
         seg = (
             db.query(Segment)
             .join(Epoch, Epoch.id == Segment.epoch_id)
-            .filter(Epoch.thread_id == thread.id, Segment.status == "sealing")
+            .filter(Epoch.thread_id == thread_id, Segment.status == "sealing")
             .first()
         )
         if seg is None:
@@ -768,14 +805,21 @@ class ContextAssembler:
         if ci is None:
             # degraded：无冻结快照，不加载全部历史
             return ""
+        # event_manifest 已按 (turn_sequence, turn_event_index) 时间序冻结
+        # （见 compaction.build_event_manifest），尾部切片即时间尾部。
         event_ids = [m.get("event_id") for m in (ci.event_manifest or [])]
         if not event_ids:
             return ""
-        from aiive.db.models import Event
+        from aiive.db.models import Event, TurnRecord
         events = (
             db.query(Event)
+            .join(
+                TurnRecord,
+                (TurnRecord.turn_id == Event.turn_id)
+                & (TurnRecord.thread_id == Event.thread_id),
+            )
             .filter(Event.id.in_(event_ids[-16:]))
-            .order_by(Event.turn_id, Event.turn_event_index)
+            .order_by(TurnRecord.turn_sequence, Event.turn_event_index)
             .all()
         )
         lines = ["## 密封中 Segment 原始尾部（桥接，bounded）"]
@@ -792,10 +836,37 @@ class ContextAssembler:
                 lines.append(f"- [{e.event_type}]")
         return "\n".join(lines)
 
+    # 注入型参数（LangChain InjectedToolCallId 等）由运行时注入，不会出现在
+    # 发送给 LLM 的工具 schema 中，token 计数前剔除以免虚高。
+    _INJECTED_TOOL_PARAMS = ("tool_call_id",)
+
+    @classmethod
+    def _strip_injected_params(cls, schema: dict[str, Any]) -> dict[str, Any]:
+        """从 JSON schema 中剔除运行时注入参数（不改变原对象）。"""
+        if not isinstance(schema, dict):
+            return schema
+        props = schema.get("properties")
+        if not isinstance(props, dict):
+            return schema
+        if not any(name in props for name in cls._INJECTED_TOOL_PARAMS):
+            return schema
+        cleaned = dict(schema)
+        cleaned["properties"] = {
+            k: v for k, v in props.items() if k not in cls._INJECTED_TOOL_PARAMS
+        }
+        required = schema.get("required")
+        if isinstance(required, list):
+            cleaned["required"] = [r for r in required if r not in cls._INJECTED_TOOL_PARAMS]
+        return cleaned
+
     def _build_tools_schema_list(
         self, _db: Session, thread_id: str, token_budget: int,
     ) -> list[dict[str, Any]]:
-        """构建工具 schema 列表，按预算限制。priority DESC 剪裁。"""
+        """构建工具 schema 列表，按预算限制。
+
+        超预算时按注册顺序连续截断（保留前缀，遇到装不下的工具即停止），
+        保证截断结果与 token 预算单调相关。
+        """
         from aiive.tools.registry import get_tool_registry
         from aiive.tools.langchain_adapter import build_langchain_tools
         from aiive.context.run_context import RunContext, RUN_CTX_USER_CHAT
@@ -818,11 +889,11 @@ class ContextAssembler:
                 "function": {
                     "name": getattr(t, "name", ""),
                     "description": getattr(t, "description", ""),
-                    "parameters": schema,
+                    "parameters": self._strip_injected_params(schema),
                 },
             })
 
-        # Priority DESC 截断
+        # 顺序连续截断
         if len(schemas) > 0:
             tc = self._token_counter.count_messages(self._profile.full_name, [], schemas)
             if tc.safe_tokens > token_budget:
@@ -830,9 +901,10 @@ class ContextAssembler:
                 current = 0
                 for s in schemas:
                     single = self._token_counter.count_messages(self._profile.full_name, [], [s])
-                    if current + single.safe_tokens <= token_budget:
-                        selected.append(s)
-                        current += single.safe_tokens
+                    if current + single.safe_tokens > token_budget:
+                        break
+                    selected.append(s)
+                    current += single.safe_tokens
                 return selected
         return schemas
 
@@ -902,7 +974,69 @@ class ContextAssembler:
                     result.append({"role": "assistant", "content": content})
 
         _flush_pending()
-        return result
+        return ContextAssembler._repair_tool_pairing(result)
+
+    @staticmethod
+    def _repair_tool_pairing(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """修补 tool_call/tool_result 配对完整性，避免 LLM API 400。
+
+        过滤（如 ForgetShield）或旧数据缺失 tool_call_id 可能产生孤儿：
+        - assistant.tool_calls 中无对应 tool 结果的调用 → 从消息中剔除；
+        - 无前置 assistant.tool_calls 的 tool 消息 → 丢弃；
+        - 无法配对（id 为空）的整对 → 丢弃并记录 warning。
+        """
+        out: list[dict[str, Any]] = []
+        i = 0
+        n = len(messages)
+        while i < n:
+            m = messages[i]
+            role = m.get("role", "")
+            if role == "assistant" and m.get("tool_calls"):
+                j = i + 1
+                following: list[dict[str, Any]] = []
+                while j < n and messages[j].get("role") == "tool":
+                    following.append(messages[j])
+                    j += 1
+                result_ids = {
+                    str(t.get("tool_call_id") or "") for t in following
+                    if t.get("tool_call_id")
+                }
+                kept_calls = [
+                    c for c in m["tool_calls"]
+                    if c.get("id") and str(c["id"]) in result_ids
+                ]
+                kept_ids = {str(c["id"]) for c in kept_calls}
+                kept_tools: list[dict[str, Any]] = []
+                seen_ids: set[str] = set()
+                for t in following:
+                    tid = str(t.get("tool_call_id") or "")
+                    if tid in kept_ids and tid not in seen_ids:
+                        kept_tools.append(t)
+                        seen_ids.add(tid)
+                if len(kept_calls) != len(m["tool_calls"]) or len(kept_tools) != len(following):
+                    logger.warning(
+                        "历史工具配对修补: 剔除孤儿 tool_call %d 个 / tool_result %d 个",
+                        len(m["tool_calls"]) - len(kept_calls),
+                        len(following) - len(kept_tools),
+                    )
+                if kept_calls:
+                    repaired = dict(m)
+                    repaired["tool_calls"] = kept_calls
+                    out.append(repaired)
+                    out.extend(kept_tools)
+                elif m.get("content"):
+                    out.append({"role": "assistant", "content": m["content"]})
+                i = j
+            elif role == "tool":
+                logger.warning(
+                    "历史工具配对修补: 丢弃无前置 tool_call 的孤儿 tool_result (id=%s)",
+                    m.get("tool_call_id"),
+                )
+                i += 1
+            else:
+                out.append(m)
+                i += 1
+        return out
 
     def _build_reports(
         self,

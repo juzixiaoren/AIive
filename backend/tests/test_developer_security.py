@@ -52,18 +52,29 @@ def test_guard_rejects_non_loopback_host(db, monkeypatch) -> None:
     assert response.status_code == 403
 
 
-def test_loopback_reads_are_allowed_and_epoch_writes_stay_compatible(db, monkeypatch) -> None:
-    """启用后允许本机读取，Epoch 写接口不误归入只读守卫。"""
+def test_loopback_reads_are_allowed_and_epoch_writes_are_guarded(db, monkeypatch) -> None:
+    """启用后允许本机读取；Epoch 写端点与读端点同受 router 级守卫保护。"""
     monkeypatch.setattr(developer_security.settings, "aiive_developer_diagnostics_enabled", True)
     client = _client(_app(db))
     assert client.get("/api/debug/events").status_code == 200
     assert client.get("/api/outbox/jobs").status_code == 200
     assert client.get("/api/epochs/thread-1").status_code == 200
 
-    monkeypatch.setattr(developer_security.settings, "aiive_developer_diagnostics_enabled", False)
+    # 启用 + loopback：写端点可用
     response = client.post("/api/epochs/thread-1/seal-segment")
     assert response.status_code == 200
     assert response.json()["reason"] == "no_open_segment"
+
+    # 启用但非 loopback 来源：写端点拒绝
+    remote = _client(_app(db), "192.0.2.10")
+    assert remote.post("/api/epochs/thread-1/seal-segment").status_code == 403
+    assert remote.post("/api/epochs/thread-1/rollover").status_code == 403
+
+    # 诊断开关关闭：读写端点一并关闭
+    monkeypatch.setattr(developer_security.settings, "aiive_developer_diagnostics_enabled", False)
+    assert client.post("/api/epochs/thread-1/seal-segment").status_code == 404
+    assert client.post("/api/epochs/thread-1/rollover").status_code == 404
+    assert client.get("/api/epochs/thread-1").status_code == 404
 
 
 def test_diagnostic_responses_are_redacted_on_server(db, monkeypatch) -> None:

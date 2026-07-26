@@ -5,7 +5,7 @@
  * - 通知状态包括：待提醒、提醒中、已确认、已延时
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNotificationListener } from "../hooks/useNotificationSocket";
 
 /** 通知数据结构 */
@@ -43,14 +43,29 @@ export default function NotificationsPage() {
   const [notifs, setNotifs] = useState<Notif[]>([]);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [category, setCategory] = useState<"pending" | "done">("pending");
+  const [loadError, setLoadError] = useState<string | null>(null);
+  /** 刷新请求序号：只采纳最新一次请求的响应，防止快速切换分类时慢响应乱序覆盖 */
+  const refreshSeqRef = useRef(0);
 
   /** 刷新通知列表 */
   const refresh = (cat?: "pending" | "done") => {
     const c = cat ?? category;
+    const seq = ++refreshSeqRef.current;
     fetch(`api/notifications?category=${c}`)
-      .then((r) => r.json())
-      .then(setNotifs)
-      .catch(() => setNotifs([]));
+      .then(async (r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then((data: Notif[]) => {
+        if (seq !== refreshSeqRef.current) return;
+        setNotifs(data);
+        setLoadError(null);
+      })
+      .catch((e) => {
+        if (seq !== refreshSeqRef.current) return;
+        setNotifs([]);
+        setLoadError(e instanceof Error ? e.message : "加载失败");
+      });
   };
 
   // 组件挂载时加载通知列表
@@ -72,12 +87,20 @@ export default function NotificationsPage() {
     setBusyId(n.id);
     try {
       const res = await fetch(`api/notifications/${n.id}`, { method: "DELETE" });
+      if (res.status === 404) {
+        // 已被其他入口删除：直接从列表移除
+        setNotifs((prev) => prev.filter((item) => item.id !== n.id));
+        return;
+      }
       const data = await res.json();
       if (data.ok) {
         setNotifs((prev) => prev.filter((item) => item.id !== n.id));
+        setLoadError(null);
+      } else {
+        setLoadError("删除失败，请重试");
       }
     } catch {
-      // 静默失败，保留通知不变动
+      setLoadError("删除失败：网络错误");
     } finally {
       setBusyId(null);
     }
@@ -111,7 +134,12 @@ export default function NotificationsPage() {
           </button>
         </div>
       </div>
-      {notifs.length === 0 && (
+      {loadError && (
+        <div className="text-center text-danger-text text-xs py-2 mb-2 bg-danger-soft rounded-lg">
+          {loadError}
+        </div>
+      )}
+      {notifs.length === 0 && !loadError && (
         <div className="text-center text-faint text-sm py-12">暂无通知</div>
       )}
       <div className="flex flex-col gap-2">

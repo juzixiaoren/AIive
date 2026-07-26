@@ -47,6 +47,14 @@
   --color-accent-soft: #faf5ff;   /* 强调浅底（purple-50） */
   --color-accent-border: #e9d5ff; /* 强调描边（purple-200） */
   --color-accent-text: #9333ea;   /* 强调文字（purple-600/700） */
+
+  /* 代码高亮 token（GitHub Light 配色） */
+  --hljs-comment: #6a737d;
+  --hljs-keyword: #d73a49;
+  --hljs-entity: #6f42c1;
+  --hljs-string: #032f62;
+  --hljs-constant: #005cc5;
+  --hljs-tag: #22863a;
 }
 
 /*
@@ -97,6 +105,14 @@
     --color-accent-soft: #4c1d95;
     --color-accent-border: #a855f7;
     --color-accent-text: #d8b4fe;
+
+    /* 代码高亮 token（GitHub Dark 配色） */
+    --hljs-comment: #8b949e;
+    --hljs-keyword: #ff7b72;
+    --hljs-entity: #d2a8ff;
+    --hljs-string: #a5d6ff;
+    --hljs-constant: #79c0ff;
+    --hljs-tag: #7ee787;
   }
 }
 
@@ -143,6 +159,74 @@
   --color-accent-soft: #4c1d95;
   --color-accent-border: #a855f7;
   --color-accent-text: #d8b4fe;
+
+  /* 代码高亮 token（GitHub Dark 配色） */
+  --hljs-comment: #8b949e;
+  --hljs-keyword: #ff7b72;
+  --hljs-entity: #d2a8ff;
+  --hljs-string: #a5d6ff;
+  --hljs-constant: #79c0ff;
+  --hljs-tag: #7ee787;
+}
+
+/*
+ * 代码高亮（highlight.js / rehype-highlight）
+ * - 不引入 highlight.js 静态主题（全局单主题，深色模式下不可读），
+ *   改用上方随主题切换的 --hljs-* 变量为常用 token 上色。
+ */
+.hljs {
+  color: var(--color-code);
+  background: transparent;
+}
+.hljs-comment,
+.hljs-quote {
+  color: var(--hljs-comment);
+  font-style: italic;
+}
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-doctag,
+.hljs-template-tag,
+.hljs-deletion {
+  color: var(--hljs-keyword);
+}
+.hljs-title,
+.hljs-title.class_,
+.hljs-title.function_,
+.hljs-section {
+  color: var(--hljs-entity);
+}
+.hljs-string,
+.hljs-regexp,
+.hljs-template-variable {
+  color: var(--hljs-string);
+}
+.hljs-number,
+.hljs-literal,
+.hljs-attr,
+.hljs-variable,
+.hljs-built_in,
+.hljs-attribute,
+.hljs-symbol,
+.hljs-meta,
+.hljs-link,
+.hljs-selector-attr,
+.hljs-selector-pseudo,
+.hljs-operator {
+  color: var(--hljs-constant);
+}
+.hljs-name,
+.hljs-selector-id,
+.hljs-selector-class,
+.hljs-bullet,
+.hljs-addition {
+  color: var(--hljs-tag);
+}
+.hljs-emphasis {
+  font-style: italic;
+}
+.hljs-strong {
+  font-weight: 600;
 }
 
 /* ===== 复用个人站背景图（随主题切换） ===== */
