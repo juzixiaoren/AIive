@@ -42,11 +42,11 @@ export default function CapabilitiesPage() {
 
   useEffect(() => {
     Promise.all([
-      fetch("/api/mcp/capabilities").then(response => {
+      fetch("api/mcp/capabilities").then(response => {
         if (!response.ok) throw new Error(`能力 HTTP ${response.status}`);
         return response.json() as Promise<InstalledCapability[]>;
       }),
-      fetch("/api/tools").then(response => {
+      fetch("api/tools").then(response => {
         if (!response.ok) throw new Error(`工具 HTTP ${response.status}`);
         return response.json() as Promise<RegisteredTool[]>;
       }),

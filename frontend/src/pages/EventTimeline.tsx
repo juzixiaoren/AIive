@@ -87,8 +87,8 @@ export default function EventTimeline({ traceId }: { traceId?: string }) {
   useEffect(() => {
     const controller = new AbortController();
     const url = traceId
-      ? `/api/inspector/events?trace_id=${encodeURIComponent(traceId)}&limit=50`
-      : `/api/inspector/events?limit=50`;
+      ? `api/inspector/events?trace_id=${encodeURIComponent(traceId)}&limit=50`
+      : `api/inspector/events?limit=50`;
     const loadEvents = async () => {
       setLoading(true);
       setError(null);

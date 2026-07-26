@@ -38,7 +38,7 @@ export default function MemoriesPage() {
     setLoading(true);
     setError("");
     try {
-      const response = await fetch("/api/memories");
+      const response = await fetch("api/memories");
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       setMemories(await response.json() as MemoryItem[]);
     } catch (err) {
@@ -56,7 +56,7 @@ export default function MemoriesPage() {
     setSaving(true);
     setError("");
     try {
-      const response = await fetch("/api/memories", {
+      const response = await fetch("api/memories", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -89,7 +89,7 @@ export default function MemoriesPage() {
     setActingId(memory.id);
     setError("");
     try {
-      const response = await fetch(`/api/memories/${memory.id}/${action}`, {
+      const response = await fetch(`api/memories/${memory.id}/${action}`, {
         method: "POST",
         headers: action === "forget" ? { "Content-Type": "application/json" } : undefined,
         body: action === "forget" ? JSON.stringify({ reason: "用户从记忆管理页面请求遗忘" }) : undefined,

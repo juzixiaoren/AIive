@@ -47,7 +47,7 @@ export default function NotificationsPage() {
   /** 刷新通知列表 */
   const refresh = (cat?: "pending" | "done") => {
     const c = cat ?? category;
-    fetch(`/api/notifications?category=${c}`)
+    fetch(`api/notifications?category=${c}`)
       .then((r) => r.json())
       .then(setNotifs)
       .catch(() => setNotifs([]));
@@ -71,7 +71,7 @@ export default function NotificationsPage() {
   const handleDelete = async (n: Notif) => {
     setBusyId(n.id);
     try {
-      const res = await fetch(`/api/notifications/${n.id}`, { method: "DELETE" });
+      const res = await fetch(`api/notifications/${n.id}`, { method: "DELETE" });
       const data = await res.json();
       if (data.ok) {
         setNotifs((prev) => prev.filter((item) => item.id !== n.id));

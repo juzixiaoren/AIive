@@ -81,8 +81,8 @@ export default function DeveloperPage({ selectedTraceId }: { selectedTraceId?: s
     setError("");
     try {
       const [eventResponse, epochResponse] = await Promise.all([
-        fetch(`/api/debug/events?thread_id=${encodeURIComponent(threadId.trim())}`),
-        fetch(`/api/epochs/${encodeURIComponent(threadId.trim())}`),
+        fetch(`api/debug/events?thread_id=${encodeURIComponent(threadId.trim())}`),
+        fetch(`api/epochs/${encodeURIComponent(threadId.trim())}`),
       ]);
       if (!eventResponse.ok || !epochResponse.ok) throw new Error(`HTTP ${eventResponse.status}/${epochResponse.status}`);
       const threadEvents = await eventResponse.json() as DebugEvent[];
@@ -102,9 +102,9 @@ export default function DeveloperPage({ selectedTraceId }: { selectedTraceId?: s
     setError("");
     try {
       const [eventResponse, callResponse, jobResponse] = await Promise.all([
-        fetch(`/api/debug/events?trace_id=${encodeURIComponent(traceId.trim())}`),
-        fetch(`/api/debug/llm_calls?trace_id=${encodeURIComponent(traceId.trim())}`),
-        fetch(`/api/outbox/jobs?trace_id=${encodeURIComponent(traceId.trim())}`),
+        fetch(`api/debug/events?trace_id=${encodeURIComponent(traceId.trim())}`),
+        fetch(`api/debug/llm_calls?trace_id=${encodeURIComponent(traceId.trim())}`),
+        fetch(`api/outbox/jobs?trace_id=${encodeURIComponent(traceId.trim())}`),
       ]);
       if (!eventResponse.ok || !callResponse.ok || !jobResponse.ok) throw new Error("诊断接口返回错误");
       setEvents(await eventResponse.json() as DebugEvent[]);

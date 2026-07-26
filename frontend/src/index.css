@@ -4,11 +4,11 @@
 
 /*
  * 语义颜色令牌（light / dark）
- * - 所有组件颜色都引用这里的 CSS 变量，切换主题只需改 [data-theme]。
- * - light 为当前主用主题；dark 暂复用亮色变量，待后续补充暗色调色板。
+ * - 所有组件颜色都引用这里的 CSS 变量，切换主题只需给根容器加 .mode-light / .mode-dark。
+ * - 浅色为默认（:root）；深色见下方 .site-shell.mode-dark 与 prefers-color-scheme。
+ * - 背景图复用个人站素材，随主题切换（见 .site-shell）。
  */
-:root,
-[data-theme="light"] {
+:root {
   --color-bg: #f8fafc;            /* 主背景（slate-50） */
   --color-surface: #ffffff;       /* 卡片 / 气泡 / 输入框（white） */
   --color-surface-muted: #f1f5f9; /* 次级底色（slate-100） */
@@ -49,8 +49,118 @@
   --color-accent-text: #9333ea;   /* 强调文字（purple-600/700） */
 }
 
-/* TODO: 暗色令牌待补充；当前暂复用亮色变量，切换 data-theme="dark" 不会 visibly 变化。 */
-[data-theme="dark"] {
+/*
+ * 双主题（复用个人站机制）：手动 .mode-light / .mode-dark 优先于系统偏好。
+ * - 浅色为默认（:root）。
+ * - 深色：系统为暗且未强制浅色时，或手动选深色时启用。
+ */
+@media (prefers-color-scheme: dark) {
+  .site-shell:not(.mode-light) {
+    color-scheme: dark;
+
+    /* ===== Dark theme (auto) ===== */
+    --color-bg: #0f172a;
+    --color-surface: #1e293b;
+    --color-surface-muted: #334155;
+    --color-content: #e2e8f0;
+    --color-title: #f8fafc;
+    --color-muted: #94a3b8;
+    --color-faint: #64748b;
+    --color-subtle: #475569;
+    --color-divider: #334155;
+    --color-code: #cbd5e1;
+
+    --color-primary: #60a5fa;
+    --color-primary-hover: #93c5fd;
+    --color-primary-soft: #172554;
+    --color-primary-border: #3b82f6;
+    --color-primary-ring: #60a5fa;
+    --color-on-primary: #0b1220;
+
+    --color-danger: #f87171;
+    --color-danger-hover: #ef4444;
+    --color-danger-soft: #450a0a;
+    --color-danger-border: #ef4444;
+    --color-danger-text: #fca5a5;
+
+    --color-success: #34d399;
+    --color-success-soft: #064e3b;
+    --color-success-border: #10b981;
+    --color-success-text: #6ee7b7;
+
+    --color-warning: #fbbf24;
+    --color-warning-soft: #78350f;
+    --color-warning-border: #f59e0b;
+    --color-warning-text: #fcd34d;
+
+    --color-accent: #c084fc;
+    --color-accent-soft: #4c1d95;
+    --color-accent-border: #a855f7;
+    --color-accent-text: #d8b4fe;
+  }
+}
+
+/* 手动深色 */
+.site-shell.mode-dark {
+  color-scheme: dark;
+
+  /* ===== Dark theme (manual) ===== */
+  --color-bg: #0f172a;
+  --color-surface: #1e293b;
+  --color-surface-muted: #334155;
+  --color-content: #e2e8f0;
+  --color-title: #f8fafc;
+  --color-muted: #94a3b8;
+  --color-faint: #64748b;
+  --color-subtle: #475569;
+  --color-divider: #334155;
+  --color-code: #cbd5e1;
+
+  --color-primary: #60a5fa;
+  --color-primary-hover: #93c5fd;
+  --color-primary-soft: #172554;
+  --color-primary-border: #3b82f6;
+  --color-primary-ring: #60a5fa;
+  --color-on-primary: #0b1220;
+
+  --color-danger: #f87171;
+  --color-danger-hover: #ef4444;
+  --color-danger-soft: #450a0a;
+  --color-danger-border: #ef4444;
+  --color-danger-text: #fca5a5;
+
+  --color-success: #34d399;
+  --color-success-soft: #064e3b;
+  --color-success-border: #10b981;
+  --color-success-text: #6ee7b7;
+
+  --color-warning: #fbbf24;
+  --color-warning-soft: #78350f;
+  --color-warning-border: #f59e0b;
+  --color-warning-text: #fcd34d;
+
+  --color-accent: #c084fc;
+  --color-accent-soft: #4c1d95;
+  --color-accent-border: #a855f7;
+  --color-accent-text: #d8b4fe;
+}
+
+/* ===== 复用个人站背景图（随主题切换） ===== */
+.site-shell {
+  background-color: var(--color-bg);
+  background-image: url("/终末地视频帧-_sx5INNN.jpg");
+  background-size: cover;
+  background-position: center;
+  background-attachment: fixed;
+  background-repeat: no-repeat;
+}
+@media (prefers-color-scheme: dark) {
+  .site-shell:not(.mode-light) {
+    background-image: url("/bg.9e174372.jpg");
+  }
+}
+.site-shell.mode-dark {
+  background-image: url("/bg.9e174372.jpg");
 }
 
 /*

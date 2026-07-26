@@ -64,7 +64,7 @@ export interface ThreadHistoryPage {
 export async function getThreadMessages(threadId: string, beforeSequence?: number): Promise<ThreadHistoryPage> {
   const query = new URLSearchParams({ page_size: "50" });
   if (beforeSequence !== undefined) query.set("before_sequence", String(beforeSequence));
-  const res = await fetch(`/api/threads/${encodeURIComponent(threadId)}/messages?${query.toString()}`);
+  const res = await fetch(`api/threads/${encodeURIComponent(threadId)}/messages?${query.toString()}`);
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`历史消息加载失败 ${res.status}: ${text}`);
@@ -139,7 +139,7 @@ export async function sendMessageStream(
   tool_calls?: Array<{ tool_call_id: string; name: string; params?: Record<string, unknown>; status?: string }>;
   tool_results?: Array<{ tool_call_id: string; name: string; params?: Record<string, unknown>; result?: unknown; status?: string }>;
 }> {
-  const res = await fetch("/api/chat/stream", {
+  const res = await fetch("api/chat/stream", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ message, thread_id: threadId ?? null }),
@@ -263,7 +263,7 @@ export async function sendMessageStream(
  * @param threadId - 可选的对话线程 ID
  */
 export async function resetThread(threadId?: string): Promise<void> {
-  await fetch("/api/thread/reset", {
+  await fetch("api/thread/reset", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ thread_id: threadId ?? null }),
@@ -293,7 +293,7 @@ export async function respondApproval(
   approvalId: string,
   action: "approve" | "deny",
 ): Promise<ApprovalResponse> {
-  const res = await fetch("/api/approval/respond", {
+  const res = await fetch("api/approval/respond", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ approval_id: approvalId, action }),
