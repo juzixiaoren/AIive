@@ -7,9 +7,9 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
+// 代码高亮 token 配色随主题切换，定义在 index.css（不再引入 highlight.js 的静态浅色主题，
+// 否则深色模式下深色背景配浅色主题 token，代码几乎不可读）
 import "./index.css";
-// 代码块语法高亮主题（rehype-highlight 依赖 highlight.js 的配色）
-import "highlight.js/styles/github.css";
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

@@ -82,11 +82,18 @@ class ForgetVisibilityService:
                 & (ForgetShield.scope_id == scope_id)
             )
         if target_time is not None:
-            # time_range shield 仅在目标时间落入范围内时生效
+            # time_range shield 仅在目标时间落入范围内时生效；
+            # 开区间（time_from/time_to 为 NULL）视为无界，NULL 比较不吞命中。
             selector_conditions.append(
                 (ForgetShield.selector_type == "time_range")
-                & (ForgetShield.time_from <= target_time)
-                & (ForgetShield.time_to >= target_time)
+                & or_(
+                    ForgetShield.time_from.is_(None),
+                    ForgetShield.time_from <= target_time,
+                )
+                & or_(
+                    ForgetShield.time_to.is_(None),
+                    ForgetShield.time_to >= target_time,
+                )
             )
 
         all_conditions = entity_conditions + selector_conditions
@@ -101,6 +108,22 @@ class ForgetVisibilityService:
     # ── Tombstone 检查 ──
 
     @staticmethod
+    def _as_utc(dt: Any) -> datetime | None:
+        """归一化为 aware UTC datetime；接受 datetime / ISO 字符串 / None。"""
+        if dt is None:
+            return None
+        if isinstance(dt, str):
+            try:
+                dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                return None
+        if not isinstance(dt, datetime):
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt
+
+    @staticmethod
     def blocked_target_ids(
         session: Session,
         target_type: str,
@@ -109,33 +132,51 @@ class ForgetVisibilityService:
         """批量返回被 Shield（实体级/选择器级/all_user_data）或 Tombstone 屏蔽的 ID。
 
         供 UnifiedRetriever / RawHistoryExpander / 各读取路径 fail-closed 过滤。
-        id_time_pairs: [(id, created_at_or_None), ...]；created_at 仅作 time_range
-        判定的兜底，实际元数据（thread/scope/canonical_key）从各自表重载，以保证
-        选择器级 Shield（scope/canonical_key/time_range）正确生效。
+        id_time_pairs: [(id, created_at_or_None), ...]；created_at 仅作元数据缺失时
+        的兜底，实际元数据（thread/scope/canonical_key/created_at）从各自表重载，
+        以保证选择器级 Shield（scope/canonical_key/time_range）正确生效。
+
+        cutoff 语义：所有选择器级 Shield（含 all_user_data）仅屏蔽创建时间
+        <= shield.cutoff_created_at 的数据；遗忘操作之后新产生的数据不受屏蔽。
+        创建时间无法确定时 fail-closed 屏蔽。
 
         返回值：应被过滤掉的（不可见）ID 集合。
         """
         if not id_time_pairs:
             return set()
         ids = [p[0] for p in id_time_pairs]
-
-        # 全局 all_user_data shield 存在 → 全部屏蔽（fail-closed）
-        global_block = (
-            session.query(ForgetShield.id)
-            .filter(
-                ForgetShield.status == "active",
-                ForgetShield.all_user_data.is_(True),
-            )
-            .first()
-        )
-        if global_block is not None:
-            return {tid for tid in ids}
+        provided_time: dict[str, Any] = {p[0]: p[1] for p in id_time_pairs}
 
         # 重载各目标元数据（thread_id / scope / canonical_key / created_at）
         meta = ForgetVisibilityService._load_target_meta(session, target_type, ids)
+        meta_by_id = {m["id"]: m for m in meta}
+        _as_utc = ForgetVisibilityService._as_utc
+
+        def _created(tid: str) -> datetime | None:
+            m = meta_by_id.get(tid)
+            if m is not None and m.get("created_at") is not None:
+                return _as_utc(m["created_at"])
+            return _as_utc(provided_time.get(tid))
+
         blocked: set[str] = set()
 
-        # 1) 实体级 Shield（target_type/target_id 直接命中）
+        # 0) 全局 all_user_data shield：屏蔽 cutoff 之前创建的数据；
+        #    创建时间未知 → fail-closed 屏蔽。
+        global_cutoffs = [
+            _as_utc(r[0]) for r in session.query(
+                ForgetShield.cutoff_created_at,
+            ).filter(
+                ForgetShield.status == "active",
+                ForgetShield.all_user_data.is_(True),
+            ).all()
+        ]
+        if global_cutoffs:
+            for tid in ids:
+                ct = _created(tid)
+                if ct is None or any(c is None or ct <= c for c in global_cutoffs):
+                    blocked.add(tid)
+
+        # 1) 实体级 Shield（target_type/target_id 直接命中，无 cutoff 语义）
         shield_rows = (
             session.query(ForgetShield.target_id)
             .filter(
@@ -147,19 +188,36 @@ class ForgetVisibilityService:
         )
         blocked.update(r[0] for r in shield_rows)
 
-        # 2) 选择器级 Shield（thread / scope / canonical_key / time_range）
+        # 2) 选择器级 Shield（thread / scope / canonical_key / time_range），
+        #    统一比较目标 created_at <= shield.cutoff_created_at。
         if meta:
+            def _within_cutoff(ct: datetime | None, cutoff: Any) -> bool:
+                cut = _as_utc(cutoff)
+                if cut is None:
+                    # 正常写入侧总有 cutoff；缺失时 fail-closed（视为覆盖）
+                    return True
+                if ct is None:
+                    return True  # 创建时间未知 → fail-closed
+                return ct <= cut
+
             thread_ids = {m["thread_id"] for m in meta if m["thread_id"]}
             if thread_ids:
-                shielded_threads = {
-                    r[0] for r in session.query(ForgetShield.thread_id).filter(
-                        ForgetShield.status == "active",
-                        ForgetShield.selector_type == "thread",
-                        ForgetShield.thread_id.in_(thread_ids),
-                    ).all()
-                }
+                trows = session.query(
+                    ForgetShield.thread_id, ForgetShield.cutoff_created_at,
+                ).filter(
+                    ForgetShield.status == "active",
+                    ForgetShield.selector_type == "thread",
+                    ForgetShield.thread_id.in_(thread_ids),
+                ).all()
+                cutoffs_by_thread: dict[str, list[Any]] = {}
+                for tid, cut in trows:
+                    cutoffs_by_thread.setdefault(tid, []).append(cut)
                 for m in meta:
-                    if m["thread_id"] in shielded_threads:
+                    cuts = cutoffs_by_thread.get(m["thread_id"] or "")
+                    if not cuts:
+                        continue
+                    ct = _as_utc(m["created_at"])
+                    if any(_within_cutoff(ct, c) for c in cuts):
                         blocked.add(m["id"])
 
             scope_pairs = {
@@ -169,40 +227,63 @@ class ForgetVisibilityService:
             if scope_pairs:
                 srows = session.query(
                     ForgetShield.scope_type, ForgetShield.scope_id,
+                    ForgetShield.cutoff_created_at,
                 ).filter(
                     ForgetShield.status == "active",
                     ForgetShield.selector_type == "scope",
                 ).all()
-                shielded_scopes = {(r[0], r[1]) for r in srows}
+                cutoffs_by_scope: dict[tuple[Any, Any], list[Any]] = {}
+                for st, si, cut in srows:
+                    cutoffs_by_scope.setdefault((st, si), []).append(cut)
                 for m in meta:
-                    if (m["scope_type"], m["scope_id"]) in shielded_scopes:
+                    cuts = cutoffs_by_scope.get((m["scope_type"], m["scope_id"]))
+                    if not cuts:
+                        continue
+                    ct = _as_utc(m["created_at"])
+                    if any(_within_cutoff(ct, c) for c in cuts):
                         blocked.add(m["id"])
 
             cks = {m["canonical_key"] for m in meta if m["canonical_key"]}
             if cks:
-                srows = session.query(ForgetShield.canonical_key).filter(
+                krows = session.query(
+                    ForgetShield.canonical_key, ForgetShield.cutoff_created_at,
+                ).filter(
                     ForgetShield.status == "active",
                     ForgetShield.selector_type == "canonical_key",
                     ForgetShield.canonical_key.in_(cks),
                 ).all()
-                shielded_cks = {r[0] for r in srows}
+                cutoffs_by_ck: dict[str, list[Any]] = {}
+                for ck, cut in krows:
+                    cutoffs_by_ck.setdefault(ck, []).append(cut)
                 for m in meta:
-                    if m["canonical_key"] in shielded_cks:
+                    cuts = cutoffs_by_ck.get(m["canonical_key"] or "")
+                    if not cuts:
+                        continue
+                    ct = _as_utc(m["created_at"])
+                    if any(_within_cutoff(ct, c) for c in cuts):
                         blocked.add(m["id"])
 
             time_shields = session.query(
                 ForgetShield.time_from, ForgetShield.time_to,
+                ForgetShield.cutoff_created_at,
             ).filter(
                 ForgetShield.status == "active",
                 ForgetShield.selector_type == "time_range",
             ).all()
             if time_shields:
                 for m in meta:
-                    ct = m["created_at"]
+                    ct = _as_utc(m["created_at"])
                     if ct is None:
+                        # 创建时间未知 → fail-closed
+                        blocked.add(m["id"])
                         continue
-                    for tf, tt in time_shields:
-                        if (tf is None or ct >= tf) and (tt is None or ct <= tt):
+                    for tf, tt, cut in time_shields:
+                        tf_u, tt_u = _as_utc(tf), _as_utc(tt)
+                        if (
+                            (tf_u is None or ct >= tf_u)
+                            and (tt_u is None or ct <= tt_u)
+                            and _within_cutoff(ct, cut)
+                        ):
                             blocked.add(m["id"])
                             break
 
@@ -386,9 +467,10 @@ class ForgetVisibilityService:
         target_type: str,
         target_ids: list[str],
     ) -> list[str]:
-        """过滤被 Shield 或 Tombstone 屏蔽的 ID，返回可见部分。"""
-        blocked = ForgetVisibilityService.batch_is_tombstone_blocked(
-            session, target_type, target_ids
+        """过滤被 Shield（实体级/选择器级/all_user_data，含 cutoff）或
+        Tombstone 屏蔽的 ID，返回可见部分。"""
+        blocked = ForgetVisibilityService.blocked_target_ids(
+            session, target_type, [(tid, None) for tid in target_ids],
         )
         return [tid for tid in target_ids if tid not in blocked]
 
@@ -399,8 +481,10 @@ class ForgetVisibilityService:
     ) -> list[dict[str, Any]]:
         """DEEP 历史回溯：过滤被 Shield/Tombstone 屏蔽的 Event。
 
-        先查选择器级 Shield（thread_id/scope/time_range/all_user_data），
-        再查实体级 Tombstone（block_visibility）。
+        统一委托 blocked_target_ids：覆盖实体级 Shield、选择器级 Shield
+        （thread/scope/time_range/all_user_data，均含 cutoff 语义）与
+        Tombstone.block_visibility。事件元数据（thread_id/created_at）从
+        events 表回源加载；字典自带 created_at 仅作元数据缺失时的兜底。
         """
         if not events:
             return []
@@ -408,39 +492,16 @@ class ForgetVisibilityService:
         def _event_id(e: dict[str, Any]) -> str | None:
             return e.get("id") or e.get("event_id")
 
-        event_ids = [eid for e in events if (eid := _event_id(e))]
+        pairs: list[tuple[str, Any]] = []
+        for e in events:
+            eid = _event_id(e)
+            if eid:
+                pairs.append((eid, e.get("created_at")))
 
-        # 选择器级 Shield：检查 thread 级别
-        thread_ids = list({e.get("thread_id") for e in events if e.get("thread_id")})
-        shielded_threads: set[str] = set()
-        if thread_ids:
-            rows = (
-                session.query(ForgetShield.thread_id)
-                .filter(
-                    ForgetShield.status == "active",
-                    ForgetShield.thread_id.in_(thread_ids),
-                )
-                .all()
-            )
-            shielded_threads = {row.thread_id for row in rows if row.thread_id}
-        # all_user_data Shield 全局拦截
-        has_all = (
-            session.query(ForgetShield.id)
-            .filter(ForgetShield.status == "active", ForgetShield.all_user_data.is_(True))
-            .first()
+        blocked = ForgetVisibilityService.blocked_target_ids(
+            session, "event", pairs,
         )
-        if has_all:
-            return []
-
-        # Tombstone 实体级屏蔽
-        blocked = ForgetVisibilityService.batch_is_tombstone_blocked(
-            session, "event", event_ids,
-        )
-        return [
-            e for e in events
-            if _event_id(e) not in blocked
-            and e.get("thread_id") not in shielded_threads
-        ]
+        return [e for e in events if _event_id(e) not in blocked]
 
     @staticmethod
     def filter_memory_ids(

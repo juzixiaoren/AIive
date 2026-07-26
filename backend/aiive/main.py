@@ -138,7 +138,10 @@ def create_app() -> FastAPI:
         try:
             _ensure_schema()
         except Exception:
-            logger.exception("数据库 schema 检查失败")
+            # 迁移失败必须阻断启动（与 validate_vector_runtime 策略一致）：
+            # 带着漂移的 schema 继续运行会产生更难恢复的数据损坏。
+            logger.exception("数据库 schema 迁移失败，阻断启动")
+            raise
         try:
             from aiive.config import settings
             from aiive.forget.fingerprint import configure_hmac_secret
@@ -174,6 +177,13 @@ def create_app() -> FastAPI:
                 validate_vector_runtime(vector_db)
             finally:
                 vector_db.close()
+        try:
+            # 重启后恢复已激活 MCP 能力的工具注册（注册表是进程内状态，DB 才是权威）
+            from aiive.mcp.bootstrap import restore_active_capabilities
+            from aiive.tools.registry import get_tool_registry
+            restore_active_capabilities(get_tool_registry())
+        except Exception:
+            logger.exception("MCP 已激活能力恢复注册失败")
         try:
             start_daemon()
         except Exception:

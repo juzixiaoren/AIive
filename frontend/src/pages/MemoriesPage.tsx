@@ -68,10 +68,14 @@ export default function MemoriesPage() {
         ok?: boolean;
         outcome?: string;
         reason?: string;
-        detail?: string;
+        detail?: unknown;
       };
       if (!response.ok || !payload.ok) {
-        throw new Error(payload.detail || payload.reason || `记忆未写入: ${payload.outcome || `HTTP ${response.status}`}`);
+        // FastAPI 请求体校验失败时 detail 是对象数组，直接放进 Error 会显示 [object Object]
+        const detail = typeof payload.detail === "string"
+          ? payload.detail
+          : payload.detail !== undefined ? JSON.stringify(payload.detail) : "";
+        throw new Error(detail || payload.reason || `记忆未写入: ${payload.outcome || `HTTP ${response.status}`}`);
       }
       setContent("");
       setPinned(false);
@@ -94,8 +98,13 @@ export default function MemoriesPage() {
         headers: action === "forget" ? { "Content-Type": "application/json" } : undefined,
         body: action === "forget" ? JSON.stringify({ reason: "用户从记忆管理页面请求遗忘" }) : undefined,
       });
-      const result = await response.json() as { ok?: boolean; reason?: string; detail?: string };
-      if (!response.ok || !result.ok) throw new Error(result.detail || result.reason || `HTTP ${response.status}`);
+      const result = await response.json() as { ok?: boolean; reason?: string; detail?: unknown };
+      if (!response.ok || !result.ok) {
+        const detail = typeof result.detail === "string"
+          ? result.detail
+          : result.detail !== undefined ? JSON.stringify(result.detail) : "";
+        throw new Error(detail || result.reason || `HTTP ${response.status}`);
+      }
       await loadMemories();
     } catch (err) {
       setError(`${actionLabel}记忆失败: ${err instanceof Error ? err.message : "未知错误"}`);

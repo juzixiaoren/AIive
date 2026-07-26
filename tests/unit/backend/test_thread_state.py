@@ -44,12 +44,13 @@ class TestThreadState:
         assert t2.id == t1.id
 
     def test_get_or_create_new_when_not_found(self, db_session):
-        """传入不存在的 ID 时应创建新线程（ID 被替换）。"""
+        """传入不存在的 ID 时应以该 ID 创建新线程（不得静默换 ID，
+        否则调用方持有的 thread_id 与实际落库线程分裂）。"""
         state = ThreadState(db_session)
         thread = state.get_or_create_thread(thread_id="nonexistent-id")
         db_session.flush()
 
-        assert thread.id != "nonexistent-id"
+        assert thread.id == "nonexistent-id"
 
     def test_load_recent_messages_bounded_empty(self, db_session):
         """空线程应返回空消息列表。"""
@@ -272,6 +273,7 @@ class TestThreadState:
         db_session.add(TurnRecord(
             thread_id=thread.id, turn_id="turn-runtime", turn_sequence=1,
             status="completed", request_fingerprint="fp-runtime",
+            source="runtime_event",
         ))
         db_session.add_all([
             Event(trace_id="trace-runtime", thread_id=thread.id, turn_id="turn-runtime",
@@ -284,6 +286,7 @@ class TestThreadState:
         db_session.add(TurnRecord(
             thread_id=thread.id, turn_id="turn-system", turn_sequence=2,
             status="completed", request_fingerprint="fp-system",
+            source="system_command",
         ))
         db_session.add(Event(
             trace_id="trace-system", thread_id=thread.id, turn_id="turn-system",

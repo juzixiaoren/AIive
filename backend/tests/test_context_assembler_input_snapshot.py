@@ -100,7 +100,7 @@ def test_unified_recall_diagnostic_failure_does_not_retry_or_pollute_session(db,
         db,
         "Python",
         ScopeContext(thread_id=thread.id),
-        thread,
+        thread.id,
         RecallConfig(),
         trace_id="trace-diagnostics-failure",
     )

@@ -105,9 +105,9 @@ def test_collect_hot_history_ids_includes_sealing_bridge_summary(db_session):
     )
     db_session.add_all([thread, epoch, segment, summary])
     db_session.flush()
-    assembler = ContextAssembler(token_counter=_FakeTokenCounter(), budget=ContextBudget.DEFAULT)
+    assembler = ContextAssembler(token_counter=_FakeTokenCounter(), budget=ContextBudget.default())
 
-    hot_ids = assembler._collect_hot_history_ids(db_session, thread)  # pyright: ignore[reportPrivateUsage]
+    hot_ids = assembler._collect_hot_history_ids(db_session, thread.id)  # pyright: ignore[reportPrivateUsage]
 
     assert summary.id in hot_ids
 
@@ -165,10 +165,10 @@ def test_langchain_conversion_tolerates_malformed_tool_arguments():
 
 def test_build_reports_includes_per_partition_and_total():
     """审查项 3: _build_reports 应产出每个分区及 total 汇总。"""
-    asm = ContextAssembler(token_counter=_FakeTokenCounter(), budget=ContextBudget.DEFAULT)
+    asm = ContextAssembler(token_counter=_FakeTokenCounter(), budget=ContextBudget.default())
     total = TokenCount(estimated_tokens=100, safety_margin_tokens=0, source="fake", model="m")
     reports = asm._build_reports(
-        trim_plan=__import__("aiive.runtime.context_assembler", fromlist=["TrimPlan"]).TrimPlan.from_budget(ContextBudget.DEFAULT, 0),
+        trim_plan=__import__("aiive.runtime.context_assembler", fromlist=["TrimPlan"]).TrimPlan.from_budget(ContextBudget.default(), 0),
         total=total,
         stable_contract_text="contract",
         core_memory_text="core",
@@ -196,8 +196,8 @@ def test_context_budget_from_env_default_without_env(monkeypatch):
     """P1-7: 未设置环境变量时 from_env 回退到默认预算。"""
     monkeypatch.delenv("AIIVE_CONTEXT_BUDGET_JSON", raising=False)
     budget = ContextBudget.from_env()
-    assert budget.model_context_window == ContextBudget.DEFAULT.model_context_window
-    assert budget.tool_results.hard_limit_tokens == ContextBudget.DEFAULT.tool_results.hard_limit_tokens
+    assert budget.model_context_window == ContextBudget.default().model_context_window
+    assert budget.tool_results.hard_limit_tokens == ContextBudget.default().tool_results.hard_limit_tokens
 
 
 def test_context_budget_from_env_override(monkeypatch):
@@ -210,7 +210,7 @@ def test_context_budget_from_env_override(monkeypatch):
     assert budget.tool_results.soft_limit_tokens == 3000
     assert budget.tool_results.hard_limit_tokens == 5000
     # 其他分区不受影响
-    assert budget.stable_contract.soft_limit_tokens == ContextBudget.DEFAULT.stable_contract.soft_limit_tokens
+    assert budget.stable_contract.soft_limit_tokens == ContextBudget.default().stable_contract.soft_limit_tokens
 
 
 def test_context_budget_from_env_rejects_invalid_limit(monkeypatch):

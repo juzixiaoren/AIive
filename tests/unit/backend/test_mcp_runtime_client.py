@@ -1,62 +1,110 @@
-"""测试 MCP 运行时客户端——工具注册、调用和错误处理。"""
-from aiive.mcp.runtime_client import MCPRuntimeClient, MCPToolResult
+"""测试 MCP 运行时客户端（真实 stdio 协议版本）的纯逻辑行为。
+
+说明：旧的进程内 mock API（register_tool + 直接调 Python callable）已随
+真实 MCP 链路移除。需要真实子进程的协议行为（initialize 握手、tools/list、
+tools/call、isError 传播、会话复用）由
+backend/tests/test_mcp_pipeline.py::TestRuntimeClient 用 Python 假 MCP
+server 夹具（backend/tests/fixtures/fake_mcp_server.py）完整覆盖；
+本文件只保留无需启动子进程的单元用例。
+"""
+from types import SimpleNamespace
+
+import pytest
+
+from aiive.mcp.runtime_client import (
+    MCPLaunchSpec,
+    MCPRuntimeClient,
+    MCPToolResult,
+    _convert_call_result,
+    build_launch_spec,
+    tool_result_is_untrusted,
+)
 
 
-class TestMCPRuntimeClient:
-    """测试 MCPRuntimeClient 的工具管理功能。"""
+class TestUntrustedContract:
+    """MCP 输出恒为不信任内容的契约。"""
 
-    def test_register_and_call_tool(self):
-        """验证注册工具后能正常调用。"""
-        client = MCPRuntimeClient()
-
-        def greet(name: str = "World") -> str:
-            return f"Hello, {name}!"
-
-        client.register_tool("greet", greet)
-        result = client.call_tool("greet", {"name": "AIive"})
-        assert result.ok is True
-        assert result.result == "Hello, AIive!"
-
-    def test_unknown_tool_returns_error(self):
-        """验证调用未注册工具时返回错误。"""
-        client = MCPRuntimeClient()
-        result = client.call_tool("nonexistent", {})
-        assert result.ok is False
-        assert "Unknown tool" in result.error
-
-    def test_tool_error_returns_error(self):
-        """验证工具执行异常时正确返回错误信息。"""
-        client = MCPRuntimeClient()
-
-        def bad_tool():
-            raise ValueError("something went wrong")
-
-        client.register_tool("bad", bad_tool)
-        result = client.call_tool("bad", {})
-        assert result.ok is False
-        assert "something went wrong" in result.error
-
-    def test_list_tools(self):
-        """验证列出已注册工具列表。"""
-        client = MCPRuntimeClient()
-        client.register_tool("t1", lambda: None)
-        client.register_tool("t2", lambda: None)
-        tools = client.list_tools()
-        assert "t1" in tools
-        assert "t2" in tools
-
-    def test_tool_result_is_untrusted(self):
-        """验证工具结果默认标记为不可信。"""
+    def test_client_tool_result_is_untrusted(self):
         client = MCPRuntimeClient()
         assert client.tool_result_is_untrusted() is True
 
-    def test_result_is_mcp_tool_result(self):
-        """验证调用结果类型为 MCPToolResult。"""
+    def test_module_level_tool_result_is_untrusted(self):
+        assert tool_result_is_untrusted() is True
+
+    def test_mcp_tool_result_untrusted_by_default(self):
+        assert MCPToolResult(ok=True, result={}).untrusted is True
+        assert MCPToolResult(ok=False, error="x").untrusted is True
+
+
+class TestConfiguration:
+    """启动规格登记与未配置能力的失败行为。"""
+
+    def test_configure_and_is_configured(self):
         client = MCPRuntimeClient()
+        assert client.is_configured("mcp:x") is False
+        client.configure("mcp:x", MCPLaunchSpec(command="node", args=("a.js",)))
+        assert client.is_configured("mcp:x") is True
 
-        def echo(msg: str = "") -> str:
-            return msg
+    def test_list_tools_unconfigured_raises(self):
+        client = MCPRuntimeClient()
+        with pytest.raises(RuntimeError, match="not configured"):
+            client.list_tools("mcp:nowhere", timeout=1, startup_timeout=1)
 
-        client.register_tool("echo", echo)
-        result = client.call_tool("echo", {"msg": "hello"})
+    def test_call_tool_unconfigured_returns_honest_error(self):
+        """call_tool 不抛异常，返回 ok=False + untrusted 标记。"""
+        client = MCPRuntimeClient()
+        result = client.call_tool("mcp:nowhere", "echo", {}, timeout=1, startup_timeout=1)
         assert isinstance(result, MCPToolResult)
+        assert result.ok is False
+        assert result.untrusted is True
+        assert "not configured" in result.error
+
+
+class TestBuildLaunchSpec:
+    """启动命令只能由安装记录的结构化字段拼装，拒绝任意命令。"""
+
+    def test_rejects_non_node_runner(self):
+        with pytest.raises(ValueError, match="unsupported MCP runner"):
+            build_launch_spec({"runner": "cmd.exe", "entry_js": "x.js"})
+
+    def test_rejects_missing_entry_js_field(self):
+        with pytest.raises(ValueError, match="missing entry_js"):
+            build_launch_spec({"runner": "node"})
+
+    def test_rejects_nonexistent_entry_file(self):
+        with pytest.raises(ValueError, match="not found"):
+            build_launch_spec({"runner": "node", "entry_js": "Z:/no/such/entry.js"})
+
+
+class TestConvertCallResult:
+    """SDK CallToolResult → MCPToolResult 的转换逻辑。"""
+
+    def test_success_result_with_text_and_structured(self):
+        raw = SimpleNamespace(
+            content=[SimpleNamespace(text="hello")],
+            structuredContent={"k": 1},
+            isError=False,
+        )
+        result = _convert_call_result(raw)
+        assert isinstance(result, MCPToolResult)
+        assert result.ok is True
+        assert result.untrusted is True
+        assert result.result["content"] == ["hello"]
+        assert result.result["structured"] == {"k": 1}
+
+    def test_is_error_maps_to_failed_result(self):
+        raw = SimpleNamespace(
+            content=[SimpleNamespace(text="something went wrong")],
+            structuredContent=None,
+            isError=True,
+        )
+        result = _convert_call_result(raw)
+        assert result.ok is False
+        assert result.untrusted is True
+        assert "something went wrong" in result.error
+
+    def test_empty_error_content_gets_placeholder(self):
+        raw = SimpleNamespace(content=[], structuredContent=None, isError=True)
+        result = _convert_call_result(raw)
+        assert result.ok is False
+        assert result.error

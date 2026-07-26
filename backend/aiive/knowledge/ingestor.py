@@ -72,6 +72,12 @@ class KnowledgeIngestor:
                     existing.mime_type = mime_type
                     existing.status = "indexed"
                 chunks = self._db.query(Chunk).filter(Chunk.document_id == existing.id).count()
+                if chunks == 0:
+                    # 去重命中但分块缺失（此前摄取失败/被清理）→ 补建分块
+                    chunks = self._replace_chunks(
+                        existing, data.decode("utf-8", errors="replace")
+                    )
+                    existing.status = "indexed"
                 self._db.flush()
                 return {
                     "ok": True, "duplicate": True, "document_id": existing.id,
@@ -119,9 +125,30 @@ class KnowledgeIngestor:
             self._db.flush()
             return {"ok": True, "document_id": document.id, "chunks": count}
         except Exception:
-            document.status = "index_failed"
             logger.exception("知识文档重新索引失败：%s", document_id)
+            # 在当前事务上赋值 status 后 raise 会被外层 rollback 抹掉（死代码）。
+            # 用独立短会话落盘失败状态，保证 index_failed 可观测。
+            self._mark_index_failed(document_id)
             raise
+
+    @staticmethod
+    def _mark_index_failed(document_id: str) -> None:
+        """用独立短会话写入 index_failed 状态（不受调用方事务回滚影响）。"""
+        try:
+            from aiive.db.base import SessionLocal
+
+            side = SessionLocal()
+            try:
+                doc = side.get(Document, document_id)
+                if doc is not None:
+                    doc.status = "index_failed"
+                    side.commit()
+                else:
+                    side.rollback()
+            finally:
+                side.close()
+        except Exception:
+            logger.warning("写入 index_failed 状态失败：%s", document_id, exc_info=True)
 
 
 def search_chunks(db: Session, query: str, limit: int = 5) -> list[dict[str, Any]]:

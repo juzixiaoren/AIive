@@ -8,30 +8,36 @@ from aiive.runtime.attention_manager import AttentionManager
 class TestAttentionManager:
     """测试注意力状态的计算、记录和查询。"""
 
-    def test_recompute_returns_continue_for_new_thread(self, db_session):
-        """验证新线程首次计算返回 continue 决策。"""
+    def test_resolve_for_turn_returns_continue_for_new_thread(self, db_session):
+        """验证新线程首回合返回 continue 决策并建立焦点。"""
         mgr = AttentionManager(db_session)
-        result = mgr.recompute("thread-new", "coding")
+        result = mgr.resolve_for_turn("thread-new", "turn-1", "coding")
         assert result["decision"] == "continue"
         assert result["focus_topic"] == "coding"
 
     def test_get_current_returns_latest(self, db_session):
         """验证查询当前状态返回最新一条记录。"""
-        mgr = AttentionManager(db_session)
-        mgr.recompute("thread-1", "topic1")
-        db_session.flush()
-        mgr.recompute("thread-1", "topic2")
+        db_session.add(AttentionState(
+            thread_id="thread-1", focus_topic="topic1",
+            recent_topics=["topic1"], decision="continue",
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        ))
+        db_session.add(AttentionState(
+            thread_id="thread-1", focus_topic="topic2",
+            recent_topics=["topic2"], decision="continue",
+            created_at=datetime.now(timezone.utc),
+        ))
         db_session.flush()
 
-        state = mgr.get_current("thread-1")
+        state = AttentionManager(db_session).get_current("thread-1")
         assert state is not None
         assert state.focus_topic == "topic2"
 
-    def test_recompute_records_recent_topics(self, db_session):
+    def test_resolve_for_turn_records_recent_topics(self, db_session):
         """验证计算结果中包含最近主题列表。"""
         mgr = AttentionManager(db_session)
-        result = mgr.recompute("thread-x", "test")
-        assert "recent_topics" in result
+        result = mgr.resolve_for_turn("thread-x", "turn-1", "test")
+        assert result["recent_topics"] == ["test"]
 
     def test_resolve_for_turn_initializes_focus_once(self, db_session):
         """首回合建立焦点，连续回合不重复写入状态。"""

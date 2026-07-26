@@ -185,8 +185,15 @@ export async function sendMessageStream(
         } else if (line.startsWith("data: ")) {
           // 解析 SSE 数据行
           const dataStr = line.slice(6);
+          // JSON 解析与回调分发分开 try：解析失败才可静默跳过，
+          // 回调内的异常必须记录，否则事件（如 tool_result）会无声丢失
+          let data: Record<string, unknown>;
           try {
-            const data = JSON.parse(dataStr);
+            data = JSON.parse(dataStr);
+          } catch {
+            continue; // 跳过格式错误的 JSON 数据
+          }
+          try {
             switch (currentEvent) {
               case "started":
                 onStarted({
@@ -235,7 +242,7 @@ export async function sendMessageStream(
             }
           } catch (error) {
             if (error instanceof ApiError) throw error;
-            // 跳过格式错误的 JSON 数据
+            console.error("SSE 事件回调处理失败:", currentEvent, error);
           }
         }
       }
@@ -263,11 +270,15 @@ export async function sendMessageStream(
  * @param threadId - 可选的对话线程 ID
  */
 export async function resetThread(threadId?: string): Promise<void> {
-  await fetch("api/thread/reset", {
+  const res = await fetch("api/thread/reset", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ thread_id: threadId ?? null }),
   });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`重置上下文失败 ${res.status}: ${text}`);
+  }
 }
 
 /**

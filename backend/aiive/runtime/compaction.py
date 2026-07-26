@@ -82,6 +82,9 @@ def build_event_manifest(db: Session, turn_ids: list[str]) -> list[dict[str, Any
     """Segment 内所有 Event 的有序清单（含 content_hash）。
 
     turn_record_id 通过 turn_id 关联回 TurnRecord，供 Phase B 逐条校验。
+    排序按 (TurnRecord.turn_sequence, Event.turn_event_index)（时间序），
+    而非 turn_id 字典序 —— 保证 event_manifest 尾部即时间尾部
+    （_load_sealing_bridge 依赖 event_ids[-N:] 取时间尾部）。
     """
     if not turn_ids:
         return []
@@ -91,8 +94,13 @@ def build_event_manifest(db: Session, turn_ids: list[str]) -> list[dict[str, Any
     }
     events = (
         db.query(Event)
+        .join(
+            TurnRecord,
+            (TurnRecord.turn_id == Event.turn_id)
+            & (TurnRecord.thread_id == Event.thread_id),
+        )
         .filter(Event.turn_id.in_(turn_ids))
-        .order_by(Event.turn_id, Event.turn_event_index)
+        .order_by(TurnRecord.turn_sequence, Event.turn_event_index)
         .all()
     )
     return [
@@ -409,10 +417,12 @@ def count_summary_tokens(model: str, summary_text: str) -> int:
 # 失败 Turn → unresolved_failures 派生（Item 2）
 # ============================================================================
 
-# 阻断密封的非终态 Turn
-NON_TERMINAL_TURN_STATUSES = {"not_started", "running", "interrupted_unknown"}
-# 视为“失败/已取消”的终态 Turn
-FAILED_TURN_STATUSES = {"failed", "cancelled", "preempted"}
+# 阻断密封的非终态 Turn（全库唯一定义，epoch_manager 从此处导入）。
+# interrupted_unknown 是吸收态（无任何修复路径，重试直接 conflict），
+# 若计入非终态会永久阻塞 Segment 密封，故视为终态、可密封。
+NON_TERMINAL_TURN_STATUSES = {"not_started", "running"}
+# 视为“失败/已取消/中断”的终态 Turn，参与 unresolved_failures 派生。
+FAILED_TURN_STATUSES = {"failed", "cancelled", "preempted", "interrupted_unknown"}
 
 
 def derive_unresolved_failures(db: Session, segment_id: str) -> list[dict[str, Any]]:

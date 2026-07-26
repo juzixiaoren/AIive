@@ -40,8 +40,8 @@ class MemoryAccessTracker:
         ids = list(dict.fromkeys(memory_ids))  # 去重，保序
         if not ids:
             return
+        db = SessionLocal()
         try:
-            db = SessionLocal()
             rows = (
                 db.query(
                     MemoryRecord.id,
@@ -83,3 +83,9 @@ class MemoryAccessTracker:
             db.commit()
         except Exception:
             logger.exception("MemoryAccessTracker.touch 异常")
+            try:
+                db.rollback()
+            except Exception:
+                logger.exception("MemoryAccessTracker.touch 回滚失败")
+        finally:
+            db.close()

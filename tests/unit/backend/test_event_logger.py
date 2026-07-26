@@ -86,8 +86,9 @@ class TestFaithfulTracing:
             "aiive.runtime.agent_graph.build_langchain_tools", return_value=tools
         ), patch("aiive.runtime.agent_graph.get_tool_registry") as mock_reg:
             mock_reg.return_value.list_all.return_value = []
-            # 直接调用内部记录点，避免真实 LLM 调用
-            graph._logger.log_event(
+            # 直接调用事件记录器，避免真实 LLM 调用
+            # （AgentGraph 已不再持有 _logger 成员，事件记录经 EventLogger 独立完成）
+            EventLogger(db_session).log_event(
                 trace_id=trace.trace_id, thread_id=thread.id,
                 event_type="system_injection",
                 payload={

@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from aiive.memory.memory_key_registry import MemoryKeyRegistry, get_memory_key_registry
-from aiive.memory.memory_policy import MemoryPolicyEngine
+from aiive.memory.memory_policy import AUTHORITY_RELATIONS, MemoryPolicyEngine
 from aiive.memory.memory_types import (
     MemoryProposal,
     Sensitivity,
@@ -79,9 +79,15 @@ class MemoryGate:
             )
 
         if proposal.evidence:
+            # relation="derived_from" 的证据仅作 provenance，不参与权威判定
+            # （如 assistant 回复事件）。过滤后若无任何权威证据，decide_authority
+            # 对空列表返回 forbidden → 维持拒绝（保护空权威场景）。
             authority = self._policy.decide_authority(
                 proposal.memory_type,
-                [item.source_type for item in proposal.evidence],
+                [
+                    item.source_type for item in proposal.evidence
+                    if item.relation in AUTHORITY_RELATIONS
+                ],
             )
             if not authority.allowed:
                 return GateDecision(

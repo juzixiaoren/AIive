@@ -128,12 +128,37 @@ class CapabilityPlanner:
         results.sort(key=lambda e: e.risk_score.overall)
         return results
 
+    def plan_from_goal(self, goal: str) -> InstallPlan:
+        """端到端规划：先分析目标提取搜索关键词，再用关键词搜索、评估、生成计划。
+
+        修复历史缺陷：analyze_goal 产出的 search_keywords 曾从未被用于搜索
+        （generate_plan 在搜索完成后才调用它）。此方法把分析提前，用
+        LLM 提取的关键词驱动候选搜索，仅调用一次 LLM。
+        """
+        analysis = self.analyze_goal(goal)
+        keywords = [str(k) for k in analysis.get("search_keywords", []) if str(k).strip()]
+        if not keywords:
+            keywords = goal.split()[:5]
+        candidates_raw = self.search_candidates(keywords)
+        # 关键词太窄搜不到时，退回用原始目标全文搜索
+        if not candidates_raw:
+            candidates_raw = self.search_candidates([goal])
+        evaluations = self.evaluate_candidates(candidates_raw)
+        return self.generate_plan(goal, candidates_raw, evaluations, analysis=analysis)
+
     def generate_plan(
         self, goal: str, _candidates_raw: list[dict[str, Any]],
         evaluations: list[CandidateEvaluation],
+        analysis: dict[str, Any] | None = None,
     ) -> InstallPlan:
-        """生成完整安装计划。"""
-        analysis = self.analyze_goal(goal)
+        """生成完整安装计划。
+
+        参数:
+            analysis: 可选的预计算目标分析结果（plan_from_goal 传入，
+                      避免重复调用 LLM）；为 None 时内部调用 analyze_goal。
+        """
+        if analysis is None:
+            analysis = self.analyze_goal(goal)
         plan = InstallPlan(
             goal=goal,
             goal_summary=analysis.get("goal_summary", ""),
@@ -156,9 +181,15 @@ class CapabilityPlanner:
     # ------------------------------------------------------------------
 
     def _compute_risk(self, candidate: dict[str, Any]) -> RiskScore:
-        """计算候选风险评分。"""
+        """计算候选风险评分。
+
+        校准说明：信任映射 semi_trusted=0.7（官方注册表来源），配合下方
+        verdict 阈值（low ≤ 0.35），使官方来源、低权限风险的候选可以达到
+        "low"→"recommended"。历史缺陷：semi_trusted=0.5 时公式最优
+        overall≈0.33 > 0.25，"recommended" 在数学上不可达。
+        """
         trust = candidate.get("definition_trust_level", "semi_trusted")
-        source_trust = {"trusted": 0.9, "semi_trusted": 0.5, "untrusted": 0.2}.get(trust, 0.3)
+        source_trust = {"trusted": 0.9, "semi_trusted": 0.7, "untrusted": 0.2}.get(trust, 0.3)
         declared_tools = candidate.get("declared_tools", [])
         tool_count = len(declared_tools) if isinstance(declared_tools, list) else 0
         tool_risk = min(1.0, tool_count / 20.0)
@@ -169,11 +200,11 @@ class CapabilityPlanner:
         stability = 0.7
         overall = 1.0 - (source_trust * 0.4 + stability * 0.2 + (1.0 - perm_risk) * 0.2 + (1.0 - tool_risk) * 0.2)
         verdict = "low"
-        if overall > 0.6:
+        if overall > 0.65:
             verdict = "critical"
-        elif overall > 0.4:
+        elif overall > 0.5:
             verdict = "high"
-        elif overall > 0.25:
+        elif overall > 0.35:
             verdict = "medium"
         return RiskScore(
             source_trust=source_trust, version_stability=stability,

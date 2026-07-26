@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json as _json
 import logging
@@ -48,10 +49,8 @@ from aiive.core.action_planner import ActionPlanner, MemorySignalDecision
 from aiive.core.llm_client import normalize_llm_error
 from aiive.core.llm_client import LLMClient
 from aiive.memory.extraction_policy import MemoryExtractionPolicy, MemorySignalAction
-from aiive.memory.memory_store import MemoryStore
 from aiive.runtime.context_assembler import ContextSnapshotData, ContextSnapshotItem
 from aiive.runtime.execution_context import TurnExecutionContext
-from aiive.runtime.event_logger import EventLogger
 from aiive.runtime.policy_engine import check_tool_calls, PolicyAction
 from aiive.runtime.thread_state import ThreadState
 from aiive.runtime.action_cards import ActionCard, PendingOperation
@@ -233,6 +232,20 @@ def _truncate(text: str, max_len: int) -> str:
     return text[:max_len] + "…"
 
 
+def _bound_stream_tool_content(content: str, normalizer: Any | None) -> str:
+    """按 ToolResultNormalizer 内联上限（token）折算的字符上限截断流式工具输出。
+
+    用于 SSE tool_result 事件与中断工具事实持久化两个消费点，
+    防止原始大结果无界推送/落库。按 ~4 字符/token 保守折算。
+    """
+    from aiive.runtime.tool_normalizer import SINGLE_TOOL_RESULT_INLINE_LIMIT
+    limit_tokens = getattr(normalizer, "SINGLE_RESULT_INLINE_LIMIT", None) or SINGLE_TOOL_RESULT_INLINE_LIMIT
+    max_chars = int(limit_tokens) * 4
+    if len(content) <= max_chars:
+        return content
+    return content[:max_chars] + "\n…[工具结果过大已截断，完整内容见 Artifact 引用]"
+
+
 def flatten_tool_result(result: object) -> str:
     """从嵌套的 {ok: bool, result: str} 结构中提取实际结果字符串。"""
     if isinstance(result, dict) and "result" in result:
@@ -254,8 +267,9 @@ class ToolRecord:
     name: str = ""
     params: dict[str, Any] = field(default_factory=dict)
     result: dict[str, Any] = field(default_factory=dict)
-    status: str = "completed"     # "completed" | "failed" | "execution_unknown"
+    status: str = "completed"     # "completed" | "failed" | "execution_unknown" | "blocked"
     order_index: int = 0          # 全局执行顺序
+    reason: str = ""              # blocked 等状态的原因说明
 
 
 @dataclass
@@ -290,18 +304,14 @@ class AgentGraph:
     Attributes:
         _llm_client: AIive LLMClient 实例
         _db: SQLAlchemy 数据库会话
-        _logger: 事件日志记录器
         _thread_state: 线程状态管理器
-        _memory_store: 记忆存储
         _action_planner: 动作规划器（记忆信号分类）
     """
 
     def __init__(self, llm_client: LLMClient, db: Session):
         self._llm_client: LLMClient = llm_client
         self._db: Session = db
-        self._logger: EventLogger = EventLogger(db)
         self._thread_state: ThreadState = ThreadState(db)
-        self._memory_store: MemoryStore = MemoryStore(db)
         self._action_planner: ActionPlanner = ActionPlanner(llm_client)
 
     # ------------------------------------------------------------------
@@ -536,6 +546,26 @@ Be concise by default. Provide additional detail when the task is complex, the u
                 return "confirm"
             logger.info("[TRACE:graph] POLICY_CHECK(ns): action=%s → %s", result.action, "finalize" if result.action == PolicyAction.BLOCK else "continue")
             if result.action == PolicyAction.BLOCK:
+                # 记录被阻止的工具事实（tool_blocked 卡片），避免阻断原因丢失后
+                # 被误报为 empty_llm_response。
+                blocked_set = set(result.blocked_tools)
+                batch_index = max(
+                    0,
+                    sum(1 for m in msgs if isinstance(m, AIMessage) and m.tool_calls) - 1,
+                )
+                for tc in tool_calls_raw:
+                    if tc["name"] not in blocked_set:
+                        continue
+                    tool_records.append({
+                        "name": tc["name"],
+                        "params": tc.get("args", {}),
+                        "result": {"ok": False, "result": f"blocked: {result.reason}"},
+                        "status": "blocked",
+                        "reason": result.reason,
+                        "trace_id": trace_id,
+                        "tool_call_id": str(tc.get("id", "") or ""),
+                        "batch_index": batch_index,
+                    })
                 return "finalize"
             return "continue"
 
@@ -796,6 +826,7 @@ Be concise by default. Provide additional detail when the task is complex, the u
 
         # ── ToolRecord（Graph state 是同步与流式共同事实源）──
         tool_records = self._tool_records_from_state(result.get("tool_records", []))
+        reply = self._merge_blocked_records(_records_raw, tool_records, reply)
 
         # 空回复且非审批挂起属于异常情况，记录告警以便定位根因
         # （LLM 空响应、工具绑定异常、streaming 兼容问题等）。
@@ -826,7 +857,8 @@ Be concise by default. Provide additional detail when the task is complex, the u
                 reply = f"需要你的确认来执行以下工具: {', '.join(tool_names)}"
 
         card_records = [
-            ToolCallRecord(name=r.name, params=r.params, result=r.result, status=r.status, trace_id=trace.trace_id)
+            ToolCallRecord(name=r.name, params=r.params, result=r.result, status=r.status,
+                           trace_id=trace.trace_id, reason=r.reason, tool_call_id=r.tool_call_id)
             for r in tool_records
         ]
         action_cards = build_action_cards(card_records, pending_approvals=pending_approvals)
@@ -882,7 +914,8 @@ Be concise by default. Provide additional detail when the task is complex, the u
         trace_id = exec_ctx.trace_id
         message_source = exec_ctx.message_source
         trace = Trace(trace_id=trace_id) if trace_id else Trace.new()
-        thread = self._thread_state.get_or_create_thread(thread_id)
+        # 同步 DB 调用不得阻塞事件循环（与 Phase 1 to_thread 先例一致）
+        thread = await asyncio.to_thread(self._thread_state.get_or_create_thread, thread_id)
 
         if normalizer is None:
             normalizer = ToolResultNormalizer(LiteLLMTokenCounter(), self._llm_client.default_model)
@@ -1010,6 +1043,10 @@ Be concise by default. Provide additional detail when the task is complex, the u
                         content = str(output)
                     receipt = parse_tool_execution_receipt(content)
                     result_status = receipt.status
+                    # on_tool_end 携带的是规范化前的原始工具输出，可能达数百 KB：
+                    # SSE 推送与中断事实持久化均须按内联上限截断（引用化版本
+                    # 由 _tools_node 的 normalizer 负责写入正式事实源）。
+                    content = _bound_stream_tool_content(content, normalizer)
                     tool_call_id = ""
                     if first is not None and hasattr(first, "tool_call_id"):
                         tool_call_id = str(getattr(first, "tool_call_id", "") or "")
@@ -1069,7 +1106,10 @@ Be concise by default. Provide additional detail when the task is complex, the u
 
         # ── Graph state 是正常完成后的唯一事实源 ──
         state_records = final_state.get("tool_records", []) if final_state is not None else _records_raw
-        tool_records = self._tool_records_from_state(state_records)
+        tool_records = self._tool_records_from_state(
+            [r for r in state_records if r.get("status") != "blocked"],
+        )
+        reply = self._merge_blocked_records(_records_raw, tool_records, reply)
 
         # ── 审批记录 ──
         if pending_approvals:
@@ -1095,7 +1135,8 @@ Be concise by default. Provide additional detail when the task is complex, the u
             )
 
         card_records = [
-            ToolCallRecord(name=r.name, params=r.params, result=r.result, status=r.status, trace_id=trace.trace_id)
+            ToolCallRecord(name=r.name, params=r.params, result=r.result, status=r.status,
+                           trace_id=trace.trace_id, reason=r.reason, tool_call_id=r.tool_call_id)
             for r in tool_records
         ]
         action_cards = build_action_cards(card_records, pending_approvals=pending_approvals)
@@ -1114,7 +1155,11 @@ Be concise by default. Provide additional detail when the task is complex, the u
 
         signal: MemorySignalDecision = MemorySignalDecision(action=MemorySignalAction.EXTRACT_ASYNC.value, confidence=0.5, reason="default")
         try:
-            signal = self._action_planner.classify_memory_signal(user_message=message, reply=reply, trace_id=trace.trace_id)
+            # 同步 LLM HTTP 调用（最长可达 30s），必须移出事件循环线程
+            signal = await asyncio.to_thread(
+                self._action_planner.classify_memory_signal,
+                user_message=message, reply=reply, trace_id=trace.trace_id,
+            )
         except Exception:
             logger.warning("记忆信号分类失败（已使用默认信号）: trace_id=%s", trace.trace_id, exc_info=True)
         signal.action = MemoryExtractionPolicy.resolve_action(
@@ -1133,6 +1178,35 @@ Be concise by default. Provide additional detail when the task is complex, the u
         }
 
     @staticmethod
+    def _merge_blocked_records(
+        records_raw: list[dict[str, Any]],
+        tool_records: list["ToolRecord"],
+        reply: str,
+    ) -> str:
+        """将 policy BLOCK 记录合并进 tool_records，并在无回复时给出如实说明。
+
+        BLOCK 时 tools 节点未执行，被阻止的调用只存在于共享 records_raw 中
+        （状态为 blocked），需在此并入结果，产出 tool_blocked 卡片而非
+        伪装成 empty_llm_response。返回（可能被替换的）回复文本。
+        """
+        blocked_raw = [r for r in records_raw if r.get("status") == "blocked"]
+        for r in blocked_raw:
+            tool_records.append(ToolRecord(
+                tool_call_id=str(r.get("tool_call_id", "") or ""),
+                batch_index=int(r.get("batch_index", 0) or 0),
+                name=str(r.get("name", "") or ""),
+                params=r.get("params", {}) if isinstance(r.get("params"), dict) else {},
+                result=r.get("result", {"ok": False, "result": "blocked"}),
+                status="blocked",
+                order_index=len(tool_records),
+                reason=str(r.get("reason", "") or ""),
+            ))
+        if not reply and blocked_raw:
+            names = ", ".join(sorted({str(r.get("name", "") or "") for r in blocked_raw}))
+            reply = f"工具调用被策略阻止（工具未注册）: {names}。请检查工具配置后重试。"
+        return reply
+
+    @staticmethod
     def _tool_records_from_state(records: list[dict[str, Any]]) -> list["ToolRecord"]:
         """将 Graph state 中的工具事实转换为统一 ToolRecord。"""
         return [
@@ -1144,6 +1218,7 @@ Be concise by default. Provide additional detail when the task is complex, the u
                 result=record.get("result", {"ok": False, "result": ""}),
                 status=str(record.get("status", "completed") or "completed"),
                 order_index=index,
+                reason=str(record.get("reason", "") or ""),
             )
             for index, record in enumerate(records)
         ]

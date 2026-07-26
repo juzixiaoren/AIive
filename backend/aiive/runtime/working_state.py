@@ -165,7 +165,15 @@ class WorkingStateService:
     # ── 崩溃恢复 ──
 
     def recover_orphaned_tools(self, db: Session, thread_id: str) -> None:
-        """清理 running_tool_state 中对应 TurnRecord 已非 running 的孤立条目。"""
+        """清理崩溃残留的孤立运行状态。
+
+        - running_tool_state：对应 TurnRecord 已非 running 的条目移除；
+        - uncommitted_side_effects：ref 对应上述被移除的孤立运行条目
+          （即其 Turn 已达终态、正常清理路径未走到）的记录一并移除，
+          否则崩溃残留会永久阻塞 Segment 密封（check_sealable 检查该字段）。
+          正常 execution_unknown 挂起副作用（有终态 Turn 但确认流程仍在进行、
+          且无对应 running 条目）不在此清理范围。
+        """
         ws = self.get_or_create(db, thread_id)
         running = list(ws.running_tool_state or [])
         stale: list[str] = []
@@ -179,6 +187,15 @@ class WorkingStateService:
             ws.version = (ws.version or 0) + 1
             ws.updated_at = datetime.now(timezone.utc)
             logger.info("已恢复 %d 个孤立运行工具 thread=%s", len(stale), thread_id)
+
+            effects = list(ws.uncommitted_side_effects or [])
+            cleaned_effects = [e for e in effects if e.get("ref") not in stale]
+            if len(cleaned_effects) != len(effects):
+                ws.uncommitted_side_effects = cleaned_effects
+                logger.info(
+                    "已清理 %d 个孤立未提交副作用 thread=%s",
+                    len(effects) - len(cleaned_effects), thread_id,
+                )
 
     # ── 语义字段：Phase 1 仅显式更新 ──
 

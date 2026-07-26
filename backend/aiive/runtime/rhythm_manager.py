@@ -29,7 +29,11 @@ class RhythmManager:
         Returns:
             包含 date、events_today、active_routines、routine_names、pending_tasks 的字典
         """
-        today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0)
+        # 用本地时区的日界（而非 UTC 零点），并清零 microsecond，
+        # 保证“今日”统计与用户感知的自然日一致。
+        today = datetime.now().astimezone().replace(
+            hour=0, minute=0, second=0, microsecond=0,
+        )
 
         events_today = (
             self._db.query(Event)

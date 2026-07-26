@@ -200,7 +200,12 @@ def get_memory_recall_run(run_id: str, db: Session = Depends(get_db)):
     try:
         run = db.get(MemoryRecallRun, run_id)
         if not run:
-            return {"error": "not found"}
+            # 与 get_retrieval_run / get_context_run 保持一致的 404 语义，
+            # 200 + {"error": ...} 会被前端当作正常详情解析导致崩溃
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "memory_recall_run_not_found", "run_id": run_id},
+            )
         candidates = (
             db.query(MemoryRecallCandidate)
             .filter(MemoryRecallCandidate.run_id == run_id)
@@ -258,7 +263,9 @@ def inspector_events(
             q = q.filter(Event.thread_id == thread_id)
         if trace_id:
             q = q.filter(Event.trace_id == trace_id)
-        events = q.order_by(Event.created_at.asc()).limit(limit).all()
+        # 取最近的 limit 条再反转为升序展示——若直接升序取前 N 条，
+        # 系统运行一段时间后该接口永远只返回最旧的一批事件
+        events = list(reversed(q.order_by(Event.created_at.desc()).limit(limit).all()))
         return [
             {
                 "id": e.id,

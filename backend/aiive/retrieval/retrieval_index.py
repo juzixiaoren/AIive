@@ -333,7 +333,14 @@ class RetrievalIndexManager:
 
     def query_exact(
         self, db: Session, index_version: int, canonical_key: str, scope_id: str | None,
+        allowed_scopes: set[tuple[str, str | None]] | None = None,
     ) -> list[RetrievalIndexEntry]:
+        """按 canonical_key 精确命中。
+
+        allowed_scopes：允许的 (scope_type, scope_id) 集合（来自
+        ScopeContext.chain()）。提供时仅返回落在授权 scope 链内的条目，
+        防止跨 scope 泄漏；None 表示调用方无 scope 约束。
+        """
         q = db.query(RetrievalIndexEntry).filter(
             RetrievalIndexEntry.index_version == index_version,
             RetrievalIndexEntry.is_current == True,  # noqa: E712
@@ -343,7 +350,13 @@ class RetrievalIndexManager:
         )
         if scope_id is not None:
             q = q.filter(RetrievalIndexEntry.scope_id == scope_id)
-        return q.all()
+        entries = q.all()
+        if allowed_scopes is not None:
+            entries = [
+                e for e in entries
+                if ((e.scope_type or "global"), e.scope_id) in allowed_scopes
+            ]
+        return entries
 
     # ── rebuild 分批游标 ──
 

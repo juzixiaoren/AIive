@@ -22,6 +22,16 @@ logger = logging.getLogger(__name__)
 _TOMBSTONE_EVENTS: frozenset[str] = frozenset({
     "memory.forgotten",
     "memory.superseded",
+    # merge loser 必须 tombstone（docstring 早已承诺；此前缺失导致 loser 被
+    # upsert 为可检索条目）
+    "memory.merged",
+    # 遗忘重建 / retention scrub 后旧版 Summary/Checkpoint 的通用下线事件
+    "source.tombstoned",
+})
+
+# validity 非 valid 的 memory_record 不应可检索（superseded/contradicted/expired）
+_INVALID_VALIDITY_STATES: frozenset[str] = frozenset({
+    "superseded", "contradicted", "expired",
 })
 
 
@@ -34,9 +44,11 @@ def refresh_source(
     """
     mgr = RetrievalIndexManager()
     active, building = mgr.get_active_and_building(db)
-    if active is None:
-        # 无 active generation，刷新无意义（rebuild 会全量覆盖）
+    if active is None and building is None:
+        # 无任何 generation，刷新无意义（rebuild 会全量覆盖）
         return 0, 0
+    # 无 active 但有 building：仍需刷新 building（#26：否则该刷新被静默丢弃，
+    # building 激活后携带陈旧/泄漏数据）。
 
     orm = _load_source(db, source_type, source_id)
     gens = [g for g in (active, building) if g is not None]
@@ -49,7 +61,15 @@ def refresh_source(
             mgr.tombstone_by_source(db, g.index_version, source_type, source_id)
             tombstoned += 1
             continue
-        if fields.get("is_forgotten") or event_type in _TOMBSTONE_EVENTS:
+        is_invalid_memory = (
+            fields.get("source_type") == "memory_record"
+            and (fields.get("validity_state") or "valid") in _INVALID_VALIDITY_STATES
+        )
+        if (
+            fields.get("is_forgotten")
+            or is_invalid_memory
+            or event_type in _TOMBSTONE_EVENTS
+        ):
             mgr.tombstone_by_source(db, g.index_version, source_type, source_id)
             tombstoned += 1
             continue
@@ -77,7 +97,7 @@ def refresh_source(
             updated_source_at=fields.get("updated_source_at"),
             tokens=fields["tokens"],
         )
-        if res == "upserted" and g.index_version == active.index_version:
+        if res == "upserted" and active is not None and g.index_version == active.index_version:
             upserted += 1
     return upserted, tombstoned
 

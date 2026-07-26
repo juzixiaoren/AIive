@@ -16,8 +16,23 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
-    // 代理配置：将 /api、/health 和 /ws 请求转发到后端服务
+    // 代理配置：将 /api、/health 和 /ws 请求转发到后端服务。
+    // base 默认为 /aiive/，页面内相对路径请求会带上该前缀，
+    // 因此需要同时代理带前缀的路径（剥掉前缀后转发），否则 npm run dev 下所有 API/WS 都 404。
     proxy: {
+      "/aiive/api": {
+        target: "http://127.0.0.1:8000",
+        rewrite: (path) => path.replace(/^\/aiive/, ""),
+      },
+      "/aiive/health": {
+        target: "http://127.0.0.1:8000",
+        rewrite: (path) => path.replace(/^\/aiive/, ""),
+      },
+      "/aiive/ws": {
+        target: "http://127.0.0.1:8000",
+        ws: true,
+        rewrite: (path) => path.replace(/^\/aiive/, ""),
+      },
       "/api": "http://127.0.0.1:8000",
       "/health": "http://127.0.0.1:8000",
       "/ws": {

@@ -63,7 +63,8 @@ class TestPatchExecutor:
                 }
             ],
         )
-        assert result["ok"] is True
+        # 存在失败（被跳过）操作时整体不应报告成功
+        assert result["ok"] is False
         assert len(result["operations_applied"]) == 0
         assert len(result["operations_failed"]) == 1
 
@@ -112,9 +113,11 @@ class TestPatchExecutor:
         mgr = SlotManager(base_dir=tmp_path / "slots")
         mgr.init_slots()
 
+        # 基线来自活跃槽位：文件放在 A/app，apply 时同步到 B/app 后再删除
+        a_app = tmp_path / "slots" / "A" / "app"
+        a_app.mkdir(parents=True, exist_ok=True)
+        (a_app / "obsolete.py").write_text("legacy")
         b_app = tmp_path / "slots" / "B" / "app"
-        b_app.mkdir(parents=True, exist_ok=True)
-        (b_app / "obsolete.py").write_text("legacy")
 
         executor = PatchExecutor(manager=mgr)
         result = executor.apply_to_inactive(
@@ -130,6 +133,83 @@ class TestPatchExecutor:
         assert len(result["operations_applied"]) == 1
         assert not (b_app / "obsolete.py").exists()
         assert (b_app / ".trash" / "obsolete.py").exists()
+
+    def test_add_file_without_content_rejected(self, tmp_path):
+        """add_file/modify_file 缺失 content 时应拒绝执行而非写空文件。"""
+        mgr = SlotManager(base_dir=tmp_path / "slots")
+        mgr.init_slots()
+
+        executor = PatchExecutor(manager=mgr)
+        result = executor.apply_to_inactive(
+            [
+                {"operation": "add_file", "target_file": "empty.py", "not_allowed_yet": False},
+            ]
+        )
+        assert result["ok"] is False
+        assert len(result["operations_failed"]) == 1
+        assert "missing_content" in result["operations_failed"][0]["reason"]
+        assert not (tmp_path / "slots" / "B" / "app" / "empty.py").exists()
+
+    def test_absolute_target_path_rejected(self, tmp_path):
+        """绝对路径 target_file 必须被拒绝，防止写仓库任意文件。"""
+        mgr = SlotManager(base_dir=tmp_path / "slots")
+        mgr.init_slots()
+
+        outside = tmp_path / "evil.py"
+        executor = PatchExecutor(manager=mgr)
+        result = executor.apply_to_inactive(
+            [
+                {
+                    "operation": "add_file",
+                    "target_file": str(outside),
+                    "content": "evil",
+                    "not_allowed_yet": False,
+                }
+            ]
+        )
+        assert result["ok"] is False
+        assert len(result["operations_applied"]) == 0
+        assert "path_escape_denied" in result["operations_failed"][0]["reason"]
+        assert not outside.exists()
+
+    def test_traversal_target_path_rejected_for_add(self, tmp_path):
+        """../ 穿越的 add_file 必须被拒绝。"""
+        mgr = SlotManager(base_dir=tmp_path / "slots")
+        mgr.init_slots()
+
+        executor = PatchExecutor(manager=mgr)
+        result = executor.apply_to_inactive(
+            [
+                {
+                    "operation": "add_file",
+                    "target_file": "../../A/app/injected.py",
+                    "content": "evil",
+                    "not_allowed_yet": False,
+                }
+            ]
+        )
+        assert result["ok"] is False
+        assert "path_escape_denied" in result["operations_failed"][0]["reason"]
+        assert not (tmp_path / "slots" / "A" / "app" / "injected.py").exists()
+
+    def test_baseline_resynced_on_each_apply(self, tmp_path):
+        """每次 apply 都应从活跃槽重刷基线，第二次 apply 不叠加上次残留。"""
+        mgr = SlotManager(base_dir=tmp_path / "slots")
+        mgr.init_slots()
+
+        executor = PatchExecutor(manager=mgr)
+        executor.apply_to_inactive(
+            [{"operation": "add_file", "target_file": "first.py", "content": "1", "not_allowed_yet": False}]
+        )
+        assert (tmp_path / "slots" / "B" / "app" / "first.py").exists()
+
+        executor.apply_to_inactive(
+            [{"operation": "add_file", "target_file": "second.py", "content": "2", "not_allowed_yet": False}]
+        )
+        b_app = tmp_path / "slots" / "B" / "app"
+        # 上一次 apply 的 first.py 不应残留（active 槽没有它）
+        assert not (b_app / "first.py").exists()
+        assert (b_app / "second.py").exists()
 
     def test_delete_file_rejects_path_traversal(self, tmp_path):
         """delete_file 必须拦截 ../ 路径穿越，保护槽位外文件。"""

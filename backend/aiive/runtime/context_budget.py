@@ -8,7 +8,6 @@ import json as _json
 import logging
 import os
 from dataclasses import dataclass
-from typing import ClassVar
 
 logger = logging.getLogger(__name__)
 
@@ -72,9 +71,6 @@ class ContextBudget:
                 f"分区 hard limits ({total}) 超过 "
                 + f"context window ({self.model_context_window})"
             )
-
-    # ── 默认实例：窗口值取自 settings.aiive_llm_context_window ──
-    DEFAULT: ClassVar["ContextBudget"]
 
     @classmethod
     def default(cls) -> "ContextBudget":
@@ -182,6 +178,3 @@ class ContextBudget:
         )
         budget.validate()
         return budget
-
-
-ContextBudget.DEFAULT = ContextBudget.from_env()

@@ -66,8 +66,13 @@ class RawHistoryExpander:
 
             seg_ids = self._segments_for_hit(db, h)
             seg_statuses: list[str] = []
+            # #19：segment_summary 命中优先使用命中自身的 Summary 版本校验，
+            # 不再按 segment_id 无排序 .first() 取任意版本。
+            hit_summary_id = h.source_id if h.source_type == "segment_summary" else None
             for seg_id in seg_ids:
-                status, events = self._load_verified_events(db, seg_id, per_hit_limit)
+                status, events = self._load_verified_events(
+                    db, seg_id, per_hit_limit, summary_id=hit_summary_id,
+                )
                 if status is None:
                     # 缺失 Summary / CompactionInput / manifest → 无法校验
                     seg_statuses.append("stale")
@@ -124,8 +129,14 @@ class RawHistoryExpander:
 
     def _load_verified_events(
         self, db: Session, seg_id: str, limit: int,
+        summary_id: str | None = None,
     ) -> tuple[str | None, list[Any]]:
         """回溯并校验单个 Segment 的原始 Event。
+
+        Summary 选取（#19）：
+        1. 优先用命中 hit 的 source_id（summary_id）加载对应版本；
+        2. 否则用 Segment.summary_id 指向的当前版本；
+        3. 最后回退到该 segment 的最高 summary_version（确定性，不再任意 .first()）。
 
         返回 (status, events)：
         - None            → 无法校验（缺失 Summary / CompactionInput / manifest）→ stale
@@ -133,18 +144,42 @@ class RawHistoryExpander:
         - "degraded"      → 数据存在但某项校验失败（source_hash / event 不在 manifest / hash 不一致）
         校验失败时不返回对应 raw 内容。
         """
-        summary = (
-            db.query(SegmentSummary)
-            .filter(SegmentSummary.segment_id == seg_id)
-            .first()
-        )
+        summary: SegmentSummary | None = None
+        if summary_id:
+            candidate = db.get(SegmentSummary, summary_id)
+            if candidate is not None and candidate.segment_id == seg_id:
+                summary = candidate
+        if summary is None:
+            from aiive.db.models import Segment
+            seg = db.get(Segment, seg_id)
+            if seg is not None and seg.summary_id:
+                candidate = db.get(SegmentSummary, seg.summary_id)
+                if candidate is not None and candidate.segment_id == seg_id:
+                    summary = candidate
+        if summary is None:
+            summary = (
+                db.query(SegmentSummary)
+                .filter(SegmentSummary.segment_id == seg_id)
+                .order_by(SegmentSummary.summary_version.desc())
+                .first()
+            )
         if summary is None or not summary.source_event_ids:
             return (None, [])
         ci = (
             db.query(CompactionInput)
-            .filter(CompactionInput.segment_id == seg_id)
+            .filter(
+                CompactionInput.segment_id == seg_id,
+                CompactionInput.summary_version == summary.summary_version,
+            )
             .first()
         )
+        if ci is None:
+            ci = (
+                db.query(CompactionInput)
+                .filter(CompactionInput.segment_id == seg_id)
+                .order_by(CompactionInput.summary_version.desc())
+                .first()
+            )
         if ci is None or not ci.event_manifest:
             return (None, [])
 

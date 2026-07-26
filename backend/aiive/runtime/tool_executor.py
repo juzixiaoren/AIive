@@ -20,6 +20,36 @@ class ToolCallRecord:
     status: str  # "completed" | "failed" | "blocked" | "duplicate" | "parse_error"
     trace_id: str
     reason: str = ""
+    tool_call_id: str = ""
+
+
+def _index_pending_approvals(
+    pending_approvals: list[dict[str, Any]] | None,
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """按 tool_call_id（首选）与工具名（旧数据回退）索引待审批记录。
+
+    同名多审批时按工具名索引会错配；tool_call_id 是逐调用唯一的稳定键。
+    """
+    by_id: dict[str, dict[str, Any]] = {}
+    by_name: dict[str, dict[str, Any]] = {}
+    for pa in pending_approvals or []:
+        tc_id = str(pa.get("id", "") or "")
+        if tc_id:
+            by_id[tc_id] = pa
+        name = str(pa.get("name", "") or "")
+        if name and name not in by_name:
+            by_name[name] = pa
+    return by_id, by_name
+
+
+def _match_approval(
+    record: "ToolCallRecord",
+    by_id: dict[str, dict[str, Any]],
+    by_name: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    if record.tool_call_id and record.tool_call_id in by_id:
+        return by_id[record.tool_call_id]
+    return by_name.get(record.name, {})
 
 
 def build_action_cards(
@@ -28,9 +58,7 @@ def build_action_cards(
 ) -> list[ActionCard]:
     """从真实工具记录构建并校验操作卡片。"""
     cards: list[ActionCard] = []
-    pa_by_name: dict[str, dict[str, Any]] = {
-        str(pa.get("name", "") or ""): pa for pa in (pending_approvals or [])
-    }
+    pa_by_id, pa_by_name = _index_pending_approvals(pending_approvals)
 
     for record in records:
         inner_raw = record.result.get("result", {})
@@ -44,7 +72,7 @@ def build_action_cards(
 
         common = {"trace_id": record.trace_id}
         if record.status == "pending_approval":
-            approval = pa_by_name.get(record.name, {})
+            approval = _match_approval(record, pa_by_id, pa_by_name)
             approval_id = str(approval.get("approval_id", "") or "")
             tool_call_id = str(approval.get("id", "") or "")
             cards.append(ActionCard(
@@ -163,9 +191,7 @@ def build_pending_operations(
     pending_approvals: list[dict[str, Any]] | None = None,
 ) -> list[PendingOperation]:
     """从真实待审批记录构建机器可读的待处理操作。"""
-    pa_by_name = {
-        str(pa.get("name", "") or ""): pa for pa in (pending_approvals or [])
-    }
+    pa_by_id, pa_by_name = _index_pending_approvals(pending_approvals)
     operations: list[PendingOperation] = []
     for record in records:
         if record.status == "execution_unknown":
@@ -191,7 +217,7 @@ def build_pending_operations(
             continue
         if record.status != "pending_approval":
             continue
-        approval = pa_by_name.get(record.name, {})
+        approval = _match_approval(record, pa_by_id, pa_by_name)
         approval_id = str(approval.get("approval_id", "") or "")
         tool_call_id = str(approval.get("id", "") or "")
         if not approval_id:

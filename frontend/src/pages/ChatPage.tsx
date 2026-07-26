@@ -46,7 +46,24 @@ function loadStored(): { threadId: string | undefined; messages: Message[] } {
  * @param messages - 消息列表
  */
 function saveStored(threadId: string | undefined, messages: Message[]) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify({ threadId, messages: messages.slice(-200) }));
+  try {
+    // 持久化前截断超大工具结果，避免大结果撑爆 localStorage 配额
+    const trimmed = messages.slice(-200).map((m) => (
+      m.toolCalls?.some((c) => c.result && c.result.length > 4000)
+        ? {
+          ...m,
+          toolCalls: m.toolCalls.map((c) => (
+            c.result && c.result.length > 4000
+              ? { ...c, result: c.result.slice(0, 4000) + "…(已截断)" }
+              : c
+          )),
+        }
+        : m
+    ));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ threadId, messages: trimmed }));
+  } catch {
+    // 配额不足或序列化失败时放弃本次持久化，不能让异常冒泡到渲染层
+  }
 }
 
 /** 单条工具调用的展示模型，状态随流推进并保留无法确认的真实终态 */
@@ -204,7 +221,10 @@ function ToolCallCard({ call }: { call: ToolCallItem }) {
  * @param onInspectTrace - 点击 trace_id 时回调，用于跳转到上下文检查器
  */
 export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: string) => void }) {
-  const stored = loadStored();
+  // 惰性初始化：只在首次挂载读取 localStorage。若每次渲染都重读，
+  // 新线程首条消息流式期间 threadId 持久化会使挂载恢复 effect 重新触发，
+  // 服务端历史整体覆盖消息列表，正在流式接收的占位消息被抹掉（回复丢失）。
+  const [stored] = useState(loadStored);
   const [messages, setMessages] = useState<Message[]>(stored.messages);
   const [input, setInput] = useState("");
   const [threadId, setThreadId] = useState<string | undefined>(stored.threadId);
@@ -265,8 +285,15 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
     el.style.height = Math.min(el.scrollHeight, 160) + "px";
   };
 
-  // 每次消息或线程 ID 变化时持久化到 localStorage
-  useEffect(() => { saveStored(threadId, messages); }, [threadId, messages]);
+  // 消息或线程 ID 变化时持久化到 localStorage（300ms 去抖：
+  // 流式期间每个 token 都会触发本 effect，全量 JSON.stringify 会造成打字卡顿）
+  useEffect(() => {
+    const timer = setTimeout(() => saveStored(threadId, messages), 300);
+    return () => clearTimeout(timer);
+  }, [threadId, messages]);
+
+  // 组件卸载时中止进行中的流式请求，避免后台 fetch 空转
+  useEffect(() => () => { abortRef.current?.abort(); }, []);
 
   // 消息更新：贴底则自动滚动；离底时累计新增的 agent 消息数为未读
   useEffect(() => {
@@ -373,6 +400,9 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
     const wsUrl = `${protocol}//${window.location.host}${BASE_PATH}ws/${threadId}`;
     let ws: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    // effect 已清理标记：ws.close() 触发的 onclose 是异步回调，会在 cleanup 之后执行，
+    // 若不拦截会再排一个重连定时器，产生指向旧线程的僵尸连接
+    let disposed = false;
 
     const connect = () => {
       ws = new WebSocket(wsUrl);
@@ -449,6 +479,7 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
         } catch {}
       };
       ws.onclose = () => {
+        if (disposed) return;
         // 5 秒后重连
         reconnectTimer = setTimeout(connect, 5000);
       };
@@ -459,6 +490,7 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
 
     connect();
     return () => {
+      disposed = true;
       ws?.close();
       if (reconnectTimer) clearTimeout(reconnectTimer);
     };
@@ -489,6 +521,8 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: text, thread_id: threadId }),
       });
+      // 后端用 202 表达"已有对话轮次进行中"，不能落入成功分支
+      if (res.status === 202) throw new Error("当前有对话正在进行，请稍后再试");
       const responseText = await res.text();
       let result: Record<string, unknown> = {};
       if (responseText) {
@@ -535,7 +569,11 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
     if (!window.confirm("确定要清空当前对话上下文吗？")) return;
     try {
       await resetThread(threadId);
-    } catch {}
+      setError(null);
+    } catch {
+      // 本地照常清空（用户意图是开新对话），但如实告知服务端未记录本次重置
+      setError("本地已清空，但服务端重置请求失败（可能后端未启动）");
+    }
     setThreadId(undefined);
     prevMsgCountRef.current = 0;
     setHistoryCursor(null);

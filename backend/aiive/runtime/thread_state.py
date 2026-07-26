@@ -38,7 +38,9 @@ class ThreadState:
             thread = self._db.get(Thread, thread_id)
             if thread:
                 return thread
-        thread = Thread(id=str(uuid.uuid4()))
+        # 指定了 thread_id 但不存在时，用请求的 id 创建（而非静默换一个新 id，
+        # 否则调用方持有的 thread_id 与实际落库线程分裂）。
+        thread = Thread(id=thread_id or str(uuid.uuid4()))
         self._db.add(thread)
         self._db.flush()
         return thread
@@ -71,11 +73,13 @@ class ThreadState:
         page_size = 20
 
         while pages_read < max_pages and len(all_turns) < max_turns:
+            # interrupted_unknown Turn 也纳入历史：其中断前已持久化的工具事实
+            # （副作用可能已发生）以降级 system 文本注入，避免模型遗忘后重复执行。
             base_query = (
                 db.query(TurnRecord)
                 .filter(
                     TurnRecord.thread_id == thread_id,
-                    TurnRecord.status == "completed",
+                    TurnRecord.status.in_(("completed", "interrupted_unknown")),
                 )
             )
             if last_sequence is not None:
@@ -116,6 +120,10 @@ class ThreadState:
                     break
 
                 turn_dicts = self._events_to_dicts(events, turn.source)
+                if turn.status == "interrupted_unknown":
+                    turn_dicts = self._degrade_interrupted_turn_dicts(turn_dicts)
+                    if not turn_dicts:
+                        continue
                 turn_bytes = sum(len(_json.dumps(d, ensure_ascii=False, default=str).encode()) for d in turn_dicts)
                 total_bytes += turn_bytes
                 if total_bytes > max_raw_bytes:
@@ -164,6 +172,48 @@ class ThreadState:
             estimated_tokens=current_tokens,
             stopped_by=stopped_by,
         )
+
+    @staticmethod
+    def _degrade_interrupted_turn_dicts(
+        turn_dicts: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """将中断 Turn 的事件降级为有界 system 文本（不还原为对话消息）。
+
+        中断 Turn 无正常 llm_response，若按原样注入会产生孤儿 tool_call/结果；
+        改为一条 system 说明，让模型知晓「上轮中断前哪些工具已实际执行」。
+        无任何已确认工具事实时返回空列表（整轮跳过）。
+        """
+        tool_lines: list[str] = []
+        results_by_id: dict[str, dict[str, Any]] = {
+            str(d.get("tool_call_id") or ""): d
+            for d in turn_dicts if d.get("type") == "tool_result"
+        }
+        for d in turn_dicts:
+            if d.get("type") != "tool_call":
+                continue
+            name = str(d.get("tool_name") or "")
+            rd = results_by_id.get(str(d.get("tool_call_id") or ""))
+            status = str(rd.get("tool_status") or "unknown") if rd else "unknown"
+            result_text = ""
+            if rd is not None:
+                raw = rd.get("tool_result", {})
+                result_text = raw if isinstance(raw, str) else _json.dumps(
+                    raw, ensure_ascii=False, default=str,
+                )
+                if len(result_text) > 300:
+                    result_text = result_text[:300] + "…[截断]"
+            tool_lines.append(f"- {name} -> {status}: {result_text}")
+        if not tool_lines:
+            return []
+        user_line = next(
+            (str(d.get("content") or "") for d in turn_dicts if d.get("type") in ("user", "system")),
+            "",
+        )
+        parts = ["[上一轮 Turn 被中断，以下工具调用在中断前已实际执行，其副作用可能已生效，请勿盲目重复执行]"]
+        if user_line:
+            parts.append(f"当时的请求: {user_line[:200]}")
+        parts.extend(tool_lines)
+        return [{"type": "system", "content": "\n".join(parts)}]
 
     @staticmethod
     def _dicts_to_chat_messages(turn_dicts: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -434,9 +484,10 @@ class ThreadState:
                     msg_type = "user" if source_val in (None, "user") else "system"
                     messages.append({"type": msg_type, "content": content, "event_id": event.id, "trace_id": event.trace_id})
             elif etype == "tool_call":
-                messages.append({"type": "tool_call", "tool_name": p.get("name", ""), "tool_params": p.get("params", {}), "event_id": event.id, "trace_id": event.trace_id, "tool_call_id": p.get("tool_call_id", ""), "batch_index": p.get("batch_index", 0)})
+                # turn_id 供 stable_tool_call_id 在缺失 tool_call_id 时构造两侧一致的回退键
+                messages.append({"type": "tool_call", "tool_name": p.get("name", ""), "tool_params": p.get("params", {}), "event_id": event.id, "trace_id": event.trace_id, "tool_call_id": p.get("tool_call_id", ""), "batch_index": p.get("batch_index", 0), "turn_id": event.turn_id})
             elif etype == "tool_result":
-                messages.append({"type": "tool_result", "tool_name": p.get("name", ""), "tool_result": p.get("result", {}), "tool_status": p.get("status", "unknown"), "event_id": event.id, "trace_id": event.trace_id, "tool_call_id": p.get("tool_call_id", ""), "batch_index": p.get("batch_index", 0)})
+                messages.append({"type": "tool_result", "tool_name": p.get("name", ""), "tool_result": p.get("result", {}), "tool_status": p.get("status", "unknown"), "event_id": event.id, "trace_id": event.trace_id, "tool_call_id": p.get("tool_call_id", ""), "batch_index": p.get("batch_index", 0), "turn_id": event.turn_id})
             elif etype == "llm_response":
                 content = p.get("content", "")
                 if content:

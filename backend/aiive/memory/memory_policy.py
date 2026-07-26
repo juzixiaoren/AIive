@@ -42,6 +42,13 @@ class MemoryPolicyDecision:
     redacted: bool = False
 
 
+# 参与写入权威判定的 evidence relation。relation 为 "derived_from" 的证据
+# 仅作 provenance（出处追溯），不参与权威判定 —— 例如 assistant 回复事件
+# （llm_derivation）作为提取上下文的出处，不应因其不在 AUTHORITY_RULES 中
+# 而导致整个提案被拒。
+AUTHORITY_RELATIONS: frozenset[str] = frozenset({"supports", "confirms", "corrects"})
+
+
 _LEGACY_EVIDENCE_SOURCE_MAP: dict[str, str] = {
     "user_message": EvidenceSourceType.USER_ASSERTION.value,
     "user_command": EvidenceSourceType.USER_ASSERTION.value,
@@ -71,7 +78,12 @@ class MemoryPolicyEngine:
         return _LEGACY_EVIDENCE_SOURCE_MAP.get(source_type)
 
     def decide_authority(self, memory_type: str, source_types: list[str]) -> MemoryPolicyDecision:
-        """要求每条 evidence 都对目标记忆类型具有写入权威。"""
+        """要求每条 evidence 都对目标记忆类型具有写入权威。
+
+        调用方应只传入 relation ∈ AUTHORITY_RELATIONS 的证据来源
+        （provenance-only 的 derived_from 证据不参与权威判定）；
+        过滤后为空列表 → 无任何权威证据 → 拒绝。
+        """
         normalized = [self.normalize_evidence_source(source) for source in source_types]
         if any(source is None for source in normalized):
             return MemoryPolicyDecision(False, MemoryPolicyReason.AUTHORITY_SOURCE_UNKNOWN.value)

@@ -24,6 +24,9 @@ frontend/dist/
 /slots/
 /runtime/
 
+# Local data（对象存储 / 记忆投影 / MCP 沙箱含 node_modules）
+/.data/
+
 # Docker volumes
 pgdata/
 

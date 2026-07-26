@@ -125,10 +125,17 @@ class AutomaticRecallEngine:
     ) -> tuple[MemoryRecallPack, list[RecallCandidateTrace]]:
         """执行全部启用的召回路由并融合为一个 pack。
 
-        include_sleeping=True 时（J.5「扩大召回/高相关」），exact / lexical / vector
+        include_sleeping=True 时（J.5「扩大召回/高相关」），exact / lexical
         高相关路由放宽到 `lifecycle_state IN (active, sleeping)`；episode 兜底路由
         始终仅 active，避免陈旧、低价值的情节记忆被重新带回上下文。
-        include_archived=True 时追加 archived（仅经统一检索显式请求，不自动 wake）。
+        include_archived=True 时追加 archived（仅经统一检索显式请求，不自动
+        wake），且 validity 放宽为 IN (valid, expired) —— archived 记录的
+        validity 通常已是 expired，仅追加 lifecycle 状态无法命中；superseded
+        仍排除（已被新记录取代）。
+
+        注意：vector 路由的 include_sleeping / include_archived 仅为接口透传。
+        向量投影按现状设计只为 active+valid 记录维护向量（sleeping / archived
+        时删除向量），因此该路由实际只返回 active+valid 结果。
         """
         candidates: list[MemoryRecallItem] = []
         candidates += self._route_exact(request, include_sleeping, include_archived)
@@ -158,6 +165,20 @@ class AutomaticRecallEngine:
             states.append(LifecycleState.ARCHIVED.value)
         return states
 
+    @staticmethod
+    def _validity_states(include_archived: bool = False) -> list[str]:
+        """返回参与召回的 validity_state 取值列表。
+
+        默认仅 valid；include_archived=True 时放宽为 (valid, expired)：
+        archived 记录的 validity 通常已被置为 expired（archive 动作副作用），
+        若仍恒过滤 valid，追加 archived lifecycle 将永远命中不到记录。
+        superseded 恒排除（已被新记录取代，召回新记录即可）。
+        """
+        states = [ValidityState.VALID.value]
+        if include_archived:
+            states.append(ValidityState.EXPIRED.value)
+        return states
+
     # ------------------------------------------------------------------
     # Routes
     # ------------------------------------------------------------------
@@ -174,20 +195,25 @@ class AutomaticRecallEngine:
         if not _KEYISH.match(q):
             return []
         states = self._lifecycle_states(include_sleeping, include_archived)
+        validity = self._validity_states(include_archived)
         out: list[MemoryRecallItem] = []
-        for scope_type, _scope_id in chain:
-            recs = (
+        for scope_type, scope_id in chain:
+            query = (
                 self._db.query(MemoryRecord)
                 .filter(
                     MemoryRecord.lifecycle_state.in_(states),
-                    MemoryRecord.validity_state == ValidityState.VALID.value,
+                    MemoryRecord.validity_state.in_(validity),
                     MemoryRecord.scope_type == scope_type,
                     (MemoryRecord.canonical_key == q) | (MemoryRecord.scope_id == q),
                 )
-                .order_by(MemoryRecord.importance.desc())
-                .limit(5)
-                .all()
             )
+            # scope_id 必须与 chain 中的取值一致（与 _route_lexical 相同），
+            # 否则仅按 scope_type 过滤会把其他 thread/project 的记忆跨界召回。
+            if scope_id is not None:
+                query = query.filter(MemoryRecord.scope_id == scope_id)
+            else:
+                query = query.filter(MemoryRecord.scope_id.is_(None))
+            recs = query.order_by(MemoryRecord.importance.desc()).limit(5).all()
             out.extend(self._to_items(recs, "exact", 1.0, chain))
             if out:
                 break
@@ -316,7 +342,7 @@ class AutomaticRecallEngine:
             MemoryRecord.lifecycle_state.in_(
                 self._lifecycle_states(include_sleeping, include_archived),
             ),
-            MemoryRecord.validity_state == ValidityState.VALID.value,
+            MemoryRecord.validity_state.in_(self._validity_states(include_archived)),
             MemoryRecord.scope_type == scope_type,
         )
         if scope_id is not None:

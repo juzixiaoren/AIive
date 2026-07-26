@@ -7,6 +7,7 @@
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from aiive.db.models import AttentionState, Event
@@ -56,7 +57,9 @@ class AttentionManager:
             .filter(
                 Event.thread_id == thread_id,
                 Event.event_type == "user_message",
-                Event.turn_id != current_turn_id,
+                # SQL 三值逻辑：`turn_id != x` 会排除 turn_id 为 NULL 的旧事件，
+                # 需显式纳入 NULL。
+                or_(Event.turn_id.is_(None), Event.turn_id != current_turn_id),
             )
             .order_by(Event.created_at.desc())
             .first()
@@ -153,7 +156,9 @@ class AttentionManager:
             Event.event_type == "user_message",
         )
         if exclude_turn_id:
-            query = query.filter(Event.turn_id != exclude_turn_id)
+            query = query.filter(
+                or_(Event.turn_id.is_(None), Event.turn_id != exclude_turn_id),
+            )
         last_event = query.order_by(Event.created_at.desc()).first()
 
         idle_hours: float | None = None

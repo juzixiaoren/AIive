@@ -4,7 +4,7 @@ API路由模块：自进化开发（Self-Dev）
 - 提供自进化计划（Plan）的创建和查询
 - 提供补丁应用、升级和回滚操作的接口
 """
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from typing import Any
@@ -176,15 +176,46 @@ def apply_inactive(request_id: str, req: ApplyRequest, db: Session = Depends(get
     executor = PatchExecutor()
     result = executor.apply_to_inactive(req.operations)
 
-    sreq.status = "applied_inactive" if result["ok"] else "apply_failed"
+    applied = result.get("operations_applied", [])
+    failed = result.get("operations_failed", [])
+    if result.get("ok"):
+        sreq.status = "applied_inactive"
+    elif applied and failed:
+        # 部分成功：区别于整体失败，便于人工介入判断
+        sreq.status = "apply_partial"
+    else:
+        sreq.status = "apply_failed"
+
+    # 应用成功（或部分成功）后自动运行定向测试，结果持久化到 plan JSON，
+    # 供 promote 端点做晋升门禁。
+    test_report = None
+    if applied:
+        from aiive.selfdev.targeted_test_runner import TargetedTestRunner
+
+        changed_files = [
+            str(op.get("target_file", ""))
+            for op in req.operations
+            if op.get("target_file")
+        ]
+        try:
+            test_report = TargetedTestRunner().run_for_changed_files(changed_files)
+        except Exception as e:
+            test_report = {"ok": False, "error": f"targeted test runner crashed: {e}"}
+        sreq.plan = {**(sreq.plan or {}), "targeted_test_report": test_report}
+
     db.commit()
 
+    if test_report is not None:
+        result = {**result, "targeted_test_report": test_report}
+    result["request_status"] = sreq.status
     return result
 
 
 class PromoteRequest(BaseModel):
     """升级请求体"""
     run_health_check: bool = True
+    # 定向测试未通过时默认拒绝晋升；force=True 显式覆盖
+    force: bool = False
 
 
 @router.post("/{request_id}/promote")
@@ -202,6 +233,19 @@ def promote(request_id: str, req: PromoteRequest, db: Session = Depends(get_db))
     sreq = db.get(SelfDevRequest, request_id)
     if not sreq:
         raise HTTPException(status_code=404, detail="请求不存在")
+
+    # 晋升门禁：apply-inactive 阶段的定向测试未通过时拒绝晋升（force 可覆盖）
+    test_report = (sreq.plan or {}).get("targeted_test_report")
+    if (
+        not req.force
+        and isinstance(test_report, dict)
+        and test_report.get("ok") is not True
+    ):
+        return {
+            "ok": False,
+            "error": "targeted tests did not pass; promotion refused (use force=true to override)",
+            "targeted_test_report": test_report,
+        }
 
     from aiive.selfdev.promote_rollback import PromoteRollback
 

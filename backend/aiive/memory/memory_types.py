@@ -245,11 +245,11 @@ AUTHORITY_RULES: dict[str, frozenset[str]] = {
         EvidenceSourceType.TEST_RESULT.value,
     }),
 }
-# Default for types not in AUTHORITY_RULES: allow user_assertion only
-_DEFAULT_AUTHORITY: frozenset[str] = frozenset({
-    EvidenceSourceType.USER_ASSERTION.value,
-})
-
+# Types not registered in AUTHORITY_RULES have NO authorized evidence sources:
+# MemoryPolicyEngine.decide_authority falls back to an empty frozenset, so every
+# evidence-bearing proposal of an unregistered type is rejected (fail-closed).
+# All 8 canonical MemoryTypes are registered above; unknown types are rejected
+# earlier by MemoryGate's type check anyway.
 
 
 

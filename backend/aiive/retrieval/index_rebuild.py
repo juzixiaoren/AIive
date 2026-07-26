@@ -269,9 +269,15 @@ def _process_one_batch(
     if batch:
         for orm in batch:
             fields = build_entry_fields(db, source_type, orm)
-            if fields is None or fields.get("is_forgotten"):
-                # forgotten 源：在该 generation 内清理其 Entry（清空文本/不检索），
-                # 而非保留旧 active 的 current Entry。
+            is_invalid_memory = (
+                fields is not None
+                and fields.get("source_type") == "memory_record"
+                and (fields.get("validity_state") or "valid")
+                in ("superseded", "contradicted", "expired")
+            )
+            if fields is None or fields.get("is_forgotten") or is_invalid_memory:
+                # forgotten / validity 非 valid 源：在该 generation 内清理其
+                # Entry（清空文本/不检索），而非保留旧 active 的 current Entry。
                 mgr.tombstone_by_source(
                     db, gen.index_version, source_type,
                     source_id=fields["source_id"] if fields else orm.id,
@@ -332,6 +338,18 @@ def _activate_if_still_valid(
     active = mgr.get_active_generation(db)
     if active is not None and active.index_version == gen.index_version:
         return  # 已激活（可能此前被接管后激活）
+    if active is not None and active.index_version > gen.index_version:
+        # #18：当前 active 已是更新的 generation（并发 rebuild 已切换）——
+        # 不得把旧 generation 重新激活、retire 更新的 active。
+        # 本 generation 直接 retire，交由 retention 清理。
+        logger.warning(
+            "放弃激活旧 generation v%s（active 已是 v%s）",
+            gen.index_version, active.index_version,
+        )
+        gen.status = "retired"
+        gen.status_changed_at = _now
+        db.flush()
+        return
     mgr.activate_generation(db, gen.index_version)
     # 该 generation 已通过全量 backfill 构建完成
     gen.backfill_done = True

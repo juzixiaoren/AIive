@@ -13,9 +13,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from aiive.db.models import (
@@ -29,6 +29,7 @@ from aiive.db.models import (
     WorkingState,
 )
 from aiive.runtime.compaction import (
+    NON_TERMINAL_TURN_STATUSES,
     build_working_state_snapshot,
     freeze_compaction_input,
     working_state_snapshot_hash,
@@ -36,8 +37,20 @@ from aiive.runtime.compaction import (
 
 logger = logging.getLogger(__name__)
 
-# 阻断密封的非终态 Turn
-NON_TERMINAL_TURN_STATUSES = {"not_started", "running", "interrupted_unknown"}
+# not_started Turn 超过该时长（按 created_at）视为遗留残骸，不再阻塞密封。
+NOT_STARTED_BLOCK_WINDOW = timedelta(hours=1)
+
+
+def _blocking_turn_condition():
+    """阻塞密封的 Turn 条件：running 恒阻塞；not_started 仅在窗口内阻塞。
+
+    interrupted_unknown 是吸收态（终态），不阻塞密封（见 compaction 模块注释）。
+    """
+    cutoff = datetime.now(timezone.utc) - NOT_STARTED_BLOCK_WINDOW
+    return or_(
+        TurnRecord.status == "running",
+        and_(TurnRecord.status == "not_started", TurnRecord.created_at >= cutoff),
+    )
 
 # 审计快照保留上限（Phase 1 §14.5 / Phase_1.md 保留约束：audit≤5）
 MAX_AUDIT_SNAPSHOTS = 5
@@ -81,7 +94,11 @@ def peek_next_turn_sequence(db: Session, thread_id: str) -> int:
 
 
 def allocate_turn_sequence(db: Session, thread_id: str) -> int:
-    """返回下一个 turn_sequence；消费发生在调用方创建 TurnRecord 落库时（max 自然推进）。"""
+    """返回下一个 turn_sequence；消费发生在调用方创建 TurnRecord 落库时（max 自然推进）。
+
+    注：生产路径统一使用 turn_execution._next_turn_sequence；本函数保留供测试
+    （tests/_util.py 与 Phase 3 测试矩阵）验证「peek 只读不消费」语义。
+    """
     return peek_next_turn_sequence(db, thread_id)
 
 
@@ -161,12 +178,13 @@ class EpochManager:
         """返回当前 Segment 不可密封的原因列表。空列表 = 可密封。"""
         reasons: list[str] = []
 
-        # 存在 running / interrupted_unknown Turn
+        # 存在阻塞性 Turn：running，或窗口内的 not_started。
+        # interrupted_unknown 为吸收终态、不阻塞；超窗 not_started 视为遗留残骸。
         non_terminal = (
             db.query(TurnRecord)
             .filter(
                 TurnRecord.thread_id == thread_id,
-                TurnRecord.status.in_(NON_TERMINAL_TURN_STATUSES),
+                _blocking_turn_condition(),
             )
             .count()
         )
@@ -240,18 +258,18 @@ class EpochManager:
         返回 (segment_id, compaction_input_id, successor_segment_id)。
         调用方负责提交事务。
         """
-        # 1. 非终态 Turn 检查
+        # 1. 阻塞性 Turn 检查（running / 窗口内 not_started）
         non_terminal = (
             db.query(TurnRecord)
             .filter(
                 TurnRecord.segment_id == segment.id,
-                TurnRecord.status.in_(NON_TERMINAL_TURN_STATUSES),
+                _blocking_turn_condition(),
             )
             .count()
         )
         if non_terminal > 0:
             raise SegmentNotSealableError(
-                f"Segment {segment.id} 含 {non_terminal} 个非终态 Turn，无法密封"
+                f"Segment {segment.id} 含 {non_terminal} 个阻塞性非终态 Turn，无法密封"
             )
 
         # 2. range 固定
@@ -384,8 +402,10 @@ class EpochManager:
         thread = db.query(Thread).with_for_update().filter(Thread.id == thread_id).one()
 
         if expected_idle_cutoff is not None:
+            # last_activity_at 为 NULL 表示从未观测到活动 → 视为「无限空闲」，
+            # 允许密封；仅在观测到晚于 cutoff 的活动时判定为活跃。
             last = thread.last_activity_at
-            if last is None or last > expected_idle_cutoff:
+            if last is not None and last > expected_idle_cutoff:
                 return SegmentSealingResult(
                     segment_id=expected_segment_id, stale=True, reason="thread_active",
                 )

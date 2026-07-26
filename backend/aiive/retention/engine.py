@@ -99,7 +99,10 @@ class RetentionEngine:
             .filter(RetentionCleanupRun.operation_id == operation_id)
             .first()
         )
-        if existing and existing.status != "done":
+        if existing is not None:
+            # 已 done 的 Run 直接返回（#17：再走新建分支会撞 operation_id 唯一约束）
+            if existing.status == "done":
+                return existing
             existing.execution_token = operation_id
             existing.claim_count += 1
             return existing
@@ -144,6 +147,8 @@ class RetentionEngine:
 
         返回 COMPLETED 表示所有 lane 已完成；CONTINUE 表示还有 lane 待处理。
         """
+        if self._run.status == "done":
+            return HandlerResult(outcome=HandlerOutcome.COMPLETED, reason="Run 已完成")
         current_lane = self._run.current_lane
         start_idx = 0
         if current_lane and current_lane in LANE_ORDER:
@@ -219,6 +224,25 @@ class RetentionEngine:
         )
         return last_batch.cursor_end_json if (last_batch and last_batch.cursor_end_json) else {}
 
+    def _get_last_cursor_phase(self, lane: str, phase: str) -> dict[str, Any]:
+        """获取指定 phase（scrub/delete）的最近完成 batch 游标（#5：
+        scrub 与 delete 必须使用相互独立的游标键，混用会互相跳过/回绕）。"""
+        batches = (
+            self._db.query(RetentionCleanupBatch)
+            .filter(
+                RetentionCleanupBatch.run_id == self._run.id,
+                RetentionCleanupBatch.lane == lane,
+                RetentionCleanupBatch.status == "done",
+            )
+            .order_by(RetentionCleanupBatch.batch_no.desc())
+            .all()
+        )
+        for b in batches:
+            cur = b.cursor_end_json or {}
+            if cur.get("phase", "scrub") == phase:
+                return cur
+        return {}
+
     def _start_batch(
         self, lane: str, batch_no: int, cursor_start: dict[str, Any],
     ) -> RetentionCleanupBatch:
@@ -252,6 +276,32 @@ class RetentionEngine:
         self._run.scrubbed_count += scrubbed
         self._run.deleted_count += deleted
 
+    def _enqueue_index_tombstone(self, source_type: str, source_id: str) -> None:
+        """scrub 后入队 tombstone 型 retrieval refresh（#6：否则检索索引 snippet
+        中的原文继续可检索）。幂等：operation_id 存在则跳过。消费端
+        indexing_service 对 event_type='source.tombstoned' 执行 tombstone_by_source。
+        """
+        op_id = f"retrieval_refresh:{source_type}:{source_id}:retention_scrub"
+        existing = (
+            self._db.query(OutboxJob)
+            .filter(OutboxJob.operation_id == op_id)
+            .first()
+        )
+        if existing is not None:
+            return
+        self._db.add(OutboxJob(
+            operation_id=op_id,
+            job_type="retrieval_index_refresh",
+            status="pending",
+            payload={
+                "schema_version": 1,
+                "source_type": source_type,
+                "source_id": source_id,
+                "event_type": "source.tombstoned",
+            },
+            max_retries=3,
+        ))
+
     def _compute_input_hash(self, cursor_start: dict[str, Any], lane: str, batch_no: int) -> str:
         raw = json.dumps(
             {"cursor_start": cursor_start, "lane": lane, "batch_no": batch_no},
@@ -274,10 +324,11 @@ class RetentionEngine:
         lane = "outbox_job"
         cutoff_scrub = self._lane_cutoff(lane, "scrub")
         cutoff_delete = self._lane_cutoff(lane, "delete")
-        cursor = self._get_last_cursor(lane)
+        # #5：scrub / delete 分别使用独立游标键，禁止混用
+        cursor = self._get_last_cursor_phase(lane, "scrub")
         batch_no = self._get_next_batch_no(lane)
 
-        # Phase 1: scrub（仅 completed，不碰 deadletter）
+        # Phase 1: scrub（仅 completed，不碰 deadletter；排除已清空行）
         query = self._db.query(OutboxJob).filter(
             OutboxJob.status == "completed",
             func.coalesce(OutboxJob.terminal_at, OutboxJob.created_at) <= cutoff_scrub,
@@ -288,25 +339,28 @@ class RetentionEngine:
         batch.input_hash = self._compute_input_hash(cursor, lane, batch_no)
 
         rows = query.all()
+        scrubbed = 0
         last_id = cursor.get("last_id", "")
         for job in rows:
+            # 已清空行只推进游标不重复 scrub
             if job.payload:
                 job.payload = {}
+                scrubbed += 1
             if job.error_message and job.error_message != (job.terminal_reason or ""):
                 job.error_message = job.terminal_reason or ""
             last_id = job.id
 
         self._finish_batch(
-            batch, scanned=len(rows), scrubbed=len(rows),
+            batch, scanned=len(rows), scrubbed=scrubbed,
             deleted=0, cursor_end={"last_id": last_id, "phase": "scrub"},
         )
 
         if len(rows) == batch_size:
             return HandlerResult(outcome=HandlerOutcome.CONTINUE, reason=f"{lane} scrub 分批")
 
-        # Phase 2: delete（仅 completed，不碰 deadletter；游标续跑）
-        delete_cursor = self._get_last_cursor(lane)
-        last_id_from = delete_cursor.get("last_id", "") if delete_cursor.get("phase") == "delete" else ""
+        # Phase 2: delete（仅 completed，不碰 deadletter；独立游标续跑）
+        delete_cursor = self._get_last_cursor_phase(lane, "delete")
+        last_id_from = delete_cursor.get("last_id", "")
 
         deletable = (
             self._db.query(OutboxJob)
@@ -325,18 +379,20 @@ class RetentionEngine:
         del_batch.input_hash = self._compute_input_hash({"last_id": last_id_from, "phase": "delete"}, lane, del_batch_no)
 
         deleted = 0
-        last_deleted_id = last_id_from
+        # #5：游标推进到「已扫描」而非「已删除」位置——被 FK 引用而跳过的行
+        # 不推进游标会导致下一批永远取到同一批行，CONTINUE 活锁。
+        last_scanned_id = last_id_from
         for job in deletable:
+            last_scanned_id = job.id
             ref_count = self._count_references(job.id)
             if ref_count > 0:
                 continue
             self._db.delete(job)
             deleted += 1
-            last_deleted_id = job.id
 
         self._finish_batch(
             del_batch, scanned=len(deletable), scrubbed=0,
-            deleted=deleted, cursor_end={"last_id": last_deleted_id, "phase": "delete"},
+            deleted=deleted, cursor_end={"last_id": last_scanned_id, "phase": "delete"},
         )
 
         if len(deletable) == batch_size:
@@ -602,6 +658,9 @@ class RetentionEngine:
             s.active_constraints = None
             s.unresolved_failures = None
             s.omitted_artifact_refs = None
+            # #6：scrub 后使该 source 的索引条目 tombstone，防止索引 snippet
+            # 中的原文继续可检索
+            self._enqueue_index_tombstone("segment_summary", s.id)
             last_id = s.id
 
         self._finish_batch(
@@ -656,6 +715,12 @@ class RetentionEngine:
             c.referenced_artifacts = None
             c.relevant_entities = None
             c.latest_verified_tool_states = None
+            # #6：scrub 后使该 source 的索引条目 tombstone。
+            # 注：不就地 bump version——旧 checkpoint bump 到 max+1 会破坏
+            # 版本序（可能被「取最新版本」的读取路径误选）并有撞
+            # uq_epoch_checkpoint_epoch_version 的风险；索引隐藏由 tombstone
+            # refresh 完整承担。
+            self._enqueue_index_tombstone("epoch_checkpoint", c.id)
             last_id = c.id
 
         self._finish_batch(
@@ -772,10 +837,12 @@ class RetentionEngine:
         deleted_targets = 0
         last_id = cursor.get("last_id", "")
         for op in purged_ops:
+            # #5：游标推进到「已扫描」位置——安全谓词跳过的行同样推进，
+            # 否则下一批永远取到同一批被跳过的行，CONTINUE 活锁。
+            last_id = op.id
             # 安全谓词：Verifier 必须已通过
             if not is_forget_operation_clearable(self._db, op.id):
                 continue
-            last_id = op.id
 
             actions = (
                 self._db.query(ForgetAction)
