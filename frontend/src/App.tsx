@@ -5,7 +5,8 @@
  * - 支持从对话页面传递 trace_id 到上下文检查器
  */
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { BASE_PATH } from "./lib/base";
 import ChatPage from "./pages/ChatPage";
 import EventTimeline from "./pages/EventTimeline";
 import ContextInspector from "./pages/ContextInspector";
@@ -23,7 +24,24 @@ const developerUiEnabled = (import.meta as ImportMeta & {
 }).env?.VITE_AIIVE_DEVELOPER_UI_ENABLED === "true";
 
 function tabFromLocation(): Tab {
-  return developerUiEnabled && window.location.pathname === "/developer" ? "developer" : "chat";
+  return developerUiEnabled && window.location.pathname.startsWith(`${BASE_PATH}developer`) ? "developer" : "chat";
+}
+
+function SunIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="4" />
+      <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
+    </svg>
+  );
+}
+
+function MoonIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+    </svg>
+  );
 }
 
 /**
@@ -41,7 +59,7 @@ export default function App() {
   }, []);
 
   const navigate = (nextTab: Tab) => {
-    const nextPath = nextTab === "developer" ? "/developer" : "/";
+    const nextPath = nextTab === "developer" ? `${BASE_PATH}developer` : BASE_PATH;
     if (window.location.pathname !== nextPath) window.history.pushState({}, "", nextPath);
     setTab(nextTab);
   };
@@ -60,8 +78,34 @@ export default function App() {
     ...(developerUiEnabled ? [{ key: "developer" as Tab, label: "开发者" }] : []),
   ];
 
+  // 双主题：null = 跟随系统；"light"/"dark" = 手动覆盖
+  const getSystemDark = useCallback(
+    () => window.matchMedia("(prefers-color-scheme: dark)").matches,
+    []
+  );
+  const [mode, setMode] = useState<"light" | "dark" | null>(null);
+  const [systemDark, setSystemDark] = useState(getSystemDark);
+  useEffect(() => {
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const handler = () => setSystemDark(mq.matches);
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
+  }, []);
+  const effectiveMode: "light" | "dark" = mode ?? (systemDark ? "dark" : "light");
+  const toggleMode = useCallback(() => {
+    setMode((prev) => {
+      const current = prev ?? (getSystemDark() ? "dark" : "light");
+      return current === "dark" ? "light" : "dark";
+    });
+  }, [getSystemDark]);
+
   return (
-    <div className="h-screen flex flex-col bg-background overflow-hidden">
+    <div
+      className={
+        "site-shell h-screen flex flex-col bg-background overflow-hidden" +
+        (mode ? ` mode-${mode}` : "")
+      }
+    >
       {/* 顶部导航栏 */}
       <header className="border-b border-divider bg-surface px-6 py-4 flex items-center justify-between shadow-sm">
         <div className="flex items-center gap-3">
@@ -84,6 +128,18 @@ export default function App() {
             </button>
           ))}
         </div>
+
+        {/* 主题切换（复用个人站双主题机制，可跟随系统） */}
+        <button
+          type="button"
+          onClick={toggleMode}
+          className="flex items-center gap-1.5 rounded-md border border-divider px-3 py-1.5 text-sm font-medium text-content transition-colors hover:bg-surface-muted"
+          title={effectiveMode === "dark" ? "切换到浅色" : "切换到深色"}
+          aria-label="切换主题"
+        >
+          {effectiveMode === "dark" ? <SunIcon /> : <MoonIcon />}
+          <span>{effectiveMode === "dark" ? "浅色" : "深色"}</span>
+        </button>
       </header>
 
       {/* 主内容区域，按当前选中的 Tab 渲染对应页面 */}

@@ -16,6 +16,7 @@ import {
   ActionCard,
   StreamIncompleteError,
 } from "../api/chat";
+import { BASE_PATH } from "../lib/base";
 import Markdown from "../components/Markdown";
 
 const STORAGE_KEY = "aiive_active_thread";
@@ -165,7 +166,7 @@ function ToolCallCard({ call }: { call: ToolCallItem }) {
         className="w-full flex items-center gap-2 text-left focus:outline-none"
       >
         <span className="shrink-0 flex items-center justify-center w-4 h-4">{statusMeta.icon}</span>
-        <span className="text-sm font-medium text-title truncate">🔧 {call.name}</span>
+        <span className="text-sm font-medium text-title truncate">{call.name}</span>
         <span className={`ml-auto text-[11px] px-2 py-0.5 rounded-full border whitespace-nowrap ${statusMeta.chip}`}>
           {statusMeta.label}
         </span>
@@ -369,7 +370,7 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
   useEffect(() => {
     if (!threadId) return;
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${protocol}//${window.location.host}/ws/${threadId}`;
+    const wsUrl = `${protocol}//${window.location.host}${BASE_PATH}ws/${threadId}`;
     let ws: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -483,7 +484,7 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
     };
     setMessages(prev => [...prev, placeholderMsg]);
     try {
-      const res = await fetch("/api/chat/system", {
+      const res = await fetch("api/chat/system", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: text, thread_id: threadId }),
@@ -950,7 +951,7 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
                         card.card_type === "memory_revised" ? "bg-accent-soft text-accent-text border-accent-border" :
                         card.card_type === "forget_result" ? "bg-danger-soft text-danger-hover border-danger-border" :
                         "bg-background text-code border-divider"
-                      }`}>📌 {card.title}{card.summary ? `: ${card.summary.slice(0, 30)}` : ""}</span>
+                      }`}>{card.title}{card.summary ? `: ${card.summary.slice(0, 30)}` : ""}</span>
                     )}
                     {card.trace_id && (
                       <button

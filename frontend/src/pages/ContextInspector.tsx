@@ -116,7 +116,7 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
     }
 
     setLoadState("loading");
-    fetch(`/api/context-runs/${encodeURIComponent(traceId)}`, { signal: controller.signal })
+    fetch(`api/context-runs/${encodeURIComponent(traceId)}`, { signal: controller.signal })
       .then(async response => {
         if (response.status === 404) {
           setLoadState("not_found");
@@ -143,7 +143,7 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
   const fetchDetail = (itemId: string) => {
     if (fullContents[itemId] !== undefined || loadingItem) return;
     setLoadingItem(itemId);
-    fetch(`/api/context-runs/${encodeURIComponent(traceId || "")}/items/${encodeURIComponent(itemId)}`)
+    fetch(`api/context-runs/${encodeURIComponent(traceId || "")}/items/${encodeURIComponent(itemId)}`)
       .then(async response => {
         if (response.status === 404) throw new Error("上下文项不存在");
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -173,7 +173,7 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
   // 无 traceId 时显示引导提示
   if (!traceId) return (
     <div className="text-center text-faint py-16">
-      <p className="text-lg mb-2">🔍 上下文检查器</p>
+      <p className="text-lg mb-2">上下文检查器</p>
       <p className="text-sm">在对话页面点击 trace_id 即可查看该次对话的完整上下文</p>
     </div>
   );

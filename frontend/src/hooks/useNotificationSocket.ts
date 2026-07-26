@@ -6,6 +6,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
+import { BASE_PATH } from "../lib/base";
 
 type NotificationData = { pending_count: number };
 
@@ -25,7 +26,7 @@ function ensureSocket() {
     return;
   }
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const url = `${protocol}//${window.location.host}/ws/${WS_PATH}`;
+  const url = `${protocol}//${window.location.host}${BASE_PATH}ws/${WS_PATH}`;
   socket = new WebSocket(url);
 
   socket.onmessage = (event) => {

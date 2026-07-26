@@ -52,24 +52,24 @@ export default function RetrievalInspector({ traceId }: { traceId?: string }) {
     setLoading(true);
     setError("");
     Promise.all([
-      fetch(`/api/retrieval-runs?trace_id=${encodeURIComponent(traceId)}`).then(r => {
+      fetch(`api/retrieval-runs?trace_id=${encodeURIComponent(traceId)}`).then(r => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json() as Promise<RunSummary[]>;
       }),
-      fetch(`/api/memory-recall-runs?trace_id=${encodeURIComponent(traceId)}`).then(r => {
+      fetch(`api/memory-recall-runs?trace_id=${encodeURIComponent(traceId)}`).then(r => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json() as Promise<Array<{ run_id: string }>>;
       }),
     ]).then(async ([runs, recallRuns]) => {
       const [retrievalDetail, recallDetail] = await Promise.all([
         runs[0]
-          ? fetch(`/api/retrieval-runs/${runs[0].run_id}`).then(r => {
+          ? fetch(`api/retrieval-runs/${runs[0].run_id}`).then(r => {
               if (!r.ok) throw new Error(`HTTP ${r.status}`);
               return r.json() as Promise<RetrievalDetail>;
             })
           : Promise.resolve(null),
         recallRuns[0]
-          ? fetch(`/api/memory-recall-runs/${recallRuns[0].run_id}`).then(r => {
+          ? fetch(`api/memory-recall-runs/${recallRuns[0].run_id}`).then(r => {
               if (!r.ok) throw new Error(`HTTP ${r.status}`);
               return r.json() as Promise<RecallDetail>;
             })

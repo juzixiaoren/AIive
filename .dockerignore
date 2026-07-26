@@ -1,0 +1,20 @@
+# 依赖与构建产物
+**/node_modules
+**/__pycache__
+**/*.pyc
+**/*.pyo
+
+# 版本控制与运行时数据
+.git
+.data
+**/.pytest_cache
+**/.wrangler
+**/*.log
+.DS_Store
+
+# Python 测试与打包中间产物（不进运行镜像）
+backend/tests
+backend/aiive.egg-info
+
+# 密钥文件：仅由 compose 的 env_file 在宿主机读取，禁止进入构建上下文/镜像层
+.env
