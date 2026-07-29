@@ -170,6 +170,7 @@ def create_app() -> FastAPI:
         from aiive.config import settings
         if settings.aiive_memory_vector_enabled:
             from aiive.db.base import SessionLocal
+            from aiive.memory.vector_bootstrap import ensure_memory_vector_backfill
             from aiive.memory.vector_projection import validate_vector_runtime
 
             vector_db = SessionLocal()
@@ -177,6 +178,7 @@ def create_app() -> FastAPI:
                 validate_vector_runtime(vector_db)
             finally:
                 vector_db.close()
+            ensure_memory_vector_backfill()
         try:
             # 重启后恢复已激活 MCP 能力的工具注册（注册表是进程内状态，DB 才是权威）
             from aiive.mcp.bootstrap import restore_active_capabilities

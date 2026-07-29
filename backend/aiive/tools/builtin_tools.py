@@ -1252,28 +1252,51 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
          "创建定时提醒并写入 Task 表，由后台可靠投递。注意：本工具只接受相对延迟 delay_minutes。"
          "若用户给的是绝对时间点（如“14点提醒我”“下午3点做某事”），必须先调用 get_current_time 获取当前时间，"
          "由你自行换算出到目标时间还剩多少分钟，再传入 delay_minutes，切勿凭空乱填。",
-         {"content": "str", "delay_minutes": {"type": "int", "description": "相对当前时间的延迟分钟数；用户给绝对时间时需先用 get_current_time 换算，默认 1"}}, "low", True, False),
+         {
+             "content": {"type": "str", "description": "提醒内容", "minLength": 1},
+             "delay_minutes": {
+                 "type": "int",
+                 "description": "相对当前时间的延迟分钟数；用户给绝对时间时需先用 get_current_time 换算，默认 1",
+                 "minimum": 1,
+                 "maximum": 525600,
+             },
+         }, "low", True, False),
         ("remind_alert", _handle_remind_alert, "激活到期提醒警报，前端显示确认/延期操作按钮",
-         {"reminder_id": "str"}, "low", True, False),
+         {"reminder_id": {"type": "str", "minLength": 1}}, "low", True, False),
         ("confirm_reminder", _handle_confirm_reminder, "确认提醒已完成",
-         {"reminder_id": "str"}, "low", True, False),
+         {"reminder_id": {"type": "str", "minLength": 1}}, "low", True, False),
         ("snooze_reminder", _handle_snooze_reminder, "延迟提醒 N 分钟，创建新的延时任务",
-         {"reminder_id": "str", "delay_minutes": {"type": "int", "description": "默认 5"}}, "low", True, False),
+         {
+             "reminder_id": {"type": "str", "minLength": 1},
+             "delay_minutes": {"type": "int", "description": "默认 5", "minimum": 1, "maximum": 525600},
+         }, "low", True, False),
         ("list_tasks", _handle_list_tasks, "列出所有任务/提醒，status='all'/'pending'/'completed'",
-         {"status": {"type": "str", "description": "空或 all=全部; pending/completed 可选"}}, "low", False, False),
+         {"status": {
+             "type": "str",
+             "description": "空或 all=全部; pending/completed 可选",
+             "enum": ["", "all", "pending", "completed"],
+         }}, "low", False, False),
         ("cancel_task", _handle_cancel_task, "按 ID 取消任务",
-         {"task_id": "str"}, "low", True, False),
+         {"task_id": {"type": "str", "minLength": 1}}, "low", True, False),
         ("dismiss_notifications", _handle_dismiss_notifications,
          "清除未执行的通知（待提醒/提醒中/已延时），将其标记为已取消。已确认和已取消的不受影响。默认仅当前线程",
-         {"scope": {"type": "str", "description": "thread(默认，仅当前线程) / all(跨线程清除)"}}, "low", True, False),
+         {"scope": {
+             "type": "str",
+             "description": "thread(默认，仅当前线程) / all(跨线程清除)",
+             "enum": ["thread", "all"],
+         }}, "low", True, False),
         ("show_notifications", _handle_show_notifications, "显示已触发的通知", {}, "low", False, False),
         # 记忆管理 —— 写入
         ("remember_or_update", _handle_remember_or_update,
          "记住或更新一条长期记忆。相同 memory_key 自动覆盖旧值，无需手动查重。\n"
          + MEMORY_KEY_GUIDE,
          {
-             "content": {"type": "str", "description": "记忆内容文本；身份键只填纯值"},
-             "memory_type": {"type": "str", "description": "user_profile / agent_self / project / policy / procedural / episodic / knowledge / environment"},
+             "content": {"type": "str", "description": "记忆内容文本；身份键只填纯值", "minLength": 1},
+             "memory_type": {
+                 "type": "str",
+                 "description": "user_profile / agent_self / project / policy / procedural / episodic / knowledge / environment",
+                 "enum": ["fact", "user_profile", "agent_self", "project", "policy", "procedural", "episodic", "knowledge", "environment"],
+             },
              "memory_key": {"type": "str", "description": "稳定键，推荐格式: user.preference.<topic> / agent.persona.<trait> / project.<name>.<topic>"},
              "keywords": {"type": "list", "description": "可选检索关键词（同义词/上位词）。用于词汇召回命中；例如记「喜欢霸王茶姬」附 ['奶茶','茶饮']，查询「想喝奶茶」即可召回。不写入 content 文本"},
          }, "low", True, False),
@@ -1282,7 +1305,11 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
          "执行 Forget Saga — Phase A 立即屏蔽。长期记忆、原始聊天、派生摘要全部清理。\n"
          + "mode: everywhere(默认/忘记一切) / memory_only(仅删记忆保留聊天) / history_only(仅删聊天及派生)",
          {
-             "mode": {"type": "str", "description": "memory_only / history_only / everywhere (默认 everywhere)"},
+             "mode": {
+                 "type": "str",
+                 "description": "memory_only / history_only / everywhere (默认 everywhere)",
+                 "enum": ["memory_only", "history_only", "everywhere"],
+             },
              "memory_ids": {"type": "list", "description": "memory_only/everywhere: 精确记忆 ID"},
              "turn_ids": {"type": "list", "description": "history_only/everywhere: 精确 Turn ID"},
              "event_ids": {"type": "list", "description": "history_only/everywhere: 精确 Event ID"},
@@ -1293,7 +1320,12 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         ("forget_status", handle_forget_status,
          "查询 forget Operation 的各阶段进度：shield/cascade/rebuild/purge/verify 的完成状态，不返回已删除内容。",
          {
-             "operation_key": {"type": "str", "description": "forget 工具返回的 operation_key"},
+             "operation_key": {
+                 "type": "str",
+                 "description": "forget 工具返回的 operation_key",
+                 "minLength": 1,
+                 "required": True,
+             },
          }, "low", False, False),
         ("run_memory_maintenance", _handle_run_memory_maintenance,
          "扫描记忆库健康状态并启动真实后台维护；返回入队前诊断快照，最终结果稍后更新",
@@ -1305,8 +1337,8 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
          {
              "query": {"type": "str", "description": "自然语言查询"},
              "memory_types": {"type": "list", "description": "可选过滤: user_profile/project/policy/procedural/episodic/knowledge"},
-             "top_k": {"type": "int", "description": "返回条数，默认 8"},
-             "token_budget": {"type": "int", "description": "结果 token 上限，默认 1000"},
+             "top_k": {"type": "int", "description": "返回条数，默认 8", "minimum": 1, "maximum": 100},
+             "token_budget": {"type": "int", "description": "结果 token 上限，默认 1000", "minimum": 1, "maximum": 20000},
          }, "low", False, False),
         ("memory_timeline", _handle_memory_timeline,
          "获取单条记忆详情 + 完整版本历史 + 证据链。memory_id 精确获取一条（跨生命周期）；" +
@@ -1326,35 +1358,46 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
          {
              "query": {"type": "str", "description": "自然语言查询"},
              "deep": {"type": "bool", "description": "是否回溯原始历史，默认 false"},
-             "top_k": {"type": "int", "description": "返回条数，默认 20"},
-             "token_budget": {"type": "int", "description": "结果 token 上限，默认 2000"},
+             "top_k": {"type": "int", "description": "返回条数，默认 20", "minimum": 1, "maximum": 100},
+             "token_budget": {"type": "int", "description": "结果 token 上限，默认 2000", "minimum": 1, "maximum": 20000},
          }, "low", False, False),
         # 文件操作
         ("safe_delete", _handle_safe_delete, "在允许范围内安全删除文件",
-         {"path": "str",
+         {"path": {"type": "str", "minLength": 1},
           "scope_id": {"type": "str", "description": "默认 test_artifacts"},
-          "mode": {"type": "str", "description": "trash / quarantine / hard_delete_for_test_only"}}, "high", True, True),
+          "mode": {
+              "type": "str",
+              "description": "trash / quarantine / hard_delete_for_test_only",
+              "enum": ["trash", "quarantine", "hard_delete_for_test_only"],
+          }}, "high", True, True),
         ("read_text_file", _handle_read_text_file, "读取 ~/Documents 下的文本文件（最多 50 行）",
-         {"path": {"type": "str", "description": "限 ~/Documents"}, "max_lines": {"type": "int", "description": "默认 50"}}, "low", False, False),
+         {
+             "path": {"type": "str", "description": "限 ~/Documents", "minLength": 1},
+             "max_lines": {"type": "int", "description": "默认 50", "minimum": 1, "maximum": 1000},
+         }, "low", False, False),
         # 知识库
         ("ingest_document", _handle_ingest_document, "导入文档到知识库并持久化原文",
          {"file_path": "str"}, "low", True, False),
         ("reindex_document", _handle_reindex_document, "从持久原文重新生成知识文档索引",
          {"document_id": "str"}, "low", True, False),
         ("search_knowledge", _handle_search_knowledge, "搜索已导入的文档",
-         {"query": "str", "limit": {"type": "int", "description": "默认 5"}}, "low", False, False),
+         {"query": "str", "limit": {"type": "int", "description": "默认 5", "minimum": 1, "maximum": 100}}, "low", False, False),
         # MCP 集成
         ("search_mcp", _handle_search_mcp, "按目标搜索 MCP 候选服务器",
-         {"goal": "str"}, "low", False, False),
+         {"goal": {"type": "str", "minLength": 1, "required": True}}, "low", False, False),
         ("install_mcp_sandbox", _handle_install_mcp_sandbox, "将 MCP 安装到沙箱",
          {"candidate_name": "str"}, "medium", True, False),
         ("plan_capability", _handle_plan_capability, "分析目标→搜索候选→评估风险→生成安装计划",
-         {"goal": "str"}, "low", False, False),
+         {"goal": {"type": "str", "minLength": 1, "required": True}}, "low", False, False),
         # 自进化
         ("create_selfdev_plan", _handle_create_selfdev_plan, "生成自进化补丁计划",
-         {"goal": "str"}, "low", False, False),
+         {"goal": {"type": "str", "minLength": 1, "required": True}}, "low", False, False),
         ("apply_patch_to_inactive_slot", _handle_apply_patch_to_inactive_slot, "仅将补丁应用到非活跃槽位",
-         {"operations": {"type": "list", "description": "补丁操作列表，来自 create_selfdev_plan 返回的 plan.operations"}}, "high", True, False),
+         {"operations": {
+             "type": "list",
+             "description": "补丁操作列表，来自 create_selfdev_plan 返回的 plan.operations",
+             "required": True,
+         }}, "high", True, False),
         ("promote_slot", _handle_promote_slot, "健康检查通过后提升非活跃槽位为活跃", {}, "high", True, False),
         ("rollback_slot", _handle_rollback_slot, "回滚到上一个活跃槽位", {}, "high", True, False),
         # 节奏 / 注意力
@@ -1366,8 +1409,16 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         "显式维护 WorkingState 语义字段: current_objective（设置当前目标）/ open_loops / active_constraints。"
         + "确定性字段（pending_approvals/artifact_refs/verified_tool_states/uncommitted_side_effects/running_tool_state）由系统自动维护，不要通过此工具修改。",
          {
-             "field": {"type": "str", "description": "current_objective / open_loops / active_constraints"},
-             "operation": {"type": "str", "description": "add / remove / update；current_objective 忽略此参数"},
+             "field": {
+                 "type": "str",
+                 "description": "current_objective / open_loops / active_constraints",
+                 "enum": ["current_objective", "open_loops", "active_constraints"],
+             },
+             "operation": {
+                 "type": "str",
+                 "description": "add / remove / update；current_objective 忽略此参数",
+                 "enum": ["add", "remove", "update"],
+             },
              "payload": {"type": "dict", "description": "字段内容。open_loops/active_constraints 单项需带 id；current_objective 为 {'value': '...'}"},
              "idempotency_key": {"type": "str", "description": "可选，重复提交保护"},
          }, "low", True, False),

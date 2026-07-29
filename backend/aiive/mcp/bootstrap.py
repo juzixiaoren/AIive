@@ -86,6 +86,9 @@ def _input_schema_to_parameters(input_schema: dict[str, Any]) -> dict[str, Any]:
         parameters[str(prop_name)] = {
             "type": _json_type_to_param_type(prop_def.get("type", "string")),
             "description": desc,
+            "required": prop_name in required,
+            **({"enum": prop_def["enum"]} if isinstance(prop_def.get("enum"), list) else {}),
+            **({"default": prop_def["default"]} if "default" in prop_def else {}),
         }
     return parameters
 
@@ -174,6 +177,7 @@ def register_capability_tools(
             parameters=_input_schema_to_parameters(
                 tool.get("input_schema") or {},
             ),
+            input_schema=tool.get("input_schema") or {},
         ))
         registered.append(cap_id)
     logger.info(

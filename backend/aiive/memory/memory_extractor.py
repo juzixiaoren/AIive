@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, ClassVar
 
 from json_repair import repair_json
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from aiive.core.text_utils import strip_code_fence
 
@@ -31,7 +31,9 @@ logger = logging.getLogger(__name__)
 
 class ExtractedMemory(BaseModel):
     """Single extracted memory item from LLM output."""
-    content: str
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", strict=True)
+
+    content: str = Field(min_length=1)
     memory_type: str = ""
     memory_key: str = ""
     confidence: float = Field(ge=0.0, le=1.0, default=0.5)
@@ -39,6 +41,8 @@ class ExtractedMemory(BaseModel):
     durable: bool = True
     importance: float = Field(ge=0.0, le=1.0, default=0.5)
     signal_type: str = ""  # routine / preference / habit / schedule (steward enrichment)
+    # 兼容旧 Steward 输出；规范化阶段仍以 content/source_span 为事实来源。
+    schedule_text: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -131,14 +135,35 @@ class UnifiedMemoryExtractor:
         messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
 
         try:
-            response: LLMResponse = self._llm_client.chat(
-                messages, trace_id=trace_id, temperature=0.1
-            )
+            extracted: list[ExtractedMemory] = []
+            for attempt in range(2):
+                response: LLMResponse = self._llm_client.chat(
+                    messages, trace_id=trace_id, temperature=0.1, json_mode=True,
+                )
+                if response.finish_reason == "length":
+                    error_text = "JSON output was truncated"
+                else:
+                    try:
+                        extracted = self._parse(response.content, strict=True)
+                        break
+                    except (json.JSONDecodeError, ValidationError, ValueError, TypeError) as error:
+                        error_text = self._validation_feedback(error)
+                if attempt == 0:
+                    messages = [
+                        *messages,
+                        {"role": "assistant", "content": response.content},
+                        {
+                            "role": "user",
+                            "content": (
+                                "上一次 JSON 未通过本地校验："
+                                f"{error_text}。请只返回修正后的 JSON 数组。"
+                            ),
+                        },
+                    ]
         except Exception:
             logger.exception("Unified extraction LLM call failed: trace_id=%s", trace_id)
             return []
 
-        extracted: list[ExtractedMemory] = self._parse(response.content)
         return self._normalize_all(
             extracted, thread_id, trace_id,
             source_event_ids=source_event_ids,
@@ -149,7 +174,7 @@ class UnifiedMemoryExtractor:
     # Parsing
     # ------------------------------------------------------------------
 
-    def _parse(self, raw: str) -> list[ExtractedMemory]:
+    def _parse(self, raw: str, *, strict: bool = False) -> list[ExtractedMemory]:
         """Parse LLM raw output into ExtractedMemory list."""
         try:
             text = strip_code_fence(raw)
@@ -161,27 +186,31 @@ class UnifiedMemoryExtractor:
                 repaired = repair_json(text)
                 data = json.loads(repaired)
             if not isinstance(data, list):
-                return []
+                raise ValueError("expected a JSON array")
             results: list[ExtractedMemory] = []
             for item in data:
                 try:
-                    results.append(ExtractedMemory(
-                        content=item.get("content", ""),
-                        memory_type=item.get("memory_type", ""),
-                        memory_key=item.get("memory_key", ""),
-                        confidence=float(item.get("confidence", 0.5)),
-                        source_span=item.get("source_span", ""),
-                        durable=item.get("durable", True),
-                        importance=float(item.get("importance", 0.5)),
-                        signal_type=item.get("signal_type", ""),
-                    ))
-                except Exception:
+                    results.append(ExtractedMemory.model_validate(item))
+                except (ValidationError, TypeError) as error:
+                    if strict:
+                        raise error
                     logger.warning("Single extraction parse failed", exc_info=True)
                     continue
             return results
         except (json.JSONDecodeError, ValueError):
+            if strict:
+                raise
             logger.warning("Extraction JSON parse failed", exc_info=True)
             return []
+
+    @staticmethod
+    def _validation_feedback(error: Exception) -> str:
+        if isinstance(error, ValidationError):
+            return "; ".join(
+                f"{'.'.join(str(p) for p in item['loc'])}: {item['msg']}"
+                for item in error.errors(include_url=False, include_input=False)[:8]
+            )
+        return str(error)[:400]
 
     # ------------------------------------------------------------------
     # Normalization
@@ -280,5 +309,3 @@ class UnifiedMemoryExtractor:
                 )
 
         return results
-
-

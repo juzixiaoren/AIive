@@ -18,6 +18,27 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # 可选的本地 Embedding 服务。仅在 scripts/start.sh 检测到
+  # AIIVE_MEMORY_VECTOR_ENABLED=true + AIIVE_EMBEDDING_PROVIDER=local 时启用。
+  # 首次启动自动下载模型，后续从宿主机 .data 缓存复用。
+  embedding:
+    image: "ghcr.io/huggingface/text-embeddings-inference:${AIIVE_TEI_IMAGE_TAG:-cpu-1.9}"
+    profiles: ["local-embedding"]
+    command:
+      - "--model-id"
+      - "${AIIVE_EMBEDDING_MODEL:-BAAI/bge-small-zh-v1.5}"
+      - "--revision"
+      - "${AIIVE_EMBEDDING_MODEL_REVISION:-534b6bfaaf500e70bcb9f3771cebc940c23b219d}"
+      - "--served-model-name"
+      - "${AIIVE_EMBEDDING_MODEL:-BAAI/bge-small-zh-v1.5}"
+      - "--max-concurrent-requests"
+      - "${AIIVE_LOCAL_EMBEDDING_MAX_CONCURRENCY:-32}"
+    volumes:
+      - ./.data/models/embeddings:/data
+    ports:
+      - "127.0.0.1:${AIIVE_LOCAL_EMBEDDING_PORT:-8081}:80"
+    restart: unless-stopped
+
   backend:
     build:
       context: .
@@ -29,6 +50,8 @@ services:
       HOST: "0.0.0.0"
       PORT: "8000"
       DATABASE_URL: "postgresql+psycopg://aiive:aiive_dev@postgres:5432/aiive"
+      # 宿主机直连用 127.0.0.1:8081；容器内通过 Compose 服务名访问。
+      AIIVE_EMBEDDING_BASE_URL: "${AIIVE_DOCKER_EMBEDDING_BASE_URL:-${AIIVE_EMBEDDING_BASE_URL:-http://embedding:80/v1}}"
     depends_on:
       postgres:
         condition: service_healthy

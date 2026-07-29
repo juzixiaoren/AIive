@@ -20,25 +20,32 @@ AIive — 面向个人用户的本地 Agent OS，具备长期记忆、工具执�
 ### Linux / macOS（Bash）
 
 ```bash
-# 1. 启动 PostgreSQL
-docker compose up -d
-
-# 2. 配置环境变量
+# 1. 配置环境变量
 cp .env.example .env
 # 编辑 .env 填入 LLM API Key 等信息
+# 如需本地向量召回，将 AIIVE_MEMORY_VECTOR_ENABLED 改为 true
 
-# 3. 安装依赖
+# 2. 启动 Docker 服务
+# 开启本地向量召回时，会自动拉取 TEI 并将模型缓存到 .data/models/embeddings
+./scripts/start.sh
+
+# 3. 查看服务状态
+docker compose --profile local-embedding ps
+```
+
+本地开发若希望后端和前端直接运行在宿主机：
+
+```bash
+docker compose up -d postgres
 pip install -e .
-
-# 4. 启动后端
 uvicorn aiive.main:app --reload --port 8000
-
-# 5. 启动前端（新终端）
 cd frontend && npm install && npm run dev
-
-# 6. 健康检查
 curl http://localhost:8000/health
 ```
+
+启用本地 Embedding 时应通过 `./scripts/start.sh` 启动模型服务。模型权重和
+Hugging Face 缓存均位于 `.data/models/embeddings/`，该目录不会进入 Git 或
+Docker 构建上下文。首次启动需要联网下载镜像与模型，之后复用本地缓存。
 
 ### Windows（命令提示符 cmd.exe）
 > 推荐使用 **Miniconda** 管理 Python 环境（本仓库实测环境名 `aiive`，Python 3.12）；`curl` 在 Win10+ 自带，否则可用 PowerShell 的 `Invoke-WebRequest`。安装依赖**务必加 `--prefer-binary`**，否则 pip 会选到只有源码包（tar.gz）的 `litellm`，卡在源码构建十几分钟（详见下方注意事项）。

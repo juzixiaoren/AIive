@@ -429,6 +429,106 @@ class TestToolRecordState:
         assert records[1].status == "failed"
 
 
+class TestLocalToolArgumentRetry:
+    """工具参数错误应反馈给模型纠正，且绝不提前执行 handler。"""
+
+    @staticmethod
+    def _registry_and_tools(calls: list[int]):
+        from aiive.tools.langchain_adapter import build_langchain_tools
+        from aiive.tools.registry import CapabilitySafetySchema, ToolRegistration, ToolRegistry
+
+        registry = ToolRegistry()
+
+        def count_items(count: int) -> str:
+            calls.append(count)
+            return str(count)
+
+        registry.register(ToolRegistration(
+            safety=CapabilitySafetySchema(
+                "count_items", "local_builtin", "trusted", "low",
+            ),
+            handler=count_items,
+            description="Count items",
+            parameters={"count": "int"},
+        ))
+        return registry, build_langchain_tools(registry)
+
+    def test_invalid_arguments_are_corrected_before_execution(self):
+        from aiive.core.llm_client import FakeLLMClient
+        from aiive.runtime.agent_graph import AgentGraph
+
+        calls: list[int] = []
+        registry, tools = self._registry_and_tools(calls)
+
+        class Assistant:
+            def __init__(self):
+                self.calls = 0
+
+            def invoke(self, _messages):
+                self.calls += 1
+                if self.calls == 1:
+                    return AIMessage(content="", tool_calls=[{
+                        "id": "bad-1", "name": "count_items", "args": {"count": "2"},
+                    }])
+                if self.calls == 2:
+                    return AIMessage(content="", tool_calls=[{
+                        "id": "good-1", "name": "count_items", "args": {"count": 2},
+                    }])
+                return AIMessage(content="done")
+
+        assistant = Assistant()
+        graph = AgentGraph(FakeLLMClient(), MagicMock())
+        compiled, _, _ = graph._build_graph(  # pyright: ignore[reportPrivateUsage]
+            assistant, tools, registry,
+        )
+        result = compiled.invoke({
+            "messages": [HumanMessage(content="count")],
+            "tool_records": [],
+        })
+
+        assert calls == [2]
+        validation_messages = [
+            message for message in result["messages"]
+            if isinstance(message, ToolMessage)
+            and "argument_validation_error" in str(message.content)
+        ]
+        assert len(validation_messages) == 1
+        assert assistant.calls == 3
+
+    def test_repeated_invalid_arguments_stop_after_retry_budget(self):
+        from aiive.core.llm_client import FakeLLMClient
+        from aiive.runtime.agent_graph import AgentGraph
+
+        calls: list[int] = []
+        registry, tools = self._registry_and_tools(calls)
+
+        class AlwaysInvalidAssistant:
+            def __init__(self):
+                self.calls = 0
+
+            def invoke(self, _messages):
+                self.calls += 1
+                return AIMessage(content="", tool_calls=[{
+                    "id": f"bad-{self.calls}",
+                    "name": "count_items",
+                    "args": {"count": "still-not-an-int"},
+                }])
+
+        assistant = AlwaysInvalidAssistant()
+        graph = AgentGraph(FakeLLMClient(), MagicMock())
+        compiled, _, _ = graph._build_graph(  # pyright: ignore[reportPrivateUsage]
+            assistant, tools, registry,
+        )
+        result = compiled.invoke({
+            "messages": [HumanMessage(content="count")],
+            "tool_records": [],
+        })
+
+        assert calls == []
+        assert assistant.calls == 3  # 初次调用 + 两次纠正机会
+        assert str(result["messages"][-1].content).startswith("工具参数连续校验失败")
+
+
 class TestLangchainAdapter:
     """测试 langchain_adapter 能创建有效的 LangChain 工具。"""
 

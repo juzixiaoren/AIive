@@ -21,6 +21,7 @@ class TestClassifyMemorySignal:
 
         assert signal.action == MemorySignalAction.SKIP.value
         assert signal.confidence == 0.9
+        assert fake._call_history[0]["json_mode"] is True
 
     def test_prompt_contains_rendered_message_and_json_example(self):
         """渲染后的 prompt 应替换占位符，且保留 JSON 示例中的花括号。"""

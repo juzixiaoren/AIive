@@ -9,13 +9,11 @@ RunContext 通过 _make_handler 闭包捕获，经由 registry.execute() 注入 
 
 from __future__ import annotations
 
-from typing import Annotated, Any
-
-from langchain_core.tools import InjectedToolCallId, StructuredTool
-from pydantic import Field
+from langchain_core.tools import StructuredTool
 
 from aiive.context.run_context import RunContext
 from aiive.tools.registry import ToolRegistry
+from aiive.tools.tool_validation import build_tool_args_model
 
 
 def _make_handler(registry: ToolRegistry, capability_id: str, run_context: RunContext | None):
@@ -101,18 +99,6 @@ def build_langchain_tools(
         if reg is None:
             continue
 
-        params = reg.parameters or {}
-        args_schema: dict[str, Any] = {}
-        for pname, pdef in params.items():
-            # 支持两种写法：纯类型字符串（"str"）或带描述的字典（{"type": "str", "description": "..."}）
-            if isinstance(pdef, dict):
-                ptype = pdef.get("type", "str")
-                pdesc = pdef.get("description", "")
-            else:
-                ptype = pdef
-                pdesc = ""
-            args_schema[pname] = (_type_str_to_python(ptype), pdesc)
-
         desc = reg.description
         safety = reg.safety
         if safety.writes_external_world:
@@ -124,65 +110,11 @@ def build_langchain_tools(
             func=_make_handler(registry, cap_id, run_context),
             name=cap_id,
             description=desc,
-            args_schema=_build_args_schema(cap_id, args_schema, inject_tool_call_id=True),
+            args_schema=build_tool_args_model(
+                reg, include_injected_tool_call_id=True,
+            ),
             return_direct=False,
         )
         tools.append(tool)
 
     return tools
-
-
-def _type_str_to_python(type_str: str) -> type:
-    """将参数类型字符串映射为 Python 类型。
-
-    参数:
-        type_str: 类型字符串（"str"、"int"、"float"、"bool"、"list"、"dict"）
-
-    返回:
-        对应的 Python type
-    """
-    mapping = {
-        "str": str,
-        "int": int,
-        "float": float,
-        "bool": bool,
-        "list": list,
-        "dict": dict,
-    }
-    return mapping.get(type_str, str)
-
-
-def _build_args_schema(
-    name: str,
-    fields: dict[str, tuple[type, str]],
-    inject_tool_call_id: bool = False,
-) -> type:
-    """为工具参数构建 Pydantic 模型（用于 LangChain args_schema）。
-
-    参数:
-        name: 模型名称前缀
-        fields: {字段名: (Python 类型, 字段描述)} 的字典；字段描述会出现在工具 schema 中，
-                是约束 LLM 传参的主要手段（尤其对 content 这类需要语义约束的参数）。
-
-    返回:
-        动态创建的 Pydantic BaseModel 子类
-
-    注意:
-        对 int 字段启用 strict 模式，拒绝 float → int 的隐式截断（如 0.5 → 0）。
-    """
-    from pydantic import create_model
-
-    field_defs: dict[str, Any] = {}
-    for fname, (ftype, fdesc) in fields.items():
-        if ftype is int:
-            field_defs[fname] = (int, Field(default=None, strict=True, description=fdesc))
-        elif ftype is float:
-            field_defs[fname] = (float, Field(default=None, description=fdesc))
-        elif ftype is str:
-            field_defs[fname] = (str, Field(default="", description=fdesc))
-        else:
-            field_defs[fname] = (ftype, Field(default=None, description=fdesc))
-    if inject_tool_call_id:
-        field_defs["tool_call_id"] = (Annotated[str, InjectedToolCallId], "")
-
-    return create_model(f"{name}_args", **field_defs)

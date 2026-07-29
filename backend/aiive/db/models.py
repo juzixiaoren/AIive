@@ -301,7 +301,7 @@ class MemoryVectorProjection(Base):
     content_hash: Mapped[str | None] = mapped_column(String(32), nullable=True)
     embedding_model: Mapped[str] = mapped_column(String(128), nullable=False)
     embedding: Mapped[list[float]] = mapped_column(
-        Vector(1536).with_variant(JSON(), "sqlite"), nullable=False,
+        Vector(512).with_variant(JSON(), "sqlite"), nullable=False,
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow,

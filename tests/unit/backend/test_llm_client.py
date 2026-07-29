@@ -1,7 +1,9 @@
 """测试 FakeLLMClient 和 LLMResponse 的各项功能。"""
+from unittest.mock import MagicMock, patch
+
 import pytest
 
-from aiive.core.llm_client import FakeLLMClient, LLMClientError, LLMResponse
+from aiive.core.llm_client import FakeLLMClient, LLMClient, LLMClientError, LLMResponse
 
 
 class TestFakeLLMClient:
@@ -88,3 +90,38 @@ class TestFakeLLMClient:
         client = FakeLLMClient()
         response = client.chat([{"role": "user", "content": "Hi"}])
         assert len(response.raw_preview) > 0
+
+    def test_records_json_mode_request(self):
+        client = FakeLLMClient()
+        client.chat([{"role": "user", "content": "Return JSON"}], json_mode=True)
+        assert client._call_history[0]["json_mode"] is True
+
+
+class TestRealLLMClientJsonMode:
+    @staticmethod
+    def _response(status: int, payload: dict | None = None, text: str = "") -> MagicMock:
+        response = MagicMock()
+        response.status_code = status
+        response.text = text
+        response.json.return_value = payload or {}
+        return response
+
+    @patch("aiive.core.llm_client.httpx.post")
+    def test_auto_falls_back_only_for_explicit_unsupported_error(self, post: MagicMock):
+        post.side_effect = [
+            self._response(400, text="response_format json_object is unsupported"),
+            self._response(200, {
+                "model": "portable-model",
+                "choices": [{"message": {"content": "{\"ok\":true}"}, "finish_reason": "stop"}],
+                "usage": {},
+            }, text='{"choices":[]}'),
+        ]
+        client = LLMClient("https://provider.example/v1", "key", "portable-model")
+        response = client.chat(
+            [{"role": "user", "content": "Return JSON"}],
+            json_mode=True,
+        )
+        assert response.content == '{"ok":true}'
+        assert post.call_count == 2
+        assert post.call_args_list[0].kwargs["json"]["response_format"] == {"type": "json_object"}
+        assert "response_format" not in post.call_args_list[1].kwargs["json"]
