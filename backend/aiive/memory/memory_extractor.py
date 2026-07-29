@@ -21,6 +21,7 @@ from aiive.core.text_utils import strip_code_fence
 from aiive.core.llm_client import LLMClient, LLMResponse
 from aiive.memory.memory_types import MEMORY_KEY_GUIDE, MemoryProposal, TrustLevel
 from aiive.memory.proposal_normalizer import ProposalNormalizer, NormalizationResult
+from aiive.prompts import get_prompt_registry
 
 logger = logging.getLogger(__name__)
 
@@ -43,48 +44,6 @@ class ExtractedMemory(BaseModel):
     signal_type: str = ""  # routine / preference / habit / schedule (steward enrichment)
     # 兼容旧 Steward 输出；规范化阶段仍以 content/source_span 为事实来源。
     schedule_text: str = ""
-
-
-# ---------------------------------------------------------------------------
-# Unified extraction prompt (covers both MemoryExtractor + StewardSignalExtractor)
-# ---------------------------------------------------------------------------
-
-UNIFIED_EXTRACT_PROMPT = """从以下对话中提取持久性信息。输出 JSON 数组，每个对象包含：
-
-- content: 事实/偏好/习惯/日程的简洁表述
-- memory_type: 以下 canonical 类型之一：
-    user_profile（身份信息、偏好、习惯、日程、规律）
-    agent_self（Agent 的名称、人格、关系风格）
-    project（项目决策、技术栈、架构选择）
-    policy（规则、约束、禁止事项）
-    procedural（工作流、执行方法、经验教训）
-    episodic（值得记住的一次性事件）
-    knowledge（通用事实和知识）
-    environment（环境配置信息）
-- memory_key: 去重用稳定键，规范见下方
-- confidence: 0.0-1.0（对持久性的确信度）
-- importance: 0.0-1.0（重要性）
-- source_span: 用户消息中包含该事实的原文片段
-- signal_type: 可选的管家信号标记（routine/habit/schedule/preference），无则留空
-
-记忆键规范：
-""" + MEMORY_KEY_GUIDE + """
-
-关键规则：
-- 只提取用户明确陈述的信息，不推断或猜测
-- 身份键的 content 必须是纯值，不含前缀
-- "我的代码报错了""今天好累""帮我看看"等暂时性情况不提取
-- 用户明确要求"记住X""以后叫我X"的，confidence 设为 0.95+
-- 用户陈述的日常规律（每天/每周）标记 signal_type=routine
-- 用户陈述的习惯（喜欢/不喜欢/习惯）标记 signal_type=habit 或 preference
-- 带时间/日期的计划标记 signal_type=schedule
-- 无任何可提取内容时返回空数组 []
-
-对话：
-User: {user_message}
-Assistant: {reply}
-
-只输出有效 JSON，不用 markdown 标记："""
 
 
 # ---------------------------------------------------------------------------
@@ -129,9 +88,12 @@ class UnifiedMemoryExtractor:
         Returns:
             List of normalized MemoryProposal.
         """
-        prompt = UNIFIED_EXTRACT_PROMPT.format(
-            user_message=user_message, reply=reply
-        )
+        prompt = get_prompt_registry().render(
+            "memory.extractor",
+            memory_key_guide=MEMORY_KEY_GUIDE,
+            user_message=user_message,
+            reply=reply,
+        ).content
         messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
 
         try:
@@ -154,10 +116,10 @@ class UnifiedMemoryExtractor:
                         {"role": "assistant", "content": response.content},
                         {
                             "role": "user",
-                            "content": (
-                                "上一次 JSON 未通过本地校验："
-                                f"{error_text}。请只返回修正后的 JSON 数组。"
-                            ),
+                            "content": get_prompt_registry().render(
+                                "memory.extractor_retry",
+                                error_text=error_text,
+                            ).content,
                         },
                     ]
         except Exception:

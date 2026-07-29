@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from aiive.core.llm_client import LLMClient
 from aiive.core.text_utils import strip_code_fence
 from aiive.memory.extraction_policy import MemorySignalAction
+from aiive.prompts import get_prompt_registry
 
 logger = logging.getLogger(__name__)
 
@@ -32,27 +33,6 @@ class MemorySignalDecision(BaseModel):
     action: Literal["skip", "extract_async", "extract_sync"] = MemorySignalAction.EXTRACT_ASYNC.value
     confidence: float = Field(ge=0.0, le=1.0, default=0.5)
     reason: str = ""
-
-
-_MEMORY_SIGNAL_PROMPT: str = """Classify whether the following conversation turn contains information worth remembering long-term.
-
-Output ONLY a JSON object:
-{
-  "action": "skip" | "extract_async" | "extract_sync",
-  "confidence": 0.0-1.0,
-  "reason": "brief explanation"
-}
-
-Rules:
-- skip: pure greeting, simple acknowledgement, transient problem report ("my code errored"), small talk, one-off factual question. Do NOT extract.
-- extract_async: contains preferences, facts, habits, project details, or general information that may be useful later. Enqueue for background processing.
-- extract_sync: contains explicit identity changes, policy rules, or critical corrections that must be remembered immediately. Use sparingly.
-
-Conversation:
-User: {user_message}
-Assistant: {reply}
-
-Output ONLY valid JSON, no markdown:"""
 
 
 # ============================================================================
@@ -85,13 +65,11 @@ class ActionPlanner:
         Returns:
             MemorySignalDecision with skip/extract_async/extract_sync.
         """
-        # 模板中含字面量 JSON 示例（裸花括号），不能用 str.format，
-        # 否则会把 JSON 里的 {...} 当成格式字段而抛 KeyError。
-        prompt = (
-            _MEMORY_SIGNAL_PROMPT
-            .replace("{user_message}", user_message)
-            .replace("{reply}", reply)
-        )
+        prompt = get_prompt_registry().render(
+            "memory.signal_classifier",
+            user_message=user_message,
+            reply=reply,
+        ).content
         messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
 
         try:
@@ -114,10 +92,10 @@ class ActionPlanner:
                         {"role": "assistant", "content": response.content},
                         {
                             "role": "user",
-                            "content": (
-                                "The previous JSON failed local validation: "
-                                f"{error_text}. Return one corrected JSON object only."
-                            ),
+                            "content": get_prompt_registry().render(
+                                "memory.signal_retry",
+                                error_text=error_text,
+                            ).content,
                         },
                     ]
         except Exception:

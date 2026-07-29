@@ -35,6 +35,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["backend"]
 
+[tool.setuptools.package-data]
+"aiive.prompts" = ["manifest.toml", "**/*.md"]
+
 [tool.basedpyright]
 include = ["backend"]
 exclude = ["backend/alembic/versions", "backend/alembic/_archive_migrations_20260717", "backend/tests", "backend/conftest.py"]

@@ -136,6 +136,12 @@ def create_app() -> FastAPI:
         # 绑定主事件循环，供后台线程安全推送 WebSocket
         ws_manager.set_main_loop(asyncio.get_running_loop())
         try:
+            from aiive.prompts import validate_prompt_catalog
+            validate_prompt_catalog()
+        except Exception:
+            logger.exception("Prompt 目录校验失败，阻断启动")
+            raise
+        try:
             _ensure_schema()
         except Exception:
             # 迁移失败必须阻断启动（与 validate_vector_runtime 策略一致）：

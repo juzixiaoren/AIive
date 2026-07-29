@@ -14,23 +14,9 @@ from json_repair import repair_json
 
 from aiive.core.llm_client import LLMClient, LLMResponse
 from aiive.core.text_utils import strip_code_fence
+from aiive.prompts import get_prompt_registry
 
 logger = logging.getLogger(__name__)
-
-_PLAN_PROMPT: str = """分析用户目标，判断需要什么类型的外部能力，输出 JSON：
-
-{
-  "goal_summary": "一句话总结",
-  "missing_capability_type": "filesystem | github | database | web_search | browser | web_scraping | api_integration | notification | email | other",
-  "search_keywords": ["关键词1", "关键词2"],
-  "risk_tolerance": "low | medium | high",
-  "reasoning": "为什么需要这个能力"
-}
-
-用户目标: {goal}
-
-只输出 JSON，不输出其他内容:"""
-
 
 @dataclass
 class RiskScore:
@@ -74,9 +60,10 @@ class CapabilityPlanner:
 
     def analyze_goal(self, goal: str) -> dict[str, Any]:
         """调用 LLM 分析用户目标，识别缺失的能力类型。"""
-        # 模板中含字面量 JSON 示例（裸花括号），不能用 str.format，
-        # 否则会把 JSON 里的 {...} 当成格式字段而抛 KeyError。
-        prompt = _PLAN_PROMPT.replace("{goal}", goal)
+        prompt = get_prompt_registry().render(
+            "mcp.capability_plan",
+            goal=goal,
+        ).content
         try:
             resp: LLMResponse = self._llm.chat(
                 [{"role": "user", "content": prompt}], temperature=0.1,

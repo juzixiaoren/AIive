@@ -39,6 +39,7 @@ from aiive.memory.extraction_policy import MemoryExtractionPolicy
 from aiive.memory.memory_extractor import UnifiedMemoryExtractor
 from aiive.memory.memory_types import MemoryProposal
 from aiive.memory.memory_write_service import MemoryBatchWriteError, MemoryWriteService
+from aiive.prompts import get_prompt_registry
 from aiive.retrieval.index_rebuild import handle_retrieval_index_rebuild
 from aiive.worker.outbox_dto import (
     ClaimedJob,
@@ -400,21 +401,20 @@ def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
         db_a.close()
 
     turn_id = str(_uuid.uuid5(_uuid.NAMESPACE_URL, operation_id))
-    message = (
-        "[Reminder triggered]\n"
-        f"reminder_id: {reminder_id}\n"
-        f"title: {title}\n"
-        f"content: {content}\n"
-        "这是一条到期提醒，需要你主动转达给用户，用户此刻并不知道提醒已到期。\n"
-        "请按以下步骤处理：\n"
-        f"1. 先调用 remind_alert 激活提醒，reminder_id 必须严格使用 {reminder_id}；\n"
-        "2. 工具成功后，用你自己的语气主动把这条提醒的内容告知用户（例如提醒他现在该去做这件事），"
-        "不要表现得像提醒是系统自动弹出的，而是由你主动转达。"
-    )
+    message = get_prompt_registry().render(
+        "runtime.reminder_delivery",
+        reminder_id=reminder_id,
+        title=title,
+        content=content,
+    ).content
     try:
         from aiive.core.llm_client import default_llm_client
         from aiive.runtime.turn_execution import TurnConflictError, TurnExecutionService
+    except Exception as exc:
+        logger.exception("提醒 Agent 运行时加载异常: task_id=%s", task_id)
+        return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, f"提醒 Agent 运行时加载异常: {exc}")
 
+    try:
         result = TurnExecutionService(
             default_llm_client(), message_source="runtime_event",
         ).execute_turn(message=message, thread_id=thread_id, turn_id=turn_id)
@@ -1572,33 +1572,15 @@ def _build_summary_prompt(source_turns: list[dict[str, Any]], tool_items: list[d
         for f in failure_items
     ) or "  （无）"
 
-    system = (
-        "你是一个结构化摘要生成器。只根据提供的源 Turn/Event 内容输出 JSON。\n"
-        "规则：\n"
-        "1. 不推测用户属性\n"
-        "2. 只做语义概括，不要复制或编造任何 ID、artifact ref、约束或未完成任务列表\n"
-        "   （这些由系统确定性合并，不属于你的职责）\n"
-        "3. 区分：用户陈述 | 工具验证结果 | Assistant 建议\n"
-        "4. 输出严格结构化 JSON，键名必须与以下 Schema 完全一致，不得增删顶层键\n"
-        "5. tool_result_summaries / failure_explanations 必须使用下方 item_ref，禁止自造 item_ref\n"
-    )
-    user = (
-        "输入 source_turns（已脱敏）：\n"
-        f"{source_turns}\n\n"
-        "工具摘要引用（仅局部引用，非真实 ID）：\n"
-        f"{tool_lines}\n"
-        "失败引用：\n"
-        f"{fail_lines}\n\n"
-        "输出 JSON（只输出以下字段）：\n"
-        "{\n"
-        '  "goal": "...",\n'
-        '  "outcome": "...",\n'
-        '  "decisions": [{"what": "", "why": "", "by": "user"|"assistant"|"tool"}],\n'
-        '  "entities": [{"name": "", "type": "", "relation": ""}],\n'
-        '  "tool_result_summaries": [{"item_ref": "tool_1", "result_summary": ""}],\n'
-        '  "failure_explanations": [{"item_ref": "failure_1", "error": ""}]\n'
-        "}\n"
-    )
+    system = get_prompt_registry().render(
+        "compaction.segment_summary_system",
+    ).content
+    user = get_prompt_registry().render(
+        "compaction.segment_summary_user",
+        source_turns=str(source_turns),
+        tool_lines=tool_lines,
+        fail_lines=fail_lines,
+    ).content
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
