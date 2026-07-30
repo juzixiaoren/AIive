@@ -1,6 +1,6 @@
 [project]
 name = "aiive"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 description = "AIive - Personal Agent OS"
 requires-python = ">=3.12"
 dependencies = [

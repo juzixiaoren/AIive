@@ -55,18 +55,46 @@ AIive（再次召回，fail-closed 校验）：
 
 这就是 AIive 的核心价值：**持续记忆、智能替代、来源可溯、遗忘可控**——而不是一个每次都从零开始的聊天框。
 
-## 技术栈
+## 它凭什么不一样（差异化）
+
+- **本地优先**：整套系统跑在你自己的机器上，数据不出本机（PostgreSQL + 可选本地模型），不是把对话转交给第三方托管服务。
+- **持续长期记忆**：跨会话保留你的目标、偏好与决策，而不是每次打开都从零开始。
+- **智能替代而非冲突并存**：信息更新时旧结论被 `supersede`（标记替代），不会同时保留两条互相矛盾的结论。
+- **来源可溯**：每条记忆都有版本历史与原始证据（出自哪一轮、哪条消息），可随时用 `memory_timeline` 查看。
+- **遗忘可控且真实生效**：`forget_memory` 经 fail-closed 校验，遗忘后不会经任何检索或召回路径重新泄露。
+- **与能力一起成长（自进化）**：通过 `plan_capability` / 自进化槽位管理，Agent 能规划并接入新能力（含 MCP），而非固定工具集。
+- **上下文不会爆**：对话历史按 token 预算逐级压缩（摘要 → 检查点 → 按需召回），无限长对话也不撑爆上下文窗口。
+
+## 技术架构
+
+### 技术栈
 
 | 层 | 技术 |
 |---|------|
 | 后端 | Python 3.12+ / FastAPI / LangChain + LangGraph |
 | LLM | DeepSeek（OpenAI 兼容 API） |
 | 数据库 | PostgreSQL 16 / SQLAlchemy 2.0 / Alembic |
-| 向量检索 | Qdrant（知识库嵌入） |
-| 前端 | React 18 / TypeScript / Vite 5 / TailwindCSS 3 |
+| 向量检索 | pgvector（PostgreSQL 向量扩展） |
+| 前端 | React 19 / TypeScript / Vite 6 / TailwindCSS 3 |
 | 实时通信 | WebSocket |
 | 定时任务 | APScheduler 3.10 |
-| 测试 | pytest 8.0 |
+| 测试 | pytest 8.0 / basedpyright |
+
+### 核心架构
+
+```
+用户输入 → AgentGraph (LangGraph)
+              ├── _assistant     (LLM + bind_tools)
+              ├── _policy_check  (ToolRegistry 校验)
+              └── _tools_node    (ToolNode 执行)
+              ↓
+         回复 + 事件持久化 + 记忆提取
+```
+
+- **AgentGraph**：基于 LangGraph StateGraph，assistant → policy_check → tools 循环
+- **ToolRegistry**：统一工具注册与发现，含 schema / risk_level / permission 元数据
+- **MemoryWriteService**：统一事务化记忆写入入口，含冲突解析、证据追踪、核心记忆与统一检索投影
+- **AutomaticRecallEngine**：生产可用的多路记忆召回（精确键 / 词汇匹配 / pgvector 语义向量 / 近期情节）；时序图能力尚未接入
 
 ## 快速开始
 
@@ -180,22 +208,6 @@ AIive/
 ├── docker-compose.yml    # PostgreSQL 16
 └── alembic.ini           # 数据库迁移配置
 ```
-
-## 核心架构
-
-```
-用户输入 → AgentGraph (LangGraph)
-              ├── _assistant     (LLM + bind_tools)
-              ├── _policy_check  (ToolRegistry 校验)
-              └── _tools_node    (ToolNode 执行)
-              ↓
-         回复 + 事件持久化 + 记忆提取
-```
-
-- **AgentGraph**：基于 LangGraph StateGraph，assistant → policy_check → tools 循环
-- **ToolRegistry**：统一工具注册与发现，含 schema / risk_level / permission 元数据
-- **MemoryWriteService**：统一事务化记忆写入入口，含冲突解析、证据追踪、核心记忆与统一检索投影
-- **AutomaticRecallEngine**：生产可用的多路记忆召回（精确键 / 词汇匹配 / pgvector 语义向量 / 近期情节）；时序图能力尚未接入
 
 ## 内置工具（28 个，9 大类）
 
