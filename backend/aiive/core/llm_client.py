@@ -237,11 +237,16 @@ class LLMClient:
             content = message.get("content", "") or ""
             finish_reason = str(choice.get("finish_reason", "") or "")
 
-            usage = {
-                "prompt_tokens": data.get("usage", {}).get("prompt_tokens", 0),
-                "completion_tokens": data.get("usage", {}).get("completion_tokens", 0),
-                "total_tokens": data.get("usage", {}).get("total_tokens", 0),
-            }
+            usage = self._normalize_usage(data.get("usage", {}))
+            if usage.get("cache_read_tokens") is not None:
+                logger.info(
+                    "LLM prompt cache usage: model=%s prompt_tokens=%d "
+                    + "cache_read_tokens=%d cache_write_tokens=%d",
+                    data.get("model", model),
+                    usage["prompt_tokens"],
+                    usage.get("cache_read_tokens", 0),
+                    usage.get("cache_write_tokens", 0),
+                )
 
             return LLMResponse(
                 content=content,
@@ -284,6 +289,65 @@ class LLMClient:
     @property
     def timeout_seconds(self) -> int:
         return self._timeout_seconds
+
+    @staticmethod
+    def _normalize_usage(raw_usage: Any) -> dict[str, int]:
+        """归一化 OpenAI-compatible 提供商的 token 与缓存统计。
+
+        OpenAI/Qwen 通常把缓存命中放在
+        ``prompt_tokens_details.cached_tokens``；DeepSeek 使用
+        ``prompt_cache_hit_tokens`` / ``prompt_cache_miss_tokens``。
+        兼容端点未返回缓存字段时保持原有三字段契约。
+        """
+        usage = raw_usage if isinstance(raw_usage, dict) else {}
+
+        def _int(value: Any) -> int:
+            try:
+                return max(0, int(value or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        normalized = {
+            "prompt_tokens": _int(usage.get("prompt_tokens")),
+            "completion_tokens": _int(usage.get("completion_tokens")),
+            "total_tokens": _int(usage.get("total_tokens")),
+        }
+        prompt_details = usage.get("prompt_tokens_details")
+        if not isinstance(prompt_details, dict):
+            prompt_details = {}
+
+        cache_fields_present = any(
+            key in usage
+            for key in (
+                "prompt_cache_hit_tokens",
+                "prompt_cache_miss_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+            )
+        ) or any(
+            key in prompt_details
+            for key in ("cached_tokens", "cache_read_tokens", "cache_write_tokens")
+        )
+        if cache_fields_present:
+            normalized["cache_read_tokens"] = _int(
+                prompt_details.get(
+                    "cached_tokens",
+                    prompt_details.get(
+                        "cache_read_tokens",
+                        usage.get(
+                            "prompt_cache_hit_tokens",
+                            usage.get("cache_read_input_tokens"),
+                        ),
+                    ),
+                )
+            )
+            normalized["cache_write_tokens"] = _int(
+                prompt_details.get(
+                    "cache_write_tokens",
+                    usage.get("cache_creation_input_tokens"),
+                )
+            )
+        return normalized
 
 
 def default_llm_client() -> "LLMClient":

@@ -1307,7 +1307,12 @@ def _try_generate_summary(
             timeout_seconds=settings.aiive_llm_timeout_seconds,
         )
         messages = _build_summary_prompt(source_turns, [], [])
-        resp = llm.chat(messages, model=settings.aiive_llm_model, temperature=0)
+        resp = llm.chat(
+            messages,
+            model=settings.aiive_llm_model,
+            temperature=0,
+            json_mode=True,
+        )
         raw = getattr(resp, "content", None) or getattr(resp, "text", "") or str(resp)
         llm_output = _extract_json(raw)
 

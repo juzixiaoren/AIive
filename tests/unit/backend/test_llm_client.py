@@ -125,3 +125,27 @@ class TestRealLLMClientJsonMode:
         assert post.call_count == 2
         assert post.call_args_list[0].kwargs["json"]["response_format"] == {"type": "json_object"}
         assert "response_format" not in post.call_args_list[1].kwargs["json"]
+
+    def test_normalizes_openai_and_deepseek_prompt_cache_usage(self):
+        openai_usage = LLMClient._normalize_usage({  # pyright: ignore[reportPrivateUsage]
+            "prompt_tokens": 120,
+            "completion_tokens": 8,
+            "total_tokens": 128,
+            "prompt_tokens_details": {"cached_tokens": 96},
+        })
+        assert openai_usage["cache_read_tokens"] == 96
+
+        deepseek_usage = LLMClient._normalize_usage({  # pyright: ignore[reportPrivateUsage]
+            "prompt_tokens": 120,
+            "completion_tokens": 8,
+            "total_tokens": 128,
+            "prompt_cache_hit_tokens": 80,
+            "prompt_cache_miss_tokens": 40,
+        })
+        assert deepseek_usage == {
+            "prompt_tokens": 120,
+            "completion_tokens": 8,
+            "total_tokens": 128,
+            "cache_read_tokens": 80,
+            "cache_write_tokens": 0,
+        }

@@ -44,6 +44,7 @@ from pydantic import SecretStr
 from sqlalchemy.orm import Session
 from typing_extensions import TypedDict
 
+from aiive.config import settings
 from aiive.context.run_context import RunContext
 from aiive.core.action_planner import ActionPlanner, MemorySignalDecision
 from aiive.core.llm_client import normalize_llm_error
@@ -277,6 +278,35 @@ class ToolRecord:
 
 
 @dataclass
+class LLMUsageStats:
+    """一次 Agent 图执行中所有主模型调用的聚合 token 用量。"""
+
+    calls_reported: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+
+    @property
+    def cache_hit_ratio(self) -> float | None:
+        if self.input_tokens <= 0:
+            return None
+        return round(self.cache_read_tokens / self.input_tokens, 4)
+
+    def as_dict(self) -> dict[str, int | float | None]:
+        return {
+            "calls_reported": self.calls_reported,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "total_tokens": self.total_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
+            "cache_hit_ratio": self.cache_hit_ratio,
+        }
+
+
+@dataclass
 class AgentGraphResult:
     """AgentGraph 执行完成后返回的纯数据结构。不含任何 DB 句柄。"""
 
@@ -289,6 +319,7 @@ class AgentGraphResult:
     pending_approvals: list[dict[str, Any]] = field(default_factory=list)
     context_snapshot: ContextSnapshotData = field(default_factory=ContextSnapshotData)
     memory_signal: Any = None  # MemorySignalDecision
+    llm_usage: LLMUsageStats = field(default_factory=LLMUsageStats)
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +362,78 @@ class AgentGraph:
             temperature=0,
             timeout=self._llm_client.timeout_seconds,
             streaming=True,
+            stream_usage=settings.aiive_llm_stream_usage,
         )
+
+    @staticmethod
+    def _collect_llm_usage(messages: list[Any]) -> LLMUsageStats:
+        """从最终图状态聚合各次 AIMessage 的 usage 与提示缓存命中。
+
+        LangChain 将 OpenAI/Qwen 的 cached_tokens 归一化到
+        input_token_details.cache_read；若兼容端点只保留原始 usage
+        （如部分 DeepSeek 版本），再从 response_metadata 补读缓存字段。
+        """
+        stats = LLMUsageStats()
+        for message in messages:
+            if not isinstance(message, AIMessage):
+                continue
+            usage = getattr(message, "usage_metadata", None)
+            response_metadata = getattr(message, "response_metadata", None)
+            raw_usage: Any = {}
+            if isinstance(response_metadata, dict):
+                candidate = response_metadata.get("token_usage", response_metadata.get("usage", {}))
+                if isinstance(candidate, dict):
+                    raw_usage = candidate
+
+            if isinstance(usage, dict):
+                stats.calls_reported += 1
+                stats.input_tokens += int(usage.get("input_tokens", 0) or 0)
+                stats.output_tokens += int(usage.get("output_tokens", 0) or 0)
+                stats.total_tokens += int(usage.get("total_tokens", 0) or 0)
+                details = usage.get("input_token_details", {})
+                if isinstance(details, dict):
+                    stats.cache_read_tokens += int(
+                        details.get("cache_read", details.get("cached_tokens", 0)) or 0
+                    )
+                    stats.cache_write_tokens += int(
+                        details.get("cache_creation", details.get("cache_write", 0)) or 0
+                    )
+            elif raw_usage:
+                normalized = LLMClient._normalize_usage(raw_usage)  # pyright: ignore[reportPrivateUsage]
+                stats.calls_reported += 1
+                stats.input_tokens += normalized["prompt_tokens"]
+                stats.output_tokens += normalized["completion_tokens"]
+                stats.total_tokens += normalized["total_tokens"]
+
+            # raw usage 仅用于补足 LangChain 尚未映射的缓存字段，避免重复累计。
+            if raw_usage:
+                normalized = LLMClient._normalize_usage(raw_usage)  # pyright: ignore[reportPrivateUsage]
+                if isinstance(usage, dict):
+                    details = usage.get("input_token_details", {})
+                    has_cache_read = isinstance(details, dict) and (
+                        "cache_read" in details or "cached_tokens" in details
+                    )
+                    has_cache_write = isinstance(details, dict) and (
+                        "cache_creation" in details or "cache_write" in details
+                    )
+                    if not has_cache_read:
+                        stats.cache_read_tokens += normalized.get("cache_read_tokens", 0)
+                    if not has_cache_write:
+                        stats.cache_write_tokens += normalized.get("cache_write_tokens", 0)
+
+        if stats.calls_reported:
+            logger.info(
+                "[TRACE:graph] LLM usage: calls=%d input=%d output=%d total=%d "
+                + "cache_read=%d cache_write=%d hit_ratio=%s",
+                stats.calls_reported,
+                stats.input_tokens,
+                stats.output_tokens,
+                stats.total_tokens,
+                stats.cache_read_tokens,
+                stats.cache_write_tokens,
+                stats.cache_hit_ratio,
+            )
+        return stats
 
     # ------------------------------------------------------------------
     # 系统提示构建
@@ -895,6 +997,7 @@ class AgentGraph:
         # ── 提取回复 ──
         reply = ""
         all_messages = result["messages"]
+        llm_usage = self._collect_llm_usage(all_messages)
         for m in reversed(all_messages):
             if isinstance(m, AIMessage) and m.content and not m.tool_calls:
                 reply = str(m.content); break
@@ -970,6 +1073,7 @@ class AgentGraph:
             pending_operations=pending_operations,
             pending_approvals=[dict(item) for item in pending_approvals],
             context_snapshot=result_snapshot, memory_signal=signal,
+            llm_usage=llm_usage,
         )
 
     # ------------------------------------------------------------------
@@ -1176,6 +1280,7 @@ class AgentGraph:
             ) from error
 
         reply = "".join(accumulated)
+        final_messages: list[Any] = []
         if final_state is not None:
             final_messages = final_state.get("messages", [])
             for final_message in reversed(final_messages):
@@ -1253,6 +1358,7 @@ class AgentGraph:
                 pending_operations=pending_operations,
                 pending_approvals=[dict(item) for item in pending_approvals],
                 context_snapshot=result_snapshot, memory_signal=signal,
+                llm_usage=self._collect_llm_usage(final_messages),
             ),
         }
 

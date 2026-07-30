@@ -33,7 +33,7 @@ def _write_catalog(
 def test_packaged_catalog_loads_and_has_audit_identity() -> None:
     registry = get_prompt_registry()
 
-    assert len(registry.prompt_ids) == 10
+    assert len(registry.prompt_ids) == 11
     assert "agent.stable_contract" in registry.prompt_ids
     assert len(registry.catalog_sha256) == 64
     assert all("@" in ref and "#" in ref for ref in registry.audit_refs())

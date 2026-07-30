@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     # 内部分类/提取调用的 JSON mode。auto 遇到明确的不支持错误时回退为
     # prompt-only JSON；主 Agent 自然语言/工具调用路径不使用该选项。
     aiive_llm_json_mode: Literal["auto", "on", "off"] = "auto"
+    # 流式主 Agent 请求是否要求返回 token usage。OpenAI、DeepSeek、Qwen
+    # 兼容接口通常支持 stream_options.include_usage；不兼容端点可关闭。
+    aiive_llm_stream_usage: bool = True
 
     # 记忆向量召回（本地/远端 OpenAI-compatible Embeddings + pgvector）
     aiive_memory_vector_enabled: bool = False

@@ -52,6 +52,12 @@ version = "2.0.0"
 role = "user"
 variables = ["source_turns", "tool_lines", "fail_lines"]
 
+[prompts."compaction.segment_summary_retry"]
+file = "compaction/segment_summary_retry.md"
+version = "2.0.0"
+role = "user"
+variables = ["error_text"]
+
 [prompts."runtime.reminder_delivery"]
 file = "runtime/reminder_delivery.md"
 version = "2.0.0"

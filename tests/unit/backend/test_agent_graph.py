@@ -590,6 +590,42 @@ class TestAgentGraphNoHardcoding:
             assert pattern not in source, \
                 f"AgentGraph 不应包含: {pattern}"
 
+
+def test_collect_llm_usage_aggregates_prompt_cache_details():
+    from aiive.runtime.agent_graph import AgentGraph
+
+    usage = AgentGraph._collect_llm_usage([  # pyright: ignore[reportPrivateUsage]
+        AIMessage(
+            content="tool call",
+            usage_metadata={
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "total_tokens": 110,
+                "input_token_details": {
+                    "cache_read": 64,
+                    "cache_creation": 16,
+                },
+            },
+        ),
+        AIMessage(
+            content="answer",
+            usage_metadata={
+                "input_tokens": 40,
+                "output_tokens": 5,
+                "total_tokens": 45,
+            },
+        ),
+    ])
+
+    assert usage.calls_reported == 2
+    assert usage.input_tokens == 140
+    assert usage.output_tokens == 15
+    assert usage.total_tokens == 155
+    assert usage.cache_read_tokens == 64
+    assert usage.cache_write_tokens == 16
+    assert usage.cache_hit_ratio == 0.4571
+
+
 class TestNoKeywordClassification:
     """验证不存在基于关键词的分类逻辑。"""
 

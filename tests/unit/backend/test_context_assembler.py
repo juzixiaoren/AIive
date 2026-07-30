@@ -192,6 +192,40 @@ def test_build_reports_includes_per_partition_and_total():
     assert total_report.safe_tokens == total.safe_tokens
 
 
+def test_prompt_messages_keep_stable_layers_before_history_and_dynamic_layers_after():
+    """缓存前缀应先放稳定摘要，再放历史，最后放本轮动态上下文。"""
+    messages = ContextAssembler._compose_prompt_messages(  # pyright: ignore[reportPrivateUsage]
+        system_content="stable",
+        epoch_checkpoint_text="epoch",
+        segment_summary_text="segments",
+        history_messages=[
+            {"role": "user", "content": "old-user"},
+            {"role": "assistant", "content": "old-assistant"},
+        ],
+        attention_text="attention",
+        working_state_text="working",
+        sealing_bridge_text="bridge",
+        history_summary_text="retrieved-history",
+        recall_messages=[{"role": "system", "content": "recalled-memory"}],
+        current_role="user",
+        current_message="current-user",
+    )
+
+    assert [message["content"] for message in messages] == [
+        "stable",
+        "epoch",
+        "segments",
+        "old-user",
+        "old-assistant",
+        "attention",
+        "working",
+        "bridge",
+        "retrieved-history",
+        "recalled-memory",
+        "current-user",
+    ]
+
+
 def test_context_budget_from_env_default_without_env(monkeypatch):
     """P1-7: 未设置环境变量时 from_env 回退到默认预算。"""
     monkeypatch.delenv("AIIVE_CONTEXT_BUDGET_JSON", raising=False)

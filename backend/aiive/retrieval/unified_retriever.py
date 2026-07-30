@@ -14,7 +14,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from collections.abc import Iterable
+from typing import Any, cast
 
 from sqlalchemy.orm import Session
 
@@ -204,7 +205,11 @@ class UnifiedRetriever:
         sc = request.scope_context
         if sc is not None and hasattr(sc, "chain") and callable(sc.chain):
             try:
-                allowed_scopes = {(st, si) for st, si in sc.chain()}
+                scope_chain = cast(
+                    Iterable[tuple[str, str | None]],
+                    sc.chain(),
+                )
+                allowed_scopes = {(st, si) for st, si in scope_chain}
             except Exception:
                 logger.warning("ScopeContext.chain() 失败，exact 路由降级为无 scope 过滤")
                 allowed_scopes = None
@@ -272,6 +277,14 @@ class UnifiedRetriever:
             if e is None:
                 continue
             if allowed is not None and e.source_type not in allowed:
+                continue
+            if (
+                request.thread_id
+                and e.source_type in ("segment_summary", "epoch_checkpoint")
+                and e.thread_id != request.thread_id
+            ):
+                # 历史压缩物只属于其原 Thread；缺少 thread_id 的旧索引条目也
+                # fail-closed，待 rebuild/refresh 补齐后才重新可见。
                 continue
             if not include_sleeping and e.lifecycle_state == "sleeping":
                 continue

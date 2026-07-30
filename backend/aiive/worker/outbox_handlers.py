@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json as _json
 import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
@@ -1437,8 +1438,14 @@ def _reconstruct_source_turns(db: Session, event_manifest: list[dict[str, Any]])
     if not event_ids:
         return []
     events = db.query(Event).filter(Event.id.in_(event_ids)).all()
+    event_order = {
+        manifest["event_id"]: index
+        for index, manifest in enumerate(event_manifest)
+    }
     by_turn: dict[str, dict[str, Any]] = {}
-    for e in sorted(events, key=lambda x: (x.turn_id or "", x.turn_event_index or 0)):
+    # event_manifest 已在冻结时按 (turn_sequence, turn_event_index) 排序；
+    # 不可使用随机 UUID turn_id 排序，否则摘要会打乱跨 Turn 的因果顺序。
+    for e in sorted(events, key=lambda item: event_order.get(item.id, len(event_order))):
         turn = by_turn.setdefault(e.turn_id or "", {
             "turn_id": e.turn_id,
             "user_message": "",
@@ -1587,6 +1594,28 @@ def _build_summary_prompt(source_turns: list[dict[str, Any]], tool_items: list[d
     ]
 
 
+def _build_extract_fallback_summary(source_turns: list[dict[str, Any]]) -> dict[str, Any]:
+    """最终重试仍失败时生成无推断的抽取式摘要，避免 sealing 永久阻塞。"""
+    user_parts = [
+        str(turn.get("user_message", "")).strip()
+        for turn in source_turns
+        if str(turn.get("user_message", "")).strip()
+    ]
+    assistant_parts = [
+        str(turn.get("assistant_reply", "")).strip()
+        for turn in source_turns
+        if str(turn.get("assistant_reply", "")).strip()
+    ]
+    return {
+        "goal": "\n".join(user_parts)[-4000:],
+        "outcome": "\n".join(assistant_parts)[-4000:],
+        "decisions": [],
+        "entities": [],
+        "tool_result_summaries": [],
+        "failure_explanations": [],
+    }
+
+
 def handle_segment_sealing(claimed: ClaimedJob) -> HandlerResult:
     """三阶段 Segment 摘要 Handler（Phase 3）。
 
@@ -1667,6 +1696,7 @@ def handle_segment_sealing(claimed: ClaimedJob) -> HandlerResult:
 
     # ── Phase B（事务外，无 DB Session 持有）──
     llm_output: dict[str, Any] | None = None
+    summary_model_id = settings.aiive_llm_model
     try:
         db_b = SessionLocal()
         try:
@@ -1691,10 +1721,48 @@ def handle_segment_sealing(claimed: ClaimedJob) -> HandlerResult:
         messages = _build_summary_prompt(
             source_turns, item_ref_map["tool_items"], item_ref_map["failure_items"],
         )
-        resp = llm.chat(messages, model=settings.aiive_llm_model, temperature=0)
-        raw = getattr(resp, "content", None) or getattr(resp, "text", "") or str(resp)
-        llm_output = _extract_json(raw)
-        warnings = validate_llm_semantic_output(llm_output, valid_refs)
+        warnings: list[str] = []
+        try:
+            for attempt in range(2):
+                resp = llm.chat(
+                    messages,
+                    model=settings.aiive_llm_model,
+                    temperature=0,
+                    json_mode=True,
+                )
+                raw = getattr(resp, "content", None) or getattr(resp, "text", "") or str(resp)
+                try:
+                    if getattr(resp, "finish_reason", "") == "length":
+                        raise ValueError("JSON 输出被截断")
+                    llm_output = _extract_json(raw)
+                    warnings = validate_llm_semantic_output(llm_output, valid_refs)
+                    break
+                except (ValueError, TypeError, KeyError) as error:
+                    if attempt == 1:
+                        raise
+                    messages = [
+                        *messages,
+                        {"role": "assistant", "content": raw},
+                        {
+                            "role": "user",
+                            "content": get_prompt_registry().render(
+                                "compaction.segment_summary_retry",
+                                error_text=str(error)[:500],
+                            ).content,
+                        },
+                    ]
+        except Exception:
+            if claimed.retry_count + 1 < claimed.max_retries:
+                raise
+            logger.exception(
+                "segment_sealing 最终重试仍无法生成结构化摘要，使用抽取式降级: "
+                + "segment_id=%s",
+                segment_id,
+            )
+            llm_output = _build_extract_fallback_summary(source_turns)
+            summary_model_id = "deterministic-extractive-fallback"
+        if llm_output is None:
+            raise ValueError("摘要模型未返回可用 JSON")
         for w in warnings:
             logger.warning("segment_sealing: %s", w)
     except NonRetryableJobError as e:
@@ -1740,9 +1808,6 @@ def handle_segment_sealing(claimed: ClaimedJob) -> HandlerResult:
 
         source_turn_ids = [m["turn_id"] for m in ci_c.turn_manifest]
         source_event_ids = [m["event_id"] for m in ci_c.event_manifest]
-        summary_text = (llm_output.get("goal", "") + llm_output.get("outcome", ""))
-        token_count = count_summary_tokens(settings.aiive_llm_model, summary_text)
-
         summary_payload = merge_summary(
             llm_output,
             boundary_snapshot=ws_snap,
@@ -1753,8 +1818,12 @@ def handle_segment_sealing(claimed: ClaimedJob) -> HandlerResult:
             source_event_ids=source_event_ids,
             source_hash=source_hash,
             summary_version=summary_version,
-            model_id=settings.aiive_llm_model,
-            token_count=token_count,
+            model_id=summary_model_id,
+            token_count=0,
+        )
+        summary_payload["token_count"] = count_summary_tokens(
+            settings.aiive_llm_model,
+            _json.dumps(summary_payload, ensure_ascii=False, default=str),
         )
 
         violations = _run_cover_checks(ci_c, summary_payload)
@@ -1924,6 +1993,62 @@ def handle_epoch_rollover(claimed: ClaimedJob) -> HandlerResult:
         db.close()
 
 
+def _build_epoch_checkpoint_payload(
+    epoch_input: EpochCompactionInput,
+    summaries: list[SegmentSummary],
+    checkpoint_version: int,
+) -> dict[str, Any]:
+    """从有序 Segment 摘要确定性聚合 Epoch checkpoint。
+
+    checkpoint 不是再次生成“摘要的摘要”；它复制最近的语义事实和边界
+    WorkingState，避免多层 LLM 压缩导致漂移。
+    """
+    def _recent_unique(
+        attr: str, identity_key: str, limit: int,
+    ) -> list[Any]:
+        values: list[Any] = []
+        seen: set[str] = set()
+        for summary in reversed(summaries):
+            for item in reversed(getattr(summary, attr, None) or []):
+                identity = (
+                    str(item.get(identity_key, ""))
+                    if isinstance(item, dict)
+                    else str(item)
+                )
+                if not identity or identity in seen:
+                    continue
+                seen.add(identity)
+                values.append(item)
+                if len(values) >= limit:
+                    return list(reversed(values))
+        return list(reversed(values))
+
+    milestones = [
+        {"description": summary.outcome, "segment_id": summary.segment_id}
+        for summary in summaries
+        if summary.outcome
+    ][-12:]
+    fallback_goal = next(
+        (summary.goal for summary in reversed(summaries) if summary.goal),
+        None,
+    )
+    source_hashes = [summary.source_hash for summary in summaries if summary.source_hash]
+    return {
+        "current_goal": epoch_input.current_objective or fallback_goal,
+        "completed_milestones": milestones,
+        "open_loops": epoch_input.open_loops,
+        "active_constraints": epoch_input.active_constraints,
+        "current_decisions": _recent_unique("decisions", "what", 24),
+        "referenced_artifacts": epoch_input.artifact_refs,
+        "relevant_entities": _recent_unique("entities", "name", 24),
+        "latest_verified_tool_states": epoch_input.verified_tool_states,
+        "source_segment_ids": epoch_input.source_segment_ids,
+        "source_hashes": source_hashes or epoch_input.source_hashes,
+        "version": checkpoint_version,
+        "token_count": 0,
+    }
+
+
 def handle_epoch_checkpoint(claimed: ClaimedJob) -> HandlerResult:
     """EpochCheckpoint Handler：从 EpochCompactionInput + SegmentSummary 聚合生成 Checkpoint。"""
     payload = claimed.payload
@@ -1988,23 +2113,21 @@ def handle_epoch_checkpoint(claimed: ClaimedJob) -> HandlerResult:
         ).first()
         if eci is None:
             return HandlerResult(HandlerOutcome.NON_RETRYABLE, "eci_not_found", terminal_reason="eci_not_found")
-        summaries = db_b.query(SegmentSummary).join(
-            Segment, Segment.id == SegmentSummary.segment_id,
-        ).filter(Segment.epoch_id == eci.epoch_id).all()
-        source_hashes = [s.source_hash for s in summaries if s.source_hash]
-        checkpoint_payload = {
-            "current_goal": eci.current_objective,
-            "open_loops": eci.open_loops,
-            "active_constraints": eci.active_constraints,
-            "current_decisions": [],
-            "referenced_artifacts": eci.artifact_refs,
-            "relevant_entities": [],
-            "latest_verified_tool_states": eci.verified_tool_states,
-            "source_segment_ids": eci.source_segment_ids,
-            "source_hashes": source_hashes or eci.source_hashes,
-            "version": checkpoint_version,
-            "token_count": 0,
-        }
+        summaries = (
+            db_b.query(SegmentSummary)
+            .join(Segment, Segment.id == SegmentSummary.segment_id)
+            .filter(Segment.epoch_id == eci.epoch_id)
+            .order_by(Segment.segment_no)
+            .all()
+        )
+        checkpoint_payload = _build_epoch_checkpoint_payload(
+            eci, summaries, checkpoint_version,
+        )
+        from aiive.runtime.compaction import count_summary_tokens
+        checkpoint_payload["token_count"] = count_summary_tokens(
+            settings.aiive_llm_model,
+            _json.dumps(checkpoint_payload, ensure_ascii=False, default=str),
+        )
     finally:
         db_b.close()
 

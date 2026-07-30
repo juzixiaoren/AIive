@@ -36,6 +36,7 @@ from aiive.db.models import (
     TurnRecord,
 )
 from aiive.memory.extraction_policy import MessageSource, MemorySignalAction
+from aiive.memory.recall_config import RecallConfig
 from aiive.runtime.action_cards import ChatResponse
 from aiive.runtime.agent_graph import (
     AgentGraph,
@@ -758,6 +759,25 @@ class TurnExecutionService:
             db.query(Thread).filter(Thread.id == turn.thread_id).update(
                 {Thread.last_activity_at: now}, synchronize_session=False,
             )
+            # 长期持续活跃的单会话可能永远达不到 idle 条件。达到确定性 Turn
+            # 上限后标记 pending，使调度器在当前 Turn 提交后主动密封，避免
+            # 单个 Segment 及其摘要 prompt 无界增长。
+            if turn.segment_id:
+                segment_turn_count = db.query(TurnRecord).filter(
+                    TurnRecord.segment_id == turn.segment_id,
+                ).count()
+                if segment_turn_count >= RecallConfig().max_segment_turn_records:
+                    db.query(Segment).filter(
+                        Segment.id == turn.segment_id,
+                        Segment.status == "open",
+                        Segment.pending_seal_at.is_(None),
+                    ).update(
+                        {
+                            Segment.pending_seal_at: now,
+                            Segment.sealed_by_turn: turn.turn_sequence,
+                        },
+                        synchronize_session=False,
+                    )
 
             # Events：pending_approval 工具不写入 tool_call/tool_result，等待审批后补充；
             # blocked 工具从未执行，也不写入（避免孤儿 tool_call 破坏历史配对），
@@ -812,7 +832,7 @@ class TurnExecutionService:
             pending_count = sum(1 for r in ag_result.tool_records if r.status == "pending_approval")
             db.add(Event(id=str(_uuid.uuid4()), trace_id=ag_result.trace_id, thread_id=turn.thread_id,
                          event_type="chat_ended", turn_id=turn.turn_id, turn_event_index=idx,
-                         payload={"tool_calls": len(ag_result.tool_records), "tool_succeeded": sum(1 for r in ag_result.tool_records if r.status == "completed"), "tool_failed": sum(1 for r in ag_result.tool_records if r.status == "failed"), "pending_approvals": pending_count, "parse_errors": 0}))
+                         payload={"tool_calls": len(ag_result.tool_records), "tool_succeeded": sum(1 for r in ag_result.tool_records if r.status == "completed"), "tool_failed": sum(1 for r in ag_result.tool_records if r.status == "failed"), "pending_approvals": pending_count, "parse_errors": 0, "llm_usage": ag_result.llm_usage.as_dict()}))
 
             # ContextSnapshot with Phase 1 rotation
             self._rotate_snapshot(db, turn, ag_result, assembled_ctx)
@@ -830,8 +850,16 @@ class TurnExecutionService:
                     output_preview=ag_result.reply[:200] if ag_result.reply else None,
                     estimated_prompt_tokens=tc.estimated_tokens,
                     safe_prompt_tokens=tc.safe_tokens,
-                    actual_prompt_tokens=None,
-                    actual_completion_tokens=None,
+                    actual_prompt_tokens=(
+                        ag_result.llm_usage.input_tokens
+                        if ag_result.llm_usage.calls_reported
+                        else None
+                    ),
+                    actual_completion_tokens=(
+                        ag_result.llm_usage.output_tokens
+                        if ag_result.llm_usage.calls_reported
+                        else None
+                    ),
                     token_source=tc.source,
                 ))
 

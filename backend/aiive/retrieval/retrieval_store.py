@@ -21,6 +21,17 @@ from aiive.retrieval.source_version import (
 logger = logging.getLogger(__name__)
 
 
+def _flatten_search_values(value: Any) -> str:
+    """将结构化摘要字段稳定展开为可词法检索文本。"""
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        return " ".join(_flatten_search_values(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return " ".join(_flatten_search_values(item) for item in value)
+    return str(value)
+
+
 def _build_memory(r: Any) -> dict[str, Any]:
     version, h = memory_source_version(r)
     search_text = f"{r.canonical_key or ''} {r.content or ''}"
@@ -53,11 +64,21 @@ def _build_memory(r: Any) -> dict[str, Any]:
 
 def _build_summary(db: Session, s: SegmentSummary) -> dict[str, Any]:
     version, h = segment_summary_source_version(s)
-    decisions = s.decisions or []
-    decisions_text = " ".join(
-        str(d.get("what") if isinstance(d, dict) else d) for d in decisions
+    search_text = " ".join(
+        _flatten_search_values(value)
+        for value in (
+            s.goal,
+            s.outcome,
+            s.decisions,
+            s.open_loops,
+            s.entities,
+            s.artifacts,
+            s.important_tool_results,
+            s.active_constraints,
+            s.unresolved_failures,
+        )
+        if value
     )
-    search_text = f"{s.goal or ''} {s.outcome or ''} {decisions_text}"
     thread_id = None
     epoch_id = None
     seg = db.query(Segment).filter(Segment.id == s.segment_id).first()
@@ -73,7 +94,7 @@ def _build_summary(db: Session, s: SegmentSummary) -> dict[str, Any]:
         "source_hash": h,
         "title": s.goal or "Segment Summary",
         "search_text": search_text,
-        "snippet": (s.outcome or "")[:200],
+        "snippet": search_text[:500],
         "scope_type": "global",
         "scope_id": None,
         "canonical_key": None,
@@ -92,17 +113,23 @@ def _build_summary(db: Session, s: SegmentSummary) -> dict[str, Any]:
     }
 
 
-def _build_checkpoint(c: EpochCheckpoint) -> dict[str, Any]:
+def _build_checkpoint(db: Session, c: EpochCheckpoint) -> dict[str, Any]:
     version, h = epoch_checkpoint_source_version(c)
-    constraints = c.active_constraints or []
-    constraints_text = " ".join(
-        str(x.get("description") if isinstance(x, dict) else x) for x in constraints
+    search_text = " ".join(
+        _flatten_search_values(value)
+        for value in (
+            c.current_goal,
+            c.completed_milestones,
+            c.open_loops,
+            c.active_constraints,
+            c.current_decisions,
+            c.referenced_artifacts,
+            c.relevant_entities,
+            c.latest_verified_tool_states,
+        )
+        if value
     )
-    loops = c.open_loops or []
-    loops_text = " ".join(
-        str(x.get("description") if isinstance(x, dict) else x) for x in loops
-    )
-    search_text = f"{c.current_goal or ''} {loops_text} {constraints_text}"
+    epoch = db.query(Epoch).filter(Epoch.id == c.epoch_id).first()
     return {
         "source_type": "epoch_checkpoint",
         "source_id": c.id,
@@ -110,14 +137,14 @@ def _build_checkpoint(c: EpochCheckpoint) -> dict[str, Any]:
         "source_hash": h,
         "title": c.current_goal or "Epoch Checkpoint",
         "search_text": search_text,
-        "snippet": (c.current_goal or "")[:200],
+        "snippet": search_text[:500],
         "scope_type": "global",
         "scope_id": None,
         "canonical_key": None,
         "lifecycle_state": "valid",
         "validity_state": "valid",
         "retrieval_tier": "warm",
-        "thread_id": None,
+        "thread_id": epoch.thread_id if epoch is not None else None,
         "epoch_id": c.epoch_id,
         "segment_id": None,
         "memory_record_id": None,
@@ -141,6 +168,6 @@ def build_entry_fields(
     if source_type == "segment_summary":
         return _build_summary(db, orm)
     if source_type == "epoch_checkpoint":
-        return _build_checkpoint(orm)
+        return _build_checkpoint(db, orm)
     logger.warning("未知 source_type，跳过索引: %s", source_type)
     return None

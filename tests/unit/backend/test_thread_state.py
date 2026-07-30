@@ -119,6 +119,44 @@ class TestThreadState:
         ]
         assert stats.turns_included == 5
 
+    def test_load_recent_messages_bounded_respects_compaction_lower_bound(self, db_session):
+        """已由摘要/桥接接管的 Turn 不应再次进入热原始历史。"""
+        state = ThreadState(db_session)
+        thread = state.get_or_create_thread()
+        for sequence in range(1, 5):
+            turn_id = f"bounded-turn-{sequence}"
+            db_session.add(TurnRecord(
+                thread_id=thread.id,
+                turn_id=turn_id,
+                turn_sequence=sequence,
+                status="completed",
+                request_fingerprint=f"bounded-fp-{sequence}",
+            ))
+            db_session.add(Event(
+                trace_id=f"bounded-trace-{sequence}",
+                thread_id=thread.id,
+                turn_id=turn_id,
+                turn_event_index=0,
+                event_type="user_message",
+                payload={"content": f"bounded-msg-{sequence}"},
+            ))
+        db_session.flush()
+
+        messages, stats = state.load_recent_messages_bounded(
+            db_session,
+            thread.id,
+            100,
+            _TokenCounter(),
+            "test-model",
+            lower_bound_sequence=2,
+        )
+
+        assert [message["content"] for message in messages] == [
+            "bounded-msg-3",
+            "bounded-msg-4",
+        ]
+        assert stats.turns_included == 2
+
     def test_load_recent_messages_bounded_skips_empty_content(self, db_session):
         """有界读取应跳过空内容消息。"""
         state = ThreadState(db_session)

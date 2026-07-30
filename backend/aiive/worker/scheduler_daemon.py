@@ -8,7 +8,7 @@ from typing import Any
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from aiive.db.base import SessionLocal
@@ -222,7 +222,7 @@ def _reconcile_enqueue(db: Session, job_type: str, operation_id: str, payload: d
 
 
 def _idle_scanner_job() -> None:
-    """周期扫描空闲且可回收的 open Segment，触发 begin_segment_sealing（J 节）。
+    """周期扫描空闲或已标记 pending 的 open Segment，并触发密封。
 
     短事务、逐候选独立会话；operation_id UNIQUE 保证幂等。
     """
@@ -230,14 +230,16 @@ def _idle_scanner_job() -> None:
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=cfg.idle_threshold_seconds)
     db = SessionLocal()
     try:
-        thread_ids = db.execute(
-            select(Thread.id).where(Thread.last_activity_at <= cutoff)
-        ).scalars().all()
-        if not thread_ids:
-            return
         candidates = (
             db.query(Segment)
-            .filter(Segment.thread_id.in_(thread_ids), Segment.status == "open")
+            .join(Thread, Thread.id == Segment.thread_id)
+            .filter(
+                Segment.status == "open",
+                or_(
+                    Thread.last_activity_at <= cutoff,
+                    Segment.pending_seal_at.is_not(None),
+                ),
+            )
             .order_by(Segment.pending_seal_at.asc().nullslast())
             .limit(_MAX_SCAN_BATCH)
             .all()
@@ -261,7 +263,9 @@ def _idle_scanner_job() -> None:
                 continue
             mgr.begin_segment_sealing(
                 sdb, thread_id, seg_id,
-                expected_idle_cutoff=cutoff,
+                # pending 是主动边界，不要求线程继续保持 idle；行锁与非终态
+                # Turn 检查仍会阻止与正在执行的 Turn 竞态密封。
+                expected_idle_cutoff=None if pending_seal_at is not None else cutoff,
             )
             sdb.commit()
         except Exception:
@@ -332,15 +336,19 @@ def _enqueue_reconciler_job() -> None:
 
         # 3) open Segment 满足 idle/pending_seal 但无 segment_sealing Job
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=cfg.idle_threshold_seconds)
-        idle_threads = db.execute(
-            select(Thread.id).where(Thread.last_activity_at <= cutoff)
-        ).scalars().all()
-        if idle_threads:
-            open_segs = (
-                db.query(Segment)
-                .filter(Segment.thread_id.in_(idle_threads), Segment.status == "open")
-                .all()
+        open_segs = (
+            db.query(Segment)
+            .join(Thread, Thread.id == Segment.thread_id)
+            .filter(
+                Segment.status == "open",
+                or_(
+                    Thread.last_activity_at <= cutoff,
+                    Segment.pending_seal_at.is_not(None),
+                ),
             )
+            .all()
+        )
+        if open_segs:
             for seg in open_segs:
                 trc = db.query(TurnRecord).filter(
                     TurnRecord.segment_id == seg.id,
@@ -355,8 +363,12 @@ def _enqueue_reconciler_job() -> None:
                     mgr = EpochManager()
                     try:
                         mgr.begin_segment_sealing(
-                            db, seg.thread_id, seg.id,
-                            expected_idle_cutoff=cutoff,
+                            db,
+                            seg.thread_id,
+                            seg.id,
+                            expected_idle_cutoff=(
+                                None if seg.pending_seal_at is not None else cutoff
+                            ),
                         )
                     except Exception:
                         logger.exception("reconciler: begin_segment_sealing 异常 seg_id=%s", seg.id)

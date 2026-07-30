@@ -56,6 +56,7 @@ class ThreadState:
         model: str,
         normalizer: Any | None = None,
         upper_bound_sequence: int | None = None,
+        lower_bound_sequence: int | None = None,
         max_pages: int = 20,
         max_turns: int = 100,
         max_events: int = 5000,
@@ -84,6 +85,10 @@ class ThreadState:
             )
             if last_sequence is not None:
                 base_query = base_query.filter(TurnRecord.turn_sequence < last_sequence)
+            if lower_bound_sequence is not None:
+                base_query = base_query.filter(
+                    TurnRecord.turn_sequence > lower_bound_sequence,
+                )
 
             turns_page = (
                 base_query
