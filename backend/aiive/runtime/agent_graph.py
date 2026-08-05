@@ -216,15 +216,9 @@ def _build_runtime_identity(runtime_identity: dict[str, str] | None) -> str:
     aname = runtime_identity.get("agent_display_name", "")
     if aname:
         lines.append(f"- agent_display_name: {aname}")
-    uname = runtime_identity.get("user_display_name", "")
-    if uname:
-        lines.append(f"- user_display_name: {uname}")
     rstyle = runtime_identity.get("relationship_style", "")
     if rstyle:
         lines.append(f"- relationship_style: {rstyle}")
-    respstyle = runtime_identity.get("response_style", "")
-    if respstyle:
-        lines.append(f"- response_style: {respstyle}")
     if len(lines) == 1:
         return ""
     return "\n".join(lines) + "\n"

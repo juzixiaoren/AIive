@@ -1244,19 +1244,18 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         # 基础工具
         ("echo", _handle_echo, "回显输入消息", {"message": "str"}, "low", False, False),
         ("get_current_time", _handle_get_current_time,
-         "获取当前时间（UTC 与本地时区）。用户给的是绝对时间点（如“14点提醒我”）时，"
-         "Agent 先调用本工具拿到现在几点，再换算成 schedule_reminder 所需的 delay_minutes，避免乱填。",
+         "获取当前时间（UTC 与本地时区）。",
          {}, "low", False, False),
         # 提醒 / 任务
         ("schedule_reminder", _handle_schedule_reminder,
          "创建定时提醒并写入 Task 表，由后台可靠投递。注意：本工具只接受相对延迟 delay_minutes。"
-         "若用户给的是绝对时间点（如“14点提醒我”“下午3点做某事”），必须先调用 get_current_time 获取当前时间，"
-         "由你自行换算出到目标时间还剩多少分钟，再传入 delay_minutes，切勿凭空乱填。",
+         "若用户给的是绝对时间点，必须先调用 get_current_time 工具获取当前时间，"
+         "再换算出到目标时间还剩多少分钟，传入 delay_minutes。",
          {
              "content": {"type": "str", "description": "提醒内容", "minLength": 1},
              "delay_minutes": {
                  "type": "int",
-                 "description": "相对当前时间的延迟分钟数；用户给绝对时间时需先用 get_current_time 换算，默认 1",
+                 "description": "相对当前时间的延迟分钟数；默认 1",
                  "minimum": 1,
                  "maximum": 525600,
              },
@@ -1270,7 +1269,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
              "reminder_id": {"type": "str", "minLength": 1},
              "delay_minutes": {"type": "int", "description": "默认 5", "minimum": 1, "maximum": 525600},
          }, "low", True, False),
-        ("list_tasks", _handle_list_tasks, "列出所有任务/提醒，status='all'/'pending'/'completed'",
+        ("list_tasks", _handle_list_tasks, "列出所有任务/提醒",
          {"status": {
              "type": "str",
              "description": "空或 all=全部; pending/completed 可选",
@@ -1279,7 +1278,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         ("cancel_task", _handle_cancel_task, "按 ID 取消任务",
          {"task_id": {"type": "str", "minLength": 1}}, "low", True, False),
         ("dismiss_notifications", _handle_dismiss_notifications,
-         "清除未执行的通知（待提醒/提醒中/已延时），将其标记为已取消。已确认和已取消的不受影响。默认仅当前线程",
+         "清除未执行的通知（待提醒/提醒中/已延时），将其标记为已取消",
          {"scope": {
              "type": "str",
              "description": "thread(默认，仅当前线程) / all(跨线程清除)",
@@ -1298,12 +1297,11 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                  "enum": ["fact", "user_profile", "agent_self", "project", "policy", "procedural", "episodic", "knowledge", "environment"],
              },
              "memory_key": {"type": "str", "description": "稳定键，推荐格式: user.preference.<topic> / agent.persona.<trait> / project.<name>.<topic>"},
-             "keywords": {"type": "list", "description": "可选检索关键词（同义词/上位词）。用于词汇召回命中；例如记「喜欢霸王茶姬」附 ['奶茶','茶饮']，查询「想喝奶茶」即可召回。不写入 content 文本"},
+             "keywords": {"type": "list", "description": "可选检索关键词。用于词汇召回命中；"},
          }, "low", True, False),
         # Phase 6A: 统一 forget 工具
         ("forget", handle_forget,
-         "执行 Forget Saga — Phase A 立即屏蔽。长期记忆、原始聊天、派生摘要全部清理。\n"
-         + "mode: everywhere(默认/忘记一切) / memory_only(仅删记忆保留聊天) / history_only(仅删聊天及派生)",
+         "mode: everywhere(默认/忘记一切) / memory_only(仅删记忆保留聊天) / history_only(仅删聊天及派生)",
          {
              "mode": {
                  "type": "str",
