@@ -11,16 +11,17 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, ClassVar
 
 from json_repair import repair_json
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from aiive.core.text_utils import strip_code_fence
 
 from aiive.core.llm_client import LLMClient, LLMResponse
 from aiive.memory.memory_types import MEMORY_KEY_GUIDE, MemoryProposal, TrustLevel
 from aiive.memory.proposal_normalizer import ProposalNormalizer, NormalizationResult
+from aiive.prompts import get_prompt_registry
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,9 @@ logger = logging.getLogger(__name__)
 
 class ExtractedMemory(BaseModel):
     """Single extracted memory item from LLM output."""
-    content: str
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", strict=True)
+
+    content: str = Field(min_length=1)
     memory_type: str = ""
     memory_key: str = ""
     confidence: float = Field(ge=0.0, le=1.0, default=0.5)
@@ -39,48 +42,8 @@ class ExtractedMemory(BaseModel):
     durable: bool = True
     importance: float = Field(ge=0.0, le=1.0, default=0.5)
     signal_type: str = ""  # routine / preference / habit / schedule (steward enrichment)
-
-
-# ---------------------------------------------------------------------------
-# Unified extraction prompt (covers both MemoryExtractor + StewardSignalExtractor)
-# ---------------------------------------------------------------------------
-
-UNIFIED_EXTRACT_PROMPT = """从以下对话中提取持久性信息。输出 JSON 数组，每个对象包含：
-
-- content: 事实/偏好/习惯/日程的简洁表述
-- memory_type: 以下 canonical 类型之一：
-    user_profile（身份信息、偏好、习惯、日程、规律）
-    agent_self（Agent 的名称、人格、关系风格）
-    project（项目决策、技术栈、架构选择）
-    policy（规则、约束、禁止事项）
-    procedural（工作流、执行方法、经验教训）
-    episodic（值得记住的一次性事件）
-    knowledge（通用事实和知识）
-    environment（环境配置信息）
-- memory_key: 去重用稳定键，规范见下方
-- confidence: 0.0-1.0（对持久性的确信度）
-- importance: 0.0-1.0（重要性）
-- source_span: 用户消息中包含该事实的原文片段
-- signal_type: 可选的管家信号标记（routine/habit/schedule/preference），无则留空
-
-记忆键规范：
-""" + MEMORY_KEY_GUIDE + """
-
-关键规则：
-- 只提取用户明确陈述的信息，不推断或猜测
-- 身份键的 content 必须是纯值，不含前缀
-- "我的代码报错了""今天好累""帮我看看"等暂时性情况不提取
-- 用户明确要求"记住X""以后叫我X"的，confidence 设为 0.95+
-- 用户陈述的日常规律（每天/每周）标记 signal_type=routine
-- 用户陈述的习惯（喜欢/不喜欢/习惯）标记 signal_type=habit 或 preference
-- 带时间/日期的计划标记 signal_type=schedule
-- 无任何可提取内容时返回空数组 []
-
-对话：
-User: {user_message}
-Assistant: {reply}
-
-只输出有效 JSON，不用 markdown 标记："""
+    # 兼容旧 Steward 输出；规范化阶段仍以 content/source_span 为事实来源。
+    schedule_text: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -125,20 +88,44 @@ class UnifiedMemoryExtractor:
         Returns:
             List of normalized MemoryProposal.
         """
-        prompt = UNIFIED_EXTRACT_PROMPT.format(
-            user_message=user_message, reply=reply
-        )
+        prompt = get_prompt_registry().render(
+            "memory.extractor",
+            memory_key_guide=MEMORY_KEY_GUIDE,
+            user_message=user_message,
+            reply=reply,
+        ).content
         messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
 
         try:
-            response: LLMResponse = self._llm_client.chat(
-                messages, trace_id=trace_id, temperature=0.1
-            )
+            extracted: list[ExtractedMemory] = []
+            for attempt in range(2):
+                response: LLMResponse = self._llm_client.chat(
+                    messages, trace_id=trace_id, temperature=0.1, json_mode=True,
+                )
+                if response.finish_reason == "length":
+                    error_text = "JSON output was truncated"
+                else:
+                    try:
+                        extracted = self._parse(response.content, strict=True)
+                        break
+                    except (json.JSONDecodeError, ValidationError, ValueError, TypeError) as error:
+                        error_text = self._validation_feedback(error)
+                if attempt == 0:
+                    messages = [
+                        *messages,
+                        {"role": "assistant", "content": response.content},
+                        {
+                            "role": "user",
+                            "content": get_prompt_registry().render(
+                                "memory.extractor_retry",
+                                error_text=error_text,
+                            ).content,
+                        },
+                    ]
         except Exception:
             logger.exception("Unified extraction LLM call failed: trace_id=%s", trace_id)
             return []
 
-        extracted: list[ExtractedMemory] = self._parse(response.content)
         return self._normalize_all(
             extracted, thread_id, trace_id,
             source_event_ids=source_event_ids,
@@ -149,7 +136,7 @@ class UnifiedMemoryExtractor:
     # Parsing
     # ------------------------------------------------------------------
 
-    def _parse(self, raw: str) -> list[ExtractedMemory]:
+    def _parse(self, raw: str, *, strict: bool = False) -> list[ExtractedMemory]:
         """Parse LLM raw output into ExtractedMemory list."""
         try:
             text = strip_code_fence(raw)
@@ -161,27 +148,31 @@ class UnifiedMemoryExtractor:
                 repaired = repair_json(text)
                 data = json.loads(repaired)
             if not isinstance(data, list):
-                return []
+                raise ValueError("expected a JSON array")
             results: list[ExtractedMemory] = []
             for item in data:
                 try:
-                    results.append(ExtractedMemory(
-                        content=item.get("content", ""),
-                        memory_type=item.get("memory_type", ""),
-                        memory_key=item.get("memory_key", ""),
-                        confidence=float(item.get("confidence", 0.5)),
-                        source_span=item.get("source_span", ""),
-                        durable=item.get("durable", True),
-                        importance=float(item.get("importance", 0.5)),
-                        signal_type=item.get("signal_type", ""),
-                    ))
-                except Exception:
+                    results.append(ExtractedMemory.model_validate(item))
+                except (ValidationError, TypeError) as error:
+                    if strict:
+                        raise error
                     logger.warning("Single extraction parse failed", exc_info=True)
                     continue
             return results
         except (json.JSONDecodeError, ValueError):
+            if strict:
+                raise
             logger.warning("Extraction JSON parse failed", exc_info=True)
             return []
+
+    @staticmethod
+    def _validation_feedback(error: Exception) -> str:
+        if isinstance(error, ValidationError):
+            return "; ".join(
+                f"{'.'.join(str(p) for p in item['loc'])}: {item['msg']}"
+                for item in error.errors(include_url=False, include_input=False)[:8]
+            )
+        return str(error)[:400]
 
     # ------------------------------------------------------------------
     # Normalization
@@ -280,5 +271,3 @@ class UnifiedMemoryExtractor:
                 )
 
         return results
-
-

@@ -136,6 +136,12 @@ def create_app() -> FastAPI:
         # 绑定主事件循环，供后台线程安全推送 WebSocket
         ws_manager.set_main_loop(asyncio.get_running_loop())
         try:
+            from aiive.prompts import validate_prompt_catalog
+            validate_prompt_catalog()
+        except Exception:
+            logger.exception("Prompt 目录校验失败，阻断启动")
+            raise
+        try:
             _ensure_schema()
         except Exception:
             # 迁移失败必须阻断启动（与 validate_vector_runtime 策略一致）：
@@ -170,6 +176,7 @@ def create_app() -> FastAPI:
         from aiive.config import settings
         if settings.aiive_memory_vector_enabled:
             from aiive.db.base import SessionLocal
+            from aiive.memory.vector_bootstrap import ensure_memory_vector_backfill
             from aiive.memory.vector_projection import validate_vector_runtime
 
             vector_db = SessionLocal()
@@ -177,6 +184,7 @@ def create_app() -> FastAPI:
                 validate_vector_runtime(vector_db)
             finally:
                 vector_db.close()
+            ensure_memory_vector_backfill()
         try:
             # 重启后恢复已激活 MCP 能力的工具注册（注册表是进程内状态，DB 才是权威）
             from aiive.mcp.bootstrap import restore_active_capabilities

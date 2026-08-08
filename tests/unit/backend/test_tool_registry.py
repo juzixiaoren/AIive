@@ -156,6 +156,99 @@ class TestToolRegistry:
         assert result["ok"] is True
         assert result["result"] == "echo: hello"
 
+    def test_execute_rejects_missing_required_argument(self):
+        """显式契约应从 handler 签名识别必填参数。"""
+        registry = ToolRegistry()
+
+        def handler(message: str) -> str:
+            return message
+
+        registry.register(ToolRegistration(
+            safety=CapabilitySafetySchema("required", "local_builtin", "trusted", "low"),
+            handler=handler,
+            parameters={"message": "str"},
+        ))
+        result = registry.execute("required", {}, "trusted_user_command")
+        assert result["ok"] is False
+        assert result["error_type"] == "argument_validation_error"
+        assert result["issues"][0]["path"] == "message"
+
+    def test_execute_rejects_extra_and_coerced_arguments(self):
+        """本地严格校验不得忽略额外字段或把字符串转换成整数。"""
+        registry = ToolRegistry()
+
+        def handler(count: int = 1) -> int:
+            return count
+
+        registry.register(ToolRegistration(
+            safety=CapabilitySafetySchema("strict", "local_builtin", "trusted", "low"),
+            handler=handler,
+            parameters={"count": "int"},
+        ))
+        coerced = registry.execute("strict", {"count": "2"}, "trusted_user_command")
+        extra = registry.execute("strict", {"count": 2, "other": True}, "trusted_user_command")
+        assert coerced["error_type"] == "argument_validation_error"
+        assert extra["error_type"] == "argument_validation_error"
+
+    def test_execute_rejects_enum_outside_contract(self):
+        registry = ToolRegistry()
+
+        def handler(mode: str = "safe") -> str:
+            return mode
+
+        registry.register(ToolRegistration(
+            safety=CapabilitySafetySchema("enum_tool", "local_builtin", "trusted", "low"),
+            handler=handler,
+            parameters={"mode": {"type": "str", "enum": ["safe", "fast"]}},
+        ))
+        result = registry.execute("enum_tool", {"mode": "dangerous"}, "trusted_user_command")
+        assert result["ok"] is False
+        assert result["issues"][0]["code"] == "enum"
+
+    def test_execute_validates_nested_mcp_input_schema(self):
+        """MCP 原始 inputSchema 的 required、嵌套类型和额外字段不得丢失。"""
+        registry = ToolRegistry()
+
+        def handler(**params):
+            return params
+
+        registry.register(ToolRegistration(
+            safety=CapabilitySafetySchema("mcp_nested", "remote_mcp", "untrusted", "low"),
+            handler=handler,
+            parameters={
+                "request": {"type": "dict", "required": True},
+            },
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "request": {
+                        "type": "object",
+                        "properties": {
+                            "limit": {"type": "integer", "minimum": 1},
+                        },
+                        "required": ["limit"],
+                        "additionalProperties": False,
+                    },
+                },
+                "required": ["request"],
+                "additionalProperties": False,
+            },
+        ))
+        missing = registry.execute(
+            "mcp_nested", {"request": {}}, "trusted_user_command",
+        )
+        nested_extra = registry.execute(
+            "mcp_nested",
+            {"request": {"limit": 1, "unknown": True}},
+            "trusted_user_command",
+        )
+        valid = registry.execute(
+            "mcp_nested", {"request": {"limit": 2}}, "trusted_user_command",
+        )
+        assert missing["error_type"] == "argument_validation_error"
+        assert nested_extra["error_type"] == "argument_validation_error"
+        assert valid["ok"] is True
+
 
 class TestBuiltinTools:
     """测试内置工具的注册状态和执行。"""

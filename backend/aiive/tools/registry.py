@@ -94,7 +94,10 @@ class ToolRegistration:
     safety: CapabilitySafetySchema
     handler: Callable[..., Any]
     description: str = ""
-    parameters: dict[str, Any] = field(default_factory=dict)
+    # None 表示旧式无显式契约（兼容测试/扩展）；{} 表示明确不接受业务参数。
+    parameters: dict[str, Any] | None = None
+    # MCP 工具保留服务端原始 inputSchema，仅用于本地执行前校验。
+    input_schema: dict[str, Any] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +163,7 @@ class ToolRegistry:
                 "effect_mode": reg.safety.effect_mode,
                 "description": reg.description,
                 "parameters": reg.parameters,
+                "input_schema": reg.input_schema,
             }
             reg = replace(
                 reg,
@@ -241,6 +245,18 @@ class ToolRegistry:
                 "allowed": reg.safety.allowed_instruction_sources,
             }
 
+        from aiive.tools.tool_validation import validate_tool_params
+
+        validation = validate_tool_params(reg, params)
+        if not validation.ok:
+            logger.warning(
+                "[TRACE:registry] INVALID_ARGS tool=%s issues=%s",
+                capability_id,
+                [issue.as_dict() for issue in validation.issues],
+            )
+            return validation.error_payload(capability_id)
+        params = validation.validated_params
+
         timeout = reg.safety.timeout_seconds or DEFAULT_TOOL_TIMEOUT
         if reg.safety.writes_external_world or reg.safety.can_delete:
             if run_context is None or not run_context.turn_record_id or not tool_call_id:
@@ -319,6 +335,13 @@ class ToolRegistry:
                 "error": "工具定义在审批后发生变化，原审批已失效",
                 "error_type": "descriptor_changed",
             }
+
+        from aiive.tools.tool_validation import validate_tool_params
+
+        validation = validate_tool_params(reg, params)
+        if not validation.ok:
+            return validation.error_payload(capability_id)
+        params = validation.validated_params
 
         logger.info("[TRACE:registry] EXECUTE_APPROVED tool=%s", capability_id)
         timeout = reg.safety.timeout_seconds or DEFAULT_TOOL_TIMEOUT

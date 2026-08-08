@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, ClassVar, Literal
 
 from json_repair import repair_json
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from aiive.core.llm_client import LLMClient
 from aiive.core.text_utils import strip_code_fence
 from aiive.memory.extraction_policy import MemorySignalAction
+from aiive.prompts import get_prompt_registry
 
 logger = logging.getLogger(__name__)
 
@@ -27,30 +28,11 @@ class MemorySignalDecision(BaseModel):
     Produced by classify_memory_signal().
     No keyword matching, no length heuristics, no hardcoded marker lists.
     """
-    action: str = Field(default=MemorySignalAction.EXTRACT_ASYNC.value)
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", strict=True)
+
+    action: Literal["skip", "extract_async", "extract_sync"] = MemorySignalAction.EXTRACT_ASYNC.value
     confidence: float = Field(ge=0.0, le=1.0, default=0.5)
     reason: str = ""
-
-
-_MEMORY_SIGNAL_PROMPT: str = """Classify whether the following conversation turn contains information worth remembering long-term.
-
-Output ONLY a JSON object:
-{
-  "action": "skip" | "extract_async" | "extract_sync",
-  "confidence": 0.0-1.0,
-  "reason": "brief explanation"
-}
-
-Rules:
-- skip: pure greeting, simple acknowledgement, transient problem report ("my code errored"), small talk, one-off factual question. Do NOT extract.
-- extract_async: contains preferences, facts, habits, project details, or general information that may be useful later. Enqueue for background processing.
-- extract_sync: contains explicit identity changes, policy rules, or critical corrections that must be remembered immediately. Use sparingly.
-
-Conversation:
-User: {user_message}
-Assistant: {reply}
-
-Output ONLY valid JSON, no markdown:"""
 
 
 # ============================================================================
@@ -83,53 +65,65 @@ class ActionPlanner:
         Returns:
             MemorySignalDecision with skip/extract_async/extract_sync.
         """
-        # 模板中含字面量 JSON 示例（裸花括号），不能用 str.format，
-        # 否则会把 JSON 里的 {...} 当成格式字段而抛 KeyError。
-        prompt = (
-            _MEMORY_SIGNAL_PROMPT
-            .replace("{user_message}", user_message)
-            .replace("{reply}", reply)
-        )
+        prompt = get_prompt_registry().render(
+            "memory.signal_classifier",
+            user_message=user_message,
+            reply=reply,
+        ).content
         messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
 
         try:
             # Use a cheap model call with low temperature for classification
             from aiive.core.llm_client import LLMResponse
-            response: LLMResponse = self._llm.chat(
-                messages, trace_id=trace_id, temperature=0.0,
-            )
-            return self._parse_signal(response.content)
+            for attempt in range(2):
+                response: LLMResponse = self._llm.chat(
+                    messages, trace_id=trace_id, temperature=0.0, json_mode=True,
+                )
+                if response.finish_reason == "length":
+                    error_text = "JSON output was truncated"
+                else:
+                    try:
+                        return self._parse_signal(response.content)
+                    except (json.JSONDecodeError, ValidationError, ValueError, TypeError) as error:
+                        error_text = self._validation_feedback(error)
+                if attempt == 0:
+                    messages = [
+                        *messages,
+                        {"role": "assistant", "content": response.content},
+                        {
+                            "role": "user",
+                            "content": get_prompt_registry().render(
+                                "memory.signal_retry",
+                                error_text=error_text,
+                            ).content,
+                        },
+                    ]
         except Exception:
             logger.warning("记忆信号分类失败，回退为 extract_async: trace_id=%s", trace_id, exc_info=True)
-            # On failure: default to EXTRACT_ASYNC (conservative)
-            return MemorySignalDecision(
-                action=MemorySignalAction.EXTRACT_ASYNC.value,
-                confidence=0.3,
-                reason="Classifier failed, defaulting to extract_async",
-            )
+        return MemorySignalDecision(
+            action=MemorySignalAction.EXTRACT_ASYNC.value,
+            confidence=0.3,
+            reason="Classifier output failed validation, defaulting to extract_async",
+        )
 
     @staticmethod
     def _parse_signal(raw: str) -> MemorySignalDecision:
         """Parse model output into MemorySignalDecision."""
+        text = strip_code_fence(raw)
         try:
-            text = strip_code_fence(raw)
-            try:
-                data: dict[str, Any] = json.loads(text)
-            except json.JSONDecodeError:
-                data = json.loads(repair_json(text))
-            action_raw = str(data.get("action", "extract_async")).lower()
-            # Validate action
-            valid_actions = {a.value for a in MemorySignalAction}
-            if action_raw not in valid_actions:
-                action_raw = MemorySignalAction.EXTRACT_ASYNC.value
-            return MemorySignalDecision(
-                action=action_raw,
-                confidence=float(data.get("confidence", 0.5)),
-                reason=str(data.get("reason", ""))[:200],
-            )
-        except (json.JSONDecodeError, ValueError, TypeError):
-            return MemorySignalDecision(
-                action=MemorySignalAction.EXTRACT_ASYNC.value,
-                confidence=0.3,
-                reason="Parse failed, defaulting to extract_async",
-            )
+            data: Any = json.loads(text)
+        except json.JSONDecodeError:
+            data = json.loads(repair_json(text))
+        if not isinstance(data, dict):
+            raise ValueError("expected a JSON object")
+        return MemorySignalDecision.model_validate(data)
+
+    @staticmethod
+    def _validation_feedback(error: Exception) -> str:
+        if isinstance(error, ValidationError):
+            parts = [
+                f"{'.'.join(str(p) for p in item['loc'])}: {item['msg']}"
+                for item in error.errors(include_url=False, include_input=False)[:6]
+            ]
+            return "; ".join(parts)
+        return str(error)[:300]

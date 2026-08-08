@@ -146,7 +146,7 @@ class ContextSnapshotData:
     items: list[ContextSnapshotItem] = field(default_factory=list)
     full_contents: dict[str, str] = field(default_factory=dict)
     stable_prefix_hash: str = ""
-    injected_memory_ids: list[str] = field(default_factory=list)
+    injected_memory_ids: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -249,6 +249,7 @@ class ContextAssembler:
         seg_sum_text: str = ""
         bridge_text: str = ""
         working_state_text: str = ""
+        raw_history_lower_bound = self._raw_history_lower_bound(db, thread_id)
         for attempt in range(MAX_TRIM_ROUNDS):
             trim_plan = TrimPlan.from_budget(self._budget, attempt)
 
@@ -261,32 +262,30 @@ class ContextAssembler:
             history_events = self._load_history_bounded(
                 db, thread_state, thread_id, trim_plan.limit("recent_messages"),
                 upper_bound=assembly_started_at_seq,
+                lower_bound=raw_history_lower_bound,
             )
 
-            # 构建消息列表
+            # 构建消息列表。按“稳定前缀 → 原始历史 → 本轮动态上下文 →
+            # 当前消息”排序，扩大模型提供商可复用的公共前缀。
             history_msgs = self._dicts_to_chat_messages(history_events)
-            messages: list[dict[str, Any]] = []
-            messages.append({"role": "system", "content": system_content})
-            if attention_text:
-                messages.append({"role": "system", "content": attention_text})
-            if working_state_text:
-                messages.append({"role": "system", "content": working_state_text})
-            # ── Phase 3: 稳定摘要上下文（在原始历史之前）──
-            epoch_cp_text = self._load_epoch_checkpoint(db, thread_id)
-            if epoch_cp_text:
-                messages.append({"role": "system", "content": epoch_cp_text})
-            seg_sum_text = self._load_segment_summaries(db, thread_id)
-            if seg_sum_text:
-                messages.append({"role": "system", "content": seg_sum_text})
+            epoch_cp_text = self._load_epoch_checkpoint(
+                db, thread_id, trim_plan.limit("epoch_checkpoint"),
+            )
+            seg_sum_text = self._load_segment_summaries(
+                db, thread_id, trim_plan.limit("segment_summaries"),
+            )
             bridge_text = self._load_sealing_bridge(db, thread_id)
-            if bridge_text:
-                messages.append({"role": "system", "content": bridge_text})
-            history_summary_text = agent_ctx.get("history_summary_text") or ""
-            if history_summary_text:
-                messages.append({"role": "system", "content": history_summary_text})
-            messages.extend(history_msgs)
+            bridge_text, _ = self._trim_text_to_tokens(
+                bridge_text, trim_plan.limit("sealing_bridge"),
+            )
+            history_summary_text, _ = self._trim_text_to_tokens(
+                agent_ctx.get("history_summary_text") or "",
+                trim_plan.limit("retrieved_history_summary"),
+            )
+
             # 召回记忆注入按 retrieved_memory 预算截断（round 3 起收紧）
             recall_budget_left = trim_plan.limit("retrieved_memory")
+            recall_messages: list[dict[str, Any]] = []
             for rm in recall_msgs_raw:
                 content = rm.get("content", "") if isinstance(rm, dict) else str(rm)
                 if not content or recall_budget_left <= 0:
@@ -294,11 +293,24 @@ class ContextAssembler:
                 content, used = self._trim_text_to_tokens(content, recall_budget_left)
                 if content:
                     recall_budget_left -= used
-                    messages.append({"role": "system", "content": content})
+                    recall_messages.append({"role": "system", "content": content})
+
             # 当前轮次的消息角色由来源决定：system 类来源（system_command /
             # runtime_event）以 system 角色注入，让模型明确其为系统消息而非用户输入。
             current_role = "user" if _source in (None, "user") else "system"
-            messages.append({"role": current_role, "content": message})
+            messages = self._compose_prompt_messages(
+                system_content=system_content,
+                epoch_checkpoint_text=epoch_cp_text,
+                segment_summary_text=seg_sum_text,
+                history_messages=history_msgs,
+                attention_text=attention_text,
+                working_state_text=working_state_text,
+                sealing_bridge_text=bridge_text,
+                history_summary_text=history_summary_text,
+                recall_messages=recall_messages,
+                current_role=current_role,
+                current_message=message,
+            )
 
             # 构建有界工具 schema
             tools_schema = self._build_tools_schema_list(
@@ -398,6 +410,47 @@ class ContextAssembler:
 
     # ── 私有辅助方法 ──
 
+    @staticmethod
+    def _compose_prompt_messages(
+        *,
+        system_content: str,
+        epoch_checkpoint_text: str,
+        segment_summary_text: str,
+        history_messages: list[dict[str, Any]],
+        attention_text: str,
+        working_state_text: str,
+        sealing_bridge_text: str,
+        history_summary_text: str,
+        recall_messages: list[dict[str, Any]],
+        current_role: str,
+        current_message: str,
+    ) -> list[dict[str, Any]]:
+        """按缓存友好的稳定性层级组装最终消息。
+
+        Epoch/Segment 摘要只在压缩边界变化，属于稳定前缀；注意力、工作状态、
+        sealing bridge 和查询召回均可能逐轮变化，放在原始历史之后、当前消息之前。
+        """
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_content},
+        ]
+        for content in (epoch_checkpoint_text, segment_summary_text):
+            if content:
+                messages.append({"role": "system", "content": content})
+
+        messages.extend(history_messages)
+
+        for content in (
+            attention_text,
+            working_state_text,
+            sealing_bridge_text,
+            history_summary_text,
+        ):
+            if content:
+                messages.append({"role": "system", "content": content})
+        messages.extend(recall_messages)
+        messages.append({"role": current_role, "content": current_message})
+        return messages
+
     def _load_agent_context(
         self, db: Session, message: str, thread_id: str,
         trace_id: str | None = None,
@@ -473,7 +526,7 @@ class ContextAssembler:
             thread_id=thread_id,
             exclude_source_ids=exclude_source_ids,
         )
-        result = UnifiedRetriever(db, retrieval_cfg).retrieve(request)
+        result = UnifiedRetriever(db, retrieval_cfg, recall_cfg).retrieve(request)
         memory_hits = [h for h in result.hits if h.source_type == "memory_record"]
         history_hits = [
             h for h in result.hits
@@ -562,24 +615,10 @@ class ContextAssembler:
         ids: set[str] = set()
         cfg = RecallConfig()
         limit = max(1, getattr(cfg, "max_segment_summaries", 5))
-        summaries = (
-            db.query(SegmentSummary)
-            .join(Segment, Segment.id == SegmentSummary.segment_id)
-            .join(Epoch, Epoch.id == Segment.epoch_id)
-            .filter(Epoch.thread_id == thread_id, Segment.status == "sealed")
-            .order_by(Segment.start_turn_sequence.desc())
-            .limit(limit)
-            .all()
-        )
+        summaries = self._recent_visible_segment_summaries(db, thread_id, limit)
         for s in summaries:
             ids.add(s.id)
-        cp = (
-            db.query(EpochCheckpoint)
-            .join(Epoch, Epoch.id == EpochCheckpoint.epoch_id)
-            .filter(Epoch.thread_id == thread_id)
-            .order_by(EpochCheckpoint.created_at.desc())
-            .first()
-        )
+        cp = self._latest_visible_epoch_checkpoint(db, thread_id)
         if cp is not None:
             ids.add(cp.id)
         sealing = (
@@ -676,8 +715,9 @@ class ContextAssembler:
         self, db: Session, thread_state: ThreadState,
         thread_id: str, token_budget: int,
         upper_bound: int | None = None,
+        lower_bound: int | None = None,
     ) -> list[dict[str, Any]]:
-        """使用 keyset pagination 按 token 预算限定读取近期消息。Phase 6A：过滤被屏蔽 Event。"""
+        """读取压缩边界之后的有界热历史，并过滤被屏蔽 Event。"""
         history, _stats = thread_state.load_recent_messages_bounded(
             db=db,
             thread_id=thread_id,
@@ -686,8 +726,25 @@ class ContextAssembler:
             model=self._profile.full_name,
             normalizer=self._normalizer,
             upper_bound_sequence=upper_bound,
+            lower_bound_sequence=lower_bound,
         )
         return self._filter_forgotten_events(db, history)
+
+    @staticmethod
+    def _raw_history_lower_bound(db: Session, thread_id: str) -> int | None:
+        """返回已由 Summary 或 sealing bridge 接管的最新 Turn 边界。"""
+        from sqlalchemy import func
+
+        boundary = (
+            db.query(func.max(Segment.end_turn_sequence))
+            .filter(
+                Segment.thread_id == thread_id,
+                Segment.status.in_(("sealed", "sealing")),
+                Segment.end_turn_sequence.is_not(None),
+            )
+            .scalar()
+        )
+        return int(boundary) if boundary is not None else None
 
     def _filter_forgotten_events(
         self, db: Session, events: list[dict[str, Any]],
@@ -698,22 +755,37 @@ class ContextAssembler:
 
     # ── Phase 3: 稳定摘要上下文加载（K 节）──
 
-    def _load_epoch_checkpoint(self, db: Session, thread_id: str) -> str:
-        """加载该 Thread 最近有效的 EpochCheckpoint（仅确定性聚合，不含 LLM）。"""
-        cp = (
+    def _latest_visible_epoch_checkpoint(
+        self, db: Session, thread_id: str,
+    ) -> EpochCheckpoint | None:
+        """返回最近且未被 forget 屏蔽的 Epoch checkpoint。"""
+        candidates = (
             db.query(EpochCheckpoint)
             .join(Epoch, Epoch.id == EpochCheckpoint.epoch_id)
             .filter(Epoch.thread_id == thread_id)
             .order_by(EpochCheckpoint.created_at.desc())
-            .first()
+            .limit(20)
+            .all()
         )
-        if cp is None:
-            return ""
-        # Phase 6A：若 checkpoint 被 forget 屏蔽则不注入，避免泄漏被忘内容
+        if not candidates:
+            return None
         from aiive.forget.visibility_service import ForgetVisibilityService
-        if cp.id in ForgetVisibilityService.blocked_target_ids(
-            db, "epoch_checkpoint", [(cp.id, cp.created_at)],
-        ):
+        blocked = ForgetVisibilityService.blocked_target_ids(
+            db,
+            "epoch_checkpoint",
+            [(candidate.id, candidate.created_at) for candidate in candidates],
+        )
+        return next(
+            (candidate for candidate in candidates if candidate.id not in blocked),
+            None,
+        )
+
+    def _load_epoch_checkpoint(
+        self, db: Session, thread_id: str, token_budget: int,
+    ) -> str:
+        """加载最近有效 checkpoint，并按独立分区预算截断。"""
+        cp = self._latest_visible_epoch_checkpoint(db, thread_id)
+        if cp is None:
             return ""
         lines = [
             "## Epoch Checkpoint（阶段性工作检查点）",
@@ -729,46 +801,125 @@ class ContextAssembler:
             lines.append("- 活跃约束:")
             for c in constraints[:8]:
                 lines.append(f"  - {c.get('description') or c.get('ref') or c}")
+        milestones = cp.completed_milestones or []
+        if milestones:
+            lines.append("- 已完成里程碑:")
+            for item in milestones[:8]:
+                lines.append(f"  - {item.get('description') if isinstance(item, dict) else item}")
+        decisions = cp.current_decisions or []
+        if decisions:
+            lines.append("- 延续决策:")
+            for item in decisions[:8]:
+                lines.append(f"  - {item.get('what') if isinstance(item, dict) else item}")
+        entities = cp.relevant_entities or []
+        if entities:
+            lines.append("- 相关实体:")
+            for item in entities[:8]:
+                lines.append(f"  - {item.get('name') if isinstance(item, dict) else item}")
+        artifacts = cp.referenced_artifacts or []
+        if artifacts:
+            lines.append("- 相关产物:")
+            for item in artifacts[:8]:
+                lines.append(f"  - {item.get('ref') if isinstance(item, dict) else item}")
         segs = cp.source_segment_ids or []
         if segs:
             lines.append(f"- 来源 Segment 数: {len(segs)}")
-        return "\n".join(lines)
+        text, _ = self._trim_text_to_tokens("\n".join(lines), token_budget)
+        return text
 
-    def _load_segment_summaries(self, db: Session, thread_id: str) -> str:
-        """加载最近 N 个已 sealed Segment 的 Summary（N = budget.max_segment_summaries）。"""
-        cfg = RecallConfig()
-        limit = max(1, getattr(cfg, "max_segment_summaries", 5))
-        summaries = (
+    def _recent_visible_segment_summaries(
+        self, db: Session, thread_id: str, limit: int,
+    ) -> list[SegmentSummary]:
+        """加载未被最新 checkpoint 覆盖、且未被 forget 屏蔽的近期摘要。"""
+        cp = self._latest_visible_epoch_checkpoint(db, thread_id)
+        covered_segment_ids = set(cp.source_segment_ids or []) if cp is not None else set()
+        query = (
             db.query(SegmentSummary)
             .join(Segment, Segment.id == SegmentSummary.segment_id)
             .join(Epoch, Epoch.id == Segment.epoch_id)
             .filter(Epoch.thread_id == thread_id, Segment.status == "sealed")
-            .order_by(Segment.start_turn_sequence.desc())
-            .limit(limit)
+        )
+        if covered_segment_ids:
+            query = query.filter(Segment.id.notin_(covered_segment_ids))
+        summaries = (
+            query.order_by(Segment.start_turn_sequence.desc())
+            .limit(limit * 3)
             .all()
         )
         if not summaries:
-            return ""
-        # Phase 6A：过滤被 forget 屏蔽的 summary，避免泄漏被忘内容
+            return []
         from aiive.forget.visibility_service import ForgetVisibilityService
         blocked = ForgetVisibilityService.blocked_target_ids(
             db, "segment_summary", [(s.id, s.created_at) for s in summaries],
         )
-        summaries = [s for s in summaries if s.id not in blocked]
+        return [s for s in summaries if s.id not in blocked][:limit]
+
+    @staticmethod
+    def _render_segment_summary_block(summary: SegmentSummary) -> str:
+        """渲染一个 Segment 摘要，保留语义与确定性状态字段。"""
+        lines: list[str] = []
+        if summary.goal:
+            lines.append(f"- 目标: {summary.goal}")
+        if summary.outcome:
+            lines.append(f"- 结果: {summary.outcome}")
+        for label, values, key, limit in (
+            ("决策", summary.decisions or [], "what", 8),
+            ("未完成循环", summary.open_loops or [], "description", 8),
+            ("活跃约束", summary.active_constraints or [], "description", 8),
+            ("未解决失败", summary.unresolved_failures or [], "error", 5),
+            ("重要工具结果", summary.important_tool_results or [], "result_summary", 5),
+            ("相关实体", summary.entities or [], "name", 8),
+            ("相关产物", summary.artifacts or [], "ref", 8),
+        ):
+            if not values:
+                continue
+            lines.append(f"- {label}:")
+            for item in values[:limit]:
+                value = item.get(key) if isinstance(item, dict) else item
+                if value:
+                    lines.append(f"  - {value}")
+        return "\n".join(lines)
+
+    def _load_segment_summaries(
+        self, db: Session, thread_id: str, token_budget: int,
+    ) -> str:
+        """按 token 预算加载未被 checkpoint 覆盖的最近 N 个摘要。"""
+        cfg = RecallConfig()
+        limit = max(1, getattr(cfg, "max_segment_summaries", 5))
+        summaries = self._recent_visible_segment_summaries(db, thread_id, limit)
         if not summaries:
             return ""
-        blocks: list[str] = ["## 历史 Segment 摘要（近期）"]
-        for i, s in enumerate(reversed(summaries), 1):
-            blocks.append(f"### 摘要 {i}")
-            if s.goal:
-                blocks.append(f"- 目标: {s.goal}")
-            if s.outcome:
-                blocks.append(f"- 结果: {s.outcome}")
-            decisions = s.decisions or []
-            if decisions:
-                blocks.append("- 决策:")
-                for d in decisions[:5]:
-                    blocks.append(f"  - {d.get('what') if isinstance(d, dict) else d}")
+
+        selected: list[str] = []
+        used = self._token_counter.count_messages(
+            self._profile.full_name,
+            [{"role": "system", "content": "## 历史 Segment 摘要（近期）"}],
+        ).safe_tokens
+        # 查询结果为新→旧；优先保证最近摘要完整，再恢复为旧→新的阅读顺序。
+        for summary in summaries:
+            block = self._render_segment_summary_block(summary)
+            if not block:
+                continue
+            cost = self._token_counter.count_messages(
+                self._profile.full_name,
+                [{"role": "system", "content": block}],
+            ).safe_tokens
+            if used + cost > token_budget:
+                if not selected:
+                    block, cost = self._trim_text_to_tokens(
+                        block, max(0, token_budget - used),
+                    )
+                    if block:
+                        selected.append(block)
+                        used += cost
+                break
+            selected.append(block)
+            used += cost
+        if not selected:
+            return ""
+        blocks = ["## 历史 Segment 摘要（近期）"]
+        for index, block in enumerate(reversed(selected), 1):
+            blocks.extend((f"### 摘要 {index}", block))
         return "\n".join(blocks)
 
     def _load_sealing_bridge(self, db: Session, thread_id: str) -> str:
@@ -838,13 +989,11 @@ class ContextAssembler:
 
     # 注入型参数（LangChain InjectedToolCallId 等）由运行时注入，不会出现在
     # 发送给 LLM 的工具 schema 中，token 计数前剔除以免虚高。
-    _INJECTED_TOOL_PARAMS = ("tool_call_id",)
+    _INJECTED_TOOL_PARAMS: ClassVar[tuple[str, ...]] = ("tool_call_id",)
 
     @classmethod
     def _strip_injected_params(cls, schema: dict[str, Any]) -> dict[str, Any]:
         """从 JSON schema 中剔除运行时注入参数（不改变原对象）。"""
-        if not isinstance(schema, dict):
-            return schema
         props = schema.get("properties")
         if not isinstance(props, dict):
             return schema
@@ -1133,15 +1282,11 @@ class ContextAssembler:
             items.append(item)
             full[item_id] = text
 
-        # 系统前缀（稳定契约）→ 核心记忆 → 工作状态 → 稳定摘要 → 历史摘要
+        # 实际请求顺序：稳定前缀 → 稳定摘要 → 原始历史 → 本轮动态上下文。
         _add("stable_prefix", "stable_prefix", "system", "trusted", stable_contract_text)
         _add("core_memory", "core_memory", "system", "trusted", core_memory_text)
-        _add("attention", "attention", "attention", "untrusted", attention_text)
-        _add("working_state", "working_state", "system", "trusted", working_state_text)
         _add("epoch_checkpoint", "epoch_checkpoint", "system", "trusted", epoch_checkpoint_text)
         _add("segment_summary", "segment_summary", "system", "trusted", segment_summary_text)
-        _add("sealing_bridge", "sealing_bridge", "system", "trusted", sealing_bridge_text)
-        _add("history_summary", "history_summary", "system", "trusted", history_summary_text)
 
         # 原始历史消息（按 role 区分用户 / 模型 / 工具结果）
         for i, m in enumerate(history_msgs or []):
@@ -1157,6 +1302,11 @@ class ContextAssembler:
             elif role == "tool":
                 _add(f"history_tool:{i}", "tool_result", "tools", "trusted", str(m.get("content", "")))
 
+        _add("attention", "attention", "attention", "untrusted", attention_text)
+        _add("working_state", "working_state", "system", "trusted", working_state_text)
+        _add("sealing_bridge", "sealing_bridge", "system", "trusted", sealing_bridge_text)
+        _add("history_summary", "history_summary", "system", "trusted", history_summary_text)
+
         # 召回记忆（本轮证据，非系统指令 → 标记 untrusted）
         _add("recall_memory", "recall_memory", "memory", "untrusted", recall_text)
 
@@ -1165,7 +1315,7 @@ class ContextAssembler:
             tools_text = _json.dumps(tools_schema, ensure_ascii=False)
             names = [
                 (s.get("function", {}) or {}).get("name", "")
-                for s in tools_schema if isinstance(s, dict)
+                for s in tools_schema
             ]
             preview_src = ", ".join(n for n in names if n) or tools_text
             item = ContextSnapshotItem(

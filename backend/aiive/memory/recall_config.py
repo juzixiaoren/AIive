@@ -48,6 +48,8 @@ class RecallConfig:
     # --- Phase 3: Idle Scanner / 摘要加载 ---
     idle_threshold_seconds: int = 900          # 15 分钟无活动视为空闲
     min_segment_turn_records: int = 3          # 未标记 pending_seal 时的最小 Turn 数
+    # 长期持续活跃会话不能只依赖 idle/上下文软阈值，否则单个压缩输入会无限增长。
+    max_segment_turn_records: int = 32
     max_segment_summaries: int = 5             # ContextAssembler 加载的最近 Summary 数
 
 

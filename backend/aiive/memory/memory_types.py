@@ -41,19 +41,19 @@ CANONICAL_TYPES: frozenset[str] = frozenset(t.value for t in MemoryType)
 
 # Memory key guide (single source of truth for key naming convention)
 # Used by extraction prompts and tool descriptions.
-MEMORY_KEY_GUIDE: str = """- agent.display_name: Agent 可见名称。触发："以后你叫X" → content="X"（纯值）
-- user.display_name: 用户称呼。触发："以后叫我X" → content="X"（纯值）
-- user.name: 用户真实姓名，仅当用户明确说"我的真实姓名是X"。content="X"（纯值）
-- user.preference.response_style: 回复风格偏好。触发："我喜欢你回答简洁一点"
-- agent.persona.tone: Agent 语气/人格。触发："你以后说话活泼一点"
-- agent.persona.relationship: 主从/关系风格（"你是我的主人""我是你的上司"）
+MEMORY_KEY_GUIDE: str = """- agent.display_name: 你的名称 （纯值）
+- user.display_name: 用户称呼。（纯值）
+- user.name: 用户真实姓名（纯值）
+- user.preference.response_style: 回复风格偏好。
+- agent.persona.tone: Agent 语气/人格。"
+- agent.persona.relationship: 主从/关系风格
 - user.preference.<topic>: 用户某主题偏好
 - user.routine.<desc>: 用户日常规律
 - user.habit.<desc>: 用户习惯
 - user.schedule.<desc>: 用户日程
-- project.<project_name>.<topic>: 项目决策。触发："AIive 后端用 FastAPI" → project.aiive.backend_stack
+- project.<project_name>.<topic>: 项目决策。
 - policy.<topic>: 规则与策略约束
-身份键的 content 必须是纯值，不含前缀或关系表述。"""
+纯值指不含前缀或关系表述。"""
 
 
 # Legacy → Canonical mapping.  Values that cannot be resolved become None

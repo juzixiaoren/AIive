@@ -13,46 +13,9 @@ from typing import Any
 from json_repair import repair_json
 
 from aiive.core.llm_client import LLMClient, LLMResponse
+from aiive.prompts import get_prompt_registry
 
 logger = logging.getLogger(__name__)
-
-# LLM 规划提示词模板：指导 LLM 生成结构化的补丁计划 JSON
-PLAN_PROMPT = (
-    "You are an AI system architect. Given a user requirement, produce a structured "
-    "patch plan for the AIive personal agent project. DO NOT apply any changes. "
-    "Only generate a plan.\n\n"
-    "## Project Structure Available\n"
-    "backend/aiive/ - FastAPI backend (api/, core/, db/, runtime/, memory/, tools/, mcp/, supervisor/, selfdev/)\n"
-    "frontend/ - React + Vite + TypeScript\n"
-    "tests/unit/backend/ - pytest unit tests\n"
-    "docs/ - design docs\n\n"
-    "## Rules\n"
-    "- NEVER suggest modifying active slot or inactive slot in this phase\n"
-    "- If an operation requires applying patches, mark it not_allowed_yet\n"
-    "- If an operation involves deletion, declare safe_delete_scope\n"
-    "- If schema changes are needed, mark requires_schema_change\n"
-    "- External tool installs must go through MCP sandbox\n\n"
-    "## Output Format (JSON only, no markdown)\n"
-    "{{\n"
-    '  "goal_summary": "one-line summary",\n'
-    '  "operations": [\n'
-    '    {{\n'
-    '      "operation": "add_file | modify_file | delete_file",\n'
-    '      "target_file": "path/to/file.py",\n'
-    '      "content": "REQUIRED for add_file/modify_file: the COMPLETE final file content (not a diff, not a summary). Omit only for delete_file.",\n'
-    '      "reason": "why this change is needed",\n'
-    '      "risk_notes": "potential risks if any",\n'
-    '      "requires_schema_change": false,\n'
-    '      "safe_delete_scope": "optional scope id",\n'
-    '      "not_allowed_yet": false\n'
-    "    }}\n"
-    "  ],\n"
-    '  "test_plan": "how to test the changes",\n'
-    '  "requires_schema_change": false\n'
-    "}}\n\n"
-    "User Requirement: {goal}\n\n"
-    "Output ONLY valid JSON:"
-)
 
 # 允许的操作类型白名单
 ALLOWED_OPERATIONS = {"add_file", "modify_file", "delete_file"}
@@ -83,7 +46,10 @@ class SelfDevPlanner:
         返回:
             包含 goal_summary、operations、test_plan 等字段的计划字典。
         """
-        prompt = PLAN_PROMPT.format(goal=goal)
+        prompt = get_prompt_registry().render(
+            "selfdev.patch_plan",
+            goal=goal,
+        ).content
         messages = [{"role": "user", "content": prompt}]
 
         try:
@@ -163,9 +129,11 @@ class SelfDevPlanner:
                 content = op.get("content")
                 if not isinstance(content, str) or not content.strip():
                     op["not_allowed_yet"] = True
-                    op["risk_notes"] = (op.get("risk_notes", "") +
-                        " MISSING_CONTENT: add_file/modify_file requires full non-empty content; "
-                        "operation blocked to avoid writing empty files.")
+                    op["risk_notes"] = (
+                        op.get("risk_notes", "")
+                        + " MISSING_CONTENT: add_file/modify_file requires full non-empty content; "
+                        + "operation blocked to avoid writing empty files."
+                    )
 
             # 标记禁止修改的核心文件路径
             for forbidden in FORBIDDEN_PATHS:

@@ -1,0 +1,65 @@
+[prompts."agent.stable_contract"]
+file = "agent/stable_contract.md"
+version = "2.1.0"
+role = "system"
+variables = []
+
+[prompts."memory.signal_classifier"]
+file = "memory/signal_classifier.md"
+version = "2.0.0"
+role = "user"
+variables = ["user_message", "reply"]
+
+[prompts."memory.signal_retry"]
+file = "memory/signal_retry.md"
+version = "2.0.0"
+role = "user"
+variables = ["error_text"]
+
+[prompts."memory.extractor"]
+file = "memory/extractor.md"
+version = "2.0.0"
+role = "user"
+variables = ["memory_key_guide", "user_message", "reply"]
+
+[prompts."memory.extractor_retry"]
+file = "memory/extractor_retry.md"
+version = "2.0.0"
+role = "user"
+variables = ["error_text"]
+
+[prompts."mcp.capability_plan"]
+file = "mcp/capability_plan.md"
+version = "2.1.0"
+role = "user"
+variables = ["goal"]
+
+[prompts."selfdev.patch_plan"]
+file = "selfdev/patch_plan.md"
+version = "2.0.0"
+role = "user"
+variables = ["goal"]
+
+[prompts."compaction.segment_summary_system"]
+file = "compaction/segment_summary_system.md"
+version = "2.0.0"
+role = "system"
+variables = []
+
+[prompts."compaction.segment_summary_user"]
+file = "compaction/segment_summary_user.md"
+version = "2.0.0"
+role = "user"
+variables = ["source_turns", "tool_lines", "fail_lines"]
+
+[prompts."compaction.segment_summary_retry"]
+file = "compaction/segment_summary_retry.md"
+version = "2.0.0"
+role = "user"
+variables = ["error_text"]
+
+[prompts."runtime.reminder_delivery"]
+file = "runtime/reminder_delivery.md"
+version = "2.0.0"
+role = "user"
+variables = ["reminder_id", "title", "content"]

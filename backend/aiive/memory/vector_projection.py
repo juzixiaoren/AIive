@@ -17,6 +17,14 @@ from aiive.memory.recall_models import MemoryRecallRequest
 EmbeddingFactory = Callable[[], OpenAIEmbeddingProvider]
 
 
+def embedding_model_identity() -> str:
+    """返回持久化投影使用的模型身份，避免不同 revision 的向量混用。"""
+    revision = settings.aiive_embedding_model_revision.strip()
+    if not revision:
+        return settings.aiive_embedding_model
+    return f"{settings.aiive_embedding_model}@{revision}"
+
+
 def validate_vector_runtime(db: Session) -> None:
     """显式启用时验证 PostgreSQL、vector 扩展和投影表均已就绪。"""
     if not settings.aiive_memory_vector_enabled:
@@ -31,17 +39,22 @@ def validate_vector_runtime(db: Session) -> None:
     )).scalar()
     if not extension_ready or not table_ready:
         raise RuntimeError("pgvector 扩展或 memory_vector_projections 表未就绪")
-    build_embedding_provider()
+    provider = build_embedding_provider()
+    # 本地模型在启动阶段做一次端到端预热和维度校验。远端服务不在启动时计费。
+    if settings.aiive_embedding_provider == "local":
+        provider.embed("AIive 本地向量服务启动检查", input_type="query")
 
 
 def build_embedding_provider() -> OpenAIEmbeddingProvider:
-    """按当前运行配置构造真实 OpenAI Embeddings provider。"""
+    """按当前运行配置构造 OpenAI-compatible Embeddings provider。"""
     return OpenAIEmbeddingProvider(
         api_key=settings.aiive_embedding_api_key,
         base_url=settings.aiive_embedding_base_url,
         model=settings.aiive_embedding_model,
         dimensions=settings.aiive_embedding_dimensions,
         timeout_seconds=settings.aiive_embedding_timeout_seconds,
+        provider=settings.aiive_embedding_provider,
+        query_prefix=settings.aiive_embedding_query_prefix,
     )
 
 
@@ -69,14 +82,14 @@ class MemoryVectorProjectionService:
             return "inactive_deleted" if delete_result == "deleted" else delete_result
 
         provider = self._provider_factory()
-        vector = provider.embed(self._embedding_text(record))
+        vector = provider.embed(self._embedding_text(record), input_type="document")
         projection = self._db.get(MemoryVectorProjection, memory_id)
         if projection is None:
             projection = MemoryVectorProjection(memory_id=memory_id)
             self._db.add(projection)
         projection.record_version = record.record_version
         projection.content_hash = record.content_hash
-        projection.embedding_model = settings.aiive_embedding_model
+        projection.embedding_model = embedding_model_identity()
         projection.embedding = vector
         return "upserted"
 
@@ -121,7 +134,7 @@ class MemoryVectorProjectionService:
         query = request.query.strip()
         if not query or limit <= 0:
             return []
-        vector = self._provider_factory().embed(query)
+        vector = self._provider_factory().embed(query, input_type="query")
         distance = MemoryVectorProjection.embedding.cosine_distance(vector)
         states = [LifecycleState.ACTIVE.value]
         if include_sleeping:
@@ -142,6 +155,7 @@ class MemoryVectorProjectionService:
                 MemoryRecord.lifecycle_state.in_(states),
                 MemoryRecord.validity_state == ValidityState.VALID.value,
                 MemoryVectorProjection.record_version == MemoryRecord.record_version,
+                MemoryVectorProjection.embedding_model == embedding_model_identity(),
                 or_(*scope_conditions),
             )
             .order_by(distance.asc())

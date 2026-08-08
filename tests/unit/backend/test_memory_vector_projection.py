@@ -10,12 +10,13 @@ from aiive.memory.vector_projection import MemoryVectorProjectionService
 class StubEmbeddingProvider:
     """单元测试专用 provider；不会进入生产装配路径。"""
 
-    dimensions = 1536
+    dimensions = 512
 
     @staticmethod
-    def embed(text: str) -> list[float]:
+    def embed(text: str, *, input_type: str = "document") -> list[float]:
         assert text.strip()
-        return [0.01] * 1536
+        assert input_type in {"query", "document"}
+        return [0.01] * 512
 
 
 def _record(db_session) -> MemoryRecord:
@@ -46,7 +47,7 @@ def test_refresh_upserts_versioned_projection(db_session, monkeypatch):
     assert projection is not None
     assert projection.record_version == 1
     assert projection.content_hash == "hash-v1"
-    assert len(projection.embedding) == 1536
+    assert len(projection.embedding) == 512
 
 
 def test_refresh_skips_stale_version(db_session):

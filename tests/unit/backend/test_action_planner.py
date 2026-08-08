@@ -8,10 +8,10 @@ from aiive.memory.extraction_policy import MemoryExtractionPolicy, MemorySignalA
 
 
 class TestClassifyMemorySignal:
-    """验证 classify_memory_signal 的 prompt 渲染不再因裸花括号抛 KeyError。"""
+    """验证 classify_memory_signal 的提示词渲染与本地解析。"""
 
     def test_prompt_rendering_does_not_raise_keyerror(self):
-        """含字面量 JSON 示例的模板不应因 str.format 而失败。"""
+        """提示词应正常渲染，并启用 JSON mode。"""
         fake = FakeLLMClient(fixed_content='{"action": "skip", "confidence": 0.9, "reason": "greeting"}')
         planner = ActionPlanner(fake)
 
@@ -21,9 +21,10 @@ class TestClassifyMemorySignal:
 
         assert signal.action == MemorySignalAction.SKIP.value
         assert signal.confidence == 0.9
+        assert fake._call_history[0]["json_mode"] is True
 
-    def test_prompt_contains_rendered_message_and_json_example(self):
-        """渲染后的 prompt 应替换占位符，且保留 JSON 示例中的花括号。"""
+    def test_prompt_contains_rendered_message_and_action_contract(self):
+        """渲染后的提示词应替换占位符，并说明合法动作值。"""
         fake = FakeLLMClient(fixed_content='{"action": "extract_async", "confidence": 0.5, "reason": ""}')
         planner = ActionPlanner(fake)
 
@@ -36,8 +37,8 @@ class TestClassifyMemorySignal:
         assert "好的，小明。" in sent_prompt
         assert "{user_message}" not in sent_prompt
         assert "{reply}" not in sent_prompt
-        # JSON 示例中的字面量花括号应原样保留
-        assert '"action": "skip" | "extract_async" | "extract_sync"' in sent_prompt
+        assert "`skip`、`extract_async` 或 `extract_sync`" in sent_prompt
+        assert '"skip" | "extract_async"' not in sent_prompt
 
     def test_malformed_json_repaired(self):
         """模型返回带尾逗号的非法 JSON 时应经 repair_json 兜底解析成功。"""

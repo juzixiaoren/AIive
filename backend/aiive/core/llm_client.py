@@ -5,7 +5,6 @@
 - 包含 LLMClient（生产客户端）、FakeLLMClient（测试替身）和 LLMResponse（响应模型）
 - 通过 default_llm_client() 工厂函数从项目配置创建统一的客户端实例
 """
-import json
 import logging
 import time
 import uuid
@@ -36,6 +35,7 @@ class LLMResponse:
     usage: dict[str, int]
     raw_preview: str
     trace_id: str
+    finish_reason: str = ""
 
 
 class LLMClientError(Exception):
@@ -53,9 +53,9 @@ class LLMClientError(Exception):
         super().__init__(message)
         self.status_code: int | None = status_code
         self.trace_id: str | None = trace_id
-        self.code = code
-        self.retryable = retryable
-        self.retry_after_seconds = retry_after_seconds
+        self.code: str = code
+        self.retryable: bool = retryable
+        self.retry_after_seconds: int | None = retry_after_seconds
 
 
 def normalize_llm_error(error: Exception, trace_id: str | None = None) -> LLMClientError:
@@ -121,6 +121,7 @@ class LLMClient:
         api_key: str,
         default_model: str,
         timeout_seconds: int = 30,
+        json_mode_policy: str = "auto",
     ):
         """初始化 LLM 客户端。
 
@@ -134,6 +135,20 @@ class LLMClient:
         self._api_key: str = api_key
         self._default_model: str = default_model
         self._timeout_seconds: int = timeout_seconds
+        self._json_mode_policy: str = json_mode_policy
+
+    @staticmethod
+    def _is_json_mode_unsupported(response: httpx.Response) -> bool:
+        """仅对明确指出 JSON mode 不支持的客户端错误执行自动降级。"""
+        if response.status_code not in (400, 422):
+            return False
+        text = response.text.lower()
+        mentions_feature = "response_format" in text or "json_object" in text or "json mode" in text
+        unsupported = any(marker in text for marker in (
+            "unsupported", "not support", "does not support", "unknown format",
+            "invalid response_format", "不支持",
+        ))
+        return mentions_feature and unsupported
 
     def chat(
         self,
@@ -142,6 +157,7 @@ class LLMClient:
         temperature: float | None = None,
         timeout: int | None = None,
         trace_id: str | None = None,
+        json_mode: bool = False,
     ) -> LLMResponse:
         """发送同步聊天完成请求，返回完整的 LLMResponse。
 
@@ -170,6 +186,9 @@ class LLMClient:
         }
         if temperature is not None:
             payload["temperature"] = temperature
+        use_json_mode = json_mode and self._json_mode_policy != "off"
+        if use_json_mode:
+            payload["response_format"] = {"type": "json_object"}
 
         headers = {
             "Authorization": f"Bearer {self._api_key}",
@@ -180,12 +199,28 @@ class LLMClient:
 
         start = time.monotonic()
         try:
-            response = httpx.post(
-                url,
-                json=payload,
-                headers=headers,
-                timeout=httpx.Timeout(timeout_s, connect=10.0),
-            )
+            while True:
+                request_payload = dict(payload)
+                response = httpx.post(
+                    url,
+                    json=request_payload,
+                    headers=headers,
+                    timeout=httpx.Timeout(timeout_s, connect=10.0),
+                )
+                if (
+                    use_json_mode
+                    and self._json_mode_policy == "auto"
+                    and self._is_json_mode_unsupported(response)
+                ):
+                    logger.warning(
+                        "模型不支持 JSON mode，当前调用降级为 prompt-only JSON: model=%s base_url=%s",
+                        model,
+                        self._base_url,
+                    )
+                    payload.pop("response_format", None)
+                    use_json_mode = False
+                    continue
+                break
             elapsed = (time.monotonic() - start) * 1000
 
             # 非正常响应：抛出 LLMClientError
@@ -200,12 +235,18 @@ class LLMClient:
             choice = data["choices"][0]
             message = choice["message"]
             content = message.get("content", "") or ""
+            finish_reason = str(choice.get("finish_reason", "") or "")
 
-            usage = {
-                "prompt_tokens": data.get("usage", {}).get("prompt_tokens", 0),
-                "completion_tokens": data.get("usage", {}).get("completion_tokens", 0),
-                "total_tokens": data.get("usage", {}).get("total_tokens", 0),
-            }
+            usage = self._normalize_usage(data.get("usage", {}))
+            if usage.get("cache_read_tokens") is not None:
+                logger.info(
+                    "LLM prompt cache usage: model=%s prompt_tokens=%d "
+                    + "cache_read_tokens=%d cache_write_tokens=%d",
+                    data.get("model", model),
+                    usage["prompt_tokens"],
+                    usage.get("cache_read_tokens", 0),
+                    usage.get("cache_write_tokens", 0),
+                )
 
             return LLMResponse(
                 content=content,
@@ -214,6 +255,7 @@ class LLMClient:
                 usage=usage,
                 raw_preview=response.text[:2000],
                 trace_id=trace_id,
+                finish_reason=finish_reason,
             )
 
         except httpx.TimeoutException:
@@ -248,6 +290,65 @@ class LLMClient:
     def timeout_seconds(self) -> int:
         return self._timeout_seconds
 
+    @staticmethod
+    def _normalize_usage(raw_usage: Any) -> dict[str, int]:
+        """归一化 OpenAI-compatible 提供商的 token 与缓存统计。
+
+        OpenAI/Qwen 通常把缓存命中放在
+        ``prompt_tokens_details.cached_tokens``；DeepSeek 使用
+        ``prompt_cache_hit_tokens`` / ``prompt_cache_miss_tokens``。
+        兼容端点未返回缓存字段时保持原有三字段契约。
+        """
+        usage = raw_usage if isinstance(raw_usage, dict) else {}
+
+        def _int(value: Any) -> int:
+            try:
+                return max(0, int(value or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        normalized = {
+            "prompt_tokens": _int(usage.get("prompt_tokens")),
+            "completion_tokens": _int(usage.get("completion_tokens")),
+            "total_tokens": _int(usage.get("total_tokens")),
+        }
+        prompt_details = usage.get("prompt_tokens_details")
+        if not isinstance(prompt_details, dict):
+            prompt_details = {}
+
+        cache_fields_present = any(
+            key in usage
+            for key in (
+                "prompt_cache_hit_tokens",
+                "prompt_cache_miss_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+            )
+        ) or any(
+            key in prompt_details
+            for key in ("cached_tokens", "cache_read_tokens", "cache_write_tokens")
+        )
+        if cache_fields_present:
+            normalized["cache_read_tokens"] = _int(
+                prompt_details.get(
+                    "cached_tokens",
+                    prompt_details.get(
+                        "cache_read_tokens",
+                        usage.get(
+                            "prompt_cache_hit_tokens",
+                            usage.get("cache_read_input_tokens"),
+                        ),
+                    ),
+                )
+            )
+            normalized["cache_write_tokens"] = _int(
+                prompt_details.get(
+                    "cache_write_tokens",
+                    usage.get("cache_creation_input_tokens"),
+                )
+            )
+        return normalized
+
 
 def default_llm_client() -> "LLMClient":
     """基于项目配置构架 LLMClient 实例的工厂函数。
@@ -262,6 +363,7 @@ def default_llm_client() -> "LLMClient":
         api_key=settings.aiive_llm_api_key,
         default_model=settings.aiive_llm_model,
         timeout_seconds=settings.aiive_llm_timeout_seconds,
+        json_mode_policy=settings.aiive_llm_json_mode,
     )
 
 
@@ -310,6 +412,7 @@ class FakeLLMClient(LLMClient):
         temperature: float | None = None,
         timeout: int | None = None,
         trace_id: str | None = None,
+        json_mode: bool = False,
     ) -> LLMResponse:
         """模拟同步聊天完成，记录调用历史并返回固定的预设内容。
 
@@ -331,6 +434,7 @@ class FakeLLMClient(LLMClient):
             "model": model,
             "temperature": temperature,
             "trace_id": trace_id,
+            "json_mode": json_mode,
         })
 
         return LLMResponse(
@@ -340,4 +444,5 @@ class FakeLLMClient(LLMClient):
             usage=dict(self._fixed_usage),
             raw_preview='{"choices":[{"message":{"content":"' + self._fixed_content + '"}}]}',
             trace_id=trace_id,
+            finish_reason="stop",
         )
