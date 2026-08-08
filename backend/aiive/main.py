@@ -92,11 +92,25 @@ def _ensure_schema():
     from alembic import command
     from alembic.config import Config
 
-    # alembic.ini 位于仓库根目录（backend 的上一级）
-    ini_path = Path(__file__).resolve().parent.parent.parent / "alembic.ini"
-    if not ini_path.exists():
-        logger.error("未找到 alembic.ini（预期路径 %s），跳过 schema 迁移", ini_path)
-        raise RuntimeError(f"alembic.ini not found at {ini_path}")
+    # alembic.ini 的位置取决于运行布局：
+    #  - 源码运行：仓库根目录（backend 的上一级）
+    #  - wheel 安装（Docker）：Dockerfile 将其复制到 /app/alembic.ini
+    #  - 也可通过环境变量 ALEMBIC_INI_PATH 显式指定
+    import os
+
+    candidates = []
+    env_ini = os.environ.get("ALEMBIC_INI_PATH")
+    if env_ini:
+        candidates.append(Path(env_ini))
+    candidates.append(Path("/app/alembic.ini"))
+    candidates.append(Path.cwd() / "alembic.ini")
+    candidates.append(Path(__file__).resolve().parent.parent.parent / "alembic.ini")
+
+    ini_path = next((p for p in candidates if p.exists()), None)
+    if ini_path is None:
+        tried = "; ".join(str(p) for p in candidates)
+        logger.error("未找到 alembic.ini，尝试过的路径: %s", tried)
+        raise RuntimeError(f"alembic.ini not found. tried: {tried}")
 
     alembic_cfg = Config(str(ini_path))
     # 用运行时配置的数据库 URL 覆盖 ini 中的默认值，保证与应用连接一致
