@@ -77,6 +77,7 @@ AIive（再次召回，fail-closed 校验）：
 | 向量检索 | pgvector（PostgreSQL 向量扩展） |
 | 前端 | React 19 / TypeScript / Vite 6 / TailwindCSS 3 |
 | Android 应用 | React 19 / Capacitor 8 / Android SDK 36（独立 UI） |
+| Desktop 应用 | Electron 37 / Electron Forge / 独立 Node Host |
 | 实时通信 | WebSocket |
 | 定时任务 | APScheduler 3.10 |
 | 测试 | pytest 8.0 / basedpyright |
@@ -128,8 +129,8 @@ curl http://localhost:8000/health
 ### Android APK
 
 Android 客户端位于 `apps/android/`，使用完全独立的组件与 CSS，不复用 Web
-页面样式。它只呈现核心流式对话，不显示工具调用、操作卡片、`trace_id`、记忆、
-能力、事件等 Web 功能。
+页面样式。它呈现核心流式对话和高危工具审批卡片，不显示普通工具明细、
+`trace_id`、记忆、能力、事件等 Web 管理功能。
 
 首次构建前，在 `apps/android/src/config.ts` 中填写部署后的后端根地址；默认值
 有意保持为空：
@@ -155,6 +156,30 @@ debug 产物位于 `artifacts/apps/android/AIive-debug.apk`。服务器只部署
 `backend/` 和 `frontend/`；APK 本身不随服务器部署，而是通过配置的服务器地址
 调用 `/api/chat/stream` 等后端接口。详细说明见
 [Android 应用构建指南](docs/guides/ANDROID_APP.md)。
+
+### Electron Desktop
+
+Desktop 客户端既是 AIive 界面，也是只在桌面进程存活时上线的本地执行节点。
+Web、Android 或 Electron 界面发出的自然语言指令都由后端 Agent 规划；若目标
+线程可寻址到在线桌面节点，Agent 才会看到 `desktop_*` 文件和命令工具。
+
+```bash
+# 当前宿主平台的未签名调试包
+./scripts/build-app.sh desktop debug
+
+# 当前宿主平台的安装/分发包
+./scripts/build-app.sh desktop release
+```
+
+默认连接 `http://127.0.0.1:8000`。远程部署时，在启动或打包环境中设置
+`AIIVE_DESKTOP_BACKEND_URL=https://你的-aiive-服务`。桌面节点使用出站 WebSocket，
+不需要在个人电脑上开放入站端口。
+
+桌面能力覆盖任意绝对路径的读取、目录遍历、文本/二进制写入和修改、复制、
+移动、建目录、安全删除与 Shell 命令。删除和 Shell 命令始终进入用户审批；
+直接删除默认移入 `~/.aiive/trash`，系统目录、磁盘根、用户主目录及其父目录拒绝
+删除。详细协议、节点绑定、权限与构建说明见
+[Desktop 应用与本地执行节点指南](docs/guides/DESKTOP_APP.md)。
 
 启用本地 Embedding 时应通过 `./scripts/start.sh` 启动模型服务。模型权重和
 Hugging Face 缓存均位于 `.data/models/embeddings/`，该目录不会进入 Git 或
@@ -219,9 +244,11 @@ REM    若系统无 curl，可用： powershell -Command "Invoke-WebRequest http
 ```
 AIive/
 ├── apps/android/          # 独立 Android 对话 UI + Capacitor 原生工程
-├── assets/branding/       # Web / Android 共用品牌源图与派生资源
+├── apps/desktop/          # Electron UI 外壳 + 隔离的本地执行 Node Host
+├── assets/branding/       # Web / Android / Desktop 共用品牌源图与派生资源
 ├── backend/aiive/
-│   ├── api/              # REST API 路由（18 个模块）
+│   ├── api/              # REST / WebSocket API 路由
+│   ├── desktop/          # 桌面节点租约、连接调度与逐 Turn 工具叠加
 │   ├── core/             # LLM 客户端、动作规划器
 │   ├── runtime/          # Agent 图编排、注意力管理、策略引擎
 │   ├── memory/           # 记忆系统（统一写入服务、冲突解析、自动召回）

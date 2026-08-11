@@ -104,7 +104,7 @@ export default function CapabilitiesPage() {
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="font-mono text-sm font-semibold text-content">{tool.capability_id}</span>
                     <span className={`text-[11px] px-2 py-0.5 rounded-full border ${RISK_STYLES[tool.risk_level] || "bg-surface-muted text-code border-divider"}`}>{tool.risk_level} 风险</span>
-                    {/* TODO: requires_confirmation 仅保留为安全元数据；用户审批恢复前不展示“需确认”状态。 */}
+                    {tool.requires_confirmation && <span className="text-[11px] px-2 py-0.5 rounded-full bg-danger-soft text-danger-hover border border-danger-border">需确认</span>}
                     {tool.writes_external_world && <span className="text-[11px] px-2 py-0.5 rounded-full bg-warning-soft text-warning-text border border-warning-border">写外部</span>}
                   </div>
                   <div className="flex flex-wrap gap-4 text-xs text-muted mt-2">

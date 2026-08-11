@@ -1,6 +1,6 @@
 """测试 PolicyEngine（策略引擎）的批次判定逻辑。
 
-当前所有已注册工具直接通过；未注册工具混入批次时仍阻止整批次。
+删除、高风险和显式确认工具进入审批；未知工具混入批次时阻止整批次。
 """
 
 from aiive.runtime.policy_engine import PolicyAction, check_tool_calls
@@ -47,7 +47,7 @@ class TestPolicyBatchBlocking:
         assert "unknown_tool" in result.blocked_tools
 
     def test_unknown_and_high_risk_blocked(self):
-        """高风险工具可直通，但同批未知工具仍使整批阻止。"""
+        """高风险工具需确认，但同批未知工具仍优先使整批阻止。"""
         registry = ToolRegistry()
         _register(registry, "danger", risk_level="high")
         result = check_tool_calls(
@@ -61,8 +61,8 @@ class TestPolicyBatchBlocking:
         assert result.allowed_tools == ["danger"]
         assert result.blocked_tools == ["unknown_tool"]
 
-    def test_all_registered_risk_metadata_allowed(self):
-        """所有已注册工具均应忽略风险和确认元数据直接通过。"""
+    def test_registered_risk_metadata_requires_confirmation(self):
+        """高风险、删除和显式确认元数据应进入审批，普通写入保持高权限直通。"""
         registry = ToolRegistry()
         _register(registry, "normal")
         _register(registry, "high_risk", risk_level="high")
@@ -79,9 +79,9 @@ class TestPolicyBatchBlocking:
             ],
             registry=registry,
         )
-        assert result.action == PolicyAction.ALLOW
+        assert result.action == PolicyAction.CONFIRM
         assert result.allowed_tools == tool_names
-        assert result.confirm_tools == []
+        assert result.confirm_tools == ["high_risk", "destructive", "confirmation_marked"]
         assert result.blocked_tools == []
 
     def test_only_registered_tool_allowed(self):

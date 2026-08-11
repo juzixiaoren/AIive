@@ -9,6 +9,8 @@
 import hashlib
 import json
 import logging
+import os
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 from dataclasses import dataclass, field
@@ -66,8 +68,27 @@ class SlotManager:
         参数:
             name: 槽位名称（"A" 或 "B"）。
         """
+        if name not in {"A", "B"}:
+            raise ValueError("active slot must be A or B")
         self._active_file.parent.mkdir(parents=True, exist_ok=True)
-        self._active_file.write_text(name)
+        temporary = self._active_file.parent / f".{self._active_file.name}.{uuid4().hex}.tmp"
+        try:
+            with temporary.open("x", encoding="utf-8") as stream:
+                stream.write(name)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self._active_file)
+            # Best-effort directory fsync makes the rename durable across a crash.
+            try:
+                directory_fd = os.open(self._active_file.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                logger.debug("active slot directory fsync unavailable", exc_info=True)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def list_slots(self) -> list[SlotInfo]:
         """
@@ -100,14 +121,7 @@ class SlotManager:
         for name in ("A", "B"):
             slot_dir = self._base_dir / name / "app"
             slot_dir.mkdir(parents=True, exist_ok=True)
-            manifest = {
-                "slot": name,
-                "version": "0.1.0",
-                "includes": ["backend/", "frontend/", "tests/", "scripts/"],
-                "excludes": ["data/", "postgres/", "qdrant/", "object_store/", "logs/", ".env"],
-                "config_templates": [".env.example"],
-                "dependency_files": ["pyproject.toml", "frontend/package.json"],
-            }
+            manifest = create_version_manifest(name)
             manifest_path = slot_dir.parent / "version_manifest.json"
             manifest_path.write_text(json.dumps(manifest, indent=2))
 

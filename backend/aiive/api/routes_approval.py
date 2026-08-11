@@ -56,6 +56,21 @@ def respond_approval(request: ApprovalRespondRequest) -> dict[str, Any]:
         if approval is None:
             raise HTTPException(status_code=404, detail="审批记录不存在")
 
+        # Persistent Task 审批只授予冻结 Action 的执行权并重新入队；真实执行在
+        # 新 AgentRun 中发生，避免审批 HTTP 请求承担长任务或重复副作用。
+        if approval.task_id is not None:
+            from aiive.control.approval_service import TaskApprovalService
+
+            try:
+                payload = TaskApprovalService(db).decide(request.approval_id, request.action)
+                db.commit()
+                return payload
+            except ValueError as error:
+                db.rollback()
+                message = str(error)
+                status = 404 if message == "task_approval_not_found" else 409
+                raise HTTPException(status_code=status, detail=message) from error
+
         if approval.status != "pending":
             if request.action == "deny" and approval.status == "denied":
                 return _terminal_response(approval)
@@ -127,6 +142,7 @@ def respond_approval(request: ApprovalRespondRequest) -> dict[str, Any]:
             db.commit()
             raise HTTPException(status_code=409, detail="审批参数快照完整性校验失败")
         descriptor_hash = approval.descriptor_hash
+        risk_snapshot = dict(approval.risk_snapshot or {})
         thread_id = approval.thread_id
         turn_record_id = approval.turn_record_id
         turn_id = approval.turn_id
@@ -142,20 +158,57 @@ def respond_approval(request: ApprovalRespondRequest) -> dict[str, Any]:
     finally:
         db.close()
 
-    registry = get_tool_registry()
-    result = registry.execute_approved(
-        tool_name,
-        tool_args,
-        descriptor_hash,
-        RunContext(
-            thread_id=thread_id,
-            trace_id=trace_id,
-            source=RUN_CTX_TRUSTED_APPROVAL,
-            turn_id=turn_id,
-            turn_record_id=turn_record_id,
-        ),
-        tool_call_id=tool_call_id,
-    )
+    if trace_id is None or turn_id is None or turn_record_id is None or tool_call_id is None:
+        raise HTTPException(status_code=409, detail="旧审批缺少 Turn 执行身份，无法安全执行")
+
+    if risk_snapshot.get("executor_kind") == "desktop_node":
+        registry_db = SessionLocal()
+        try:
+            from aiive.desktop.registry_overlay import build_registry_for_thread
+
+            registry = build_registry_for_thread(registry_db, thread_id)
+        finally:
+            registry_db.close()
+        registration = registry.get(tool_name)
+        if (
+            registration is None
+            or registration.executor_kind != "desktop_node"
+            or registration.executor_node_id != risk_snapshot.get("executor_node_id")
+        ):
+            result = {
+                "ok": False,
+                "error": "原审批绑定的桌面节点已离线或发生变化",
+                "error_type": "execution_unknown",
+            }
+        else:
+            result = registry.execute_approved(
+                tool_name,
+                tool_args,
+                descriptor_hash,
+                RunContext(
+                    thread_id=thread_id,
+                    trace_id=trace_id,
+                    source=RUN_CTX_TRUSTED_APPROVAL,
+                    turn_id=turn_id,
+                    turn_record_id=turn_record_id,
+                ),
+                tool_call_id=tool_call_id,
+            )
+    else:
+        registry = get_tool_registry()
+        result = registry.execute_approved(
+            tool_name,
+            tool_args,
+            descriptor_hash,
+            RunContext(
+                thread_id=thread_id,
+                trace_id=trace_id,
+                source=RUN_CTX_TRUSTED_APPROVAL,
+                turn_id=turn_id,
+                turn_record_id=turn_record_id,
+            ),
+            tool_call_id=tool_call_id,
+        )
 
     error_type = str(result.get("error_type", "") or "")
     if result.get("ok"):

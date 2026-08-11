@@ -4,6 +4,17 @@ export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
+  approvals?: ApprovalItem[];
+}
+
+export interface ApprovalItem {
+  approvalId: string;
+  toolCallId: string;
+  toolName: string;
+  params: Record<string, unknown>;
+  status: "pending" | "executing" | "succeeded" | "denied" | "failed" | "interrupted_unknown";
+  result?: unknown;
+  error?: string;
 }
 
 export interface StreamCallbacks {
@@ -14,6 +25,16 @@ export interface StreamCallbacks {
 interface StreamResult {
   threadId: string;
   reply: string;
+  approvals: ApprovalItem[];
+}
+
+export interface ApprovalResponse {
+  ok: boolean;
+  action: "succeeded" | "denied" | "failed" | "interrupted_unknown";
+  approval_id: string;
+  tool_name?: string;
+  tool_result?: unknown;
+  error?: string;
 }
 
 function apiUrl(path: string): string {
@@ -55,7 +76,7 @@ export async function streamMessage(
   let buffer = "";
   let activeEvent = "";
   let completed = false;
-  let result: StreamResult = { threadId: threadId ?? "", reply: "" };
+  let result: StreamResult = { threadId: threadId ?? "", reply: "", approvals: [] };
 
   const handleLine = (line: string) => {
     if (line.startsWith("event:")) {
@@ -81,14 +102,38 @@ export async function streamMessage(
       callbacks.onToken(String(data.text || ""));
     } else if (activeEvent === "done") {
       completed = true;
+      const cards = Array.isArray(data.action_cards) ? data.action_cards : [];
+      const approvals: ApprovalItem[] = cards.flatMap((candidate) => {
+        if (!candidate || typeof candidate !== "object") return [];
+        const card = candidate as Record<string, unknown>;
+        if (card.card_type !== "approval_required") return [];
+        const refs = card.resource_refs && typeof card.resource_refs === "object"
+          ? card.resource_refs as Record<string, unknown>
+          : {};
+        const preview = card.payload_preview && typeof card.payload_preview === "object"
+          ? card.payload_preview as Record<string, unknown>
+          : {};
+        const approvalId = String(refs.approval_id || preview.approval_id || "");
+        if (!approvalId) return [];
+        return [{
+          approvalId,
+          toolCallId: String(refs.tool_call_id || preview.tool_call_id || ""),
+          toolName: String(preview.tool_name || "未知工具"),
+          params: preview.tool_params && typeof preview.tool_params === "object"
+            ? preview.tool_params as Record<string, unknown>
+            : {},
+          status: "pending" as const,
+        }];
+      });
       result = {
         threadId: String(data.thread_id || result.threadId),
         reply: String(data.reply || ""),
+        approvals,
       };
     } else if (activeEvent === "error") {
       throw new Error(String(data.message || "对话请求失败"));
     }
-    // tool_call / tool_result / trace_id 有意忽略：Android 版只呈现核心对话。
+    // 普通 tool_call / tool_result 暂不展示；审批卡片必须呈现，才能远程放行桌面高危操作。
   };
 
   try {
@@ -119,4 +164,17 @@ export async function resetConversation(threadId?: string): Promise<void> {
     body: JSON.stringify({ thread_id: threadId }),
   });
   if (!response.ok) throw await responseError(response);
+}
+
+export async function respondApproval(
+  approvalId: string,
+  action: "approve" | "deny",
+): Promise<ApprovalResponse> {
+  const response = await fetch(apiUrl("approval/respond"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ approval_id: approvalId, action }),
+  });
+  if (!response.ok) throw await responseError(response);
+  return response.json() as Promise<ApprovalResponse>;
 }

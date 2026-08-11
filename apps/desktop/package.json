@@ -1,0 +1,27 @@
+{
+  "name": "aiive-desktop",
+  "productName": "AIive",
+  "version": "0.1.0",
+  "description": "AIive Electron desktop client and local execution node",
+  "author": "AIive",
+  "private": true,
+  "type": "module",
+  "main": "src/main/index.mjs",
+  "config": {
+    "forge": "./forge.config.cjs"
+  },
+  "scripts": {
+    "start": "electron-forge start",
+    "package": "electron-forge package",
+    "make": "electron-forge make",
+    "test:node-host": "node --test src/node-host/journal.test.mjs"
+  },
+  "devDependencies": {
+    "@electron-forge/cli": "^7.8.1",
+    "@electron-forge/maker-deb": "^7.8.1",
+    "@electron-forge/maker-rpm": "^7.8.1",
+    "@electron-forge/maker-squirrel": "^7.8.1",
+    "@electron-forge/maker-zip": "^7.8.1",
+    "electron": "^37.0.0"
+  }
+}

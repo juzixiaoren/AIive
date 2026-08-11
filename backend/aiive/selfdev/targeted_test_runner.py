@@ -21,13 +21,18 @@ _DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[3]
 # 源代码目录 → 测试文件映射表
 # 当某目录下的文件发生变更时，自动运行对应的测试文件
 TEST_MAPPING = {
+    "backend/aiive/": ["tests/unit/backend/test_health.py"],
     "backend/aiive/core/": ["tests/unit/backend/test_agent_graph.py", "tests/unit/backend/test_identity_memory.py"],
     "backend/aiive/memory/": ["tests/unit/backend/test_memory_store.py", "tests/unit/backend/test_memory_gate.py", "tests/unit/backend/test_memory_extractor.py", "tests/unit/backend/test_memory_types.py", "tests/unit/backend/test_steward_signal_extractor.py"],
     "backend/aiive/tools/": ["tests/unit/backend/test_tool_registry.py", "tests/unit/backend/test_safe_delete.py"],
     "backend/aiive/mcp/": ["tests/unit/backend/test_mcp_discovery.py", "tests/unit/backend/test_mcp_installer.py", "tests/unit/backend/test_mcp_runtime_client.py"],
     "backend/aiive/supervisor/": ["tests/unit/backend/test_slot_manager.py", "tests/unit/backend/test_supervisor_health.py"],
     "backend/aiive/selfdev/": ["tests/unit/backend/test_selfdev_planner.py"],
-    "frontend/": [],  # 前端暂无自动测试
+    "backend/aiive/prompts/": ["tests/unit/backend/test_prompt_registry.py"],
+    "backend/aiive/task_runtime/": ["tests/unit/backend/test_persistent_task_runtime.py"],
+    "backend/aiive/control/": ["tests/unit/backend/test_persistent_task_runtime.py", "backend/tests/test_approval_security.py"],
+    "backend/aiive/desktop/": ["tests/unit/backend/test_desktop_nodes.py", "tests/unit/backend/test_persistent_task_runtime.py"],
+    "frontend/": [],
 }
 
 
@@ -61,10 +66,54 @@ class TargetedTestRunner:
             测试报告字典，包含 ok、total、passed、failed、results 等字段。
         """
         tests = self._select_tests(changed_files)
-        if not tests:
+        frontend_changed = any(path.replace("\\", "/").startswith("frontend/") for path in changed_files)
+        if not tests and not frontend_changed:
+            if changed_files:
+                return {
+                    "ok": False,
+                    "degraded": True,
+                    "tests_run": [],
+                    "reason": "No validation mapped for changed files",
+                }
             return {"ok": True, "tests_run": [], "reason": "No tests mapped, skipped"}
+        report: dict[str, Any] = self._run_tests(tests, artifact_dir) if tests else {
+            "ok": True, "degraded": False, "total": 0, "passed": 0, "failed": 0, "results": [],
+        }
+        if frontend_changed:
+            frontend_result = self._run_frontend_build()
+            results = report.get("results")
+            if not isinstance(results, list):
+                results = []
+                report["results"] = results
+            results.append(frontend_result)
+            report["total"] = int(report.get("total", 0)) + 1
+            if frontend_result["result"] == "passed":
+                report["passed"] = int(report.get("passed", 0)) + 1
+            else:
+                report["failed"] = int(report.get("failed", 0)) + 1
+                report["ok"] = False
+        report["degraded"] = int(report.get("passed", 0)) + int(report.get("failed", 0)) == 0
+        return report
 
-        return self._run_tests(tests, artifact_dir)
+    def _run_frontend_build(self) -> dict[str, Any]:
+        frontend = self._repo_root / "frontend"
+        if not (frontend / "package.json").is_file():
+            return {"file": "frontend", "result": "failed", "reason": "candidate frontend missing"}
+        try:
+            proc = subprocess.run(
+                ["npm", "run", "build"],
+                cwd=frontend,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            return {
+                "file": "frontend",
+                "result": "passed" if proc.returncode == 0 else "failed",
+                "stdout": (proc.stdout + proc.stderr)[-2000:],
+            }
+        except Exception as error:
+            return {"file": "frontend", "result": "error", "error": str(error)}
 
     def _select_tests(self, files: list[str]) -> list[str]:
         """
@@ -104,7 +153,9 @@ class TargetedTestRunner:
         for tf in test_files:
             test_path = self._repo_root / tf
             if not test_path.exists():
-                results.append({"file": tf, "result": "skipped", "reason": "not found"})
+                # 映射声明的验证缺失意味着 Candidate 不完整，必须 fail closed。
+                failed += 1
+                results.append({"file": tf, "result": "failed", "reason": "not found"})
                 continue
 
             try:
@@ -124,7 +175,7 @@ class TargetedTestRunner:
                 results.append({
                     "file": tf,
                     "result": "passed" if ok else "failed",
-                    "stdout": proc.stdout[:500],  # 仅保留前500字符的输出
+                    "stdout": (proc.stdout + proc.stderr)[-2000:],
                 })
             except subprocess.TimeoutExpired:
                 logger.warning("测试超时: %s", tf)

@@ -160,6 +160,9 @@ class AssembledContext:
     working_state_text: str = ""
     snapshot: ContextSnapshotData = field(default_factory=ContextSnapshotData)
     agent_ctx: dict[str, Any] = field(default_factory=dict)
+    # ContextAssembler 与 AgentGraph 必须共享同一不可变工具视图，避免 Desktop
+    # Node 在两阶段之间上下线时出现“schema 可见但执行注册表不同”的竞态。
+    tool_registry: Any = None
 
 
 class ContextBudgetExceededError(Exception):
@@ -250,6 +253,11 @@ class ContextAssembler:
         bridge_text: str = ""
         working_state_text: str = ""
         raw_history_lower_bound = self._raw_history_lower_bound(db, thread_id)
+        from aiive.task_runtime.tools import build_main_agent_registry
+
+        # Conversation Agent 固定只拥有任务元工具。Desktop/文件/selfdev 能力由
+        # Persistent Task Worker 经 CapabilityBroker 获取，绝不动态叠加到主对话。
+        tool_registry = build_main_agent_registry()
         for attempt in range(MAX_TRIM_ROUNDS):
             trim_plan = TrimPlan.from_budget(self._budget, attempt)
 
@@ -314,7 +322,7 @@ class ContextAssembler:
 
             # 构建有界工具 schema
             tools_schema = self._build_tools_schema_list(
-                db, thread_id, trim_plan.limit("tool_definitions"),
+                db, thread_id, trim_plan.limit("tool_definitions"), tool_registry,
             )
 
             # ── Phase II: 最终整体 hard gate ──
@@ -384,6 +392,7 @@ class ContextAssembler:
                     working_state_text=working_state_text,
                     snapshot=snapshot,
                     agent_ctx=agent_ctx,
+                    tool_registry=tool_registry,
                 )
 
         # 所有裁剪轮次后仍超限
@@ -1009,18 +1018,18 @@ class ContextAssembler:
         return cleaned
 
     def _build_tools_schema_list(
-        self, _db: Session, thread_id: str, token_budget: int,
+        self, _db: Session, thread_id: str, token_budget: int, registry: Any = None,
     ) -> list[dict[str, Any]]:
         """构建工具 schema 列表，按预算限制。
 
         超预算时按注册顺序连续截断（保留前缀，遇到装不下的工具即停止），
         保证截断结果与 token 预算单调相关。
         """
-        from aiive.tools.registry import get_tool_registry
+        from aiive.task_runtime.tools import build_main_agent_registry
         from aiive.tools.langchain_adapter import build_langchain_tools
         from aiive.context.run_context import RunContext, RUN_CTX_USER_CHAT
 
-        registry = get_tool_registry()
+        registry = registry or build_main_agent_registry()
         run_ctx = RunContext(thread_id=thread_id, trace_id="assembler", source=RUN_CTX_USER_CHAT)
         langchain_tools = build_langchain_tools(registry, run_context=run_ctx)
 

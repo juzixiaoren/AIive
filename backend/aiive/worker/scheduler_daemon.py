@@ -22,11 +22,8 @@ from aiive.db.models import (
     Thread,
     TurnRecord,
 )
-from aiive.memory.recall_config import (
-    ENABLED_OUTBOX_JOB_TYPES,
-    MaintenanceConfig,
-    RecallConfig,
-)
+from aiive.memory.recall_config import MaintenanceConfig, RecallConfig
+from aiive.worker.job_types import ENABLED_OUTBOX_JOB_TYPES
 from aiive.runtime.epoch_manager import EpochManager
 from aiive.runtime.task_manager import TaskManager
 from aiive.worker.task_worker import enqueue_due_tasks
@@ -57,6 +54,8 @@ _MAX_SCAN_BATCH = 10
 # Phase 4: 维护调度
 _MAINTENANCE_SCAN_INTERVAL = 3600   # 秒：维护轮询周期（Daily 间隔同上）
 _MAINTENANCE_SCOPE_KEY = "all_user_memories"
+_AGENT_TASK_SCAN_INTERVAL = 10
+_RELEASE_MONITOR_INTERVAL = 60
 
 
 def _poll_job():
@@ -131,6 +130,14 @@ def start_daemon():
         _retention_scanner_job, IntervalTrigger(seconds=_RETENTION_INTERVAL),
         id="phase6b_retention_scanner", replace_existing=True,
     )
+    scheduler.add_job(
+        _agent_task_scanner_job, IntervalTrigger(seconds=_AGENT_TASK_SCAN_INTERVAL),
+        id="agent_task_scanner", replace_existing=True,
+    )
+    scheduler.add_job(
+        _release_monitor_job, IntervalTrigger(seconds=_RELEASE_MONITOR_INTERVAL),
+        id="release_health_monitor", replace_existing=True,
+    )
 
 
 def set_outbox_worker(worker: Any) -> None:
@@ -204,6 +211,38 @@ def _poll_tool_operations() -> None:
             id="tool_operation_poll",
             replace_existing=True,
         )
+
+
+def _agent_task_scanner_job() -> None:
+    """恢复过期 Run、清理资源锁并轮询确定性 Watcher。"""
+    db = SessionLocal()
+    try:
+        from aiive.task_runtime.repository import reconcile_queued_tasks, recover_stale_tasks
+        from aiive.task_runtime.resource_locks import ResourceLockService
+        from aiive.task_runtime.watchers import WatcherService
+        from aiive.control.approval_service import TaskApprovalService
+
+        recover_stale_tasks(db)
+        reconcile_queued_tasks(db)
+        TaskApprovalService(db).expire_due()
+        ResourceLockService().expire(db)
+        WatcherService(db).poll_due()
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Persistent Agent Task scanner 异常")
+    finally:
+        db.close()
+
+
+def _release_monitor_job() -> None:
+    """对刚切换的 Candidate 运行观察窗健康检查，异常时自动回滚。"""
+    try:
+        from aiive.supervisor.release_manager import ReleaseManager
+
+        ReleaseManager().monitor_once()
+    except Exception:
+        logger.exception("Release health monitor 异常")
 
 
 def _reconcile_enqueue(db: Session, job_type: str, operation_id: str, payload: dict[str, Any]) -> None:

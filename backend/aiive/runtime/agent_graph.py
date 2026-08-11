@@ -59,7 +59,7 @@ from aiive.runtime.action_cards import ActionCard, PendingOperation
 from aiive.runtime.tool_executor import ToolCallRecord, build_action_cards, build_pending_operations
 from aiive.runtime.trace import Trace
 from aiive.tools.langchain_adapter import build_langchain_tools
-from aiive.tools.registry import ToolRegistry, get_tool_registry
+from aiive.tools.registry import ToolRegistry
 from aiive.runtime.tool_normalizer import ToolResultNormalizer
 from aiive.runtime.token_counter import LiteLLMTokenCounter
 from aiive.runtime.working_state import WorkingStateService
@@ -757,6 +757,8 @@ class AgentGraph:
                     "requires_confirmation": reg.safety.requires_confirmation,
                     "writes_external_world": reg.safety.writes_external_world,
                     "can_delete": reg.safety.can_delete,
+                    "executor_kind": reg.executor_kind,
+                    "executor_node_id": reg.executor_node_id,
                 }
             logger.info("[TRACE:graph] CONFIRM(ns): prepared %d pending approvals", len(_pending_approval_list))
             return {}
@@ -946,7 +948,12 @@ class AgentGraph:
 
         # ── Execute graph ──
         langchain_llm = self._build_langchain_llm()
-        registry = get_tool_registry()
+        if assembled_ctx.tool_registry is None:
+            from aiive.task_runtime.tools import build_main_agent_registry
+
+            registry = build_main_agent_registry()
+        else:
+            registry = assembled_ctx.tool_registry
         run_ctx_exec = RunContext(
             thread_id=thread.id,
             trace_id=trace.trace_id,
@@ -1108,7 +1115,12 @@ class AgentGraph:
         context_snapshot = assembled_ctx.snapshot
 
         langchain_llm = self._build_langchain_llm()
-        registry = get_tool_registry()
+        if assembled_ctx.tool_registry is None:
+            from aiive.task_runtime.tools import build_main_agent_registry
+
+            registry = build_main_agent_registry()
+        else:
+            registry = assembled_ctx.tool_registry
         run_ctx_exec = RunContext(
             thread_id=thread.id,
             trace_id=trace.trace_id,

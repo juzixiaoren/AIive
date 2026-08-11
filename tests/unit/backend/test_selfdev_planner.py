@@ -112,6 +112,26 @@ class TestSelfDevPlanner:
         assert plan["goal_summary"] == "Could not generate plan"
         assert plan["operations"] == []
 
+    def test_handles_wrong_json_shapes_without_crashing(self):
+        for payload in (["not", "an", "object"], {"operations": "not-a-list"}, {"operations": ["bad-op"]}):
+            planner = SelfDevPlanner(FakeLLMClient(fixed_content=json.dumps(payload)))
+            plan = planner.plan("test")
+            assert isinstance(plan, dict)
+            assert plan["operations"] == []
+
+    def test_unknown_operation_is_blocked_instead_of_silently_rewritten(self):
+        planner = SelfDevPlanner(FakeLLMClient(fixed_content=json.dumps({
+            "operations": [{
+                "operation": "execute_anything",
+                "target_file": "frontend/src/new.ts",
+                "content": "export {};",
+            }],
+        })))
+        operation = planner.plan("test")["operations"][0]
+        assert operation["operation"] == "add_file"
+        assert operation["not_allowed_yet"] is True
+        assert "UNKNOWN_OPERATION" in operation["risk_notes"]
+
     def test_plan_includes_test_plan(self):
         """规划结果应包含测试计划字段。"""
         fake = FakeLLMClient(fixed_content=json.dumps({

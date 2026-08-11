@@ -13,6 +13,7 @@ import {
   sendMessageStream,
   resetThread,
   getThreadMessages,
+  respondApproval,
   ActionCard,
   StreamIncompleteError,
 } from "../api/chat";
@@ -248,6 +249,7 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
   const [historyCursor, setHistoryCursor] = useState<number | null>(null);
   const [hasMoreHistory, setHasMoreHistory] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
+  const [approvalBusyId, setApprovalBusyId] = useState<string | null>(null);
 
   /** 按占位消息 ID 更新当前流，避免并发或线程切换时写入其他消息。 */
   const updateStreamingAgent = useCallback((messageId: string, updater: (m: Message) => Message) => {
@@ -475,6 +477,30 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
                   : call
               )),
             })));
+          } else if (msg.type === "task_event" && msg.data?.task_id && msg.data?.sequence) {
+            const taskId = String(msg.data.task_id);
+            const sequence = Number(msg.data.sequence);
+            const eventType = String(msg.data.event_type || "task_event");
+            const payload = msg.data.payload || {};
+            const summary = eventType === "task_completed"
+              ? String(payload.summary || "任务已结束")
+              : eventType === "task_blocked_approval"
+                ? `任务需要审批：${String(payload.capability_id || "高风险操作")}`
+                : eventType === "task_blocked_user"
+                  ? String(payload.question || "任务正在等待补充信息")
+                  : eventType === "task_created"
+                    ? `任务已受理：${String(msg.data.title || taskId.slice(0, 8))}`
+                    : `任务状态更新：${String(msg.data.status || eventType)}`;
+            const messageId = `task:${taskId}:${sequence}`;
+            setMessages(prev => prev.some(message => message.id === messageId) ? prev : [...prev, {
+              id: messageId,
+              role: "agent",
+              content: `${summary}\n\n任务 ID：\`${taskId}\``,
+              traceId: taskId,
+              threadId,
+              actionCards: [],
+              toolCalls: [],
+            }]);
           }
         } catch {}
       };
@@ -495,6 +521,69 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
       if (reconnectTimer) clearTimeout(reconnectTimer);
     };
   }, [threadId]);
+
+  /** 执行或拒绝服务端冻结的工具调用；客户端永远不回传可篡改的工具参数。 */
+  const handleApprovalAction = async (approvalId: string, action: "approve" | "deny") => {
+    if (!approvalId || approvalBusyId) return;
+    setApprovalBusyId(approvalId);
+    setError(null);
+    try {
+      const response = await respondApproval(approvalId, action);
+      const status = response.action === "succeeded"
+        ? "completed"
+        : response.action === "denied"
+          ? "cancelled"
+          : response.action === "interrupted_unknown"
+            ? "execution_unknown"
+            : "failed";
+      const serializedResult = response.tool_result === undefined
+        ? response.error
+        : typeof response.tool_result === "string"
+          ? response.tool_result
+          : JSON.stringify(response.tool_result);
+      setMessages((current) => current.map((message) => {
+        const matchingCards = (message.actionCards || []).filter((card) => (
+          card.card_type === "approval_required"
+          && (card.resource_refs?.approval_id === approvalId
+            || card.payload_preview?.approval_id === approvalId)
+        ));
+        if (matchingCards.length === 0) return message;
+        const toolCallIds = new Set(matchingCards.map((card) => String(
+          card.resource_refs?.tool_call_id || card.payload_preview?.tool_call_id || "",
+        )).filter(Boolean));
+        return {
+          ...message,
+          actionCards: message.actionCards?.map((card) => (
+            card.card_type === "approval_required"
+            && (card.resource_refs?.approval_id === approvalId
+              || card.payload_preview?.approval_id === approvalId)
+              ? {
+                ...card,
+                status,
+                actions: [],
+                payload_preview: {
+                  ...card.payload_preview,
+                  approval_status: response.action,
+                  result: response.tool_result,
+                  error: response.error,
+                },
+              }
+              : card
+          )),
+          toolCalls: message.toolCalls?.map((call) => (
+            toolCallIds.has(call.id)
+              ? { ...call, status, result: serializedResult }
+              : call
+          )),
+        };
+      }));
+      if (response.error) setError(response.error);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "审批请求失败");
+    } finally {
+      setApprovalBusyId(null);
+    }
+  };
 
   /** 处理提醒操作：通过系统指令让 LLM 调用 confirm_reminder / snooze_reminder */
   const handleReminderAction = async (action: "confirm" | "snooze", reminderId: string, delayMin?: number) => {
@@ -981,7 +1070,50 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
                         </div>
                       );
                     })()}
-                    {/* TODO: 用户审批当前有意停用；恢复时必须同步启用后端策略、审批节点、前端交互、测试和文档。 */}
+                    {card.card_type === "approval_required" && (() => {
+                      const approvalId = String(
+                        card.resource_refs?.approval_id || card.payload_preview?.approval_id || "",
+                      );
+                      const params = card.payload_preview?.tool_params;
+                      const pending = card.status === "needs_review" && (card.actions || []).length > 0;
+                      const busy = approvalBusyId === approvalId;
+                      return (
+                        <div className="rounded-xl border border-warning-border bg-warning-soft px-4 py-3 shadow-sm max-w-xl">
+                          <div className="flex items-center justify-between gap-3">
+                            <span className="text-sm font-semibold text-warning-text">{card.title}</span>
+                            <span className="text-[11px] font-mono text-muted">
+                              {busy ? "执行中…" : pending ? "等待确认" : card.status === "completed" ? "已处理" : "执行失败"}
+                            </span>
+                          </div>
+                          <p className="mt-1 text-xs text-muted">{card.summary}</p>
+                          {params !== undefined && (
+                            <pre className="mt-2 max-h-40 overflow-auto rounded-lg bg-background px-2.5 py-2 text-[11px] text-code whitespace-pre-wrap break-all font-mono">
+                              {JSON.stringify(params, null, 2)}
+                            </pre>
+                          )}
+                          {pending && (
+                            <div className="mt-3 flex items-center gap-2">
+                              <button
+                                type="button"
+                                disabled={busy || !approvalId}
+                                onClick={() => void handleApprovalAction(approvalId, "approve")}
+                                className="rounded-lg bg-danger px-3.5 py-1.5 text-xs font-medium text-on-primary hover:bg-danger-hover disabled:opacity-40 transition-colors"
+                              >
+                                {busy ? "正在执行" : "确认执行"}
+                              </button>
+                              <button
+                                type="button"
+                                disabled={busy || !approvalId}
+                                onClick={() => void handleApprovalAction(approvalId, "deny")}
+                                className="rounded-lg border border-divider bg-surface px-3.5 py-1.5 text-xs font-medium text-muted hover:text-title disabled:opacity-40 transition-colors"
+                              >
+                                拒绝
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
                     {/* 其他卡片：保持原有 badge 样式 */}
                     {card.card_type !== "reminder_alert" && card.card_type !== "approval_required" && card.card_type !== "maintenance_report" && (
                       <span className={`text-[11px] px-2 py-0.5 rounded-full border ${

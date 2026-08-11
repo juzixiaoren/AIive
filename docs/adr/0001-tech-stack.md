@@ -37,4 +37,5 @@ AIive 需要从 V0 起锁定技术栈，避免后期频繁切换导致工程债�
 ## 后果
 - 不允许替换为 Django、Flask、SQLite-only、MongoDB
 - 不允许早期引入 Redis/Celery/Kafka/RabbitMQ
-- 不允许使用 Next.js 全栈后端或 Electron
+- 不允许使用 Next.js 全栈后端；Electron 仅可作为 ADR 0002 定义的独立桌面客户端
+  与本地执行节点，不替换 FastAPI 后端或 React Web 前端

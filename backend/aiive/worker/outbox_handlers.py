@@ -1337,7 +1337,10 @@ def _mark_maintenance_run_failed(run_id: str, execution_token: str, error: str) 
 
 def register_all(registry: HandlerRegistry) -> None:
     from aiive.tools.operation_executor import handle_tool_operation
+    from aiive.worker.handlers_agent_tasks import handle_agent_task_run
 
+    registry.register("agent_task_run", handle_agent_task_run,
+                       supported_schema_versions=frozenset({1}))
     registry.register("tool_operation", handle_tool_operation,
                        supported_schema_versions=frozenset({1}))
     registry.register("memory_extraction", handle_memory_extraction,

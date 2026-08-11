@@ -23,7 +23,7 @@ from aiive.db.models import (
     Task,
     Thread,
 )
-from aiive.memory.recall_config import ENABLED_OUTBOX_JOB_TYPES
+from aiive.worker.job_types import ENABLED_OUTBOX_JOB_TYPES
 from aiive.worker.handler_registry import HandlerRegistry
 from aiive.worker.outbox_dto import (
     ActiveClaim,

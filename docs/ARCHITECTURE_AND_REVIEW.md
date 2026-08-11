@@ -54,7 +54,7 @@ ContextAssembler  ── 有界上下文硬门（超预算抛 ContextBudgetExcee
 AgentGraph (LangGraph)
         │  START → assistant → policy_check → [tools → assistant]* → END
         │  · assistant：ChatOpenAI.bind_tools 生成原生 tool_calls
-        │  · policy_check：已注册工具直接 allow；未注册工具 block（审批暂时停用）
+        │  · policy_check：普通已注册工具 allow；高危/删除工具 confirm；未注册工具 block
         │  · tools：ToolNode 执行 + 工具结果规范化（大结果→Artifact 引用）+ WorkingState 生命周期维护
         ▼
 _finalize_turn  ── 事务化落库
@@ -198,7 +198,7 @@ _finalize_turn  ── 事务化落库
 - **数据库口令**：`config.py:27` 的明文口令是 pydantic 默认值，`.env` 的 `DATABASE_URL` 会覆盖且指向 localhost，属本地开发便利。只需注意勿将真实生产口令写进源码（用 `.env`/环境变量即可），当前写法**无需改动**。
 
 **D.3 清空全部记忆的确认策略需复核**
-`forget` 工具支持 `all_user_data=True`（经 `builtin_tools.py:469-470` 的 `scope="all"` 委托）。当前审批策略已临时停用，`can_delete` 不再触发 CONFIRM，该高危路径会直接执行；恢复安全审批时必须优先重新启用此保护。
+`forget` 工具支持 `all_user_data=True`（经 `builtin_tools.py:469-470` 的 `scope="all"` 委托）。审批策略现已启用，`can_delete`、显式确认以及 high/critical 风险工具会触发 CONFIRM。
 
 **D.4 检索可解释性闭环**
 - 每轮 Turn 在上下文装配前生成统一 `trace_id`，ContextAssembler 只通过 `UnifiedRetriever` 发起检索；`AutomaticRecallEngine` 仅作为其内部 MemoryRecord 路由，不再由调用方二次 fallback。exact/memory/index/raw-history 路由独立降级并写入稳定 notes，全路由或编排失败返回 fail-closed 空结果。
@@ -211,11 +211,15 @@ _finalize_turn  ── 事务化落库
 - SSE 使用相同字段并增加 `status`；错误事件会终止本轮流，不会再以空回复 `done` 伪装成功。
 - 前端仅展示安全 `message`，内部 SDK 异常保留在后端日志并通过 `trace_id` 关联。
 
-### D.6 工具审批基础设施（当前停用）
+### D.6 工具审批基础设施（已启用）
 
-当前产品策略不启用用户审批：`check_tool_calls()` 对所有已注册工具统一返回 `ALLOW`，仅阻止未注册工具；`risk_level`、`requires_confirmation`、`writes_external_world` 和 `can_delete` 保留为安全元数据，但不参与运行时审批判定。Chat 不展示审批卡片，Capability Dashboard 不展示“需确认”徽标。
+`check_tool_calls()` 阻止未注册工具，并将 `requires_confirmation`、`can_delete` 或
+high/critical 风险工具送入审批；普通读写保持个人 Agent 的高权限直通。Web、Android
+和 Electron UI 均展示审批卡片，Capability Dashboard 展示“需确认”徽标。
 
-`approval_requests`、审批图节点和审批响应接口作为休眠基础设施保留，不属于当前可达运行链路。未来恢复审批时，必须同时启用策略判定、审批节点、前端交互、回归测试和文档，禁止只接通单层逻辑。保留基础设施原有约束：服务端冻结工具参数和风险快照、条件状态迁移、工具描述指纹校验、来源 Turn 绑定，以及外部副作用超时后不自动重试。
+`approval_requests` 是唯一审批事实源：服务端冻结工具参数和风险快照，使用条件状态
+迁移、工具描述指纹、来源 Turn 与执行 fencing 防止客户端篡改和重复执行。Desktop
+审批额外冻结节点 ID；节点离线或变化后原审批不会漂移到另一台电脑。
 
 ### E. 前端
 
@@ -223,7 +227,7 @@ _finalize_turn  ── 事务化落库
 - 普通用户导航提供 Chat、Memory Dashboard、Capability Dashboard、Event/Context/Retrieval Inspector、Tools 和 Notifications。
 - 本项目定位为本地单用户个人应用。Event/Context/Retrieval Inspector 是用户观察本人 Agent 上下文、事件和检索过程的产品能力，允许返回原始上下文正文、查询和事件 payload，不经过开发者网关或诊断脱敏；若未来支持远程或多用户部署，必须先增加身份认证、资源归属校验并重新评估敏感字段边界。
 - Memory Dashboard 只展示 `GET /api/memories` 返回的最近 100 条可见记录，搜索为当前列表本地筛选；创建、sleep、archive、forget 均调用真实后端 API 并在成功后重新读取数据库状态。
-- Capability Dashboard 只读展示 `/api/mcp/capabilities` 与 `/api/tools` 的真实状态和安全声明。MCP 安装、激活、自进化和后台维护不直接调用 Service 路由，继续通过 Chat、ToolRegistry 与真实 smoke 链路执行；当前不启用用户审批。
+- Capability Dashboard 只读展示 `/api/mcp/capabilities` 与 `/api/tools` 的真实状态和安全声明。MCP 安装、激活、自进化和后台维护不直接调用 Service 路由，继续通过 Chat、ToolRegistry 与真实 smoke 链路执行；高危工具进入统一用户审批。
 - debug、outbox、epochs 等内部读取端点进入独立的 `/developer` 只读诊断页：前端构建开关 `VITE_AIIVE_DEVELOPER_UI_ENABLED` 与后端 `AIIVE_DEVELOPER_DIAGNOSTICS_ENABLED` 均默认关闭，后端启用后仍同时限制 loopback 客户端和 Host。这些内部端点的 LLM 预览与 Outbox 错误详情在服务端脱敏后才返回；该规则不适用于作为普通用户观察能力的 Inspector。页面不提供 seal、rollover、retry 或 requeue 操作。`POST /api/epochs/{thread_id}/seal-segment` 与 `POST /api/epochs/{thread_id}/rollover` 是现有业务写接口，不属于 Developer 只读 guard 的保护范围，继续保持兼容。
 - Capability activate 在真实 MCP 安装、启动、`tools/list`、`tools/call`、smoke 和 ToolRegistry 注册链路完成前保持 fail-closed，计划转为 `needs_user_review`，禁止硬编码 smoke 成功或写入不可调用的 active 状态。
 - Forget Phase A 使用 Session 同步更新：同一事务立即读取 `lifecycle_state=forgotten`；正文保留到异步 purge 阶段处理，Shield/Tombstone 在此期间保证 fail-closed。

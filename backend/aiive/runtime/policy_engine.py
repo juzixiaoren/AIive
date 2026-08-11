@@ -1,9 +1,8 @@
 """
 运行时层 - 策略引擎。
 
-当前策略对所有已注册工具直接放行，仅阻止未注册工具。
-风险等级、外部写入、删除能力和确认标记仍保留在工具元数据中，
-但暂不参与运行时审批判定。
+策略按注册表安全元数据执行：未知工具阻止；删除、高危或显式标记的工具进入
+服务端冻结参数的审批路径；其余已注册工具直接执行。
 """
 
 from __future__ import annotations
@@ -40,8 +39,6 @@ class PolicyResult:
     allowed_tools: list[str] = field(default_factory=list)
 
 
-# TODO: 用户审批当前有意停用。恢复时必须同步启用策略判定、审批节点、前端 UI、测试和文档，禁止仅接通单层逻辑。
-# 以下规则仅保留为未来审批策略的元数据定义，当前不得参与 check_tool_calls 判定。
 EFFECT_TYPE_RULES = {
     "destructive_write": PolicyAction.CONFIRM,
     "external_communication": PolicyAction.CONFIRM,
@@ -53,10 +50,10 @@ def check_tool_calls(
     tool_calls: list[dict[str, Any]],
     registry: ToolRegistry | None = None,
 ) -> PolicyResult:
-    """批量校验 AIMessage.tool_calls 是否已注册。
+    """批量校验 AIMessage.tool_calls 的注册状态与审批元数据。
 
-    当前关闭用户审批：所有已注册工具均直接允许执行，工具风险元数据不参与
-    策略判定。批次中只要包含未注册工具，仍阻止整个批次，避免部分执行。
+    批次中只要包含未注册工具就阻止整批；否则只要存在一个需确认工具，整批
+    冻结等待审批，避免低风险调用先执行后高风险调用被拒造成半批副作用。
 
     Args:
         tool_calls: AIMessage.tool_calls 中的工具调用字典列表，
@@ -74,19 +71,37 @@ def check_tool_calls(
 
     allowed: list[str] = []
     blocked: list[str] = []
+    confirm: list[str] = []
 
     for tc in tool_calls:
         tool_name = tc.get("name", "")
-        if registry.get(tool_name) is None:
+        registration = registry.get(tool_name)
+        if registration is None:
             blocked.append(tool_name)
         else:
             allowed.append(tool_name)
+            safety = registration.safety
+            if (
+                safety.requires_confirmation
+                or safety.can_delete
+                or safety.risk_level in ("high", "critical")
+            ):
+                confirm.append(tool_name)
 
     if blocked:
         return PolicyResult(
             action=PolicyAction.BLOCK,
             reason="; ".join(f"Unknown tool: {name}" for name in blocked),
             blocked_tools=blocked,
+            allowed_tools=allowed,
+            confirm_tools=confirm,
+        )
+
+    if confirm:
+        return PolicyResult(
+            action=PolicyAction.CONFIRM,
+            reason="需要用户确认: " + ", ".join(confirm),
+            confirm_tools=confirm,
             allowed_tools=allowed,
         )
 

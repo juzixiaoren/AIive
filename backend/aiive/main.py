@@ -40,6 +40,8 @@ from aiive.api.routes_epochs import router as epochs_router
 from aiive.api.routes_ws import router as ws_router
 from aiive.api.routes_forget import router as forget_router
 from aiive.api.routes_approval import router as approval_router
+from aiive.api.routes_desktop import router as desktop_router
+from aiive.api.routes_agent_tasks import router as agent_tasks_router
 from aiive.config import settings
 
 logger = logging.getLogger(__name__)
@@ -147,9 +149,11 @@ def create_app() -> FastAPI:
         from aiive.worker.handler_registry import HandlerRegistry
         from aiive.worker.outbox_handlers import register_all
         from aiive.api.ws_manager import ws_manager
+        from aiive.desktop.connection_manager import desktop_connection_manager
 
         # 绑定主事件循环，供后台线程安全推送 WebSocket
         ws_manager.set_main_loop(asyncio.get_running_loop())
+        desktop_connection_manager.set_main_loop(asyncio.get_running_loop())
         try:
             from aiive.prompts import validate_prompt_catalog
             validate_prompt_catalog()
@@ -308,6 +312,8 @@ def create_app() -> FastAPI:
     app.include_router(ws_router)
     app.include_router(forget_router)
     app.include_router(approval_router)
+    app.include_router(desktop_router)
+    app.include_router(agent_tasks_router)
     return app
 
 

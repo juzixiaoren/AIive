@@ -79,19 +79,19 @@ def _registry(calls: list[dict[str, str]]) -> ToolRegistry:
     return registry
 
 
-def test_registered_tool_bypasses_confirmation_while_approval_is_disabled() -> None:
-    """审批停用期间，需要确认的已注册工具也必须直接放行。"""
+def test_registered_tool_requires_confirmation() -> None:
+    """显式标记的高风险工具必须进入审批。"""
     registry = _registry([])
 
     result = check_tool_calls([{"name": "dangerous_tool", "args": {}, "id": "call-1"}], registry)
 
-    assert result.action is PolicyAction.ALLOW
+    assert result.action is PolicyAction.CONFIRM
     assert result.allowed_tools == ["dangerous_tool"]
-    assert result.confirm_tools == []
+    assert result.confirm_tools == ["dangerous_tool"]
 
 
-def test_unknown_tool_remains_blocked_while_approval_is_disabled() -> None:
-    """审批停用不应绕过未注册工具的注册表边界。"""
+def test_unknown_tool_remains_blocked() -> None:
+    """审批启用后仍不得绕过未注册工具边界。"""
     result = check_tool_calls([{"name": "unknown_tool", "args": {}, "id": "call-1"}], ToolRegistry())
 
     assert result.action is PolicyAction.BLOCK

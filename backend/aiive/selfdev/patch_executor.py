@@ -42,6 +42,17 @@ class PatchExecutor:
             包含 active_slot、inactive_slot、operations_applied、
             operations_failed 的结果字典。
         """
+        from aiive.selfdev.trusted_core import validate_operations
+
+        trusted_core_issues = validate_operations(operations)
+        if trusted_core_issues:
+            return {
+                "ok": False,
+                "error": "trusted_core_policy_denied",
+                "issues": trusted_core_issues,
+                "operations_applied": [],
+                "operations_failed": operations,
+            }
         slots = self._manager.list_slots()
         active_name = self._manager.get_active_slot()
         inactive_name = "B" if active_name == "A" else "A"
@@ -155,6 +166,7 @@ class PatchExecutor:
             "ok": (not failed) and (bool(applied) or not operations),
             "active_slot": active_name,
             "inactive_slot": inactive_name,
+            "candidate_root": str(inactive_slot.root / "app"),
             "operations_applied": applied,
             "operations_failed": failed,
         }

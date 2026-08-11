@@ -20,6 +20,7 @@ import os
 import uuid as _uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from sqlalchemy.orm import Session
 
@@ -1140,13 +1141,26 @@ def _handle_apply_patch_to_inactive_slot(operations: list[dict[str, Any]] | None
                     来自 create_selfdev_plan 的 plan.operations。
     """
     from aiive.selfdev.patch_executor import PatchExecutor
-    return PatchExecutor().apply_to_inactive(operations or [])
+    from aiive.selfdev.targeted_test_runner import TargetedTestRunner
+
+    frozen = operations or []
+    result = PatchExecutor().apply_to_inactive(frozen)
+    if result.get("operations_applied"):
+        changed = [str(item.get("target_file", "")) for item in frozen if item.get("target_file")]
+        candidate_root = Path(str(result.get("candidate_root") or ""))
+        result = {
+            **result,
+            "targeted_test_report": TargetedTestRunner(
+                repo_root=candidate_root,
+            ).run_for_changed_files(changed),
+        }
+    return result
 
 
 def _handle_promote_slot():
     """健康检查通过后将非活跃槽位提升为活跃版本。"""
-    from aiive.selfdev.promote_rollback import PromoteRollback
-    return PromoteRollback().promote()
+    from aiive.supervisor.release_manager import ReleaseManager
+    return ReleaseManager().promote()
 
 
 def _handle_rollback_slot():
@@ -1154,11 +1168,8 @@ def _handle_rollback_slot():
 
     自动检测当前活跃槽位（A/B），回退到另一个槽位。
     """
-    from aiive.selfdev.promote_rollback import PromoteRollback
-    pr = PromoteRollback()
-    active = pr.get_active_slot()
-    previous = "B" if active == "A" else "A"
-    return pr.rollback(previous)
+    from aiive.supervisor.release_manager import ReleaseManager
+    return ReleaseManager().rollback()
 
 
 # ── Rhythm / Attention（节奏/注意力）──

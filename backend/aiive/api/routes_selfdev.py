@@ -4,7 +4,10 @@ API路由模块：自进化开发（Self-Dev）
 - 提供自进化计划（Plan）的创建和查询
 - 提供补丁应用、升级和回滚操作的接口
 """
-from fastapi import APIRouter, Depends, HTTPException
+import hmac
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from typing import Any
@@ -18,6 +21,17 @@ from aiive.selfdev.planner import SelfDevPlanner
 from aiive.supervisor.launcher import Launcher
 
 router = APIRouter(prefix="/api/selfdev")
+
+
+def require_trusted_core_admin(
+    x_aiive_trusted_core_token: str = Header(default=""),
+) -> None:
+    """旧直接变更 API 的显式管理边界；普通 Agent 无法构造此 Header。"""
+    if not hmac.compare_digest(
+        x_aiive_trusted_core_token,
+        settings.aiive_trusted_core_admin_token,
+    ):
+        raise HTTPException(status_code=403, detail="trusted_core_admin_required")
 
 
 class PlanRequest(BaseModel):
@@ -156,7 +170,12 @@ class ApplyRequest(BaseModel):
 
 
 @router.post("/{request_id}/apply-inactive")
-def apply_inactive(request_id: str, req: ApplyRequest, db: Session = Depends(get_db)):
+def apply_inactive(
+    request_id: str,
+    req: ApplyRequest,
+    db: Session = Depends(get_db),
+    _authorized: None = Depends(require_trusted_core_admin),
+):
     """将补丁应用到非激活槽位
 
     Args:
@@ -172,6 +191,11 @@ def apply_inactive(request_id: str, req: ApplyRequest, db: Session = Depends(get
         raise HTTPException(status_code=404, detail="请求不存在")
 
     from aiive.selfdev.patch_executor import PatchExecutor
+
+    from aiive.selfdev.trusted_core import validate_operations
+    issues = validate_operations(req.operations)
+    if issues:
+        raise HTTPException(status_code=403, detail={"error": "trusted_core_policy_denied", "issues": issues})
 
     executor = PatchExecutor()
     result = executor.apply_to_inactive(req.operations)
@@ -198,7 +222,8 @@ def apply_inactive(request_id: str, req: ApplyRequest, db: Session = Depends(get
             if op.get("target_file")
         ]
         try:
-            test_report = TargetedTestRunner().run_for_changed_files(changed_files)
+            candidate_root = Path(str(result.get("candidate_root") or ""))
+            test_report = TargetedTestRunner(repo_root=candidate_root).run_for_changed_files(changed_files)
         except Exception as e:
             test_report = {"ok": False, "error": f"targeted test runner crashed: {e}"}
         sreq.plan = {**(sreq.plan or {}), "targeted_test_report": test_report}
@@ -219,7 +244,12 @@ class PromoteRequest(BaseModel):
 
 
 @router.post("/{request_id}/promote")
-def promote(request_id: str, req: PromoteRequest, db: Session = Depends(get_db)):
+def promote(
+    request_id: str,
+    req: PromoteRequest,
+    db: Session = Depends(get_db),
+    _authorized: None = Depends(require_trusted_core_admin),
+):
     """将非激活槽位的变更升级为激活状态
 
     Args:
@@ -236,21 +266,19 @@ def promote(request_id: str, req: PromoteRequest, db: Session = Depends(get_db))
 
     # 晋升门禁：apply-inactive 阶段的定向测试未通过时拒绝晋升（force 可覆盖）
     test_report = (sreq.plan or {}).get("targeted_test_report")
-    if (
-        not req.force
-        and isinstance(test_report, dict)
-        and test_report.get("ok") is not True
-    ):
+    if req.force:
+        raise HTTPException(status_code=403, detail="trusted_core_test_override_disabled")
+    if not isinstance(test_report, dict) or test_report.get("ok") is not True:
         return {
             "ok": False,
-            "error": "targeted tests did not pass; promotion refused (use force=true to override)",
+            "error": "targeted tests did not pass; promotion refused",
             "targeted_test_report": test_report,
         }
 
-    from aiive.selfdev.promote_rollback import PromoteRollback
+    from aiive.supervisor.release_manager import ReleaseManager
 
-    pr = PromoteRollback()
-    result = pr.promote(run_health_check=req.run_health_check)
+    # Trusted Core promotion 永远运行健康检查并进入自动回滚观察窗。
+    result = ReleaseManager().promote()
 
     sreq.status = "promoted" if result["ok"] else "promote_failed"
     db.commit()
@@ -259,7 +287,11 @@ def promote(request_id: str, req: PromoteRequest, db: Session = Depends(get_db))
 
 
 @router.post("/{request_id}/rollback")
-def rollback(request_id: str, db: Session = Depends(get_db)):
+def rollback(
+    request_id: str,
+    db: Session = Depends(get_db),
+    _authorized: None = Depends(require_trusted_core_admin),
+):
     """回滚当前激活槽位到上一个版本
 
     Args:
@@ -273,13 +305,9 @@ def rollback(request_id: str, db: Session = Depends(get_db)):
     if not sreq:
         raise HTTPException(status_code=404, detail="请求不存在")
 
-    from aiive.selfdev.promote_rollback import PromoteRollback
+    from aiive.supervisor.release_manager import ReleaseManager
 
-    active = PromoteRollback().get_active_slot()
-    previous = "B" if active == "A" else "A"
-
-    pr = PromoteRollback()
-    result = pr.rollback(previous)
+    result = ReleaseManager().rollback()
 
     sreq.status = "rolled_back" if result["ok"] else "rollback_failed"
     db.commit()

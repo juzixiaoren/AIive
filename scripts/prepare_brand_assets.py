@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare the generated AIive logo for web and Android consumers.
+"""Prepare the generated AIive logo for web, Android and desktop consumers.
 
 The selected ImageGen output contains a rendered transparency checkerboard.
 This script removes only the border-connected neutral checkerboard, keeps the
@@ -19,6 +19,8 @@ BRAND_DIR = PROJECT_ROOT / "assets" / "branding"
 SOURCE_PATH = BRAND_DIR / "aiive-logo-source.png"
 LOGO_PATH = BRAND_DIR / "aiive-logo.png"
 LAUNCHER_PATH = BRAND_DIR / "aiive-app-icon.png"
+WINDOWS_ICON_PATH = BRAND_DIR / "aiive-app-icon.ico"
+MACOS_ICON_PATH = BRAND_DIR / "aiive-app-icon.icns"
 WEB_PUBLIC_DIR = PROJECT_ROOT / "frontend" / "public"
 ANDROID_PUBLIC_DIR = PROJECT_ROOT / "apps" / "android" / "public"
 ANDROID_RES_DIR = PROJECT_ROOT / "apps" / "android" / "android" / "app" / "src" / "main" / "res"
@@ -176,6 +178,16 @@ def save_android_assets(logo: Image.Image, launcher: Image.Image) -> None:
         splash.convert("RGB").save(splash_path, optimize=True)
 
 
+def save_desktop_assets(launcher: Image.Image) -> None:
+    """生成 Electron 打包器在 Windows 和 macOS 上使用的原生图标容器。"""
+    launcher.save(
+        WINDOWS_ICON_PATH,
+        format="ICO",
+        sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)],
+    )
+    launcher.save(MACOS_ICON_PATH, format="ICNS")
+
+
 def main() -> None:
     if not SOURCE_PATH.exists():
         raise SystemExit(f"Logo source not found: {SOURCE_PATH}")
@@ -193,8 +205,11 @@ def main() -> None:
 
     save_web_assets(logo)
     save_android_assets(logo, launcher)
+    save_desktop_assets(launcher)
     print(f"Prepared {LOGO_PATH.relative_to(PROJECT_ROOT)}")
     print(f"Prepared {LAUNCHER_PATH.relative_to(PROJECT_ROOT)}")
+    print(f"Prepared {WINDOWS_ICON_PATH.relative_to(PROJECT_ROOT)}")
+    print(f"Prepared {MACOS_ICON_PATH.relative_to(PROJECT_ROOT)}")
 
 
 if __name__ == "__main__":

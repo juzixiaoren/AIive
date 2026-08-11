@@ -52,6 +52,60 @@ class Thread(Base):
     context_snapshots: Mapped[list["ContextSnapshot"]] = relationship(back_populates="thread", cascade="all, delete-orphan")
 
 
+class DesktopNode(Base):
+    """Electron 桌面执行节点。
+
+    节点通过出站 WebSocket 主动连接后端，并以短租约表达在线状态。capabilities
+    保存节点本次连接实际声明的工具定义；只有租约有效的节点能力才可进入 Agent
+    的本轮工具快照。
+    """
+
+    __tablename__: str = "desktop_nodes"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    platform: Mapped[str] = mapped_column(String(32), nullable=False)
+    arch: Mapped[str] = mapped_column(String(32), nullable=False)
+    app_version: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+    capabilities: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="offline")
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__: tuple[Index | CheckConstraint, ...] = (
+        Index("ix_desktop_nodes_status_lease", "status", "lease_expires_at"),
+        CheckConstraint(
+            "status IN ('online','offline')",
+            name="ck_desktop_node_status",
+        ),
+    )
+
+
+class ThreadDesktopBinding(Base):
+    """对话线程到默认桌面节点的一对一绑定。"""
+
+    __tablename__: str = "thread_desktop_bindings"
+
+    thread_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("threads.id", ondelete="CASCADE"), primary_key=True
+    )
+    node_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("desktop_nodes.id", ondelete="CASCADE"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__: tuple[Index, ...] = (
+        Index("ix_thread_desktop_binding_node", "node_id"),
+    )
+
+
 class Event(Base):
     """事件模型：记录对话中的各类事件（用户消息、工具调用、系统事件等）。"""
     __tablename__: str = "events"
@@ -143,15 +197,32 @@ class ApprovalRequest(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     thread_id: Mapped[str] = mapped_column(String(36), ForeignKey("threads.id"), nullable=False)
-    turn_record_id: Mapped[str] = mapped_column(String(36), ForeignKey("turn_records.id"), nullable=False)
-    turn_id: Mapped[str] = mapped_column(String(36), nullable=False)
-    trace_id: Mapped[str] = mapped_column(String(36), nullable=False)
-    tool_call_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # 统一审批事实源：旧对话工具审批绑定 Turn；Persistent Task 审批绑定
+    # task/action/checkpoint。两组身份由表级 XOR 约束保证不会混用。
+    turn_record_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("turn_records.id"), nullable=True
+    )
+    turn_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    tool_call_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    task_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("agent_tasks.id", ondelete="CASCADE"), nullable=True
+    )
+    action_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("agent_actions.id", ondelete="CASCADE"), nullable=True
+    )
+    checkpoint_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("agent_task_checkpoints.id", ondelete="SET NULL"), nullable=True
+    )
     tool_name: Mapped[str] = mapped_column(String(128), nullable=False)
     tool_args: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     tool_args_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     descriptor_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     risk_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    preconditions: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    effects: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    approval_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     decision: Mapped[str | None] = mapped_column(String(16), nullable=True)
     execution_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
@@ -167,8 +238,15 @@ class ApprovalRequest(Base):
 
     __table_args__: tuple[UniqueConstraint | Index | CheckConstraint, ...] = (
         UniqueConstraint("turn_record_id", "tool_call_id", name="uq_approval_turn_tool_call"),
+        UniqueConstraint("action_id", name="uq_approval_action"),
         Index("ix_approval_thread_status", "thread_id", "status"),
         Index("ix_approval_turn_record", "turn_record_id"),
+        Index("ix_approval_task_status", "task_id", "status"),
+        CheckConstraint(
+            "((turn_record_id IS NOT NULL AND action_id IS NULL AND task_id IS NULL) "
+            "OR (turn_record_id IS NULL AND action_id IS NOT NULL AND task_id IS NOT NULL))",
+            name="ck_approval_exactly_one_owner",
+        ),
         CheckConstraint(
             "status IN ('pending','executing','succeeded','denied','failed','interrupted_unknown')",
             name="ck_approval_status",
@@ -1446,4 +1524,347 @@ class RetrievalIndexRun(Base):
         UniqueConstraint("outbox_job_id", name="uq_retrieval_run_outbox_job"),
         UniqueConstraint("operation_id", name="uq_retrieval_run_operation"),
         Index("ix_retrieval_run_status", "status"),
+    )
+
+
+# ============================================================================
+# Persistent Agent Task Runtime
+# ============================================================================
+
+
+class AgentTask(Base):
+    """跨 Turn、跨进程持久化的用户任务；与提醒表 ``tasks`` 完全独立。"""
+
+    __tablename__: str = "agent_tasks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    thread_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("threads.id", ondelete="CASCADE"), nullable=False
+    )
+    source_turn_record_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("turn_records.id", ondelete="SET NULL"), nullable=True
+    )
+    task_type: Mapped[str] = mapped_column(String(64), nullable=False, default="general")
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    goal: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    executor_type: Mapped[str] = mapped_column(String(32), nullable=False, default="agent")
+    priority: Mapped[int] = mapped_column(nullable=False, default=50)
+    target_node_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("desktop_nodes.id", ondelete="SET NULL"), nullable=True
+    )
+    task_brief: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    task_state: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    report: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    current_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    budgets: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    usage: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    version: Mapped[int] = mapped_column(nullable=False, default=1)
+    wake_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__: tuple[Index | CheckConstraint, ...] = (
+        Index("ix_agent_tasks_thread_status", "thread_id", "status"),
+        Index("ix_agent_tasks_wake", "status", "wake_at"),
+        Index("ix_agent_tasks_node_status", "target_node_id", "status"),
+        CheckConstraint(
+            "status IN ('queued','dispatching','running','blocked_approval',"
+            "'blocked_user','blocked_node','reconciling','verifying','succeeded',"
+            "'partial','failed','cancelled')",
+            name="ck_agent_task_status",
+        ),
+    )
+
+
+class AgentRun(Base):
+    """Task 的一次有界推理/恢复尝试；审批恢复和重启恢复均创建新 Run。"""
+
+    __tablename__: str = "agent_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    task_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agent_tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    run_index: Mapped[int] = mapped_column(nullable=False)
+    trigger: Mapped[str] = mapped_column(String(32), nullable=False, default="dispatch")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="created")
+    execution_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    input_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    output_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    token_usage: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__: tuple[UniqueConstraint | Index | CheckConstraint, ...] = (
+        UniqueConstraint("task_id", "run_index", name="uq_agent_run_task_index"),
+        Index("ix_agent_runs_task_status", "task_id", "status"),
+        CheckConstraint(
+            "status IN ('created','running','completed','failed','interrupted')",
+            name="ck_agent_run_status",
+        ),
+    )
+
+
+class AgentAction(Base):
+    """Task 的最小可审批、可调度、可对账副作用单元。"""
+
+    __tablename__: str = "agent_actions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    task_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agent_tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    execution_run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    sequence: Mapped[int] = mapped_column(nullable=False)
+    capability_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    target_node_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("desktop_nodes.id", ondelete="SET NULL"), nullable=True
+    )
+    arguments: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    arguments_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    descriptor_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="planned")
+    risk_level: Mapped[str] = mapped_column(String(16), nullable=False, default="low")
+    requires_approval: Mapped[bool] = mapped_column(nullable=False, default=False)
+    preconditions: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    effects: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    result_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    evidence_refs: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    execution_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__: tuple[UniqueConstraint | Index | CheckConstraint, ...] = (
+        UniqueConstraint("task_id", "sequence", name="uq_agent_action_task_sequence"),
+        Index("ix_agent_actions_task_status", "task_id", "status"),
+        Index("ix_agent_actions_node_status", "target_node_id", "status"),
+        CheckConstraint(
+            "status IN ('planned','validated','awaiting_approval','ready','dispatched',"
+            "'running','succeeded','failed','cancelled','unknown','invalidated')",
+            name="ck_agent_action_status",
+        ),
+    )
+
+
+class AgentTaskEvent(Base):
+    """Task 的追加式事件日志；sequence 是单 Task 内的稳定时间线。"""
+
+    __tablename__: str = "agent_task_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    task_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agent_tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    visibility: Mapped[str] = mapped_column(String(16), nullable=False, default="task")
+    run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    action_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("agent_actions.id", ondelete="SET NULL"), nullable=True
+    )
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    dedupe_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    __table_args__: tuple[UniqueConstraint | Index | CheckConstraint, ...] = (
+        UniqueConstraint("task_id", "sequence", name="uq_agent_task_event_sequence"),
+        UniqueConstraint("task_id", "dedupe_key", name="uq_agent_task_event_dedupe"),
+        Index("ix_agent_task_events_task_created", "task_id", "created_at"),
+        CheckConstraint(
+            "visibility IN ('conversation','task','internal')",
+            name="ck_agent_task_event_visibility",
+        ),
+    )
+
+
+class AgentTaskCheckpoint(Base):
+    """可恢复 Task 状态的不可变快照。"""
+
+    __tablename__: str = "agent_task_checkpoints"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    task_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agent_tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    version: Mapped[int] = mapped_column(nullable=False)
+    event_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    state: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    plan: Mapped[dict[str, Any] | list[Any]] = mapped_column(JSON, nullable=False, default=list)
+    pending_action_refs: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    evidence_refs: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    reason: Mapped[str] = mapped_column(String(128), nullable=False)
+    snapshot_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    __table_args__: tuple[UniqueConstraint | Index, ...] = (
+        UniqueConstraint("task_id", "version", name="uq_agent_checkpoint_task_version"),
+        Index("ix_agent_checkpoints_task_created", "task_id", "created_at"),
+    )
+
+
+class TaskEvidence(Base):
+    """执行证据元数据；大内容存对象存储，数据库只保留摘要和校验信息。"""
+
+    __tablename__: str = "task_evidence"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    task_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agent_tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    action_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("agent_actions.id", ondelete="SET NULL"), nullable=True
+    )
+    kind: Mapped[str] = mapped_column(String(64), nullable=False, default="tool_result")
+    summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    inline_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    object_bucket: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    object_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    mime_type: Mapped[str] = mapped_column(String(255), nullable=False, default="application/json")
+    content_size: Mapped[int] = mapped_column(nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    __table_args__: tuple[Index, ...] = (
+        Index("ix_task_evidence_task_action", "task_id", "action_id"),
+        Index("ix_task_evidence_hash", "content_hash"),
+    )
+
+
+class TaskArtifact(Base):
+    """用户可交付产物，引用对象存储并携带完整 Task/Action 来源。"""
+
+    __tablename__: str = "task_artifacts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    task_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agent_tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    action_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("agent_actions.id", ondelete="SET NULL"), nullable=True
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    artifact_type: Mapped[str] = mapped_column(String(64), nullable=False, default="file")
+    summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    object_bucket: Mapped[str] = mapped_column(String(128), nullable=False)
+    object_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    mime_type: Mapped[str] = mapped_column(String(255), nullable=False, default="application/octet-stream")
+    content_size: Mapped[int] = mapped_column(nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    __table_args__: tuple[Index, ...] = (
+        Index("ix_task_artifacts_task_created", "task_id", "created_at"),
+    )
+
+
+class TaskResourceLock(Base):
+    """跨 Worker 的资源/工作区/前台 GUI 租约。"""
+
+    __tablename__: str = "task_resource_locks"
+
+    resource_key: Mapped[str] = mapped_column(String(768), primary_key=True)
+    task_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agent_tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    action_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("agent_actions.id", ondelete="CASCADE"), nullable=True
+    )
+    lease_token: Mapped[str] = mapped_column(String(36), nullable=False)
+    lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__: tuple[Index, ...] = (
+        Index("ix_task_resource_locks_task", "task_id"),
+        Index("ix_task_resource_locks_expiry", "lease_expires_at"),
+    )
+
+
+class AgentTaskWatch(Base):
+    """确定性观察器；观察器只产生事件和唤醒 Task，不运行 Agent。"""
+
+    __tablename__: str = "agent_task_watches"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    task_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agent_tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    watch_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    cursor: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    next_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__: tuple[Index | CheckConstraint, ...] = (
+        Index("ix_agent_task_watches_due", "status", "next_check_at"),
+        CheckConstraint("status IN ('active','paused','completed')", name="ck_agent_watch_status"),
+    )
+
+
+class DesktopActionReceipt(Base):
+    """Desktop Node journal 的服务端投影，用于断线后确定性对账。"""
+
+    __tablename__: str = "desktop_action_receipts"
+
+    action_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agent_actions.id", ondelete="CASCADE"), primary_key=True
+    )
+    node_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("desktop_nodes.id", ondelete="CASCADE"), nullable=False
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    arguments_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    result_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    result_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    node_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    node_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__: tuple[UniqueConstraint | Index | CheckConstraint, ...] = (
+        UniqueConstraint("node_id", "idempotency_key", name="uq_desktop_receipt_node_idempotency"),
+        Index("ix_desktop_receipts_node_status", "node_id", "status"),
+        CheckConstraint(
+            "status IN ('received','started','committed','failed','unknown')",
+            name="ck_desktop_receipt_status",
+        ),
     )

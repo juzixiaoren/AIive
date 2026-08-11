@@ -1,6 +1,6 @@
 [prompts."agent.stable_contract"]
 file = "agent/stable_contract.md"
-version = "2.1.0"
+version = "2.2.0"
 role = "system"
 variables = []
 
@@ -63,3 +63,27 @@ file = "runtime/reminder_delivery.md"
 version = "2.0.0"
 role = "user"
 variables = ["reminder_id", "title", "content"]
+
+[prompts."task_runtime.worker_system"]
+file = "task_runtime/worker_system.md"
+version = "1.0.0"
+role = "system"
+variables = []
+
+[prompts."task_runtime.task_context"]
+file = "task_runtime/task_context.md"
+version = "1.0.0"
+role = "user"
+variables = ["task_context", "capabilities"]
+
+[prompts."task_runtime.task_report"]
+file = "task_runtime/task_report.md"
+version = "1.0.0"
+role = "user"
+variables = ["task_context"]
+
+[prompts."task_runtime.evidence_summary"]
+file = "task_runtime/evidence_summary.md"
+version = "1.0.0"
+role = "user"
+variables = ["max_chars", "evidence"]

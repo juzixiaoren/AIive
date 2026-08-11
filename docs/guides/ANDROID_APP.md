@@ -8,8 +8,9 @@ Android 应用是独立分发物，不部署到服务器。生产环境只部署
 - `frontend/`：完整 Web 管理与对话页面
 
 APK 内置独立的移动端对话 UI，通过 HTTP(S) 调用服务器上的
-`/api/chat/stream` 与 `/api/thread/reset`。移动端不会加载或复用 Web 页面，
-也不会打包记忆、能力、事件、工具卡片或开发者页面。
+`/api/chat/stream`、`/api/thread/reset` 与 `/api/approval/respond`。移动端不会加载
+或复用 Web 页面，也不会打包记忆、能力、事件、普通工具卡片或开发者页面；仅保留
+远程桌面删除、Shell 等高危操作所需的审批卡片。
 
 ## 配置服务器地址
 
@@ -76,18 +77,18 @@ debug APK 使用 Android debug key 签名，可直接安装测试。release 输�
 - 对话本地恢复
 - 新建对话与停止生成
 - Markdown 消息展示
+- 高危工具审批与结果展示
 - 浅色 / 深色主题
 - Android 安全区域与原生触控尺寸
 
 有意不包含：
 
 - `trace_id` 与 `thread_id` 元信息展示
-- 工具调用、工具结果和操作卡片
+- 普通工具调用、普通工具结果和非审批操作卡片
 - 记忆、能力、事件、上下文、检索、通知和开发者页面
-- WebSocket 通知与审批交互
+- WebSocket 通知
 
 ## 扩展新的应用形态
 
-`scripts/build-app.sh` 按 target 分发到 `scripts/app-builders/<target>.sh`。未来新增
-Windows 客户端时，只需增加可执行的 `windows.sh` 构建器并保持产物输出到
-`artifacts/apps/windows/`，无需改变统一入口。
+`scripts/build-app.sh` 按 target 分发到 `scripts/app-builders/<target>.sh`。Electron
+桌面端已经以 `desktop.sh` 接入；未来新增其他客户端时保持同一构建器契约即可。

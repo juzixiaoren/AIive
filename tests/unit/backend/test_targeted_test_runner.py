@@ -35,6 +35,12 @@ class TestTargetedTestRunner:
         tests = runner._select_tests(["some/unknown/file.py"])
         assert tests == []
 
+    def test_changed_file_without_validation_cannot_pass_release_gate(self):
+        runner = TargetedTestRunner()
+        result = runner.run_for_changed_files(["some/unknown/file.py"])
+        assert result["ok"] is False
+        assert result["degraded"] is True
+
     def test_deduplicates_duplicate_mappings(self, tmp_path):
         """相同前缀的多个文件不应导致测试重复。"""
         runner = TargetedTestRunner()
@@ -52,3 +58,20 @@ class TestTargetedTestRunner:
         result = runner.run_for_changed_files([])
         assert result["ok"] is True
         assert result["tests_run"] == []
+
+    def test_missing_mapped_test_fails_closed_even_when_another_test_passes(self, tmp_path, monkeypatch):
+        runner = TargetedTestRunner(repo_root=tmp_path)
+        monkeypatch.setattr(
+            runner,
+            "_select_tests",
+            lambda _files: ["tests/present.py", "tests/missing.py"],
+        )
+        present = tmp_path / "tests" / "present.py"
+        present.parent.mkdir(parents=True)
+        present.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+
+        result = runner.run_for_changed_files(["backend/aiive/example.py"])
+
+        assert result["ok"] is False
+        assert result["failed"] == 1
+        assert any(item["file"].endswith("missing.py") for item in result["results"])

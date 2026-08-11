@@ -57,6 +57,10 @@ class RunContext:
     workspace_id: str | None = None
     capability_ids: list[str] = field(default_factory=list)
     environment_id: str | None = None
+    # Persistent Task Runtime 身份；不进入 LLM tool schema。
+    task_id: str = ""
+    agent_run_id: str = ""
+    action_id: str = ""
 
     @property
     def is_valid(self) -> bool:

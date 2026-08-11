@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm";
 import {
   type ChatMessage,
   hasBackendConfig,
+  respondApproval,
   resetConversation,
   streamMessage,
 } from "./api/chat";
@@ -95,6 +96,7 @@ export default function App() {
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState("");
+  const [approvalBusyId, setApprovalBusyId] = useState("");
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -155,6 +157,45 @@ export default function App() {
     setStreaming(false);
   };
 
+  const handleApproval = async (approvalId: string, action: "approve" | "deny") => {
+    if (!approvalId || approvalBusyId) return;
+    setApprovalBusyId(approvalId);
+    setError("");
+    setMessages((current) => current.map((message) => ({
+      ...message,
+      approvals: message.approvals?.map((approval) => (
+        approval.approvalId === approvalId ? { ...approval, status: "executing" } : approval
+      )),
+    })));
+    try {
+      const response = await respondApproval(approvalId, action);
+      setMessages((current) => current.map((message) => ({
+        ...message,
+        approvals: message.approvals?.map((approval) => (
+          approval.approvalId === approvalId
+            ? {
+              ...approval,
+              status: response.action,
+              result: response.tool_result,
+              error: response.error,
+            }
+            : approval
+        )),
+      })));
+      if (response.error) setError(response.error);
+    } catch (cause) {
+      setMessages((current) => current.map((message) => ({
+        ...message,
+        approvals: message.approvals?.map((approval) => (
+          approval.approvalId === approvalId ? { ...approval, status: "pending" } : approval
+        )),
+      })));
+      setError(cause instanceof Error ? cause.message : "审批失败，请稍后重试");
+    } finally {
+      setApprovalBusyId("");
+    }
+  };
+
   const send = async () => {
     const content = input.trim();
     if (!content || streaming || !configured) return;
@@ -186,7 +227,7 @@ export default function App() {
       setThreadId(result.threadId);
       setMessages((current) => current.map((message) => (
         message.id === replyId
-          ? { ...message, content: result.reply || message.content }
+          ? { ...message, content: result.reply || message.content, approvals: result.approvals }
           : message
       )));
     } catch (cause) {
@@ -262,18 +303,58 @@ export default function App() {
               {message.role === "assistant" && (
                 <img src="./aiive-logo.png" alt="" className="message-avatar" />
               )}
-              <div className={`message-bubble ${message.role}`}>
-                {message.role === "assistant" && !message.content && streaming ? (
-                  <span className="typing" aria-label="正在回复">
-                    <i /><i /><i />
-                  </span>
-                ) : message.role === "assistant" && !streaming ? (
-                  <div className="markdown">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
-                  </div>
-                ) : (
-                  <span className="plain-message">{message.content}</span>
-                )}
+              <div className={`message-stack ${message.role}`}>
+                <div className={`message-bubble ${message.role}`}>
+                  {message.role === "assistant" && !message.content && streaming ? (
+                    <span className="typing" aria-label="正在回复">
+                      <i /><i /><i />
+                    </span>
+                  ) : message.role === "assistant" && !streaming ? (
+                    <div className="markdown">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+                    </div>
+                  ) : (
+                    <span className="plain-message">{message.content}</span>
+                  )}
+                </div>
+                {message.approvals?.map((approval) => {
+                  const busy = approval.status === "executing" || approvalBusyId === approval.approvalId;
+                  const pending = approval.status === "pending";
+                  const stateLabel = busy ? "执行中…"
+                    : pending ? "等待确认"
+                      : approval.status === "succeeded" ? "执行成功"
+                        : approval.status === "denied" ? "已拒绝"
+                          : approval.status === "interrupted_unknown" ? "结果未知"
+                            : "执行失败";
+                  return (
+                    <section className="approval-card" key={approval.approvalId}>
+                      <div className="approval-title">
+                        <strong>需要确认：{approval.toolName}</strong>
+                        <span>{stateLabel}</span>
+                      </div>
+                      <pre>{JSON.stringify(approval.params, null, 2)}</pre>
+                      {approval.result !== undefined && (
+                        <pre>{typeof approval.result === "string" ? approval.result : JSON.stringify(approval.result, null, 2)}</pre>
+                      )}
+                      {approval.error && <p className="approval-error">{approval.error}</p>}
+                      {pending && (
+                        <div className="approval-actions">
+                          <button
+                            type="button"
+                            className="approve"
+                            disabled={Boolean(approvalBusyId)}
+                            onClick={() => void handleApproval(approval.approvalId, "approve")}
+                          >确认执行</button>
+                          <button
+                            type="button"
+                            disabled={Boolean(approvalBusyId)}
+                            onClick={() => void handleApproval(approval.approvalId, "deny")}
+                          >拒绝</button>
+                        </div>
+                      )}
+                    </section>
+                  );
+                })}
               </div>
             </article>
           ))}

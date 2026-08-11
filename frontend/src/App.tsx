@@ -5,19 +5,21 @@
  * - 支持从对话页面传递 trace_id 到上下文检查器
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import { BASE_PATH } from "./lib/base";
-import ChatPage from "./pages/ChatPage";
-import EventTimeline from "./pages/EventTimeline";
-import ContextInspector from "./pages/ContextInspector";
-import RetrievalInspector from "./pages/RetrievalInspector";
-import MemoriesPage from "./pages/MemoriesPage";
-import CapabilitiesPage from "./pages/CapabilitiesPage";
-import DeveloperPage from "./pages/DeveloperPage";
-import NotificationsPage from "./pages/NotificationsPage";
 import { useNotificationCount } from "./hooks/useNotificationSocket";
 
-type Tab = "chat" | "memories" | "capabilities" | "events" | "context" | "retrieval" | "notifs" | "developer";
+const ChatPage = lazy(() => import("./pages/ChatPage"));
+const EventTimeline = lazy(() => import("./pages/EventTimeline"));
+const ContextInspector = lazy(() => import("./pages/ContextInspector"));
+const RetrievalInspector = lazy(() => import("./pages/RetrievalInspector"));
+const MemoriesPage = lazy(() => import("./pages/MemoriesPage"));
+const CapabilitiesPage = lazy(() => import("./pages/CapabilitiesPage"));
+const DeveloperPage = lazy(() => import("./pages/DeveloperPage"));
+const NotificationsPage = lazy(() => import("./pages/NotificationsPage"));
+const TaskCenterPage = lazy(() => import("./pages/TaskCenterPage"));
+
+type Tab = "chat" | "tasks" | "memories" | "capabilities" | "events" | "context" | "retrieval" | "notifs" | "developer";
 
 const developerUiEnabled = (import.meta as ImportMeta & {
   env?: Record<string, string | undefined>;
@@ -69,6 +71,7 @@ export default function App() {
   // 导航标签配置
   const tabs: { key: Tab; label: string }[] = [
     { key: "chat", label: "对话" },
+    { key: "tasks", label: "任务" },
     { key: "memories", label: "记忆" },
     { key: "capabilities", label: "能力" },
     { key: "events", label: "事件" },
@@ -148,22 +151,25 @@ export default function App() {
       </header>
 
       {/* 主内容区域，按当前选中的 Tab 渲染对应页面 */}
-      <main className="flex-1 min-h-0 w-full max-w-3xl mx-auto px-4 flex flex-col">
-        {tab === "chat" ? (
-          // 对话页占满可用高度，输入框贴底
-          <ChatPage onInspectTrace={(tid) => { setInspectTraceId(tid); navigate("context"); }} />
-        ) : (
-          // 其余页面在独立可滚动容器中展示
-          <div className="flex-1 min-h-0 overflow-y-auto py-6">
-            {tab === "memories" && <MemoriesPage />}
-            {tab === "capabilities" && <CapabilitiesPage />}
-            {tab === "events" && <EventTimeline traceId={inspectTraceId} />}
-            {tab === "context" && <ContextInspector traceId={inspectTraceId} />}
-            {tab === "retrieval" && <RetrievalInspector traceId={inspectTraceId} />}
-            {tab === "notifs" && <NotificationsPage />}
-            {tab === "developer" && <DeveloperPage selectedTraceId={inspectTraceId} />}
-          </div>
-        )}
+      <main className={`flex-1 min-h-0 w-full mx-auto px-4 flex flex-col ${tab === "tasks" ? "max-w-6xl" : "max-w-3xl"}`}>
+        <Suspense fallback={<div className="py-8 text-sm text-muted">加载中…</div>}>
+          {tab === "chat" ? (
+            // 对话页占满可用高度，输入框贴底
+            <ChatPage onInspectTrace={(tid) => { setInspectTraceId(tid); navigate("context"); }} />
+          ) : (
+            // 其余页面在独立可滚动容器中展示
+            <div className="flex-1 min-h-0 overflow-y-auto py-6">
+              {tab === "memories" && <MemoriesPage />}
+              {tab === "tasks" && <TaskCenterPage />}
+              {tab === "capabilities" && <CapabilitiesPage />}
+              {tab === "events" && <EventTimeline traceId={inspectTraceId} />}
+              {tab === "context" && <ContextInspector traceId={inspectTraceId} />}
+              {tab === "retrieval" && <RetrievalInspector traceId={inspectTraceId} />}
+              {tab === "notifs" && <NotificationsPage />}
+              {tab === "developer" && <DeveloperPage selectedTraceId={inspectTraceId} />}
+            </div>
+          )}
+        </Suspense>
       </main>
     </div>
   );

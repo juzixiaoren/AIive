@@ -179,13 +179,9 @@ class TestToolCallsForSearch:
 class TestPolicyEngine:
     """测试 4-5：策略引擎根据工具元数据进行拦截或确认。"""
 
-    @pytest.mark.xfail(
-        reason="用户审批当前有意停用，所有已注册工具（含高风险的 safe_delete）均直接放行；"
-               "恢复审批后此用例需改回 BLOCK/CONFIRM 断言。",
-    )
     def test_policy_blocks_high_risk(self):
         """高风险工具应被策略引擎捕获。"""
-        from aiive.runtime.policy_engine import check_tool_calls, PolicyAction, PolicyResult
+        from aiive.runtime.policy_engine import check_tool_calls, PolicyAction
 
         tool_calls = [
             {"name": "safe_delete", "args": {"path": "/tmp/test"}, "id": "call_1"},

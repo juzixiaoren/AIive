@@ -79,6 +79,16 @@ class Settings(BaseSettings):
     # 工具参数首次校验失败后，最多允许模型纠正并重试的次数。
     tool_argument_max_retries: int = 2
 
+    # Electron Desktop Node：节点以出站 WebSocket 连接后端，心跳续租。租约过期后
+    # 立即停止向新 Turn 注入该节点的本地工具；在途执行由 operation 状态单独收敛。
+    aiive_desktop_node_lease_seconds: int = 45
+    aiive_desktop_dispatch_timeout_seconds: int = 30
+    # Node v2 握手令牌。默认值仅供 loopback 开发；非 loopback 监听必须显式更换。
+    aiive_desktop_node_auth_token: str = "aiive-desktop-dev-token"
+    aiive_desktop_protocol_version: int = 2
+    # 旧 selfdev 直接变更 API 的 Trusted Core 管理令牌；Task 路径仍需 Action 审批。
+    aiive_trusted_core_admin_token: str = "aiive-trusted-core-dev-token"
+
     # 服务器监听配置
     host: str = "127.0.0.1"
     port: int = 8000
@@ -111,6 +121,23 @@ class Settings(BaseSettings):
                 raise ValueError("AIIVE_MEMORY_FILE_PROJECTION_DIR 不允许包含父目录跳转")
         if self.tool_argument_max_retries < 0:
             raise ValueError("TOOL_ARGUMENT_MAX_RETRIES 不能小于 0")
+        if self.aiive_desktop_node_lease_seconds < 15:
+            raise ValueError("AIIVE_DESKTOP_NODE_LEASE_SECONDS 不能小于 15")
+        if self.aiive_desktop_dispatch_timeout_seconds <= 0:
+            raise ValueError("AIIVE_DESKTOP_DISPATCH_TIMEOUT_SECONDS 必须大于 0")
+        if self.aiive_desktop_protocol_version != 2:
+            raise ValueError("当前后端只支持 AIIVE_DESKTOP_PROTOCOL_VERSION=2")
+        if not self.aiive_desktop_node_auth_token.strip():
+            raise ValueError("AIIVE_DESKTOP_NODE_AUTH_TOKEN 不能为空")
+        if self.host not in {"127.0.0.1", "localhost", "::1"} and self.aiive_desktop_node_auth_token == "aiive-desktop-dev-token":
+            raise ValueError("非 loopback 部署必须更换 Desktop Node 默认令牌")
+        if not self.aiive_trusted_core_admin_token.strip():
+            raise ValueError("AIIVE_TRUSTED_CORE_ADMIN_TOKEN 不能为空")
+        if (
+            self.host not in {"127.0.0.1", "localhost", "::1"}
+            and self.aiive_trusted_core_admin_token == "aiive-trusted-core-dev-token"
+        ):
+            raise ValueError("非 loopback 部署必须更换 Trusted Core 默认管理令牌")
         if not self.aiive_memory_vector_enabled:
             return self
         if not self.database_url.startswith("postgresql"):

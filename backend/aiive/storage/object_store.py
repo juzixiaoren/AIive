@@ -55,6 +55,14 @@ def _atomic_put(ref: ObjectRef, data: bytes) -> ObjectRef:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, ref.path)
+        try:
+            directory_fd = os.open(ref.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            logger.debug("对象存储目录 fsync 不可用", exc_info=True)
     finally:
         if temporary.exists():
             from aiive.tools.safe_delete import safe_delete
@@ -112,6 +120,15 @@ def get_verified(ref: ObjectRef, expected_hash: str) -> bytes:
 def get_text(ref: ObjectRef) -> str:
     """以 UTF-8 读取文本对象。"""
     return get(ref).decode("utf-8")
+
+
+def get_range(ref: ObjectRef, offset: int = 0, max_bytes: int = 65536) -> bytes:
+    """有界读取对象片段，供 Task Evidence/Artifact API 使用。"""
+    if offset < 0 or max_bytes < 1 or max_bytes > 1_048_576:
+        raise ValueError("对象读取范围无效")
+    with ref.path.open("rb") as stream:
+        stream.seek(offset)
+        return stream.read(max_bytes)
 
 
 def exists(ref: ObjectRef) -> bool:

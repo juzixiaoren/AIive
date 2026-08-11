@@ -98,6 +98,10 @@ class ToolRegistration:
     parameters: dict[str, Any] | None = None
     # MCP 工具保留服务端原始 inputSchema，仅用于本地执行前校验。
     input_schema: dict[str, Any] | None = None
+    # local 为后端进程内 handler；desktop_node 为绑定到单个在线 Electron 节点的
+    # 远端 handler。后者由 Desktop WebSocket 调度，不进入服务端 Outbox 执行器。
+    executor_kind: str = "local"
+    executor_node_id: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +168,8 @@ class ToolRegistry:
                 "description": reg.description,
                 "parameters": reg.parameters,
                 "input_schema": reg.input_schema,
+                "executor_kind": reg.executor_kind,
+                "executor_node_id": reg.executor_node_id,
             }
             reg = replace(
                 reg,
@@ -185,6 +191,26 @@ class ToolRegistry:
         """
         return self._tools.get(capability_id)
 
+    def snapshot(self) -> "ToolRegistry":
+        """复制当前注册映射，供单个 Turn 叠加动态节点工具。
+
+        ToolRegistration 与安全 schema 均视为不可变定义，浅复制映射即可；后续在
+        快照注册或覆盖工具不会影响进程级基础注册表。
+        """
+        cloned = ToolRegistry()
+        cloned._tools = dict(self._tools)
+        return cloned
+
+    def scoped(self, capability_ids: set[str] | frozenset[str]) -> "ToolRegistry":
+        """返回仅含明确 capability allowlist 的不可扩张快照。"""
+        cloned = ToolRegistry()
+        cloned._tools = {
+            capability_id: registration
+            for capability_id, registration in self._tools.items()
+            if capability_id in capability_ids
+        }
+        return cloned
+
     def list_all(self) -> list[dict[str, Any]]:
         """列出所有已注册工具的摘要信息。
 
@@ -203,6 +229,10 @@ class ToolRegistry:
                 "can_access_secret": r.safety.can_access_secret,
                 "can_delete": r.safety.can_delete,
                 "descriptor_hash": r.safety.descriptor_hash,
+                "executor_kind": r.executor_kind,
+                "executor_node_id": r.executor_node_id,
+                "parameters": r.parameters,
+                "input_schema": r.input_schema,
             }
             for r in self._tools.values()
         ]
@@ -217,9 +247,9 @@ class ToolRegistry:
     ) -> dict[str, Any]:
         """执行工具调用，保留来源授权、执行身份和超时守卫。
 
-        当前关闭用户审批，已注册工具不会因 requires_confirmation 被拒绝。
-        工具执行仍需通过指令来源授权；副作用工具还需持久化执行身份，
-        并统一进入 operation 执行链。
+        AgentGraph 在进入此方法前按安全元数据完成阻止或审批分流。这里继续强制
+        指令来源授权；本地副作用工具还需持久化执行身份并进入 operation 执行链，
+        Desktop Node 工具则由节点 WebSocket 代理执行。
 
         Args:
             capability_id: 工具能力标识符
@@ -258,6 +288,9 @@ class ToolRegistry:
         params = validation.validated_params
 
         timeout = reg.safety.timeout_seconds or DEFAULT_TOOL_TIMEOUT
+        if reg.executor_kind == "desktop_node":
+            return self._execute_direct(reg, params, run_context, timeout, capability_id)
+
         if reg.safety.writes_external_world or reg.safety.can_delete:
             if run_context is None or not run_context.turn_record_id or not tool_call_id:
                 return {
@@ -277,6 +310,17 @@ class ToolRegistry:
             )
             return wait_for_tool_operation(operation.id, timeout)
 
+        return self._execute_direct(reg, params, run_context, timeout, capability_id)
+
+    @staticmethod
+    def _execute_direct(
+        reg: ToolRegistration,
+        params: dict[str, Any],
+        run_context: RunContext | None,
+        timeout: float,
+        capability_id: str,
+    ) -> dict[str, Any]:
+        """在线程池执行本地或 Desktop WebSocket 代理 handler。"""
         has_ctx = "ctx" in inspect.signature(reg.handler).parameters
         future = _tool_executor.submit(_invoke_handler, reg.handler, has_ctx, run_context, params)
         try:
@@ -291,14 +335,30 @@ class ToolRegistry:
                 "[TRACE:registry] TIMEOUT tool=%s after %.0fs params=%s",
                 capability_id, timeout, params,
             )
+            remote_unknown = reg.executor_kind == "desktop_node"
             return {
                 "ok": False,
-                "error": f"Tool '{capability_id}' timed out after {timeout:.0f}s",
-                "error_type": "timeout",
+                "error": (
+                    f"Desktop tool '{capability_id}' timed out after {timeout:.0f}s; final state is unknown"
+                    if remote_unknown
+                    else f"Tool '{capability_id}' timed out after {timeout:.0f}s"
+                ),
+                "error_type": "execution_unknown" if remote_unknown else "timeout",
+                "execution_status": "execution_unknown" if remote_unknown else "failed",
                 "timeout_seconds": timeout,
             }
         except Exception as e:
             logger.exception("[TRACE:registry] FAILED tool=%s error=%s", capability_id, e)
+            if reg.executor_kind == "desktop_node" and str(e) in {
+                "desktop_node_disconnected",
+                "desktop_operation_timeout",
+            }:
+                return {
+                    "ok": False,
+                    "error": str(e),
+                    "error_type": "execution_unknown",
+                    "execution_status": "execution_unknown",
+                }
             return {"ok": False, "error": str(e), "error_type": "execution_failed"}
 
     def execute_approved(
@@ -345,6 +405,9 @@ class ToolRegistry:
 
         logger.info("[TRACE:registry] EXECUTE_APPROVED tool=%s", capability_id)
         timeout = reg.safety.timeout_seconds or DEFAULT_TOOL_TIMEOUT
+        if reg.executor_kind == "desktop_node":
+            return self._execute_direct(reg, params, run_context, timeout, capability_id)
+
         if reg.safety.writes_external_world or reg.safety.can_delete:
             if not run_context.turn_record_id or not tool_call_id:
                 return {
@@ -364,22 +427,35 @@ class ToolRegistry:
             )
             return wait_for_tool_operation(operation.id, timeout)
 
-        has_ctx = "ctx" in inspect.signature(reg.handler).parameters
-        future = _tool_executor.submit(_invoke_handler, reg.handler, has_ctx, run_context, params)
-        try:
-            result = future.result(timeout=timeout)
-            return {"ok": True, "result": result}
-        except concurrent.futures.TimeoutError:
-            logger.error("[TRACE:registry] APPROVED_TIMEOUT tool=%s after %.0fs", capability_id, timeout)
-            return {
-                "ok": False,
-                "error": f"工具 '{capability_id}' 执行超过 {timeout:.0f} 秒，最终状态未知",
-                "error_type": "timeout",
-                "timeout_seconds": timeout,
-            }
-        except Exception as error:
-            logger.exception("[TRACE:registry] APPROVED_FAILED tool=%s", capability_id)
-            return {"ok": False, "error": str(error), "error_type": "execution_failed"}
+        return self._execute_direct(reg, params, run_context, timeout, capability_id)
+
+    def execute_brokered(
+        self,
+        capability_id: str,
+        params: dict[str, Any],
+        expected_descriptor_hash: str,
+        run_context: RunContext,
+    ) -> dict[str, Any]:
+        """执行已经由 CapabilityBroker 完成 scope/policy 校验的 Task Action。
+
+        此入口不接受模型直接调用，也不复用 Turn-bound ToolOperation 身份；Task
+        Action 自身就是持久化幂等单元。仍强制工具定义指纹和参数 schema，防止
+        审批后工具定义变化或参数漂移。
+        """
+        reg = self.get(capability_id)
+        if reg is None:
+            return {"ok": False, "error": "unknown_capability", "error_type": "unknown_tool"}
+        if not expected_descriptor_hash or reg.safety.descriptor_hash != expected_descriptor_hash:
+            return {"ok": False, "error": "descriptor_changed", "error_type": "descriptor_changed"}
+        from aiive.tools.tool_validation import validate_tool_params
+
+        validation = validate_tool_params(reg, params)
+        if not validation.ok:
+            return validation.error_payload(capability_id)
+        timeout = reg.safety.timeout_seconds or DEFAULT_TOOL_TIMEOUT
+        return self._execute_direct(
+            reg, validation.validated_params, run_context, timeout, capability_id,
+        )
 
 
 # 全局单例

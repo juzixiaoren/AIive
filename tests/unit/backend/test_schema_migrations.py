@@ -57,3 +57,38 @@ def test_upgrade_head_removes_legacy_forget_requests(monkeypatch, tmp_path):
         assert "forget_requests" not in Base.metadata.tables
     finally:
         engine.dispose()
+
+
+def test_upgrade_head_contains_desktop_node_contract(monkeypatch, tmp_path):
+    """空库迁移后应包含 Desktop Node、在线租约和线程绑定结构。"""
+    engine = _upgrade_empty_database(monkeypatch, tmp_path)
+    try:
+        inspector = inspect(engine)
+        tables = set(inspector.get_table_names())
+        assert {"desktop_nodes", "thread_desktop_bindings"} <= tables
+        node_columns = {column["name"] for column in inspector.get_columns("desktop_nodes")}
+        assert {
+            "id", "capabilities", "status", "last_seen_at", "lease_expires_at",
+        } <= node_columns
+    finally:
+        engine.dispose()
+
+
+def test_upgrade_head_contains_persistent_agent_task_contract(monkeypatch, tmp_path):
+    """P0-P8 任务运行时表、统一审批身份和对账投影必须由 Alembic 创建。"""
+    engine = _upgrade_empty_database(monkeypatch, tmp_path)
+    try:
+        inspector = inspect(engine)
+        tables = set(inspector.get_table_names())
+        assert {
+            "agent_tasks", "agent_runs", "agent_actions", "agent_task_events",
+            "agent_task_checkpoints", "task_evidence", "task_artifacts",
+            "task_resource_locks", "agent_task_watches", "desktop_action_receipts",
+        } <= tables
+        approval_columns = {column["name"]: column for column in inspector.get_columns("approval_requests")}
+        assert {"task_id", "action_id", "checkpoint_id", "preconditions", "effects", "approval_hash", "expires_at"} <= set(approval_columns)
+        assert approval_columns["turn_record_id"]["nullable"] is True
+        action_columns = {column["name"] for column in inspector.get_columns("agent_actions")}
+        assert {"idempotency_key", "arguments_hash", "preconditions", "effects", "evidence_refs"} <= action_columns
+    finally:
+        engine.dispose()
