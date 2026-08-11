@@ -109,6 +109,11 @@ export default function App() {
       {/* 顶部导航栏 */}
       <header className="border-b border-divider bg-surface px-6 py-4 flex items-center justify-between shadow-sm">
         <div className="flex items-center gap-3">
+          <img
+            src={`${BASE_PATH}aiive-logo.png`}
+            alt="AIive Logo"
+            className="h-10 w-10 object-contain drop-shadow-sm"
+          />
           <h1 className="text-xl font-bold tracking-tight text-content">AIive</h1>
           <span className="text-xs text-faint bg-surface-muted px-2 py-0.5 rounded">个人管家</span>
         </div>

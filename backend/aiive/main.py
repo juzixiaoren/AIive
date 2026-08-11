@@ -40,6 +40,7 @@ from aiive.api.routes_epochs import router as epochs_router
 from aiive.api.routes_ws import router as ws_router
 from aiive.api.routes_forget import router as forget_router
 from aiive.api.routes_approval import router as approval_router
+from aiive.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -270,10 +271,16 @@ def create_app() -> FastAPI:
 
     app.middleware("http")(catch_unhandled_exceptions)
 
-    # 配置 CORS 中间件，允许前端开发服务器跨域访问
+    # 配置 CORS 中间件，允许 Web 开发服务器和 Android Capacitor WebView 访问。
+    # 生产域名可通过 AIIVE_CORS_ORIGINS 追加或替换，避免使用通配符来源。
+    cors_origins = [
+        origin.strip()
+        for origin in settings.aiive_cors_origins.split(",")
+        if origin.strip()
+    ]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:5173"],
+        allow_origins=cors_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

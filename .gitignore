@@ -1,44 +1,107 @@
-# AIive .gitignore
+# AIive
 
-# Environment
+# -----------------------------------------------------------------------------
+# Local environment and secrets
+# -----------------------------------------------------------------------------
 .env
+.env.*
+!.env.example
+*.local
 
+# Signing material must never enter version control.
+*.jks
+*.keystore
+keystore.properties
+signing.properties
+
+# -----------------------------------------------------------------------------
 # Python
+# -----------------------------------------------------------------------------
 __pycache__/
 *.py[cod]
-*.egg-info/
+*$py.class
 *.egg
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyright/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+venv/
+.venv/
+
+# -----------------------------------------------------------------------------
+# Node.js / Vite
+# -----------------------------------------------------------------------------
+node_modules/
+.vite/
+.turbo/
+.parcel-cache/
+.eslintcache
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# -----------------------------------------------------------------------------
+# Generated build output
+# -----------------------------------------------------------------------------
 dist/
 build/
+/artifacts/apps/
+*.apk
+*.aab
+*.apks
 
-# Tests
-.pytest_cache/
-tests/artifacts/v*/
-!tests/artifacts/.gitkeep
+# -----------------------------------------------------------------------------
+# Android / Gradle / Capacitor
+# Keep native source and res/ icons, but ignore every regenerated build surface.
+# -----------------------------------------------------------------------------
+.gradle/
+/.gradle-cache/
+local.properties
+.cxx/
+.externalNativeBuild/
+captures/
+*.hprof
+lint-results*.html
+lint-results*.xml
 
-# Frontend
-frontend/node_modules/
-frontend/dist/
+/apps/android/android/capacitor-cordova-android-plugins/
+/apps/android/android/app/src/main/assets/public/
+/apps/android/android/app/src/main/assets/capacitor.config.json
+/apps/android/android/app/src/main/assets/capacitor.plugins.json
+/apps/android/android/app/src/main/res/xml/config.xml
 
-# A/B Slots runtime
+# -----------------------------------------------------------------------------
+# Tests and reports
+# -----------------------------------------------------------------------------
+/tests/artifacts/v*/
+!/tests/artifacts/.gitkeep
+coverage/
+
+# -----------------------------------------------------------------------------
+# AIive runtime data
+# -----------------------------------------------------------------------------
+/.data/
+/pgdata/
 /slots/
 /runtime/
 
-# Local data（对象存储 / 记忆投影 / MCP 沙箱含 node_modules）
-/.data/
-
-# Docker volumes
-pgdata/
-
-# IDE
+# -----------------------------------------------------------------------------
+# Editors and operating systems
+# -----------------------------------------------------------------------------
 .idea/
 .vscode/
+*.iml
 *.swp
 *.swo
-
-# macOS
+*~
 .DS_Store
-
-# Virtualenv
-venv/
-.venv/
+Thumbs.db
+Desktop.ini

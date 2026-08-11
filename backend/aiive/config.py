@@ -82,6 +82,12 @@ class Settings(BaseSettings):
     # 服务器监听配置
     host: str = "127.0.0.1"
     port: int = 8000
+    # 允许访问 API 的浏览器/WebView 来源，逗号分隔。Android Capacitor
+    # WebView 默认使用 https://localhost；本地浏览器开发端口一并列出。
+    aiive_cors_origins: str = (
+        "http://localhost:5173,http://localhost:5174,"
+        "http://localhost,https://localhost,capacitor://localhost"
+    )
 
     # 本地开发者诊断接口默认关闭；启用后仍仅允许 loopback 请求。
     aiive_developer_diagnostics_enabled: bool = False

@@ -76,6 +76,7 @@ AIive（再次召回，fail-closed 校验）：
 | 数据库 | PostgreSQL 16 / SQLAlchemy 2.0 / Alembic |
 | 向量检索 | pgvector（PostgreSQL 向量扩展） |
 | 前端 | React 19 / TypeScript / Vite 6 / TailwindCSS 3 |
+| Android 应用 | React 19 / Capacitor 8 / Android SDK 36（独立 UI） |
 | 实时通信 | WebSocket |
 | 定时任务 | APScheduler 3.10 |
 | 测试 | pytest 8.0 / basedpyright |
@@ -123,6 +124,37 @@ uvicorn aiive.main:app --reload --port 8000
 cd frontend && npm install && npm run dev
 curl http://localhost:8000/health
 ```
+
+### Android APK
+
+Android 客户端位于 `apps/android/`，使用完全独立的组件与 CSS，不复用 Web
+页面样式。它只呈现核心流式对话，不显示工具调用、操作卡片、`trace_id`、记忆、
+能力、事件等 Web 功能。
+
+首次构建前，在 `apps/android/src/config.ts` 中填写部署后的后端根地址；默认值
+有意保持为空：
+
+```ts
+const DEFAULT_BACKEND_BASE_URL = "http://192.168.1.10:8000";
+```
+
+然后通过统一入口构建：
+
+```bash
+# 已注册的客户端形态
+./scripts/build-app.sh list
+
+# 可直接安装的 debug APK
+./scripts/build-app.sh android debug
+
+# 未签名 release APK（发布前需使用自己的密钥签名）
+./scripts/build-app.sh android release
+```
+
+debug 产物位于 `artifacts/apps/android/AIive-debug.apk`。服务器只部署
+`backend/` 和 `frontend/`；APK 本身不随服务器部署，而是通过配置的服务器地址
+调用 `/api/chat/stream` 等后端接口。详细说明见
+[Android 应用构建指南](docs/guides/ANDROID_APP.md)。
 
 启用本地 Embedding 时应通过 `./scripts/start.sh` 启动模型服务。模型权重和
 Hugging Face 缓存均位于 `.data/models/embeddings/`，该目录不会进入 Git 或
@@ -186,6 +218,8 @@ REM    若系统无 curl，可用： powershell -Command "Invoke-WebRequest http
 
 ```
 AIive/
+├── apps/android/          # 独立 Android 对话 UI + Capacitor 原生工程
+├── assets/branding/       # Web / Android 共用品牌源图与派生资源
 ├── backend/aiive/
 │   ├── api/              # REST API 路由（18 个模块）
 │   ├── core/             # LLM 客户端、动作规划器
@@ -206,6 +240,7 @@ AIive/
 ├── docs/                 # 设计文档与阶段计划
 ├── tests/unit/backend/   # 单元测试（47 个测试文件）
 ├── docker-compose.yml    # PostgreSQL 16
+├── scripts/build-app.sh  # 可扩展的统一客户端构建入口
 └── alembic.ini           # 数据库迁移配置
 ```
 
