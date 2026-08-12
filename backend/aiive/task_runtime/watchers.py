@@ -29,8 +29,8 @@ def _parse_time(value: Any) -> datetime | None:
 
 class WatcherService:
     def __init__(self, db: Session):
-        self.db = db
-        self.repo = TaskRepository(db)
+        self.db: Session = db
+        self.repo: TaskRepository = TaskRepository(db)
 
     def create_from_proposal(self, task: AgentTask, proposal: dict[str, Any]) -> AgentTaskWatch:
         watch_type = str(proposal.get("watch_type") or "")

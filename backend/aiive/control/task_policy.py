@@ -36,6 +36,10 @@ class TaskPolicyEngine:
         safety = registration.safety
         if safety.can_access_secret and not scope.allow_secrets:
             return ActionPolicyDecision("block", "secret_access_not_in_task_scope")
+        if capability_id == "install_mcp_sandbox" and arguments.get("env_keys") and not scope.allow_secrets:
+            return ActionPolicyDecision("block", "mcp_environment_access_not_in_task_scope")
+        if safety.uses_network and not scope.allow_network:
+            return ActionPolicyDecision("block", "network_access_not_in_task_scope")
         if (
             capability_id in ALWAYS_APPROVE
             or safety.requires_confirmation

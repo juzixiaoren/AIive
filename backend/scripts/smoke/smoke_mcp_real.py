@@ -49,7 +49,7 @@ def main() -> int:
 
     print("[2/6] real npm install ...")
     result = install_sandbox(
-        db, candidate.name, candidate.package_ref, "latest", candidate.transport,
+        db, candidate.name, candidate.package_ref, candidate.version, candidate.transport,
         candidate.declared_tools,
         {"name": candidate.name, "description": candidate.description,
          "trust_level": candidate.definition_trust_level},

@@ -30,10 +30,10 @@ class ReleaseManager:
         state_file: Path | None = None,
         monitor_seconds: int = 600,
     ) -> None:
-        self._manager = manager or SlotManager()
-        self._probe = probe or HealthProbe()
-        self._state_file = state_file or (ACTIVE_SLOT_FILE.parent / "release_state.json")
-        self._monitor_seconds = max(60, monitor_seconds)
+        self._manager: SlotManager = manager or SlotManager()
+        self._probe: HealthProbe = probe or HealthProbe()
+        self._state_file: Path = state_file or (ACTIVE_SLOT_FILE.parent / "release_state.json")
+        self._monitor_seconds: int = max(60, monitor_seconds)
 
     def promote(self) -> dict[str, Any]:
         with _release_lock:

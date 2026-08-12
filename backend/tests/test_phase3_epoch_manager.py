@@ -16,7 +16,7 @@ from aiive.runtime.epoch_manager import (
     allocate_turn_sequence,
     peek_next_turn_sequence,
 )
-from tests._util import (
+from backend.tests._util import (
     add_event,
     add_turn,
     claim_job,

@@ -33,7 +33,9 @@ _TASK_BROADCAST_WATERMARKS_KEY = "aiive_task_broadcast_watermarks"
 
 
 @sa_event.listens_for(Session, "after_transaction_create")
-def _remember_nested_broadcast_watermark(session: Session, transaction: Any) -> None:
+def _remember_nested_broadcast_watermark(  # pyright: ignore[reportUnusedFunction]
+    session: Session, transaction: Any
+) -> None:
     """记录 SAVEPOINT 进入时的队列长度，以便只撤销内层产生的广播。"""
     if transaction.nested:
         pending = session.info.get(_TASK_BROADCASTS_KEY, [])
@@ -41,7 +43,9 @@ def _remember_nested_broadcast_watermark(session: Session, transaction: Any) -> 
 
 
 @sa_event.listens_for(Session, "after_commit")
-def _broadcast_task_events_after_commit(session: Session) -> None:
+def _broadcast_task_events_after_commit(  # pyright: ignore[reportUnusedFunction]
+    session: Session,
+) -> None:
     """只广播已经成为数据库事实的高层 Task 事件，避免回滚后出现幽灵消息。"""
     # SQLAlchemy 对 SAVEPOINT release 也触发 after_commit；此时外层事务仍可回滚。
     if session.in_nested_transaction():
@@ -60,7 +64,9 @@ def _broadcast_task_events_after_commit(session: Session) -> None:
 
 
 @sa_event.listens_for(Session, "after_rollback")
-def _discard_rolled_back_task_broadcasts(session: Session) -> None:
+def _discard_rolled_back_task_broadcasts(  # pyright: ignore[reportUnusedFunction]
+    session: Session,
+) -> None:
     nested = session.get_nested_transaction()
     if nested is None:
         session.info.pop(_TASK_BROADCASTS_KEY, None)
@@ -74,7 +80,9 @@ def _discard_rolled_back_task_broadcasts(session: Session) -> None:
 
 
 @sa_event.listens_for(Session, "after_transaction_end")
-def _discard_nested_broadcast_watermark(session: Session, transaction: Any) -> None:
+def _discard_nested_broadcast_watermark(  # pyright: ignore[reportUnusedFunction]
+    session: Session, transaction: Any
+) -> None:
     if not transaction.nested:
         return
     watermarks = session.info.get(_TASK_BROADCAST_WATERMARKS_KEY)
@@ -108,7 +116,7 @@ class TaskRepository:
     """所有 Task 聚合写入均经由此类；调用方负责 commit/rollback。"""
 
     def __init__(self, db: Session):
-        self.db = db
+        self.db: Session = db
 
     def create_task(
         self,

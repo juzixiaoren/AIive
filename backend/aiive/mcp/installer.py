@@ -28,6 +28,10 @@ logger = logging.getLogger(__name__)
 
 # npm install 超时（秒）
 NPM_INSTALL_TIMEOUT_SECONDS = 300
+_EXACT_SEMVER_RE = re.compile(
+    r"^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
+    + r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
+)
 
 # 仓库根目录：backend/aiive/mcp/installer.py 向上 3 级
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -197,6 +201,12 @@ def install_sandbox(
     if transport != "stdio":
         return {"ok": False, "installed": False,
                 "error": f"unsupported transport: {transport} (only stdio)"}
+    if not _EXACT_SEMVER_RE.fullmatch(version):
+        return {
+            "ok": False,
+            "installed": False,
+            "error": "MCP version must be an exact semantic version",
+        }
 
     package_name = _npm_package_from_ref(package_ref)
     if not package_name:
@@ -226,6 +236,11 @@ def install_sandbox(
     }
     definition = dict(definition)
     definition["launch"] = launch_config
+    # 包身份、固定版本和声明工具参与描述符指纹；升级或重装后不得沿用旧审批。
+    definition["package_ref"] = package_ref
+    definition["version"] = version
+    definition["transport"] = transport
+    definition["declared_tools"] = list(declared_tools)
 
     capability_id = f"mcp:{candidate_name}"
     descriptor_hash = _hash(json.dumps(
@@ -241,9 +256,9 @@ def install_sandbox(
     )
 
     if existing:
-        # 已有能力：如果描述符变化，标记为需要重新审查
-        if existing.descriptor_hash and existing.descriptor_hash != descriptor_hash:
-            existing.state = "needs_review"
+        # 每次真实重装都必须重新 tools/list 冒烟；即使版本与描述符相同，
+        # node_modules 的实际内容也可能因依赖解析而变化。
+        existing.state = "needs_review"
         existing.descriptor_hash = descriptor_hash
         # 合并 launch 等最新定义信息（重装后入口路径可能变化）
         merged = dict(existing.definition or {})

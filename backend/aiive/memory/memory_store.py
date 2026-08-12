@@ -71,13 +71,13 @@ class MemoryStore:
         now = datetime.now(timezone.utc)
         # 语义去重 hash 落库：content_hash 与 ConflictResolver._hash_matches 的
         # 回退算法一致（sha256[:16]）；structured_value_hash 与
-        # ConflictResolver._hash_structured 一致。不落库会导致 maintenance
+        # ConflictResolver.hash_structured 一致。不落库会导致 maintenance
         # planner 的 merge_exact_duplicate 桶永不触发、resolver 的
         # structured_value_hash 分支不可达。
         from aiive.memory.conflict_resolver import ConflictResolver
         content_hash = proposal.content_hash or proposal.compute_content_hash()
         structured_value_hash = (
-            ConflictResolver._hash_structured(proposal.structured_value)
+            ConflictResolver.hash_structured(proposal.structured_value)
             if proposal.structured_value else None
         ) or None
         record = MemoryRecord(

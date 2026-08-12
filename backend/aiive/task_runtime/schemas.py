@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -45,7 +45,7 @@ class ActionStatus(StrEnum):
 
 
 class TaskBudget(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
     max_runs: int = Field(default=20, ge=1, le=1000)
     max_model_calls: int = Field(default=30, ge=1, le=5000)
@@ -59,7 +59,7 @@ class TaskBudget(BaseModel):
 
 
 class TaskScopeModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
     allowed_capabilities: list[str] = Field(default_factory=list, max_length=128)
     allowed_roots: list[str] = Field(default_factory=list, max_length=64)
@@ -70,7 +70,7 @@ class TaskScopeModel(BaseModel):
 
 
 class TaskBrief(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
     goal: str = Field(min_length=1, max_length=20_000)
     acceptance_criteria: list[str] = Field(default_factory=list, max_length=64)
@@ -82,7 +82,7 @@ class TaskBrief(BaseModel):
 class ActionProposal(BaseModel):
     """Worker LLM 每次只能提出一个 Action 或结束/等待决策。"""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
     decision: Literal["action", "finish", "ask_user", "watch"]
     capability_id: str = ""
@@ -106,7 +106,7 @@ class ActionProposal(BaseModel):
 
 
 class TaskReport(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
     status: Literal["succeeded", "partial", "failed"]
     summary: str

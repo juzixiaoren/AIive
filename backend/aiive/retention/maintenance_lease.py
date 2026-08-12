@@ -76,7 +76,7 @@ class MaintenanceLease:
                     {"lock_id": lock_id},
                 )
             except Exception:
-                pass
+                logger.warning("PostgreSQL advisory lock 释放失败: lock_id=%d", lock_id, exc_info=True)
 
     # ------------------------------------------------------------------
     # SQLite: 表行锁（简单实现，依赖连接级事务）

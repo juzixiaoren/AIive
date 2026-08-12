@@ -46,6 +46,7 @@ class CapabilitySafetySchema:
         writes_external_world: 是否会写入外部世界（文件系统、数据库等）
         can_access_secret: 是否可访问密钥
         can_delete: 是否可删除数据
+        uses_network: 是否访问外部网络
         allowed_instruction_sources: 允许的指令来源列表
         descriptor_hash: 安全描述的 SHA256 哈希（用于变更检测）
         tool_description_is_instruction: 工具描述是否可作为指令
@@ -59,6 +60,7 @@ class CapabilitySafetySchema:
     writes_external_world: bool = False
     can_access_secret: bool = False
     can_delete: bool = False
+    uses_network: bool = False
     allowed_instruction_sources: list[str] = field(default_factory=lambda: ["trusted_user_command"])
     descriptor_hash: str = ""
     tool_description_is_instruction: bool = False
@@ -161,6 +163,7 @@ class ToolRegistry:
                 "writes_external_world": reg.safety.writes_external_world,
                 "can_access_secret": reg.safety.can_access_secret,
                 "can_delete": reg.safety.can_delete,
+                "uses_network": reg.safety.uses_network,
                 "allowed_instruction_sources": reg.safety.allowed_instruction_sources,
                 "tool_description_is_instruction": reg.safety.tool_description_is_instruction,
                 "timeout_seconds": reg.safety.timeout_seconds,
@@ -228,6 +231,7 @@ class ToolRegistry:
                 "writes_external_world": r.safety.writes_external_world,
                 "can_access_secret": r.safety.can_access_secret,
                 "can_delete": r.safety.can_delete,
+                "uses_network": r.safety.uses_network,
                 "descriptor_hash": r.safety.descriptor_hash,
                 "executor_kind": r.executor_kind,
                 "executor_node_id": r.executor_node_id,

@@ -590,21 +590,18 @@ class MemoryWriteService:
 
             # 记录 tombstone event（向后兼容）
             if run_context and run_context.thread_id:
-                try:
-                    self._executor.log_event(
-                        trace_id=run_context.trace_id,
-                        event_type="memory.forgotten",
-                        memory_id=memory_ids[0] if memory_ids else "",
-                        payload={
-                            "operation_key": result["operation_key"],
-                            "mode": mode,
-                            "target_count": result["target_count"],
-                            "reason": reason,
-                        },
-                        thread_id=run_context.thread_id,
-                    )
-                except Exception:
-                    pass  # 隔离写入
+                self._executor.log_event(
+                    trace_id=run_context.trace_id,
+                    event_type="memory.forgotten",
+                    memory_id=memory_ids[0] if memory_ids else "",
+                    payload={
+                        "operation_key": result["operation_key"],
+                        "mode": mode,
+                        "target_count": result["target_count"],
+                        "reason": reason,
+                    },
+                    thread_id=run_context.thread_id,
+                )
 
             return WriteResult(
                 outcome=WriteOutcome.WRITTEN,
@@ -1081,7 +1078,7 @@ class MemoryWriteService:
         """
         try:
             bind = self._db.get_bind()
-            dialect_name = bind.dialect.name if bind is not None else ""
+            dialect_name = bind.dialect.name
         except Exception:
             dialect_name = ""
         if dialect_name != "postgresql":

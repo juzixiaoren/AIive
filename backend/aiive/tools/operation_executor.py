@@ -317,8 +317,9 @@ def _execute_db_transactional(
         operation.result_payload = _json_value(result)
         operation.effect_receipt = {"transactional": True, "committed": True}
         operation.error_message = None
-        operation.completed_at = datetime.now(timezone.utc)
-        operation.updated_at = operation.completed_at
+        completed_at = datetime.now(timezone.utc)
+        operation.completed_at = completed_at
+        operation.updated_at = completed_at
         db.add(_build_terminal_event(operation, "committed"))
         db.commit()
         if needs_broadcast:
@@ -375,8 +376,9 @@ def _execute_external(
             operation.status = "committed"
             operation.result_payload = _json_value(result)
             operation.effect_receipt = {"transactional": False, "handler_returned": True}
-            operation.completed_at = datetime.now(timezone.utc)
-            operation.updated_at = operation.completed_at
+            completed_at = datetime.now(timezone.utc)
+            operation.completed_at = completed_at
+            operation.updated_at = completed_at
             db.add(_build_terminal_event(operation, "committed"))
             db.commit()
         finally:
@@ -472,8 +474,9 @@ def _fail_operation(db: Session, operation: ToolOperation, error: str, reason: s
     operation.status = "failed"
     operation.error_message = error[:2000]
     operation.terminal_reason = reason
-    operation.completed_at = datetime.now(timezone.utc)
-    operation.updated_at = operation.completed_at
+    completed_at = datetime.now(timezone.utc)
+    operation.completed_at = completed_at
+    operation.updated_at = completed_at
     db.add(_build_terminal_event(operation, "failed"))
     db.commit()
     _notify(operation.id)

@@ -19,7 +19,7 @@ class LockGrant:
 class ResourceBusyError(RuntimeError):
     def __init__(self, resource_key: str):
         super().__init__(f"resource_busy:{resource_key}")
-        self.resource_key = resource_key
+        self.resource_key: str = resource_key
 
 
 def _aware(value: datetime) -> datetime:

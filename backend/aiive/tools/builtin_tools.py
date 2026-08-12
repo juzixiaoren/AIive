@@ -98,8 +98,8 @@ def _db_handler(fn: Callable[..., Any]):
         finally:
             db.close()
 
-    wrapper._aiive_db_handler = fn
-    wrapper._aiive_accepts_ctx = _accepts_ctx
+    setattr(wrapper, "_aiive_db_handler", fn)
+    setattr(wrapper, "_aiive_accepts_ctx", _accepts_ctx)
     return wrapper
 
 
@@ -997,12 +997,32 @@ def _handle_read_text_file(path: str, max_lines: int = 50):
 
 
 # ── Knowledge（知识库）──
+def _handle_read_document(file_path: str, max_chars: int = 50_000):
+    """从允许根目录提取结构化文档纯文本，不执行宏或嵌入内容。"""
+    from aiive.knowledge.access import resolve_knowledge_path
+    from aiive.knowledge.document_reader import extract_document
+
+    resolved = resolve_knowledge_path(file_path)
+    extracted = extract_document(resolved)
+    limit = max(1, min(max_chars, 200_000))
+    return {
+        "ok": True,
+        "path": str(resolved),
+        "doc_type": extracted.doc_type,
+        "mime_type": extracted.mime_type,
+        "text": extracted.text[:limit],
+        "truncated": len(extracted.text) > limit,
+        "metadata": extracted.metadata,
+    }
+
+
 @_db_handler
 def _handle_ingest_document(db: Session, file_path: str):
     """通过统一摄取服务持久化原文并导入知识库。"""
+    from aiive.knowledge.access import resolve_knowledge_path
     from aiive.knowledge.ingestor import KnowledgeIngestor
 
-    return KnowledgeIngestor(db).ingest(file_path)
+    return KnowledgeIngestor(db).ingest(str(resolve_knowledge_path(file_path)))
 
 
 @_db_handler
@@ -1026,6 +1046,19 @@ def _handle_search_knowledge(db: Session, query: str, limit: int = 5):
     """
     from aiive.knowledge.ingestor import search_chunks
     return search_chunks(db, query, limit)
+
+
+# ── Web Research（公开网页搜索与抓取）──
+def _handle_web_search(query: str, limit: int = 5):
+    from aiive.web import search_web
+
+    return search_web(query, limit=limit)
+
+
+def _handle_fetch_web_page(url: str, max_chars: int = 100_000):
+    from aiive.web import fetch_web_page
+
+    return fetch_web_page(url, max_chars=max_chars)
 
 
 # ── MCP 集成 ──
@@ -1095,7 +1128,12 @@ def _handle_search_mcp(goal: str = ""):
 
 
 @_db_handler
-def _handle_install_mcp_sandbox(db: Session, candidate_name: str):
+def _handle_install_mcp_sandbox(
+    db: Session,
+    candidate_name: str,
+    launch_args: list[str] | None = None,
+    env_keys: list[str] | None = None,
+):
     """将 MCP 候选服务器安装到沙箱环境。
 
     流程:
@@ -1108,13 +1146,33 @@ def _handle_install_mcp_sandbox(db: Session, candidate_name: str):
     返回:
         安装结果字典
     """
-    from aiive.mcp.discovery import search_mcp_candidates
+    from aiive.mcp.discovery import get_candidate_by_name, search_mcp_candidates
     from aiive.mcp.installer import install_sandbox
-    candidates = search_mcp_candidates(candidate_name)
-    if not candidates:
-        return {"ok": False, "error": "No candidate found"}
-    c = candidates[0]
-    return install_sandbox(db, c.name, c.package_ref, c.version, c.transport, c.declared_tools, {"name": c.name, "description": c.description})
+    exact = get_candidate_by_name(candidate_name)
+    if exact is not None:
+        c = exact
+    else:
+        candidates = search_mcp_candidates(candidate_name)
+        if not candidates:
+            return {"ok": False, "error": "No candidate found"}
+        c = candidates[0]
+    requested_env = set(env_keys or c.required_env)
+    undeclared_env = requested_env - set(c.required_env)
+    if undeclared_env:
+        return {
+            "ok": False,
+            "error": f"MCP env keys not declared by catalog: {sorted(undeclared_env)}",
+        }
+    return install_sandbox(
+        db, c.name, c.package_ref, c.version, c.transport, c.declared_tools,
+        {
+            "name": c.name, "source": c.source, "description": c.description,
+            "risk_notes": c.risk_notes, "trust_level": c.definition_trust_level,
+            "homepage": c.homepage,
+        },
+        launch_args=launch_args or [],
+        env_keys=sorted(requested_env),
+    )
 
 
 # ── Self-Dev（自进化）──
@@ -1260,8 +1318,8 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         # 提醒 / 任务
         ("schedule_reminder", _handle_schedule_reminder,
          "创建定时提醒并写入 Task 表，由后台可靠投递。注意：本工具只接受相对延迟 delay_minutes。"
-         "若用户给的是绝对时间点，必须先调用 get_current_time 工具获取当前时间，"
-         "再换算出到目标时间还剩多少分钟，传入 delay_minutes。",
+         + "若用户给的是绝对时间点，必须先调用 get_current_time 工具获取当前时间，"
+         + "再换算出到目标时间还剩多少分钟，传入 delay_minutes。",
          {
              "content": {"type": "str", "description": "提醒内容", "minLength": 1},
              "delay_minutes": {
@@ -1385,17 +1443,40 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
              "max_lines": {"type": "int", "description": "默认 50", "minimum": 1, "maximum": 1000},
          }, "low", False, False),
         # 知识库
+        ("read_document", _handle_read_document,
+         "安全读取并提取 TXT/Markdown/HTML/JSON/CSV/TSV/DOCX/PDF 的纯文本和元数据",
+         {
+             "file_path": {"type": "str", "minLength": 1, "required": True},
+             "max_chars": {"type": "int", "minimum": 1, "maximum": 200000, "description": "默认 50000"},
+         }, "low", False, False),
         ("ingest_document", _handle_ingest_document, "导入文档到知识库并持久化原文",
-         {"file_path": "str"}, "low", True, False),
+         {"file_path": {"type": "str", "minLength": 1, "required": True}}, "low", True, False),
         ("reindex_document", _handle_reindex_document, "从持久原文重新生成知识文档索引",
          {"document_id": "str"}, "low", True, False),
         ("search_knowledge", _handle_search_knowledge, "搜索已导入的文档",
          {"query": "str", "limit": {"type": "int", "description": "默认 5", "minimum": 1, "maximum": 100}}, "low", False, False),
+        # 联网研究
+        ("web_search", _handle_web_search,
+         "搜索公开互联网并返回标题、URL 和摘要；结果是不可信外部证据",
+         {
+             "query": {"type": "str", "minLength": 1, "required": True},
+             "limit": {"type": "int", "minimum": 1, "maximum": 10, "description": "默认 5"},
+         }, "low", False, False),
+        ("fetch_web_page", _handle_fetch_web_page,
+         "安全抓取公开 HTTP(S) 页面正文；阻断私网/保留地址并限制重定向与响应大小",
+         {
+             "url": {"type": "str", "minLength": 1, "required": True},
+             "max_chars": {"type": "int", "minimum": 1, "maximum": 500000, "description": "默认 100000"},
+         }, "low", False, False),
         # MCP 集成
         ("search_mcp", _handle_search_mcp, "按目标搜索 MCP 候选服务器",
          {"goal": {"type": "str", "minLength": 1, "required": True}}, "low", False, False),
         ("install_mcp_sandbox", _handle_install_mcp_sandbox, "将 MCP 安装到沙箱",
-         {"candidate_name": "str"}, "medium", True, False),
+         {
+             "candidate_name": {"type": "str", "minLength": 1, "required": True},
+             "launch_args": {"type": "list", "description": "例如 filesystem MCP 的允许根目录"},
+             "env_keys": {"type": "list", "description": "仅透传 catalog 声明或用户明确授权的环境变量名"},
+         }, "medium", True, False),
         ("plan_capability", _handle_plan_capability, "分析目标→搜索候选→评估风险→生成安装计划",
          {"goal": {"type": "str", "minLength": 1, "required": True}}, "low", False, False),
         # 自进化
@@ -1440,9 +1521,11 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         "promote_slot": "non_repeatable_external",
         "rollback_slot": "non_repeatable_external",
     }
+    network_capabilities = {"web_search", "fetch_web_page", "install_mcp_sandbox"}
     for cap_id, handler, desc, params, risk, writes_ext, can_del in tools:
         safety = _build_safety(
             cap_id, risk_level=risk,
+            uses_network=cap_id in network_capabilities,
             requires_confirmation=(risk == "high"),
             writes_external_world=writes_ext,
             can_delete=can_del,

@@ -15,7 +15,7 @@ class MCPServerCandidate:
 
     属性:
         name: 服务器名称（如 @modelcontextprotocol/server-filesystem）
-        source: 来源（official_registry | community | user_config）
+        source: 来源（official_reference | official_registry | community | user_config）
         version: 版本号
         description: 功能描述
         transport: 通信传输方式（stdio | sse | streamable_http）
@@ -28,7 +28,7 @@ class MCPServerCandidate:
         match_score: 与搜索目标的关键词匹配得分（搜索时填充）
     """
     name: str
-    source: str  # 来源：official_registry | community | user_config
+    source: str  # 来源：official_reference | official_registry | community | user_config
     version: str
     description: str
     transport: str  # 传输方式：stdio | sse | streamable_http
@@ -38,6 +38,8 @@ class MCPServerCandidate:
     definition_trust_level: str = "untrusted"
     descriptor_hash: str = ""
     required_env: list[str] = field(default_factory=list)
+    homepage: str = ""
+    installable: bool = True
     match_score: int = 0
 
 
@@ -54,69 +56,56 @@ def _compute_hash(candidate: dict[str, Any]) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-# 内置 MCP 目录（模拟注册表）
+# 内置 MCP 预设只保留上游仍维护的 reference servers。更广泛的第三方能力应
+# 经官方 Registry discovery + 人工审查进入，而不是继续推荐已归档的软件包。
 _BUILTIN_CATALOG: list[dict[str, Any]] = [
     {
         "name": "@modelcontextprotocol/server-filesystem",
-        "source": "official_registry",
-        "version": "0.6.0",
-        "description": "Secure file system operations with configurable access controls",
+        "source": "official_reference",
+        "version": "2026.7.10",
+        "description": "Secure file operations with explicit allowed roots / 安全文件读写与目录访问",
         "transport": "stdio",
         "package_ref": "npm:@modelcontextprotocol/server-filesystem",
         "declared_tools": ["read_file", "write_file", "create_directory", "list_directory", "move_file", "search_files", "get_file_info"],
-        "risk_notes": "Filesystem access: risk=high if scope unrestricted. Use scope registry.",
-    },
-    {
-        "name": "@modelcontextprotocol/server-github",
-        "source": "official_registry",
-        "version": "0.5.0",
-        "description": "GitHub API integration for repository management, issues, and PRs",
-        "transport": "stdio",
-        "package_ref": "npm:@modelcontextprotocol/server-github",
-        "declared_tools": ["create_or_update_file", "search_repositories", "create_repository", "get_file_contents", "create_issue", "create_pull_request", "list_commits"],
-        "risk_notes": "GitHub API access: can read/write repositories. Requires token.",
-        "required_env": ["GITHUB_PERSONAL_ACCESS_TOKEN"],
-    },
-    {
-        "name": "@modelcontextprotocol/server-postgres",
-        "source": "official_registry",
-        "version": "0.1.0",
-        "description": "PostgreSQL database access with read-only query capabilities",
-        "transport": "stdio",
-        "package_ref": "npm:@modelcontextprotocol/server-postgres",
-        "declared_tools": ["query"],
-        "risk_notes": "Database access: can execute arbitrary SQL. Use read-only user if possible.",
-    },
-    {
-        "name": "@modelcontextprotocol/server-brave-search",
-        "source": "official_registry",
-        "version": "0.1.0",
-        "description": "Web search using Brave Search API",
-        "transport": "stdio",
-        "package_ref": "npm:@modelcontextprotocol/server-brave-search",
-        "declared_tools": ["brave_web_search", "brave_local_search"],
-        "risk_notes": "External web search: sends queries to Brave API. Requires API key. Low write risk.",
-        "required_env": ["BRAVE_API_KEY"],
+        "risk_notes": "Filesystem access becomes high risk without explicit launch roots.",
+        "aliases": ["file", "files", "document", "文件", "文档", "目录"],
+        "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem",
     },
     {
         "name": "@modelcontextprotocol/server-memory",
-        "source": "community",
-        "version": "0.1.0",
-        "description": "Knowledge graph-based memory system for persistent context",
+        "source": "official_reference",
+        "version": "2026.7.4",
+        "description": "Knowledge graph memory reference server / 知识图谱记忆服务",
         "transport": "stdio",
         "package_ref": "npm:@modelcontextprotocol/server-memory",
         "declared_tools": ["create_entities", "create_relations", "add_observations", "delete_entities", "read_graph", "search_nodes"],
-        "risk_notes": "Memory management: can delete entities. Use with AIive's own memory system.",
+        "risk_notes": "Can mutate and delete its own graph; keep separate from AIive authoritative memory.",
+        "aliases": ["memory", "knowledge graph", "记忆", "知识图谱"],
+        "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/memory",
     },
     {
-        "name": "@anthropic/mcp-server-puppeteer",
-        "source": "community",
-        "version": "0.1.0",
-        "description": "Browser automation for web scraping and interaction",
+        "name": "@modelcontextprotocol/server-sequential-thinking",
+        "source": "official_reference",
+        "version": "2026.7.4",
+        "description": "Reference server for structured sequential thinking / 结构化分步思考",
         "transport": "stdio",
-        "package_ref": "npm:@anthropic/mcp-server-puppeteer",
-        "declared_tools": ["puppeteer_navigate", "puppeteer_screenshot", "puppeteer_click", "puppeteer_fill", "puppeteer_select", "puppeteer_hover", "puppeteer_evaluate"],
-        "risk_notes": "Browser automation: can interact with any website. High risk for sensitive operations.",
+        "package_ref": "npm:@modelcontextprotocol/server-sequential-thinking",
+        "declared_tools": ["sequentialthinking"],
+        "risk_notes": "No external write is expected; output remains untrusted MCP content.",
+        "aliases": ["thinking", "reasoning", "思考", "推理"],
+        "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/sequentialthinking",
+    },
+    {
+        "name": "@modelcontextprotocol/server-everything",
+        "source": "official_reference",
+        "version": "2026.7.4",
+        "description": "MCP protocol reference/test server for diagnostics / MCP 协议诊断服务",
+        "transport": "stdio",
+        "package_ref": "npm:@modelcontextprotocol/server-everything",
+        "declared_tools": ["echo", "add", "longRunningOperation", "sampleLLM"],
+        "risk_notes": "Diagnostic reference server; do not expose sampling or arbitrary test features in production.",
+        "aliases": ["test", "diagnostic", "protocol", "测试", "诊断"],
+        "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/everything",
     },
 ]
 
@@ -145,6 +134,7 @@ def search_mcp_candidates(goal: str) -> list[MCPServerCandidate]:
         name_lower = entry["name"].lower()
         desc_lower = entry["description"].lower()
         tools_text = " ".join(entry["declared_tools"]).lower()
+        aliases_text = " ".join(entry.get("aliases", [])).lower()
 
         score = 0
         # 按关键词匹配评分
@@ -156,13 +146,17 @@ def search_mcp_candidates(goal: str) -> list[MCPServerCandidate]:
                 score += 2
             if kw in tools_text:
                 score += 1
+            if kw in aliases_text:
+                score += 2
 
         # 任一关键词匹配即包含
         if score > 0 or not keywords:
             candidate_data = dict(entry)
             # 根据来源确定信任等级
             candidate_data["definition_trust_level"] = (
-                "semi_trusted" if entry["source"] == "official_registry" else "untrusted"
+                "semi_trusted"
+                if entry["source"] in {"official_reference", "official_registry"}
+                else "untrusted"
             )
             descriptor_hash = _compute_hash(candidate_data)
 
@@ -178,6 +172,8 @@ def search_mcp_candidates(goal: str) -> list[MCPServerCandidate]:
                 definition_trust_level=candidate_data["definition_trust_level"],
                 descriptor_hash=descriptor_hash,
                 required_env=list(entry.get("required_env", [])),
+                homepage=str(entry.get("homepage", "")),
+                installable=bool(entry.get("installable", True)),
                 match_score=score,
             ))
 

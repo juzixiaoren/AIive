@@ -9,14 +9,16 @@ from sqlalchemy.orm import Session
 
 from aiive.db.models import AgentAction, AgentTask, AgentTaskEvent, TaskArtifact, TaskEvidence
 from aiive.prompts import get_prompt_registry
+from aiive.skills import SkillDefinition
 from aiive.task_runtime.repository import TaskRepository
 
 
 class TaskContextAssembler:
     def __init__(self, db: Session):
-        self.db = db
+        self.db: Session = db
 
     def snapshot(self, task: AgentTask, capabilities: list[dict[str, Any]]) -> dict[str, Any]:
+        skill = self._active_skill(task)
         checkpoint = TaskRepository(self.db).latest_checkpoint(task.id)
         actions = self.db.query(AgentAction).filter(
             AgentAction.task_id == task.id,
@@ -76,22 +78,37 @@ class TaskContextAssembler:
                 for item in reversed(events)
             ],
             "capability_ids": [item.get("capability_id") for item in capabilities],
+            "skill": skill.as_dict() if skill else None,
         }
 
     def messages(self, task: AgentTask, capabilities: list[dict[str, Any]]) -> tuple[list[dict[str, str]], dict[str, Any], list[str]]:
         snapshot = self.snapshot(task, capabilities)
         prompts = get_prompt_registry()
         system = prompts.render("task_runtime.worker_system")
+        skill = self._active_skill(task)
+        system_content = system.content
+        if skill is not None:
+            system_content += f"\n\n# Active Skill: {skill.name}\n\n{skill.instructions}"
         user = prompts.render(
             "task_runtime.task_context",
             task_context=json.dumps(snapshot, ensure_ascii=False, default=str),
             capabilities=json.dumps(capabilities, ensure_ascii=False, default=str),
         )
         return (
-            [{"role": system.role, "content": system.content}, {"role": user.role, "content": user.content}],
+            [{"role": system.role, "content": system_content}, {"role": user.role, "content": user.content}],
             snapshot,
             [system.audit_ref, user.audit_ref],
         )
+
+    @staticmethod
+    def _active_skill(task: AgentTask) -> SkillDefinition | None:
+        initial = (task.task_brief or {}).get("initial_input")
+        skill_id = initial.get("skill_id") if isinstance(initial, dict) else None
+        if not isinstance(skill_id, str) or not skill_id:
+            return None
+        from aiive.skills import get_skill
+
+        return get_skill(skill_id)
 
 
 def _bounded_value(value: Any, max_chars: int) -> Any:

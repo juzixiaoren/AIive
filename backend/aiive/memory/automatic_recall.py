@@ -14,6 +14,7 @@ import logging
 import re
 from collections.abc import Sequence
 from datetime import datetime, timezone
+from typing import Protocol
 
 # ---------------------------------------------------------------------------
 # CJK-aware tokenization — avoids the \W+ pitfall where Chinese text
@@ -64,6 +65,19 @@ logger = logging.getLogger(__name__)
 _KEYISH = re.compile(r"^[A-Za-z0-9_.]+$")
 
 
+class VectorSearchService(Protocol):
+    """Automatic Recall 所需的最小向量检索接口。"""
+
+    def search(
+        self,
+        request: MemoryRecallRequest,
+        *,
+        include_sleeping: bool,
+        include_archived: bool,
+        limit: int,
+    ) -> Sequence[tuple[MemoryRecord, float]]: ...
+
+
 def _recency_score(r: MemoryRecord) -> float:
     """Recency in 0..1 over a 30-day window."""
     ref = r.observed_at or r.updated_at or r.created_at
@@ -102,13 +116,13 @@ class AutomaticRecallEngine:
         self,
         db: Session,
         config: RecallConfig | None = None,
-        vector_service: object | None = None,
+        vector_service: VectorSearchService | None = None,
     ) -> None:
         self._db: Session = db
         self._store: MemoryStore = MemoryStore(db)
-        self._policy = MemoryPolicyEngine()
+        self._policy: MemoryPolicyEngine = MemoryPolicyEngine()
         self._config: RecallConfig = config or RecallConfig()
-        self._vector_service = vector_service
+        self._vector_service: VectorSearchService | None = vector_service
         if self._vector_service is None:
             from aiive.config import settings
             if settings.aiive_memory_vector_enabled:
@@ -260,11 +274,8 @@ class AutomaticRecallEngine:
         """通过已配置的 pgvector 服务执行语义召回。"""
         if self._vector_service is None:
             return []
-        search = getattr(self._vector_service, "search", None)
-        if not callable(search):
-            raise TypeError("vector_service 必须提供 search 方法")
         from aiive.config import settings
-        rows = search(
+        rows = self._vector_service.search(
             request,
             include_sleeping=include_sleeping,
             include_archived=include_archived,

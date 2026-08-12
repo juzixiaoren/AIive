@@ -13,7 +13,7 @@ from aiive.runtime.compaction import (
     validate_llm_semantic_output,
 )
 from aiive.worker.outbox_handlers import _run_cover_checks
-from tests._util import add_event, add_turn, new_epoch, new_segment, new_thread, new_ws
+from backend.tests._util import add_event, add_turn, new_epoch, new_segment, new_thread, new_ws
 
 
 def _freeze(db, seg, thread, epoch, ws, **kw):

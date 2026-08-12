@@ -4,7 +4,7 @@
 定义 Agent 向前端发送的结构化操作卡片（ActionCard），用于展示工具执行结果、
 提醒、通知、审批请求等各类运行时事件。
 """
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -24,7 +24,7 @@ ActionCardStatus = Literal[
 class ActionCardAction(BaseModel):
     """操作卡片上可由用户触发的结构化动作。"""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
     action: str = Field(min_length=1)
     approval_id: str = ""
@@ -34,7 +34,7 @@ class ActionCardAction(BaseModel):
 class ActionCard(BaseModel):
     """前端操作卡片的结构化数据模型。"""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
     card_type: ActionCardType
     title: str
@@ -59,7 +59,7 @@ class ActionCard(BaseModel):
 class PendingOperation(BaseModel):
     """从真实审批或副作用 operation 状态投影出的待处理操作。"""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
     operation_id: str = Field(min_length=1)
     operation_type: str = Field(min_length=1)
@@ -80,7 +80,7 @@ class PendingOperation(BaseModel):
 class ChatResponse(BaseModel):
     """同步聊天和 SSE 完成事件共用的响应契约。"""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
     reply: str
     event_id: str = Field(min_length=1)

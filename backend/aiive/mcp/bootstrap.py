@@ -36,6 +36,10 @@ _WRITE_HINTS = (
     "set", "add", "fill", "click", "navigate", "execute", "apply",
 )
 _DELETE_HINTS = ("delete", "remove", "drop", "clear")
+# `search` 本身并不代表联网：memory/search_nodes、filesystem/search_files 都是
+# 典型的本地检索。这里只匹配能明确表达网络 I/O 的词，避免错误要求
+# TaskScope.allow_network。
+_NETWORK_HINTS = ("web", "fetch", "url", "http", "browser", "navigate")
 
 _RISK_ORDER = ("low", "medium", "high", "critical")
 
@@ -146,6 +150,7 @@ def register_capability_tools(
         name_lower = tool_name.lower()
         can_delete = any(w in name_lower for w in _DELETE_HINTS)
         writes = can_delete or any(w in name_lower for w in _WRITE_HINTS)
+        uses_network = any(w in name_lower for w in _NETWORK_HINTS)
         risk = base_risk_level
         if writes:
             risk = _max_risk(risk, "medium")
@@ -162,6 +167,7 @@ def register_capability_tools(
             writes_external_world=writes,
             can_access_secret=False,
             can_delete=can_delete,
+            uses_network=uses_network,
             allowed_instruction_sources=["trusted_user_command"],
             tool_description_is_instruction=False,
             timeout_seconds=MCP_TOOL_TIMEOUT_SECONDS,

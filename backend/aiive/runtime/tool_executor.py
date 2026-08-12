@@ -70,7 +70,6 @@ def build_action_cards(
         if not isinstance(inner_raw, dict):
             inner_raw = {}
 
-        common = {"trace_id": record.trace_id}
         if record.status == "pending_approval":
             approval = _match_approval(record, pa_by_id, pa_by_name)
             approval_id = str(approval.get("approval_id", "") or "")
@@ -96,7 +95,7 @@ def build_action_cards(
                     ActionCardAction(action="approve", approval_id=approval_id, label="确认执行"),
                     ActionCardAction(action="deny", approval_id=approval_id, label="拒绝"),
                 ],
-                **common,
+                trace_id=record.trace_id,
             ))
         elif record.name == "remind_alert" and record.status == "completed":
             reminder_id = str(inner_raw.get("reminder_id", "") or "")
@@ -144,21 +143,21 @@ def build_action_cards(
                     "pre_enqueue_scan": pre_enqueue_scan,
                     "result": None,
                 },
-                **common,
+                trace_id=record.trace_id,
             ))
         elif record.status == "blocked":
             cards.append(ActionCard(
                 card_type="tool_blocked", title=f"已阻止: {record.name}",
                 summary=record.reason, status="blocked",
                 payload_preview={"tool_name": record.name, "reason": record.reason},
-                **common,
+                trace_id=record.trace_id,
             ))
         elif record.status == "parse_error":
             cards.append(ActionCard(
                 card_type="tool_error", title="工具调用解析失败",
                 summary=record.reason, status="error",
                 payload_preview={"tool_name": record.name, "reason": record.reason},
-                **common,
+                trace_id=record.trace_id,
             ))
         elif record.status in ("completed", "failed", "execution_unknown"):
             operation_id = str(
@@ -181,7 +180,7 @@ def build_action_cards(
                     "result": inner_raw,
                     "operation_id": operation_id,
                 },
-                **common,
+                trace_id=record.trace_id,
             ))
     return cards
 

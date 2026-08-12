@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import PurePath
-from typing import Any
+from typing import Any, ClassVar
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
@@ -23,7 +23,7 @@ router = APIRouter(prefix="/api/agent-tasks", tags=["agent-tasks"])
 
 
 class CreateAgentTaskRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
     thread_id: str = Field(min_length=1, max_length=36)
     goal: str = Field(min_length=1, max_length=20_000)
@@ -37,7 +37,7 @@ class CreateAgentTaskRequest(BaseModel):
 
 
 class TaskInputRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
     content: str = Field(min_length=1, max_length=20_000)
 
 

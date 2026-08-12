@@ -908,3 +908,29 @@ class TestCompactionInputScrub:
         assert refreshed.turn_manifest == original_turn
         assert refreshed.event_manifest == original_event
         assert refreshed.source_hash == original_hash
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 12. Vacuum 安全与阈值
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestVacuumExecutor:
+    def test_sqlite_vacuum_honors_file_size_threshold(self, tmp_path):
+        database_path = tmp_path / "vacuum.db"
+        database_url = f"sqlite:///{database_path}"
+        engine = create_engine(database_url)
+        with engine.begin() as connection:
+            connection.execute(sa_text("CREATE TABLE payload (content BLOB)"))
+            connection.execute(sa_text("INSERT INTO payload VALUES (zeroblob(2097152))"))
+            connection.execute(sa_text("DROP TABLE payload"))
+        engine.dispose()
+
+        executor = VacuumExecutor(database_url)
+        assert executor.sqlite_vacuum(min_freelist_pct=0, min_file_size_mb=100) is False
+        assert executor.sqlite_vacuum(min_freelist_pct=0, min_file_size_mb=0) is True
+
+    def test_postgres_maintenance_rejects_unsafe_table_name(self):
+        executor = VacuumExecutor("postgresql://unused")
+        with pytest.raises(ValueError, match="invalid_table_name"):
+            executor.pg_vacuum_analyze("records; DROP TABLE records")

@@ -81,7 +81,7 @@ def _task(db_session, thread: Thread, **kwargs):
 def test_main_agent_only_has_task_meta_tools() -> None:
     registry = build_main_agent_registry()
     assert {item["capability_id"] for item in registry.list_all()} == {
-        "delegate_task", "get_task_status", "cancel_task", "send_task_input",
+        "list_skills", "delegate_task", "get_task_status", "cancel_task", "send_task_input",
     }
     assert registry.get("desktop_fs_read_text") is None
     assert registry.get("safe_delete") is None
@@ -825,4 +825,11 @@ def test_explicit_git_worktree_isolation_rewrites_task_scope(db_session, tmp_pat
     assert task.task_brief["scope"]["allowed_roots"] == [workspace]
     assert (tmp_path / "repository" / ".data" / "task-worktrees" / task.id).resolve() == Path(workspace).resolve()
     assert (Path(workspace) / "README.md").exists()
-    WorktreeIsolation(repository).remove(task.id)
+    isolation = WorktreeIsolation(repository)
+    isolation.remove(task.id)
+
+    # 删除 worktree 不会删除分支；再次创建必须复用原分支，不能用 -b 重建。
+    recreated = isolation.create(task.id)
+    assert recreated.resolve() == Path(workspace).resolve()
+    assert (recreated / "README.md").exists()
+    isolation.remove(task.id)

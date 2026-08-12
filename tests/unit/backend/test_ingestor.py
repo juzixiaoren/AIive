@@ -2,6 +2,7 @@
 from aiive.db.models import Chunk, Document
 from aiive.knowledge.chunker import chunk_text
 from aiive.knowledge.ingestor import KnowledgeIngestor
+from aiive.knowledge.ingestor import search_chunks
 from aiive.storage.object_store import ObjectRef, exists
 
 
@@ -107,3 +108,20 @@ class TestIngestor:
         assert two["duplicate"] is True
         assert two["document_id"] == one["document_id"]
         assert document.object_key.endswith(one["content_hash"])
+
+    def test_search_is_multi_term_ranked_and_escapes_wildcards(self, db_session, tmp_path):
+        first = tmp_path / "first.md"
+        second = tmp_path / "second.md"
+        first.write_text("季度报告\n收入增长 20%\n产品表现稳定", encoding="utf-8")
+        second.write_text("收入说明\n没有增长数据", encoding="utf-8")
+        ingestor = KnowledgeIngestor(db_session)
+        first_result = ingestor.ingest(str(first))
+        ingestor.ingest(str(second))
+
+        results = search_chunks(db_session, "收入 增长 20%", 5)
+        assert results[0]["document_id"] == first_result["document_id"]
+        assert results[0]["matched_terms"] == ["收入", "增长", "20%"]
+        assert [item["document_id"] for item in search_chunks(db_session, "%", 5)] == [
+            first_result["document_id"],
+        ]
+        assert search_chunks(db_session, "_missing_", 5) == []

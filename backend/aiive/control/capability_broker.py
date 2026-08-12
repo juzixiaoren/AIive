@@ -34,9 +34,9 @@ class CapabilityBroker:
         policy: TaskPolicyEngine | None = None,
         locks: ResourceLockService | None = None,
     ) -> None:
-        self.db = db
-        self.policy = policy or TaskPolicyEngine()
-        self.locks = locks or ResourceLockService()
+        self.db: Session = db
+        self.policy: TaskPolicyEngine = policy or TaskPolicyEngine()
+        self.locks: ResourceLockService = locks or ResourceLockService()
 
     def registry_for(self, task: AgentTask) -> ToolRegistry:
         scope = TaskScope.from_brief(task.task_brief or {})

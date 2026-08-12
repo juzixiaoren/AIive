@@ -26,7 +26,7 @@ from aiive.worker.handler_registry import HandlerRegistry
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome
 from aiive.worker.outbox_heartbeat import ActiveClaimRegistry
 from aiive.worker.outbox_worker import OutboxWorker
-from tests._util import (
+from backend.tests._util import (
     FakeLLM,
     add_event,
     add_turn,
@@ -431,4 +431,3 @@ def test_retention_cleanup_run_deadlettered_with_outbox_job(db):
         RetentionCleanupRun.outbox_job_id == "job-rc").first()
     assert job2.status == "deadletter"
     assert run2.status == "deadletter"
-

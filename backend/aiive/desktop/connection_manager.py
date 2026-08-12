@@ -37,7 +37,7 @@ class DesktopConnectionManager:
     def __init__(self) -> None:
         self._connections: dict[str, WebSocket] = {}
         self._pending: dict[str, _PendingDispatch] = {}
-        self._lock = threading.Lock()
+        self._lock: threading.Lock = threading.Lock()
         self._main_loop: asyncio.AbstractEventLoop | None = None
 
     def set_main_loop(self, loop: asyncio.AbstractEventLoop) -> None:

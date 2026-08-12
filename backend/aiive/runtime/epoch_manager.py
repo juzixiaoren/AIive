@@ -29,7 +29,6 @@ from aiive.db.models import (
     WorkingState,
 )
 from aiive.runtime.compaction import (
-    NON_TERMINAL_TURN_STATUSES,
     build_working_state_snapshot,
     freeze_compaction_input,
     working_state_snapshot_hash,

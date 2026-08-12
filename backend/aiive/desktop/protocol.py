@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -146,7 +146,7 @@ def definition_for(capability_id: str) -> DesktopCapabilityDefinition | None:
 class DesktopActionEnvelope(BaseModel):
     """服务器发送给 Node 的不可变 Action 身份与约束。"""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
     request_id: str
     action_id: str
@@ -163,7 +163,7 @@ class DesktopActionEnvelope(BaseModel):
 
 
 class DesktopActionAck(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
     request_id: str
     action_id: str
@@ -171,7 +171,7 @@ class DesktopActionAck(BaseModel):
 
 
 class DesktopJournalEntry(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="ignore")
 
     action_id: str
     idempotency_key: str

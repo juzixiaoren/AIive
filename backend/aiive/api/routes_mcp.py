@@ -43,6 +43,10 @@ def search_mcp(request: MCPSearchRequest):
                 "risk_notes": c.risk_notes,
                 "definition_trust_level": c.definition_trust_level,
                 "descriptor_hash": c.descriptor_hash,
+                "required_env": c.required_env,
+                "homepage": c.homepage,
+                "installable": c.installable,
+                "match_score": c.match_score,
             }
             for c in candidates
         ]
@@ -72,6 +76,8 @@ def list_capabilities(state: str = "candidate"):
                 "description": c.description,
                 "declared_tools": c.declared_tools,
                 "descriptor_hash": c.descriptor_hash,
+                "homepage": c.homepage,
+                "installable": c.installable,
             }
             for c in all_candidates
         ]

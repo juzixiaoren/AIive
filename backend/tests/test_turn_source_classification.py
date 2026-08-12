@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from aiive.db.models import Event
 from aiive.runtime.context_assembler import ContextAssembler
 from aiive.runtime.thread_state import ThreadState
-from tests._util import add_event, add_turn, new_thread
+from backend.tests._util import add_event, add_turn, new_thread
 
 
 class _FakeTokenCounter:

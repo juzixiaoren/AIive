@@ -62,7 +62,7 @@ class MemoryReadModel:
 
     def __init__(self, store: MemoryStore) -> None:
         self._store: MemoryStore = store
-        self._policy = MemoryPolicyEngine()
+        self._policy: MemoryPolicyEngine = MemoryPolicyEngine()
 
     # ------------------------------------------------------------------
     # Runtime Identity

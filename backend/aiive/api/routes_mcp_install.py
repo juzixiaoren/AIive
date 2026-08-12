@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -32,10 +32,10 @@ class InstallRequest(BaseModel):
     env_keys: 运行时需要从服务端宿主环境透传的环境变量名（如 API key 名）。
     """
     package_ref: str = Field(...)
-    version: str = "latest"
+    version: str = ""
     transport: str = "stdio"
-    launch_args: list[str] = []
-    env_keys: list[str] = []
+    launch_args: list[str] = Field(default_factory=list)
+    env_keys: list[str] = Field(default_factory=list)
 
 
 class SmokeRequest(BaseModel):
@@ -45,7 +45,7 @@ class SmokeRequest(BaseModel):
     指定时额外对该工具做一次真实 tools/call。
     """
     tool_name: str = ""
-    params: dict[str, Any] = {}
+    params: dict[str, Any] = Field(default_factory=dict)
 
 
 @router.post("/{candidate_name:path}/install-sandbox")
@@ -70,11 +70,23 @@ def install_to_sandbox(
         return {"ok": False, "error": f"No MCP candidate found for: {candidate_name}"}
 
     candidate = matched[0]
+    if request.package_ref != candidate.package_ref:
+        raise HTTPException(status_code=400, detail="package_ref must match the catalog candidate")
+    requested_version = request.version or candidate.version
+    if requested_version != candidate.version:
+        raise HTTPException(status_code=400, detail="version must match the pinned catalog version")
+    requested_env = set(request.env_keys or candidate.required_env)
+    undeclared_env = requested_env - set(candidate.required_env)
+    if undeclared_env:
+        raise HTTPException(
+            status_code=400,
+            detail=f"env_keys not declared by catalog: {sorted(undeclared_env)}",
+        )
     result = install_sandbox(
         db=db,
         candidate_name=candidate.name,
         package_ref=request.package_ref,
-        version=request.version,
+        version=requested_version,
         transport=request.transport,
         declared_tools=candidate.declared_tools,
         definition={
@@ -85,7 +97,7 @@ def install_to_sandbox(
             "trust_level": candidate.definition_trust_level,
         },
         launch_args=request.launch_args,
-        env_keys=request.env_keys or candidate.required_env,
+        env_keys=sorted(requested_env),
     )
     db.commit()
     return result

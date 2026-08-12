@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -13,7 +13,7 @@ _CAPABILITY_NAME = re.compile(r"^desktop_[a-z0-9_]{1,96}$")
 class DesktopCapability(BaseModel):
     """由桌面节点声明、经后端再次校验的单个工具定义。"""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
     name: str
     description: str = Field(min_length=1, max_length=1000)
@@ -49,7 +49,7 @@ class DesktopCapability(BaseModel):
 class DesktopHello(BaseModel):
     """Desktop Node 建立连接后的首个 hello 消息。"""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
     node_id: str = Field(min_length=8, max_length=36)
     name: str = Field(min_length=1, max_length=128)
@@ -64,7 +64,7 @@ class DesktopHello(BaseModel):
 class DesktopBindRequest(BaseModel):
     """将一个现有线程绑定到指定桌面节点。"""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
     thread_id: str = Field(min_length=1, max_length=36)
     node_id: str = Field(min_length=8, max_length=36)
@@ -73,7 +73,7 @@ class DesktopBindRequest(BaseModel):
 class DesktopOperationResult(BaseModel):
     """Desktop Node 返回的一次工具执行终态。"""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
     request_id: str = Field(min_length=1, max_length=64)
     action_id: str = Field(default="", max_length=64)

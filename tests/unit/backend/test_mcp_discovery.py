@@ -31,10 +31,10 @@ class TestSearchMCP:
 
     def test_search_returns_results_for_goal(self):
         """验证按目标搜索能返回相关结果。"""
-        results = search_mcp_candidates("github")
+        results = search_mcp_candidates("sequential thinking")
         assert len(results) > 0
         names = [r.name for r in results]
-        assert any("github" in n.lower() for n in names)
+        assert any("sequential-thinking" in n.lower() for n in names)
 
     def test_search_returns_results_for_file(self):
         """验证按文件类型搜索能返回结果。"""
@@ -43,7 +43,7 @@ class TestSearchMCP:
 
     def test_search_returns_results_for_database(self):
         """验证按数据库类型搜索能返回结果。"""
-        results = search_mcp_candidates("database query")
+        results = search_mcp_candidates("reasoning")
         assert len(results) > 0
 
     def test_results_have_descriptor_hash(self):
@@ -61,23 +61,24 @@ class TestSearchMCP:
 
     def test_results_have_risk_notes(self):
         """验证搜索结果都包含风险说明。"""
-        results = search_mcp_candidates("github")
+        results = search_mcp_candidates("memory")
         for r in results:
             assert r.risk_notes
 
-    def test_official_registry_is_semi_trusted(self):
-        """验证官方注册源的结果可信等级为 semi_trusted。"""
+    def test_official_reference_catalog_is_semi_trusted(self):
+        """验证官方 reference catalog 的结果可信等级为 semi_trusted。"""
         results = search_mcp_candidates("filesystem")
-        official = [r for r in results if r.source == "official_registry"]
+        official = [r for r in results if r.source == "official_reference"]
         for r in official:
             assert r.definition_trust_level == "semi_trusted"
 
-    def test_community_source_is_untrusted(self):
-        """验证社区来源的结果可信等级为 untrusted。"""
-        results = search_mcp_candidates("memory")
-        community = [r for r in results if r.source == "community"]
-        for r in community:
-            assert r.definition_trust_level == "untrusted"
+    def test_catalog_only_recommends_maintained_installable_presets(self):
+        """内置预设不再推荐已经归档的 Brave/GitHub/Postgres/Puppeteer 包。"""
+        results = search_mcp_candidates("")
+        assert len(results) == 4
+        assert all(r.source == "official_reference" and r.installable for r in results)
+        names = {r.name for r in results}
+        assert not any(token in " ".join(names) for token in ("github", "brave", "postgres", "puppeteer"))
 
     def test_results_are_mcpservercandidate_instances(self):
         """验证搜索结果均为 MCPServerCandidate 实例。"""

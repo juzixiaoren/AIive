@@ -3,6 +3,8 @@ API路由模块：工具管理
 - 提供工具注册表查询接口
 - 提供安全删除（safe-delete）接口
 """
+from typing import Any
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -35,7 +37,10 @@ def list_tools():
 
 
 @router.get("/tool-operations/{operation_id}")
-def get_tool_operation(operation_id: str, db: Session = Depends(get_db)) -> dict:
+def get_tool_operation(
+    operation_id: str,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
     """查询副作用工具操作的真实当前状态和已确认结果。"""
     operation = db.get(ToolOperation, operation_id)
     if operation is None:
@@ -56,7 +61,7 @@ def get_tool_operation(operation_id: str, db: Session = Depends(get_db)) -> dict
 
 
 @router.post("/tools/safe-delete")
-def safe_delete_tool(_request: SafeDeleteRequest) -> dict:
+def safe_delete_tool(_request: SafeDeleteRequest) -> dict[str, Any]:
     """拒绝绕过 ToolRegistry、审批和持久化 operation 的直接删除入口。"""
     raise HTTPException(
         status_code=409,

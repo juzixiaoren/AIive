@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any, cast
 
 from sqlalchemy import and_, delete, or_, text
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
 from aiive.config import settings
@@ -66,8 +68,8 @@ class MemoryVectorProjectionService:
         db: Session,
         provider_factory: EmbeddingFactory = build_embedding_provider,
     ) -> None:
-        self._db = db
-        self._provider_factory = provider_factory
+        self._db: Session = db
+        self._provider_factory: EmbeddingFactory = provider_factory
 
     def refresh(self, memory_id: str, expected_version: int) -> str:
         """按当前 MemoryRecord 状态幂等 upsert 或删除投影。"""
@@ -95,19 +97,20 @@ class MemoryVectorProjectionService:
 
     def delete(self, memory_id: str, expected_version: int) -> str:
         """原子删除不高于事件版本的投影，防止旧任务移除新版本。"""
-        deleted_count = self._db.execute(
+        delete_result = cast(CursorResult[Any], self._db.execute(
             delete(MemoryVectorProjection).where(
                 MemoryVectorProjection.memory_id == memory_id,
                 MemoryVectorProjection.record_version <= expected_version,
             )
-        ).rowcount
+        ))
+        deleted_count = delete_result.rowcount
         if deleted_count:
             return "deleted"
 
         current_version = self._db.execute(
             text(
                 "SELECT record_version FROM memory_vector_projections "
-                "WHERE memory_id = :memory_id"
+                + "WHERE memory_id = :memory_id"
             ),
             {"memory_id": memory_id},
         ).scalar_one_or_none()

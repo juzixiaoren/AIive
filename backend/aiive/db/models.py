@@ -244,7 +244,7 @@ class ApprovalRequest(Base):
         Index("ix_approval_task_status", "task_id", "status"),
         CheckConstraint(
             "((turn_record_id IS NOT NULL AND action_id IS NULL AND task_id IS NULL) "
-            "OR (turn_record_id IS NULL AND action_id IS NOT NULL AND task_id IS NOT NULL))",
+            + "OR (turn_record_id IS NULL AND action_id IS NOT NULL AND task_id IS NOT NULL))",
             name="ck_approval_exactly_one_owner",
         ),
         CheckConstraint(
@@ -360,7 +360,7 @@ class MemoryRecord(Base):
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
     )
 
-    __table_args__ = (
+    __table_args__: tuple[CheckConstraint, ...] = (
         CheckConstraint(
             "sensitivity IN ('normal','personal','confidential','secret')",
             name="ck_memory_records_sensitivity",
@@ -595,7 +595,7 @@ class Document(Base):
     status: Mapped[str] = mapped_column(String(32), default="indexed", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
-    __table_args__ = (
+    __table_args__: tuple[CheckConstraint, ...] = (
         CheckConstraint(
             "status IN ('indexed','index_failed','source_unavailable')",
             name="ck_documents_status",
@@ -1574,8 +1574,8 @@ class AgentTask(Base):
         Index("ix_agent_tasks_node_status", "target_node_id", "status"),
         CheckConstraint(
             "status IN ('queued','dispatching','running','blocked_approval',"
-            "'blocked_user','blocked_node','reconciling','verifying','succeeded',"
-            "'partial','failed','cancelled')",
+            + "'blocked_user','blocked_node','reconciling','verifying','succeeded',"
+            + "'partial','failed','cancelled')",
             name="ck_agent_task_status",
         ),
     )
@@ -1664,7 +1664,7 @@ class AgentAction(Base):
         Index("ix_agent_actions_node_status", "target_node_id", "status"),
         CheckConstraint(
             "status IN ('planned','validated','awaiting_approval','ready','dispatched',"
-            "'running','succeeded','failed','cancelled','unknown','invalidated')",
+            + "'running','succeeded','failed','cancelled','unknown','invalidated')",
             name="ck_agent_action_status",
         ),
     )

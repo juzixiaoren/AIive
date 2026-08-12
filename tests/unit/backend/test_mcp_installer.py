@@ -80,7 +80,7 @@ class TestMCPInstaller:
             db=db_session,
             candidate_name="test2",
             package_ref="npm:test2",
-            version="2.0",
+            version="2.0.0",
             transport="stdio",
             declared_tools=["t1"],
             definition={},
@@ -98,7 +98,7 @@ class TestMCPInstaller:
             db=db_session,
             candidate_name="test3",
             package_ref="npm:test3",
-            version="1.0",
+            version="1.0.0",
             transport="stdio",
             declared_tools=["echo"],
             definition={},
@@ -109,21 +109,21 @@ class TestMCPInstaller:
         assert len(versions) == 1
         assert versions[0].tool_list_hash is not None
 
-    def test_reinstall_with_same_hash_no_state_change(self, db_session, fake_npm):
-        """验证相同哈希重新安装不改变状态。"""
-        install_sandbox(db_session, "same", "npm:same", "1.0", "stdio", ["echo"], {})
+    def test_reinstall_with_same_hash_requires_review(self, db_session, fake_npm):
+        """即使描述符相同，真实重装也必须重新冒烟。"""
+        install_sandbox(db_session, "same", "npm:same", "1.0.0", "stdio", ["echo"], {})
         db_session.flush()
-        install_sandbox(db_session, "same", "npm:same", "1.0", "stdio", ["echo"], {})
+        install_sandbox(db_session, "same", "npm:same", "1.0.0", "stdio", ["echo"], {})
         db_session.flush()
 
         cap = db_session.query(Capability).filter(Capability.capability_id == "mcp:same").first()
-        assert cap.state == "sandbox"
+        assert cap.state == "needs_review"
 
     def test_hash_change_triggers_needs_review(self, db_session, fake_npm):
         """验证哈希变更时触发 needs_review 状态。"""
-        install_sandbox(db_session, "changed", "npm:changed", "1.0", "stdio", ["echo"], {"v": 1})
+        install_sandbox(db_session, "changed", "npm:changed", "1.0.0", "stdio", ["echo"], {"v": 1})
         db_session.flush()
-        install_sandbox(db_session, "changed", "npm:changed", "2.0", "stdio", ["echo"], {"v": 2})
+        install_sandbox(db_session, "changed", "npm:changed", "2.0.0", "stdio", ["echo"], {"v": 2})
         db_session.flush()
 
         cap = db_session.query(Capability).filter(Capability.capability_id == "mcp:changed").first()
@@ -136,7 +136,7 @@ class TestMCPInstaller:
 
         monkeypatch.setattr(installer_mod, "_run_npm_install", _must_not_run)
         result = install_sandbox(
-            db_session, "evil", "npm:evil-package", "1.0", "stdio", [], {},
+            db_session, "evil", "npm:evil-package", "1.0.0", "stdio", [], {},
         )
         assert result["ok"] is False
         assert result["installed"] is False
@@ -155,7 +155,7 @@ class TestMCPInstaller:
                              "sandbox_path": str(d)},
         )
         result = install_sandbox(
-            db_session, "test-server", "npm:test-server", "1.0", "stdio", [], {},
+            db_session, "test-server", "npm:test-server", "1.0.0", "stdio", [], {},
         )
         assert result["ok"] is False
         assert "npm install exit=1" in result["error"]
@@ -167,7 +167,7 @@ class TestSmoke:
 
     def test_smoke_passed_activates_capability(self, db_session, fake_npm):
         """验证冒烟测试通过后能力状态变为 active。"""
-        install_sandbox(db_session, "smoke-test", "npm:test", "1.0", "stdio", ["echo"], {})
+        install_sandbox(db_session, "smoke-test", "npm:test", "1.0.0", "stdio", ["echo"], {})
         db_session.flush()
 
         result = run_smoke(db_session, "mcp:smoke-test", {"ok": True, "tool": "echo"})
@@ -176,7 +176,7 @@ class TestSmoke:
 
     def test_smoke_failed_sets_needs_review(self, db_session, fake_npm):
         """验证冒烟测试失败后状态变为 needs_review。"""
-        install_sandbox(db_session, "fail-test", "npm:test", "1.0", "stdio", ["echo"], {})
+        install_sandbox(db_session, "fail-test", "npm:test", "1.0.0", "stdio", ["echo"], {})
         db_session.flush()
 
         result = run_smoke(db_session, "mcp:fail-test", {"ok": False})
@@ -185,7 +185,7 @@ class TestSmoke:
 
     def test_smoke_retry_from_needs_review(self, db_session, fake_npm):
         """needs_review 状态允许再次冒烟（修复单向死路）。"""
-        install_sandbox(db_session, "retry-test", "npm:test", "1.0", "stdio", ["echo"], {})
+        install_sandbox(db_session, "retry-test", "npm:test", "1.0.0", "stdio", ["echo"], {})
         db_session.flush()
         run_smoke(db_session, "mcp:retry-test", {"ok": False, "error": "spawn failed"})
         db_session.flush()
@@ -200,7 +200,7 @@ class TestSmoke:
 
     def test_smoke_wrong_state(self, db_session, fake_npm):
         """验证对已激活能力重复冒烟测试返回失败。"""
-        install_sandbox(db_session, "active-one", "npm:test", "1.0", "stdio", ["echo"], {})
+        install_sandbox(db_session, "active-one", "npm:test", "1.0.0", "stdio", ["echo"], {})
         db_session.flush()
         run_smoke(db_session, "mcp:active-one", {"ok": True})
         db_session.flush()
@@ -257,7 +257,7 @@ class TestSmokeCapabilityDeclaredTool:
         self, db_session, fake_npm, stub_runtime_routes,
     ):
         """指定的工具不在真实工具列表 → 冒烟失败并写 needs_review。"""
-        install_sandbox(db_session, "srv", "npm:srv", "1.0", "stdio", ["real_tool"], {})
+        install_sandbox(db_session, "srv", "npm:srv", "1.0.0", "stdio", ["real_tool"], {})
         db_session.flush()
         stub_runtime_routes(["real_tool"])
 
@@ -276,7 +276,7 @@ class TestSmokeCapabilityDeclaredTool:
         self, db_session, fake_npm, stub_runtime_routes,
     ):
         """真实工具列表内的工具调用成功 → 能力转 active。"""
-        install_sandbox(db_session, "srv2", "npm:srv2", "1.0", "stdio", ["real_tool"], {})
+        install_sandbox(db_session, "srv2", "npm:srv2", "1.0.0", "stdio", ["real_tool"], {})
         db_session.flush()
         stub_runtime_routes(["real_tool"], call_ok=True)
 
@@ -293,7 +293,7 @@ class TestSmokeCapabilityDeclaredTool:
         self, db_session, fake_npm, stub_runtime_routes,
     ):
         """不指定 tool_name 时默认做 tools/list 校验，并记录声明差异。"""
-        install_sandbox(db_session, "srv2", "npm:srv2", "1.0", "stdio",
+        install_sandbox(db_session, "srv2", "npm:srv2", "1.0.0", "stdio",
                         ["real_tool", "ghost_tool"], {})
         db_session.flush()
         stub_runtime_routes(["real_tool", "extra_tool"])

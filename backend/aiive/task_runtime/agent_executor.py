@@ -25,8 +25,8 @@ class AgentDecision:
 
 class TaskAgentExecutor:
     def __init__(self, db: Session, llm_client: LLMClient | None = None):
-        self.db = db
-        self.llm = llm_client or default_llm_client()
+        self.db: Session = db
+        self.llm: LLMClient = llm_client or default_llm_client()
 
     def decide(self, task: AgentTask, capabilities: list[dict[str, Any]]) -> AgentDecision:
         task_id = task.id

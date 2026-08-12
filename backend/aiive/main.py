@@ -42,6 +42,7 @@ from aiive.api.routes_forget import router as forget_router
 from aiive.api.routes_approval import router as approval_router
 from aiive.api.routes_desktop import router as desktop_router
 from aiive.api.routes_agent_tasks import router as agent_tasks_router
+from aiive.api.routes_skills import router as skills_router
 from aiive.config import settings
 
 logger = logging.getLogger(__name__)
@@ -206,8 +207,20 @@ def create_app() -> FastAPI:
             ensure_memory_vector_backfill()
         try:
             # 重启后恢复已激活 MCP 能力的工具注册（注册表是进程内状态，DB 才是权威）
+            from aiive.db.base import SessionLocal
+            from aiive.mcp.builtin import ensure_builtin_mcp_capability
             from aiive.mcp.bootstrap import restore_active_capabilities
             from aiive.tools.registry import get_tool_registry
+
+            builtin_db = SessionLocal()
+            try:
+                ensure_builtin_mcp_capability(builtin_db)
+                builtin_db.commit()
+            except Exception:
+                builtin_db.rollback()
+                raise
+            finally:
+                builtin_db.close()
             restore_active_capabilities(get_tool_registry())
         except Exception:
             logger.exception("MCP 已激活能力恢复注册失败")
@@ -314,6 +327,7 @@ def create_app() -> FastAPI:
     app.include_router(approval_router)
     app.include_router(desktop_router)
     app.include_router(agent_tasks_router)
+    app.include_router(skills_router)
     return app
 
 

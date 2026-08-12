@@ -193,7 +193,8 @@ def main() -> None:
         raise SystemExit(f"Logo source not found: {SOURCE_PATH}")
 
     BRAND_DIR.mkdir(parents=True, exist_ok=True)
-    logo = extract_logo(Image.open(SOURCE_PATH))
+    with Image.open(SOURCE_PATH) as source:
+        logo = extract_logo(source)
     logo = logo.resize((1024, 1024), Image.Resampling.LANCZOS)
     logo.save(LOGO_PATH, optimize=True)
 

@@ -6,6 +6,7 @@ API路由模块：聊天接口
 """
 import json
 import logging
+from typing import ClassVar, NoReturn
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -32,12 +33,23 @@ def _llm_error_payload(error: LLMClientError) -> dict[str, object]:
     }
 
 
-def _raise_llm_http_error(error: LLMClientError) -> None:
+def _raise_llm_http_error(error: LLMClientError) -> NoReturn:
     """将 LLM 错误转换为稳定的 HTTP 状态和响应体。"""
     raise HTTPException(
         status_code=error.status_code or 503,
         detail=_llm_error_payload(error),
     )
+
+
+def _http_status(value: object, default: int = 500) -> int:
+    """把不可信的运行时状态安全收敛到合法 HTTP 错误码。"""
+    if isinstance(value, bool):
+        return default
+    try:
+        status = int(value) if isinstance(value, (int, str)) else default
+    except ValueError:
+        return default
+    return status if 400 <= status <= 599 else default
 
 
 def _chat_error_payload(result: dict[str, object]) -> dict[str, object]:
@@ -49,7 +61,7 @@ def _chat_error_payload(result: dict[str, object]) -> dict[str, object]:
         "retryable": bool(result.get("retryable", False)),
         "trace_id": result.get("trace_id"),
         "retry_after_seconds": result.get("retry_after_seconds"),
-        "status": int(result.get("_status", 500) or 500),
+        "status": _http_status(result.get("_status", 500)),
     }
     for key in (
         "safe_tokens", "context_window", "hard_input_limit",
@@ -60,13 +72,13 @@ def _chat_error_payload(result: dict[str, object]) -> dict[str, object]:
     return payload
 
 
-def _raise_chat_result_error(result: dict[str, object]) -> None:
+def _raise_chat_result_error(result: dict[str, object]) -> NoReturn:
     """将同步 TurnExecution 错误转换为稳定 HTTP 响应。"""
     payload = _chat_error_payload(result)
-    raise HTTPException(status_code=int(payload["status"]), detail=payload)
+    raise HTTPException(status_code=_http_status(payload["status"]), detail=payload)
 
 
-def _raise_turn_conflict_error(error: TurnConflictError) -> None:
+def _raise_turn_conflict_error(error: TurnConflictError) -> NoReturn:
     """将 TurnConflictError 转换为与 SSE error payload 相同的结构化 detail。"""
     message = str(error)
     status = 202 if message == "turn_in_progress" else 409
@@ -83,7 +95,7 @@ def _raise_turn_conflict_error(error: TurnConflictError) -> None:
 class ChatRequest(BaseModel):
     """聊天请求体；消息来源只能由服务端路由确定。"""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
     message: str = Field(..., min_length=1)
     thread_id: str | None = None
@@ -93,7 +105,7 @@ class ChatRequest(BaseModel):
 class SystemChatRequest(BaseModel):
     """系统指令请求；来源固定由该服务端端点赋值。"""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
     message: str = Field(..., min_length=1)
     thread_id: str

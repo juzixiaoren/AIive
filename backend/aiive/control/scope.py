@@ -5,9 +5,11 @@ import posixpath
 import re
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 
 PATH_ARGUMENTS = frozenset({"path", "source", "destination", "cwd", "file_path", "target_file"})
+URL_ARGUMENTS = frozenset({"url"})
 
 
 def _normalize_remote_path(value: str) -> str:
@@ -43,7 +45,7 @@ class TaskScope:
 
     @classmethod
     def from_brief(cls, brief: dict[str, Any]) -> "TaskScope":
-        raw = brief.get("scope") if isinstance(brief, dict) else {}
+        raw = brief.get("scope")
         raw = raw if isinstance(raw, dict) else {}
         return cls(
             allowed_capabilities=frozenset(str(v) for v in raw.get("allowed_capabilities", []) if v),
@@ -68,6 +70,22 @@ class TaskScope:
                 issues.append(f"path_scope_missing:{name}")
             elif not any(path_within(value, root) for root in self.allowed_roots):
                 issues.append(f"path_outside_task_scope:{name}")
+        for name, value in arguments.items():
+            if name not in URL_ARGUMENTS or not isinstance(value, str) or not value:
+                continue
+            try:
+                parsed = urlsplit(value)
+                host = (parsed.hostname or "").casefold()
+            except ValueError:
+                issues.append(f"invalid_network_url:{name}")
+                continue
+            if parsed.scheme not in {"http", "https"} or not host:
+                issues.append(f"invalid_network_url:{name}")
+            elif self.allowed_hosts and not any(
+                host == allowed or host.endswith("." + allowed)
+                for allowed in self.allowed_hosts
+            ):
+                issues.append(f"host_outside_task_scope:{name}")
         if capability_id == "desktop_exec":
             cwd = arguments.get("cwd")
             if not isinstance(cwd, str) or not cwd:

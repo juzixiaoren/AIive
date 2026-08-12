@@ -206,7 +206,8 @@ def activate_capability(plan_id: str, db: Session = Depends(get_db)):
 def _risk_verdict_for(plan: CapabilityPlan, candidate_name: str) -> str:
     """从计划的风险评分中取选中候选的 verdict（缺省 medium）。"""
     for row in plan.risk_scores or []:
-        if isinstance(row, dict) and row.get("candidate") == candidate_name:
+        # JSON 历史数据可能绕过 ORM 类型约束；这里有意保留运行时防御。
+        if isinstance(row, dict) and row.get("candidate") == candidate_name:  # pyright: ignore[reportUnnecessaryIsInstance]
             verdict = str(row.get("verdict", "medium"))
             if verdict in ("low", "medium", "high", "critical"):
                 return verdict

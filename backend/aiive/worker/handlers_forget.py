@@ -59,6 +59,17 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _non_negative_int(value: Any, default: int = 0) -> int:
+    """收敛 LLM/JSON 派生的计数字段，拒绝容器、布尔值和负数。"""
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return max(0, parsed)
+
+
 # selector_type → ForgetTarget.target_type 映射（turn/event 选择器不得写成 memory_record）
 _SELECTOR_TARGET_TYPE: dict[str, str] = {
     "turn_ids": "turn_record",
@@ -1092,7 +1103,7 @@ def _rebuild_summaries_batch(
             source_hash=summary_payload.get("source_hash") or "",
             summary_version=new_version,
             model_id=summary_payload.get("model_id") or "redacted",
-            token_count=int(summary_payload.get("token_count") or 0),
+            token_count=_non_negative_int(summary_payload.get("token_count")),
             created_at=now,
         ))
         db.flush()
@@ -1449,7 +1460,7 @@ def _scrub_event_turn_targets(db: Session, operation_id: str) -> None:
         # 同时兼容直接传 turn_records.id 的旧数据。
         db.execute(sa_text(
             "UPDATE turn_records SET response_payload = NULL "
-            "WHERE turn_id IN :ids OR id IN :ids"
+            + "WHERE turn_id IN :ids OR id IN :ids"
         ).bindparams(ids_bind), {"ids": turn_ids})
         # 该 turn 下的事件正文一并清除
         db.execute(sa_text(

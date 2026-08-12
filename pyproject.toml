@@ -19,8 +19,11 @@ dependencies = [
     "json-repair>=0.30.0",
     "apscheduler>=3.10",
     "litellm>=1.50.0,<2.0.0",
-    "mcp>=1.0",
+    # FastMCP 1.x provides mcp.server.fastmcp used by the bundled stdio server.
+    # MCP SDK 2.x removed that import path and requires a separate migration.
+    "mcp>=1.0,<2.0",
     "pillow>=10.0",
+    "pypdf>=5.0",
 ]
 
 [project.optional-dependencies]
@@ -38,6 +41,7 @@ where = ["backend"]
 
 [tool.setuptools.package-data]
 "aiive.prompts" = ["manifest.toml", "**/*.md"]
+"aiive.skills" = ["builtin/**/SKILL.md"]
 
 [tool.basedpyright]
 include = ["backend"]

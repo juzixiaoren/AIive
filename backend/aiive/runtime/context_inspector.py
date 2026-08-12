@@ -83,8 +83,10 @@ def get_system_contract() -> ContextSection:
         title="Stable Contract（系统提示词）",
         kind="static",
         content=rendered.content,
-        source=f"prompts/agent/stable_contract.md @{rendered.version} "
-               f"(sha256:{rendered.sha256[:12]})",
+        source=(
+            f"prompts/agent/stable_contract.md @{rendered.version} "
+            + f"(sha256:{rendered.sha256[:12]})"
+        ),
         note="纯文件资源，离线即可完整渲染。",
     )
 
@@ -114,8 +116,10 @@ def get_runtime_identity_placeholder() -> ContextSection:
         kind="dynamic",
         content=body,
         source="memory/memory_read_model.py:resolve_identity",
-        note="身份字段来自 memory_records（context_role=runtime_identity），"
-             "离线不连 DB 仅展示模板；仅保留 Core Memory 投影不了的字段。",
+        note=(
+            "身份字段来自 memory_records（context_role=runtime_identity），"
+            + "离线不连 DB 仅展示模板；仅保留 Core Memory 投影不了的字段。"
+        ),
     )
 
 
@@ -228,8 +232,10 @@ def get_core_memory_source_map() -> ContextSection:
         kind="static",
         content=body,
         source="memory/memory_key_registry.py:get_core_memory_keys",
-        note="区块结构离线可见；区块实时内容来自 core_memory_blocks 表 / "
-             "memory_records 投影，离线不连 DB 以占位表示。",
+        note=(
+            "区块结构离线可见；区块实时内容来自 core_memory_blocks 表 / "
+            + "memory_records 投影，离线不连 DB 以占位表示。"
+        ),
     )
 
 
@@ -245,10 +251,10 @@ def get_working_state_template() -> ContextSection:
     lines = [f"- {label}：{field}" for label, field in fields]
     body = (
         "【字段模板（真实，来自 runtime/working_state.py:render_for_context）】\n"
-        "## Working State（当前操作上下文，有界）\n"
+        + "## Working State（当前操作上下文，有界）\n"
         + "\n".join(lines)
         + "\n\n【实时值占位 —— 需 DB：WorkingStateService.render_for_context()】\n"
-        "{working_state_text}"
+        + "{working_state_text}"
     )
     return ContextSection(
         key="working_state",
@@ -368,12 +374,16 @@ def render_markdown(dump: ContextDump) -> str:
     parts.append("")
     parts.append(f"> 生成时间：{dump.generated_at}")
     parts.append(">")
-    parts.append("> 本文件由 `scripts/dump_agent_context.py` 离线生成，**不连接数据库、"
-                 "不绑定线程、不依赖任何会话状态**。")
+    parts.append(
+        "> 本文件由 `scripts/dump_agent_context.py` 离线生成，**不连接数据库、"
+        + "不绑定线程、不依赖任何会话状态**。"
+    )
 
 
-    parts.append("> 静态部分展示真实文本/真实结构；动态部分（仅真实会话中存在）"
-                 "以 `{xxx}` 占位，便于阅读者判断上下文骨架是否合理、哪里需要精简。")
+    parts.append(
+        "> 静态部分展示真实文本/真实结构；动态部分（仅真实会话中存在）"
+        + "以 `{xxx}` 占位，便于阅读者判断上下文骨架是否合理、哪里需要精简。"
+    )
     parts.append("")
 
     # 分区总览表

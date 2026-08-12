@@ -55,7 +55,7 @@ class ConflictResolver:
         conflict_policy: str = key_spec.conflict_policy if key_spec else "supersede"
         content_hash: str = proposal.content_hash or proposal.compute_content_hash()
         structured_hash: str = (
-            self._hash_structured(proposal.structured_value)
+            self.hash_structured(proposal.structured_value)
             if proposal.structured_value else ""
         )
 
@@ -187,7 +187,7 @@ class ConflictResolver:
         return None
 
     @staticmethod
-    def _hash_structured(value: dict[str, Any] | None) -> str:
+    def hash_structured(value: dict[str, Any] | None) -> str:
         if value is None:
             return ""
         try:

@@ -127,6 +127,7 @@ class EvidenceStore:
 
     @staticmethod
     def read(db: Session, evidence: TaskEvidence, offset: int, max_bytes: int) -> tuple[bytes, bool]:
+        _ = db  # 保留兼容的存储接口；对象存储和内联证据读取均不需要会话。
         if evidence.object_bucket and evidence.object_key:
             data = get_range(
                 ObjectRef(evidence.object_bucket, evidence.object_key),

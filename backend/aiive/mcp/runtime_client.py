@@ -23,8 +23,9 @@ import concurrent.futures
 import logging
 import os
 import shutil
+import sys
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -38,15 +39,15 @@ DEFAULT_STARTUP_TIMEOUT_SECONDS = 60.0
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 60.0
 
 try:  # MCP 官方 SDK：延迟失败——导入失败时首次使用会抛出可读错误
-    from mcp import ClientSession, StdioServerParameters
-    from mcp.client.stdio import get_default_environment, stdio_client
-    _MCP_SDK_IMPORT_ERROR: Exception | None = None
+    from mcp import ClientSession, StdioServerParameters  # pyright: ignore[reportMissingImports]
+    from mcp.client.stdio import get_default_environment, stdio_client  # pyright: ignore[reportMissingImports]
+    _mcp_sdk_import_error: Exception | None = None
 except Exception as _import_error:  # pragma: no cover - SDK 已在依赖中
     ClientSession = None  # type: ignore[assignment]
     StdioServerParameters = None  # type: ignore[assignment]
     stdio_client = None  # type: ignore[assignment]
     get_default_environment = None  # type: ignore[assignment]
-    _MCP_SDK_IMPORT_ERROR = _import_error
+    _mcp_sdk_import_error = _import_error
 
 
 def tool_result_is_untrusted() -> bool:
@@ -77,17 +78,20 @@ class MCPLaunchSpec:
     属性:
         command: 可执行文件绝对路径（正常链路恒为 node）
         args: 命令行参数（entry_js 及安装时声明的附加参数）
-        env_keys: 需要从宿主进程环境透传的环境变量名
+        env_keys: 必须从宿主进程环境透传的环境变量名
+        optional_env_keys: 存在时透传、缺省时不告警的环境变量名
     """
     command: str
     args: tuple[str, ...] = ()
     env_keys: tuple[str, ...] = ()
+    optional_env_keys: tuple[str, ...] = ()
 
 
 def build_launch_spec(launch_config: dict[str, Any]) -> MCPLaunchSpec:
     """从安装记录的 launch 配置构造启动规格。
 
-    只接受 installer 写入的结构化字段（runner=node + entry_js + args），
+    只接受 installer 写入的结构化字段（runner=node + entry_js + args），或
+    AIive 固定路径的 bundled Python MCP server，
     不接受任意命令字符串。entry_js 必须真实存在。
 
     参数:
@@ -100,6 +104,22 @@ def build_launch_spec(launch_config: dict[str, Any]) -> MCPLaunchSpec:
         ValueError: 配置缺失/入口不存在/runner 不受支持
     """
     runner = str(launch_config.get("runner", "node"))
+    args = tuple(str(a) for a in launch_config.get("args", []) or [])
+    env_keys = tuple(str(k) for k in launch_config.get("env_keys", []) or [])
+    optional_env_keys = tuple(
+        str(k) for k in launch_config.get("optional_env_keys", []) or []
+    )
+    if runner == "python_builtin":
+        entry_py = Path(str(launch_config.get("entry_py", ""))).resolve()
+        expected = Path(__file__).with_name("builtin_server.py").resolve()
+        if entry_py != expected or not entry_py.is_file():
+            raise ValueError("bundled MCP entry_py is not the trusted builtin server")
+        return MCPLaunchSpec(
+            command=sys.executable,
+            args=(str(entry_py),) + args,
+            env_keys=env_keys,
+            optional_env_keys=optional_env_keys,
+        )
     if runner != "node":
         raise ValueError(f"unsupported MCP runner: {runner}")
     entry_js = str(launch_config.get("entry_js", "")).strip()
@@ -111,12 +131,11 @@ def build_launch_spec(launch_config: dict[str, Any]) -> MCPLaunchSpec:
     node_path = shutil.which("node")
     if not node_path:
         raise ValueError("node executable not found in PATH")
-    args = tuple(str(a) for a in launch_config.get("args", []) or [])
-    env_keys = tuple(str(k) for k in launch_config.get("env_keys", []) or [])
     return MCPLaunchSpec(
         command=node_path,
         args=(str(entry_path),) + args,
         env_keys=env_keys,
+        optional_env_keys=optional_env_keys,
     )
 
 
@@ -129,7 +148,7 @@ class _LoopThread:
 
     def __init__(self) -> None:
         self.loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
-        self.thread = threading.Thread(
+        self.thread: threading.Thread = threading.Thread(
             target=self._run, name="mcp-runtime-loop", daemon=True,
         )
         self.thread.start()
@@ -174,13 +193,13 @@ class _SessionWorker:
         loop_thread: _LoopThread,
         idle_timeout: float,
     ) -> None:
-        self._capability_id = capability_id
-        self._spec = spec
-        self._loop = loop_thread.loop
-        self._idle_timeout = idle_timeout
+        self._capability_id: str = capability_id
+        self._spec: MCPLaunchSpec = spec
+        self._loop: asyncio.AbstractEventLoop = loop_thread.loop
+        self._idle_timeout: float = idle_timeout
         self._queue: asyncio.Queue[Any] | None = None
         self._ready: concurrent.futures.Future[bool] = concurrent.futures.Future()
-        self._closed = False
+        self._closed: bool = False
         loop_thread.call_soon(self._start_in_loop)
 
     # -- 事件循环内部 --------------------------------------------------
@@ -203,11 +222,17 @@ class _SessionWorker:
                 logger.warning(
                     "MCP 能力 %s 声明的环境变量缺失: %s", self._capability_id, key,
                 )
+        for key in self._spec.optional_env_keys:
+            value = os.environ.get(key)
+            if value is not None:
+                env[key] = value
         return env
 
     async def _run(self) -> None:
         assert self._queue is not None
         try:
+            if StdioServerParameters is None or stdio_client is None or ClientSession is None:
+                raise RuntimeError(f"MCP Python SDK unavailable: {_mcp_sdk_import_error}")
             params = StdioServerParameters(
                 command=self._spec.command,
                 args=list(self._spec.args),
@@ -314,10 +339,11 @@ class _SessionWorker:
             return fut.result(timeout)
         except concurrent.futures.TimeoutError:
             fut.cancel()
-            raise TimeoutError(
+            message = (
                 f"MCP request timed out after {timeout:.0f}s: "
-                f"{self._capability_id}/{kind}"
-            ) from None
+                + f"{self._capability_id}/{kind}"
+            )
+            raise TimeoutError(message) from None
 
     def stop(self) -> None:
         """请求会话优雅退出（幂等）。"""
@@ -342,10 +368,10 @@ class MCPRuntimeClient:
     """
 
     def __init__(self, idle_timeout_seconds: float = DEFAULT_IDLE_TIMEOUT_SECONDS):
-        self._idle_timeout = idle_timeout_seconds
+        self._idle_timeout: float = idle_timeout_seconds
         self._specs: dict[str, MCPLaunchSpec] = {}
         self._workers: dict[str, _SessionWorker] = {}
-        self._lock = threading.Lock()
+        self._lock: threading.Lock = threading.Lock()
 
     # -- 配置 -----------------------------------------------------------
 
@@ -363,10 +389,6 @@ class MCPRuntimeClient:
     def _ensure_worker(
         self, capability_id: str, startup_timeout: float,
     ) -> _SessionWorker:
-        if _MCP_SDK_IMPORT_ERROR is not None:  # pragma: no cover
-            raise RuntimeError(
-                f"MCP Python SDK unavailable: {_MCP_SDK_IMPORT_ERROR}"
-            )
         with self._lock:
             worker = self._workers.get(capability_id)
             if worker is not None and worker.alive:
@@ -375,6 +397,10 @@ class MCPRuntimeClient:
             if spec is None:
                 raise RuntimeError(
                     f"MCP capability not configured: {capability_id}"
+                )
+            if _mcp_sdk_import_error is not None:  # pragma: no cover
+                raise RuntimeError(
+                    f"MCP Python SDK unavailable: {_mcp_sdk_import_error}"
                 )
             worker = _SessionWorker(
                 capability_id, spec, _get_loop_thread(), self._idle_timeout,

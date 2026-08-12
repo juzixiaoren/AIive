@@ -172,7 +172,7 @@ def create_memory(request: CreateMemoryRequest,
                 content=record.content,
                 lifecycle_state=record.lifecycle_state,
                 memory_type=record.memory_type,
-                canonical_key=record.canonical_key,
+                canonical_key=record.canonical_key or "",
                 reason=(
                     "所有 source_event 均已计入，不重复强化"
                     if replay_outcome == WriteOutcome.REINFORCE_SKIPPED

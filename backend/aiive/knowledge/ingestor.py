@@ -1,14 +1,16 @@
 """知识文档摄取、持久原文读取和重新索引模块。"""
 
 import logging
-import mimetypes
+import re
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 
 from aiive.db.models import Chunk, Document
 from aiive.knowledge.chunker import chunk_text
+from aiive.knowledge.document_reader import extract_document_bytes
 from aiive.storage.object_store import ObjectRef, get_verified, put_content_addressed
 
 logger = logging.getLogger(__name__)
@@ -20,17 +22,7 @@ class KnowledgeIngestor:
 
     def __init__(self, db: Session):
         """绑定当前数据库事务。"""
-        self._db = db
-
-    @staticmethod
-    def _document_type(path: Path) -> str:
-        """根据来源后缀推断文档类型。"""
-        suffix = path.suffix.lower()
-        if suffix in (".md", ".markdown"):
-            return "markdown"
-        if suffix in (".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs"):
-            return "code"
-        return "text"
+        self._db: Session = db
 
     def _replace_chunks(self, document: Document, content: str) -> int:
         """在当前事务中用持久原文重建全部分块。"""
@@ -57,7 +49,8 @@ class KnowledgeIngestor:
             return {"ok": False, "error": "文件不存在", "path": file_path}
         try:
             data = path.read_bytes()
-            mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            extracted = extract_document_bytes(data, path.name)
+            mime_type = extracted.mime_type
             ref, content_hash = put_content_addressed(
                 KNOWLEDGE_BUCKET, data, {"mime_type": mime_type, "source_name": path.name}
             )
@@ -75,7 +68,7 @@ class KnowledgeIngestor:
                 if chunks == 0:
                     # 去重命中但分块缺失（此前摄取失败/被清理）→ 补建分块
                     chunks = self._replace_chunks(
-                        existing, data.decode("utf-8", errors="replace")
+                        existing, extracted.text
                     )
                     existing.status = "indexed"
                 self._db.flush()
@@ -88,14 +81,15 @@ class KnowledgeIngestor:
                 source_path=str(path.resolve()), content_hash=content_hash,
                 object_bucket=ref.bucket, object_key=ref.key, content_size=len(data),
                 mime_type=mime_type, title=path.name,
-                doc_type=self._document_type(path), status="indexed",
+                doc_type=extracted.doc_type, status="indexed",
             )
             self._db.add(document)
             self._db.flush()
-            count = self._replace_chunks(document, data.decode("utf-8", errors="replace"))
+            count = self._replace_chunks(document, extracted.text)
             return {
                 "ok": True, "document_id": document.id, "chunks": count,
-                "content_hash": content_hash,
+                "content_hash": content_hash, "doc_type": extracted.doc_type,
+                "mime_type": extracted.mime_type, "metadata": extracted.metadata,
             }
         except Exception:
             logger.exception("知识文档摄取失败：%s", file_path)
@@ -120,7 +114,10 @@ class KnowledgeIngestor:
             raise LookupError("知识文档不存在")
         try:
             data = self.read_source(document_id)
-            count = self._replace_chunks(document, data.decode("utf-8", errors="replace"))
+            extracted = extract_document_bytes(data, document.title or Path(document.source_path).name)
+            count = self._replace_chunks(document, extracted.text)
+            document.doc_type = extracted.doc_type
+            document.mime_type = extracted.mime_type
             document.status = "indexed"
             self._db.flush()
             return {"ok": True, "document_id": document.id, "chunks": count}
@@ -152,17 +149,37 @@ class KnowledgeIngestor:
 
 
 def search_chunks(db: Session, query: str, limit: int = 5) -> list[dict[str, Any]]:
-    """基于关键词检索已生成的知识分块。"""
-    results = (
+    """边界化多关键词检索，并按命中覆盖度排序。"""
+    normalized = query.strip().casefold()
+    if not normalized:
+        return []
+    limit = max(1, min(int(limit), 100))
+    tokens = list(dict.fromkeys(token for token in re.split(r"\s+", normalized) if token))[:12]
+
+    def escaped(token: str) -> str:
+        return token.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    filters = [Chunk.content.ilike(f"%{escaped(token)}%", escape="\\") for token in tokens]
+    candidates = (
         db.query(Chunk, Document)
         .join(Document, Chunk.document_id == Document.id)
-        .filter(Chunk.content.ilike(f"%{query}%"))
-        .order_by(Chunk.chunk_index)
-        .limit(limit)
+        .filter(or_(*filters))
+        .order_by(Document.created_at.desc(), Chunk.chunk_index.asc())
+        .limit(min(1000, limit * 20))
         .all()
     )
+    results = sorted(
+        candidates,
+        key=lambda row: (
+            normalized in row[0].content.casefold(),
+            sum(token in row[0].content.casefold() for token in tokens),
+            -row[0].chunk_index,
+        ),
+        reverse=True,
+    )[:limit]
     return [{
         "chunk_id": chunk.id, "document_id": document.id,
         "source_path": document.source_path, "content_preview": chunk.content[:200],
         "line_start": chunk.line_start, "line_end": chunk.line_end,
+        "matched_terms": [token for token in tokens if token in chunk.content.casefold()],
     } for chunk, document in results]

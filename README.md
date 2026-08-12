@@ -295,15 +295,28 @@ AIive/
 ### 文件操作
 - `safe_delete` — 安全删除（scope 保护、符号链接拒绝）
 - `read_text_file` — 读取 ~/Documents 下文本文件
+- `read_document` — 提取 TXT/Markdown/HTML/JSON/CSV/TSV/DOCX/PDF 纯文本
 
 ### 知识库
 - `ingest_document` — 导入文档到知识库
 - `search_knowledge` — 搜索已导入文档
+- `reindex_document` — 从内容寻址原文重建索引
+
+### 联网研究
+- `web_search` — DuckDuckGo（免密钥）/ Brave / SearXNG 搜索
+- `fetch_web_page` — 带 SSRF、重定向、响应大小限制的网页正文抓取
+
+### 内置 Skills
+- `document_processing` — 文档读取、导入、检索与重建
+- `web_research` — 多来源网页搜索与正文取证
+- `knowledge_base` — 本地持久知识库管理
+- `mcp_management` — MCP 搜索、风险规划与沙箱安装
 
 ### MCP 集成
 - `search_mcp` — 搜索 MCP 候选服务器
 - `install_mcp_sandbox` — 安装到沙箱
 - `plan_capability` — 分析目标 → 搜索 → 评估风险 → 生成计划
+- `aiive-essentials` — 随应用启用的零下载 stdio MCP（文档提取、网页搜索、网页抓取）
 
 ### 自进化
 - `create_selfdev_plan` — 生成自进化补丁计划
@@ -325,6 +338,7 @@ AIive/
 | `/api/attention` | 注意力状态 |
 | `/api/selfdev` | 自进化操作 |
 | `/api/knowledge` | 知识库操作 |
+| `/api/skills` | 内置 Skill catalog 与指令详情 |
 | `/api/threads` | 线程管理 |
 | `/api/ws` | WebSocket 实时通信 |
 

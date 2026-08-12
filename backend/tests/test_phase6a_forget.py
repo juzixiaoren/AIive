@@ -47,6 +47,16 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(None, 0), (True, 0), ([], 0), ({}, 0), (-2, 0), ("7", 7), ("invalid", 0)],
+)
+def test_non_negative_int_rejects_invalid_summary_counts(raw, expected):
+    from aiive.worker.handlers_forget import _non_negative_int
+
+    assert _non_negative_int(raw) == expected
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Phase A Shield 测试
 # ═══════════════════════════════════════════════════════════════════

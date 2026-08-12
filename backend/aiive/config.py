@@ -79,6 +79,19 @@ class Settings(BaseSettings):
     # 工具参数首次校验失败后，最多允许模型纠正并重试的次数。
     tool_argument_max_retries: int = 2
 
+    # 公开网页检索与抓取。默认 DuckDuckGo HTML 无需密钥；也可切换 Brave API
+    # 或自建 SearXNG。所有返回内容均标记为不可信外部证据。
+    aiive_web_search_enabled: bool = True
+    aiive_web_search_provider: Literal["duckduckgo", "brave", "searxng"] = "duckduckgo"
+    aiive_brave_search_api_key: str = ""
+    aiive_searxng_base_url: str = ""
+    aiive_web_request_timeout_seconds: int = 15
+    aiive_web_max_response_bytes: int = 2_000_000
+    aiive_web_user_agent: str = "AIive/0.1 (+local-personal-agent)"
+    # 可读取/导入文档的受信根目录，使用 os.pathsep 分隔。留空时默认
+    # ~/Documents 与仓库 .data/knowledge。
+    aiive_knowledge_roots: str = ""
+
     # Electron Desktop Node：节点以出站 WebSocket 连接后端，心跳续租。租约过期后
     # 立即停止向新 Turn 注入该节点的本地工具；在途执行由 operation 状态单独收敛。
     aiive_desktop_node_lease_seconds: int = 45
@@ -121,6 +134,14 @@ class Settings(BaseSettings):
                 raise ValueError("AIIVE_MEMORY_FILE_PROJECTION_DIR 不允许包含父目录跳转")
         if self.tool_argument_max_retries < 0:
             raise ValueError("TOOL_ARGUMENT_MAX_RETRIES 不能小于 0")
+        if self.aiive_web_request_timeout_seconds <= 0:
+            raise ValueError("AIIVE_WEB_REQUEST_TIMEOUT_SECONDS 必须大于 0")
+        if not 1024 <= self.aiive_web_max_response_bytes <= 10_000_000:
+            raise ValueError("AIIVE_WEB_MAX_RESPONSE_BYTES 必须在 1KB 到 10MB 之间")
+        if self.aiive_web_search_provider == "brave" and not self.aiive_brave_search_api_key.strip():
+            raise ValueError("使用 Brave 搜索时必须配置 AIIVE_BRAVE_SEARCH_API_KEY")
+        if self.aiive_web_search_provider == "searxng" and not self.aiive_searxng_base_url.strip():
+            raise ValueError("使用 SearXNG 搜索时必须配置 AIIVE_SEARXNG_BASE_URL")
         if self.aiive_desktop_node_lease_seconds < 15:
             raise ValueError("AIIVE_DESKTOP_NODE_LEASE_SECONDS 不能小于 15")
         if self.aiive_desktop_dispatch_timeout_seconds <= 0:

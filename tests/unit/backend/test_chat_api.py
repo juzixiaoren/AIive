@@ -248,6 +248,26 @@ class TestChatAPI:
         assert detail["hard_input_limit"] == 90
         assert detail["partition_reports"] == [{"name": "recent_messages"}]
 
+    @pytest.mark.parametrize("invalid_status", [None, True, [], "not-a-status", 399, 600])
+    def test_post_chat_invalid_runtime_status_falls_back_to_500(
+        self, client, monkeypatch, invalid_status,
+    ):
+        """运行时返回的不可信状态值不能让错误处理自身崩溃或产生非法 HTTP 状态。"""
+        monkeypatch.setattr(
+            "aiive.api.routes_chat.TurnExecutionService.execute_turn",
+            lambda self, **_kwargs: {
+                "reply": "",
+                "error": "runtime_failure",
+                "message": "runtime failure",
+                "_status": invalid_status,
+            },
+        )
+
+        response = client.post("/api/chat", json={"message": "Hello"})
+
+        assert response.status_code == 500
+        assert response.json()["detail"]["status"] == 500
+
     def test_post_chat_stream_context_budget_error_is_structured(self, client, monkeypatch):
         """SSE 预算超限保持 HTTP 200，但事件业务状态必须为 413。"""
         async def fake_execute_turn_stream(self, **_kwargs):

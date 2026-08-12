@@ -26,7 +26,7 @@ def stable_tool_call_id(data: dict[str, Any]) -> str:
         return f"tc_{turn_id}_{batch_index}"
     logger.warning(
         "工具事件缺少 tool_call_id 且无 (turn_id, batch_index) 回退键，"
-        "该事件将无法配对并被丢弃: event_id=%s", data.get("event_id"),
+        + "该事件将无法配对并被丢弃: event_id=%s", data.get("event_id"),
     )
     return ""
 

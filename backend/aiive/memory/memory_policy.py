@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import ClassVar
 
 from aiive.memory.memory_types import (
     AUTHORITY_RULES,
@@ -67,7 +68,7 @@ _LEGACY_EVIDENCE_SOURCE_MAP: dict[str, str] = {
 class MemoryPolicyEngine:
     """统一执行 evidence taxonomy、写入权威与读取敏感度策略。"""
 
-    REDACTED_CONTENT = "[记忆内容已脱敏]"
+    REDACTED_CONTENT: ClassVar[str] = "[记忆内容已脱敏]"
 
     @staticmethod
     def normalize_evidence_source(source_type: str) -> str | None:

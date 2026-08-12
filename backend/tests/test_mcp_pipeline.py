@@ -41,13 +41,13 @@ class TestDiscovery:
         # filesystem server 应因名称+描述+工具名多重命中排第一
         assert results[0].name == "@modelcontextprotocol/server-filesystem"
 
-    def test_best_match_first_for_github(self):
-        results = search_mcp_candidates("github repository issues")
-        assert results[0].name == "@modelcontextprotocol/server-github"
+    def test_best_match_first_for_sequential_thinking(self):
+        results = search_mcp_candidates("sequential thinking reasoning")
+        assert results[0].name == "@modelcontextprotocol/server-sequential-thinking"
 
     def test_empty_goal_returns_full_catalog(self):
         results = search_mcp_candidates("")
-        assert len(results) == 6
+        assert len(results) == 4
 
     def test_whitelist_contains_catalog_packages(self):
         packages = allowed_npm_packages()
@@ -55,10 +55,10 @@ class TestDiscovery:
         assert "evil-package" not in packages
 
     def test_get_candidate_by_name(self):
-        c = get_candidate_by_name("@modelcontextprotocol/server-github")
+        c = get_candidate_by_name("@modelcontextprotocol/server-memory")
         assert c is not None
         assert c.definition_trust_level == "semi_trusted"
-        assert "GITHUB_PERSONAL_ACCESS_TOKEN" in c.required_env
+        assert c.required_env == []
         assert get_candidate_by_name("no-such-server") is None
 
 
@@ -138,6 +138,23 @@ class TestPlanner:
 # ---------------------------------------------------------------------------
 
 class TestInstaller:
+    def test_rejects_non_exact_version(self, db, monkeypatch):
+        def _fail_if_called(*args, **kwargs):
+            raise AssertionError("非法版本不应触发 npm install")
+
+        monkeypatch.setattr(installer_mod, "_run_npm_install", _fail_if_called)
+        result = install_sandbox(
+            db,
+            "@modelcontextprotocol/server-memory",
+            "npm:@modelcontextprotocol/server-memory",
+            "npm:evil-package@1.0.0",
+            "stdio",
+            [],
+            {"name": "memory"},
+        )
+        assert result["ok"] is False
+        assert "exact semantic version" in result["error"]
+
     def test_rejects_package_not_in_whitelist(self, db, monkeypatch):
         def _fail_if_called(*args, **kwargs):
             raise AssertionError("非白名单包不应触发 npm install")
@@ -215,6 +232,33 @@ class TestInstaller:
         )
         assert result["ok"] is False
         assert "npm install exit=1" in result["error"]
+
+    def test_reinstall_requires_a_fresh_smoke(self, db, monkeypatch, tmp_path):
+        entry = tmp_path / "index.js"
+        entry.write_text("// fake entry", encoding="utf-8")
+        monkeypatch.setattr(
+            installer_mod,
+            "_run_npm_install",
+            lambda *_args: {
+                "ok": True,
+                "entry_js": str(entry),
+                "error": None,
+                "sandbox_path": str(tmp_path),
+            },
+        )
+        args = (
+            db,
+            "@modelcontextprotocol/server-memory",
+            "npm:@modelcontextprotocol/server-memory",
+            "1.0.0",
+            "stdio",
+            ["read_graph"],
+            {"name": "memory"},
+        )
+        first = install_sandbox(*args)
+        run_smoke(db, first["capability_id"], {"ok": True, "real_tools": ["read_graph"]})
+        second = install_sandbox(*args)
+        assert second["state"] == "needs_review"
 
 
 class TestRunSmoke:

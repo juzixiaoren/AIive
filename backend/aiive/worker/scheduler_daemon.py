@@ -573,7 +573,7 @@ def _retention_scanner_job() -> None:
             try:
                 db.close()
             except Exception:
-                pass
+                logger.debug("retention_scanner Session 关闭失败", exc_info=True)
 
 
 def _has_dirty_memory(db: Session, cfg: MaintenanceConfig, now: datetime) -> bool:

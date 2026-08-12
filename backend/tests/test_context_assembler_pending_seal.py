@@ -9,7 +9,7 @@ from aiive.db.models import Segment
 from aiive.runtime.context_assembler import ContextAssembler
 from aiive.runtime.context_budget import ContextBudget, PartitionBudget
 from aiive.runtime.token_models import ModelProfile, TokenCount
-from tests._util import new_epoch, new_segment, new_thread
+from backend.tests._util import new_epoch, new_segment, new_thread
 
 
 class _FakeTokenCounter:

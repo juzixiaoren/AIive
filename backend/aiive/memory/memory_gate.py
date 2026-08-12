@@ -51,7 +51,7 @@ class MemoryGate:
 
     def __init__(self, registry: MemoryKeyRegistry | None = None) -> None:
         self._registry: MemoryKeyRegistry = registry or get_memory_key_registry()
-        self._policy = MemoryPolicyEngine()
+        self._policy: MemoryPolicyEngine = MemoryPolicyEngine()
 
     # ------------------------------------------------------------------
     # Public API

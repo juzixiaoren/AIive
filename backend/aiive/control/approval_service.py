@@ -34,8 +34,8 @@ def _approval_hash(action: AgentAction, expires_at: datetime, checkpoint_id: str
 
 class TaskApprovalService:
     def __init__(self, db: Session):
-        self.db = db
-        self.repo = TaskRepository(db)
+        self.db: Session = db
+        self.repo: TaskRepository = TaskRepository(db)
 
     def create(self, task: AgentTask, action: AgentAction, *, ttl_hours: int = 24) -> ApprovalRequest:
         if ttl_hours < 1 or ttl_hours > 168:

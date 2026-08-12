@@ -35,10 +35,10 @@ class PersistentTaskRuntime:
         agent_executor: TaskAgentExecutor | None = None,
         evidence_store: EvidenceStore | None = None,
     ) -> None:
-        self.db = db
-        self.repo = TaskRepository(db)
-        self.agent = agent_executor or TaskAgentExecutor(db)
-        self.evidence = evidence_store or EvidenceStore()
+        self.db: Session = db
+        self.repo: TaskRepository = TaskRepository(db)
+        self.agent: TaskAgentExecutor = agent_executor or TaskAgentExecutor(db)
+        self.evidence: EvidenceStore = evidence_store or EvidenceStore()
 
     def run(self, task_id: str, *, trigger: str = "dispatch") -> dict[str, Any]:
         task, run = self.repo.start_run(task_id, trigger=trigger)

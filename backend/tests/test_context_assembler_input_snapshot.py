@@ -14,7 +14,7 @@ from aiive.memory.recall_models import ScopeContext
 from aiive.retrieval.retrieval_types import RetrievalResult
 from aiive.runtime.context_budget import ContextBudget, PartitionBudget
 from aiive.runtime.token_models import ModelProfile, TokenCount
-from tests._util import new_thread, new_epoch, new_segment
+from backend.tests._util import new_thread, new_epoch, new_segment
 
 
 class _FakeTokenCounter:
