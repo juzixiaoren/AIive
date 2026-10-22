@@ -531,8 +531,8 @@ api/routes_agent_tasks.py 创建任务 → task_runtime/repository.py::create_ta
 | `scripts/smoke/` | 冒烟脚本 |
 | `scripts/check_single_file_tests.sh` | 单文件隔离运行防线：每个测试文件单独进程跑一遍，捕获跨文件顺序依赖（CI 与本地共用） |
 | `docker-compose.yml` | postgres(pgvector:pg16, 127.0.0.1:5432) + backend(8000, env_file .env) + frontend(127.0.0.1:8080) + 可选 embedding(TEI, profile local-embedding) |
-| `backend/Dockerfile` | python:3.12-slim，apt 源切阿里云，pip 腾讯云镜像，uvicorn `aiive.main:app` |
-| `frontend/Dockerfile` | node 多阶段构建 → nginx:alpine:8080；`nginx.conf`：SPA 回退 + `/api/` 反代 backend:8000（SSE 关缓冲）+ `/ws/` WebSocket 反代 |
+| `backend/Dockerfile` | python:3.12-slim；apt/pip 源由 build-arg 控制（`APT_MIRROR` 默认阿里云、`PIP_INDEX_URL` 默认腾讯云，CI 传官方源）；uvicorn `aiive.main:app` |
+| `frontend/Dockerfile` | node 多阶段构建（`NPM_REGISTRY` build-arg，默认腾讯云）→ nginx:alpine:8080；`nginx.conf`：SPA 回退 + `/api/` 反代 backend:8000（SSE 关缓冲）+ `/ws/` WebSocket 反代 |
 | `pyproject.toml` | 依赖：fastapi/langgraph/langchain/mcp<2/apscheduler/litellm/pgvector；dev=pytest；package-data 含 prompts 与 skills SKILL.md |
 
 ---

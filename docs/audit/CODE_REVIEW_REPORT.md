@@ -346,7 +346,9 @@ bash scripts/check_single_file_tests.sh       → 91/91 个测试文件单独运
 
 ### 9.3 未做与风险
 
-- **CI 未在真实 GitHub Actions 上执行**：本轮只做本地等价验证（同样的命令、同样的 Python 3.12 + SQLite 环境）。新增两个 job 的首次真实运行结果需在推送后确认。
+- **CI 已在真实 GitHub Actions 上跑通**（run 39725637725，8/8 job 绿）。推送后依次修掉：basedpyright job 缺项目依赖、
+  docker-smoke 的国内镜像跨境超时、启动迁移与 CI 迁移并发撞车、非 loopback 下默认开发令牌被 Settings 拒绝。
+  细节见 `docs/reports/2026-10-22_第二轮架构重构阶段总结.md` §3.5。
 - **PG 语义回归仍未覆盖**：`memory_write_service.py` 的事务/锁/幂等需要真实 PostgreSQL；本机无 PG 环境，且测试文件归用户维护，本轮未新增 PG 用例。
 - **3 个惰性循环依赖未拆**（CODE_MAP §10.3）：修复需侵入 control/worker/registry 契约，仍列为后续项。
 - 单文件 job 会把 CI 时长增加约 6 分钟（JOBS=2）；若后续变慢，可提高到 `JOBS=4` 或改为按层抽样。
