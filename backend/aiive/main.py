@@ -6,12 +6,12 @@
 """
 import logging
 import sys
+from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
-from collections.abc import Awaitable, Callable
-from contextlib import asynccontextmanager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,30 +19,31 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 
-from aiive.api.routes_health import router as health_router
+from aiive.api.routes_agent_tasks import router as agent_tasks_router
+from aiive.api.routes_approval import router as approval_router
+from aiive.api.routes_attention import router as attention_router
+from aiive.api.routes_capabilities import router as capabilities_router
 from aiive.api.routes_chat import router as chat_router
 from aiive.api.routes_debug import router as debug_router
-from aiive.api.routes_memories import router as memories_router
-from aiive.api.routes_personal import router as personal_router
-from aiive.api.routes_tools import router as tools_router
-from aiive.api.routes_capabilities import router as capabilities_router
+from aiive.api.routes_desktop import router as desktop_router
+from aiive.api.routes_epochs import router as epochs_router
+from aiive.api.routes_eval import router as eval_router
+from aiive.api.routes_forget import router as forget_router
+from aiive.api.routes_health import router as health_router
+from aiive.api.routes_inspector import router as inspector_router
+from aiive.api.routes_knowledge import router as knowledge_router
 from aiive.api.routes_mcp import router as mcp_router
 from aiive.api.routes_mcp_install import router as mcp_install_router
-from aiive.api.routes_selfdev import router as selfdev_router
-from aiive.api.routes_outbox import router as outbox_router
-from aiive.api.routes_knowledge import router as knowledge_router
-from aiive.api.routes_inspector import router as inspector_router
-from aiive.api.routes_tasks import router as tasks_router
-from aiive.api.routes_attention import router as attention_router
+from aiive.api.routes_memories import router as memories_router
 from aiive.api.routes_notifications import router as notifications_router
-from aiive.api.routes_threads import router as threads_router
-from aiive.api.routes_epochs import router as epochs_router
-from aiive.api.routes_ws import router as ws_router
-from aiive.api.routes_forget import router as forget_router
-from aiive.api.routes_approval import router as approval_router
-from aiive.api.routes_desktop import router as desktop_router
-from aiive.api.routes_agent_tasks import router as agent_tasks_router
+from aiive.api.routes_outbox import router as outbox_router
+from aiive.api.routes_personal import router as personal_router
+from aiive.api.routes_selfdev import router as selfdev_router
 from aiive.api.routes_skills import router as skills_router
+from aiive.api.routes_tasks import router as tasks_router
+from aiive.api.routes_threads import router as threads_router
+from aiive.api.routes_tools import router as tools_router
+from aiive.api.routes_ws import router as ws_router
 from aiive.config import settings
 
 logger = logging.getLogger(__name__)
@@ -55,7 +56,7 @@ def _ensure_system_thread():
     try:
         ThreadBootstrapService.ensure_system_thread()
     except Exception:
-        logger.error("Failed to ensure system thread", exc_info=True)
+        logger.exception("Failed to ensure system thread")
 
 
 def _ensure_retrieval_generation():
@@ -81,7 +82,7 @@ def _ensure_retrieval_generation():
         finally:
             db.close()
     except Exception:
-        logger.error("Failed to ensure retrieval generation", exc_info=True)
+        logger.exception("Failed to ensure retrieval generation")
 
 
 def _ensure_schema():
@@ -91,16 +92,15 @@ def _ensure_schema():
     不再使用 create_all() + 手工 ALTER 的双轨机制（会与 Alembic 迁移历史漂移）。
     schema 的任何变更都必须通过新增 Alembic 迁移脚本完成。
     """
-    from pathlib import Path
-
-    from alembic import command
-    from alembic.config import Config
-
     # alembic.ini 的位置取决于运行布局：
     #  - 源码运行：仓库根目录（backend 的上一级）
     #  - wheel 安装（Docker）：Dockerfile 将其复制到 /app/alembic.ini
     #  - 也可通过环境变量 ALEMBIC_INI_PATH 显式指定
     import os
+    from pathlib import Path
+
+    from alembic import command
+    from alembic.config import Config
 
     candidates = []
     env_ini = os.environ.get("ALEMBIC_INI_PATH")
@@ -144,13 +144,14 @@ def create_app() -> FastAPI:
         import asyncio
         import os
         import uuid as _uuid
-        from aiive.worker.scheduler_daemon import start_daemon
-        from aiive.worker.outbox_worker import OutboxWorker
-        from aiive.worker.outbox_heartbeat import ActiveClaimRegistry, OutboxHeartbeat
-        from aiive.worker.handler_registry import HandlerRegistry
-        from aiive.worker.outbox_handlers import register_all
+
         from aiive.api.ws_manager import ws_manager
         from aiive.desktop.connection_manager import desktop_connection_manager
+        from aiive.worker.handler_registry import HandlerRegistry
+        from aiive.worker.outbox_handlers import register_all
+        from aiive.worker.outbox_heartbeat import ActiveClaimRegistry, OutboxHeartbeat
+        from aiive.worker.outbox_worker import OutboxWorker
+        from aiive.worker.scheduler_daemon import start_daemon
 
         # 绑定主事件循环，供后台线程安全推送 WebSocket
         ws_manager.set_main_loop(asyncio.get_running_loop())
@@ -208,8 +209,8 @@ def create_app() -> FastAPI:
         try:
             # 重启后恢复已激活 MCP 能力的工具注册（注册表是进程内状态，DB 才是权威）
             from aiive.db.base import SessionLocal
-            from aiive.mcp.builtin import ensure_builtin_mcp_capability
             from aiive.mcp.bootstrap import restore_active_capabilities
+            from aiive.mcp.builtin import ensure_builtin_mcp_capability
             from aiive.tools.registry import get_tool_registry
 
             builtin_db = SessionLocal()
@@ -307,6 +308,7 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(chat_router)
     app.include_router(debug_router)
+    app.include_router(eval_router)
     app.include_router(memories_router)
     app.include_router(personal_router)
     app.include_router(tools_router)

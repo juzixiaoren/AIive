@@ -123,6 +123,7 @@
 | 内置 Skill catalog | `skills/catalog.py` + `skills/builtin/*/SKILL.md` | `api/routes_skills.py`、`task_runtime/tools.py` | `test_skills*.py` |
 | 自进化：补丁计划 | `selfdev/planner.py`、`selfdev/trusted_core.py` | `api/routes_selfdev.py` | `test_selfdev*.py` |
 | 自进化：槽位 promote/rollback | `selfdev/promote_rollback.py`、`selfdev/patch_executor.py` | `supervisor/slot_manager.py` | `test_selfdev_slot*.py` |
+| 自进化：安全闸门（Replay Eval + Kernel Contract Checks） | `eval/`（`contracts.py`/`replay.py`/`gate.py`/`scenarios.py`/`persistence.py`/`cli.py`/`models.py`） | `selfdev/promote_rollback.py::promote`（gate 接入点）、`api/routes_eval.py`（只读查询 `/api/eval/runs`、`/runs/latest`） | `tests/unit/backend/test_eval_*.py` |
 
 ### 2.5 任务 / 桌面 / 知识库 / 通知
 
@@ -642,3 +643,22 @@ api/routes_agent_tasks.py 创建任务 → task_runtime/repository.py::create_ta
   不要把模板库改回逐用例 `create_all`：实测建表 1.226s/次、拷贝 0.008s/次，改回去会让 unit 层从 78s 回到 330s。
 - `tests/integration/conftest.py`：`db` 夹具（进程级共享库，会话级建表 + 用例级清空数据）；集成层用 `db`，不要用 `db_session`。
 - 不请求 `db_session` 的用例会落到进程级库（已建表），适合需要生产代码自开会话提交的场景。
+
+### 3.x `eval/` — 自进化安全闸门（Offline Replay Eval + Kernel Contract Checks）
+
+> 最小可用的自进化安全门：promote 前必须离线跑通“内核契约检查 + 重放评测”，任一失败/异常/结果不完整一律 fail-closed 阻断晋升。无 LLM、无网络、无 API key，全部复用真实执行链（ToolRegistry.execute / MemoryStore / ORM 模型）。
+
+| 文件 | 职责 / 关键符号 |
+|---|---|
+| `models.py` | 纯数据契约：`ContractResult`、`StepResult`、`EvalCaseResult`、`EvalRunResult`（`.ok`=无异常且 failed==0）、`GateResult`（`.to_summary()`）；无外部依赖，可 JSON 序列化 |
+| `contracts.py` | 5 项内核契约检查（fail-closed，单检查异常记为 critical 失败）：`check_memory_single_source`（canonical_key 唯一真相源）、`check_key_events_persisted`（completed turn 必须有 chat_ended Event）、`check_outbox_idempotent`（operation_id 唯一 + 重复入队被唯一约束拒绝）、`check_safe_delete_guard`（危险/越界拒绝、域内允许）、`check_context_snapshot_persisted`（warning 级）；`KERNEL_CONTRACTS` 列表 + `run_contract_checks(session, only=None)` |
+| `scenarios.py` | 24 个离线确定性场景（eval.s01–eval.s24）：工具调用（echo/current_time/list_tasks/.../memory_search）、失败处理（未知工具/未授权来源/非法参数/safe_delete 拦截/域内允许）、记忆读写、Event/Outbox/Snapshot 写入与断言、组合流。`SCENARIOS` 列表；每场景用唯一 key/id 互不干扰 |
+| `replay.py` | `isolated_eval_session()`（一次性 SQLite + 重定向 `aiive.tools.builtin_tools.SessionLocal` 给 db 工具用）；`ReplayRunner.run(session)` 把每个 step 派发到 `_exec_*` 走真实执行链；`run_replay_isolated()`（崩溃即 fail-closed 返回 `EvalRunResult(error=...)`） |
+| `gate.py` | `SafetyGate.evaluate(live_session=None, candidate_app_dir=None, persist=False)`：先跑契约（有 live_session 用现场，否则隔离库），必跑 `run_replay_isolated()`，可选跑候选子进程（候选 backend 前置 PYTHONPATH 阴影当前 aiive，fail-closed 于非零/不可解析）；`ok = 契约 and 重放 and 候选`；`persist=True` 落盘 `runtime/eval_runs/*.json` |
+| `persistence.py` | 结果落盘/读取：`save_gate_result` / `load_runs` / `latest`（`<repo>/runtime/eval_runs/`，复用文件态约定，无新表、无 UI） |
+| `cli.py` | `python -m aiive.eval run [--json] [--out PATH]`：跑 `run_replay_isolated()` 并打印摘要或 JSON |
+| `__init__.py` | 公共表面再导出 contracts/replay/gate/persistence/scenarios + 模型类 |
+
+**接入点**：`selfdev/promote_rollback.py::promote` 在健康检查后、切换活动槽位前调用 `SafetyGate().evaluate(candidate_app_dir=..., persist=True)`；失败返回 `ok=False` 并阻断。只读查询路由见 `api/routes_eval.py`（`GET /api/eval/runs`、`GET /api/eval/runs/latest`）。
+
+**测试**：`tests/unit/backend/test_eval_contracts.py`（5 契约正负例）、`test_eval_replay.py`（24 场景全过 + 隔离稳定 + 损坏场景 fail-closed + 未授权工具拒绝）、`test_eval_gate.py`（干净系统通过 / 契约违规阻断 / 候选子进程失败阻断 / promote 被阻断 / 通过后 proceed）、`test_eval_persistence.py`（落盘读取往返）。

@@ -6,10 +6,10 @@
 确保切换操作的安全性。
 """
 import logging
+from typing import Any
 
 from aiive.supervisor.health_probe import HealthProbe
 from aiive.supervisor.slot_manager import SlotManager
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ class PromoteRollback:
         """返回当前活跃槽位标识（A/B）。"""
         return self._manager.get_active_slot()
 
-    def promote(self, run_health_check: bool = True) -> dict[str, Any]:
+    def promote(self, run_health_check: bool = True, run_gate: bool = True) -> dict[str, Any]:
         """
         将非活跃槽位升级为活跃槽位。
 
@@ -61,6 +61,31 @@ class PromoteRollback:
                     "error": "Health check failed for inactive slot",
                     "health": result.message,
                     "checks": [c for c in result.checks if not c.get("ok", True)],
+                }
+
+        # 自进化安全门禁：契约检查 + Replay Eval + 候选槽位评测（fail-closed）
+        if run_gate:
+            candidate_app = inactive_slot.root / "app"
+            try:
+                from aiive.eval.gate import SafetyGate
+
+                gate = SafetyGate()
+                gate_result = gate.evaluate(
+                    candidate_app_dir=str(candidate_app) if candidate_app.exists() else None,
+                    persist=True,
+                )
+            except Exception as exc:
+                logger.exception("safety gate raised during promote")
+                return {
+                    "ok": False,
+                    "error": "Safety gate errored during promote (blocked)",
+                    "detail": str(exc),
+                }
+            if not gate_result.ok:
+                return {
+                    "ok": False,
+                    "error": "Safety gate failed: promote blocked",
+                    "gate": gate_result.to_summary(),
                 }
 
         # 切换活跃槽位指针
