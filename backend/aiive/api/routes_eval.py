@@ -3,14 +3,18 @@
 Results are produced by the gate (contracts + replay eval) and persisted as JSON
 under <repo>/runtime/eval_runs/ (see aiive.eval.persistence). This router only
 reads them back; it never triggers or mutates an evaluation.
+
+Access control: same guard as the other developer diagnostics routers
+(routes_debug / routes_outbox) — loopback + diagnostics switch.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
+from aiive.api.developer_security import require_local_developer
 from aiive.eval import persistence
 
-router = APIRouter(prefix="/api/eval")
+router = APIRouter(prefix="/api/eval", dependencies=[Depends(require_local_developer)])
 
 
 @router.get("/runs")

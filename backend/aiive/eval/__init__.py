@@ -3,7 +3,7 @@
 Public surface:
   - contracts.run_contract_checks(session)
   - replay.ReplayRunner / replay.run_replay_isolated()
-  - gate.SafetyGate
+  - gate.SafetyGate / gate.evaluate_promotion_gate()
   - persistence.save_gate_result / load_runs / latest
 """
 from aiive.eval import (
@@ -22,6 +22,9 @@ from aiive.eval import (
     scenarios as scenarios,
 )
 from aiive.eval.gate import SafetyGate as SafetyGate
+from aiive.eval.gate import (
+    evaluate_promotion_gate as evaluate_promotion_gate,
+)
 from aiive.eval.models import (
     ContractResult as ContractResult,
 )

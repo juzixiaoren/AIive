@@ -34,13 +34,25 @@ def test_all_contracts_pass_on_clean_db(db_session):
 
 
 def test_memory_single_source_negative(db_session):
+    # 注册为 single cardinality 的精确键（memory_key_registry）不得有多条 active 记录
     store = MemoryStore(db_session)
-    store.create_record(_make_proposal("user.eval.dup", "v1"), lifecycle_state=LifecycleState.ACTIVE.value)
-    store.create_record(_make_proposal("user.eval.dup", "v2"), lifecycle_state=LifecycleState.ACTIVE.value)
+    store.create_record(_make_proposal("user.display_name", "v1"), lifecycle_state=LifecycleState.ACTIVE.value)
+    store.create_record(_make_proposal("user.display_name", "v2"), lifecycle_state=LifecycleState.ACTIVE.value)
     db_session.flush()
     res = check_memory_single_source(db_session)
     assert res.ok is False
-    assert "user.eval.dup" in res.evidence["duplicate_keys"]
+    assert "user.display_name" in res.evidence["duplicate_keys"]
+
+
+def test_memory_single_source_multi_cardinality_is_legal(db_session):
+    # multi cardinality 模式键（project.*，conflict_policy=append）多条 active 合法
+    store = MemoryStore(db_session)
+    store.create_record(_make_proposal("project.eval.dup", "v1"), lifecycle_state=LifecycleState.ACTIVE.value)
+    store.create_record(_make_proposal("project.eval.dup", "v2"), lifecycle_state=LifecycleState.ACTIVE.value)
+    db_session.flush()
+    res = check_memory_single_source(db_session)
+    assert res.ok is True, res.detail
+    assert res.evidence["multi_cardinality_keys"] == {"project.eval.dup": 2}
 
 
 def test_key_events_persisted_negative(db_session):

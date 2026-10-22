@@ -8,6 +8,7 @@
 import logging
 from typing import Any
 
+from aiive.eval.gate import evaluate_promotion_gate
 from aiive.supervisor.health_probe import HealthProbe
 from aiive.supervisor.slot_manager import SlotManager
 
@@ -63,24 +64,11 @@ class PromoteRollback:
                     "checks": [c for c in result.checks if not c.get("ok", True)],
                 }
 
-        # 自进化安全门禁：契约检查 + Replay Eval + 候选槽位评测（fail-closed）
+        # 自进化安全门禁：契约检查 + Replay Eval + 候选槽位评测（fail-closed）。
+        # 与 ReleaseManager.promote 共用 evaluate_promotion_gate 统一入口，
+        # 保证两条晋升路径的闸门语义完全一致。
         if run_gate:
-            candidate_app = inactive_slot.root / "app"
-            try:
-                from aiive.eval.gate import SafetyGate
-
-                gate = SafetyGate()
-                gate_result = gate.evaluate(
-                    candidate_app_dir=str(candidate_app) if candidate_app.exists() else None,
-                    persist=True,
-                )
-            except Exception as exc:
-                logger.exception("safety gate raised during promote")
-                return {
-                    "ok": False,
-                    "error": "Safety gate errored during promote (blocked)",
-                    "detail": str(exc),
-                }
+            gate_result = evaluate_promotion_gate(inactive_slot.root)
             if not gate_result.ok:
                 return {
                     "ok": False,

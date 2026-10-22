@@ -20,8 +20,13 @@ from collections.abc import Callable
 from typing import Any
 
 from aiive.context.run_context import RunContext
-from aiive.db.base import SessionLocal
+from aiive.db.base import SessionLocal as SessionLocal  # noqa: PLC0414 - 显式再导出，见下方说明
 from aiive.memory.memory_types import MEMORY_KEY_GUIDE
+
+# SessionLocal 以同名别名显式再导出：测试与 tests/support.py 依赖
+# `aiive.tools.builtin_tools.SessionLocal` 命名空间契约做 monkeypatch（把会话重定向到
+# 隔离测试库）；同名 re-export 同时让 basedpyright 放行其他模块对该符号的引用
+# （reportPrivateLocalImportUsage）。PLC0414（别名未改名）是本模式的预期告警。
 
 logger = logging.getLogger(__name__)
 from aiive.tools.forget_tool import handle_forget, handle_forget_status

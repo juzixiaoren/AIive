@@ -3,17 +3,52 @@
 Reuses the project's file-state convention (slot manifests / release state): results
 are written as JSON under <repo>/runtime/eval_runs/. A read-only API reads them back.
 No new DB tables, no UI dependency.
+
+Directory resolution order (first hit wins):
+  1. AIIVE_EVAL_RUNS_DIR environment variable (explicit override, e.g. Docker volume);
+  2. repo root detected by walking upward from this file (source layout:
+     <repo>/backend/aiive/eval/persistence.py -> <repo>);
+  3. repo root detected from the current working directory (wheel/site-packages
+     layout, e.g. the Docker backend container whose WORKDIR holds alembic.ini);
+  4. legacy fallback: parents[3] of this file.
+
+A repo root is a directory containing ``alembic.ini`` (or both ``pyproject.toml``
+and ``backend/``), matching the markers copied into deployment images.
 """
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
 from aiive.eval.models import GateResult
 
+_ENV_OVERRIDE = "AIIVE_EVAL_RUNS_DIR"
+
+
+def _is_repo_root(path: Path) -> bool:
+    if (path / "alembic.ini").is_file():
+        return True
+    return (path / "pyproject.toml").is_file() and (path / "backend").is_dir()
+
+
+def _find_repo_root() -> Path | None:
+    for origin in (Path(__file__).resolve(), Path.cwd().resolve()):
+        for parent in (origin, *origin.parents):
+            if _is_repo_root(parent):
+                return parent
+    return None
+
 
 def _default_dir() -> Path:
+    override = os.environ.get(_ENV_OVERRIDE)
+    if override:
+        return Path(override)
+    root = _find_repo_root()
+    if root is not None:
+        return root / "runtime" / "eval_runs"
+    # 源码布局的历史行为；安装布局下找不到仓库标记时保持兼容
     return Path(__file__).resolve().parents[3] / "runtime" / "eval_runs"
 
 

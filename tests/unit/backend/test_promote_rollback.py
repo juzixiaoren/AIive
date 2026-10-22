@@ -1,6 +1,8 @@
 """测试 PromoteRollback（提升与回滚）模块。
-
 覆盖自进化系统中槽位提升（A->B 切换活跃槽位）和回滚（恢复到之前版本）的功能。
+
+注意：本文件聚焦槽位切换语义，promote 一律显式 run_gate=False 跳过安全门
+（闸门行为由 tests/unit/backend/test_eval_gate.py 与 test_release_manager.py 覆盖）。
 """
 
 from aiive.selfdev.promote_rollback import PromoteRollback
@@ -16,7 +18,7 @@ class TestPromoteRollback:
         mgr.init_slots()
         pr = PromoteRollback(manager=mgr)
 
-        result = pr.promote()
+        result = pr.promote(run_gate=False)
         assert result["ok"] is True
         assert result["previous_active"] == "A"
         assert result["new_active"] == "B"
@@ -29,7 +31,7 @@ class TestPromoteRollback:
         pr = PromoteRollback(manager=mgr)
 
         # 先提升 A -> B
-        pr.promote()
+        pr.promote(run_gate=False)
         assert mgr.get_active_slot() == "B"
 
         # 再回滚 B -> A
@@ -43,10 +45,10 @@ class TestPromoteRollback:
         mgr.init_slots()
         pr = PromoteRollback(manager=mgr)
 
-        r1 = pr.promote()  # A -> B
+        r1 = pr.promote(run_gate=False)  # A -> B
         assert r1["new_active"] == "B"
 
-        r2 = pr.promote()  # B -> A
+        r2 = pr.promote(run_gate=False)  # B -> A
         assert r2["new_active"] == "A"
 
     def test_rollback_invalid_slot(self, tmp_path):

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from aiive.eval.gate import SafetyGate, evaluate_promotion_gate
 from aiive.supervisor.health_probe import HealthProbe
 from aiive.supervisor.slot_manager import ACTIVE_SLOT_FILE, SlotManager
 
@@ -21,7 +22,13 @@ def _now() -> datetime:
 
 
 class ReleaseManager:
-    """Promotion 之后持续保留 previous slot，健康异常时自动切回。"""
+    """Promotion 之后持续保留 previous slot，健康异常时自动切回。
+
+    晋升（promote）在切换活跃指针前依次执行：
+      1. 非活跃槽位健康检查（HealthProbe）；
+      2. 自进化安全门（SafetyGate：内核契约 + Replay Eval + 候选子进程评测，fail-closed）。
+    回滚（rollback）是紧急逃生通道，刻意不设闸门——目标槽位是此前已通过校验的版本。
+    """
 
     def __init__(
         self,
@@ -29,13 +36,16 @@ class ReleaseManager:
         probe: HealthProbe | None = None,
         state_file: Path | None = None,
         monitor_seconds: int = 600,
+        gate: SafetyGate | None = None,
     ) -> None:
         self._manager: SlotManager = manager or SlotManager()
         self._probe: HealthProbe = probe or HealthProbe()
         self._state_file: Path = state_file or (ACTIVE_SLOT_FILE.parent / "release_state.json")
         self._monitor_seconds: int = max(60, monitor_seconds)
+        # 闸门可注入（测试替身）；默认构造真实 SafetyGate。
+        self._gate: SafetyGate = gate or SafetyGate()
 
-    def promote(self) -> dict[str, Any]:
+    def promote(self, run_gate: bool = True) -> dict[str, Any]:
         with _release_lock:
             previous = self._manager.get_active_slot()
             if previous not in {"A", "B"}:
@@ -48,6 +58,23 @@ class ReleaseManager:
                     "error": "Health check failed for inactive slot",
                     "health": pre_switch_health,
                 }
+            # 自进化安全门禁：契约 + Replay Eval + 候选评测（fail-closed）。
+            # 这是 promote 的真实生产入口（REST /api/selfdev/{id}/promote 与
+            # promote_slot 工具都经由本方法），闸门必须在此生效。
+            if run_gate:
+                slot = next(
+                    (item for item in self._manager.list_slots() if item.name == current), None,
+                )
+                gate_result = evaluate_promotion_gate(
+                    slot.root if slot is not None else None,
+                    gate=self._gate,
+                )
+                if not gate_result.ok:
+                    return {
+                        "ok": False,
+                        "error": "Safety gate failed: promote blocked",
+                        "gate": gate_result.to_summary(),
+                    }
             self._manager.set_active_slot(current)
             result = {"ok": True, "previous_active": previous, "new_active": current}
             now = _now()

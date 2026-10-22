@@ -30,10 +30,10 @@ def test_gate_ok_on_clean_system():
 
 
 def test_gate_fails_on_contract_violation(db_session):
-    # Inject a duplicate active memory into the LIVE session passed to the gate.
+    # Inject a duplicate active memory (single-cardinality key) into the LIVE session.
     store = MemoryStore(db_session)
-    store.create_record(_make_proposal("user.eval.dup", "v1"), lifecycle_state=LifecycleState.ACTIVE.value)
-    store.create_record(_make_proposal("user.eval.dup", "v2"), lifecycle_state=LifecycleState.ACTIVE.value)
+    store.create_record(_make_proposal("user.display_name", "v1"), lifecycle_state=LifecycleState.ACTIVE.value)
+    store.create_record(_make_proposal("user.display_name", "v2"), lifecycle_state=LifecycleState.ACTIVE.value)
     db_session.flush()
 
     res = SafetyGate().evaluate(live_session=db_session)
@@ -42,6 +42,30 @@ def test_gate_fails_on_contract_violation(db_session):
     violated = [c for c in res.contracts if not c.ok]
     assert violated, "expected at least one failed contract"
     assert any(c.name == "memory_single_source_of_truth" for c in violated)
+
+
+def test_gate_warning_contract_failure_does_not_block(monkeypatch):
+    """warning 级契约失败只记录、不阻断；critical 失败才阻断。"""
+    from aiive.eval import gate as gate_module
+
+    def fake_warning_only(session, only=None):
+        return [
+            ContractResult("memory_single_source_of_truth", True, "critical"),
+            ContractResult("context_snapshot_persisted", False, "warning", "missing"),
+        ]
+
+    monkeypatch.setattr(gate_module, "run_contract_checks", fake_warning_only)
+    res = SafetyGate().evaluate()
+    assert res.ok is True, res.error
+    assert any("context_snapshot_persisted" in note for note in res.notes)
+
+    def fake_critical(session, only=None):
+        return [ContractResult("memory_single_source_of_truth", False, "critical", "dup")]
+
+    monkeypatch.setattr(gate_module, "run_contract_checks", fake_critical)
+    blocked = SafetyGate().evaluate()
+    assert blocked.ok is False
+    assert "memory_single_source_of_truth" in blocked.error
 
 
 def test_gate_candidate_subprocess_failure(tmp_path):
@@ -55,6 +79,18 @@ def test_gate_candidate_subprocess_failure(tmp_path):
     assert res.ok is False
     assert res.candidate_eval is not None
     assert res.candidate_eval.ok is False
+
+
+def test_gate_candidate_without_eval_package_fails(tmp_path):
+    """候选 app 存在但没有 aiive/eval 包 → fail-closed 判失败（而非静默跳过）。"""
+    cand = tmp_path / "candidate" / "backend" / "aiive"
+    cand.mkdir(parents=True)
+    (cand / "__init__.py").write_text("", encoding="utf-8")
+    res = SafetyGate().evaluate(candidate_app_dir=str(tmp_path / "candidate"))
+    assert res.ok is False
+    assert res.candidate_eval is not None
+    assert res.candidate_eval.ok is False
+    assert "no aiive/eval package" in res.candidate_eval.error
 
 
 def test_promote_blocked_when_gate_fails(monkeypatch, tmp_path):

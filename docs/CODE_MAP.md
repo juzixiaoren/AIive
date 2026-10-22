@@ -122,8 +122,8 @@
 | 内置 MCP（aiive-essentials） | `mcp/builtin.py`、`mcp/builtin_server.py` | `main.py` lifespan | `test_mcp_builtin*.py` |
 | 内置 Skill catalog | `skills/catalog.py` + `skills/builtin/*/SKILL.md` | `api/routes_skills.py`、`task_runtime/tools.py` | `test_skills*.py` |
 | 自进化：补丁计划 | `selfdev/planner.py`、`selfdev/trusted_core.py` | `api/routes_selfdev.py` | `test_selfdev*.py` |
-| 自进化：槽位 promote/rollback | `selfdev/promote_rollback.py`、`selfdev/patch_executor.py` | `supervisor/slot_manager.py` | `test_selfdev_slot*.py` |
-| 自进化：安全闸门（Replay Eval + Kernel Contract Checks） | `eval/`（`contracts.py`/`replay.py`/`gate.py`/`scenarios.py`/`persistence.py`/`cli.py`/`models.py`） | `selfdev/promote_rollback.py::promote`（gate 接入点）、`api/routes_eval.py`（只读查询 `/api/eval/runs`、`/runs/latest`） | `tests/unit/backend/test_eval_*.py` |
+| 自进化：槽位 promote/rollback | `supervisor/release_manager.py`（生产晋升入口）、`selfdev/promote_rollback.py`、`selfdev/patch_executor.py` | `supervisor/slot_manager.py` | `test_release_manager.py`、`test_selfdev_slot*.py` |
+| 自进化：安全闸门（Replay Eval + Kernel Contract Checks） | `eval/`（`contracts.py`/`replay.py`/`gate.py`/`scenarios.py`/`persistence.py`/`cli.py`/`models.py`） | `supervisor/release_manager.py::promote` 与 `selfdev/promote_rollback.py::promote`（共用 `eval/gate.py::evaluate_promotion_gate`，fail-closed）、`api/routes_eval.py`（只读查询 `/api/eval/runs`、`/runs/latest`） | `tests/unit/backend/test_eval_*.py`、`test_release_manager.py` |
 
 ### 2.5 任务 / 桌面 / 知识库 / 通知
 
@@ -164,7 +164,7 @@
 
 | 文件 | 职责 |
 |---|---|
-| `main.py` | FastAPI 装配：`create_app()` L131；`lifespan` L142（启动序列：事件循环绑定→prompt catalog 校验→`_ensure_schema` L87 Alembic upgrade→HMAC 密钥→`_ensure_system_thread` L51→检索 generation→backfill→ContextBudget 校验→向量运行时→MCP 恢复 `restore_active_capabilities`→`start_daemon`→OutboxWorker+Heartbeat+APScheduler）；25 个 `include_router` L307-330 |
+| `main.py` | FastAPI 装配：`create_app()` L131；`lifespan` L142（启动序列：事件循环绑定→prompt catalog 校验→`_ensure_schema` L87 Alembic upgrade→HMAC 密钥→`_ensure_system_thread` L51→检索 generation→backfill→ContextBudget 校验→向量运行时→MCP 恢复 `restore_active_capabilities`→`start_daemon`→OutboxWorker+Heartbeat+APScheduler）；25 个 `include_router` L308-332 |
 | `config.py` | `Settings` L13（pydantic-settings，`.env` 加载）；`validate_memory_features()` L126 启动校验；单例 `settings` L186。**几乎所有模块 `from aiive.config import settings`** |
 
 ### 3.2 `api/` — REST/WS 路由层
@@ -194,6 +194,7 @@
 | `routes_ws.py` | `WS /ws/{thread_id}` |
 | `routes_debug.py` | `/api/debug/events`、`/llm_calls`、`/traces/{id}`（`require_local_developer`） |
 | `routes_outbox.py` | `GET /api/outbox/jobs`（开发者守卫） |
+| `routes_eval.py` | `GET /api/eval/runs`、`/runs/latest`（只读安全门结果，`require_local_developer`） |
 | `routes_personal.py` | `GET /api/personal-signals` |
 | `routes_health.py` | `GET /health` |
 
@@ -294,7 +295,7 @@
 
 - `skills/catalog.py`：`SkillDefinition` L10（`as_dict(include_instructions=False)` L23）；`_DEFINITIONS` L35-92（4 个：document_processing/web_research/knowledge_base/mcp_management）；`list_skills()` L100、`get_skill()` L108；指令文本在 `skills/builtin/<id>/SKILL.md`。被 `task_runtime/tools.py:43`、`task_runtime/context_assembler.py:111`、`api/routes_skills.py` 使用。
 - `mcp/`：`discovery.py`（`_BUILTIN_CATALOG` L61-110、`search_mcp_candidates` L113、`allowed_npm_packages` L193）；`capability_planner.py`（`plan_from_goal` L118、`_compute_risk` L170）；`installer.py`（`SANDBOX_ROOT` L39=`<repo>/.data/mcp_sandbox`、`install_sandbox` L165、`run_smoke` L315）；`runtime_client.py`（`MCPRuntimeClient` L361、每能力长驻 `_SessionWorker`、`get_runtime_client` L534）；`bootstrap.py`（`register_capability_tools` L121 untrusted 包装、`restore_active_capabilities` L235 启动恢复）；`builtin.py`（`ensure_builtin_mcp_capability` L83、`BUILTIN_MCP_TOOLS` L17-57）；`builtin_server.py`（FastMCP stdio server，3 工具）。
-- `selfdev/`：`trusted_core.py`（`TRUSTED_CORE_PREFIXES` L9-23，13 条受保护路径，fail-closed）；`planner.py`（LLM 生成 patch plan+逐条校验）；`patch_executor.py`（`apply_to_inactive`：复制活跃槽位基线→应用）；`targeted_test_runner.py`（按变更文件前缀匹配测试，frontend 变更跑 `npm run build`）；`promote_rollback.py`（health check 后切活跃槽位指针）。
+- `selfdev/`：`trusted_core.py`（`TRUSTED_CORE_PREFIXES` L9-23，13 条受保护路径，fail-closed）；`planner.py`（LLM 生成 patch plan+逐条校验）；`patch_executor.py`（`apply_to_inactive`：复制活跃槽位基线→应用）；`targeted_test_runner.py`（按变更文件前缀匹配测试，frontend 变更跑 `npm run build`）；`promote_rollback.py`（health check + 安全门后切活跃槽位指针；与 `release_manager.promote` 共用 `evaluate_promotion_gate`，无生产调用方）。
 
 ### 3.8 `worker/` — Outbox 事务队列 + 调度守护
 
@@ -330,7 +331,7 @@
 ### 3.11 其余包
 
 - `knowledge/`：`ingestor.py`（摄入+`search_chunks` Postgres ILIKE）、`chunker.py`、`document_reader.py`（TXT/MD/HTML/JSON/CSV/TSV/DOCX/PDF）、`access.py`（访问控制）
-- `supervisor/`：`health_probe.py`（健康探针）、`launcher.py`（进程守护拉起）、`release_manager.py`、`slot_manager.py`（A/B 槽位管理，manifest excludes 列表含 qdrant——全仓未用 Qdrant，向量走 pgvector）
+- `supervisor/`：`health_probe.py`（健康探针）、`launcher.py`（进程守护拉起）、`release_manager.py`（**生产晋升入口**：`promote(run_gate=True)` 先健康检查再跑安全门 `evaluate_promotion_gate`，切换后进入观察窗，异常自动回滚；回滚不设闸门）、`slot_manager.py`（A/B 槽位管理，manifest excludes 列表含 qdrant——全仓未用 Qdrant，向量走 pgvector）
 - `context/run_context.py`：运行上下文；`storage/object_store.py`：对象/工件存储；`web/client.py`：Web 检索 HTTP 客户端（SSRF/重定向/大小限制）
 - `prompts/`：LLM prompt 模板（`manifest.toml` + 16 个 md），`main.py::validate_prompt_catalog` 启动校验
 
@@ -508,7 +509,7 @@ api/routes_agent_tasks.py 创建任务 → task_runtime/repository.py::create_ta
 
 | 位置 | 层级 | 说明 |
 |---|---|---|
-| `tests/unit/backend/` | 单元 | 后端单元测试（约 72 个 `test_*.py`），命名 `test_<被测试模块>.py`；`tests/unit/conftest.py` 经"分发式 SessionLocal"把模块级 DB 绑定重定向到按用例隔离的测试库 |
+| `tests/unit/backend/` | 单元 | 后端单元测试（67 个 `test_*.py`），命名 `test_<被测试模块>.py`；`tests/unit/conftest.py` 经"分发式 SessionLocal"把模块级 DB 绑定重定向到按用例隔离的测试库 |
 | `tests/integration/backend/` | 本地集成 | 多组件组合测试（Worker/Handler/调度/检索/生命周期），共享进程级 SQLite + 每用例重建表；`_util.py` 为共享夹具辅助 |
 | `tests/flow/` | 关键流程 | 跨模块高价值链路（Turn 执行、提醒闭环），外部边界离线模拟 |
 | `tests/conftest.py` | 公共 | 从 `.env` 仅加载 `AIIVE_` 前缀变量；`db_session` 夹具；按目录自动标注层级 marker |
@@ -569,7 +570,7 @@ api/routes_agent_tasks.py 创建任务 → task_runtime/repository.py::create_ta
 
 ### 10.1 方法
 - 对 backend/aiive 全量 .py 做 AST 静态 import 扫描，构建模块依赖图，Tarjan 求强连通分量（SCC）。
-- 扫描规模：约 203 个模块（含 10 个 builtin_*.py 领域模块）。
+- 扫描规模：约 212 个模块（含 10 个 builtin_*.py 领域模块与 eval/ 安全门 9 个模块）。
 - 同时实跑 import + register_builtin_tools：成功注册 36 个工具，无 ImportError，证明所有静态环均为惰性（lazy）延迟导入，加载期可安全解析。
 
 ### 10.2 依赖方向（允许方向）
@@ -578,6 +579,8 @@ api/routes_agent_tasks.py 创建任务 → task_runtime/repository.py::create_ta
 - builtin_tools.py → 领域模块（末尾 re-export）+ 共享机制（本模块定义）。
 - 关键约束：SessionLocal 与 db_handler 必须同处 builtin_tools 命名空间——测试与 tests/support.py 会 monkeypatch aiive.tools.builtin_tools.SessionLocal 把会话重定向到隔离测试库。因此曾尝试的「下沉到独立 _shared 叶子模块」方案已回退（会破坏该 monkeypatch 契约）。
 - tools/registry.py 仅在 get_tool_registry() 内部延迟 import builtin_tools，不构成加载期环。
+- eval/ 安全门包是纯消费方：eval.replay → tools.registry（仅模块导入）、eval.gate → eval.contracts/replay/models；
+  selfdev/promote_rollback 与 supervisor/release_manager → eval.gate（顶层导入，已实测无加载期环）。
 
 ### 10.3 检测到的环（SCC>1）
 共 3 个 SCC，全部为延迟/惰性导入，加载期可正常导入：
@@ -621,19 +624,36 @@ api/routes_agent_tasks.py 创建任务 → task_runtime/repository.py::create_ta
 | 全量测试 | `python -m pytest` | 857 passed / 0 failed（改名与类型收窄后复跑） |
 | 单文件隔离 | `bash scripts/check_single_file_tests.sh` | 91/91 个测试文件单独运行通过（已纳入 CI） |
 
+**第三轮复跑基线（2026-10-22，安全门接入 ReleaseManager + 契约口径修正后）**
+
+| 检查 | 命令 | 结果 |
+| --- | --- | --- |
+| ruff | `ruff check backend/aiive --select F,E9` | 0 error |
+| ruff（改动文件全规则） | `ruff check <改动文件>` | 新增/改写文件 0 issue；`builtin_tools.py` 维持 4 项 HEAD 存量（C408、B010×2、re-export 块 I001，均非本轮引入） |
+| basedpyright | `basedpyright`（全仓） | **0 errors / 0 warnings / 0 notes** |
+| 全量测试 | `python -m pytest` | **884 passed / 0 failed / 153.79s**（876 + 本轮新增 8） |
+| 单文件隔离（本轮改动的 7 个测试文件） | 逐文件单独进程 | 7/7 通过 |
+
+第三轮修复记录（勿重复排查）：
+
+- `eval/replay.py` 访问 `bt.SessionLocal` 曾触发 3 条 `reportPrivateLocalImportUsage`——**仅全仓跑法可见，局部文件跑法不触发**；静态检查声明必须以全仓入口（CI 的 `basedpyright`）为准。已在 `builtin_tools.py` 用同名别名显式再导出修复（`# noqa: PLC0414`，monkeypatch 契约不变）。
+- 闸门契约口径：`check_memory_single_source` 改为按 `memory_key_registry` 的 cardinality 判定（multi/未注册键的多条 active 合法），与 `MemoryStore._infer_cardinality`、`memory_maintenance_planner` 的既有口径一致。
+- gate severity 语义落地：仅 critical 失败阻断；warning 失败（`check_context_snapshot_persisted`）记入 `GateResult.notes` 不阻断。
+- 晋升双入口共用 `evaluate_promotion_gate`；`ReleaseManager.promote(run_gate=True)` 为生产路径（REST 与 `promote_slot` 工具），回滚刻意不设闸门。
+
 ### 10.6 测试分层入口与耗时基线（2026-10-21）
 
 > 全仓唯一入口是仓库根 pyproject.toml 的 [tool.pytest.ini_options]，testpaths = ["tests"]。
 > 层级筛选必须用目录路径（pytest 9 的 -m 过滤先于 conftest 打标记，`-m unit` 不生效）。
 
-| 入口 | 用例数 | 实测耗时（2026-10-22 夹具改造后） |
+| 入口 | 用例数 | 实测耗时（2026-10-22 安全门修复轮复测） |
 | --- | --- | --- |
-| `python -m pytest tests/unit` | 532 | 78.47s（改造前 330.83s） |
-| `python -m pytest tests/integration` | 315 | 29.00s（改造前 23.27s，同机波动） |
-| `python -m pytest tests/flow` | 10 | 19.76s（其中 1 个 7.6s 真实链路） |
-| `python -m pytest`（全量） | 857 | **112.35s**（改造前 363.80s） |
-| `python -m pytest tests/unit tests/flow`（默认快速集） | 542 | **89.17s** |
-| `PYTHON_BIN=.venv/Scripts/python.exe JOBS=4 bash scripts/check_single_file_tests.sh` | 91 个文件 | 约 3 分钟（91/91 通过） |
+| `python -m pytest tests/unit` | 559 | 126.78s（夹具改造后 78.47s→安全门用例加入后回升；eval 四文件合计约 50s） |
+| `python -m pytest tests/integration` | 315 | 31.48s |
+| `python -m pytest tests/flow` | 10 | 9.13s |
+| `python -m pytest`（全量） | 884 | **153.79s** |
+| `python -m pytest tests/unit tests/flow`（默认快速集） | 569 | 约 136s（unit+flow 之和） |
+| `PYTHON_BIN=.venv/Scripts/python.exe JOBS=4 bash scripts/check_single_file_tests.sh` | 91 个文件 | 约 3 分钟（91/91 通过；本轮另对 7 个改动测试文件单独复跑 7/7 通过） |
 
 测试基础设施要点（改动前先读）：
 
@@ -651,14 +671,17 @@ api/routes_agent_tasks.py 创建任务 → task_runtime/repository.py::create_ta
 | 文件 | 职责 / 关键符号 |
 |---|---|
 | `models.py` | 纯数据契约：`ContractResult`、`StepResult`、`EvalCaseResult`、`EvalRunResult`（`.ok`=无异常且 failed==0）、`GateResult`（`.to_summary()`）；无外部依赖，可 JSON 序列化 |
-| `contracts.py` | 5 项内核契约检查（fail-closed，单检查异常记为 critical 失败）：`check_memory_single_source`（canonical_key 唯一真相源）、`check_key_events_persisted`（completed turn 必须有 chat_ended Event）、`check_outbox_idempotent`（operation_id 唯一 + 重复入队被唯一约束拒绝）、`check_safe_delete_guard`（危险/越界拒绝、域内允许）、`check_context_snapshot_persisted`（warning 级）；`KERNEL_CONTRACTS` 列表 + `run_contract_checks(session, only=None)` |
+| `contracts.py` | 5 项内核契约检查（fail-closed，单检查异常记为 critical 失败）：`check_memory_single_source`（**按注册表 cardinality 判定**：single 基数键唯一；multi/未注册键多条 active 合法，见 memory_key_registry）、`check_key_events_persisted`（completed turn 必须有 chat_ended Event）、`check_outbox_idempotent`（operation_id 唯一 + 重复入队被唯一约束拒绝）、`check_safe_delete_guard`（危险/越界拒绝、域内允许）、`check_context_snapshot_persisted`（warning 级，不阻断）；`KERNEL_CONTRACTS` 列表 + `run_contract_checks(session, only=None)` |
 | `scenarios.py` | 24 个离线确定性场景（eval.s01–eval.s24）：工具调用（echo/current_time/list_tasks/.../memory_search）、失败处理（未知工具/未授权来源/非法参数/safe_delete 拦截/域内允许）、记忆读写、Event/Outbox/Snapshot 写入与断言、组合流。`SCENARIOS` 列表；每场景用唯一 key/id 互不干扰 |
 | `replay.py` | `isolated_eval_session()`（一次性 SQLite + 重定向 `aiive.tools.builtin_tools.SessionLocal` 给 db 工具用）；`ReplayRunner.run(session)` 把每个 step 派发到 `_exec_*` 走真实执行链；`run_replay_isolated()`（崩溃即 fail-closed 返回 `EvalRunResult(error=...)`） |
-| `gate.py` | `SafetyGate.evaluate(live_session=None, candidate_app_dir=None, persist=False)`：先跑契约（有 live_session 用现场，否则隔离库），必跑 `run_replay_isolated()`，可选跑候选子进程（候选 backend 前置 PYTHONPATH 阴影当前 aiive，fail-closed 于非零/不可解析）；`ok = 契约 and 重放 and 候选`；`persist=True` 落盘 `runtime/eval_runs/*.json` |
-| `persistence.py` | 结果落盘/读取：`save_gate_result` / `load_runs` / `latest`（`<repo>/runtime/eval_runs/`，复用文件态约定，无新表、无 UI） |
+| `gate.py` | `SafetyGate.evaluate(live_session=None, candidate_app_dir=None, persist=False)`：先跑契约（有 live_session 用现场，否则隔离库），必跑 `run_replay_isolated()`，可选跑候选子进程（候选 backend 前置 PYTHONPATH 阴影当前 aiive，fail-closed 于非零/不可解析/缺 eval 包）；**severity 语义：仅 critical 失败阻断，warning 失败记入 notes 不阻断**；`ok = 关键契约 and 重放 and 候选`；`persist=True` 落盘 `runtime/eval_runs/*.json`。`evaluate_promotion_gate(candidate_slot_root, persist=True, gate=None)`：晋升统一入口（PromoteRollback / ReleaseManager 共用），异常一律转换为 ok=False |
+| `persistence.py` | 结果落盘/读取：`save_gate_result` / `load_runs` / `latest`。目录解析优先级：`AIIVE_EVAL_RUNS_DIR` 环境变量 → 从 `__file__`/cwd 向上探测仓库根（含 `alembic.ini` 或 `pyproject.toml`+`backend/`）→ 历史 `parents[3]` 回退；源码与 wheel/site-packages（Docker）布局下均落在 `<repo>/runtime/eval_runs/` |
 | `cli.py` | `python -m aiive.eval run [--json] [--out PATH]`：跑 `run_replay_isolated()` 并打印摘要或 JSON |
 | `__init__.py` | 公共表面再导出 contracts/replay/gate/persistence/scenarios + 模型类 |
 
-**接入点**：`selfdev/promote_rollback.py::promote` 在健康检查后、切换活动槽位前调用 `SafetyGate().evaluate(candidate_app_dir=..., persist=True)`；失败返回 `ok=False` 并阻断。只读查询路由见 `api/routes_eval.py`（`GET /api/eval/runs`、`GET /api/eval/runs/latest`）。
+**接入点**：两个晋升入口在健康检查后、切换活动槽位前共用 `eval/gate.py::evaluate_promotion_gate(inactive_slot.root)`（fail-closed，异常也阻断）：
+- `supervisor/release_manager.py::promote(run_gate=True)` —— **生产入口**（REST `POST /api/selfdev/{id}/promote` 与 `promote_slot` 工具共用；`ReleaseManager(manager=, probe=, state_file=, gate=)` 支持注入闸门替身）；
+- `selfdev/promote_rollback.py::promote(run_gate=True)` —— 同语义保留入口（无生产调用方）。
+回滚（rollback）是紧急逃生通道，刻意不设闸门。只读查询路由见 `api/routes_eval.py`（`GET /api/eval/runs`、`GET /api/eval/runs/latest`，`require_local_developer` 守卫）。
 
-**测试**：`tests/unit/backend/test_eval_contracts.py`（5 契约正负例）、`test_eval_replay.py`（24 场景全过 + 隔离稳定 + 损坏场景 fail-closed + 未授权工具拒绝）、`test_eval_gate.py`（干净系统通过 / 契约违规阻断 / 候选子进程失败阻断 / promote 被阻断 / 通过后 proceed）、`test_eval_persistence.py`（落盘读取往返）。
+**测试**：`tests/unit/backend/test_eval_contracts.py`（5 契约正负例 + multi 基数合法重复）、`test_eval_replay.py`（24 场景全过 + 隔离稳定 + 损坏场景 fail-closed + 未授权工具拒绝）、`test_eval_gate.py`（干净系统通过 / 契约违规阻断 / warning 级不阻断 / 候选子进程失败阻断 / 候选缺 eval 包阻断 / promote 被阻断 / 通过后 proceed）、`test_eval_persistence.py`（落盘读取往返 + 目录解析）、`test_release_manager.py`（观察窗回滚 + 生产入口闸门阻断/放行/显式跳过）。

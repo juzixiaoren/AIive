@@ -28,7 +28,16 @@ logger = logging.getLogger(__name__)
 
 
 def check_memory_single_source(session: Session) -> ContractResult:
+    """单基数记忆的唯一性：registered single-cardinality key 不得有多条 active+valid 记录。
+
+    口径与记忆系统自身一致（见 memory/memory_key_registry.py）：
+    - 注册为 single cardinality 的 key（含精确键与 single 模式键）必须唯一；
+    - 注册为 multi cardinality 的 key（conflict_policy=append，如 project.* / episodic.*）
+      同一 key 多条 active 是合法状态，不参与判定；
+    - 未注册 key 由系统按 multi 处理（MemoryStore._infer_cardinality 约定），同样不强制唯一。
+    """
     from aiive.db.models import MemoryRecord
+    from aiive.memory.memory_key_registry import get_memory_key_registry
     from aiive.memory.memory_types import LifecycleState, ValidityState
 
     rows = (
@@ -41,18 +50,32 @@ def check_memory_single_source(session: Session) -> ContractResult:
         .all()
     )
     counts = Counter(r[0] for r in rows)
-    dupes = {k: v for k, v in counts.items() if v > 1}
+    registry = get_memory_key_registry()
+    dupes: dict[str, int] = {}
+    multi_keys: dict[str, int] = {}
+    for key, count in counts.items():
+        if key is None or count <= 1:
+            continue
+        if registry.is_single_cardinality(key):
+            dupes[key] = count
+        else:
+            # multi cardinality（或未注册按 multi 约定）：多条 active 合法，仅记录供审计
+            multi_keys[key] = count
     ok = not dupes
     return ContractResult(
         name="memory_single_source_of_truth",
         ok=ok,
         severity="critical",
         detail=(
-            "every active memory has a unique canonical_key"
+            "every active single-cardinality memory has a unique canonical_key"
             if ok
-            else "duplicate active canonical_key detected: " + str(dupes)
+            else "duplicate active canonical_key on single-cardinality keys: " + str(dupes)
         ),
-        evidence={"active_memory_count": len(rows), "duplicate_keys": dupes},
+        evidence={
+            "active_memory_count": len(rows),
+            "duplicate_keys": dupes,
+            "multi_cardinality_keys": multi_keys,
+        },
     )
 
 

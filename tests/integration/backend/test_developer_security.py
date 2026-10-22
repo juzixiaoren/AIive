@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from aiive.api import developer_security
 from aiive.api.routes_debug import router as debug_router
 from aiive.api.routes_epochs import router as epochs_router
+from aiive.api.routes_eval import router as eval_router
 from aiive.api.routes_outbox import router as outbox_router
 from aiive.db.base import get_db
 from aiive.db.models import Event, LLMCall, OutboxJob, Thread
@@ -23,6 +24,7 @@ def _app(db) -> FastAPI:
     app.include_router(debug_router)
     app.include_router(outbox_router)
     app.include_router(epochs_router)
+    app.include_router(eval_router)
     return app
 
 
@@ -36,6 +38,7 @@ def test_guard_defaults_to_closed(db, monkeypatch) -> None:
     monkeypatch.setattr(developer_security.settings, "aiive_developer_diagnostics_enabled", False)
     response = _client(_app(db)).get("/api/debug/events")
     assert response.status_code == 404
+    assert _client(_app(db)).get("/api/eval/runs").status_code == 404
 
 
 def test_guard_rejects_non_loopback_client(db, monkeypatch) -> None:
@@ -43,6 +46,7 @@ def test_guard_rejects_non_loopback_client(db, monkeypatch) -> None:
     monkeypatch.setattr(developer_security.settings, "aiive_developer_diagnostics_enabled", True)
     response = _client(_app(db), "192.0.2.10").get("/api/outbox/jobs")
     assert response.status_code == 403
+    assert _client(_app(db), "192.0.2.10").get("/api/eval/runs").status_code == 403
 
 
 def test_guard_rejects_non_loopback_host(db, monkeypatch) -> None:
@@ -59,6 +63,11 @@ def test_loopback_reads_are_allowed_and_epoch_writes_are_guarded(db, monkeypatch
     assert client.get("/api/debug/events").status_code == 200
     assert client.get("/api/outbox/jobs").status_code == 200
     assert client.get("/api/epochs/thread-1").status_code == 200
+    # eval 只读查询（gate 结果）同样仅本机可见
+    eval_runs = client.get("/api/eval/runs")
+    assert eval_runs.status_code == 200
+    assert isinstance(eval_runs.json()["runs"], list)
+    assert client.get("/api/eval/runs/latest").status_code == 200
 
     # 启用 + loopback：写端点可用
     response = client.post("/api/epochs/thread-1/seal-segment")
