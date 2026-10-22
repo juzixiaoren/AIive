@@ -168,7 +168,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: 准备 .env
-        run: cp .env.example .env
+        run: |
+          cp .env.example .env
+          # compose 把 HOST 设为 0.0.0.0（非 loopback），Settings 会拒绝 .env.example
+          # 里的默认开发令牌；冒烟测试换成一次性占位令牌即可，不涉及真实权限。
+          sed -i 's|^AIIVE_DESKTOP_NODE_AUTH_TOKEN=.*|AIIVE_DESKTOP_NODE_AUTH_TOKEN=ci-desktop-node-token|' .env
+          sed -i 's|^AIIVE_TRUSTED_CORE_ADMIN_TOKEN=.*|AIIVE_TRUSTED_CORE_ADMIN_TOKEN=ci-trusted-core-admin-token|' .env
       - name: 构建镜像
         run: docker compose build
       - name: 启动服务栈
