@@ -371,6 +371,18 @@ class MemoryRecord(Base):
 class MemoryVectorProjection(Base):
     """记忆的 pgvector 派生投影；MemoryRecord 仍是唯一真相源。"""
     __tablename__: str = "memory_vector_projections"
+    __table_args__: tuple[Index, ...] = (
+        # HNSW 近邻索引由 Alembic 迁移以裸 DDL 创建（见 e7b29c4d8a11 / c6e8f1a2b3d4），
+        # 此处同步声明，使 ORM metadata 与迁移后的库结构一致（alembic check 不再报告待删除索引），
+        # 也让 create_all 建出的库具备同等索引。仅 PostgreSQL 有意义：
+        # SQLite 的 embedding 是 JSON 变体，没有 pgvector 算子类，故按方言抑制。
+        Index(
+            "ix_memory_vector_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ).ddl_if(dialect="postgresql"),
+    )
 
     memory_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("memory_records.id", ondelete="CASCADE"), primary_key=True,

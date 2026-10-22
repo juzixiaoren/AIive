@@ -697,3 +697,9 @@ api/routes_agent_tasks.py 创建任务 → task_runtime/repository.py::create_ta
 | `tests/integration/pg/test_pg_contracts.py` | 8 个契约用例：PG 自检、advisory lock 真实持有、同键并发写只留 1 条 active、并发 claim 不重复、SKIP LOCKED 跳过锁定行不阻塞、forget cascade 异常回滚无半状态、forget deadletter 三表原子一致、写入回滚无记忆/投影残留 |
 
 **被测实现（只读复用，未改动）**：`memory/memory_write_service.py::_acquire_lock`（`pg_advisory_xact_lock`）、`worker/outbox_worker.py::claim_one`（`with_for_update(skip_locked=True)`）、`worker/handlers_forget.py`（cascade 事务边界）、`worker/outbox_worker.py::_deadletter_forget_stage`（deadletter 原子更新）。
+
+**迁移一致性**：ORM 与 Alembic 迁移后的库结构由 `alembic check` 守护（CI `alembic` Job 在 `upgrade head` 后执行）。
+`memory_vector_projections` 的 HNSW 索引 `ix_memory_vector_embedding_hnsw` 由迁移以裸 DDL 创建，
+模型侧在 `MemoryVectorProjection.__table_args__` 同步声明（`postgresql_using="hnsw"` +
+`postgresql_ops={"embedding": "vector_cosine_ops"}`，`.ddl_if(dialect="postgresql")` 抑制 SQLite），
+因此 `create_all` 与迁移建库的索引定义一致。

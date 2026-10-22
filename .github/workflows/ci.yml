@@ -132,6 +132,9 @@ jobs:
           pip install -e .
       - name: 在空库上执行迁移至 head
         run: alembic upgrade head
+      - name: 校验 ORM metadata 与迁移后的库结构一致
+        # 防止“迁移里存在但模型未声明”的结构漂移（如 pgvector 的 HNSW 索引）。
+        run: alembic check
 
   integration:
     name: 本地集成测试（pytest）

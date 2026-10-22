@@ -62,3 +62,11 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - 默认全量：884 passed, 8 skipped, 0 failed（116.66s）。
 - 未发现产品 Bug；修正两处测试自身构建问题（非法 memory_type、FK 插入顺序）。
 - 详见 `docs/audit/pg_contract_tests_report.md`。
+
+### Alembic 一致性补验（同日补跑）
+- 空库 `alembic upgrade head`：16 个迁移全部成功，head `e2f6a8c4d1b7`。
+- 结构对比（迁移后库 vs ORM metadata）：71/71 表，列/类型/可空性/唯一约束/索引全部 0 差异。
+- 发现并修复 1 处漂移：HNSW 索引 `ix_memory_vector_embedding_hnsw` 只存在于迁移的裸 DDL，
+  已在 `MemoryVectorProjection.__table_args__` 同步声明（`.ddl_if(dialect="postgresql")` 抑制 SQLite），
+  `alembic check` 由 FAILED 转为 `No new upgrade operations detected.`，`create_all` 与迁移索引定义一致。
+- CI `alembic` Job 增加 `alembic check` 步骤，防止同类漂移再次进入主干。

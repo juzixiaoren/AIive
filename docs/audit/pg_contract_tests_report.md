@@ -43,9 +43,34 @@
   2. `ForgetStageRun` 与 `OutboxJob` 无 ORM relationship，同批 insert 时 FK 顺序不确定；显式 `flush()` 父行后插入。
 
 ## 6. 仍存在的数据库一致性风险
-- PG 测试用 `Base.metadata.create_all` 建表，而非 Alembic 迁移；schema 与迁移历史可能漂移（`alembic` CI Job 单独覆盖迁移）。
+- 测试建库走 `Base.metadata.create_all`，不执行迁移历史。已在 §7 补跑迁移校验证明两者结构一致，
+  但**只有迁移才会创建的对象**（自定义函数、触发器、部分索引之外的 DDL 等）仍不会被测试建库覆盖。
 - 并发用例为有限线程（6–8）与单键工作负载；未压测多键交叉死锁、长事务、连接池耗尽。
 - advisory lock 键为 sha256 前 64 位，理论碰撞未测试。
 - 仅覆盖 outbox claim 的 SKIP LOCKED；`tool_operations` 等其他领取路径未覆盖。
 - Forget deadletter 用例直接调用 `_retry_or_deadletter`，未跑完整 poll 循环；跨进程重启的多阶段恢复未覆盖。
 - 仅验证 PostgreSQL 16 + pgvector；其他版本未验证。
+
+## 7. 补充：Alembic 迁移与 ORM 结构一致性校验
+- 环境：一次性容器 `aiive-pg-alembic`（`127.0.0.1:55432`，`--rm`），空库从零开始。
+- 迁移：`alembic upgrade head` 依次执行 16 个版本（`69da20d1e47c` → `e2f6a8c4d1b7`）全部成功，
+  `alembic current` = `e2f6a8c4d1b7 (head)`，无报错、无降级。
+- 结构对比（迁移后的库 vs `Base.metadata`，类型按 PostgreSQL 方言编译后比较）：
+  表 71/71、缺表 0、多表 0、列集合 0 差异、类型 0 差异、可空性 0 差异、
+  唯一约束 0 差异、索引 0 差异 → `STRUCTURE_OK`。
+- **发现的漂移（1 处）**：`alembic check` 报
+  `Detected removed index 'ix_memory_vector_embedding_hnsw' on 'memory_vector_projections'`。
+  该 HNSW 索引由迁移以裸 DDL 创建（`e7b29c4d8a11` 建、`c6e8f1a2b3d4` 随 512 维重建），
+  但 ORM 模型未声明，导致 autogenerate 认为应删除它、`create_all` 也不会建它。
+- **修复（最小范围）**：在 `MemoryVectorProjection.__table_args__` 声明同参数索引
+  （`postgresql_using="hnsw"` + `postgresql_ops={"embedding": "vector_cosine_ops"}`），
+  并用 `.ddl_if(dialect="postgresql")` 只在 PostgreSQL 生成——SQLite 的 `embedding` 是 JSON 变体，
+  没有 pgvector 算子类，无需要也不能建该索引。未改动任何迁移文件、未改产品行为。
+- 修复后复验：
+  - `alembic check` → `No new upgrade operations detected.`（全新空库与已迁移库各一次）。
+  - 结构对比 → 全部 0 差异，`STRUCTURE_OK`。
+  - `create_all` 建库与迁移建库的索引定义完全一致：
+    均为 `CREATE INDEX ix_memory_vector_embedding_hnsw ON public.memory_vector_projections USING hnsw (embedding vector_cosine_ops)`。
+  - 回归：PG 专项 `8 passed`（11.79s）；默认全量 `884 passed, 8 skipped`（114.76s）；
+    `ruff check backend/aiive --select F,E9` 通过；`basedpyright` 0 errors 0 warnings。
+- 防回归：CI `alembic` Job 在 `upgrade head` 后新增 `alembic check`，今后「迁移有、模型无」的结构漂移会直接失败。
