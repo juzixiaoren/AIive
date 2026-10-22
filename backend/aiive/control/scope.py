@@ -42,11 +42,16 @@ class TaskScope:
     allow_network: bool = False
     allow_secrets: bool = False
     isolation_mode: str = "shared"
+    # unified：不按任务类型/技能预置能力白名单，全部可用能力都可被发现和执行，
+    # 真实约束（路径根、域名、密钥、节点可用性、策略/审批）仍然生效。
+    # restricted：调用方显式给出 allowed_capabilities，作为授权白名单强制执行。
+    capability_policy: str = "restricted"
 
     @classmethod
     def from_brief(cls, brief: dict[str, Any]) -> "TaskScope":
         raw = brief.get("scope")
         raw = raw if isinstance(raw, dict) else {}
+        policy = str(raw.get("capability_policy", "restricted"))
         return cls(
             allowed_capabilities=frozenset(str(v) for v in raw.get("allowed_capabilities", []) if v),
             allowed_roots=tuple(str(v) for v in raw.get("allowed_roots", []) if v),
@@ -54,9 +59,12 @@ class TaskScope:
             allow_network=bool(raw.get("allow_network", False)),
             allow_secrets=bool(raw.get("allow_secrets", False)),
             isolation_mode=str(raw.get("isolation_mode", "shared")),
+            capability_policy=policy if policy in {"unified", "restricted"} else "restricted",
         )
 
     def allows_capability(self, capability_id: str) -> bool:
+        if self.capability_policy == "unified":
+            return True
         return capability_id in self.allowed_capabilities
 
     def validate_arguments(self, capability_id: str, arguments: dict[str, Any]) -> list[str]:
@@ -102,6 +110,7 @@ class TaskScope:
             "allow_network": self.allow_network,
             "allow_secrets": self.allow_secrets,
             "isolation_mode": self.isolation_mode,
+            "capability_policy": self.capability_policy,
         }
 
 

@@ -67,6 +67,8 @@ class TaskScopeModel(BaseModel):
     allow_network: bool = False
     allow_secrets: bool = False
     isolation_mode: Literal["shared", "git_worktree"] = "shared"
+    # unified：不按任务类型/技能收窄能力面；restricted：allowed_capabilities 为授权白名单。
+    capability_policy: Literal["unified", "restricted"] = "restricted"
 
 
 class TaskBrief(BaseModel):
@@ -84,12 +86,16 @@ class ActionProposal(BaseModel):
 
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
-    decision: Literal["action", "finish", "ask_user", "watch"]
+    decision: Literal[
+        "action", "finish", "ask_user", "watch", "search_capabilities", "describe_capability",
+    ]
     capability_id: str = ""
     arguments: dict[str, Any] = Field(default_factory=dict)
     preconditions: dict[str, Any] = Field(default_factory=dict)
     effects: dict[str, Any] = Field(default_factory=dict)
     summary: str = ""
+    # search_capabilities 的检索关键词；发现类决策只读，不产生 Action。
+    query: str = ""
     report_status: Literal["succeeded", "partial", "failed"] = "succeeded"
     question: str = ""
     watch: dict[str, Any] = Field(default_factory=dict)
@@ -102,6 +108,10 @@ class ActionProposal(BaseModel):
             raise ValueError("ask_user decision requires question")
         if self.decision == "watch" and not self.watch:
             raise ValueError("watch decision requires watch config")
+        if self.decision == "search_capabilities" and not self.query.strip():
+            raise ValueError("search_capabilities decision requires query")
+        if self.decision == "describe_capability" and not self.capability_id.strip():
+            raise ValueError("describe_capability decision requires capability_id")
         return self
 
 

@@ -39,9 +39,38 @@ class CapabilityBroker:
         self.locks: ResourceLockService = locks or ResourceLockService()
 
     def registry_for(self, task: AgentTask) -> ToolRegistry:
+        """执行视图：restricted 时裁剪到授权白名单，unified 时返回全部可用能力。"""
         scope = TaskScope.from_brief(task.task_brief or {})
         registry = build_registry_for_thread(self.db, task.thread_id, task.target_node_id)
+        if scope.capability_policy == "unified":
+            return registry
         return registry.scoped(scope.allowed_capabilities)
+
+    def available_registry(self, task: AgentTask) -> ToolRegistry:
+        """发现视图：内置 + 在线桌面 + MCP 的完整可用能力，不按任务收窄。
+
+        发现只回答"系统里有什么"，不代表获得执行授权；实际调用仍由
+        registry_for 的授权视图与 TaskPolicyEngine 判定。
+        """
+        return build_registry_for_thread(self.db, task.thread_id, task.target_node_id)
+
+    def search_capabilities(
+        self, task: AgentTask, query: str, *, limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """关键词检索全量可用能力，附带 in_scope 标记（授权信息，不是授权本身）。"""
+        scope = TaskScope.from_brief(task.task_brief or {})
+        return [
+            {**entry, "in_scope": scope.allows_capability(entry["capability_id"])}
+            for entry in self.available_registry(task).search(query, limit=limit)
+        ]
+
+    def describe_capability(self, task: AgentTask, capability_id: str) -> dict[str, Any] | None:
+        """查询单个能力的完整定义；不存在时返回 None。"""
+        scope = TaskScope.from_brief(task.task_brief or {})
+        definition = self.available_registry(task).definition(capability_id)
+        if definition is None:
+            return None
+        return {**definition, "in_scope": scope.allows_capability(capability_id)}
 
     def list_capabilities(self, task: AgentTask) -> list[dict[str, Any]]:
         return self.registry_for(task).list_all()

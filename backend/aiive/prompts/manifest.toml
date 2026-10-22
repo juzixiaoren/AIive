@@ -66,15 +66,15 @@ variables = ["reminder_id", "title", "content"]
 
 [prompts."task_runtime.worker_system"]
 file = "task_runtime/worker_system.md"
-version = "1.0.0"
+version = "2.0.0"
 role = "system"
 variables = []
 
 [prompts."task_runtime.task_context"]
 file = "task_runtime/task_context.md"
-version = "1.0.0"
+version = "2.0.0"
 role = "user"
-variables = ["task_context", "capabilities"]
+variables = ["task_context"]
 
 [prompts."task_runtime.task_report"]
 file = "task_runtime/task_report.md"

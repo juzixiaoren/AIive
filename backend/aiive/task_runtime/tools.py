@@ -48,17 +48,21 @@ def _delegate_task(
         if selected_skill is not None and task_type == "general"
         else task_type
     )
-    effective_capabilities = (
-        allowed_capabilities
-        if allowed_capabilities
-        else list(selected_skill.capabilities) if selected_skill is not None else []
-    )
+    if allowed_capabilities:
+        # 调用方显式给出的能力列表是真实授权约束，保持 restricted。
+        effective_capabilities = list(allowed_capabilities)
+        capability_policy = "restricted"
+    else:
+        # Skill 只提供指令与网络需求，不再用技能 profile 缩小可发现能力面。
+        effective_capabilities = list(selected_skill.capabilities) if selected_skill is not None else []
+        capability_policy = "unified"
     raw_brief = {
         "acceptance_criteria": acceptance_criteria or [],
         "constraints": constraints or [],
         "scope": {
             "allowed_roots": allowed_roots or [],
             "allowed_capabilities": effective_capabilities,
+            "capability_policy": capability_policy,
             "allowed_hosts": allowed_hosts or [],
             "allow_network": allow_network or bool(
                 selected_skill and selected_skill.requires_network

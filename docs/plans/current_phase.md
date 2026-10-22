@@ -70,3 +70,27 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
   已在 `MemoryVectorProjection.__table_args__` 同步声明（`.ddl_if(dialect="postgresql")` 抑制 SQLite），
   `alembic check` 由 FAILED 转为 `No new upgrade operations detected.`，`create_all` 与迁移索引定义一致。
 - CI `alembic` Job 增加 `alembic check` 步骤，防止同类漂移再次进入主干。
+
+## V35 统一 Agent 工具发现与分层注入（完成）
+
+### Implemented
+- `tools/registry.py`：职责分层——`register/unregister`、`catalog()`（轻量目录，无 Schema）、
+  `search()`（本地关键词检索，确定性打分）、`definition()`（单工具完整定义）、
+  `list_all()`（仅管理/诊断，docstring 禁止整段注入模型上下文）；执行链未改动。
+- `task_runtime/tool_injection.py`：L0 常驻清单（记忆读取/基础搜索/desktop_exec/任务管理）、
+  注入模式阈值（≤12 工具且 ≤24k 字符全量注入，否则按需发现）、发现状态（只存 id + 指纹）、
+  `build_tool_view`（执行视图 vs 发现视图，`in_scope` 标注，陈旧指纹标记）。
+- `control/scope.py` + `task_runtime/router.py`：新增 `capability_policy`（unified/restricted）；
+  task_type 不再生成默认能力白名单，Skill Profile 不再缩小发现范围；路径/域名/网络/密钥/节点约束保留。
+- `control/capability_broker.py`：`registry_for` 支持 unified；新增 `available_registry`、
+  `search_capabilities`、`describe_capability`、`resident_capabilities`（发现不越权）。
+- `task_runtime/schemas.py`：`ActionProposal` 新增只读决策 `search_capabilities` / `describe_capability`。
+- `task_runtime/runtime.py`：发现决策不创建 AgentAction、不调用 handler，仅记录状态与事件；
+  常驻能力注入替代全量清单；`usage.discovery_steps` 观测。
+- `task_runtime/context_assembler.py`：`snapshot.tools` 取代全量 `capabilities` 与 `capability_ids`。
+- 提示词：`worker_system` 2.0.0 增加发现协议/漏选恢复/能力不足处理；`task_context` 2.0.0 说明 tools 字段。
+
+### Observable Result
+- 新增 `tests/unit/backend/test_worker_tool_injection.py` 16 例全通过。
+- 全量离线：900 passed / 8 skipped（PG 专项默认跳过）；`tests/integration` 330 passed。
+- 对话 Agent 仍固定 5 个任务元工具（既有用例继续通过）。

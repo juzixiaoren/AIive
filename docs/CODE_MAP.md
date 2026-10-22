@@ -92,6 +92,9 @@
 | 副作用工具 Outbox 化执行 | `tools/operation_executor.py` | `worker/scheduler_daemon.py::_poll_tool_operations` | `test_tool_operation*.py` |
 | 安全删除 | `tools/safe_delete.py` | `tools/builtin_files.py::handle_safe_delete` | `test_safe_delete*.py` |
 | 工具结果引用化（大结果→Artifact） | `runtime/tool_normalizer.py`、`runtime/tool_executor.py` | `storage/object_store.py`、`runtime/action_cards.py` | — |
+| 工具注入方案（分层/tool_plan/检索选型分析） | `docs/architecture/工具注入方案分析.md` | 下述注入面实证 | — |
+
+**工具注入面（改绑定/可见性前必读）**：对话 Agent 每轮**只绑定 5 个任务元工具**（`task_runtime/tools.py::build_main_agent_registry`，`context_assembler.py:256` 固定注入，`tool_definitions` 分区 4000/6000 token 前缀截断），架构不变。持久任务 Worker 采用**分层注入 + 自主发现**（`task_runtime/tool_injection.py`）：L0 常驻能力（长期记忆读取、基础搜索、`desktop_exec`、任务管理）始终注入完整定义；其余能力由 Worker 通过 `search_capabilities` / `describe_capability` 两个只读决策按需发现，`TaskContextAssembler` 只注入 `tools.resident / available / discovered / loaded`，**不再整段注入 `list_all()` 清单**；目录 ≤12 个工具时直接全量注入 Schema，超过则转为发现模式。发现范围覆盖全部可用能力（内置 + 在线桌面 + MCP + 自进化），**不受 task_type / Skill Profile 收窄**（`TaskScope.capability_policy=unified`）；执行仍由 `CapabilityBroker` 的授权视图 + `TaskPolicyEngine` + 审批 + 资源锁 + `descriptor_hash` 裁决，发现不扩大权限。方案与实施记录见 `docs/architecture/工具注入方案分析.md`。
 
 ### 2.3 记忆系统
 
@@ -261,7 +264,7 @@
 
 | 文件 | 职责 / 关键符号 |
 |---|---|
-| `registry.py` | `CapabilitySafetySchema` L36（definition_source/trust_level/risk_level/requires_confirmation/writes_external_world/can_delete/uses_network/allowed_instruction_sources/timeout/effect_mode）；`ToolRegistration` L86；`compute_descriptor_hash` L71；`ToolRegistry` L135：`register` L150、`snapshot` L197、`scoped` L207、**`execute` L244**（指令来源授权→参数校验→副作用入队/直接执行）、**`execute_approved` L368**（审批后，强制指纹一致）、**`execute_brokered` L436**（Task Action 经 CapabilityBroker）、`_execute_direct` L319（线程池+超时）；单例 `get_tool_registry` L469 |
+| `registry.py` | `CapabilitySafetySchema` L36（definition_source/trust_level/risk_level/requires_confirmation/writes_external_world/can_delete/uses_network/allowed_instruction_sources/timeout/effect_mode）；`ToolRegistration` L86；`compute_descriptor_hash` L71；`ToolRegistry` L135：`register` L150、`unregister`（卸载，目录即时一致）、`catalog`（轻量目录，不含 Schema）、`search`（本地关键词检索，确定性打分）、`definition`（单工具完整定义）、`snapshot` L197、`scoped` L207、**`execute` L244**（指令来源授权→参数校验→副作用入队/直接执行）、**`execute_approved` L368**（审批后，强制指纹一致）、**`execute_brokered` L436**（Task Action 经 CapabilityBroker）、`_execute_direct` L319（线程池+超时）；单例 `get_tool_registry` L469 |
 | `builtin_tools.py` | 内置工具**注册与组合入口** + 共享机制（第一轮架构重构后）：`register_builtin_tools` L141（统一注册全部 36 工具，逐项 cap_id/handler/desc/params/risk/writes_ext/can_del + effect_mode 映射）；共享机制（_build_safety / db_handler / require_ctx）定义在本模块（单一实现，领域模块复用，不复制装饰器）；其中 SessionLocal 与 db_handler 必须同处 builtin_tools 命名空间——测试与 tests/support.py 会 monkeypatch aiive.tools.builtin_tools.SessionLocal 把会话重定向到隔离测试库。register_builtin_tools 统一注册全部 36 工具；10 个领域模块用公开名 handle_* 实现，本模块以私有别名 _handle_* re-export（见下表），保持对 aiive.tools.builtin_tools 的导入契约完全不变；forget/forget_status 由 forget_tool.py 提供并同样 re-export。依赖方向：领域模块 → builtin_tools（仅 import db_handler/require_ctx），builtin_tools 末尾再 import 领域模块做 re-export；共享符号先于 re-export 定义，故为可安全导入的惰性环（详见 §10）。 |
 | `tool_validation.py` | `build_tool_args_model` L150（`create_model(strict=True, extra="forbid")`）；`validate_tool_params` L340 返回可重试 `error_payload()` |
 | `operation_executor.py` | `enqueue_tool_operation` L89（幂等键=sha256(turn_record_id\|tool_call_id\|capability_id\|params_hash)）；`handle_tool_operation` L219（`with_for_update` fencing+execution_token） |
@@ -314,7 +317,8 @@
 
 - `task_runtime/runtime.py`：`PersistentTaskRuntime.run` L43、`_dispatch_ready` L262、`_complete` L346、`_budget_issue` L425（LLM 只提案不执行，Broker 统一派发）
 - `task_runtime/repository.py`：`TaskRepository` 唯一写入口：`create_task` L121、`transition_task` L185、`append_event` L217、`checkpoint` L265、`enqueue_run` L310、`start_run` L329、`create_action` L400、`ready_action` L481、`cancel_task` L487、`send_input` L526、`detail` L570；`recover_stale_tasks` L660 / `reconcile_queued_tasks` L704（scheduler 调用）；commit 后 WS 广播 L46（SAVEPOINT 水位防幽灵消息）
-- `task_runtime/agent_executor.py`（`decide` L31，JSON 修复解析）、`context_assembler.py`（L20，绝不加载会话 raw history；`_bounded_value` 超限降级 sha256+preview）、`tools.py`（`build_main_agent_registry` L190：主 Agent 仅见 delegate/status/cancel/input/list_skills）、`router.py`、`state_machine.py`、`resource_locks.py`（`ResourceLockService` L30，固定顺序获取防死锁）、`evidence.py`（`EvidenceStore` L30 内容寻址）、`watchers.py`（time/file/node 三类，`wake_node_tasks` L95）、`worktree.py`（Git 隔离）、`schemas.py`
+- `task_runtime/tool_injection.py`：`WORKER_RESIDENT_CAPABILITIES`（L0 常驻清单）、`FULL_INJECTION_MAX_TOOLS=12`、`discovery_state/record_search/record_definition/merge_state`（只存 id + 指纹）、`build_tool_view`（执行视图与发现视图分离，`in_scope` 标注；loaded 按当前注册表重建，`definition_changed`/`unavailable` 不返回旧 Schema）
+- `task_runtime/agent_executor.py`（`decide` L31，JSON 修复解析）、`context_assembler.py`（L20，绝不加载会话 raw history；`_bounded_value` 超限降级 sha256+preview；`snapshot` 输出 `tools.*` 而非全量 capabilities）、`tools.py`（`build_main_agent_registry` L190：主 Agent 仅见 delegate/status/cancel/input/list_skills）、`router.py`、`state_machine.py`、`resource_locks.py`（`ResourceLockService` L30，固定顺序获取防死锁）、`evidence.py`（`EvidenceStore` L30 内容寻址）、`watchers.py`（time/file/node 三类，`wake_node_tasks` L95）、`worktree.py`（Git 隔离）、`schemas.py`
 - `control/`：`capability_broker.py`（`CapabilityBroker`：TaskScope 校验→TaskPolicyEngine→ResourceLock→`registry.execute_brokered`）；`scope.py`（`TaskScope.from_brief` L47/`validate_arguments` L62/`as_envelope` L97）；`task_policy.py`（allow/approval/block）；`approval_service.py`（审批生命周期）
 
 ### 3.10 `desktop/` — 桌面执行节点通道

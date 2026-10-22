@@ -11,14 +11,36 @@ from aiive.db.models import AgentAction, AgentTask, AgentTaskEvent, TaskArtifact
 from aiive.prompts import get_prompt_registry
 from aiive.skills import SkillDefinition
 from aiive.task_runtime.repository import TaskRepository
+from aiive.task_runtime.tool_injection import build_tool_view, discovery_state
+from aiive.tools.registry import ToolRegistry
 
 
 class TaskContextAssembler:
     def __init__(self, db: Session):
         self.db: Session = db
 
-    def snapshot(self, task: AgentTask, capabilities: list[dict[str, Any]]) -> dict[str, Any]:
+    def snapshot(
+        self,
+        task: AgentTask,
+        capabilities: list[dict[str, Any]],
+        *,
+        registry: ToolRegistry | None = None,
+        discovery_registry: ToolRegistry | None = None,
+    ) -> dict[str, Any]:
+        """构造 Task Context 快照。
+
+        capabilities 是常驻能力定义（不是全量清单）。可选工具通过
+        tools.discovered / tools.loaded 暴露，且每次都按当前注册表重建，
+        因此注册、卸载或定义变化不会被旧缓存掩盖。
+        """
         skill = self._active_skill(task)
+        execution, available = self._registries(task, registry, discovery_registry)
+        tool_view = build_tool_view(
+            execution,
+            capabilities,
+            discovery_state(task.task_state or {}),
+            discovery_registry=available,
+        )
         checkpoint = TaskRepository(self.db).latest_checkpoint(task.id)
         actions = self.db.query(AgentAction).filter(
             AgentAction.task_id == task.id,
@@ -77,12 +99,21 @@ class TaskContextAssembler:
                 {"event_type": item.event_type, "payload": _bounded_value(item.payload, 4000)}
                 for item in reversed(events)
             ],
-            "capability_ids": [item.get("capability_id") for item in capabilities],
+            "tools": _bounded_value(tool_view, 24_000),
             "skill": skill.as_dict() if skill else None,
         }
 
-    def messages(self, task: AgentTask, capabilities: list[dict[str, Any]]) -> tuple[list[dict[str, str]], dict[str, Any], list[str]]:
-        snapshot = self.snapshot(task, capabilities)
+    def messages(
+        self,
+        task: AgentTask,
+        capabilities: list[dict[str, Any]],
+        *,
+        registry: ToolRegistry | None = None,
+        discovery_registry: ToolRegistry | None = None,
+    ) -> tuple[list[dict[str, str]], dict[str, Any], list[str]]:
+        snapshot = self.snapshot(
+            task, capabilities, registry=registry, discovery_registry=discovery_registry,
+        )
         prompts = get_prompt_registry()
         system = prompts.render("task_runtime.worker_system")
         skill = self._active_skill(task)
@@ -92,12 +123,28 @@ class TaskContextAssembler:
         user = prompts.render(
             "task_runtime.task_context",
             task_context=json.dumps(snapshot, ensure_ascii=False, default=str),
-            capabilities=json.dumps(capabilities, ensure_ascii=False, default=str),
         )
         return (
             [{"role": system.role, "content": system_content}, {"role": user.role, "content": user.content}],
             snapshot,
             [system.audit_ref, user.audit_ref],
+        )
+
+    def _registries(
+        self,
+        task: AgentTask,
+        registry: ToolRegistry | None,
+        discovery_registry: ToolRegistry | None,
+    ) -> tuple[ToolRegistry, ToolRegistry]:
+        """返回（执行视图，发现视图）；调用方已提供的一侧直接复用。"""
+        if registry is not None and discovery_registry is not None:
+            return registry, discovery_registry
+        from aiive.control.capability_broker import CapabilityBroker
+
+        broker = CapabilityBroker(self.db)
+        return (
+            registry if registry is not None else broker.registry_for(task),
+            discovery_registry if discovery_registry is not None else broker.available_registry(task),
         )
 
     @staticmethod
@@ -126,6 +173,8 @@ def _bounded_value(value: Any, max_chars: int) -> Any:
 
 def _compact_task_state(state: dict[str, Any]) -> dict[str, Any]:
     compact = dict(state)
+    # 工具发现状态已在 snapshot.tools 中按当前注册表重建，这里不重复注入原始记录。
+    compact.pop("tool_discovery", None)
     inputs = state.get("inputs")
     if isinstance(inputs, list):
         compact["inputs"] = [

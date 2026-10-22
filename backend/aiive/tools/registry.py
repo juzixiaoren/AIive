@@ -13,6 +13,7 @@ import hashlib
 import inspect
 import json
 import logging
+import re
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
@@ -105,6 +106,56 @@ class ToolRegistration:
     executor_kind: str = "local"
     executor_node_id: str = ""
 
+
+_CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _search_tokens(query: str) -> list[str]:
+    """把查询拆成可匹配词元；中文长词额外展开为二元组，提高召回。"""
+    normalized = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", " ", query.casefold()).strip()
+    if not normalized:
+        return []
+    tokens: list[str] = []
+    for part in normalized.split():
+        if len(part) > 2 and _CJK_PATTERN.search(part):
+            tokens.extend(part[index:index + 2] for index in range(len(part) - 1))
+        tokens.append(part)
+    unique: list[str] = []
+    for token in tokens:
+        if token not in unique:
+            unique.append(token)
+    return unique
+
+
+def _parameter_names(reg: ToolRegistration) -> list[str]:
+    """收集参数名，供检索命中参数维度（不返回任何 Schema 内容）。"""
+    names: list[str] = []
+    if isinstance(reg.parameters, dict):
+        names.extend(str(name) for name in reg.parameters)
+    schema = reg.input_schema
+    if isinstance(schema, dict) and isinstance(schema.get("properties"), dict):
+        names.extend(str(name) for name in schema["properties"])
+    return names
+
+
+def _score_registration(reg: ToolRegistration, tokens: list[str]) -> int:
+    """确定性的本地相关性打分：id > 描述 > 参数名。"""
+    capability_id = reg.safety.capability_id.casefold()
+    description = (reg.description or "").casefold()
+    parameter_names = " ".join(_parameter_names(reg)).casefold()
+    score = 0
+    for token in tokens:
+        if token == capability_id:
+            score += 60
+        elif token in capability_id:
+            score += 24
+        position = description.find(token)
+        if position >= 0:
+            # 描述开头通常就是该能力的主语，位置越靠前越可能是主题词。
+            score += 10 + (8 if position == 0 else 4 if position < 20 else 0)
+        if token in parameter_names:
+            score += 4
+    return score
 
 # ---------------------------------------------------------------------------
 # 工具调用辅助函数（在独立线程中执行，支持超时中断）
@@ -215,7 +266,10 @@ class ToolRegistry:
         return cloned
 
     def list_all(self) -> list[dict[str, Any]]:
-        """列出所有已注册工具的摘要信息。
+        """列出所有已注册工具的完整摘要（管理 API / 诊断专用）。
+
+        警告：返回值包含全部 parameters / input_schema，禁止整段注入模型
+        上下文；模型可见的工具面必须走 catalog / search / definition。
 
         返回:
             工具信息字典列表，每项包含 capability_id、description、风险等级等
@@ -240,6 +294,79 @@ class ToolRegistry:
             }
             for r in self._tools.values()
         ]
+
+    def unregister(self, capability_id: str) -> bool:
+        """移除一个能力（如 MCP server 卸载、桌面节点离线）。
+
+        目录与检索每次都读取实时注册映射，不维护独立缓存，因此卸载后不会再
+        被搜索或注入。返回是否确实移除了条目。
+        """
+        return self._tools.pop(capability_id, None) is not None
+
+    def catalog(self) -> list[dict[str, Any]]:
+        """轻量能力目录：只含选择所需的最小元数据，绝不含参数 Schema。
+
+        这是模型可见工具列表的唯一来源。与 list_all 的区别是刻意不返回
+        parameters / input_schema，避免"查目录"变成"注入全量 Schema"。
+        需要完整定义时用 definition。
+        """
+        return [self._catalog_entry(reg) for reg in self._tools.values()]
+
+    def search(self, query: str, *, limit: int = 5) -> list[dict[str, Any]]:
+        """本地关键词检索能力目录（确定性、无外部服务、无向量库）。
+
+        打分规则固定：capability_id 命中权重最高，其次描述，最后参数名。
+        相同分数按 capability_id 排序，保证同一注册表状态下结果完全可复现。
+        每次调用都基于当前注册映射，注册/卸载/重注册后立即可见。
+        """
+        tokens = _search_tokens(query)
+        if not tokens or limit <= 0:
+            return []
+        scored: list[tuple[int, str, ToolRegistration]] = []
+        for reg in self._tools.values():
+            score = _score_registration(reg, tokens)
+            if score > 0:
+                scored.append((score, reg.safety.capability_id, reg))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return [
+            {**self._catalog_entry(reg), "score": score}
+            for score, _, reg in scored[:limit]
+        ]
+
+    def definition(self, capability_id: str) -> dict[str, Any] | None:
+        """单个能力的完整定义（含参数 Schema），供按需加载使用。
+
+        返回的 descriptor_hash 是注册时的定义指纹；调用方应保存它，并在
+        下一次使用前与最新值比较，避免沿用已变更的旧 Schema。
+        """
+        reg = self._tools.get(capability_id)
+        if reg is None:
+            return None
+        return {
+            **self._catalog_entry(reg),
+            "definition_trust_level": reg.safety.definition_trust_level,
+            "timeout_seconds": reg.safety.timeout_seconds,
+            "parameters": reg.parameters,
+            "input_schema": reg.input_schema,
+        }
+
+    @staticmethod
+    def _catalog_entry(reg: ToolRegistration) -> dict[str, Any]:
+        """目录条目的唯一定义处，避免各查询接口字段漂移。"""
+        return {
+            "capability_id": reg.safety.capability_id,
+            "description": reg.description,
+            "definition_source": reg.safety.definition_source,
+            "risk_level": reg.safety.risk_level,
+            "requires_confirmation": reg.safety.requires_confirmation,
+            "writes_external_world": reg.safety.writes_external_world,
+            "can_access_secret": reg.safety.can_access_secret,
+            "can_delete": reg.safety.can_delete,
+            "uses_network": reg.safety.uses_network,
+            "descriptor_hash": reg.safety.descriptor_hash,
+            "executor_kind": reg.executor_kind,
+            "executor_node_id": reg.executor_node_id,
+        }
 
     def execute(
         self,

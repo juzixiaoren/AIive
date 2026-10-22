@@ -23,6 +23,13 @@ from aiive.task_runtime.schemas import (
     TaskReport,
     TaskStatus,
 )
+from aiive.task_runtime.tool_injection import (
+    MAX_SEARCH_RESULTS,
+    merge_state,
+    record_definition,
+    record_search,
+    resident_definitions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,8 +87,12 @@ class PersistentTaskRuntime:
                 )
 
             broker = CapabilityBroker(self.db)
-            capabilities = broker.list_capabilities(task)
-            if not capabilities:
+            # 常驻入口按"全部可用能力"解析：即使任务显式收窄了授权，L0 入口仍可见，
+            # 由注入视图里的 in_scope 标记说明当前是否可执行。
+            available = broker.available_registry(task)
+            catalog = available.catalog()
+            resident = resident_definitions(available)
+            if not catalog:
                 self.repo.transition_task(
                     task, TaskStatus.BLOCKED_NODE.value,
                     event_type="task_blocked_node",
@@ -102,7 +113,8 @@ class PersistentTaskRuntime:
                 run.input_snapshot = {
                     "task_id": task.id,
                     "executor_type": "deterministic",
-                    "capability_ids": [item.get("capability_id") for item in capabilities],
+                    "resident_capability_ids": [item["capability_id"] for item in resident],
+                    "catalog_size": len(catalog),
                     "prompt_refs": [],
                 }
             elif task.executor_type == "deterministic":
@@ -128,7 +140,7 @@ class PersistentTaskRuntime:
                 task.usage = usage
                 self.repo.renew_run(run, lease_seconds=180)
                 self.db.commit()
-                decision = self.agent.decide(task, capabilities)
+                decision = self.agent.decide(task, resident)
                 last_model = decision.model
                 run_tokens = self._merge_usage(run_tokens, decision.token_usage)
                 self._record_tokens(task, decision.token_usage)
@@ -145,6 +157,11 @@ class PersistentTaskRuntime:
                 {"decision": proposal.decision, "summary": proposal.summary},
                 visibility="internal", run_id=run.id,
             )
+
+            if proposal.decision in {"search_capabilities", "describe_capability"}:
+                self._record_discovery(task, run, proposal, broker)
+                completed_this_run += 1
+                continue
 
             if proposal.decision == "finish":
                 return self._complete(
@@ -258,6 +275,51 @@ class PersistentTaskRuntime:
         self.repo.enqueue_run(task, trigger="continue")
         self.db.commit()
         return {"status": task.status, "task_id": task.id, "continued": True}
+
+    def _record_discovery(
+        self,
+        task: AgentTask,
+        run: AgentRun,
+        proposal: ActionProposal,
+        broker: CapabilityBroker,
+    ) -> None:
+        """处理只读的能力发现决策：不创建 Action、不调用任何工具 handler。
+
+        发现结果只写入 task_state（id + 定义指纹），下一次组装上下文时按当前
+        注册表重新解析；因此注册、卸载或定义变化会立刻反映到注入结果里。
+        """
+        state = dict(task.task_state or {})
+        if proposal.decision == "search_capabilities":
+            results = broker.search_capabilities(task, proposal.query, limit=MAX_SEARCH_RESULTS)
+            discovery = record_search(
+                state, proposal.query, [item["capability_id"] for item in results],
+            )
+            payload = {
+                "query": proposal.query,
+                "matched": [item["capability_id"] for item in results],
+            }
+            event_type = "tool_search"
+        else:
+            definition = broker.describe_capability(task, proposal.capability_id)
+            discovery = record_definition(
+                state,
+                proposal.capability_id,
+                definition["descriptor_hash"] if definition else "",
+            )
+            payload = {
+                "capability_id": proposal.capability_id,
+                "found": definition is not None,
+                "in_scope": bool(definition and definition.get("in_scope")),
+            }
+            event_type = "tool_describe"
+        task.task_state = merge_state(state, discovery)
+        usage = dict(task.usage or {})
+        usage["discovery_steps"] = int(usage.get("discovery_steps", 0)) + 1
+        task.usage = usage
+        self.repo.append_event(
+            task.id, event_type, payload, visibility="internal", run_id=run.id,
+        )
+        self.db.commit()
 
     def _dispatch_ready(self, task: AgentTask, run: AgentRun, action: AgentAction) -> str:
         self.repo.renew_run(run, lease_seconds=900)
