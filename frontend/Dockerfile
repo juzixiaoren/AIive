@@ -2,8 +2,9 @@
 FROM node:20-alpine AS build
 WORKDIR /app
 
-# 腾讯云 npm 镜像加速
-RUN npm config set registry https://mirrors.cloud.tencent.com/npm/
+# npm 源可配置：默认腾讯云镜像（国内），CI 用 build-arg 切官方源。
+ARG NPM_REGISTRY=https://mirrors.cloud.tencent.com/npm/
+RUN npm config set registry "$NPM_REGISTRY"
 
 COPY frontend/package.json ./
 RUN npm install

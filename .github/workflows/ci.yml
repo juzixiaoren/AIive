@@ -160,6 +160,11 @@ jobs:
   docker-smoke:
     name: Docker Compose 冒烟测试
     runs-on: ubuntu-latest
+    env:
+      # 境外 runner 用官方源构建镜像；默认值（国内镜像）留给本地与国内服务器。
+      AIIVE_APT_MIRROR: deb.debian.org
+      AIIVE_PIP_INDEX_URL: https://pypi.org/simple
+      AIIVE_NPM_REGISTRY: https://registry.npmjs.org
     steps:
       - uses: actions/checkout@v4
       - name: 准备 .env
@@ -181,6 +186,11 @@ jobs:
           echo "backend 未就绪"; docker compose logs --tail=100 backend; exit 1
       - name: 检查前端
         run: curl -fsS http://127.0.0.1:8080/ >/dev/null
+      - name: 失败诊断
+        if: failure()
+        run: |
+          docker compose ps -a
+          docker compose logs --tail=200
       - name: 关停
         if: always()
         run: docker compose down -v

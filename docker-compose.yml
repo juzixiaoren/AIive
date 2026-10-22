@@ -43,6 +43,10 @@ services:
     build:
       context: .
       dockerfile: backend/Dockerfile
+      # 默认走国内镜像；境外 CI 通过环境变量切官方源（见 .github/workflows/ci.yml）。
+      args:
+        APT_MIRROR: ${AIIVE_APT_MIRROR:-mirrors.aliyun.com}
+        PIP_INDEX_URL: ${AIIVE_PIP_INDEX_URL:-https://mirrors.cloud.tencent.com/pypi/simple/}
     # 复用宿主机 .env 中的 LLM Key 等配置（不写进镜像）
     env_file: .env
     environment:
@@ -70,6 +74,8 @@ services:
     build:
       context: .
       dockerfile: frontend/Dockerfile
+      args:
+        NPM_REGISTRY: ${AIIVE_NPM_REGISTRY:-https://mirrors.cloud.tencent.com/npm/}
     ports:
       # 仅暴露到本机，由服务器 nginx(443) 反代 /aiive 对外提供服务
       - "127.0.0.1:8080:8080"
