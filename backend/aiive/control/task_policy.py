@@ -6,7 +6,11 @@ from typing import Any
 
 from aiive.control.scope import TaskScope
 from aiive.tools.registry import ToolRegistration
-from aiive.tools.shell_policy import SHELL_CAPABILITY_ID, classify_shell_command
+from aiive.tools.shell_policy import (
+    SHELL_CAPABILITY_ID,
+    classify_shell_command,
+    shell_path_violations,
+)
 
 
 @dataclass(frozen=True)
@@ -43,12 +47,25 @@ class TaskPolicyEngine:
             return ActionPolicyDecision("block", "network_access_not_in_task_scope")
         if capability_id == SHELL_CAPABILITY_ID:
             # 本机 Shell 按命令内容分级：只读命令放行，其余进入审批；
-            # 涉及网络的命令还必须显式允许联网。
-            verdict = classify_shell_command(str(arguments.get("command") or ""))
+            # 涉及网络的命令还必须显式允许联网；命令里出现的路径必须落在
+            # allowed_roots 内（否则只读白名单会变成任意路径读取的通道）。
+            command = str(arguments.get("command") or "")
+            verdict = classify_shell_command(command)
             if verdict.uses_network and not scope.allow_network:
                 return ActionPolicyDecision("block", "network_access_not_in_task_scope")
+            violations, dynamic_path = shell_path_violations(
+                command,
+                cwd=str(arguments.get("cwd") or ""),
+                allowed_roots=scope.allowed_roots,
+            )
+            if violations:
+                detail = ",".join(violations[:3])
+                return ActionPolicyDecision("block", f"shell_path_outside_task_scope:{detail}")
             if not verdict.read_only:
                 return ActionPolicyDecision("approval", f"shell_{verdict.reason}")
+            if dynamic_path:
+                # 含 $VAR/反引号等无法静态判定的路径，不能按只读直接放行。
+                return ActionPolicyDecision("approval", "shell_dynamic_path_requires_approval")
         if (
             capability_id in ALWAYS_APPROVE
             or safety.requires_confirmation

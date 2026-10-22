@@ -8,10 +8,13 @@
 """
 from __future__ import annotations
 
+import os
 import re
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
+
+from aiive.control.scope import path_within
 
 SHELL_CAPABILITY_ID = "run_shell"
 
@@ -87,3 +90,56 @@ def _git_read_only(args: list[str]) -> bool:
         return all(flag in _GIT_REMOTE_LIST_FLAGS for flag in rest)
     return False
 
+
+# 形如绝对路径 / 家目录 / 上级目录 / 含分隔符的相对路径，需要做 scope 校验。
+_PATHLIKE = re.compile(r"^([A-Za-z]:[\\/]|/|~|\.\.|.*[\\/])")
+_MSYS_DRIVE = re.compile(r"^/([A-Za-z])(/.*)?$")
+
+
+def _windows_from_msys(token: str) -> str:
+    """Windows 上把 Git Bash 的 /c/foo 还原成 C:/foo，避免把作用域内的路径判成越界。"""
+    if os.name != "nt":
+        return token
+    match = _MSYS_DRIVE.match(token)
+    if not match:
+        return token
+    rest = (match.group(2) or "").lstrip("/")
+    return f"{match.group(1).upper()}:/{rest}"
+
+
+def shell_path_violations(
+    command: str, *, cwd: str, allowed_roots: tuple[str, ...] | list[str],
+) -> tuple[list[str], bool]:
+    """保守检查命令中的路径参数是否越出 allowed_roots。
+
+    返回 (违规 token 列表, 是否存在无法静态解析的动态路径)。动态路径（$VAR / 反引号）
+    无法静态判定，交由调用方要求审批，而不是直接放行。
+    """
+    try:
+        argv = shlex.split(command or "", posix=True)
+    except ValueError:
+        return [], True
+    if not argv:
+        return [], False
+    base = Path(cwd).expanduser() if cwd else Path.cwd()
+    violations: list[str] = []
+    dynamic = False
+    for raw in argv[1:]:
+        token = raw.split("=", 1)[1] if raw.startswith("--") and "=" in raw else raw
+        if not token or token.startswith("-"):
+            continue
+        if not _PATHLIKE.match(token):
+            continue
+        if "$" in token or "`" in token:
+            dynamic = True
+            continue
+        candidate = Path(_windows_from_msys(token)).expanduser()
+        if not candidate.is_absolute():
+            candidate = base / candidate
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        if not any(path_within(str(resolved), root) for root in allowed_roots):
+            violations.append(token)
+    return violations, dynamic

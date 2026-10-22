@@ -242,3 +242,78 @@ def test_shell_cwd_outside_allowed_roots_is_blocked(db_session, tmp_path) -> Non
     action = db_session.query(AgentAction).filter(AgentAction.task_id == task.id).one()
     assert action.status == "failed"
     assert "path_outside_task_scope:cwd" in (action.error_message or "")
+
+def _outside_path() -> str:
+    return "C:/Windows/win.ini" if sys.platform.startswith("win") else "/etc/passwd"
+
+
+def test_shell_path_violations_detects_escape_and_dynamic(tmp_path) -> None:
+    from aiive.tools.shell_policy import shell_path_violations
+
+    roots = [str(tmp_path)]
+    assert shell_path_violations("ls -la", cwd=str(tmp_path), allowed_roots=roots) == ([], False)
+    assert shell_path_violations("cat sub/a.txt", cwd=str(tmp_path), allowed_roots=roots) == ([], False)
+    violations, dynamic = shell_path_violations("cat ../secret", cwd=str(tmp_path), allowed_roots=roots)
+    assert violations == ["../secret"] and dynamic is False
+    violations, _ = shell_path_violations(
+        f"cat {_outside_path()}", cwd=str(tmp_path), allowed_roots=roots,
+    )
+    assert violations == [_outside_path()]
+    violations, dynamic = shell_path_violations(
+        'cat "$HOME"/.ssh/id_rsa', cwd=str(tmp_path), allowed_roots=roots,
+    )
+    assert violations == [] and dynamic is True
+
+
+def test_read_only_command_with_out_of_scope_path_is_blocked() -> None:
+    registration = get_tool_registry().get(SHELL_CAPABILITY_ID)
+    assert registration is not None
+    scope = TaskScope.from_brief(
+        {"scope": {"capability_policy": "unified", "allowed_roots": ["/tmp/work"]}},
+    )
+    policy = TaskPolicyEngine()
+    decision = policy.decide(
+        registration, scope, SHELL_CAPABILITY_ID,
+        {"command": f"cat {_outside_path()}", "cwd": "/tmp/work"},
+    )
+    assert decision.outcome == "block"
+    assert decision.reason.startswith("shell_path_outside_task_scope:")
+
+    traversal = policy.decide(
+        registration, scope, SHELL_CAPABILITY_ID, {"command": "cat ../secret", "cwd": "/tmp/work"},
+    )
+    assert traversal.outcome == "block"
+
+
+def test_dynamic_path_in_read_only_command_requires_approval() -> None:
+    registration = get_tool_registry().get(SHELL_CAPABILITY_ID)
+    assert registration is not None
+    scope = TaskScope.from_brief(
+        {"scope": {"capability_policy": "unified", "allowed_roots": ["/tmp/work"]}},
+    )
+    decision = TaskPolicyEngine().decide(
+        registration, scope, SHELL_CAPABILITY_ID,
+        {"command": 'cat "$HOME"/.ssh/id_rsa', "cwd": "/tmp/work"},
+    )
+    assert decision.outcome == "approval"
+    assert decision.reason == "shell_dynamic_path_requires_approval"
+
+
+def test_shell_scope_missing_roots_is_blocked() -> None:
+    registration = get_tool_registry().get(SHELL_CAPABILITY_ID)
+    assert registration is not None
+    scope = TaskScope.from_brief({"scope": {"capability_policy": "unified"}})
+    decision = TaskPolicyEngine().decide(
+        registration, scope, SHELL_CAPABILITY_ID, {"command": "ls", "cwd": "/tmp/work"},
+    )
+    assert decision.outcome == "block"
+    assert "path_scope_missing:cwd" in decision.reason
+
+
+@pytest.mark.skipif(not sys.platform.startswith("win"), reason="MSYS 路径还原只在 Windows 生效")
+def test_msys_style_path_inside_root_is_not_a_violation() -> None:
+    from aiive.tools.shell_policy import shell_path_violations
+
+    assert shell_path_violations(
+        "ls /c/Windows", cwd="C:/Windows", allowed_roots=["C:/Windows"],
+    ) == ([], False)
