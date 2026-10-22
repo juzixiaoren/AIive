@@ -1,8 +1,9 @@
 Metadata-Version: 2.4
 Name: aiive
-Version: 0.1.0
+Version: 0.1.0a1
 Summary: AIive - Personal Agent OS
 Requires-Python: >=3.12
+License-File: LICENSE
 Requires-Dist: fastapi>=0.115.0
 Requires-Dist: uvicorn[standard]>=0.30.0
 Requires-Dist: pydantic-settings>=2.5.0
@@ -18,6 +19,10 @@ Requires-Dist: langgraph-prebuilt>=1.0
 Requires-Dist: json-repair>=0.30.0
 Requires-Dist: apscheduler>=3.10
 Requires-Dist: litellm<2.0.0,>=1.50.0
+Requires-Dist: mcp<2.0,>=1.0
+Requires-Dist: pillow>=10.0
+Requires-Dist: pypdf>=5.0
 Provides-Extra: dev
 Requires-Dist: pytest>=8.0; extra == "dev"
 Requires-Dist: pytest-asyncio>=0.24.0; extra == "dev"
+Dynamic: license-file

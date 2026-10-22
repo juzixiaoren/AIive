@@ -1,4 +1,4 @@
-"""回归测试：ContextAssembler.assemble() 必须填充强类型上下文快照。
+﻿"""回归测试：ContextAssembler.assemble() 必须填充强类型上下文快照。
 
 输入与输出快照统一由 ContextSnapshotData 承载，避免字典 meta 与恒空列表双轨。
 """
@@ -14,7 +14,7 @@ from aiive.memory.recall_models import ScopeContext
 from aiive.retrieval.retrieval_types import RetrievalResult
 from aiive.runtime.context_budget import ContextBudget, PartitionBudget
 from aiive.runtime.token_models import ModelProfile, TokenCount
-from backend.tests._util import new_thread, new_epoch, new_segment
+from tests.integration.backend._util import new_thread, new_epoch, new_segment
 
 
 class _FakeTokenCounter:

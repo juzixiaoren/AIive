@@ -75,7 +75,7 @@ _TYPE_MAP: dict[str, type[Any]] = {
 
 
 def _handler_signature(handler: Any) -> inspect.Signature:
-    """优先读取 ``_db_handler`` 保存的原始函数签名。"""
+    """优先读取 ``db_handler`` 保存的原始函数签名。"""
     target = getattr(handler, "_aiive_db_handler", handler)
     try:
         return inspect.signature(target)

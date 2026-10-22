@@ -30,7 +30,8 @@ def test_builtin_mcp_uses_only_fixed_python_entry_and_registers_tools(db_session
     capability = ensure_builtin_mcp_capability(db_session)
     spec = build_launch_spec(capability.definition["launch"])
     assert spec.command == sys.executable
-    assert spec.args[0].endswith("aiive/mcp/builtin_server.py")
+    # 用 Path 分段断言，避免 Windows 反斜杠导致 POSIX 后缀匹配失效
+    assert Path(spec.args[0]).parts[-3:] == ("aiive", "mcp", "builtin_server.py")
     assert "AIIVE_WEB_SEARCH_PROVIDER" in spec.optional_env_keys
     assert spec.env_keys == ()
 

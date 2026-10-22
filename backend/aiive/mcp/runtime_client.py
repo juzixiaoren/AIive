@@ -39,8 +39,8 @@ DEFAULT_STARTUP_TIMEOUT_SECONDS = 60.0
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 60.0
 
 try:  # MCP 官方 SDK：延迟失败——导入失败时首次使用会抛出可读错误
-    from mcp import ClientSession, StdioServerParameters  # pyright: ignore[reportMissingImports]
-    from mcp.client.stdio import get_default_environment, stdio_client  # pyright: ignore[reportMissingImports]
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import get_default_environment, stdio_client
     _mcp_sdk_import_error: Exception | None = None
 except Exception as _import_error:  # pragma: no cover - SDK 已在依赖中
     ClientSession = None  # type: ignore[assignment]

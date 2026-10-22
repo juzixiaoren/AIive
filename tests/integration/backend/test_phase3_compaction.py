@@ -1,4 +1,4 @@
-"""Phase 3: compaction 纯函数单元测试（测试矩阵 11/12/13/52/59/60/68/70/71/72）。"""
+﻿"""Phase 3: compaction 纯函数单元测试（测试矩阵 11/12/13/52/59/60/68/70/71/72）。"""
 from __future__ import annotations
 
 import pytest
@@ -13,7 +13,7 @@ from aiive.runtime.compaction import (
     validate_llm_semantic_output,
 )
 from aiive.worker.outbox_handlers import _run_cover_checks
-from backend.tests._util import add_event, add_turn, new_epoch, new_segment, new_thread, new_ws
+from tests.integration.backend._util import add_event, add_turn, new_epoch, new_segment, new_thread, new_ws
 
 
 def _freeze(db, seg, thread, epoch, ws, **kw):

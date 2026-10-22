@@ -186,7 +186,11 @@ class ForgetVisibilityService:
             )
             .all()
         )
-        blocked.update(r[0] for r in shield_rows)
+        # target_id 列可空；None 不是有效目标，直接跳过（同时收窄为 str）
+        for row in shield_rows:
+            shield_target_id = row[0]
+            if shield_target_id is not None:
+                blocked.add(shield_target_id)
 
         # 2) 选择器级 Shield（thread / scope / canonical_key / time_range），
         #    统一比较目标 created_at <= shield.cutoff_created_at。
@@ -211,6 +215,8 @@ class ForgetVisibilityService:
                 ).all()
                 cutoffs_by_thread: dict[str, list[Any]] = {}
                 for tid, cut in trows:
+                    if tid is None:
+                        continue  # 选择器行的 thread_id 可空，空值不构成 shield
                     cutoffs_by_thread.setdefault(tid, []).append(cut)
                 for m in meta:
                     cuts = cutoffs_by_thread.get(m["thread_id"] or "")
@@ -254,6 +260,8 @@ class ForgetVisibilityService:
                 ).all()
                 cutoffs_by_ck: dict[str, list[Any]] = {}
                 for ck, cut in krows:
+                    if ck is None:
+                        continue  # 选择器行的 canonical_key 可空，空值不构成 shield
                     cutoffs_by_ck.setdefault(ck, []).append(cut)
                 for m in meta:
                     cuts = cutoffs_by_ck.get(m["canonical_key"] or "")

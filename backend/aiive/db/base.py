@@ -41,8 +41,21 @@ def get_db() -> Generator[Session, None, None]:
 
 
 def create_all():
-    """创建所有数据表。供迁移初始化和测试场景使用。"""
+    """创建所有数据表。供迁移初始化和测试场景使用。
+
+    必须显式导入全部模型模块：SQLAlchemy 只有在其模型类被导入后才把表登记到
+    Base.metadata，仅导入 models 会漏掉 retention / forget 两张业务表
+    （历史上测试因此报 no such table: forget_tombstones）。
+    """
+    from aiive.db import forget_models, retention_models
     from aiive.db.models import Base  # noqa: F811
+
+    # 显式引用一次：导入本身用于把表登记进 Base.metadata，这里同时让静态检查
+    # 明确看到这两个模块被使用，避免误报 unused import。
+    logger.debug(
+        "create_all: 模型模块已注册 %s / %s",
+        forget_models.__name__, retention_models.__name__,
+    )
 
     try:
         Base.metadata.create_all(bind=engine)

@@ -1485,12 +1485,15 @@ def _scrub_batch(db: Session, memory_ids: list[str]) -> None:
 
     # --- 前置：计算专属来源 event（必须在 DELETE evidence 之前）---
     # 共享来源 event 不在窄选择器内 scrub，避免破坏其他仍有效的 memory。
-    event_ids = [
-        row[0] for row in db.query(MemoryEvidence.source_event_id).filter(
-            MemoryEvidence.memory_id.in_(memory_ids),
-            MemoryEvidence.source_event_id.isnot(None),
-        ).distinct().all()
-    ]
+    # source_event_id 列可空：SQL 侧已过滤 NULL，这里用显式循环再收窄一次，保证 list[str]
+    event_ids: list[str] = []
+    for evidence_row in db.query(MemoryEvidence.source_event_id).filter(
+        MemoryEvidence.memory_id.in_(memory_ids),
+        MemoryEvidence.source_event_id.isnot(None),
+    ).distinct().all():
+        source_event_id = evidence_row[0]
+        if source_event_id is not None:
+            event_ids.append(source_event_id)
     exclusive_event_ids: list[str] = []
     if event_ids:
         surviving = {
@@ -1633,8 +1636,8 @@ def _scrub_wide(db: Session, operation_id: str) -> None:
             f"UPDATE compaction_inputs SET working_state_snapshot='{{}}' WHERE {where}"
         ), params)
         db.execute(sa_text(
-            f"UPDATE epoch_compaction_inputs SET current_objective=NULL, open_loops='[]', "
-            + f"active_constraints='[]', artifact_refs='[]', verified_tool_states='[]', "
+            "UPDATE epoch_compaction_inputs SET current_objective=NULL, open_loops='[]', "
+            + "active_constraints='[]', artifact_refs='[]', verified_tool_states='[]', "
             + f"source_segment_ids='[]', source_hashes='[]' WHERE {where}"
         ), params)
 

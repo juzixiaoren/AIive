@@ -51,7 +51,16 @@ class PatchExecutor:
                 "error": "trusted_core_policy_denied",
                 "issues": trusted_core_issues,
                 "operations_applied": [],
-                "operations_failed": operations,
+                # 失败项必须是带 reason 的诊断记录；直接回填原始 operations 会丢失
+                # 拒绝原因，调用方只能看到一堆没有 reason 的入参副本。
+                "operations_failed": [
+                    {
+                        "ok": False,
+                        "target_file": issue.get("target_file", ""),
+                        "reason": issue.get("reason", "policy_denied"),
+                    }
+                    for issue in trusted_core_issues
+                ],
             }
         slots = self._manager.list_slots()
         active_name = self._manager.get_active_slot()

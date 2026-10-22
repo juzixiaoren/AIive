@@ -175,7 +175,13 @@ class TestAgentGraphToolIntegration:
     """需求 1、4：execute_turn 返回结构正确，无 tool_call 标签泄露。"""
 
     def test_run_never_returns_tool_call_tags(self, monkeypatch):
-        """用户可见回复绝不能包含 <tool_call> 标签。"""
+        """用户可见回复绝不能包含 <tool_call> 标签。
+
+        不请求 db_session：execute_turn 内部经 SessionLocal() 在独立短事务中
+        提交 thread 行，若复用同一隔离会话会因嵌套提交产生锁冲突。此处走
+        分发器回退路径，使用根 conftest 统一指定的进程级 SQLite 测试库
+        （由 tests/support.py 兜底建表）。
+        """
         from aiive.runtime.turn_execution import TurnExecutionService
 
         llm = MagicMock()
@@ -195,7 +201,10 @@ class TestAgentGraphToolIntegration:
         assert "trace_id" in result
 
     def test_run_returns_structured_response(self, monkeypatch):
-        """execute_turn 返回的 dict 包含必要的结构字段。"""
+        """execute_turn 返回的 dict 包含必要的结构字段。
+
+        不请求 db_session，理由同 test_run_never_returns_tool_call_tags。
+        """
         from aiive.runtime.turn_execution import TurnExecutionService
 
         llm = MagicMock()

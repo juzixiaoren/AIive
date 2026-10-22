@@ -1,4 +1,4 @@
-"""Phase 3: Outbox Handlers 与约束测试（测试矩阵 2/16/61/62/63/67/73/75）。
+﻿"""Phase 3: Outbox Handlers 与约束测试（测试矩阵 2/16/61/62/63/67/73/75）。
 
 端到端密封流程：begin_segment_sealing → handle_segment_sealing（伪 LLM）→
 Segment sealed + SegmentSummary + 条件性 epoch job 入队。
@@ -26,7 +26,7 @@ from aiive.worker.handler_registry import HandlerRegistry
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome
 from aiive.worker.outbox_heartbeat import ActiveClaimRegistry
 from aiive.worker.outbox_worker import OutboxWorker
-from backend.tests._util import (
+from tests.integration.backend._util import (
     FakeLLM,
     add_event,
     add_turn,

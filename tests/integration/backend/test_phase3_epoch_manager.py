@@ -1,4 +1,4 @@
-"""Phase 3: EpochManager 单元测试（测试矩阵 31/32/33/47/57/58/64/69）。"""
+﻿"""Phase 3: EpochManager 单元测试（测试矩阵 31/32/33/47/57/58/64/69）。"""
 from __future__ import annotations
 
 import uuid
@@ -16,7 +16,7 @@ from aiive.runtime.epoch_manager import (
     allocate_turn_sequence,
     peek_next_turn_sequence,
 )
-from backend.tests._util import (
+from tests.integration.backend._util import (
     add_event,
     add_turn,
     claim_job,

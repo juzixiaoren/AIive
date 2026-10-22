@@ -27,9 +27,9 @@ import json as _json
 import logging
 import operator
 import uuid as _uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass, field
-from typing import Annotated, Any, Callable
+from typing import Annotated, Any
 
 logger = logging.getLogger(__name__)
 
@@ -913,30 +913,29 @@ class AgentGraph:
         return compiled, tool_records, _pending_approval_list
 
     # ------------------------------------------------------------------
-    # Phase 0.5A: _execute_graph（LLM + 工具执行，无 DB 事件写入）
+    # Shared graph-execution helpers (extracted from sync + streaming paths)
     # ------------------------------------------------------------------
 
-    def _execute_graph(
-        self, message: str, exec_ctx: TurnExecutionContext,
-        ctx_bundle: Any = None,
-        normalizer: "ToolResultNormalizer | None" = None,
-    ) -> "AgentGraphResult":
-        """Execute graph inference. Uses pre-assembled context from ContextAssembler."""
-        thread_id = exec_ctx.thread_id
-        turn_id = exec_ctx.turn_id
-        turn_record_id = exec_ctx.turn_record_id
-        execution_id = exec_ctx.execution_id
-        trace_id = exec_ctx.trace_id
-        message_source = exec_ctx.message_source
-        trace = Trace(trace_id=trace_id) if trace_id else Trace.new()
-        thread = self._thread_state.get_or_create_thread(thread_id)
+    def _prepare_execution(
+        self,
+        thread: Any,
+        exec_ctx: "TurnExecutionContext",
+        ctx_bundle: Any,
+        normalizer: "ToolResultNormalizer | None",
+        trace: "Trace",
+    ) -> dict[str, Any]:
+        """Assemble context, build registry/tools and compile the LangGraph graph.
 
-        # Phase 1: 工具结果规范化（有界引用化）+ WorkingState 生命周期维护
+        Shared by both sync (_execute_graph) and streaming (_execute_graph_stream).
+        `thread` is resolved by the caller (sync calls directly; streaming wraps the
+        network-free DB call in asyncio.to_thread).
+        `trace` 由调用方创建后传入，保证图内事件与最终结果使用同一个 trace_id
+        （否则 trace_id 为空时两处各自 Trace.new() 会产生不一致的 id）。
+        """
+        ws_service = WorkingStateService()
         if normalizer is None:
             normalizer = ToolResultNormalizer(LiteLLMTokenCounter(), self._llm_client.default_model)
-        ws_service = WorkingStateService()
 
-        # ── Phase 1: ContextAssembler 预组装消息（唯一路径）──
         assembled_ctx = getattr(ctx_bundle, "assembled_ctx", None) if ctx_bundle is not None else None
         if assembled_ctx is None:
             raise RuntimeError("execute_turn 必须通过 ContextAssembler 提供 assembled_ctx")
@@ -946,26 +945,22 @@ class AgentGraph:
         initial_messages = self._dicts_to_langchain_messages(chat_messages)
         context_snapshot = assembled_ctx.snapshot
 
-        # ── Execute graph ──
         langchain_llm = self._build_langchain_llm()
-        if assembled_ctx.tool_registry is None:
+        # AssembledContext.tool_registry 的默认值就是 None（见 context_assembler），
+        # 因此「属性缺失」与「显式 None」语义一致：都表示未注入注册表，回落到默认注册表。
+        registry = getattr(assembled_ctx, "tool_registry", None)
+        if registry is None:
             from aiive.task_runtime.tools import build_main_agent_registry
 
             registry = build_main_agent_registry()
-        else:
-            registry = assembled_ctx.tool_registry
         run_ctx_exec = RunContext(
             thread_id=thread.id,
             trace_id=trace.trace_id,
-            # 执行者即当前会话回合：复用其 MessageSource.value（user /
-            # system_command / runtime_event），与 RunContext.source 词汇表兼容。
             source=exec_ctx.message_source.value,
-            turn_id=turn_id,
-            turn_record_id=turn_record_id,
+            turn_id=exec_ctx.turn_id,
+            turn_record_id=exec_ctx.turn_record_id,
         )
         tools = build_langchain_tools(registry, run_context=run_ctx_exec)
-        # Phase 1: 当 ContextAssembler 已裁剪工具 schema 时，仅绑定该有界子集，
-        # 保证 LLM 实际可见工具数与上下文预算一致。
         if tool_schemas is not None:
             allowed = {s.get("function", {}).get("name") for s in tool_schemas}
             tools = [t for t in tools if getattr(t, "name", None) in allowed]
@@ -981,48 +976,90 @@ class AgentGraph:
             trace_id=trace.trace_id, _thread_id=thread.id,
             _model=self._llm_client.default_model,
             normalizer=normalizer, ws_service=ws_service,
-            thread_id=thread.id, turn_record_id=turn_record_id, execution_id=execution_id,
+            thread_id=thread.id, turn_record_id=exec_ctx.turn_record_id,
+            execution_id=exec_ctx.execution_id,
+        )
+        return {
+            "trace": trace,
+            "ws_service": ws_service,
+            "normalizer": normalizer,
+            "initial_messages": initial_messages,
+            "context_snapshot": context_snapshot,
+            "registry": registry,
+            "tools": tools,
+            "compiled": compiled,
+            "_records_raw": _records_raw,
+            "pending_approvals": pending_approvals,
+            "run_ctx_exec": run_ctx_exec,
+        }
+
+    @staticmethod
+    def _extract_reply(messages: "list[Any]") -> str:
+        """Extract the final assistant reply from a list of graph messages.
+
+        Prefer a tool-free AIMessage; fall back to any AIMessage with content.
+        """
+        reply = ""
+        for m in reversed(messages):
+            if isinstance(m, AIMessage) and m.content and not m.tool_calls:
+                reply = str(m.content)
+                break
+        if not reply:
+            for m in reversed(messages):
+                if isinstance(m, AIMessage) and m.content:
+                    reply = str(m.content)
+                    break
+        return reply
+
+    def _classify_memory_signal(
+        self, message: str, reply: str, trace_id: str, message_source: Any,
+    ) -> "MemorySignalDecision":
+        """Classify the memory extraction signal for this turn (LLM call).
+
+        Sync callers invoke directly; streaming callers wrap in asyncio.to_thread
+        to keep the network call off the event loop.
+        """
+        signal: MemorySignalDecision = MemorySignalDecision(
+            action=MemorySignalAction.EXTRACT_ASYNC.value, confidence=0.5, reason="default",
         )
         try:
-            result = compiled.invoke({"messages": initial_messages, "tool_records": []})
-        except Exception as error:
-            logger.exception(
-                "[TRACE:graph] compiled.invoke 异常: trace_id=%s model=%s msgs_count=%d tools_count=%d",
-                trace.trace_id,
-                self._llm_client.default_model,
-                len(initial_messages),
-                len(tools),
+            signal = self._action_planner.classify_memory_signal(
+                user_message=message, reply=reply, trace_id=trace_id,
             )
-            raise normalize_llm_error(error, trace.trace_id) from error
-
-        # ── 提取回复 ──
-        reply = ""
-        all_messages = result["messages"]
-        llm_usage = self._collect_llm_usage(all_messages)
-        for m in reversed(all_messages):
-            if isinstance(m, AIMessage) and m.content and not m.tool_calls:
-                reply = str(m.content); break
-        if not reply:
-            for m in reversed(all_messages):
-                if isinstance(m, AIMessage) and m.content:
-                    reply = str(m.content); break
-
-        # ── ToolRecord（Graph state 是同步与流式共同事实源）──
-        tool_records = self._tool_records_from_state(result.get("tool_records", []))
-        reply = self._merge_blocked_records(_records_raw, tool_records, reply)
-
-        # 空回复且非审批挂起属于异常情况，记录告警以便定位根因
-        # （LLM 空响应、工具绑定异常、streaming 兼容问题等）。
-        if not reply and not pending_approvals:
+        except Exception:
             logger.warning(
-                "[TRACE:graph] _execute_graph 返回空回复: trace_id=%s message=%s msgs_count=%d tool_record_count=%d",
-                trace.trace_id,
-                message[:100],
-                len(all_messages),
-                len(tool_records),
+                "记忆信号分类失败（已使用默认信号）: trace_id=%s", trace_id, exc_info=True,
             )
+        signal.action = MemoryExtractionPolicy.resolve_action(
+            signal.action, message, message_source,
+        ).value
+        return signal
 
-        # ── 审批记录：CONFIRM 工具未执行，构造 pending_approval 的 ToolRecord ──
+    def _assemble_agent_result(
+        self,
+        *,
+        reply: str,
+        graph_state_tool_records: "list[dict[str, Any]]",
+        records_raw: "list[dict[str, Any]]",
+        pending_approvals: "list[dict[str, Any]]",
+        trace: "Trace",
+        message: str,
+        context_snapshot: "ContextSnapshotData",
+        llm_usage: "LLMUsageStats",
+        signal: "MemorySignalDecision",
+    ) -> "AgentGraphResult":
+        """Assemble the final AgentGraphResult from the shared post-processing.
+
+        Used by both _execute_graph and _execute_graph_stream so the tool-record
+        conversion, blocked-record merge, approval cards and context snapshot
+        building stay in one place. Reply extraction and memory-signal
+        classification differ between the two paths and are handled by the caller.
+        """
+        # Graph state is the single source of truth for executed tool facts;
+        # the closure-level records_raw additionally holds policy-blocked facts.
+        tool_records = self._tool_records_from_state(graph_state_tool_records)
+        reply = self._merge_blocked_records(records_raw, tool_records, reply)
+
         if pending_approvals:
             for pa in pending_approvals:
                 tc_name = str(pa.get("name", "") or "")
@@ -1058,16 +1095,6 @@ class AgentGraph:
             injected_memory_ids=list(context_snapshot.injected_memory_ids),
         )
 
-        # ── 记忆信号分类（LLM，事务外）──
-        signal: MemorySignalDecision = MemorySignalDecision(action=MemorySignalAction.EXTRACT_ASYNC.value, confidence=0.5, reason="default")
-        try:
-            signal = self._action_planner.classify_memory_signal(user_message=message, reply=reply, trace_id=trace.trace_id)
-        except Exception:
-            logger.warning("记忆信号分类失败（已使用默认信号）: trace_id=%s", trace.trace_id, exc_info=True)
-        signal.action = MemoryExtractionPolicy.resolve_action(
-            signal.action, message, message_source,
-        ).value
-
         return AgentGraphResult(
             reply=reply, trace_id=trace.trace_id, user_message=message,
             tool_records=tool_records, action_cards=action_cards,
@@ -1075,6 +1102,70 @@ class AgentGraph:
             pending_approvals=[dict(item) for item in pending_approvals],
             context_snapshot=result_snapshot, memory_signal=signal,
             llm_usage=llm_usage,
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 0.5A: _execute_graph（LLM + 工具执行，无 DB 事件写入）
+    # ------------------------------------------------------------------
+
+    def _execute_graph(
+        self, message: str, exec_ctx: TurnExecutionContext,
+        ctx_bundle: Any = None,
+        normalizer: "ToolResultNormalizer | None" = None,
+    ) -> "AgentGraphResult":
+        """Execute graph inference. Uses pre-assembled context from ContextAssembler."""
+        thread_id = exec_ctx.thread_id
+        trace_id = exec_ctx.trace_id
+        message_source = exec_ctx.message_source
+        trace = Trace(trace_id=trace_id) if trace_id else Trace.new()
+        thread = self._thread_state.get_or_create_thread(thread_id)
+
+        prep = self._prepare_execution(thread, exec_ctx, ctx_bundle, normalizer, trace=trace)
+        context_snapshot = prep["context_snapshot"]
+        compiled = prep["compiled"]
+        _records_raw = prep["_records_raw"]
+        pending_approvals = prep["pending_approvals"]
+        initial_messages = prep["initial_messages"]
+        tools = prep["tools"]
+        try:
+            result = compiled.invoke({"messages": initial_messages, "tool_records": []})
+        except Exception as error:
+            logger.exception(
+                "[TRACE:graph] compiled.invoke 异常: trace_id=%s model=%s msgs_count=%d tools_count=%d",
+                trace.trace_id,
+                self._llm_client.default_model,
+                len(initial_messages),
+                len(tools),
+            )
+            raise normalize_llm_error(error, trace.trace_id) from error
+
+        # ── 提取回复 ──
+        all_messages = result["messages"]
+        llm_usage = self._collect_llm_usage(all_messages)
+        reply = self._extract_reply(all_messages)
+
+        # 空回复且非审批挂起属于异常情况，记录告警以便定位根因
+        # （LLM 空响应、工具绑定异常、streaming 兼容问题等）。
+        if not reply and not pending_approvals:
+            logger.warning(
+                "[TRACE:graph] _execute_graph 返回空回复: trace_id=%s message=%s msgs_count=%d tool_record_count=%d",
+                trace.trace_id,
+                message[:100],
+                len(all_messages),
+                len(result.get("tool_records", [])),
+            )
+
+        signal = self._classify_memory_signal(message, reply, trace.trace_id, message_source)
+        return self._assemble_agent_result(
+            reply=reply,
+            graph_state_tool_records=result.get("tool_records", []),
+            records_raw=_records_raw,
+            pending_approvals=pending_approvals,
+            trace=trace,
+            message=message,
+            context_snapshot=context_snapshot,
+            llm_usage=llm_usage,
+            signal=signal,
         )
 
     # ------------------------------------------------------------------
@@ -1092,62 +1183,18 @@ class AgentGraph:
         利用 LangGraph astream_events(v2) 实现 token 级真正流式传输。
         """
         thread_id = exec_ctx.thread_id
-        turn_id = exec_ctx.turn_id
-        turn_record_id = exec_ctx.turn_record_id
-        execution_id = exec_ctx.execution_id
         trace_id = exec_ctx.trace_id
         message_source = exec_ctx.message_source
         trace = Trace(trace_id=trace_id) if trace_id else Trace.new()
         # 同步 DB 调用不得阻塞事件循环（与 Phase 1 to_thread 先例一致）
         thread = await asyncio.to_thread(self._thread_state.get_or_create_thread, thread_id)
 
-        if normalizer is None:
-            normalizer = ToolResultNormalizer(LiteLLMTokenCounter(), self._llm_client.default_model)
-        ws_service = WorkingStateService()
-
-        assembled_ctx = getattr(ctx_bundle, "assembled_ctx", None) if ctx_bundle is not None else None
-        if assembled_ctx is None:
-            raise RuntimeError("execute_turn 必须通过 ContextAssembler 提供 assembled_ctx")
-
-        chat_messages = assembled_ctx.messages
-        tool_schemas = assembled_ctx.tools_schema
-        initial_messages = self._dicts_to_langchain_messages(chat_messages)
-        context_snapshot = assembled_ctx.snapshot
-
-        langchain_llm = self._build_langchain_llm()
-        if assembled_ctx.tool_registry is None:
-            from aiive.task_runtime.tools import build_main_agent_registry
-
-            registry = build_main_agent_registry()
-        else:
-            registry = assembled_ctx.tool_registry
-        run_ctx_exec = RunContext(
-            thread_id=thread.id,
-            trace_id=trace.trace_id,
-            # 执行者即当前会话回合：复用其 MessageSource.value（user /
-            # system_command / runtime_event），与 RunContext.source 词汇表兼容。
-            source=exec_ctx.message_source.value,
-            turn_id=turn_id,
-            turn_record_id=turn_record_id,
-        )
-        tools = build_langchain_tools(registry, run_context=run_ctx_exec)
-        if tool_schemas is not None:
-            allowed = {s.get("function", {}).get("name") for s in tool_schemas}
-            tools = [t for t in tools if getattr(t, "name", None) in allowed]
-        if not tools:
-            logger.warning(
-                "[TRACE:graph] 工具列表为空（tool_schemas=%s），LLM 将无工具可用",
-                "present" if tool_schemas else "none",
-            )
-        llm_with_tools = langchain_llm.bind_tools(tools)
-
-        compiled, _records_raw, pending_approvals = self._build_graph(
-            llm_with_tools, tools, registry,
-            trace_id=trace.trace_id, _thread_id=thread.id,
-            _model=self._llm_client.default_model,
-            normalizer=normalizer, ws_service=ws_service,
-            thread_id=thread.id, turn_record_id=turn_record_id, execution_id=execution_id,
-        )
+        prep = self._prepare_execution(thread, exec_ctx, ctx_bundle, normalizer, trace=trace)
+        context_snapshot = prep["context_snapshot"]
+        compiled = prep["compiled"]
+        _records_raw = prep["_records_raw"]
+        pending_approvals = prep["pending_approvals"]
+        initial_messages = prep["initial_messages"]
 
         # ── 流式执行 ──
         accumulated: list[str] = []
@@ -1296,27 +1343,11 @@ class AgentGraph:
 
         # ── Graph state 是正常完成后的唯一事实源 ──
         state_records = final_state.get("tool_records", []) if final_state is not None else _records_raw
-        tool_records = self._tool_records_from_state(
-            [r for r in state_records if r.get("status") != "blocked"],
-        )
-        reply = self._merge_blocked_records(_records_raw, tool_records, reply)
+        graph_state_tool_records = [r for r in state_records if r.get("status") != "blocked"]
 
-        # ── 审批记录 ──
-        if pending_approvals:
-            for pa in pending_approvals:
-                tc_name = str(pa.get("name", "") or "")
-                tc_args = pa.get("args", {}) if isinstance(pa.get("args"), dict) else {}
-                tool_records.append(ToolRecord(
-                    tool_call_id=str(pa.get("id", "") or ""),
-                    name=tc_name,
-                    params=tc_args,
-                    result={"ok": False, "result": "awaiting_approval"},
-                    status="pending_approval",
-                    order_index=len(tool_records),
-                ))
-            if not reply and pending_approvals:
-                tool_names = [str(pa.get("name", "")) for pa in pending_approvals]
-                reply = f"需要你的确认来执行以下工具: {', '.join(tool_names)}"
+        signal = await asyncio.to_thread(
+            self._classify_memory_signal, message, reply, trace.trace_id, message_source,
+        )
 
         if not reply and not pending_approvals and not _records_raw:
             logger.warning(
@@ -1324,49 +1355,18 @@ class AgentGraph:
                 trace.trace_id, message[:100],
             )
 
-        card_records = [
-            ToolCallRecord(name=r.name, params=r.params, result=r.result, status=r.status,
-                           trace_id=trace.trace_id, reason=r.reason, tool_call_id=r.tool_call_id)
-            for r in tool_records
-        ]
-        action_cards = build_action_cards(card_records, pending_approvals=pending_approvals)
-        pending_operations = build_pending_operations(card_records, pending_approvals=pending_approvals)
-
-        post_items, post_full = self._build_post_context_items(reply, [
-            {"name": r.name, "params": r.params, "result": r.result, "status": r.status, "trace_id": trace.trace_id}
-            for r in tool_records
-        ])
-        result_snapshot = ContextSnapshotData(
-            items=[*context_snapshot.items, *post_items],
-            full_contents={**context_snapshot.full_contents, **post_full},
-            stable_prefix_hash=context_snapshot.stable_prefix_hash,
-            injected_memory_ids=list(context_snapshot.injected_memory_ids),
+        result = self._assemble_agent_result(
+            reply=reply,
+            graph_state_tool_records=graph_state_tool_records,
+            records_raw=_records_raw,
+            pending_approvals=pending_approvals,
+            trace=trace,
+            message=message,
+            context_snapshot=context_snapshot,
+            llm_usage=self._collect_llm_usage(final_messages),
+            signal=signal,
         )
-
-        signal: MemorySignalDecision = MemorySignalDecision(action=MemorySignalAction.EXTRACT_ASYNC.value, confidence=0.5, reason="default")
-        try:
-            # 同步 LLM HTTP 调用（最长可达 30s），必须移出事件循环线程
-            signal = await asyncio.to_thread(
-                self._action_planner.classify_memory_signal,
-                user_message=message, reply=reply, trace_id=trace.trace_id,
-            )
-        except Exception:
-            logger.warning("记忆信号分类失败（已使用默认信号）: trace_id=%s", trace.trace_id, exc_info=True)
-        signal.action = MemoryExtractionPolicy.resolve_action(
-            signal.action, message, message_source,
-        ).value
-
-        yield {
-            "type": "__graph_result__",
-            "result": AgentGraphResult(
-                reply=reply, trace_id=trace.trace_id, user_message=message,
-                tool_records=tool_records, action_cards=action_cards,
-                pending_operations=pending_operations,
-                pending_approvals=[dict(item) for item in pending_approvals],
-                context_snapshot=result_snapshot, memory_signal=signal,
-                llm_usage=self._collect_llm_usage(final_messages),
-            ),
-        }
+        yield {"type": "__graph_result__", "result": result}
 
     @staticmethod
     def _merge_blocked_records(

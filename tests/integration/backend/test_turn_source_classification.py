@@ -1,4 +1,4 @@
-"""回归测试：消息来源统一由 TurnRecord.source 结构化判定。
+﻿"""回归测试：消息来源统一由 TurnRecord.source 结构化判定。
 
 覆盖两类路径：
 - 前端展示（list_thread_messages_page / _events_to_display_messages）：
@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from aiive.db.models import Event
 from aiive.runtime.context_assembler import ContextAssembler
 from aiive.runtime.thread_state import ThreadState
-from backend.tests._util import add_event, add_turn, new_thread
+from tests.integration.backend._util import add_event, add_turn, new_thread
 
 
 class _FakeTokenCounter:

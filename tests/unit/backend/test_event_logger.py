@@ -82,22 +82,21 @@ class TestFaithfulTracing:
         tool_list.name = "list_tasks"
         tools = [tool_echo, tool_list]
 
-        with patch(
-            "aiive.runtime.agent_graph.build_langchain_tools", return_value=tools
-        ), patch("aiive.runtime.agent_graph.get_tool_registry") as mock_reg:
-            mock_reg.return_value.list_all.return_value = []
-            # 直接调用事件记录器，避免真实 LLM 调用
-            # （AgentGraph 已不再持有 _logger 成员，事件记录经 EventLogger 独立完成）
-            EventLogger(db_session).log_event(
-                trace_id=trace.trace_id, thread_id=thread.id,
-                event_type="system_injection",
-                payload={
-                    "content": system_content,
-                    "injected_tools": [getattr(t, "name", "") for t in tools],
-                    "memory_count": 1, "active_task_count": 0, "due_task_count": 0,
-                },
-            )
-            db_session.flush()
+        # 直接调用事件记录器，避免真实 LLM 调用
+        # （AgentGraph 已不再持有 _logger 成员，事件记录经 EventLogger 独立完成）
+        # 注：原先对 aiive.runtime.agent_graph.get_tool_registry 的 mock 目标在模块中
+        # 并不存在（该符号从未作为 agent_graph 的模块属性导出），会触发 AttributeError。
+        # 该 patch 对 EventLogger 的直接调用并无实质作用，故移除之，保留对事件写入的断言。
+        EventLogger(db_session).log_event(
+            trace_id=trace.trace_id, thread_id=thread.id,
+            event_type="system_injection",
+            payload={
+                "content": system_content,
+                "injected_tools": [getattr(t, "name", "") for t in tools],
+                "memory_count": 1, "active_task_count": 0, "due_task_count": 0,
+            },
+        )
+        db_session.flush()
 
         evt = db_session.query(Event).filter(
             Event.event_type == "system_injection",

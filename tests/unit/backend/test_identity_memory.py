@@ -3,7 +3,9 @@
 核心防回归点：
 - remember_or_update 工具的 content/memory_key 字段描述必须告诉模型身份键用纯值、
   关系风格走 agent.persona.relationship（避免再次把整句塞进 user_display_name）。
-- Runtime Identity 渲染把称呼（user_display_name）与关系风格（relationship_style）分开。
+- Runtime Identity 只渲染 Core Memory 投影不了的身份字段（agent_runtime_id /
+  agent_display_name / relationship_style）；称呼 user_display_name 由 Core Memory
+  投影提供，不得在此重复渲染（见 context_inspector.get_runtime_identity_placeholder）。
 """
 import pytest
 
@@ -33,20 +35,24 @@ def test_remember_tool_schema_carries_identity_guidance():
     assert "agent.persona." in rem.description
 
 
-def test_runtime_identity_separates_display_name_and_relationship():
-    """称呼与关系风格必须分两行，且关系表述不得进入 display name。"""
+def test_runtime_identity_renders_agent_fields_and_relationship_only():
+    """Runtime Identity 只渲染 agent 侧字段与关系风格，称呼交给 Core Memory 投影。"""
     text = _build_runtime_identity({
+        "agent_runtime_id": "agent-1",
+        "agent_display_name": "小忆",
         "user_display_name": "博士",
         "relationship_style": "user addresses agent as 主人",
     })
-    assert "user_display_name: 博士" in text
-    assert "relationship_style:" in text
-    # 关系表述不应出现在 user_display_name 行
-    assert "我的主人" not in text.split("relationship_style:")[0]
+    assert "agent_runtime_id: agent-1" in text
+    assert "agent_display_name: 小忆" in text
+    assert "relationship_style: user addresses agent as 主人" in text
+    # user_display_name 由 Core Memory 投影提供，此处重复渲染会让同一份数据出现两次
+    assert "user_display_name" not in text
+    assert "博士" not in text
 
 
 def test_runtime_identity_omits_empty_relationship():
-    """没有关系风格时不渲染 relationship_style 行。"""
+    """没有可渲染的身份字段时整块为空，不输出空的 relationship_style 行。"""
     text = _build_runtime_identity({"user_display_name": "博士"})
-    assert "user_display_name: 博士" in text
+    assert text == ""
     assert "relationship_style" not in text

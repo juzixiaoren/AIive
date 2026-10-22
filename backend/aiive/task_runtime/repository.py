@@ -33,7 +33,7 @@ _TASK_BROADCAST_WATERMARKS_KEY = "aiive_task_broadcast_watermarks"
 
 
 @sa_event.listens_for(Session, "after_transaction_create")
-def _remember_nested_broadcast_watermark(  # pyright: ignore[reportUnusedFunction]
+def _remember_nested_broadcast_watermark(
     session: Session, transaction: Any
 ) -> None:
     """记录 SAVEPOINT 进入时的队列长度，以便只撤销内层产生的广播。"""
@@ -43,7 +43,7 @@ def _remember_nested_broadcast_watermark(  # pyright: ignore[reportUnusedFunctio
 
 
 @sa_event.listens_for(Session, "after_commit")
-def _broadcast_task_events_after_commit(  # pyright: ignore[reportUnusedFunction]
+def _broadcast_task_events_after_commit(
     session: Session,
 ) -> None:
     """只广播已经成为数据库事实的高层 Task 事件，避免回滚后出现幽灵消息。"""
@@ -64,7 +64,7 @@ def _broadcast_task_events_after_commit(  # pyright: ignore[reportUnusedFunction
 
 
 @sa_event.listens_for(Session, "after_rollback")
-def _discard_rolled_back_task_broadcasts(  # pyright: ignore[reportUnusedFunction]
+def _discard_rolled_back_task_broadcasts(
     session: Session,
 ) -> None:
     nested = session.get_nested_transaction()
@@ -80,7 +80,7 @@ def _discard_rolled_back_task_broadcasts(  # pyright: ignore[reportUnusedFunctio
 
 
 @sa_event.listens_for(Session, "after_transaction_end")
-def _discard_nested_broadcast_watermark(  # pyright: ignore[reportUnusedFunction]
+def _discard_nested_broadcast_watermark(
     session: Session, transaction: Any
 ) -> None:
     if not transaction.nested:

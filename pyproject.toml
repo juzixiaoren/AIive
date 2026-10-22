@@ -36,6 +36,29 @@ dev = [
 requires = ["setuptools>=75.0"]
 build-backend = "setuptools.build_meta"
 
+[tool.pytest.ini_options]
+# 全仓库唯一测试入口：tests/（unit / integration / flow 三个层级，全部离线）
+minversion = "8.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+# -v        逐用例输出，任何测试都采用同一粒度
+# --tb=short 失败时打印精简堆栈，异常可见但不淹没结果
+# -ra       结尾汇总 skipped/xfailed 等非通过态，避免静默跳过
+addopts = "-v --tb=short -ra --strict-markers"
+# 测试层级标记（由 tests/conftest.py 按目录自动标注，无需逐个文件手写）：
+#   unit        单元测试：独立函数/类/模块，无外部依赖（默认快速测试）
+#   integration 本地集成测试：多个真实本地组件组合（SQLite/Outbox/Handler）
+#   flow        关键流程测试：跨模块高价值链路，外部边界离线模拟
+#   slow        执行耗时较长的用例（默认入口不排除，仅用于定位瓶颈）
+markers = [
+    "unit: 单元测试（快速、无外部依赖）",
+    "integration: 本地集成测试（真实本地组件组合）",
+    "flow: 关键流程测试（跨模块链路，外部边界离线模拟）",
+    "slow: 执行耗时较长的用例",
+]
+
 [tool.setuptools.packages.find]
 where = ["backend"]
 
@@ -45,7 +68,7 @@ where = ["backend"]
 
 [tool.basedpyright]
 include = ["backend"]
-exclude = ["backend/alembic/versions", "backend/alembic/_archive_migrations_20260717", "backend/tests", "backend/conftest.py"]
+exclude = ["backend/alembic/versions", "backend/alembic/_archive_migrations_20260717"]
 reportImportCycles = "none"
 reportCallInDefaultInitializer = "none"
 reportUnknownMemberType = "none"

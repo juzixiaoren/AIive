@@ -169,7 +169,12 @@ class TestPatchExecutor:
         )
         assert result["ok"] is False
         assert len(result["operations_applied"]) == 0
-        assert "path_escape_denied" in result["operations_failed"][0]["reason"]
+        # 绝对路径/穿越由 trusted_core 先行拒绝（executor 的 path_escape_denied 是第二道），
+        # 两道都必须给出明确 reason，而不是静默失败或回填无 reason 的原始操作。
+        assert result["operations_failed"][0]["reason"] in {
+            "invalid_or_parent_traversal_path",
+            "path_escape_denied",
+        }
         assert not outside.exists()
 
     def test_traversal_target_path_rejected_for_add(self, tmp_path):
@@ -189,7 +194,12 @@ class TestPatchExecutor:
             ]
         )
         assert result["ok"] is False
-        assert "path_escape_denied" in result["operations_failed"][0]["reason"]
+        # 绝对路径/穿越由 trusted_core 先行拒绝（executor 的 path_escape_denied 是第二道），
+        # 两道都必须给出明确 reason，而不是静默失败或回填无 reason 的原始操作。
+        assert result["operations_failed"][0]["reason"] in {
+            "invalid_or_parent_traversal_path",
+            "path_escape_denied",
+        }
         assert not (tmp_path / "slots" / "A" / "app" / "injected.py").exists()
 
     def test_baseline_resynced_on_each_apply(self, tmp_path):

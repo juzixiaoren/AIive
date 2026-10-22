@@ -1,7 +1,7 @@
 """
 运行时层 - Thread 启动引导服务。
 
-确保 Thread 在工具执行前已提交到数据库，使得 _db_handler 装饰器创建的
+确保 Thread 在工具执行前已提交到数据库，使得 db_handler 装饰器创建的
 独立 DB 会话能通过 FK 约束校验。
 """
 import logging

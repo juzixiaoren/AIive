@@ -30,7 +30,7 @@ TEST_MAPPING = {
     "backend/aiive/selfdev/": ["tests/unit/backend/test_selfdev_planner.py"],
     "backend/aiive/prompts/": ["tests/unit/backend/test_prompt_registry.py"],
     "backend/aiive/task_runtime/": ["tests/unit/backend/test_persistent_task_runtime.py"],
-    "backend/aiive/control/": ["tests/unit/backend/test_persistent_task_runtime.py", "backend/tests/test_approval_security.py"],
+    "backend/aiive/control/": ["tests/unit/backend/test_persistent_task_runtime.py", "tests/integration/backend/test_approval_security.py"],
     "backend/aiive/desktop/": ["tests/unit/backend/test_desktop_nodes.py", "tests/unit/backend/test_persistent_task_runtime.py"],
     "frontend/": [],
 }

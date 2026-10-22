@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import subprocess
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -10,7 +9,12 @@ from pathlib import Path
 
 from aiive.control.approval_service import TaskApprovalService
 from aiive.control.capability_broker import CapabilityBroker
-from aiive.control.scope import TaskScope, action_resource_keys, path_within
+from aiive.control.scope import (
+    TaskScope,
+    _normalize_remote_path,
+    action_resource_keys,
+    path_within,
+)
 from aiive.db.models import (
     AgentAction,
     AgentRun,
@@ -24,7 +28,7 @@ from aiive.db.models import (
     TaskEvidence,
     Thread,
 )
-from aiive.desktop.reconciliation import desktop_reconciliation_service
+from aiive.desktop.reconciliation import _hash_result, desktop_reconciliation_service
 from aiive.desktop.connection_manager import DesktopDispatchError, desktop_connection_manager
 from aiive.selfdev.trusted_core import protected_reason, validate_operations
 from aiive.task_runtime.agent_executor import AgentDecision
@@ -557,15 +561,16 @@ def test_unknown_desktop_action_retains_lock_until_journal_reconciliation(
     assert db_session.query(TaskResourceLock).filter(TaskResourceLock.action_id == action.id).count() == 1
 
     reconciled_result = {"path": str(target), "bytes_written": 5}
+    # result_hash 必须使用生产序列化契约（ensure_ascii=False）：tmp 路径含非 ASCII
+    # 字符时，测试侧自行 json.dumps 的哈希与 Desktop Node stableStringify 不一致，
+    # 会导致 journal 校验静默拒绝。直接复用生产哈希函数验证契约往返。
     assert desktop_reconciliation_service.apply_entry(db_session, node.id, {
         "action_id": action.id,
         "idempotency_key": action.idempotency_key,
         "arguments_hash": action.arguments_hash,
         "status": "committed",
         "result": reconciled_result,
-        "result_hash": hashlib.sha256(
-            json.dumps(reconciled_result, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest(),
+        "result_hash": _hash_result(reconciled_result),
     }) is True
     assert db_session.query(TaskResourceLock).filter(TaskResourceLock.action_id == action.id).count() == 0
 
@@ -742,7 +747,7 @@ def test_resource_lock_and_scope_guards(db_session, tmp_path) -> None:
     assert action_resource_keys("desktop_fs_read_text", {"path": str(tmp_path)}, "node-1") == []
     assert action_resource_keys(
         "desktop_fs_write_text", {"path": str(tmp_path)}, "node-1", mutates_resources=True,
-    ) == [f"node:node-1:path:{tmp_path}"]
+    ) == [f"node:node-1:path:{_normalize_remote_path(str(tmp_path))}"]
 
 
 def test_complex_task_keeps_multiple_actions_in_task_timeline(db_session) -> None:

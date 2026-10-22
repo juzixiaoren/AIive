@@ -67,8 +67,10 @@ class RetrievalIndexManager:
 
     def next_index_version(self, db: Session) -> int:
         row = db.query(func.max(RetrievalIndexGeneration.index_version)).first()
-        max_v = row[0] if row and row[0] is not None else 0
-        return int(max_v) + 1
+        # func.max 在空表上返回 NULL（运行期 None），类型标注按 int | None 收窄，
+        # 避免基于 int 静态类型的“比较恒为真”误判。
+        max_v: int | None = row[0] if row else None
+        return int(max_v or 0) + 1
 
     def create_generation(
         self, db: Session, index_version: int, status: str = "building",

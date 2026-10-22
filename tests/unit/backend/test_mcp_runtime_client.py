@@ -3,9 +3,9 @@
 说明：旧的进程内 mock API（register_tool + 直接调 Python callable）已随
 真实 MCP 链路移除。需要真实子进程的协议行为（initialize 握手、tools/list、
 tools/call、isError 传播、会话复用）由
-backend/tests/test_mcp_pipeline.py::TestRuntimeClient 用 Python 假 MCP
-server 夹具（backend/tests/fixtures/fake_mcp_server.py）完整覆盖；
-本文件只保留无需启动子进程的单元用例。
+tests/integration/backend/test_mcp_pipeline.py::TestRuntimeClient 用 Python
+假 MCP server 夹具（tests/integration/backend/fixtures/fake_mcp_server.py）
+完整覆盖；本文件只保留无需启动子进程的单元用例。
 """
 from types import SimpleNamespace
 

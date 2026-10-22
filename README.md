@@ -80,7 +80,7 @@ AIive（再次召回，fail-closed 校验）：
 | Desktop 应用 | Electron 37 / Electron Forge / 独立 Node Host |
 | 实时通信 | WebSocket |
 | 定时任务 | APScheduler 3.10 |
-| 测试 | pytest 8.0 / basedpyright |
+| 测试 | pytest 8.0（仓库根统一配置 `pyproject.toml`；三层结构 unit / integration / flow，全部离线，SQLite + 关闭向量） / basedpyright（CI 类型检查入口，`pyproject.toml` 已配置；本轮已安装并实跑，重构核心模块 0 error） |
 
 ### 核心架构
 
@@ -252,7 +252,7 @@ AIive/
 │   ├── core/             # LLM 客户端、动作规划器
 │   ├── runtime/          # Agent 图编排、注意力管理、策略引擎
 │   ├── memory/           # 记忆系统（统一写入服务、冲突解析、自动召回）
-│   ├── tools/            # 工具注册表、26+ 内置工具、安全删除
+│   ├── tools/            # 工具注册表（registry.py）、统一注册入口与共享机制（builtin_tools.py + _shared.py）、按领域拆分的 handler 模块（builtin_*.py）、安全删除
 │   ├── mcp/              # MCP 工具集成（发现、安装、沙箱）
 │   ├── selfdev/          # 自进化（补丁规划、槽位管理）
 │   ├── db/               # SQLAlchemy 模型、数据库配置
@@ -265,13 +265,17 @@ AIive/
 │   ├── pages/            # ChatPage、ToolsPage、NotificationsPage 等
 │   └── api/              # 前端 API 客户端
 ├── docs/                 # 设计文档与阶段计划
-├── tests/unit/backend/   # 单元测试（47 个测试文件）
+├── tests/unit/backend/   # 单元测试（约 66 个测试文件）
+├── tests/integration/backend/  # 本地集成测试（Worker/Handler/调度/检索等）
+├── tests/flow/           # 关键流程测试（Turn 执行、提醒闭环）
 ├── docker-compose.yml    # PostgreSQL 16
 ├── scripts/build-app.sh  # 可扩展的统一客户端构建入口
 └── alembic.ini           # 数据库迁移配置
 ```
 
-## 内置工具（28 个，9 大类）
+## 内置工具（36 个，统一注册于 builtin_tools.py::register_builtin_tools）
+
+处理函数按业务领域拆分到 backend/aiive/tools/builtin_*.py（基础 / 提醒任务 / 记忆写入 / 记忆召回 / 文件 / 知识库 / 联网研究 / MCP / 自进化 / 运行时状态），builtin_tools.py 仅负责统一注册组合与共享机制（db_handler DB 会话装饰器、require_ctx RunContext 校验、_build_safety 安全配置；三者定义在本模块，不下沉到独立叶子模块——SessionLocal 必须与 db_handler 同处该命名空间，否则 tests/support.py 的 monkeypatch 契约失效）。领域模块用公开名（handle_*）实现，builtin_tools 以私有别名（_handle_*）re-export，历史导入契约不变。工具名称、参数 Schema、描述、风险等级、权限与确认要求、注册行为及执行结果契约保持不变。
 
 ### 基础
 - `echo` — 回显输入消息
@@ -344,11 +348,31 @@ AIive/
 
 ## 测试
 
+测试分三层，**全部离线**：不调用真实 LLM / Embedding / MCP 等外部服务，
+不需要任何 API Key，也不消耗第三方额度。数据库统一使用 SQLite（由根
+`conftest.py` 注入），无需本地 PostgreSQL。
+
+| 目录 | 层级 | 说明 |
+|---|---|---|
+| `tests/unit/` | 单元 | 独立函数/类/模块的业务逻辑；纯逻辑测试不建库，需要数据库时请求 `db_session` |
+| `tests/integration/` | 本地集成 | 多个真实本地组件组合（Worker/Handler/调度/检索/生命周期），共享进程级 SQLite |
+| `tests/flow/` | 关键流程 | 跨模块高价值链路（Turn 执行、提醒闭环），外部边界离线模拟 |
+
 ```bash
-# 运行所有测试
-python -m pytest tests/ -v
+# 默认快速测试（单元 + 关键流程，日常开发用）
+python -m pytest tests/unit tests/flow
+
+# 本地集成测试
+python -m pytest tests/integration
+
+# 完整测试（全部离线用例）
+python -m pytest
 
 # 按模块筛选
-python -m pytest tests/ -v -k "memory"
-python -m pytest tests/ -v -k "tool"
+python -m pytest tests/unit -k "memory"
+python -m pytest tests/unit -k "tool"
 ```
+
+外部 HTTP 边界（LLM / Embedding）的验证方式为**可控响应替换**：
+保留真实的请求构造、响应解析与错误归一化代码，仅替换传输层，
+见 `tests/unit/backend/test_llm_client.py` 与 `test_embedding_provider.py`。

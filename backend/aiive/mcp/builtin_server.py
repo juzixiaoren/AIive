@@ -10,7 +10,7 @@ _BACKEND_ROOT = Path(__file__).resolve().parents[2]
 if str(_BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(_BACKEND_ROOT))
 
-from mcp.server.fastmcp import FastMCP  # pyright: ignore[reportMissingImports]
+from mcp.server.fastmcp import FastMCP
 
 from aiive.knowledge.access import resolve_knowledge_path
 from aiive.knowledge.document_reader import extract_document

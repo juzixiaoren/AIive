@@ -1,4 +1,4 @@
-"""回归测试：ContextAssembler.assemble() 在软阈值触发 mark_pending_seal 后，
+﻿"""回归测试：ContextAssembler.assemble() 在软阈值触发 mark_pending_seal 后，
 必须真正提交事务，否则 flush 会随会话关闭被回滚丢弃
 （原 bug：Segment.pending_seal_at 永远写不进数据库）。
 """
@@ -9,7 +9,7 @@ from aiive.db.models import Segment
 from aiive.runtime.context_assembler import ContextAssembler
 from aiive.runtime.context_budget import ContextBudget, PartitionBudget
 from aiive.runtime.token_models import ModelProfile, TokenCount
-from backend.tests._util import new_epoch, new_segment, new_thread
+from tests.integration.backend._util import new_epoch, new_segment, new_thread
 
 
 class _FakeTokenCounter:

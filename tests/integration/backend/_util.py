@@ -126,6 +126,7 @@ class FakeLLM:
         self.output = output
         self.calls = 0
 
-    def chat(self, messages, model=None, temperature=0):
+    def chat(self, messages, model=None, temperature=0, json_mode=False):
+        """签名与 LLMClient.chat 保持一致，接受生产代码实际传入的全部关键字参数。"""
         self.calls += 1
         return types.SimpleNamespace(content=json.dumps(self.output))
