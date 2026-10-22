@@ -58,7 +58,8 @@ jobs:
         with:
           python-version: "3.12"
       - name: 安装 ruff
-        run: pip install ruff
+        # 与本地基线（docs/CODE_MAP.md §10.5）同版本，避免上游规则变更导致门禁漂移
+        run: pip install ruff==0.17.1
       - name: 运行 ruff
         # 只启用真实缺陷规则（未定义名、语法错误）；风格项不作为门禁，
         # 与本地基线 docs/CODE_MAP.md §10.5 保持一致。
@@ -72,8 +73,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: 安装依赖
+        # basedpyright 需要能解析第三方包（sqlalchemy/fastapi/mcp 等），
+        # 否则 reportMissingImports 会把缺失依赖报成 error，并连带触发
+        # reportImplicitRelativeImport（第一轮该 job 一直失败的真因）。
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
       - name: 安装 basedpyright
-        run: pip install basedpyright
+        run: pip install basedpyright==1.40.2
       - name: 运行 basedpyright
         run: basedpyright
 
