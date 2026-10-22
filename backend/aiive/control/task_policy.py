@@ -6,6 +6,7 @@ from typing import Any
 
 from aiive.control.scope import TaskScope
 from aiive.tools.registry import ToolRegistration
+from aiive.tools.shell_policy import SHELL_CAPABILITY_ID, classify_shell_command
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,14 @@ class TaskPolicyEngine:
             return ActionPolicyDecision("block", "mcp_environment_access_not_in_task_scope")
         if safety.uses_network and not scope.allow_network:
             return ActionPolicyDecision("block", "network_access_not_in_task_scope")
+        if capability_id == SHELL_CAPABILITY_ID:
+            # 本机 Shell 按命令内容分级：只读命令放行，其余进入审批；
+            # 涉及网络的命令还必须显式允许联网。
+            verdict = classify_shell_command(str(arguments.get("command") or ""))
+            if verdict.uses_network and not scope.allow_network:
+                return ActionPolicyDecision("block", "network_access_not_in_task_scope")
+            if not verdict.read_only:
+                return ActionPolicyDecision("approval", f"shell_{verdict.reason}")
         if (
             capability_id in ALWAYS_APPROVE
             or safety.requires_confirmation

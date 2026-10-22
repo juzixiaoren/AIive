@@ -79,6 +79,16 @@ class Settings(BaseSettings):
     # 工具参数首次校验失败后，最多允许模型纠正并重试的次数。
     tool_argument_max_retries: int = 2
 
+    # 本机 Bash 执行（run_shell）。
+    # shell_bash_path: 显式指定 bash 可执行文件；为空时按 PATH → 常见 Git Bash 路径探测。
+    #   探测失败直接返回 shell_unavailable，绝不静默回退到 cmd/powershell。
+    # shell_default_timeout_seconds / shell_max_timeout_seconds: 单次命令默认与最大超时。
+    # shell_max_output_bytes: stdout / stderr 各自保留的最大字节数，超出截断。
+    shell_bash_path: str = ""
+    shell_default_timeout_seconds: int = 60
+    shell_max_timeout_seconds: int = 300
+    shell_max_output_bytes: int = 65536
+
     # 公开网页检索与抓取。默认 DuckDuckGo HTML 无需密钥；也可切换 Brave API
     # 或自建 SearXNG。所有返回内容均标记为不可信外部证据。
     aiive_web_search_enabled: bool = True

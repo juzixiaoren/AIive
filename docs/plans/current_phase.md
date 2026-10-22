@@ -94,3 +94,22 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - 新增 `tests/unit/backend/test_worker_tool_injection.py` 16 例全通过。
 - 全量离线：900 passed / 8 skipped（PG 专项默认跳过）；`tests/integration` 330 passed。
 - 对话 Agent 仍固定 5 个任务元工具（既有用例继续通过）。
+
+## V36 本机 Bash 常驻能力（完成）
+
+### Implemented
+- `tools/local_shell.py`：真实 bash 子进程执行器（`resolve_bash` 配置→PATH→Git Bash 路径，
+  失败返回 `shell_unavailable` 不回退）；临时文件承载输出并限量读取；超时终止进程树；
+  最小环境白名单（不传密钥类变量）；结构化结果（exit_code/stdout/stderr/timed_out/truncated/shell）。
+- `tools/shell_policy.py`：命令静态分级（只读白名单 + 复合操作符拦截 + git 子命令细分 + 网络命令识别）。
+- `tools/builtin_shell.py` + `builtin_tools.py`：注册 `run_shell`（medium / writes_external_world /
+  `non_repeatable_external`），工具总数 37。
+- `control/task_policy.py`：`run_shell` 只读命令放行、其余审批、网络命令需 `allow_network`。
+- `runtime/policy_engine.py`：对话侧如绑定该工具，同样按命令内容要求确认。
+- `task_runtime/tool_injection.py`：`run_shell` 加入 L0 常驻清单。
+- 提示词 `worker_system` 2.1.0：说明 cwd 约束、只读/审批/联网边界、超时与截断语义。
+
+### Observable Result
+- 新增 `tests/unit/backend/test_local_shell.py` 25 例全通过（真实 bash 执行、超时清理、截断、
+  环境隔离、bash 缺失不回退、分级策略、任务内直接执行与审批/路径拦截）。
+- 本机实测 shell：GNU bash 5.2.26（Git Bash）。

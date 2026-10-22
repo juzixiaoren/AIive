@@ -12,6 +12,7 @@ from enum import Enum
 from typing import Any
 
 from aiive.tools.registry import ToolRegistry, get_tool_registry
+from aiive.tools.shell_policy import SHELL_CAPABILITY_ID, classify_shell_command
 
 
 class PolicyAction(str, Enum):
@@ -81,7 +82,12 @@ def check_tool_calls(
         else:
             allowed.append(tool_name)
             safety = registration.safety
-            if (
+            if tool_name == SHELL_CAPABILITY_ID and not classify_shell_command(
+                str((tc.get("args") or {}).get("command") or "")
+            ).read_only:
+                # 对话侧若绑定本机 Shell，同样按命令内容决定是否确认。
+                confirm.append(tool_name)
+            elif (
                 safety.requires_confirmation
                 or safety.can_delete
                 or safety.risk_level in ("high", "critical")

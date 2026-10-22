@@ -119,6 +119,7 @@ from aiive.tools.builtin_basic import (
     handle_echo as _handle_echo,
     handle_get_current_time as _handle_get_current_time,
 )
+from aiive.tools.builtin_shell import handle_run_shell as _handle_run_shell
 from aiive.tools.builtin_files import (
     handle_read_text_file as _handle_read_text_file,
     handle_safe_delete as _handle_safe_delete,
@@ -185,6 +186,31 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         ("get_current_time", _handle_get_current_time,
          "获取当前时间（UTC 与本地时区）。",
          {}, "low", False, False),
+        # 本机 Shell（常驻核心能力）：真实 bash，无需 Desktop Node。
+        ("run_shell", _handle_run_shell,
+         "在 AIive 所在主机上用真实 bash 执行一条命令，返回退出码、stdout、stderr 与超时状态。"
+         + "cwd 必须位于任务允许的根目录内；只读命令可直接执行，其余命令需要审批。"
+         + "输出超过上限会被截断（truncated 标记）；超时会终止整个进程树。",
+         {
+             "command": {
+                 "type": "str",
+                 "description": "交给 bash -c 执行的命令文本；不要包含交互式提示",
+                 "minLength": 1,
+                 "required": True,
+             },
+             "cwd": {
+                 "type": "str",
+                 "description": "工作目录绝对路径，必须在任务 allowed_roots 内",
+                 "minLength": 1,
+                 "required": True,
+             },
+             "timeout_seconds": {
+                 "type": "int",
+                 "description": "超时秒数；0 表示默认 60s，上限 300",
+                 "minimum": 0,
+                 "maximum": 300,
+             },
+         }, "medium", True, False),
         # 提醒 / 任务
         ("schedule_reminder", _handle_schedule_reminder,
          "创建定时提醒并写入 Task 表，由后台可靠投递。注意：本工具只接受相对延迟 delay_minutes。"
@@ -385,6 +411,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
     ]
 
     external_effect_modes = {
+        "run_shell": "non_repeatable_external",
         "forget": "externally_reconcilable",
         "safe_delete": "non_repeatable_external",
         "apply_patch_to_inactive_slot": "non_repeatable_external",

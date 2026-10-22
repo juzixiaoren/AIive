@@ -15,6 +15,7 @@ WORKER_RESIDENT_CAPABILITIES: tuple[str, ...] = (
     "memory_event_log",
     "web_search",
     "search_knowledge",
+    "run_shell",
     "desktop_exec",
     "list_tasks",
     "cancel_task",
