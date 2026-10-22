@@ -3,6 +3,10 @@
 > 审查范围：后端 `backend/aiive`（core / runtime / tools / worker / memory / api）及前端 `frontend/src` 关键文件。
 > 审查方式：逐文件阅读 + 跨文件引用/死代码核实。所有结论均给出文件与行号。
 > 时间：2026-07-09
+>
+> **历史快照提示**：§1~§8 的文件名与行号对应当日代码（含已删除的 `runtime/agent_loop.py`、
+> `core/intent_classifier.py`、`runtime/context_builder.py`），仅作溯源用；当前落点见
+> `docs/CODE_MAP.md` 与 `docs/audit/final_convergence_report.md`，修复结论见 §9。
 
 ---
 

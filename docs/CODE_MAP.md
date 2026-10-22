@@ -625,18 +625,20 @@ api/routes_agent_tasks.py 创建任务 → task_runtime/repository.py::create_ta
 > 全仓唯一入口是仓库根 pyproject.toml 的 [tool.pytest.ini_options]，testpaths = ["tests"]。
 > 层级筛选必须用目录路径（pytest 9 的 -m 过滤先于 conftest 打标记，`-m unit` 不生效）。
 
-| 入口 | 用例数 | 实测耗时 |
+| 入口 | 用例数 | 实测耗时（2026-10-22 夹具改造后） |
 | --- | --- | --- |
-| `python -m pytest tests/unit` | 532 | 362s |
-| `python -m pytest tests/integration` | 315 | 29s |
-| `python -m pytest tests/flow` | 10 | ~1s |
-| `python -m pytest`（全量） | 857 | 315~357s（约 5~6 分钟）；2026-10-22 复跑 401.87s |
-| `bash scripts/check_single_file_tests.sh`（每文件单独进程，JOBS=2） | 91 个文件 | 约 6 分钟（本地实测 91/91 通过） |
+| `python -m pytest tests/unit` | 532 | 78.47s（改造前 330.83s） |
+| `python -m pytest tests/integration` | 315 | 29.00s（改造前 23.27s，同机波动） |
+| `python -m pytest tests/flow` | 10 | 19.76s（其中 1 个 7.6s 真实链路） |
+| `python -m pytest`（全量） | 857 | **112.35s**（改造前 363.80s） |
+| `python -m pytest tests/unit tests/flow`（默认快速集） | 542 | **89.17s** |
+| `PYTHON_BIN=.venv/Scripts/python.exe JOBS=4 bash scripts/check_single_file_tests.sh` | 91 个文件 | 约 3 分钟（91/91 通过） |
 
 测试基础设施要点（改动前先读）：
 
 - 根 `conftest.py`：注入 SQLite 地址与向量开关、为进程级库建表一次、统一结果输出。
 - `tests/support.py`：SessionLocal 分发器（先于业务模块导入安装），`db_session` 会把隔离会话注册进来。
-- `tests/conftest.py`：`db_session` 夹具（独立临时库 + 全模型建表）；单元/流程层用 `db_session`。
+- `tests/conftest.py`：`db_session` 夹具（会话级模板库 `_db_template` 只建一次表，逐用例 `copyfile` 出独立库 + 外层事务回滚）；单元/流程层用 `db_session`。
+  不要把模板库改回逐用例 `create_all`：实测建表 1.226s/次、拷贝 0.008s/次，改回去会让 unit 层从 78s 回到 330s。
 - `tests/integration/conftest.py`：`db` 夹具（进程级共享库，会话级建表 + 用例级清空数据）；集成层用 `db`，不要用 `db_session`。
 - 不请求 `db_session` 的用例会落到进程级库（已建表），适合需要生产代码自开会话提交的场景。

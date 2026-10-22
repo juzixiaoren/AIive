@@ -32,9 +32,9 @@ def pytest_collection_modifyitems(config, items) -> None:
     tests/unit -> unit，tests/integration -> integration，tests/flow -> flow。
 
     注意：pytest 核心插件在同一钩子内执行 -m/-k 过滤，且其 hook 优先于
-    conftest，因此这里添加的 marker 只用于报告与 `--markers` 查询，
-    不能作为 `-m <layer>` 的选择依据。层级筛选请使用目录路径入口：
-    ``pytest tests/unit`` / ``pytest tests/integration`` / ``pytest tests/flow``。
+    conftest，因此这里添加的 marker 只用于报告与 --markers 查询，
+    不能作为 -m <layer> 的选择依据。层级筛选请使用目录路径入口：
+    pytest tests/unit / pytest tests/integration / pytest tests/flow。
     """
     del config  # 仅使用 items
     for item in items:
@@ -47,17 +47,40 @@ def pytest_collection_modifyitems(config, items) -> None:
             item.add_marker(pytest.mark.flow)
 
 
+@pytest.fixture(scope="session")
+def _db_template(tmp_path_factory) -> Path:
+    """会话级 SQLite 模板库：整个 pytest 进程只建一次表，用例侧只做文件拷贝。
+
+    实测 Base.metadata.create_all 在 Windows 上约 1.2s/次，而 unit 层约 250 个
+    用例请求 db_session，逐用例建表会把 unit 层拖到 5 分钟以上。改为模板库后
+    建表开销摊到会话级一次，用例只剩 shutil.copyfile（约 8ms），隔离语义不变：
+    每个用例仍是独立物理库文件 + 外层事务回滚。
+
+    PRAGMA journal_mode=DELETE 保证模板文件自包含（WAL 模式下数据可能留在
+    -wal 旁路文件里，只拷 .db 会丢表）。
+    """
+    path = tmp_path_factory.mktemp("db_template") / "template.db"
+    engine = create_engine(f"sqlite:///{path}")
+    Base.metadata.create_all(engine)
+    with engine.connect() as conn:
+        conn.exec_driver_sql("PRAGMA journal_mode=DELETE")
+        conn.commit()
+    engine.dispose()
+    return path
+
+
 @pytest.fixture
-def db_session():
+def db_session(_db_template: Path):
     """Create temporary SQLite database session fixture.
 
     每个用例独立临时库 + 外层事务，teardown 回滚，杜绝跨用例污染。
+    库文件由会话级模板库拷贝而来，避免逐用例重复建表。
     """
     tmpdir = tempfile.mkdtemp()
     db_path = Path(tmpdir) / "test.db"
+    shutil.copyfile(_db_template, db_path)
 
     engine = create_engine(f"sqlite:///{db_path}")
-    Base.metadata.create_all(engine)
 
     connection = engine.connect()
     transaction = connection.begin()
