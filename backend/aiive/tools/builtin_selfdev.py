@@ -42,14 +42,20 @@ def handle_apply_patch_to_inactive_slot(operations: list[dict[str, Any]] | None 
     return result
 
 def handle_promote_slot():
-    """健康检查通过后将非活跃槽位提升为活跃版本。"""
+    """健康检查通过后将非活跃槽位提升为活跃版本。
+
+    启用 Supervisor 时切换由守护进程执行，返回 status=switch_requested；
+    此时"已晋升"必须由后续读取（/api/selfdev/supervisor 或新进程状态）确认。
+    """
+    from aiive.supervisor.client import supervisor_client_from_settings
     from aiive.supervisor.release_manager import ReleaseManager
-    return ReleaseManager().promote()
+    return ReleaseManager(client=supervisor_client_from_settings()).promote()
 
 def handle_rollback_slot():
     """回滚到上一个活跃槽位版本。
 
     自动检测当前活跃槽位（A/B），回退到另一个槽位。
     """
+    from aiive.supervisor.client import supervisor_client_from_settings
     from aiive.supervisor.release_manager import ReleaseManager
-    return ReleaseManager().rollback()
+    return ReleaseManager(client=supervisor_client_from_settings()).rollback()

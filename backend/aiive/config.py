@@ -89,6 +89,30 @@ class Settings(BaseSettings):
     shell_max_timeout_seconds: int = 300
     shell_max_output_bytes: int = 65536
 
+    # Supervisor 进程托管（自进化 A/B 槽位晋升的真实进程切换）。
+    # enabled: 是否启用独立守护进程托管应用进程；关闭时 promote 只切 active_slot 指针
+    #   （兼容 docker compose 由容器编排负责重启的部署方式）。
+    # host/port: 被托管应用监听的地址与端口（守护进程与被托管进程共用）。
+    # app_module: uvicorn 导入串；app_command: 覆盖默认启动命令（模板占位符
+    #   {python} {host} {port} {slot} {slot_root} {app_module}），用于测试或自定义启动方式。
+    # start_timeout_seconds: 新进程从启动到通过健康检查的最长等待。
+    # stop_timeout_seconds: 停止进程时的优雅等待上限，超时后强制结束进程树。
+    # poll_seconds: 守护循环轮询间隔；max_restarts/restart_window_seconds: 崩溃重启预算。
+    # monitor_seconds: 晋升后的观察窗，窗内异常退出自动回滚。
+    supervisor_enabled: bool = False
+    supervisor_host: str = "127.0.0.1"
+    supervisor_port: int = 8000
+    supervisor_health_path: str = "/health"
+    supervisor_app_module: str = "aiive.main:app"
+    supervisor_app_command: str = ""
+    supervisor_start_timeout_seconds: int = 90
+    supervisor_stop_timeout_seconds: int = 15
+    supervisor_poll_seconds: float = 2.0
+    supervisor_max_restarts: int = 3
+    supervisor_restart_window_seconds: int = 300
+    supervisor_monitor_seconds: int = 600
+    supervisor_state_dir: str = ""
+
     # 公开网页检索与抓取。默认 DuckDuckGo HTML 无需密钥；也可切换 Brave API
     # 或自建 SearXNG。所有返回内容均标记为不可信外部证据。
     aiive_web_search_enabled: bool = True

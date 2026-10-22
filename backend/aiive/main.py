@@ -162,6 +162,14 @@ def create_app() -> FastAPI:
         except Exception:
             logger.exception("Prompt 目录校验失败，阻断启动")
             raise
+        role = os.environ.get("AIIVE_PROCESS_ROLE", "").strip().lower()
+        if role == "candidate":
+            # Supervisor 候选进程只做"能否启动 + 能否响应健康检查"的自检：不跑迁移、
+            # 不启动调度/Outbox、不注册 MCP，避免与仍在运行的旧版本并发迁移或重复执行
+            # 周期任务。验证通过后它会被停止，并在主端口以 normal 角色重新启动。
+            logger.info("Supervisor candidate 模式：跳过迁移与后台 worker")
+            yield
+            return
         try:
             _ensure_schema()
         except Exception:

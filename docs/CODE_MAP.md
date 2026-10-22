@@ -49,7 +49,7 @@
 │    ├─ handlers_forget.py   (遗忘 Saga 五阶段)                    │
 │    ├─ handlers_retention.py / handlers_agent_tasks.py / task_worker.py│
 │                                                                │
-│  supervisor/  守护进程 (health_probe / launcher / slot_manager)  │
+│  supervisor/  进程托管 (daemon / process_control / release_manager)│
 └───────────────────────────┬────────────────────────────────────┘
                             ▼
         db/ (SQLAlchemy 71 表)  +  alembic/ (schema 唯一真相源)
@@ -126,6 +126,7 @@
 | 内置 Skill catalog | `skills/catalog.py` + `skills/builtin/*/SKILL.md` | `api/routes_skills.py`、`task_runtime/tools.py` | `test_skills*.py` |
 | 自进化：补丁计划 | `selfdev/planner.py`、`selfdev/trusted_core.py` | `api/routes_selfdev.py` | `test_selfdev*.py` |
 | 自进化：槽位 promote/rollback | `supervisor/release_manager.py`（生产晋升入口）、`selfdev/promote_rollback.py`、`selfdev/patch_executor.py` | `supervisor/slot_manager.py` | `test_release_manager.py`、`test_selfdev_slot*.py` |
+| 自进化：进程托管（真实启停/健康/回滚） | `supervisor/daemon.py`（`Supervisor` 守护循环）、`supervisor/process_control.py`（`ProcessController` 启停与所有权）、`supervisor/health_http.py`（HTTP 探针）、`supervisor/control.py`（请求/事件/锁）、`supervisor/client.py`（应用侧客户端） | `api/routes_selfdev.py::supervisor_status`、`release_manager.py::promote`（`client` 注入）、`worker/scheduler_daemon.py::_release_monitor_job` | `test_supervisor_lifecycle.py` |
 | 自进化：安全闸门（Replay Eval + Kernel Contract Checks） | `eval/`（`contracts.py`/`replay.py`/`gate.py`/`scenarios.py`/`persistence.py`/`cli.py`/`models.py`） | `supervisor/release_manager.py::promote` 与 `selfdev/promote_rollback.py::promote`（共用 `eval/gate.py::evaluate_promotion_gate`，fail-closed）、`api/routes_eval.py`（只读查询 `/api/eval/runs`、`/runs/latest`） | `tests/unit/backend/test_eval_*.py`、`test_release_manager.py` |
 
 ### 2.5 任务 / 桌面 / 知识库 / 通知
@@ -337,7 +338,16 @@
 ### 3.11 其余包
 
 - `knowledge/`：`ingestor.py`（摄入+`search_chunks` Postgres ILIKE）、`chunker.py`、`document_reader.py`（TXT/MD/HTML/JSON/CSV/TSV/DOCX/PDF）、`access.py`（访问控制）
-- `supervisor/`：`health_probe.py`（健康探针）、`launcher.py`（进程守护拉起）、`release_manager.py`（**生产晋升入口**：`promote(run_gate=True)` 先健康检查再跑安全门 `evaluate_promotion_gate`，切换后进入观察窗，异常自动回滚；回滚不设闸门）、`slot_manager.py`（A/B 槽位管理，manifest excludes 列表含 qdrant——全仓未用 Qdrant，向量走 pgvector）
+- `supervisor/`：
+  - `slot_manager.py`：A/B 槽位与 `runtime/active_slot` 原子写（manifest excludes 含 data/postgres/object_store/logs/.env/slots/runtime）。
+  - `health_probe.py`：槽位静态健康（manifest、app 目录、槽位内 `import aiive.main`）；`launcher.py`：槽位状态概览。
+  - `release_manager.py`：**生产晋升入口**，先静态健康 + 安全门 `evaluate_promotion_gate`，再决定"自己切指针"还是"交给 Supervisor"（`client` 注入；未启用时保持指针切换 + 观察窗回滚）。
+  - `daemon.py`：`Supervisor` 守护循环（recover/tick/run_forever），负责暂存端口验证、主端口切换、观察窗监测、异常退出重启预算、中断切换恢复；`python -m aiive.supervisor.daemon` 为独立进程入口。
+  - `process_control.py`：`ProcessController` 启动/停止/存活判定，`processes.json` 是唯一所有权凭据（未登记 pid 拒绝操作）。
+  - `health_http.py`：运行中进程的 HTTP 健康探测（不走代理）。
+  - `control.py`：控制面文件协议（原子写、事件 JSONL、`supervisor.lock`/`switch.lock`、幂等结果查询）。
+  - `client.py`：应用侧客户端（提交请求即返回；切换会重启当前进程，不能同步等待）。
+  - 设计说明见 `docs/architecture/supervisor_进程托管.md`。
 - `context/run_context.py`：运行上下文；`storage/object_store.py`：对象/工件存储；`web/client.py`：Web 检索 HTTP 客户端（SSRF/重定向/大小限制）
 - `prompts/`：LLM prompt 模板（`manifest.toml` + 16 个 md），`main.py::validate_prompt_catalog` 启动校验
 

@@ -20,7 +20,7 @@ completed（离线自进化安全门已实现并落地到 promote 晋升流程�
 
 ## Not Implemented（V35+ 候选，按优先级）
 - P1 model_router / cost & latency 记录 + 上下文装配统一评分
-- P2 supervisor 真正托管进程（spawn/stop/restart + 端口切换 + slot_switch_events）
+- ~~P2 supervisor 真正托管进程~~（V37 已完成：spawn/stop/restart + 端口切换 + 事件流）
 - 其他：PG 并发契约测试、MaintenanceReport 页面、npm install --ignore-scripts
 
 ## Observable Result
@@ -114,3 +114,42 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - 新增 `tests/unit/backend/test_local_shell.py` 30 例全通过（真实 bash 执行、超时清理、截断、
   环境隔离、bash 缺失不回退、分级策略、路径越界与动态路径降级、任务内直接执行与审批/路径拦截）。
 - 本机实测 shell：GNU bash 5.2.26（Git Bash）。
+
+## V37 Supervisor 进程托管（完成）
+
+### Implemented
+- `supervisor/control.py`：控制面文件协议——`state.json`、`events.jsonl`、`requests/`、`results/`、
+  `processes.json`；原子写（临时文件 + fsync + `os.replace`）、`FileLock`（O_EXCL + pid 存活/超时判定）、
+  幂等结果回查。`pid_alive` 在 Windows 用 OpenProcess/GetExitCodeProcess，避免 `os.kill(pid,0)` 被当成杀进程。
+- `supervisor/process_control.py`：`ProcessController` 启动/停止/存活/回收；`processes.json` 为唯一所有权凭据，
+  未登记 pid 拒绝操作；启动命令来自配置模板（占位符 `{python} {host} {port} {slot} {slot_root} {app_module}`）；
+  POSIX 进程组 SIGTERM→SIGKILL，Windows 自有子进程 TerminateProcess 快路径、接管进程 `taskkill /T /F`。
+- `supervisor/health_http.py`：运行中进程的 `/health` 探测（stdlib、不走代理），支持等待与超时。
+- `supervisor/daemon.py`：`Supervisor`（recover/tick/run_forever）——暂存端口验证候选、停旧启新、
+  观察窗监测、异常退出重启预算、预算耗尽回滚、`degraded` 兜底、中断切换恢复、存活进程接管与指针收敛；
+  `python -m aiive.supervisor.daemon [--status|--once]` 为独立进程入口，单实例锁 + 切换锁。
+- `supervisor/client.py`：应用侧客户端（提交即返回、状态查询），`supervisor_client_from_settings` 受
+  `AIIVE_SUPERVISOR_ENABLED` 控制。
+- `supervisor/release_manager.py`：新增 `client` 注入——启用 Supervisor 时闸门通过后只提交请求并返回
+  `status=switch_requested`（不自行切指针）；`monitor_once` 在托管模式返回 `supervised`，避免双头监测。
+- `api/routes_selfdev.py`：新增只读 `GET /api/selfdev/supervisor`；promote/rollback 走托管客户端并把
+  请求态记为 `promote_requested`/`rollback_requested`。`worker/scheduler_daemon.py` 同步注入客户端。
+- `config.py`：新增 `supervisor_*` 配置组（enabled/host/port/health_path/app_module/app_command/超时/轮询/
+  重启预算/观察窗/状态目录）。
+- `main.py`：新增 `AIIVE_PROCESS_ROLE=candidate` 分支——候选进程只加载应用与 `/health`，
+  跳过迁移、调度器、Outbox 与 MCP 注册，避免与在运行的旧版本并发迁移或重复跑周期任务。
+
+### 晋升顺序（失败即回滚并验证）
+1. 应用侧静态健康 + `evaluate_promotion_gate`（契约 + Replay Eval + 候选评测，fail-closed）；
+2. 提交请求（`gate_ok=true`），守护进程拒绝无该标记的请求；
+3. 暂存端口启动候选 → HTTP 健康；进程提前退出判 `candidate_start_failed`；
+4. 停旧进程 → 主端口启动候选 → 再次健康；
+5. 通过后才写 `active_slot` + `state.json` + `release_state.json`（观察窗）；
+6. 任一环节失败 → 停候选、重启旧槽位、**验证旧版本健康**，指针保持旧值。
+
+### Observable Result
+- 新增 `tests/unit/backend/test_supervisor_lifecycle.py` 16 例全通过（真实本地子进程）：
+  启停与所有权、晋升成功（pid 变化/状态一致/事件完整）、候选启动失败、暂存健康失败、
+  主端口健康失败回滚并 `verified=true`、观察窗内异常退出自动回滚、无 `gate_ok` 拒绝、
+  幂等去重、并发切换拒绝、Supervisor 重启接管、中断切换恢复、manifest 数据隔离。
+- 设计说明：`docs/architecture/supervisor_进程托管.md`。

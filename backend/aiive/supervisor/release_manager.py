@@ -10,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from aiive.eval.gate import SafetyGate, evaluate_promotion_gate
+from aiive.supervisor.client import SupervisorClient
 from aiive.supervisor.health_probe import HealthProbe
 from aiive.supervisor.slot_manager import ACTIVE_SLOT_FILE, SlotManager
 
@@ -37,6 +38,7 @@ class ReleaseManager:
         state_file: Path | None = None,
         monitor_seconds: int = 600,
         gate: SafetyGate | None = None,
+        client: SupervisorClient | None = None,
     ) -> None:
         self._manager: SlotManager = manager or SlotManager()
         self._probe: HealthProbe = probe or HealthProbe()
@@ -44,6 +46,9 @@ class ReleaseManager:
         self._monitor_seconds: int = max(60, monitor_seconds)
         # 闸门可注入（测试替身）；默认构造真实 SafetyGate。
         self._gate: SafetyGate = gate or SafetyGate()
+        # 进程托管客户端：非 None 且守护进程存活时，切换交给 Supervisor 执行；
+        # None 表示未启用 Supervisor（例如 docker compose 由容器编排负责重启）。
+        self._client: SupervisorClient | None = client
 
     def promote(self, run_gate: bool = True) -> dict[str, Any]:
         with _release_lock:
@@ -75,6 +80,37 @@ class ReleaseManager:
                         "error": "Safety gate failed: promote blocked",
                         "gate": gate_result.to_summary(),
                     }
+            # Supervisor 托管：真正启动候选进程并验证，切换由守护进程完成。
+            # 本进程随后会被替换，因此只提交请求并返回 accepted，不等待结果。
+            if self._client is not None and self._client.available():
+                accepted = self._client.submit(
+                    "promote",
+                    {"target": current, "gate_ok": bool(run_gate)},
+                    idempotency_key=str(uuid4()),
+                )
+                if not accepted.get("ok"):
+                    return {
+                        "ok": False,
+                        "error": accepted.get("error", "supervisor_submit_failed"),
+                        "previous_active": previous,
+                    }
+                self._write_state({
+                    "release_id": str(uuid4()),
+                    "status": "switch_requested",
+                    "request_id": accepted.get("request_id", ""),
+                    "previous_active": previous,
+                    "active_slot": previous,
+                    "target_slot": current,
+                    "requested_at": _now().isoformat(),
+                })
+                return {
+                    "ok": True,
+                    "status": "switch_requested",
+                    "request_id": accepted.get("request_id", ""),
+                    "previous_active": previous,
+                    "new_active": current,
+                }
+
             self._manager.set_active_slot(current)
             result = {"ok": True, "previous_active": previous, "new_active": current}
             now = _now()
@@ -106,6 +142,9 @@ class ReleaseManager:
     def monitor_once(self) -> dict[str, Any]:
         with _release_lock:
             state = self.read_state()
+            if self._client is not None and self._client.available():
+                # 守护进程负责进程级健康监测与自动回滚，应用侧不得重复干预。
+                return {"ok": True, "action": "supervised", "state": state}
             if state.get("status") != "monitoring":
                 return {"ok": True, "action": "noop", "state": state}
             current = str(state.get("active_slot") or "")
@@ -154,6 +193,24 @@ class ReleaseManager:
             state = self.read_state()
             current = self._manager.get_active_slot()
             previous = str(state.get("previous_active") or ("B" if current == "A" else "A"))
+            if self._client is not None and self._client.available():
+                accepted = self._client.submit(
+                    "rollback", {"target": previous}, idempotency_key=str(uuid4()),
+                )
+                if not accepted.get("ok"):
+                    return {"ok": False, "error": accepted.get("error", "supervisor_submit_failed")}
+                state.update({
+                    "status": "switch_requested",
+                    "request_id": accepted.get("request_id", ""),
+                    "requested_at": _now().isoformat(),
+                })
+                self._write_state(state)
+                return {
+                    "ok": True,
+                    "status": "switch_requested",
+                    "request_id": accepted.get("request_id", ""),
+                    "rolled_back_to": previous,
+                }
             result = self._rollback_to(previous)
             state.update({
                 "status": "rolled_back" if result.get("ok") else "rollback_failed",

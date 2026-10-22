@@ -238,9 +238,11 @@ def _agent_task_scanner_job() -> None:
 def _release_monitor_job() -> None:
     """对刚切换的 Candidate 运行观察窗健康检查，异常时自动回滚。"""
     try:
+        from aiive.supervisor.client import supervisor_client_from_settings
         from aiive.supervisor.release_manager import ReleaseManager
 
-        ReleaseManager().monitor_once()
+        # 启用 Supervisor 时由守护进程做进程级监测，应用侧 monitor_once 只返回 supervised。
+        ReleaseManager(client=supervisor_client_from_settings()).monitor_once()
     except Exception:
         logger.exception("Release health monitor 异常")
 

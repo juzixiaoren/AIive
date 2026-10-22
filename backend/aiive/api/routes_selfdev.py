@@ -52,6 +52,17 @@ def list_slots():
     return launcher.get_status()
 
 
+@router.get("/supervisor")
+def supervisor_status():
+    """Supervisor 托管状态：守护进程是否存活、当前阶段、受管进程与最近事件。
+
+    只读接口；进程控制只能由 Supervisor 守护进程执行，API 不提供直接启动/杀进程能力。
+    """
+    from aiive.supervisor.client import SupervisorClient
+
+    return SupervisorClient().status(events=20)
+
+
 @router.post("/slots/health-check", operation_id="check_selfdev_slot_health")
 def check_slot_health():
     """对当前槽位进行健康检查
@@ -275,12 +286,17 @@ def promote(
             "targeted_test_report": test_report,
         }
 
+    from aiive.supervisor.client import supervisor_client_from_settings
     from aiive.supervisor.release_manager import ReleaseManager
 
     # Trusted Core promotion 永远运行健康检查并进入自动回滚观察窗。
-    result = ReleaseManager().promote()
+    # 启用 Supervisor 时，切换由守护进程执行（本进程随后会被替换）。
+    result = ReleaseManager(client=supervisor_client_from_settings()).promote()
 
-    sreq.status = "promoted" if result["ok"] else "promote_failed"
+    if result.get("status") == "switch_requested":
+        sreq.status = "promote_requested"
+    else:
+        sreq.status = "promoted" if result["ok"] else "promote_failed"
     db.commit()
 
     return result
@@ -305,11 +321,15 @@ def rollback(
     if not sreq:
         raise HTTPException(status_code=404, detail="请求不存在")
 
+    from aiive.supervisor.client import supervisor_client_from_settings
     from aiive.supervisor.release_manager import ReleaseManager
 
-    result = ReleaseManager().rollback()
+    result = ReleaseManager(client=supervisor_client_from_settings()).rollback()
 
-    sreq.status = "rolled_back" if result["ok"] else "rollback_failed"
+    if result.get("status") == "switch_requested":
+        sreq.status = "rollback_requested"
+    else:
+        sreq.status = "rolled_back" if result["ok"] else "rollback_failed"
     db.commit()
 
     return result
