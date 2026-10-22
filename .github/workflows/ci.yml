@@ -183,7 +183,12 @@ jobs:
             fi
             sleep 3
           done
-          echo "backend 未就绪"; docker compose logs --tail=100 backend; exit 1
+          echo "backend 未就绪"
+          docker compose ps -a
+          docker compose logs --tail=200 backend
+          # 日志在无权限时不可见；把尾部日志写进 annotation（公开可读）便于定位
+          echo "::error title=backend-startup::$(docker compose logs --tail=60 backend 2>&1 | tr '\n' ' ' | tr -s ' ' | cut -c1-3000)"
+          exit 1
       - name: 确认迁移到 head
         # 幂等校验：应用已迁移完毕，这里只确认 alembic 版本与 head 一致。
         run: docker compose exec -T backend alembic upgrade head
