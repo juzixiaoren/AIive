@@ -685,3 +685,15 @@ api/routes_agent_tasks.py 创建任务 → task_runtime/repository.py::create_ta
 回滚（rollback）是紧急逃生通道，刻意不设闸门。只读查询路由见 `api/routes_eval.py`（`GET /api/eval/runs`、`GET /api/eval/runs/latest`，`require_local_developer` 守卫）。
 
 **测试**：`tests/unit/backend/test_eval_contracts.py`（5 契约正负例 + multi 基数合法重复）、`test_eval_replay.py`（24 场景全过 + 隔离稳定 + 损坏场景 fail-closed + 未授权工具拒绝）、`test_eval_gate.py`（干净系统通过 / 契约违规阻断 / warning 级不阻断 / 候选子进程失败阻断 / 候选缺 eval 包阻断 / promote 被阻断 / 通过后 proceed）、`test_eval_persistence.py`（落盘读取往返 + 目录解析）、`test_release_manager.py`（观察窗回滚 + 生产入口闸门阻断/放行/显式跳过）。
+
+### 3.y PostgreSQL 核心契约测试（`tests/integration/pg/`）
+
+> 在真实 PostgreSQL 上验证 SQLite 无法覆盖的事务/锁/并发语义。默认快速测试跳过（`pg` marker），
+> 设置 `AIIVE_PG_TESTS=1` 后运行；CI 有独立 Job `postgres-contract`。
+
+| 文件 | 职责 / 关键符号 |
+|---|---|
+| `tests/integration/pg/conftest.py` | `pg_url`（Docker `pgvector/pgvector:pg16` 一次性容器或 `AIIVE_PG_TEST_URL`）、`pg_engine`（`CREATE EXTENSION vector` + `create_all`）、`pg_sessionmaker`、`_route_sessionlocal`（把生产 `SessionLocal()` 重定向到 PG，复用 `tests/support.py` 分发器）、`_clean_pg`（每用例全表 TRUNCATE） |
+| `tests/integration/pg/test_pg_contracts.py` | 8 个契约用例：PG 自检、advisory lock 真实持有、同键并发写只留 1 条 active、并发 claim 不重复、SKIP LOCKED 跳过锁定行不阻塞、forget cascade 异常回滚无半状态、forget deadletter 三表原子一致、写入回滚无记忆/投影残留 |
+
+**被测实现（只读复用，未改动）**：`memory/memory_write_service.py::_acquire_lock`（`pg_advisory_xact_lock`）、`worker/outbox_worker.py::claim_one`（`with_for_update(skip_locked=True)`）、`worker/handlers_forget.py`（cascade 事务边界）、`worker/outbox_worker.py::_deadletter_forget_stage`（deadletter 原子更新）。

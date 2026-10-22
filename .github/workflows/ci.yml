@@ -157,6 +157,41 @@ jobs:
             echo "tests/integration 暂无可收集测试，跳过"
           fi
 
+  postgres-contract:
+    name: PostgreSQL 核心契约测试（事务/锁/幂等/并发）
+    runs-on: ubuntu-latest
+    # 独立 PG 服务：验证 advisory lock、SKIP LOCKED、FOR UPDATE、deadletter 原子性等
+    # 无法在 SQLite 上验证的语义。默认 pytest 会跳过该目录，本 Job 显式启用。
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: aiive
+          POSTGRES_PASSWORD: aiive_dev
+          POSTGRES_DB: aiive
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aiive -d aiive"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      AIIVE_PG_TESTS: "1"
+      AIIVE_PG_TEST_URL: postgresql+psycopg://aiive:aiive_dev@localhost:5432/aiive
+      AIIVE_MEMORY_VECTOR_ENABLED: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: 运行 PostgreSQL 契约测试
+        run: pytest tests/integration/pg -v
+
   docker-smoke:
     name: Docker Compose 冒烟测试
     runs-on: ubuntu-latest

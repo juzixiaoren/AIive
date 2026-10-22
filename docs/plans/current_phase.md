@@ -43,3 +43,22 @@ completed（离线自进化安全门已实现并落地到 promote 晋升流程�
 
 ## Next Phase
 project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 supervisor 真实托管进程（P2）。
+
+---
+
+## V34.1 PostgreSQL 核心契约测试（完成）
+
+### Implemented
+- 新增 `tests/integration/pg/`：8 个真实 PostgreSQL 契约用例 + 隔离夹具（Docker 一次性
+  `pgvector/pgvector:pg16` 或 `AIIVE_PG_TEST_URL`，每用例全表 TRUNCATE）。
+- 覆盖：并发同键写入只留 1 条 active（advisory lock 真实持有）、并发 claim 不重复（SKIP LOCKED）、
+  SKIP LOCKED 跳过锁定行不阻塞、forget cascade 异常回滚无半状态、forget deadletter 三表原子一致、
+  写入回滚无记忆/投影残留。
+- `pg` marker 注册；默认未启用时收集阶段 skip（0.09s，不启动容器）。
+- CI 新增独立 Job `postgres-contract`（pgvector service + `AIIVE_PG_TESTS=1`）。
+
+### Observable Result
+- PG 专项：8 passed（连续 3 次稳定，16–18s/次）。
+- 默认全量：884 passed, 8 skipped, 0 failed（116.66s）。
+- 未发现产品 Bug；修正两处测试自身构建问题（非法 memory_type、FK 插入顺序）。
+- 详见 `docs/audit/pg_contract_tests_report.md`。

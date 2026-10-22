@@ -57,6 +57,7 @@ markers = [
     "integration: 本地集成测试（真实本地组件组合）",
     "flow: 关键流程测试（跨模块链路，外部边界离线模拟）",
     "slow: 执行耗时较长的用例",
+    "pg: PostgreSQL 专项契约测试（需 AIIVE_PG_TESTS=1 与 PG 环境；默认跳过）",
 ]
 
 [tool.setuptools.packages.find]
