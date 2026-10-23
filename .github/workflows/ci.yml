@@ -28,7 +28,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
       - name: 运行单元与关键流程测试
-        run: pytest tests/unit tests/flow -v
+        # tee 保留完整输出，失败时由下一步转成 ::error:: 注解（job 日志需仓库权限）。
+        run: pytest tests/unit tests/flow -v 2>&1 | tee /tmp/pytest.log
+      - name: 失败摘要（pytest）
+        if: failure()
+        run: |
+          { grep -E '^(FAILED|ERROR) ' /tmp/pytest.log || true
+            grep -E '^E  ' /tmp/pytest.log || true
+            tail -10 /tmp/pytest.log || true
+          } | awk '!seen[$0]++' | head -10 | while read -r line; do
+            echo "::error::${line}"
+          done
 
   single-file:
     name: 单文件隔离运行（顺序依赖防线）
@@ -47,7 +57,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
       - name: 逐文件单独运行
-        run: bash scripts/check_single_file_tests.sh
+        run: bash scripts/check_single_file_tests.sh 2>&1 | tee /tmp/single_file.log
+      - name: 失败摘要（单文件）
+        if: failure()
+        run: |
+          { grep -E '^(FAIL|--- )' /tmp/single_file.log || true
+            tail -15 /tmp/single_file.log || true
+          } | awk '!seen[$0]++' | head -10 | while read -r line; do
+            echo "::error::${line}"
+          done
 
   ruff:
     name: 静态检查（ruff）
