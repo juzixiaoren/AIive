@@ -20,7 +20,7 @@ completed（离线自进化安全门已实现并落地到 promote 晋升流程�
 
 ## Not Implemented（V35+ 候选，按优先级）
 - P1 model_router / cost & latency 记录 + 上下文装配统一评分
-- ~~P2 supervisor 真正托管进程~~（V37 已完成：spawn/stop/restart + 端口切换 + 事件流）
+- `P2 supervisor 真正托管进程`（V37 已完成：spawn/stop/restart + 端口切换 + 事件流）
 - 其他：PG 并发契约测试、MaintenanceReport 页面、npm install --ignore-scripts
 
 ## Observable Result
@@ -153,3 +153,43 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
   主端口健康失败回滚并 `verified=true`、观察窗内异常退出自动回滚、无 `gate_ok` 拒绝、
   幂等去重、并发切换拒绝、Supervisor 重启接管、中断切换恢复、manifest 数据隔离。
 - 设计说明：`docs/architecture/supervisor_进程托管.md`。
+
+## V38 能力生命周期闭环（完成）
+
+### Implemented
+- `capability/states.py`：`CapabilityState` 六态（candidate/sandbox/needs_review/verified/
+  active/disabled）+ `LIFECYCLE_TRANSITIONS` 唯一转换表；`ensure_transition` 对非法转换抛
+  `InvalidCapabilityTransition`（candidate→active、active→verified 等均被拒绝）。
+- `capability/lifecycle.py`：`CapabilityLifecycleService` 提供 status/verify/probe/enable/
+  disable/upgrade/rollback/uninstall/audit/reconcile。四个事实（installed_at/verified_at/
+  registered_at/enabled_at）分开记录在 `definition["lifecycle"]`，历史有界 20 条。
+- 启用：校验 launch 与沙箱产物 → 校验 `verified_fingerprint`（验证后改定义必须重验）→
+  真实注册 → 才置 active；注册失败状态不变。停用：按 `registered_tools` + 缓存工具列表
+  精确反注册、关闭 MCP 会话、保留 launch/trust/risk 等用户配置。
+- 升级：新版本装到 `<sandbox>/<name>@<version>`，用 `#staging` 独立会话验证；验证失败只删
+  staging 目录、旧定义与注册不变；切换失败恢复旧定义/旧 `descriptor_hash`/旧状态并重新注册。
+  回滚：从 `capability_versions.definition_snapshot` 恢复定义、注册与状态，而非只改版本号。
+- 卸载：仅 `mcp:` 能力可卸载；未终结 Action / Task 引用时返回 `capability_in_use`（`force` 才继续）；
+  清理注册、会话、安装记录、版本记录、能力行与专属沙箱目录；目录必须在 `SANDBOX_ROOT` 下且
+  名字等于 `sanitize(name)` 或 `sanitize(name)@*`，越界目录只告警跳过。
+- 一致性：`audit()` 报告 active_not_registered / inactive_still_registered /
+  missing_artifacts / orphan_registration / version_mismatch；`reconcile()` 只修注册索引与
+  故障态，不动文件、不删记录。
+- `control/capability_broker.py`：停用能力的在途 Action 派发返回 `capability_disabled`
+  （与 `unknown_tool` 区分）。
+- `mcp/installer.py`：抽出 `install_to_dir`（支持版本化目录）、`run_smoke(auto_activate=False)`
+  只推进到 verified；`mcp/bootstrap.py` 新增 `registered_tool_ids` /
+  `unregister_capability_tools` 作为发现索引同步的唯一入口。
+- `api/routes_capabilities.py`：新增 `/api/capabilities/lifecycle/*` 九个端点；activate 链路改为
+  probe(→verified) + enable(→active)，不再把验证当启用。
+- DB：`capability_versions` 新增 source/state/sandbox_path/definition_snapshot 四列（迁移
+  `b4d7c1e9a2f5`，全部可空，无需回填）。
+- 文档：`docs/architecture/capability_生命周期.md`；CODE_MAP §2.4/§3.1/§3.7/§5 同步。
+
+### Observable Result
+- 新增 `tests/unit/backend/test_capability_lifecycle.py` 29 例全通过（全离线）：
+  状态机合法性、安装≠验证≠注册≠启用、验证不启用、启用需验证、定义变更需重验、
+  停用后从发现索引消失且保留配置、停用/启用/升级/卸载幂等、停用后 dispatch 返回
+  `capability_disabled`、同能力写操作串行、升级成功/验证失败/注册失败回滚、
+  回滚恢复定义与注册、卸载清理范围与越界保护、在途 Action 拒绝与 force、
+  审计与 reconcile、历史有界。

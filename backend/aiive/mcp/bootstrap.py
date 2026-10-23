@@ -192,6 +192,54 @@ def register_capability_tools(
     return registered
 
 
+def capability_tool_ids(capability_name: str, tools: list[dict[str, Any]]) -> list[str]:
+    """把能力的真实工具列表换算成 ToolRegistry 中的 capability_id 列表。"""
+    ids: list[str] = []
+    for tool in tools:
+        name = str(tool.get("name", "")).strip()
+        if not name:
+            continue
+        tool_id = mcp_tool_capability_id(capability_name, name)
+        if tool_id not in ids:
+            ids.append(tool_id)
+    return ids
+
+
+def registered_tool_ids(cap: Any) -> list[str]:
+    """能力当前应注册的全部工具 id（缓存工具列表 + 实际注册记录）。
+
+    只认这两处显式来源，绝不按前缀猜测：能力名互为前缀时（server-memory 与
+    server-memory-extra）前缀清扫会误删别家工具。
+    """
+    definition = dict(cap.definition or {})
+    tools = definition.get("tools")
+    ids = capability_tool_ids(
+        str(cap.name), tools if isinstance(tools, list) else [],
+    )
+    lifecycle = definition.get("lifecycle")
+    recorded = lifecycle.get("registered_tools") if isinstance(lifecycle, dict) else None
+    for tool_id in recorded or []:
+        if isinstance(tool_id, str) and tool_id not in ids:
+            ids.append(tool_id)
+    return ids
+
+
+def unregister_capability_tools(registry: Any, cap: Any) -> list[str]:
+    """把能力已注册的工具从 ToolRegistry 移除（发现索引同步的唯一入口）。
+
+    返回实际移除的 id 列表；对未注册的 id 静默跳过，保证重复调用幂等。
+    """
+    removed: list[str] = []
+    for tool_id in registered_tool_ids(cap):
+        if registry.unregister(tool_id):
+            removed.append(tool_id)
+    if removed:
+        logger.info(
+            "MCP 能力已从 ToolRegistry 移除: %s tools=%s", cap.capability_id, removed,
+        )
+    return removed
+
+
 def activate_capability_tools(registry: Any, cap: Any) -> dict[str, Any]:
     """为一个 state=active 的 Capability（DB 行）完成运行时配置 + 注册。
 

@@ -122,6 +122,7 @@
 | MCP 风险评估与计划 | `mcp/capability_planner.py` | `api/routes_capabilities.py` | `test_capability_planner*.py` |
 | MCP 沙箱安装 / 冒烟 | `mcp/installer.py` | `api/routes_mcp_install.py`、`.data/mcp_sandbox/` | `test_mcp_install*.py` |
 | MCP 运行时桥接（stdio） | `mcp/runtime_client.py`、`mcp/bootstrap.py` | `tools/registry.py::register` | `test_mcp_bootstrap*.py` |
+| 能力生命周期（验证/启用/停用/升级/回滚/卸载） | `capability/lifecycle.py::CapabilityLifecycleService` L143、`capability/states.py::CapabilityState` L22 | `mcp/bootstrap.py::registered_tool_ids` L208 / `unregister_capability_tools` L227、`mcp/installer.py::install_to_dir` L169、`api/routes_capabilities.py::/lifecycle/*` L255-329 | `test_capability_lifecycle.py` |
 | 内置 MCP（aiive-essentials） | `mcp/builtin.py`、`mcp/builtin_server.py` | `main.py` lifespan | `test_mcp_builtin*.py` |
 | 内置 Skill catalog | `skills/catalog.py` + `skills/builtin/*/SKILL.md` | `api/routes_skills.py`、`task_runtime/tools.py` | `test_skills*.py` |
 | 自进化：补丁计划 | `selfdev/planner.py`、`selfdev/trusted_core.py` | `api/routes_selfdev.py` | `test_selfdev*.py` |
@@ -182,7 +183,7 @@
 | `routes_tools.py` | `/api/tools`、`/tool-operations/{id}`、`POST /tools/safe-delete` |
 | `routes_agent_tasks.py` | `/api/agent-tasks` 增删查改 + `WS /ws/{task_id}` |
 | `routes_approval.py` | `POST /api/approval/respond` |
-| `routes_capabilities.py` | `/api/capabilities/plan-from-goal`、`/{plan_id}/activate` |
+| `routes_capabilities.py` | `/api/capabilities/plan-from-goal`、`/{plan_id}/activate`；生命周期 `/lifecycle/audit`、`/lifecycle/audit/reconcile`、`/lifecycle/{id}`（status）、`/{id}/verify|enable|disable|upgrade|rollback`、`DELETE /lifecycle/{id}` |
 | `routes_mcp.py` / `routes_mcp_install.py` | `/api/mcp/search`、`/capabilities`；`/{name}/install-sandbox`、`/{id}/smoke` |
 | `routes_skills.py` | `/api/skills`、`/{skill_id}`（catalog + ready/degraded 对照） |
 | `routes_selfdev.py` | `/api/selfdev/slots`、`/plan`、`/{id}/apply-inactive|promote|rollback` |
@@ -300,7 +301,8 @@
 ### 3.7 `skills/` 与 `mcp/` 与 `selfdev/`
 
 - `skills/catalog.py`：`SkillDefinition` L10（`as_dict(include_instructions=False)` L23）；`_DEFINITIONS` L35-92（4 个：document_processing/web_research/knowledge_base/mcp_management）；`list_skills()` L100、`get_skill()` L108；指令文本在 `skills/builtin/<id>/SKILL.md`。被 `task_runtime/tools.py:43`、`task_runtime/context_assembler.py:111`、`api/routes_skills.py` 使用。
-- `mcp/`：`discovery.py`（`_BUILTIN_CATALOG` L61-110、`search_mcp_candidates` L113、`allowed_npm_packages` L193）；`capability_planner.py`（`plan_from_goal` L118、`_compute_risk` L170）；`installer.py`（`SANDBOX_ROOT` L39=`<repo>/.data/mcp_sandbox`、`install_sandbox` L165、`run_smoke` L315）；`runtime_client.py`（`MCPRuntimeClient` L361、每能力长驻 `_SessionWorker`、`get_runtime_client` L534）；`bootstrap.py`（`register_capability_tools` L121 untrusted 包装、`restore_active_capabilities` L235 启动恢复）；`builtin.py`（`ensure_builtin_mcp_capability` L83、`BUILTIN_MCP_TOOLS` L17-57）；`builtin_server.py`（FastMCP stdio server，3 工具）。
+- `mcp/`：`discovery.py`（`_BUILTIN_CATALOG` L61-110、`search_mcp_candidates` L113、`allowed_npm_packages` L193）；`capability_planner.py`（`plan_from_goal` L118、`_compute_risk` L170）；`installer.py`（`SANDBOX_ROOT` L39=`<repo>/.data/mcp_sandbox`、`install_to_dir` L169（装到指定/版本化目录，供升级）、`install_sandbox` L253、`run_smoke` L375（`auto_activate=False` 只到 verified））；`runtime_client.py`（`MCPRuntimeClient` L361、每能力长驻 `_SessionWorker`、`get_runtime_client` L534）；`bootstrap.py`（`register_capability_tools` L121 untrusted 包装、`capability_tool_ids` L195、`registered_tool_ids` L208、`unregister_capability_tools` L227、`activate_capability_tools` L243、`restore_active_capabilities` L283 启动恢复）；`builtin.py`（`ensure_builtin_mcp_capability` L83、`BUILTIN_MCP_TOOLS` L17-57）；`builtin_server.py`（FastMCP stdio server，3 工具）。
+- `capability/`：`states.py`（`CapabilityState` L22、`LIFECYCLE_TRANSITIONS`、`ensure_transition`——非法转换抛 `InvalidCapabilityTransition`）；`lifecycle.py`（`CapabilityLifecycleService` L143：`status/verify/probe/enable/disable/upgrade/rollback/uninstall/audit/reconcile`，进程内 `_capability_lock` L75 + DB `FOR UPDATE`，生命周期元数据写 `definition["lifecycle"]`，历史有界 20 条）。
 - `selfdev/`：`trusted_core.py`（`TRUSTED_CORE_PREFIXES` L9-23，13 条受保护路径，fail-closed）；`planner.py`（LLM 生成 patch plan+逐条校验）；`patch_executor.py`（`apply_to_inactive`：复制活跃槽位基线→应用）；`targeted_test_runner.py`（按变更文件前缀匹配测试，frontend 变更跑 `npm run build`）；`promote_rollback.py`（health check + 安全门后切活跃槽位指针；与 `release_manager.promote` 共用 `evaluate_promotion_gate`，无生产调用方）。
 
 ### 3.8 `worker/` — Outbox 事务队列 + 调度守护
@@ -423,7 +425,7 @@
 | 知识库 | `documents`、`chunks`、`retrieval_runs`、`retrieval_candidates` | 文档/分块/检索运行/候选 |
 | 遗忘 Saga | `forget_operations`、`forget_selector_manifests`、`forget_shields`、`forget_targets`、`forget_dependencies`、`forget_batches`、`forget_actions`、`forget_tombstones`、`forget_stage_runs`、`content_provenance_refs` | Phase 6A 遗忘全家桶 |
 | 保留治理 | `retention_cleanup_runs`、`retention_cleanup_batches` | Phase 6B |
-| 能力/MCP | `capabilities`、`capability_versions`、`mcp_install_records`、`capability_plans` | |
+| 能力/MCP | `capabilities`、`capability_versions`（含 `source`/`state`/`sandbox_path`/`definition_snapshot` 生命周期列）、`mcp_install_records`、`capability_plans` | |
 | 自进化 | `selfdev_requests`、`patch_operations` | |
 | 桌面节点 | `desktop_nodes`、`thread_desktop_bindings`、`desktop_action_receipts` | |
 | 审批 | `approval_requests` | 工具调用人工审批 |

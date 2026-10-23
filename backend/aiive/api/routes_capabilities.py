@@ -1,4 +1,4 @@
-"""MCP 能力自举 API：从目标生成安装计划、端到端激活能力。
+"""MCP 能力自举与生命周期 API。
 
 激活链路（真实执行）：
 计划(evaluated) → npm 沙箱安装 → stdio 子进程启动 + tools/list 冒烟 →
@@ -13,9 +13,10 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from aiive.capability.lifecycle import CapabilityLifecycleService
 from aiive.core.llm_client import default_llm_client
 from aiive.db.base import get_db
-from aiive.db.models import Capability, CapabilityPlan, MCPInstallRecord
+from aiive.db.models import Capability, CapabilityPlan
 from aiive.mcp.capability_planner import CapabilityPlanner
 
 logger = logging.getLogger(__name__)
@@ -174,8 +175,10 @@ def activate_capability(plan_id: str, db: Session = Depends(get_db)):
     cap.definition = definition
 
     # 2) 真实冒烟（尚未 active 时）：启动 stdio 子进程 → tools/list
+    #    验证只推进到 verified，不把"验证通过"当成"已启用"。
+    lifecycle = CapabilityLifecycleService(db)
     if cap.state != "active":
-        smoke = _real_smoke(db, cap)
+        smoke = lifecycle.probe(cap)
         plan.smoke_result = {k: v for k, v in smoke.items() if k != "tools"}
         if not smoke.get("ok"):
             return _fail(
@@ -184,13 +187,11 @@ def activate_capability(plan_id: str, db: Session = Depends(get_db)):
             )
         db.commit()
 
-    # 3) 注册进 ToolRegistry（Agent 即刻可调用）
-    from aiive.mcp.bootstrap import activate_capability_tools
-    from aiive.tools.registry import get_tool_registry
-
-    activation = activate_capability_tools(get_tool_registry(), cap)
-    if not activation.get("ok"):
-        return _fail(f"tool registration failed: {activation.get('error')}")
+    # 3) 注册进 ToolRegistry 并正式启用（Agent 即刻可调用）
+    enabled = lifecycle.enable(cap.capability_id)
+    if not enabled.get("ok"):
+        return _fail(f"tool registration failed: {enabled.get('error')}")
+    registered = [str(item) for item in enabled["details"].get("registered", [])]
 
     plan.status = "activated"
     plan.capability_id = cap.capability_id
@@ -199,7 +200,7 @@ def activate_capability(plan_id: str, db: Session = Depends(get_db)):
         ok=True,
         capability_id=cap.capability_id,
         smoke_result=plan.smoke_result,
-        registered_tools=list(activation.get("registered", [])),
+        registered_tools=registered,
     )
 
 
@@ -214,51 +215,116 @@ def _risk_verdict_for(plan: CapabilityPlan, candidate_name: str) -> str:
     return "medium"
 
 
-def _real_smoke(db: Session, cap: Capability) -> dict[str, Any]:
-    """对能力做真实 tools/list 冒烟，并通过 installer.run_smoke 推进状态机。
+class LifecycleRequest(BaseModel):
+    """生命周期操作的请求体（升级可覆盖版本与启动参数，回滚可指定目标版本）。"""
 
-    返回冒烟结果字典（含 ok / real_tools / error；tools 键携带完整工具
-    定义用于缓存，不落入 smoke 记录）。
-    """
-    from aiive.mcp.installer import run_smoke
-    from aiive.mcp.runtime_client import build_launch_spec, get_runtime_client
+    target_version: str = ""
+    launch_args: list[str] | None = None
+    env_keys: list[str] | None = None
+    force: bool = False
 
-    launch = (cap.definition or {}).get("launch")
-    if not isinstance(launch, dict):
-        return {"ok": False, "mode": "tools_list", "error": "missing launch config"}
 
-    install = (
-        db.query(MCPInstallRecord)
-        .filter(MCPInstallRecord.capability_id == cap.id)
-        .order_by(MCPInstallRecord.created_at.desc())
-        .first()
+class LifecycleResponse(BaseModel):
+    """生命周期操作结果：ok 与 error_type 区分"做成了"和"为什么没做成"。"""
+
+    ok: bool
+    capability_id: str = ""
+    action: str = ""
+    state: str = ""
+    error: str = ""
+    error_type: str = ""
+    changed: bool = False
+    details: dict[str, object] = {}
+
+
+def _lifecycle_response(result: dict[str, Any]) -> LifecycleResponse:
+    """把服务层结果转成响应模型（字段一一对应，不做语义改写）。"""
+    return LifecycleResponse(
+        ok=bool(result.get("ok")),
+        capability_id=str(result.get("capability_id", "")),
+        action=str(result.get("action", "")),
+        state=str(result.get("state", "")),
+        error=str(result.get("error", "")),
+        error_type=str(result.get("error_type", "")),
+        changed=bool(result.get("changed")),
+        details=dict(result.get("details") or {}),
     )
-    declared = set(install.declared_tools) if install else set()
 
-    client = get_runtime_client()
-    try:
-        client.configure(cap.capability_id, build_launch_spec(launch))
-        tools = client.list_tools(cap.capability_id)
-    except Exception as e:
-        logger.warning("MCP 激活冒烟失败: %s error=%s", cap.capability_id, e)
-        smoke: dict[str, Any] = {"ok": False, "mode": "tools_list", "error": str(e)}
-        run_smoke(db, cap.capability_id, smoke)
-        return smoke
 
-    real_names = [t["name"] for t in tools]
-    smoke = {
-        "ok": len(real_names) > 0,
-        "mode": "tools_list",
-        "real_tools": real_names,
-        "declared_missing": sorted(declared - set(real_names)),
-        "undeclared_extra": sorted(set(real_names) - declared),
-        "error": None if real_names else "server started but exposes no tools",
-    }
-    # 缓存真实工具定义，注册与重启恢复时复用
-    definition = dict(cap.definition or {})
-    definition["tools"] = tools
-    cap.definition = definition
+@router.get("/lifecycle/audit")
+def audit_capabilities(db: Session = Depends(get_db)):
+    """核对能力在数据库、注册表与文件系统之间的一致性。"""
+    return CapabilityLifecycleService(db).audit()
 
-    run_smoke(db, cap.capability_id, smoke)
-    smoke["tools"] = tools
-    return smoke
+
+@router.post("/lifecycle/audit/reconcile")
+def reconcile_capabilities(db: Session = Depends(get_db)):
+    """按核查结果修复注册索引漂移（不动文件、不删记录）。"""
+    return CapabilityLifecycleService(db).reconcile()
+
+
+@router.get("/lifecycle/{capability_id:path}")
+def capability_lifecycle_status(
+    capability_id: str, db: Session = Depends(get_db),
+):
+    """查询单个能力的生命周期状态（安装/验证/注册/启用四个事实分列）。"""
+    return _lifecycle_response(CapabilityLifecycleService(db).status(capability_id))
+
+
+@router.post("/lifecycle/{capability_id:path}/verify")
+def verify_capability(capability_id: str, db: Session = Depends(get_db)):
+    """重新验证能力：真实 tools/list 通过后进入 verified（未启用）。"""
+    return _lifecycle_response(CapabilityLifecycleService(db).verify(capability_id))
+
+
+@router.post("/lifecycle/{capability_id:path}/enable")
+def enable_capability(capability_id: str, db: Session = Depends(get_db)):
+    """启用能力：注册工具并进入 active。"""
+    return _lifecycle_response(CapabilityLifecycleService(db).enable(capability_id))
+
+
+@router.post("/lifecycle/{capability_id:path}/disable")
+def disable_capability(capability_id: str, db: Session = Depends(get_db)):
+    """停用能力：从发现索引移除，保留安装产物与用户配置。"""
+    return _lifecycle_response(CapabilityLifecycleService(db).disable(capability_id))
+
+
+@router.post("/lifecycle/{capability_id:path}/upgrade")
+def upgrade_capability(
+    capability_id: str,
+    request: LifecycleRequest | None = None,
+    db: Session = Depends(get_db),
+):
+    """升级能力到指定版本；验证或注册失败时旧版本定义与注册保持不变。"""
+    body = request or LifecycleRequest()
+    return _lifecycle_response(CapabilityLifecycleService(db).upgrade(
+        capability_id,
+        body.target_version,
+        launch_args=body.launch_args,
+        env_keys=body.env_keys,
+    ))
+
+
+@router.post("/lifecycle/{capability_id:path}/rollback")
+def rollback_capability(
+    capability_id: str,
+    request: LifecycleRequest | None = None,
+    db: Session = Depends(get_db),
+):
+    """回滚到上一个（或指定）版本：定义、注册与状态一起回退。"""
+    body = request or LifecycleRequest()
+    return _lifecycle_response(CapabilityLifecycleService(db).rollback(
+        capability_id, body.target_version,
+    ))
+
+
+@router.delete("/lifecycle/{capability_id:path}")
+def uninstall_capability(
+    capability_id: str,
+    force: bool = False,
+    db: Session = Depends(get_db),
+):
+    """卸载能力：检查运行中引用后清理注册、记录与专属安装产物。"""
+    return _lifecycle_response(CapabilityLifecycleService(db).uninstall(
+        capability_id, force=force,
+    ))

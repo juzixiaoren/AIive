@@ -14,6 +14,7 @@ from aiive.control.scope import TaskScope, action_resource_keys
 from aiive.control.task_policy import ActionPolicyDecision, TaskPolicyEngine
 from aiive.db.models import AgentAction, AgentRun, AgentTask, TaskEvidence
 from aiive.desktop.registry_overlay import build_registry_for_thread
+from aiive.mcp.bootstrap import registered_tool_ids
 from aiive.task_runtime.resource_locks import ResourceBusyError, ResourceLockService
 from aiive.tools.registry import ToolRegistration, ToolRegistry
 
@@ -130,6 +131,18 @@ class CapabilityBroker:
                 return "promotion_requires_passing_isolated_evaluation"
         return None
 
+    def _is_disabled(self, *, capability_id: str) -> bool:
+        """该工具是否属于某个已被显式停用的能力。"""
+        from aiive.db.models import Capability
+
+        rows = (
+            self.db.query(Capability)
+            .filter(Capability.state == "disabled")
+            .limit(50)
+            .all()
+        )
+        return any(capability_id in registered_tool_ids(cap) for cap in rows)
+
     @staticmethod
     def validate_preconditions(action: AgentAction) -> list[str]:
         """对服务端可观察的文件 preconditions 做 TOCTOU 前置校验。
@@ -178,6 +191,14 @@ class CapabilityBroker:
         registry = self.registry_for(task)
         registration = registry.get(action.capability_id)
         if registration is None:
+            # 停用与"从未存在"必须区分：停用是用户显式动作，任务应按可恢复错误处理，
+            # 不能当成工具名写错（unknown_tool）。
+            if self._is_disabled(capability_id=action.capability_id):
+                return {
+                    "ok": False,
+                    "error": "capability_disabled",
+                    "error_type": "capability_disabled",
+                }
             return {"ok": False, "error": "capability_unavailable", "error_type": "unknown_tool"}
         if registration.safety.descriptor_hash != action.descriptor_hash:
             return {"ok": False, "error": "descriptor_changed", "error_type": "descriptor_changed"}

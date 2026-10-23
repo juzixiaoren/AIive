@@ -38,6 +38,10 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 # 沙箱根目录（跨平台，不用 /tmp）
 SANDBOX_ROOT = _REPO_ROOT / ".data" / "mcp_sandbox"
 
+# 描述符指纹刻意排除的易变键：launch 含安装路径（重装会变），lifecycle 随
+# 启停/验证时间戳变化。二者都不属于"能力定义"本身，不应让旧审批失效。
+_VOLATILE_DEFINITION_KEYS = frozenset({"launch", "lifecycle"})
+
 
 def _hash(data: str) -> str:
     """计算数据的 SHA256 哈希（取前 16 位）。
@@ -162,41 +166,27 @@ def _run_npm_install(
             "sandbox_path": str(sandbox_dir)}
 
 
-def install_sandbox(
-    db: Session,
+def install_to_dir(
+    *,
     candidate_name: str,
     package_ref: str,
     version: str,
     transport: str,
     declared_tools: list[str],
     definition: dict[str, Any],
-    *,
+    target_dir: Path,
     launch_args: list[str] | None = None,
     env_keys: list[str] | None = None,
 ) -> dict[str, Any]:
-    """将 MCP 候选服务器真实安装到沙箱环境并记账。
+    """把 MCP 包安装到指定目录并返回完整启动定义（不写数据库）。
 
-    流程：
-    1. 包名白名单校验（只接受 discovery 目录中列出的 npm 包）
-    2. 真实执行 npm install 到仓库根 .data/mcp_sandbox/{sanitized_name}/
-    3. 解析 bin 入口，把启动信息写入 Capability.definition["launch"]
-    4. 创建/更新 Capability、MCPInstallRecord、CapabilityVersion 记录
+    升级流程需要把新版本装到独立目录并在切换前完成验证，因此把"文件系统
+    安装 + 启动信息拼装 + 指纹计算"从 `install_sandbox` 中抽出。写库动作仍由
+    调用方负责，避免升级失败时污染现有能力记录。
 
-    参数:
-        db: 数据库会话
-        candidate_name: 候选服务器名称
-        package_ref: 包引用（如 npm:@modelcontextprotocol/server-filesystem）
-        version: 版本号
-        transport: 通信传输方式
-        declared_tools: 声明的工具列表
-        definition: 服务器定义字典（含 name、description）
-        launch_args: 启动 server 时附加的命令行参数（如 filesystem server 的
-                     允许目录）；仅作为参数传给 bin 入口，不构成命令本身
-        env_keys: 运行时需要从宿主环境透传的环境变量名列表（如 API key）
-
-    返回:
-        安装结果字典；成功时包含 capability_id、state、entry_js 等，
-        失败时如实返回 {"ok": False, "installed": False, "error": ...}
+    返回：
+        ok/error/launch/definition/descriptor_hash/tool_list_hash/
+        sandbox_path/entry_js/package_name
     """
     if transport != "stdio":
         return {"ok": False, "installed": False,
@@ -219,8 +209,7 @@ def install_sandbox(
         return {"ok": False, "installed": False,
                 "error": f"package not in MCP catalog whitelist: {package_name}"}
 
-    sandbox_dir = SANDBOX_ROOT / sanitize_dir_name(candidate_name)
-    npm_result = _run_npm_install(package_name, version, sandbox_dir)
+    npm_result = _run_npm_install(package_name, version, target_dir)
     if not npm_result["ok"]:
         logger.warning("MCP 沙箱安装失败: %s error=%s", candidate_name, npm_result["error"])
         return {"ok": False, "installed": False, "error": npm_result["error"]}
@@ -234,19 +223,90 @@ def install_sandbox(
         "sandbox_path": npm_result["sandbox_path"],
         "package": package_name,
     }
-    definition = dict(definition)
-    definition["launch"] = launch_config
+    merged = dict(definition)
+    merged["launch"] = launch_config
     # 包身份、固定版本和声明工具参与描述符指纹；升级或重装后不得沿用旧审批。
-    definition["package_ref"] = package_ref
-    definition["version"] = version
-    definition["transport"] = transport
-    definition["declared_tools"] = list(declared_tools)
+    merged["package_ref"] = package_ref
+    merged["version"] = version
+    merged["transport"] = transport
+    merged["declared_tools"] = list(declared_tools)
 
-    capability_id = f"mcp:{candidate_name}"
     descriptor_hash = _hash(json.dumps(
-        {k: v for k, v in definition.items() if k != "launch"}, sort_keys=True,
+        {k: v for k, v in merged.items() if k not in _VOLATILE_DEFINITION_KEYS},
+        sort_keys=True,
     ))
     tool_list_hash = _hash(",".join(sorted(declared_tools)))
+    return {
+        "ok": True,
+        "installed": True,
+        "error": None,
+        "launch": launch_config,
+        "definition": merged,
+        "descriptor_hash": descriptor_hash,
+        "tool_list_hash": tool_list_hash,
+        "sandbox_path": npm_result["sandbox_path"],
+        "entry_js": npm_result["entry_js"],
+        "package_name": package_name,
+    }
+
+
+def install_sandbox(
+    db: Session,
+    candidate_name: str,
+    package_ref: str,
+    version: str,
+    transport: str,
+    declared_tools: list[str],
+    definition: dict[str, Any],
+    *,
+    launch_args: list[str] | None = None,
+    env_keys: list[str] | None = None,
+    target_dir: Path | None = None,
+) -> dict[str, Any]:
+    """将 MCP 候选服务器真实安装到沙箱环境并记账。
+
+    流程：
+    1. 包名白名单校验（只接受 discovery 目录中列出的 npm 包）
+    2. 真实执行 npm install 到仓库根 .data/mcp_sandbox/{sanitized_name}/
+    3. 解析 bin 入口，把启动信息写入 Capability.definition["launch"]
+    4. 创建/更新 Capability、MCPInstallRecord、CapabilityVersion 记录
+
+    参数:
+        db: 数据库会话
+        candidate_name: 候选服务器名称
+        package_ref: 包引用（如 npm:@modelcontextprotocol/server-filesystem）
+        version: 版本号
+        transport: 通信传输方式
+        declared_tools: 声明的工具列表
+        definition: 服务器定义字典（含 name、description）
+        launch_args: 启动 server 时附加的命令行参数（如 filesystem server 的
+                     允许目录）；仅作为参数传给 bin 入口，不构成命令本身
+        env_keys: 运行时需要从宿主环境透传的环境变量名列表（如 API key）
+        target_dir: 覆盖安装目录（升级时指向版本化目录），默认 <沙箱根>/<sanitized_name>
+
+    返回:
+        安装结果字典；成功时包含 capability_id、state、entry_js 等，
+        失败时如实返回 {"ok": False, "installed": False, "error": ...}
+    """
+    sandbox_dir = target_dir or (SANDBOX_ROOT / sanitize_dir_name(candidate_name))
+    staged = install_to_dir(
+        candidate_name=candidate_name,
+        package_ref=package_ref,
+        version=version,
+        transport=transport,
+        declared_tools=declared_tools,
+        definition=definition,
+        target_dir=sandbox_dir,
+        launch_args=launch_args,
+        env_keys=env_keys,
+    )
+    if not staged.get("ok"):
+        return {"ok": False, "installed": False, "error": staged.get("error")}
+
+    definition = dict(staged["definition"])
+    capability_id = f"mcp:{candidate_name}"
+    descriptor_hash = str(staged["descriptor_hash"])
+    tool_list_hash = str(staged["tool_list_hash"])
 
     # 检查是否已有同名能力
     existing = (
@@ -258,6 +318,13 @@ def install_sandbox(
     if existing:
         # 每次真实重装都必须重新 tools/list 冒烟；即使版本与描述符相同，
         # node_modules 的实际内容也可能因依赖解析而变化。
+        if existing.state == "active":
+            # 重装把状态拉回 needs_review 时，必须同步把工具从发现索引摘除，
+            # 否则会出现"状态不可用但工具仍可被发现"的漂移。
+            from aiive.mcp.bootstrap import unregister_capability_tools
+            from aiive.tools.registry import get_tool_registry
+
+            unregister_capability_tools(get_tool_registry(), existing)
         existing.state = "needs_review"
         existing.descriptor_hash = descriptor_hash
         # 合并 launch 等最新定义信息（重装后入口路径可能变化）
@@ -286,7 +353,7 @@ def install_sandbox(
         version=version,
         transport=transport,
         declared_tools=list(declared_tools),
-        sandbox_path=npm_result["sandbox_path"],
+        sandbox_path=str(staged["sandbox_path"]),
     )
     db.add(install)
 
@@ -306,8 +373,8 @@ def install_sandbox(
         "state": cap.state,
         "descriptor_hash": descriptor_hash,
         "tool_list_hash": tool_list_hash,
-        "entry_js": npm_result["entry_js"],
-        "sandbox_path": npm_result["sandbox_path"],
+        "entry_js": staged["entry_js"],
+        "sandbox_path": staged["sandbox_path"],
         "installed": True,
     }
 
@@ -316,14 +383,19 @@ def run_smoke(
     db: Session,
     capability_id: str,
     smoke_result: dict[str, Any],
+    *,
+    auto_activate: bool = True,
 ) -> dict[str, Any]:
     """记录 MCP 能力的冒烟测试结果并推进状态机。
 
-    冒烟测试通过 -> 状态变为 active
+    冒烟测试通过 -> auto_activate=True 时进入 active（既有"激活"语义）；
+                    auto_activate=False 时只进入 verified（验证通过但未启用）。
     冒烟测试失败 -> 状态变为 needs_review
 
-    允许从 sandbox 或 needs_review 状态发起冒烟（修复单向死路：
-    此前一旦进入 needs_review 便无法再次冒烟）。
+    允许从 sandbox / needs_review / verified / disabled 状态发起冒烟
+    （修复单向死路：此前一旦进入 needs_review 便无法再次冒烟；停用或升级后的
+    能力也需要能重新验证）。active 状态拒绝冒烟：已启用的能力要先停用，
+    避免验证过程与线上发现索引并发竞争。
 
     参数:
         db: 数据库会话
@@ -341,10 +413,13 @@ def run_smoke(
     if not cap:
         return {"ok": False, "error": f"Capability not found: {capability_id}"}
 
-    if cap.state not in ("sandbox", "needs_review"):
+    if cap.state not in ("sandbox", "needs_review", "verified", "disabled"):
         return {
             "ok": False,
-            "error": f"Capability must be in sandbox/needs_review, current: {cap.state}",
+            "error": (
+                "Capability must be in sandbox/needs_review/verified/disabled, "
+                f"current: {cap.state}"
+            ),
         }
 
     # 更新最新版本的冒烟测试结果
@@ -363,7 +438,7 @@ def run_smoke(
 
     # 根据冒烟测试结果更新能力状态
     if smoke_result.get("ok") is True:
-        cap.state = "active"
+        cap.state = "active" if auto_activate else "verified"
     else:
         cap.state = "needs_review"
 
@@ -373,4 +448,5 @@ def run_smoke(
         "capability_id": cap.capability_id,
         "state": cap.state,
         "smoke_passed": smoke_result.get("ok") is True,
+        "auto_activated": auto_activate and smoke_result.get("ok") is True,
     }

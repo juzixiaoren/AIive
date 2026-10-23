@@ -431,6 +431,12 @@ class CapabilityVersion(Base):
     descriptor_hash: Mapped[str] = mapped_column(String(32))
     tool_list_hash: Mapped[str | None] = mapped_column(String(32), nullable=True)
     smoke_result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # 生命周期扩展：来源、当时的启用状态、安装目录与完整定义快照。
+    # 回滚必须能还原"定义 + 注册 + 状态"，只存版本号是不够的。
+    source: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    sandbox_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    definition_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
