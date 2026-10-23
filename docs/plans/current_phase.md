@@ -193,3 +193,92 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
   `capability_disabled`、同能力写操作串行、升级成功/验证失败/注册失败回滚、
   回滚恢复定义与注册、卸载清理范围与越界保护、在途 Action 拒绝与 force、
   审计与 reconcile、历史有界。
+
+---
+
+## V39 知识库维护闭环（完成）
+
+### Implemented
+- `knowledge/ingestor.py`：文档五态（indexed / index_failed / source_unavailable /
+  superseded / deleted）。`ingest` 版本感知：同 `source_path` 内容变化时旧版本置
+  `superseded` + 写入 `superseded_by` + **立即清空旧分块**，内容回到历史版本时复活原记录。
+  新增 `delete`（软删除 + 释放原文对象 + 幂等）、`purge_chunks`、`release_object`；
+  `reindex` 拒绝失效文档并支持 `mark_failure=False` 供维护任务在保存点内调用。
+- `search_chunks`：唯一过滤条件 `Document.status NOT IN (superseded, deleted)`，
+  从根上保证"更新/删除后旧内容不可召回"，无需维护额外检索索引。
+- `knowledge/maintenance.py`：`scan_knowledge_base` 报告 7 类问题
+  （orphan_chunks / duplicate_chunks / stale_document_chunks / missing_chunks /
+  missing_object / orphan_objects / expired_superseded_objects）；`apply_report` 逐类幂等清理，
+  每篇重建走独立 SAVEPOINT，单篇失败标记 `index_failed` 不影响整批；
+  `documents_rebuild_failed` 不计入"有进展"，避免维护任务无限空转。
+- 所有权边界：删除只动 `documents` / `chunks` / 对象存储 `knowledge-documents` 桶，
+  **永不删除 `source_path` 指向的用户文件**（响应显式 `source_file_removed: false`）；
+  对象回收只处理 `sha256/xx/<64 hex>` 形态键并跳过隐藏目录。
+- Outbox：新增 job_type `knowledge_maintenance`（`worker/job_types.py::KNOWLEDGE_JOB_TYPES`）
+  + `worker/handlers_knowledge.py::handle_knowledge_maintenance`（5 轮扫描-清理、
+  未清完 CONTINUE、无进展 COMPLETED(partial)）；
+  `scheduler_daemon._knowledge_maintenance_scanner_job` 每小时检查，DB 侧不一致即时入队，
+  否则每日一次对象对账，`operation_id` 按天幂等。
+- API：`DELETE /api/knowledge/{id}`、`GET/POST /api/knowledge/maintenance`，
+  `GET /api/knowledge` 增加 source_path / superseded_by / updated_at / deleted_at。
+- DB：`documents` 新增 superseded_by / deleted_at / updated_at + `source_path` 索引，
+  status 约束扩展两态；`chunks` 新增 `(document_id, chunk_index)` 唯一约束
+  （迁移 `c7e3a1f5b9d2`，迁移前清理历史重复行；已验证 upgrade/downgrade 双向）。
+- 文档：`docs/architecture/knowledge_维护.md`；CODE_MAP §2.5/§3.2/§3.8/§3.11 同步。
+
+### Observable Result
+- 新增 `tests/unit/backend/test_knowledge_maintenance.py` 27 例全通过（全离线，对象存储隔离到 tmp_path）：
+  版本取代后旧内容零召回、内容回退复活旧记录、重复导入幂等、删除不动原文件、重复删除幂等、
+  失效文档拒绝重索引、分块唯一约束、7 类问题识别、缺失分块重建、原文损坏保留 index_failed、
+  原文丢失标记 source_unavailable、孤儿/过期对象回收、新写入对象不被回收、
+  Handler 幂等与无进展停止、调度入队幂等、列表默认过滤墓碑、OpenAPI schema 可构建。
+- 迁移 `c7e3a1f5b9d2` 在 SQLite 上 upgrade → downgrade → upgrade 全通；`alembic check`
+  对 documents / chunks 无结构漂移（仅剩既有的 12 项 SQLite 类型差异）。
+- 全量：1005 passed / 8 skipped / 0 failed（980 基线 + 25 新增，148s）。
+- ruff `--select F,E9`：All checks passed；basedpyright 全仓：0 errors / 0 warnings / 0 notes。
+
+> 统计口径更正（V39 独立审查轮）：上条"1005"为笔误——新增用例实际 27 例，
+> 正确口径为 **1007 passed / 8 skipped / 0 failed**（980 基线 + 27 新增）。
+> 审查机（Windows，WSL bash 不可用）实测 1000 passed / 8 skipped / 7 failed，
+> 7 个失败全部是 `test_local_shell.py` 的 bash 环境依赖，与 V39 无关。
+
+---
+
+## V39 独立代码审查（审查后修复轮）
+
+### 发现与修复
+- **P1 调度幂等缺陷（已修复）**：`_knowledge_maintenance_scanner_job` 原实现对"当天已存在
+  任意状态的 knowledge_maintenance 任务"直接返回，导致当天首个任务完成/失败后，新出现的
+  DB 侧不一致（孤儿/失效/缺失分块、index_failed）直到次日才能入队，违背"DB 侧不一致即时
+  入队"的设计约定。修复：在途判定收紧为 pending/running（与记忆维护扫描器一致），
+  `enqueue_knowledge_maintenance_job` 在基础 operation_id 被终态任务占用时分配
+  `#2/#3…` 后缀补跑（UNIQUE 不撞车）；回归测试 3 例。
+- **P2 路由错误码契约（已修复）**：原文对象丢失/损坏时 `POST /{id}/reindex` 与
+  `GET /{id}/source` 直接抛 FileNotFoundError / ValueError（HTTP 500）。修复：统一映射
+  409；回归测试 2 例。
+- **P2 迁移契约无自动化覆盖（已补齐）**：`test_schema_migrations.py` 新增
+  `test_knowledge_lifecycle_migration_dedups_and_roundtrips`：从父修订造历史重复分块，
+  验证 head 去重（保留最早一条）、新列/索引/唯一约束/状态约束、updated_at 回填非空、
+  downgrade→upgrade 往返。
+- **P2 并发导入同路径竞态（已根治）**：架构文档 §9 原文声称并发导入同路径
+  "最终只有一个活跃版本"不成立（READ COMMITTED 下不同内容的并发插入互不可见，
+  无约束拦截）。修复：新增迁移 `d1e2f3a4b5c6`，为 `documents` 建
+  `ix_documents_active_source_path` 部分唯一索引（活跃三态），ingest 写序调整为
+  "先置失效旧版本并 flush，再写入/激活新版本"（新文档 id 预生成以保留 superseded_by
+  版本链），路由把 `IntegrityError` 映射为 409（可重试）。迁移内置历史重复活跃文档
+  去重（每个 source_path 保留 created_at 最新一条，旧版分块清空）。
+  回归：SQLite 侧 3 例（schema 拦截、失效态不占位、路由 409）+ 迁移契约 1 例；
+  PG 并发语义 2 例已写入 `tests/integration/pg/test_pg_contracts.py`（本机无
+  Docker 未执行，需在 PG 环境验证）。
+- 文档口径：架构文档 §7 补充后缀补跑语义；§10 更新为 35 例；测试统计口径见上。
+
+### 验证
+- 受影响测试：`test_knowledge_maintenance.py`（35）+ `test_schema_migrations.py`（7）
+  + `test_ingestor.py`（8）共 50 例全通过（离线）。
+- 全量回归见最终汇报。
+
+### Known Gaps
+- 不提供"回滚到旧版本" API（`superseded` 原文对象保留 30 天，仅保留能力）。
+- 对象级问题（孤儿对象 / 原文丢失）每日对账一次，不触发即时入队（需遍历文件系统）。
+- 不做原文哈希全量巡检：完整性在读取路径 `get_verified` 校验。
+- `deleted` 墓碑行不自动清理（体量小，保留审计）。

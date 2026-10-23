@@ -11,10 +11,14 @@ FOR UPDATE 语义）。默认快速测试不启用；设置 ``AIIVE_PG_TESTS=1``
   3. SKIP LOCKED 跳过已被其他事务锁定的行（不阻塞）。
   4. Forget cascade 阶段异常 → 事务回滚，无半完成 batch / 无 next-stage job。
   5. 事务回滚 → 无残留 MemoryRecord 与不一致的投影 OutboxJob。
+  6. 知识库部分唯一索引：同一 source_path 的第二条活跃文档插入被拦截（并发导入
+     同路径竞态的 schema 级根治）。
+  7. 知识库并发导入同一路径：最终只剩一条活跃文档（新旧内容不会同时被召回）。
 """
 from __future__ import annotations
 
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 
@@ -26,8 +30,9 @@ from aiive.db.forget_models import (
     ForgetSelectorManifest,
     ForgetStageRun,
 )
-from aiive.db.models import MemoryProposal as MemoryProposalModel
+from aiive.db.models import Chunk, Document, MemoryProposal as MemoryProposalModel
 from aiive.db.models import MemoryRecord, OutboxJob, Thread
+from aiive.knowledge.ingestor import KnowledgeIngestor
 from aiive.memory.memory_types import (
     EvidenceItem,
     LifecycleState,
@@ -36,6 +41,8 @@ from aiive.memory.memory_types import (
     ValidityState,
 )
 from aiive.memory.memory_write_service import MemoryWriteService
+from aiive.storage import object_store
+from aiive.tools.safe_delete import get_scope_registry
 from aiive.worker import handlers_forget as hf
 from aiive.worker.handler_registry import HandlerRegistry
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome
@@ -379,3 +386,115 @@ def test_advisory_lock_is_acquired_on_postgresql(pg_sessionmaker):
         s_a.close()
         s_b.rollback()
         s_b.close()
+
+
+@pytest.fixture
+def store(tmp_path, monkeypatch):
+    """把对象存储根目录隔离到 tmp_path（PG 用例同样不写真实 .data）。"""
+    root = tmp_path / "object_store"
+    monkeypatch.setattr(object_store, "ROOT", root)
+    registry = get_scope_registry()
+    previous = registry.get_scope_root("object_store")
+    registry.register("object_store", root)
+    try:
+        yield root
+    finally:
+        if previous is not None:
+            registry.register("object_store", previous)
+
+
+def test_partial_unique_index_blocks_second_active_source_path(pg_sessionmaker):
+    """部分唯一索引：同一 source_path 的第二条活跃文档插入被拦截。
+
+    复现竞态根因：两个事务各自插入同一 source_path 的活跃文档，后插入方在 PG 上
+    阻塞于唯一索引，先提交方落库后收到 IntegrityError——schema 层面保证不会
+    留下两个活跃版本（SQLite 无并发写，无法验证该语义）。
+    """
+    source_path = "/tmp/pg-active-source-unique.md"
+    s1 = pg_sessionmaker()
+    s2 = pg_sessionmaker()
+    try:
+        s1.add(Document(
+            id="doc-active-1", source_path=source_path,
+            content_hash="h1" + "a" * 62, status="indexed",
+            mime_type="text/plain", title="第一版",
+        ))
+        s1.flush()  # 未提交：s2 的插入必须阻塞在唯一索引上
+
+        s2.execute(text("SET statement_timeout = '10s'"))
+        s2.add(Document(
+            id="doc-active-2", source_path=source_path,
+            content_hash="h2" + "b" * 62, status="indexed",
+            mime_type="text/plain", title="第二版",
+        ))
+
+        outcome: list[str] = []
+
+        def _attempt_insert() -> None:
+            try:
+                s2.flush()
+                outcome.append("inserted")
+            except Exception as exc:  # noqa: BLE001 - 记录异常类型用于断言
+                outcome.append(type(exc).__name__)
+                s2.rollback()
+
+        worker = threading.Thread(target=_attempt_insert)
+        worker.start()
+        time.sleep(0.5)  # 确保 s2 已阻塞在索引上
+        s1.commit()      # 先提交方胜出 → s2 收到唯一冲突
+        worker.join(timeout=20)
+
+        assert outcome == ["IntegrityError"], (
+            f"第二条活跃文档应被唯一索引拦截，实际 {outcome}"
+        )
+        assert s1.query(Document).filter_by(
+            source_path=source_path, status="indexed"
+        ).count() == 1
+    finally:
+        s1.close()
+        s2.close()
+
+
+def test_concurrent_ingest_same_path_yields_single_active_version(
+    pg_session, pg_sessionmaker, tmp_path, store
+):
+    """并发导入同一 source_path：无论哪个约束拦截后提交方，最终只剩一条活跃文档。"""
+    source = tmp_path / "kb-concurrent.md"
+    source.write_text("第一版内容", encoding="utf-8")
+
+    n = 2
+    barrier = threading.Barrier(n)
+
+    def worker(index: int) -> str:
+        try:
+            barrier.wait(timeout=20)
+        except threading.BrokenBarrierError:
+            return "ERR:barrier"
+        if index == 1:
+            # 第二个线程改写文件，尽量触发 source_path 部分唯一索引而非 content_hash
+            source.write_text(f"第二版内容-{index}", encoding="utf-8")
+        session = pg_sessionmaker()
+        try:
+            result = KnowledgeIngestor(session).ingest(str(source))
+            session.commit()
+            return "ok:" + result.get("content_hash", "")[:8]
+        except Exception as exc:  # noqa: BLE001 - 收集并发结果用于断言
+            session.rollback()
+            return "ERR:" + type(exc).__name__
+        finally:
+            session.close()
+
+    with ThreadPoolExecutor(max_workers=n) as ex:
+        results = list(ex.map(worker, range(n)))
+
+    for item in results:
+        assert item.startswith("ok:") or item.startswith("ERR:IntegrityError"), results
+    assert len([item for item in results if item.startswith("ERR:")]) <= 1, results
+
+    pg_session.expire_all()
+    active = pg_session.query(Document).filter_by(
+        source_path=str(source.resolve())
+    ).all()
+    assert len(active) == 1, f"并发导入后应只剩一条活跃文档，实际 {[d.id for d in active]}"
+    assert active[0].status == "indexed"
+    assert pg_session.query(Chunk).filter_by(document_id=active[0].id).count() > 0

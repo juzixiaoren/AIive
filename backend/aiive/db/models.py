@@ -598,11 +598,17 @@ class ToolOperation(Base):
 
 
 class Document(Base):
-    """知识文档模型：持久化原文对象引用、来源信息和索引状态。"""
+    """知识文档模型：持久化原文对象引用、来源信息和索引状态。
+
+    status 取值见 `aiive.knowledge.ingestor.DOCUMENT_STATUSES`：
+    - indexed / index_failed / source_unavailable：活跃文档（参与检索）
+    - superseded：同一 source_path 的旧版本，分块已失效，不参与检索
+    - deleted：用户已删除，分块与对象已释放，仅保留墓碑记录
+    """
     __tablename__: str = "documents"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
-    source_path: Mapped[str] = mapped_column(String(512))
+    source_path: Mapped[str] = mapped_column(String(512), index=True)
     content_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     object_bucket: Mapped[str | None] = mapped_column(String(128), nullable=True)
     object_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
@@ -611,12 +617,31 @@ class Document(Base):
     title: Mapped[str | None] = mapped_column(String(256), nullable=True)
     doc_type: Mapped[str] = mapped_column(String(32), default="text")
     status: Mapped[str] = mapped_column(String(32), default="indexed", index=True)
+    # 被同路径新版本取代时指向新文档，用于追溯版本链
+    superseded_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow,
+    )
 
-    __table_args__: tuple[CheckConstraint, ...] = (
+    __table_args__: tuple[CheckConstraint | Index, ...] = (
         CheckConstraint(
-            "status IN ('indexed','index_failed','source_unavailable')",
+            "status IN ('indexed','index_failed','source_unavailable','superseded','deleted')",
             name="ck_documents_status",
+        ),
+        # 每个 source_path 同时只允许一条活跃文档（ACTIVE_STATUSES，定义见
+        # knowledge/ingestor.py，此处保持字面量以避免循环导入）。部分唯一索引从
+        # schema 层面杜绝"并发导入同路径不同内容 → 两个活跃版本"：READ COMMITTED
+        # 下两个未提交插入互不可见，仅靠应用层查询无法拦截，其结果会让新旧内容
+        # 同时被召回。失效态（superseded/deleted）不占用唯一位，版本切换与历史
+        # 版本复活均不受影响。
+        Index(
+            "ix_documents_active_source_path",
+            "source_path",
+            unique=True,
+            sqlite_where=text("status IN ('indexed', 'index_failed', 'source_unavailable')"),
+            postgresql_where=text("status IN ('indexed', 'index_failed', 'source_unavailable')"),
         ),
     )
 
@@ -633,6 +658,11 @@ class Chunk(Base):
     chunk_index: Mapped[int] = mapped_column()
     token_estimate: Mapped[int] = mapped_column(default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    __table_args__: tuple[UniqueConstraint, ...] = (
+        # 同一文档内分块序号唯一：重建时不会因并发/中断留下重复分块
+        UniqueConstraint("document_id", "chunk_index", name="uq_chunks_document_chunk_index"),
+    )
 
 
 class RetrievalRun(Base):

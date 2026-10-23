@@ -142,7 +142,8 @@
 | 通知 | `api/routes_notifications.py` | `worker/outbox_handlers.py`、`frontend/src/pages/NotificationsPage.tsx` | `test_notification*.py` |
 | 桌面节点服务端 | `desktop/node_service.py`、`desktop/connection_manager.py`、`desktop/protocol.py` | `api/routes_desktop.py`、`desktop/registry_overlay.py` | `test_desktop*.py` |
 | 桌面节点客户端（Electron） | `apps/desktop/src/node-host/client.mjs` | `apps/desktop/src/node-host/locks.mjs`、`journal.mjs` | `apps/desktop/src/node-host/journal.test.mjs` |
-| 知识库摄入 / 分块 / 检索 | `knowledge/ingestor.py`、`knowledge/chunker.py` | `knowledge/document_reader.py`、`api/routes_knowledge.py` | `test_knowledge*.py` |
+| 知识库摄入 / 分块 / 检索 | `knowledge/ingestor.py`、`knowledge/chunker.py` | `knowledge/document_reader.py`、`api/routes_knowledge.py` | `test_ingestor.py`、`test_knowledge*.py` |
+| 知识库维护闭环（版本/删除/孤儿清理） | `knowledge/maintenance.py`、`knowledge/ingestor.py` | `worker/handlers_knowledge.py`、`worker/scheduler_daemon.py::_knowledge_maintenance_scanner_job`、`api/routes_knowledge.py` | `test_knowledge_maintenance.py` |
 | 文档读取（多格式） | `knowledge/document_reader.py` | `tools/builtin_knowledge.py::handle_read_document` | `test_document*.py` |
 
 ### 2.6 前端 / 客户端 / 基础设施
@@ -188,7 +189,7 @@
 | `routes_skills.py` | `/api/skills`、`/{skill_id}`（catalog + ready/degraded 对照） |
 | `routes_selfdev.py` | `/api/selfdev/slots`、`/plan`、`/{id}/apply-inactive|promote|rollback` |
 | `routes_forget.py` | `/api/forget` + `/{operation_key}/status` |
-| `routes_knowledge.py` | `/api/knowledge/ingest`、`/knowledge`、`/search` |
+| `routes_knowledge.py` | `/api/knowledge/ingest`、`/knowledge`、`/knowledge/maintenance`（GET 报告 / POST 清理）、`DELETE /knowledge/{id}`、`/{id}/source`、`/{id}/reindex`、`/search` |
 | `routes_epochs.py` | `/api/epochs/{thread_id}`、`/{id}/seal-segment|rollover` |
 | `routes_inspector.py` | `/api/context-runs/{trace_id}`（+`/items/{id}`）、检索运行查询 |
 | `routes_tasks.py` | `/api/tasks` 条件任务 CRUD + `/{id}/cancel|check-now` |
@@ -315,7 +316,8 @@
 | `outbox_handlers.py`（96KB） | 装配 `register_all` L1338（17 类 job_type，schema_version=1）；`handle_memory_extraction` L106、`handle_reminder_delivery` L350、`handle_core_memory_refresh` L617、`handle_memory_vector_refresh` L639、`handle_memory_markdown_project` L664、`handle_retrieval_index_refresh` L697、`handle_memory_maintenance` L1165、`handle_segment_sealing` L1622、`handle_epoch_rollover` L1961、`handle_epoch_checkpoint` L2055 |
 | `handlers_forget.py`（71KB） | 遗忘 Saga：`handle_forget_cascade` L133（目标物化 L239/墓碑 L435/依赖发现 L619）、`handle_forget_rebuild` L807、`handle_forget_purge` L1356（`_scrub_wide` L1535）、`handle_forget_verify` L1677、`handle_forget_reconcile` L1801；`BATCH_SIZE=200` |
 | `handlers_retention.py` / `handlers_agent_tasks.py` | `handle_retention_cleanup` L27 分批驱动 RetentionEngine；`handle_agent_task_run` L16 驱动 PersistentTaskRuntime |
-| `scheduler_daemon.py`（27KB） | 模块级 `scheduler` L33；`start_daemon` L90（8 个周期 job）；`schedule_outbox_poll` L149；`_poll_tool_operations` L193（独立线程防饿死）；`_agent_task_scanner_job` L216（stale run 恢复/锁过期/watcher/审批过期）；`_idle_scanner_job` L263；`_forget_reconcile_scanner_job` L423；`enqueue_maintenance_job` L453、`enqueue_retention_job` L509 |
+| `handlers_knowledge.py` | `handle_knowledge_maintenance` L29：扫描→分批清理→commit，无进展时 COMPLETED(partial) 而非空转；`MAX_MAINTENANCE_BATCHES=5` |
+| `scheduler_daemon.py`（27KB） | 模块级 `scheduler` L33；`start_daemon` L90（9 个周期 job）；`schedule_outbox_poll` L149；`_poll_tool_operations` L193（独立线程防饿死）；`_agent_task_scanner_job` L216（stale run 恢复/锁过期/watcher/审批过期）；`_idle_scanner_job` L263；`_forget_reconcile_scanner_job` L423；`enqueue_maintenance_job` L453、`enqueue_retention_job` L509、`enqueue_knowledge_maintenance_job`、`knowledge_needs_maintenance`、`_knowledge_maintenance_scanner_job`（在途判定只认 pending/running；DB 侧不一致即时入队 + 每日对象对账；终态任务不阻塞，补跑分配 `#n` 后缀 operation_id） |
 | `outbox_heartbeat.py` / `job_types.py` / `task_worker.py` | 租约续期线程 + `ActiveClaimRegistry`；`ENABLED_OUTBOX_JOB_TYPES` allowlist；到期提醒原子入队 `reminder_delivery`（FOR UPDATE SKIP LOCKED） |
 
 ### 3.9 `task_runtime/` + `control/` — 持久任务与执行边界
@@ -339,7 +341,11 @@
 
 ### 3.11 其余包
 
-- `knowledge/`：`ingestor.py`（摄入+`search_chunks` Postgres ILIKE）、`chunker.py`、`document_reader.py`（TXT/MD/HTML/JSON/CSV/TSV/DOCX/PDF）、`access.py`（访问控制）
+- `knowledge/`：
+  - `ingestor.py`：`KnowledgeIngestor`（`ingest` 版本感知去重、`delete` 软删除、`reindex`、`read_source`）、`search_chunks`（ILIKE 多词覆盖度排序，**只检索活跃状态文档**）、状态常量 `ACTIVE_STATUSES`/`RECOVERABLE_STATUSES`/`INACTIVE_STATUSES`。写序固定"先置失效旧版本并 flush，再写入/激活新版本"，配合 `documents` 的部分唯一索引 `ix_documents_active_source_path`（活跃三态，根治并发导入同路径竞态；迁移 `d1e2f3a4b5c6`）。
+  - `maintenance.py`：`scan_knowledge_base`（7 类一致性问题）、`apply_report`（幂等清理：失效分块/孤儿分块/重复分块/缺失分块重建/对象丢失标记/过期 superseded 对象/孤儿对象）；`SUPERSEDED_OBJECT_RETENTION_DAYS=30`。
+  - `chunker.py`、`document_reader.py`（TXT/MD/HTML/JSON/CSV/TSV/DOCX/PDF）、`access.py`（访问控制）。
+  - 设计说明见 `docs/architecture/knowledge_维护.md`。
 - `supervisor/`：
   - `slot_manager.py`：A/B 槽位与 `runtime/active_slot` 原子写（manifest excludes 含 data/postgres/object_store/logs/.env/slots/runtime）。
   - `health_probe.py`：槽位静态健康（manifest、app 目录、槽位内 `import aiive.main`）；`launcher.py`：槽位状态概览。
@@ -513,7 +519,7 @@ api/routes_agent_tasks.py 创建任务 → task_runtime/repository.py::create_ta
   → HMAC 密钥 → _ensure_system_thread → _ensure_retrieval_generation
   → ContextBudget 校验 → 向量运行时 (vector_bootstrap)
   → mcp/bootstrap.py::restore_active_capabilities (L235) + ensure_builtin_mcp_capability
-  → supervisor start_daemon (scheduler_daemon.py L90, 8 个周期 job)
+  → supervisor start_daemon (scheduler_daemon.py L90, 9 个周期 job)
   → OutboxWorker + OutboxHeartbeat + ws_manager + desktop_connection_manager
 ```
 

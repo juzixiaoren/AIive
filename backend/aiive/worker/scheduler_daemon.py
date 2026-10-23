@@ -13,6 +13,8 @@ from sqlalchemy.orm import Session
 
 from aiive.db.base import SessionLocal
 from aiive.db.models import (
+    Chunk,
+    Document,
     Epoch,
     EpochCompactionInput,
     MemoryMaintenanceRun,
@@ -54,6 +56,10 @@ _MAX_SCAN_BATCH = 10
 # Phase 4: 维护调度
 _MAINTENANCE_SCAN_INTERVAL = 3600   # 秒：维护轮询周期（Daily 间隔同上）
 _MAINTENANCE_SCOPE_KEY = "all_user_memories"
+# 知识库维护：有 DB 侧不一致时立即入队；否则保证每天至少一次对象级对账
+_KNOWLEDGE_MAINTENANCE_INTERVAL = 3600
+_KNOWLEDGE_MAINTENANCE_POLICY_VERSION = 1
+_KNOWLEDGE_DAILY_INTERVAL_SECONDS = 86400
 _AGENT_TASK_SCAN_INTERVAL = 10
 _RELEASE_MONITOR_INTERVAL = 60
 
@@ -129,6 +135,12 @@ def start_daemon():
     scheduler.add_job(
         _retention_scanner_job, IntervalTrigger(seconds=_RETENTION_INTERVAL),
         id="phase6b_retention_scanner", replace_existing=True,
+    )
+    # 知识库维护扫描器
+    scheduler.add_job(
+        _knowledge_maintenance_scanner_job,
+        IntervalTrigger(seconds=_KNOWLEDGE_MAINTENANCE_INTERVAL),
+        id="knowledge_maintenance_scanner", replace_existing=True,
     )
     scheduler.add_job(
         _agent_task_scanner_job, IntervalTrigger(seconds=_AGENT_TASK_SCAN_INTERVAL),
@@ -576,6 +588,154 @@ def _retention_scanner_job() -> None:
                 db.close()
             except Exception:
                 logger.debug("retention_scanner Session 关闭失败", exc_info=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 知识库维护入队与扫描
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _knowledge_maintenance_operation_id(window_bucket: str) -> str:
+    """知识库维护任务的基础幂等 operation_id（策略版本 + 窗口）。"""
+    return (
+        f"knowledge_maintenance:all:"
+        f"{_KNOWLEDGE_MAINTENANCE_POLICY_VERSION}:{window_bucket}"
+    )
+
+
+def enqueue_knowledge_maintenance_job(
+    db: Session,
+    window_bucket: str | None = None,
+    now: datetime | None = None,
+) -> str | None:
+    """入队一个 `knowledge_maintenance` OutboxJob。
+
+    operation_id = `knowledge_maintenance:all:{policy_version}:{window_bucket}`：
+
+    - 窗口内已有 pending/running 任务（含 `#n` 后缀的补跑任务）→ 返回基础
+      operation_id，不重复创建（在途去重）；
+    - 基础 operation_id 已被终态任务（completed / deadletter 等）占用时，分配
+      `#2`、`#3`… 后缀的新 operation_id：UNIQUE 约束下不会撞车，同时保证
+      "当天新出现的不一致仍能即时入队"，不会被当天早些时候已结束的任务堵住。
+    """
+    now = now or datetime.now(timezone.utc)
+    window_bucket = window_bucket or now.strftime("%Y-%m-%d")
+    base_op_id = _knowledge_maintenance_operation_id(window_bucket)
+
+    in_flight = db.query(OutboxJob).filter(
+        OutboxJob.operation_id.like(f"{base_op_id}%"),
+        OutboxJob.status.in_(["pending", "running"]),
+    ).count()
+    if in_flight > 0:
+        return base_op_id
+
+    op_id = base_op_id
+    suffix = 1
+    while db.query(OutboxJob).filter(OutboxJob.operation_id == op_id).count() > 0:
+        suffix += 1
+        op_id = f"{base_op_id}#{suffix}"
+
+    payload = {"schema_version": 1, "operation_id": op_id}
+    if _outbox_worker is not None:
+        try:
+            _outbox_worker.enqueue(
+                db, "knowledge_maintenance", payload, operation_id=op_id,
+            )
+        except ValueError:
+            logger.warning("knowledge_maintenance enqueue 不在 allowlist，跳过")
+            return None
+    else:
+        db.add(OutboxJob(
+            operation_id=op_id, job_type="knowledge_maintenance",
+            status="pending", payload=payload, max_retries=3,
+        ))
+    return op_id
+
+
+def knowledge_needs_maintenance(db: Session) -> bool:
+    """轻量 EXISTS 判定：DB 侧是否存在需要清理的知识库不一致。"""
+    from aiive.knowledge.ingestor import ACTIVE_STATUSES, INACTIVE_STATUSES
+
+    # 失效文档（superseded / deleted）残留分块：会被错误召回
+    if db.query(Chunk.id).join(
+        Document, Chunk.document_id == Document.id
+    ).filter(Document.status.in_(tuple(INACTIVE_STATUSES))).limit(1).first() is not None:
+        return True
+    # 没有所属文档的孤儿分块
+    if db.query(Chunk.id).outerjoin(
+        Document, Chunk.document_id == Document.id
+    ).filter(Document.id.is_(None)).limit(1).first() is not None:
+        return True
+    # 活跃文档分块缺失（摄取/重建中断）
+    if db.query(Document.id).filter(
+        Document.status.in_(tuple(ACTIVE_STATUSES)),
+        ~Document.id.in_(db.query(Chunk.document_id)),
+    ).limit(1).first() is not None:
+        return True
+    # 重建失败待重试
+    if db.query(Document.id).filter(
+        Document.status == "index_failed"
+    ).limit(1).first() is not None:
+        return True
+    return False
+
+
+def _last_knowledge_maintenance_at(db: Session) -> datetime | None:
+    """最近一次成功完成的知识库维护时间。"""
+    job = (
+        db.query(OutboxJob)
+        .filter(
+            OutboxJob.job_type == "knowledge_maintenance",
+            OutboxJob.status == "completed",
+            OutboxJob.terminal_at.isnot(None),
+        )
+        .order_by(OutboxJob.terminal_at.desc())
+        .first()
+    )
+    return job.terminal_at if job is not None else None
+
+
+def _knowledge_maintenance_scanner_job() -> None:
+    """周期检查知识库一致性并按窗口幂等入队维护任务。
+
+    - 窗口内已有 pending/running 任务（含 `#n` 补跑）→ 跳过，避免重复执行；
+    - 存在 DB 侧不一致（失效分块 / 孤儿分块 / 缺失分块 / 重建失败）→ 立即入队
+      （即使当天已有任务结束：新问题分配 `#n` 后缀任务，不被旧任务堵住）；
+    - 否则每天至少入队一次，用于对象级对账（孤儿对象、原文丢失）。
+    """
+    db: Session | None = None
+    try:
+        db = SessionLocal()
+        now = datetime.now(timezone.utc)
+        bucket = now.strftime("%Y-%m-%d")
+        window_prefix = f"{_knowledge_maintenance_operation_id(bucket)}%"
+        in_flight = db.query(OutboxJob).filter(
+            OutboxJob.operation_id.like(window_prefix),
+            OutboxJob.status.in_(["pending", "running"]),
+        ).count()
+        if in_flight > 0:
+            return
+
+        last_ok = _last_knowledge_maintenance_at(db)
+        # SQLite 读回的 datetime 为 naive，比较前补齐 UTC
+        if last_ok is not None and last_ok.tzinfo is None:
+            last_ok = last_ok.replace(tzinfo=timezone.utc)
+        daily_due = (
+            last_ok is None
+            or (now - last_ok).total_seconds() >= _KNOWLEDGE_DAILY_INTERVAL_SECONDS
+        )
+        if not daily_due and not knowledge_needs_maintenance(db):
+            return
+
+        enqueue_knowledge_maintenance_job(db, window_bucket=bucket, now=now)
+        db.commit()
+    except Exception:
+        if db is not None:
+            db.rollback()
+        logger.exception("knowledge_maintenance_scanner 异常")
+    finally:
+        if db is not None:
+            db.close()
 
 
 def _has_dirty_memory(db: Session, cfg: MaintenanceConfig, now: datetime) -> bool:

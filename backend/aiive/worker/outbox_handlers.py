@@ -1390,6 +1390,10 @@ def register_all(registry: HandlerRegistry) -> None:
     from aiive.worker.handlers_retention import handle_retention_cleanup
     registry.register("retention_cleanup", handle_retention_cleanup,
                        supported_schema_versions=frozenset({1}))
+    # 知识库维护：孤儿分块 / 失效文档 / 对象引用一致性清理
+    from aiive.worker.handlers_knowledge import handle_knowledge_maintenance
+    registry.register("knowledge_maintenance", handle_knowledge_maintenance,
+                       supported_schema_versions=frozenset({1}))
 
 
 # ============================================================================
