@@ -47,6 +47,9 @@
 
 实现入口：`backend/aiive/selfdev/repair_loop.py::SelfDevRepairLoop.run`。
 
+除上述步骤外，`after_tests`、`after_gate`、`before_promote` 三处各做一次候选指纹复核
+（`tree_fingerprint` 必须等于登记值），任一处不符即以 `candidate_changed` 阻断，不晋升。
+
 ## 3. 代码理解：为什么新增 ProjectReader
 
 要求是"复用现有文件读取、搜索和本机 Shell 能力，只有确实不足才补 Project Reader"。核查结论：
@@ -70,8 +73,9 @@
 ### 安全边界
 
 - 拒绝绝对路径、`..` 穿越、符号链接逃逸（`Path.resolve()` + `is_relative_to`）；
-- 拒绝 `.env`（保留 `.env.example`）、`*.pem/*.key/*.db/*.log`、`id_rsa*`、`credentials.json`；
-- 跳过 `.git/.venv/node_modules/__pycache__/data/runtime/slots/.data/postgres/qdrant/object_store/logs`；
+- 拒绝 `.env`（保留 `.env.example`）、后缀 `.pem/.key/.p12/.pfx/.sqlite/.sqlite3/.db/.log`、
+  精确文件名 `id_rsa`/`id_ed25519`/`credentials.json`/`.netrc`/`.npmrc`/`.pypirc`（是精确匹配，不做 `id_rsa*` 通配）；
+- 跳过 `.git/venv/.venv/node_modules/__pycache__/.pytest_cache/.mypy_cache/.ruff_cache/dist/build/.next/coverage/data/runtime/slots/.data/postgres/qdrant/object_store/logs`；
 - 单文件 40KB、单次扫描 20k 文件 / 1MB 单文件、上下文总量 120KB。
 
 ## 4. 补丁生成与隔离
@@ -109,6 +113,9 @@
 | 测试通过 + 安全门失败 | `gate_failed` | 绝不晋升 |
 | 测试持续失败且轮次耗尽 | `tests_failed` + `max_rounds_exhausted` | `ok=False` |
 | 模型提交完全相同的补丁 | `tests_failed` + `repeated_patch_fingerprint` | 提前停止，避免空转 |
+| 已有修复在跑（锁被占） | `repair_busy` | 不排队、不覆盖、不等待，附持有者信息 |
+| 候选指纹与登记值不符 | `candidate_changed` | `after_tests` / `after_gate` / `before_promote` 任一处不符即阻断 |
+| 未预期异常（本模块自身出错） | `failed` | 回滚候选槽位，`failure_reason` 带 `unexpected_error` |
 
 `max_rounds` 默认 3，硬上限 5；总尝试次数 = `max_rounds + 1`（首次规划 + 修复轮）。
 
@@ -128,7 +135,8 @@
 
 ### 6.2 候选隔离 `CandidateSlotGuard`
 
-- 每轮修复先 `capture_baseline`：记录活跃槽位版本 + `tree_fingerprint`；
+- 每次 run 开始时 `capture_baseline` **一次**：记录活跃槽位版本 + `tree_fingerprint`（修复轮内不重采，
+  否则会把已改动的候选当成基线）；
 - 改写候选代码**之前** `mark_not_promotable`，写 `slots/<X>/candidate_state.json`；
 - 失败后 `restore` 整树回滚到基线并复核指纹；恢复不了就保持"不可晋升"标记，避免失败代码被误晋升；
 - 晋升前 `ReleaseManager._candidate_block` 核对不可晋升标记与指纹，不符即阻断。
@@ -189,6 +197,9 @@
 }
 ```
 
+（示例省略 `run_id`、`lock`、`recovery`、`phases`、`candidate` 等审计字段，完整结构见
+`repair_loop.py::_new_record`。）
+
 `PatchOperation` 只记录最终补丁的操作摘要（不含文件内容），避免数据库膨胀。
 复用 `Trace`（trace_id）、`SelfDevRequest`（状态）、`PatchOperation`（操作），
 不新增任务框架或事件表。
@@ -201,8 +212,11 @@
 | `GET /api/selfdev/requests/{id}` | 读取落库记录（`plan.repair`） |
 | 工具 `run_selfdev_repair` | Agent 单入口；`promote` 默认 false，`high` 风险 + 需确认 |
 
-`/repair` 与原有 `/plan`、`/{id}/apply-inactive`、`/{id}/promote` 共用同一套
-Trusted Core 管理边界，不新增权限模型。
+`/repair` 与 `/{id}/apply-inactive`、`/{id}/promote`、`/{id}/rollback` 共用同一套 Trusted Core
+管理边界（`X-AIive-Trusted-Core-Token`），不新增权限模型。
+
+`/plan`、`/slots`、`/slots/health-check`、`/supervisor`、`GET /requests/{id}` **不带**该 Header 校验，
+沿用既有行为：只读查询、健康探测或仅落库规划，都不直接改写槽位代码。
 
 ## 10. 测试
 
@@ -245,5 +259,7 @@ LLM 使用脚本替身，测试运行器使用假报告，不访问网络、不�
   并发不覆盖；跨进程边界仍由 SlotManager 的指针切换语义兜底，不做分布式锁。
 - **中断恢复不重放规划**：只按 journal 回滚候选槽位并把运行标为 `interrupted*`，
   下次从零重新规划，不续跑中断时的计划。
-- **隔离依赖 runtime 目录**：`candidate_state.json` 与 journal 都在 runtime 下，
-  目录被整体清空则失去"不可晋升"保护。
+- **隔离与恢复分别依赖两个目录**：不可晋升标记在 `slots/<X>/candidate_state.json`，运行日志在
+  `runtime/selfdev/runs/`。清空 `slots/` 会同时丢掉基线、标记与候选代码；清空 `runtime/` 只丢 journal
+  与锁，`slots/<X>/candidate_state.json` 里的不可晋升标记仍在，要等下一次修复结束（成功
+  `mark_promotable`，或失败但回滚成功 `clear_candidate_state`）才会解除。

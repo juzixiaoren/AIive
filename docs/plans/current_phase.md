@@ -301,8 +301,9 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
   读码 → 规划 → `PatchExecutor.apply_to_inactive` → `TargetedTestRunner` →
   失败时按真实错误有限修复（默认 3 轮，硬上限 5）→ `evaluate_promotion_gate` →
   可选 `ReleaseManager.promote()`。
-  `patch_fingerprint` 对相同补丁提前停止；所有失败状态显式（`planner_failed` /
-  `blocked` / `apply_failed` / `tests_failed` / `gate_failed` / `promote_failed`），
+  `patch_fingerprint` 对相同补丁提前停止；所有终态显式（`planner_failed` / `blocked` /
+  `apply_failed` / `tests_failed` / `gate_failed` / `promote_failed` / `candidate_changed` /
+  `repair_busy` / `failed`），
   绝不伪造成功。`persist_repair_run` 落库到 `SelfDevRequest.plan["repair"]` + `PatchOperation`。
 - `selfdev/repair_guard.py`（新增）：补并发控制、候选隔离、中断恢复三件事，不重复版本管理与晋升。
   `RepairLock`：`O_CREAT|O_EXCL` 原子建锁 + owner token，只有持有者能释放、持有者存活时绝不抢占、
@@ -317,7 +318,7 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
   `ReleaseManager`（健康检查 + 安全门 + Supervisor + 观察窗回滚）。
 - API/工具：`POST /api/selfdev/repair`（Trusted Core token 守卫）、
   工具 `run_selfdev_repair`（`high` 风险 + 需确认，`promote` 默认 false）。
-- 文档：`docs/architecture/selfdev_自主修复.md`；CODE_MAP §2.4/§2.8/§3.1/§3.7 同步。
+- 文档：`docs/architecture/selfdev_自主修复.md`；CODE_MAP §2.4/§3.2/§3.6/§3.7 同步。
 
 ### Observable Result
 - 新增 `tests/unit/backend/test_selfdev_repair.py` 28 例全通过（全离线，LLM/测试运行器用替身）：
@@ -342,4 +343,5 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - 默认不自动晋升（`promote=False`）；自动晋升需显式开启，且仍受 ReleaseManager 闸门约束。
 - 并发锁是**本地文件锁**：只约束同一 runtime 目录下的进程；多实例/跨机器并发不覆盖。
 - 中断恢复只按 journal 回滚候选槽位，不重放中断时的规划结果（下次从零重新规划）。
-- 候选隔离依赖 `slots/<X>/candidate_state.json` 与指纹；runtime 目录被整体清空则失去保护。
+- 候选隔离依赖 `slots/<X>/candidate_state.json` 与指纹（在 `slots/` 下，不在 runtime）；
+  `runtime/` 被清空只丢 journal 与锁，不可晋升标记仍在，等下一次修复结束才解除。

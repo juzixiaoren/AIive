@@ -189,7 +189,7 @@
 | `routes_capabilities.py` | `/api/capabilities/plan-from-goal`、`/{plan_id}/activate`；生命周期 `/lifecycle/audit`、`/lifecycle/audit/reconcile`、`/lifecycle/{id}`（status）、`/{id}/verify|enable|disable|upgrade|rollback`、`DELETE /lifecycle/{id}` |
 | `routes_mcp.py` / `routes_mcp_install.py` | `/api/mcp/search`、`/capabilities`；`/{name}/install-sandbox`、`/{id}/smoke` |
 | `routes_skills.py` | `/api/skills`、`/{skill_id}`（catalog + ready/degraded 对照） |
-| `routes_selfdev.py` | `/api/selfdev/slots`、`/plan`、`/repair`、`/{id}/apply-inactive|promote|rollback` |
+| `routes_selfdev.py` | `/api/selfdev/slots`、`/slots/health-check`、`/supervisor`、`/plan`、`/repair`、`GET /requests/{id}`、`/{id}/apply-inactive|promote|rollback`（仅 `/repair` 与三个 `/{id}/...` 需 Trusted Core Token） |
 | `routes_forget.py` | `/api/forget` + `/{operation_key}/status` |
 | `routes_knowledge.py` | `/api/knowledge/ingest`、`/knowledge`、`/knowledge/maintenance`（GET 报告 / POST 清理）、`DELETE /knowledge/{id}`、`/{id}/source`、`/{id}/reindex`、`/search` |
 | `routes_epochs.py` | `/api/epochs/{thread_id}`、`/{id}/seal-segment|rollover` |
@@ -297,8 +297,8 @@
 
 **工具执行三入口**（改执行语义必读）：`execute`（正常 LLM 调用）/ `execute_approved`（人工审批后）/ `execute_brokered`（Task Action 独立执行边界）。读操作直接线程池执行；写外部效应入 Outbox；`executor_kind=desktop_node` 走 `DesktopConnectionManager.dispatch_sync`。
 
-**37 个内置工具清单**（注册于 `builtin_tools.py::register_builtin_tools` L141 起；handler 实现分布于上表 `builtin_*.py` 领域模块，经 `builtin_tools.py` 末尾 re-export 保持导入契约不变）：
-基础：`echo`、`get_current_time`；提醒/任务：`schedule_reminder`、`remind_alert`、`confirm_reminder`、`snooze_reminder`、`list_tasks`、`cancel_task`、`show_notifications`、`dismiss_notifications`；记忆写入：`remember_or_update`、`forget`、`forget_status`、`run_memory_maintenance`；记忆召回：`memory_search`、`memory_timeline`、`memory_event_log`、`history_search`；文件：`safe_delete`、`read_text_file`、`read_document`；知识库：`ingest_document`、`reindex_document`、`search_knowledge`；联网：`web_search`、`fetch_web_page`；MCP：`search_mcp`、`install_mcp_sandbox`、`plan_capability`；自进化：`create_selfdev_plan`、`apply_patch_to_inactive_slot`、`promote_slot`、`rollback_slot`、`run_selfdev_repair`；节奏/注意力：`query_rhythm`、`query_attention`；WorkingState：`update_working_state`。
+**38 个内置工具清单**（注册于 `builtin_tools.py::register_builtin_tools` L141 起；handler 实现分布于上表 `builtin_*.py` 领域模块，经 `builtin_tools.py` 末尾 re-export 保持导入契约不变）：
+基础：`echo`、`get_current_time`；本机 Shell：`run_shell`；提醒/任务：`schedule_reminder`、`remind_alert`、`confirm_reminder`、`snooze_reminder`、`list_tasks`、`cancel_task`、`show_notifications`、`dismiss_notifications`；记忆写入：`remember_or_update`、`forget`、`forget_status`、`run_memory_maintenance`；记忆召回：`memory_search`、`memory_timeline`、`memory_event_log`、`history_search`；文件：`safe_delete`、`read_text_file`、`read_document`；知识库：`ingest_document`、`reindex_document`、`search_knowledge`；联网：`web_search`、`fetch_web_page`；MCP：`search_mcp`、`install_mcp_sandbox`、`plan_capability`；自进化：`create_selfdev_plan`、`apply_patch_to_inactive_slot`、`promote_slot`、`rollback_slot`、`run_selfdev_repair`；节奏/注意力：`query_rhythm`、`query_attention`；WorkingState：`update_working_state`。
 动态补充：桌面节点 14 个 `desktop_*` 能力（`desktop/protocol.py::DESKTOP_CAPABILITIES`）+ MCP 桥接工具（`mcp/bootstrap.py`）。
 
 ### 3.7 `skills/` 与 `mcp/` 与 `selfdev/`
