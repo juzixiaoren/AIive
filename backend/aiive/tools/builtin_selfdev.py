@@ -26,19 +26,33 @@ def handle_apply_patch_to_inactive_slot(operations: list[dict[str, Any]] | None 
                     来自 create_selfdev_plan 的 plan.operations。
     """
     from aiive.selfdev.patch_executor import PatchExecutor
+    from aiive.selfdev.repair_guard import (
+        CandidateSlotGuard,
+        apply_candidate_patch,
+        finalize_candidate_patch,
+    )
     from aiive.selfdev.targeted_test_runner import TargetedTestRunner
 
     frozen = operations or []
-    result = PatchExecutor().apply_to_inactive(frozen)
+    executor = PatchExecutor()
+    # 与自主修复闭环共用同一把候选代码互斥锁与候选状态标记。
+    result = apply_candidate_patch(executor, frozen)
+    if result.get("error") == "concurrent_repair_in_progress":
+        return result
+    test_report = None
     if result.get("operations_applied"):
         changed = [str(item.get("target_file", "")) for item in frozen if item.get("target_file")]
         candidate_root = Path(str(result.get("candidate_root") or ""))
-        result = {
-            **result,
-            "targeted_test_report": TargetedTestRunner(
-                repo_root=candidate_root,
-            ).run_for_changed_files(changed),
-        }
+        test_report = TargetedTestRunner(
+            repo_root=candidate_root,
+        ).run_for_changed_files(changed)
+        result = {**result, "targeted_test_report": test_report}
+    result["candidate_state"] = finalize_candidate_patch(
+        result,
+        tests_ok=isinstance(test_report, dict) and test_report.get("ok") is True,
+        guard=CandidateSlotGuard(manager=getattr(executor, "_manager", None)),
+        reason="targeted_tests_failed" if result.get("operations_applied") else "apply_failed",
+    )
     return result
 
 def handle_promote_slot():
@@ -50,6 +64,19 @@ def handle_promote_slot():
     from aiive.supervisor.client import supervisor_client_from_settings
     from aiive.supervisor.release_manager import ReleaseManager
     return ReleaseManager(client=supervisor_client_from_settings()).promote()
+
+def handle_run_selfdev_repair(
+    goal: str = "", max_rounds: int = 3, promote: bool = False
+):
+    """自主修复闭环：读码 → 规划 → 补丁 → 定向测试 → 有限修复 → 安全门。
+
+    所有修改只进入非活跃槽位；promote=True 时仍需通过现有安全门与
+    ReleaseManager（健康检查、Supervisor 切换、观察窗回滚）。
+    """
+    from aiive.selfdev.repair_loop import SelfDevRepairLoop
+    return SelfDevRepairLoop(max_rounds=max_rounds).run(
+        goal, promote=promote,
+    )
 
 def handle_rollback_slot():
     """回滚到上一个活跃槽位版本。

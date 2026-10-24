@@ -36,20 +36,31 @@ class SelfDevPlanner:
         """
         self._llm_client: LLMClient = llm_client
 
-    def plan(self, goal: str, trace_id: str | None = None) -> dict[str, Any]:
+    def plan(
+        self,
+        goal: str,
+        trace_id: str | None = None,
+        *,
+        context: Any = None,
+        previous_plan: dict[str, Any] | None = None,
+        failure_feedback: str | None = None,
+    ) -> dict[str, Any]:
         """
         根据用户目标生成结构化补丁计划。
 
         参数:
             goal: 用户需求描述文本。
             trace_id: 追踪 ID，可选。
+            context: 只读代码上下文（ProjectContext 或其字典形式），可选。
+            previous_plan: 上一轮已应用但测试失败的补丁计划，可选。
+            failure_feedback: 上一轮测试失败的真实输出，可选。
 
         返回:
             包含 goal_summary、operations、test_plan 等字段的计划字典。
         """
         prompt = get_prompt_registry().render(
             "selfdev.patch_plan",
-            goal=goal,
+            goal=self._compose_goal(goal, context, previous_plan, failure_feedback),
         ).content
         messages = [{"role": "user", "content": prompt}]
 
@@ -61,6 +72,50 @@ class SelfDevPlanner:
             logger.exception("自进化计划生成LLM调用失败")
             raise
         return self._parse(response.content)
+
+    @staticmethod
+    def _compose_goal(
+        goal: str,
+        context: Any = None,
+        previous_plan: dict[str, Any] | None = None,
+        failure_feedback: str | None = None,
+    ) -> str:
+        """把目标、代码上下文与失败反馈拼成单个提示词变量。
+
+        复用 ``selfdev.patch_plan`` 模板（不新增提示词条目），
+        但把只读代码与真实测试错误作为"待规划数据"一并交给模型。
+        """
+        sections: list[str] = [str(goal).strip()]
+        if context:
+            from aiive.selfdev.project_reader import format_context_for_prompt
+
+            sections.append(
+                "# 已读取的仓库代码（只读上下文，来自当前仓库）\n\n"
+                + format_context_for_prompt(context)
+            )
+        if previous_plan:
+            operations = previous_plan.get("operations")
+            lines: list[str] = []
+            if isinstance(operations, list):
+                for operation in operations[:20]:
+                    if not isinstance(operation, dict):
+                        continue
+                    lines.append(
+                        f"- {operation.get('operation', '')} "
+                        + f"{operation.get('target_file', '')}"
+                    )
+            sections.append(
+                "# 上一轮补丁（已应用，但测试未通过）\n\n"
+                + ("\n".join(lines) if lines else "（上一轮没有任何可执行操作）")
+            )
+        if failure_feedback:
+            sections.append(
+                "# 测试失败的真实输出（必须据此修正，不要重复提交相同补丁）\n\n"
+                + "<<<TEST_OUTPUT\n"
+                + str(failure_feedback)[-8000:]
+                + "\nTEST_OUTPUT>>>"
+            )
+        return "\n\n".join(sections)
 
     def _parse(self, raw: str) -> dict[str, Any]:
         """

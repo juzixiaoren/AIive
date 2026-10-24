@@ -10,7 +10,7 @@
 - 文件操作：safe_delete, read_text_file
 - 知识库：ingest_document, reindex_document, search_knowledge
 - MCP 集成：search_mcp, install_mcp_sandbox
-- 自进化：create_selfdev_plan, apply_patch_to_inactive_slot, promote_slot, rollback_slot
+- 自进化：create_selfdev_plan, apply_patch_to_inactive_slot, promote_slot, rollback_slot, run_selfdev_repair
 - 节奏/注意力：query_rhythm, query_attention
 """
 
@@ -165,6 +165,7 @@ from aiive.tools.builtin_selfdev import (
     handle_create_selfdev_plan as _handle_create_selfdev_plan,
     handle_promote_slot as _handle_promote_slot,
     handle_rollback_slot as _handle_rollback_slot,
+    handle_run_selfdev_repair as _handle_run_selfdev_repair,
 )
 from aiive.tools.builtin_web import (
     handle_fetch_web_page as _handle_fetch_web_page,
@@ -386,6 +387,14 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
          }}, "high", True, False),
         ("promote_slot", _handle_promote_slot, "健康检查通过后提升非活跃槽位为活跃", {}, "high", True, False),
         ("rollback_slot", _handle_rollback_slot, "回滚到上一个活跃槽位", {}, "high", True, False),
+        ("run_selfdev_repair", _handle_run_selfdev_repair,
+         "自主修复闭环：读取相关代码 → 生成补丁 → 应用到非活跃槽位 → 定向测试 → "
+         + "失败时按真实错误有限次修复 → 安全门；promote=True 才提交受控晋升",
+         {
+             "goal": {"type": "str", "minLength": 1, "required": True},
+             "max_rounds": {"type": "int", "minimum": 0, "maximum": 5, "description": "默认 3"},
+             "promote": {"type": "bool", "description": "默认 false；true 时仍走安全门"},
+         }, "high", True, False),
         # 节奏 / 注意力
         ("query_rhythm", _handle_query_rhythm, "获取每日节奏摘要", {}, "low", False, False),
         ("query_attention", _handle_query_attention, "只读查询当前注意力状态与空闲评估",
@@ -417,6 +426,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         "apply_patch_to_inactive_slot": "non_repeatable_external",
         "promote_slot": "non_repeatable_external",
         "rollback_slot": "non_repeatable_external",
+        "run_selfdev_repair": "non_repeatable_external",
     }
     network_capabilities = {"web_search", "fetch_web_page", "install_mcp_sandbox"}
     for cap_id, handler, desc, params, risk, writes_ext, can_del in tools:

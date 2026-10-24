@@ -2,6 +2,7 @@
 API路由模块：自进化开发（Self-Dev）
 - 提供代码槽位（Slots）状态查询和健康检查
 - 提供自进化计划（Plan）的创建和查询
+- 提供自主修复闭环（读码 → 规划 → 补丁 → 定向测试 → 有限修复 → 安全门）
 - 提供补丁应用、升级和回滚操作的接口
 """
 import hmac
@@ -37,6 +38,26 @@ def require_trusted_core_admin(
 class PlanRequest(BaseModel):
     """自进化计划请求体"""
     goal: str = Field(..., min_length=1)
+
+
+class RepairRequest(BaseModel):
+    """自主修复闭环请求体。"""
+
+    goal: str = Field(..., min_length=1)
+    max_rounds: int = Field(3, ge=0, le=5, description="测试失败后的最大修复轮次")
+    promote: bool = Field(False, description="安全门通过后是否提交晋升（仍走 ReleaseManager）")
+    run_gate: bool = Field(True, description="是否在晋升前运行 Replay Eval + 内核契约")
+    files: list[str] = Field(default_factory=list, description="可选的仓库相对路径提示")
+
+
+def _build_llm_client() -> LLMClient:
+    """按当前配置构造 LLM 客户端（计划与修复共用）。"""
+    return LLMClient(
+        base_url=settings.aiive_llm_base_url,
+        api_key=settings.aiive_llm_api_key,
+        default_model=settings.aiive_llm_model,
+        timeout_seconds=settings.aiive_llm_timeout_seconds,
+    )
 
 
 # ===================== V11: 槽位管理 =====================
@@ -89,12 +110,7 @@ def create_plan(request: PlanRequest, db: Session = Depends(get_db)):
     Returns:
         创建的计划信息，包含 request_id、trace_id、status 和 plan 详情
     """
-    client = LLMClient(
-        base_url=settings.aiive_llm_base_url,
-        api_key=settings.aiive_llm_api_key,
-        default_model=settings.aiive_llm_model,
-        timeout_seconds=settings.aiive_llm_timeout_seconds,
-    )
+    client = _build_llm_client()
     trace = Trace.new()
     planner = SelfDevPlanner(client)
     plan = planner.plan(request.goal, trace_id=trace.trace_id)
@@ -129,6 +145,43 @@ def create_plan(request: PlanRequest, db: Session = Depends(get_db)):
         "status": req.status,
         "plan": plan,
     }
+
+
+@router.post("/repair")
+def run_repair(
+    request: RepairRequest,
+    db: Session = Depends(get_db),
+    _authorized: None = Depends(require_trusted_core_admin),
+) -> dict[str, Any]:
+    """执行自主修复闭环并落库。
+
+    流程：读取相关代码 → 生成补丁 → 应用到非活跃槽位 → 定向测试 →
+    失败时按真实错误有限次修复 → 安全门（内核契约 + Replay Eval）→
+    可选受控晋升（仍由 ReleaseManager / Supervisor 执行健康检查与回滚）。
+
+    所有代码修改只进入非活跃槽位；未通过测试或安全门的候选版本不会晋升。
+
+    并发：同一项目同一时间只允许一个修复流程。已有修复在跑时不排队、不覆盖，
+    直接返回 ``status="repair_busy"``（ok=False，``lock.holder`` 给出持有者），
+    调用方可稍后重试。中断恢复：上一次运行若在任意阶段被强杀，本次调用会先
+    按运行日志把候选槽位回滚到基线（或显式隔离），再开始新一轮。
+    """
+    from aiive.selfdev.repair_loop import SelfDevRepairLoop, persist_repair_run
+
+    trace = Trace.new()
+    loop = SelfDevRepairLoop(
+        llm_client=_build_llm_client(),
+        max_rounds=request.max_rounds,
+    )
+    record = loop.run(
+        request.goal,
+        trace_id=trace.trace_id,
+        files=request.files or None,
+        promote=request.promote,
+        run_gate=request.run_gate,
+    )
+    persist_repair_run(db, record)
+    return record
 
 
 @router.get("/requests/{request_id}")
@@ -202,14 +255,27 @@ def apply_inactive(
         raise HTTPException(status_code=404, detail="请求不存在")
 
     from aiive.selfdev.patch_executor import PatchExecutor
-
+    from aiive.selfdev.repair_guard import (
+        apply_candidate_patch,
+        finalize_candidate_patch,
+    )
     from aiive.selfdev.trusted_core import validate_operations
+
     issues = validate_operations(req.operations)
     if issues:
         raise HTTPException(status_code=403, detail={"error": "trusted_core_policy_denied", "issues": issues})
 
     executor = PatchExecutor()
-    result = executor.apply_to_inactive(req.operations)
+    # 与自主修复闭环共用同一把候选代码互斥锁：并发的修复流程不会互相覆盖。
+    result = apply_candidate_patch(executor, req.operations)
+    if result.get("error") == "concurrent_repair_in_progress":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "concurrent_repair_in_progress",
+                "holder": result.get("holder") or {},
+            },
+        )
 
     applied = result.get("operations_applied", [])
     failed = result.get("operations_failed", [])
@@ -238,6 +304,18 @@ def apply_inactive(
         except Exception as e:
             test_report = {"ok": False, "error": f"targeted test runner crashed: {e}"}
         sreq.plan = {**(sreq.plan or {}), "targeted_test_report": test_report}
+
+    # 候选状态定级：定向测试通过才登记为可晋升（并绑定代码指纹），
+    # 否则显式标记不可晋升，避免失败代码被后续 promote 误用。
+    from aiive.selfdev.repair_guard import CandidateSlotGuard
+
+    tests_ok = isinstance(test_report, dict) and test_report.get("ok") is True
+    result["candidate_state"] = finalize_candidate_patch(
+        result,
+        tests_ok=tests_ok,
+        guard=CandidateSlotGuard(manager=getattr(executor, "_manager", None)),
+        reason="targeted_tests_failed" if applied else "apply_failed",
+    )
 
     db.commit()
 

@@ -10,7 +10,7 @@ from typing import Any
 
 from aiive.eval.gate import evaluate_promotion_gate
 from aiive.supervisor.health_probe import HealthProbe
-from aiive.supervisor.slot_manager import SlotManager
+from aiive.supervisor.slot_manager import SlotManager, candidate_promotion_block
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,12 @@ class PromoteRollback:
         inactive_slot = next((s for s in slots if s.name == inactive), None)
         if not inactive_slot:
             return {"ok": False, "error": "Inactive slot not found"}
+
+        # 候选状态核对（fail-closed）：修复流程标记为不可晋升、或验证后代码
+        # 被改动的槽位一律不得晋升。与 ReleaseManager 共用同一份判定。
+        blocked = candidate_promotion_block(inactive_slot.root)
+        if blocked is not None:
+            return {"ok": False, "error": blocked}
 
         # 对非活跃槽位执行健康检查（可跳过）
         if run_health_check:

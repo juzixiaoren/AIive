@@ -12,7 +12,12 @@ from uuid import uuid4
 from aiive.eval.gate import SafetyGate, evaluate_promotion_gate
 from aiive.supervisor.client import SupervisorClient
 from aiive.supervisor.health_probe import HealthProbe
-from aiive.supervisor.slot_manager import ACTIVE_SLOT_FILE, SlotManager
+from aiive.supervisor.slot_manager import (
+    ACTIVE_SLOT_FILE,
+    SlotManager,
+    candidate_promotion_block,
+    read_candidate_state,
+)
 
 
 _release_lock = threading.Lock()
@@ -56,6 +61,11 @@ class ReleaseManager:
             if previous not in {"A", "B"}:
                 return {"ok": False, "error": "invalid_active_slot"}
             current = "B" if previous == "A" else "A"
+            # 候选版本核对（fail-closed）：被修复流程标记为不可晋升的槽位、
+            # 或验证之后代码又被改动的槽位，一律不得晋升。
+            blocked = self._candidate_block(current)
+            if blocked is not None:
+                return blocked
             pre_switch_health = self._check_slot(current)
             if not pre_switch_health["healthy"]:
                 return {
@@ -237,6 +247,27 @@ class ReleaseManager:
             return raw if isinstance(raw, dict) else {}
         except (OSError, ValueError):
             return {}
+
+    def _candidate_block(self, name: str) -> dict[str, Any] | None:
+        """晋升前的候选版本核对：返回阻断结果，或 None 表示放行。
+
+        只对"由修复流程登记过状态"的槽位生效（无状态文件的槽位保持原有行为）：
+        - promotable=False：该槽位装着失败/未验证的代码，禁止晋升；
+        - 指纹与登记值不一致：验证之后代码被改动，禁止晋升。
+        """
+        slot = next(
+            (item for item in self._manager.list_slots() if item.name == name), None,
+        )
+        if slot is None:
+            return None
+        blocked = candidate_promotion_block(slot.root)
+        if blocked is None:
+            return None
+        return {
+            "ok": False,
+            "error": blocked,
+            "candidate_state": read_candidate_state(slot.root),
+        }
 
     def _check_slot(self, name: str) -> dict[str, Any]:
         slot = next((item for item in self._manager.list_slots() if item.name == name), None)

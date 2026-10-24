@@ -10,7 +10,7 @@ import logging
 import shutil
 from pathlib import Path
 
-from aiive.supervisor.slot_manager import SlotManager
+from aiive.supervisor.slot_manager import SlotManager, sync_app_tree
 from aiive.tools.safe_delete import get_scope_registry, safe_delete
 from typing import Any
 
@@ -83,11 +83,9 @@ class PatchExecutor:
         # 总是得到 "active 基线 + 本次操作" 的确定结果）。
         src_app = active_slot.root / "app"
         dst_app = inactive_slot.root / "app"
-        if src_app.exists():
-            if dst_app.exists():
-                shutil.rmtree(dst_app)
-            shutil.copytree(src_app, dst_app)
-        dst_app.mkdir(parents=True, exist_ok=True)
+        # 与 CandidateSlotGuard.restore 共用同一份"整树同步"实现，
+        # 保证"应用补丁"和"失败回滚"得到完全相同的基线语义。
+        sync_app_tree(src_app, dst_app)
         dst_app_resolved = dst_app.resolve()
 
         # 第三步：逐一应用操作

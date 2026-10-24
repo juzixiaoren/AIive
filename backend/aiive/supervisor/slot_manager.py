@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,16 @@ class SlotManager:
         """
         self._base_dir: Path = base_dir or SLOTS_ROOT
         self._active_file: Path = base_dir.parent / "runtime" / "active_slot" if base_dir else ACTIVE_SLOT_FILE
+
+    @property
+    def base_dir(self) -> Path:
+        """槽位根目录（A/B 所在目录）。"""
+        return self._base_dir
+
+    @property
+    def runtime_dir(self) -> Path:
+        """运行时目录：与 active_slot 标记文件同级。"""
+        return self._active_file.parent
 
     def get_active_slot(self) -> str:
         """
@@ -155,6 +166,120 @@ def _compute_manifest_checksum(manifest: dict[str, Any]) -> str:
     """
     raw = json.dumps(manifest, sort_keys=True)
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+# 候选槽位状态文件：与 app/ 同级，记录该槽位当前是否允许晋升。
+CANDIDATE_STATE_FILE = "candidate_state.json"
+
+# 指纹计算时忽略的目录：构建产物与缓存不属于候选代码语义。
+_FINGERPRINT_IGNORED_DIRS: frozenset[str] = frozenset({
+    "__pycache__", ".git", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    "node_modules", ".venv", "dist", "build", ".next", "coverage",
+})
+_FINGERPRINT_IGNORED_SUFFIXES: frozenset[str] = frozenset({".pyc", ".pyo"})
+
+
+def tree_fingerprint(root: Path | str | None) -> str | None:
+    """计算目录树的确定性指纹（相对路径 + 文件内容 SHA-256）。
+
+    参数:
+        root: 目录路径；None 或目录不存在时返回 None。
+
+    返回:
+        十六进制指纹字符串；**None 表示"无法验证"**，调用方必须按失败处理，
+        不能当成"验证通过"。
+    """
+    if root is None:
+        return None
+    base = Path(root)
+    if not base.is_dir():
+        return None
+    entries: list[str] = []
+    for path in sorted(base.rglob("*")):
+        try:
+            if not path.is_file():
+                continue
+            relative = path.relative_to(base).as_posix()
+        except OSError:
+            continue
+        if any(part in _FINGERPRINT_IGNORED_DIRS for part in relative.split("/")[:-1]):
+            continue
+        if path.suffix in _FINGERPRINT_IGNORED_SUFFIXES:
+            continue
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1 << 20), b""):
+                    digest.update(chunk)
+        except OSError:
+            continue
+        entries.append(f"{relative}:{digest.hexdigest()}")
+    return hashlib.sha256("\n".join(entries).encode("utf-8")).hexdigest()
+
+
+def sync_app_tree(source_app: Path, target_app: Path) -> None:
+    """把 source_app 完整同步为 target_app（先删旧树，再整树复制）。"""
+    if source_app.exists():
+        if target_app.exists():
+            shutil.rmtree(target_app)
+        shutil.copytree(source_app, target_app)
+    target_app.mkdir(parents=True, exist_ok=True)
+
+
+def candidate_state_path(slot_root: Path | str) -> Path:
+    """槽位候选状态文件路径。"""
+    return Path(slot_root) / CANDIDATE_STATE_FILE
+
+
+def read_candidate_state(slot_root: Path | str) -> dict[str, Any]:
+    """读取槽位候选状态；文件不存在或损坏时返回空字典。"""
+    try:
+        raw = json.loads(candidate_state_path(slot_root).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def write_candidate_state(slot_root: Path | str, payload: dict[str, Any]) -> None:
+    """原子写入槽位候选状态。"""
+    path = candidate_state_path(slot_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / f".{path.name}.{uuid4().hex}.tmp"
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def clear_candidate_state(slot_root: Path | str) -> None:
+    """删除槽位候选状态文件。"""
+    candidate_state_path(slot_root).unlink(missing_ok=True)
+
+
+def candidate_promotion_block(slot_root: Path | str) -> str | None:
+    """晋升前的候选状态核对（fail-closed）：返回阻断原因，None 表示放行。
+
+    - 状态标记 promotable=false：槽位里是失败/未验证的代码，禁止晋升；
+    - 登记的代码指纹与当前 app/ 不一致：验证之后代码被改动，禁止晋升。
+    没有状态文件时返回 None，保持未接入修复流程的槽位原有行为。
+    """
+    state = read_candidate_state(slot_root)
+    if not state:
+        return None
+    if state.get("promotable") is False:
+        return "candidate_not_promotable: " + str(state.get("reason") or "unknown")
+    expected = str(state.get("fingerprint") or "")
+    if not expected:
+        return None
+    if tree_fingerprint(Path(slot_root) / "app") != expected:
+        return (
+            "candidate_fingerprint_mismatch: candidate code changed after verification"
+        )
+    return None
 
 
 def create_version_manifest(slot: str, version: str = "0.1.0") -> dict[str, Any]:
