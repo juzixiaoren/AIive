@@ -282,3 +282,64 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - 对象级问题（孤儿对象 / 原文丢失）每日对账一次，不触发即时入队（需遍历文件系统）。
 - 不做原文哈希全量巡检：完整性在读取路径 `get_verified` 校验。
 - `deleted` 墓碑行不自动清理（体量小，保留审计）。
+
+---
+
+## V40 自主修复闭环（完成）
+
+### Implemented
+- `selfdev/project_reader.py`（新增）：`ProjectReader` 仓库范围内只读、有界检索/读取；
+  `collect_context` 提取目标中的文件路径/标识符 → 检索 → 取命中最多文件 → 附带同名测试；
+  `format_context_for_prompt` 渲染提示词片段。拒绝绝对路径/`..`/符号链接逃逸、
+  `.env`/`*.pem`/`*.key`/`*.db`/`*.log`、`.git/.venv/node_modules/data/runtime/slots` 等。
+  新增原因：`read_text_file` 硬限定 `~/Documents`，`run_shell` 受 TaskScope/审批约束，
+  都不能用于服务端读仓库源码；未重复实现任何写文件工具。
+- `selfdev/planner.py`：`plan(..., context=, previous_plan=, failure_feedback=)`，
+  复用同一个 `selfdev.patch_plan` 提示词（不新增提示词条目），把只读代码与真实测试错误
+  作为待规划数据注入；原有单参数调用完全兼容。
+- `selfdev/repair_loop.py`（新增）：`SelfDevRepairLoop.run` 串起
+  读码 → 规划 → `PatchExecutor.apply_to_inactive` → `TargetedTestRunner` →
+  失败时按真实错误有限修复（默认 3 轮，硬上限 5）→ `evaluate_promotion_gate` →
+  可选 `ReleaseManager.promote()`。
+  `patch_fingerprint` 对相同补丁提前停止；所有失败状态显式（`planner_failed` /
+  `blocked` / `apply_failed` / `tests_failed` / `gate_failed` / `promote_failed`），
+  绝不伪造成功。`persist_repair_run` 落库到 `SelfDevRequest.plan["repair"]` + `PatchOperation`。
+- `selfdev/repair_guard.py`（新增）：补并发控制、候选隔离、中断恢复三件事，不重复版本管理与晋升。
+  `RepairLock`：`O_CREAT|O_EXCL` 原子建锁 + owner token，只有持有者能释放、持有者存活时绝不抢占、
+  死进程陈旧锁可接管，占用时返回 `repair_busy`。`CandidateSlotGuard`：改写前记活跃槽位基线指纹并
+  `mark_not_promotable`，失败整树 `restore` 并复核指纹，恢复不了就隔离为不可晋升。
+  `RepairJournal` + `recover_interrupted`：阶段快照落 `runtime/selfdev/runs/<run_id>.json`（终态保留 7 天），
+  下次运行前按日志回滚上次中断，状态只写 `interrupted*`。
+  `RepairLoop.run` 改为：取锁 → 恢复中断 → 闭环；`ReleaseManager._candidate_block` 晋升前核对
+  不可晋升标记与指纹；手工 `apply-inactive` 同样受锁与标记约束。
+- 安全边界：本模块没有直接写文件/执行 shell 的代码；写入只经 `PatchExecutor`
+  （非活跃槽位 + Trusted Core + 路径穿越 + safe_delete 四层校验），晋升只经
+  `ReleaseManager`（健康检查 + 安全门 + Supervisor + 观察窗回滚）。
+- API/工具：`POST /api/selfdev/repair`（Trusted Core token 守卫）、
+  工具 `run_selfdev_repair`（`high` 风险 + 需确认，`promote` 默认 false）。
+- 文档：`docs/architecture/selfdev_自主修复.md`；CODE_MAP §2.4/§2.8/§3.1/§3.7 同步。
+
+### Observable Result
+- 新增 `tests/unit/backend/test_selfdev_repair.py` 28 例全通过（全离线，LLM/测试运行器用替身）：
+  补丁指纹稳定性与敏感性、一轮修复成功、轮次耗尽失败、相同补丁提前停止、阻塞计划不应用、
+  应用失败、规划器异常、安全门失败/异常 fail-closed、晋升请求/失败/禁用、
+  真实 `PatchExecutor` 只改非活跃槽位、ProjectReader 检索与拒绝边界、
+  Planner 上下文/错误注入、持久化与路由/工具接线。
+- 新增 `tests/unit/backend/test_selfdev_repair_guard.py` 25 例全通过（全离线）：锁互斥/陈旧接管/
+  越权释放、三类失败后候选回滚与恢复失败隔离、安全门后候选被改即阻断、三方指纹绑定、
+  journal 阶段与终态、中断恢复六种终态与幂等、晋升前标记核对、手工 apply 的锁与标记约束。
+- 回归：`test_selfdev_planner.py`、`test_patch_executor.py`、`test_targeted_test_runner.py`、
+  `test_prompt_registry.py`、`test_identity_memory.py`、`test_tool_registry.py` 共 55 例全通过
+  （清理后复跑 108 例仍全过）。
+- 全量离线：`1070 passed / 10 skipped / 0 failed`（163.31s；10 skipped 为 PG 专项默认未启用）。
+- ruff `--select F,E9` 改动文件 All checks passed；新增文件默认规则亦全过；
+  basedpyright `backend`：0 errors / 0 warnings / 0 notes（tests 不在类型检查基线内）。
+
+### Known Gaps
+- 不做语义级代码理解（无 AST/调用图）：ProjectReader 是子串检索 + 文件读取。
+- LLM 生成完整文件内容而非 diff，大文件 token 成本高；靠 40KB/120KB 上限兜底。
+- 定向测试依赖 `TEST_MAPPING`；未登记目录会 fail-closed，需要人工补映射。
+- 默认不自动晋升（`promote=False`）；自动晋升需显式开启，且仍受 ReleaseManager 闸门约束。
+- 并发锁是**本地文件锁**：只约束同一 runtime 目录下的进程；多实例/跨机器并发不覆盖。
+- 中断恢复只按 journal 回滚候选槽位，不重放中断时的规划结果（下次从零重新规划）。
+- 候选隔离依赖 `slots/<X>/candidate_state.json` 与指纹；runtime 目录被整体清空则失去保护。

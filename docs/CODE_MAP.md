@@ -126,6 +126,8 @@
 | 内置 MCP（aiive-essentials） | `mcp/builtin.py`、`mcp/builtin_server.py` | `main.py` lifespan | `test_mcp_builtin*.py` |
 | 内置 Skill catalog | `skills/catalog.py` + `skills/builtin/*/SKILL.md` | `api/routes_skills.py`、`task_runtime/tools.py` | `test_skills*.py` |
 | 自进化：补丁计划 | `selfdev/planner.py`、`selfdev/trusted_core.py` | `api/routes_selfdev.py` | `test_selfdev*.py` |
+| 自进化：自主修复闭环（读码→补丁→测试→有限修复→安全门） | `selfdev/repair_loop.py::SelfDevRepairLoop`、`selfdev/project_reader.py::ProjectReader` | `api/routes_selfdev.py::/repair`、`tools/builtin_selfdev.py::handle_run_selfdev_repair`、`eval/gate.py::evaluate_promotion_gate`、`supervisor/release_manager.py::promote` | `test_selfdev_repair.py` |
+| 自进化：修复并发锁 / 候选隔离 / 中断恢复 | `selfdev/repair_guard.py`（`RepairLock` owner-token 锁、`CandidateSlotGuard` 基线+指纹+恢复+不可晋升标记、`RepairJournal` 阶段日志、`recover_interrupted`）、`supervisor/slot_manager.py`（`tree_fingerprint`/`sync_app_tree`/`candidate_state.json` 读写） | `selfdev/repair_loop.py::run`（取锁→恢复→闭环，失败回滚）、`supervisor/release_manager.py::_candidate_block`（晋升前核对不可晋升标记与指纹） | `test_selfdev_repair_guard.py` |
 | 自进化：槽位 promote/rollback | `supervisor/release_manager.py`（生产晋升入口）、`selfdev/promote_rollback.py`、`selfdev/patch_executor.py` | `supervisor/slot_manager.py` | `test_release_manager.py`、`test_selfdev_slot*.py` |
 | 自进化：进程托管（真实启停/健康/回滚） | `supervisor/daemon.py`（`Supervisor` 守护循环）、`supervisor/process_control.py`（`ProcessController` 启停与所有权）、`supervisor/health_http.py`（HTTP 探针）、`supervisor/control.py`（请求/事件/锁）、`supervisor/client.py`（应用侧客户端） | `api/routes_selfdev.py::supervisor_status`、`release_manager.py::promote`（`client` 注入）、`worker/scheduler_daemon.py::_release_monitor_job` | `test_supervisor_lifecycle.py` |
 | 自进化：安全闸门（Replay Eval + Kernel Contract Checks） | `eval/`（`contracts.py`/`replay.py`/`gate.py`/`scenarios.py`/`persistence.py`/`cli.py`/`models.py`） | `supervisor/release_manager.py::promote` 与 `selfdev/promote_rollback.py::promote`（共用 `eval/gate.py::evaluate_promotion_gate`，fail-closed）、`api/routes_eval.py`（只读查询 `/api/eval/runs`、`/runs/latest`） | `tests/unit/backend/test_eval_*.py`、`test_release_manager.py` |
@@ -187,7 +189,7 @@
 | `routes_capabilities.py` | `/api/capabilities/plan-from-goal`、`/{plan_id}/activate`；生命周期 `/lifecycle/audit`、`/lifecycle/audit/reconcile`、`/lifecycle/{id}`（status）、`/{id}/verify|enable|disable|upgrade|rollback`、`DELETE /lifecycle/{id}` |
 | `routes_mcp.py` / `routes_mcp_install.py` | `/api/mcp/search`、`/capabilities`；`/{name}/install-sandbox`、`/{id}/smoke` |
 | `routes_skills.py` | `/api/skills`、`/{skill_id}`（catalog + ready/degraded 对照） |
-| `routes_selfdev.py` | `/api/selfdev/slots`、`/plan`、`/{id}/apply-inactive|promote|rollback` |
+| `routes_selfdev.py` | `/api/selfdev/slots`、`/plan`、`/repair`、`/{id}/apply-inactive|promote|rollback` |
 | `routes_forget.py` | `/api/forget` + `/{operation_key}/status` |
 | `routes_knowledge.py` | `/api/knowledge/ingest`、`/knowledge`、`/knowledge/maintenance`（GET 报告 / POST 清理）、`DELETE /knowledge/{id}`、`/{id}/source`、`/{id}/reindex`、`/search` |
 | `routes_epochs.py` | `/api/epochs/{thread_id}`、`/{id}/seal-segment|rollover` |
@@ -295,8 +297,8 @@
 
 **工具执行三入口**（改执行语义必读）：`execute`（正常 LLM 调用）/ `execute_approved`（人工审批后）/ `execute_brokered`（Task Action 独立执行边界）。读操作直接线程池执行；写外部效应入 Outbox；`executor_kind=desktop_node` 走 `DesktopConnectionManager.dispatch_sync`。
 
-**36 个内置工具清单**（注册于 `builtin_tools.py::register_builtin_tools` L141 起；handler 实现分布于上表 `builtin_*.py` 领域模块，经 `builtin_tools.py` 末尾 re-export 保持导入契约不变）：
-基础：`echo`、`get_current_time`；提醒/任务：`schedule_reminder`、`remind_alert`、`confirm_reminder`、`snooze_reminder`、`list_tasks`、`cancel_task`、`show_notifications`、`dismiss_notifications`；记忆写入：`remember_or_update`、`forget`、`forget_status`、`run_memory_maintenance`；记忆召回：`memory_search`、`memory_timeline`、`memory_event_log`、`history_search`；文件：`safe_delete`、`read_text_file`、`read_document`；知识库：`ingest_document`、`reindex_document`、`search_knowledge`；联网：`web_search`、`fetch_web_page`；MCP：`search_mcp`、`install_mcp_sandbox`、`plan_capability`；自进化：`create_selfdev_plan`、`apply_patch_to_inactive_slot`、`promote_slot`、`rollback_slot`；节奏/注意力：`query_rhythm`、`query_attention`；WorkingState：`update_working_state`。
+**37 个内置工具清单**（注册于 `builtin_tools.py::register_builtin_tools` L141 起；handler 实现分布于上表 `builtin_*.py` 领域模块，经 `builtin_tools.py` 末尾 re-export 保持导入契约不变）：
+基础：`echo`、`get_current_time`；提醒/任务：`schedule_reminder`、`remind_alert`、`confirm_reminder`、`snooze_reminder`、`list_tasks`、`cancel_task`、`show_notifications`、`dismiss_notifications`；记忆写入：`remember_or_update`、`forget`、`forget_status`、`run_memory_maintenance`；记忆召回：`memory_search`、`memory_timeline`、`memory_event_log`、`history_search`；文件：`safe_delete`、`read_text_file`、`read_document`；知识库：`ingest_document`、`reindex_document`、`search_knowledge`；联网：`web_search`、`fetch_web_page`；MCP：`search_mcp`、`install_mcp_sandbox`、`plan_capability`；自进化：`create_selfdev_plan`、`apply_patch_to_inactive_slot`、`promote_slot`、`rollback_slot`、`run_selfdev_repair`；节奏/注意力：`query_rhythm`、`query_attention`；WorkingState：`update_working_state`。
 动态补充：桌面节点 14 个 `desktop_*` 能力（`desktop/protocol.py::DESKTOP_CAPABILITIES`）+ MCP 桥接工具（`mcp/bootstrap.py`）。
 
 ### 3.7 `skills/` 与 `mcp/` 与 `selfdev/`
@@ -304,7 +306,7 @@
 - `skills/catalog.py`：`SkillDefinition` L10（`as_dict(include_instructions=False)` L23）；`_DEFINITIONS` L35-92（4 个：document_processing/web_research/knowledge_base/mcp_management）；`list_skills()` L100、`get_skill()` L108；指令文本在 `skills/builtin/<id>/SKILL.md`。被 `task_runtime/tools.py:43`、`task_runtime/context_assembler.py:111`、`api/routes_skills.py` 使用。
 - `mcp/`：`discovery.py`（`_BUILTIN_CATALOG` L61-110、`search_mcp_candidates` L113、`allowed_npm_packages` L193）；`capability_planner.py`（`plan_from_goal` L118、`_compute_risk` L170）；`installer.py`（`SANDBOX_ROOT` L39=`<repo>/.data/mcp_sandbox`、`install_to_dir` L169（装到指定/版本化目录，供升级）、`install_sandbox` L253、`run_smoke` L375（`auto_activate=False` 只到 verified））；`runtime_client.py`（`MCPRuntimeClient` L361、每能力长驻 `_SessionWorker`、`get_runtime_client` L534）；`bootstrap.py`（`register_capability_tools` L121 untrusted 包装、`capability_tool_ids` L195、`registered_tool_ids` L208、`unregister_capability_tools` L227、`activate_capability_tools` L243、`restore_active_capabilities` L283 启动恢复）；`builtin.py`（`ensure_builtin_mcp_capability` L83、`BUILTIN_MCP_TOOLS` L17-57）；`builtin_server.py`（FastMCP stdio server，3 工具）。
 - `capability/`：`states.py`（`CapabilityState` L22、`LIFECYCLE_TRANSITIONS`、`ensure_transition`——非法转换抛 `InvalidCapabilityTransition`）；`lifecycle.py`（`CapabilityLifecycleService` L143：`status/verify/probe/enable/disable/upgrade/rollback/uninstall/audit/reconcile`，进程内 `_capability_lock` L75 + DB `FOR UPDATE`，生命周期元数据写 `definition["lifecycle"]`，历史有界 20 条）。
-- `selfdev/`：`trusted_core.py`（`TRUSTED_CORE_PREFIXES` L9-23，13 条受保护路径，fail-closed）；`planner.py`（LLM 生成 patch plan+逐条校验）；`patch_executor.py`（`apply_to_inactive`：复制活跃槽位基线→应用）；`targeted_test_runner.py`（按变更文件前缀匹配测试，frontend 变更跑 `npm run build`）；`promote_rollback.py`（health check + 安全门后切活跃槽位指针；与 `release_manager.promote` 共用 `evaluate_promotion_gate`，无生产调用方）。
+- `selfdev/`：`trusted_core.py`（`TRUSTED_CORE_PREFIXES` L9-23，13 条受保护路径，fail-closed）；`planner.py`（LLM 生成 patch plan+逐条校验；`plan(..., context=, previous_plan=, failure_feedback=)` 复用同一提示词注入只读代码与真实测试错误）；`project_reader.py`（`ProjectReader`：仓库范围内只读、有界检索/读取，拒绝密钥与 `.data/runtime/slots`；`format_context_for_prompt`）；`patch_executor.py`（`apply_to_inactive`：复制活跃槽位基线→应用）；`targeted_test_runner.py`（按变更文件前缀匹配测试，frontend 变更跑 `npm run build`）；`repair_loop.py`（`SelfDevRepairLoop`：读码→规划→应用→定向测试→有限修复→安全门→可选晋升；`patch_fingerprint` 去重、`persist_repair_run` 落库；`run` 先取 `RepairLock`（占用时返回 `repair_busy`）→ `recover_interrupted` 恢复上次中断 → 闭环，失败走 `_abort` 回滚候选槽位）；`repair_guard.py`（`RepairLock`：`O_EXCL` + owner token，只有持有者能释放、持有进程存活时绝不抢占、进程死亡后可接管；`CandidateSlotGuard`：`capture_baseline` 记活跃槽位版本+指纹、`mark_not_promotable`/`mark_promotable` 写 `slots/<X>/candidate_state.json`、`restore` 整树回滚并复核指纹；`RepairJournal`：`runtime/selfdev/runs/<run_id>.json` 阶段快照（随槽位 runtime 目录，无基线时不写）+ 7 天终态清理；`recover_interrupted`：跳过存活持有者，按日志回滚/隔离，状态只写 `interrupted*`）；`promote_rollback.py`（health check + 安全门后切活跃槽位指针；与 `release_manager.promote` 共用 `evaluate_promotion_gate`，无生产调用方）。
 
 ### 3.8 `worker/` — Outbox 事务队列 + 调度守护
 
@@ -347,7 +349,7 @@
   - `chunker.py`、`document_reader.py`（TXT/MD/HTML/JSON/CSV/TSV/DOCX/PDF）、`access.py`（访问控制）。
   - 设计说明见 `docs/architecture/knowledge_维护.md`。
 - `supervisor/`：
-  - `slot_manager.py`：A/B 槽位与 `runtime/active_slot` 原子写（manifest excludes 含 data/postgres/object_store/logs/.env/slots/runtime）。
+  - `slot_manager.py`：A/B 槽位与 `runtime/active_slot` 原子写（manifest excludes 含 data/postgres/object_store/logs/.env/slots/runtime）；另有 `tree_fingerprint(app)`（相对路径+内容 SHA-256，忽略 `__pycache__`/构建产物，返回 None 表示"无法验证"）、`sync_app_tree`（整树同步，apply 与回滚共用）、`read/write/clear_candidate_state`（`slots/<X>/candidate_state.json`：`promotable`/`fingerprint`/`run_id`/`reason`）。
   - `health_probe.py`：槽位静态健康（manifest、app 目录、槽位内 `import aiive.main`）；`launcher.py`：槽位状态概览。
   - `release_manager.py`：**生产晋升入口**，先静态健康 + 安全门 `evaluate_promotion_gate`，再决定"自己切指针"还是"交给 Supervisor"（`client` 注入；未启用时保持指针切换 + 观察窗回滚）。
   - `daemon.py`：`Supervisor` 守护循环（recover/tick/run_forever），负责暂存端口验证、主端口切换、观察窗监测、异常退出重启预算、中断切换恢复；`python -m aiive.supervisor.daemon` 为独立进程入口。
@@ -664,6 +666,7 @@ api/routes_agent_tasks.py 创建任务 → task_runtime/repository.py::create_ta
 - 闸门契约口径：`check_memory_single_source` 改为按 `memory_key_registry` 的 cardinality 判定（multi/未注册键的多条 active 合法），与 `MemoryStore._infer_cardinality`、`memory_maintenance_planner` 的既有口径一致。
 - gate severity 语义落地：仅 critical 失败阻断；warning 失败（`check_context_snapshot_persisted`）记入 `GateResult.notes` 不阻断。
 - 晋升双入口共用 `evaluate_promotion_gate`；`ReleaseManager.promote(run_gate=True)` 为生产路径（REST 与 `promote_slot` 工具），回滚刻意不设闸门。
+- 晋升前另有一道**候选状态核对**（`ReleaseManager._candidate_block`，fail-closed）：槽位 `candidate_state.json` 为 `promotable=false`（修复失败/中断/恢复失败）或当前 `app/` 指纹与登记指纹不一致（验证后代码被改动）时直接阻断；无状态文件的槽位保持原有行为。
 
 ### 10.6 测试分层入口与耗时基线（2026-10-21）
 
