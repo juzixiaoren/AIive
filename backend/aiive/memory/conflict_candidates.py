@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -44,6 +45,23 @@ _CONFLICT_STATES = (LifecycleState.ACTIVE.value, LifecycleState.SLEEPING.value)
 
 # 实体别名兜底匹配的扫描上限（有界查询，避免稠密图全表扫描）
 _ALIAS_SCAN_LIMIT = 300
+
+# 实体绑定候选的来源标记（仅描述"为什么把它列为候选"，不构成合并依据）
+ENTITY_MATCH_EXACT = "exact_name"
+ENTITY_MATCH_ALIAS = "alias"
+ENTITY_MATCH_TOKEN = "token_overlap"
+ENTITY_MATCH_CONTAINS = "contains"
+ENTITY_MATCH_RELATION = "relation"
+
+# 每次裁决最多给模型多少个实体候选（有界，避免提示词膨胀）
+_ENTITY_CANDIDATE_LIMIT = 6
+_MATCH_STRENGTH = {
+    ENTITY_MATCH_EXACT: 4,
+    ENTITY_MATCH_ALIAS: 3,
+    ENTITY_MATCH_TOKEN: 2,
+    ENTITY_MATCH_CONTAINS: 1,
+    ENTITY_MATCH_RELATION: 1,
+}
 
 
 @dataclass
@@ -81,6 +99,40 @@ class ConflictCandidate:
 
 
 @dataclass
+class EntityCandidate:
+    """一个"可能就是这个名称所指"的既有实体（交给 LLM 判断，不直接合并）。
+
+    候选只说明为什么把它列出来（精确名 / 别名 / 词重叠 / 字符串包含 / 出现在
+    相关关系里），身份是否相同由同一次裁决里的 LLM 判断，服务端再校验。
+    """
+
+    entity_id: str
+    display_name: str
+    normalized_name: str
+    entity_type: str
+    aliases: list[str]
+    scope_type: str
+    scope_id: str | None
+    matched_by: list[str] = field(default_factory=list)
+    matched_names: list[str] = field(default_factory=list)
+    relation_ids: list[str] = field(default_factory=list)
+
+    def to_evidence(self) -> dict[str, Any]:
+        return {
+            "entity_id": self.entity_id,
+            "display_name": self.display_name,
+            "normalized_name": self.normalized_name,
+            "entity_type": self.entity_type,
+            "aliases": list(self.aliases),
+            "scope_type": self.scope_type,
+            "scope_id": self.scope_id,
+            "matched_by": list(self.matched_by),
+            "matched_names": list(self.matched_names),
+            "relation_ids": list(self.relation_ids),
+        }
+
+
+@dataclass
 class CandidateDiscovery:
     """一次候选发现的结果。"""
 
@@ -88,9 +140,18 @@ class CandidateDiscovery:
     graph_evidence: list[dict[str, Any]] = field(default_factory=list)
     exact_conflict: bool = False
     notes: list[str] = field(default_factory=list)
+    # 实体绑定：需要消歧的事实名称 + 可复用的实体候选
+    entity_candidates: list[EntityCandidate] = field(default_factory=list)
+    pending_entity_names: list[str] = field(default_factory=list)
+    # 名称 → 实体 ID 的确定性绑定（命中已确认别名，无需模型判断）
+    resolved_entity_bindings: dict[str, str] = field(default_factory=dict)
 
     def is_empty(self) -> bool:
         return not self.candidates and not self.graph_evidence
+
+    def needs_entity_binding(self) -> bool:
+        """是否存在"名称没被精确命中、但有候选实体"的绑定工作。"""
+        return bool(self.pending_entity_names) and bool(self.entity_candidates)
 
 
 def _scope_clause(model: Any, scope_chain: list[tuple[str, str | None]]) -> Any:
@@ -108,6 +169,20 @@ def _scope_clause(model: Any, scope_chain: list[tuple[str, str | None]]) -> Any:
                 model.scope_id == scope_id,
             ))
     return or_(*clauses) if clauses else model.scope_type == "global"
+
+
+def _name_tokens(value: str) -> set[str]:
+    """把实体名切成可比较的片段（空白与常见分隔符），忽略单字符噪声。"""
+    text = normalize_entity_name(value)
+    return {part for part in re.split(r"[\s\-_/.·]+", text) if len(part) >= 2}
+
+
+def _token_overlap(left: str, right: str) -> float:
+    """词片段重合度（0~1）。只用于"是否值得给模型看"，不用于合并。"""
+    a, b = _name_tokens(left), _name_tokens(right)
+    if not a or not b:
+        return 0.0
+    return len(a & b) / min(len(a), len(b))
 
 
 class ConflictCandidateFinder:
@@ -151,6 +226,7 @@ class ConflictCandidateFinder:
         self._collect_exact(proposal, merged, result)
         self._collect_retrieval(proposal, scope_chain, scope_context, merged, result)
         self._collect_graph(proposal, graph_chain, merged, result)
+        self._collect_entities(proposal, result)
 
         visible = self._visible_ids(list(merged))
         candidates: list[ConflictCandidate] = []
@@ -308,6 +384,8 @@ class ConflictCandidateFinder:
                 result.graph_evidence.append({
                     "relation_id": relation.id,
                     "source_memory_id": relation.source_memory_id,
+                    "subject_entity_id": entity.id,
+                    "object_entity_id": relation.object_entity_id,
                     "subject": entity.display_name,
                     "predicate": relation.predicate,
                     "object": other_object,
@@ -334,33 +412,184 @@ class ConflictCandidateFinder:
                     "cardinality": cardinality(relation.predicate),
                 })
 
-    def _find_entity(
+    # ------------------------------------------------------------------
+    # 4. 实体绑定候选（复用同一批关系证据，不重复检索）
+    # ------------------------------------------------------------------
+
+    def _collect_entities(
+        self,
+        proposal: Any,
+        result: CandidateDiscovery,
+    ) -> None:
+        """收集"新事实里的名称可能指向哪些既有实体"。
+
+        只回答"要不要让模型看一眼"，不回答"是不是同一个实体"：
+        精确名命中的名称直接跳过（投影按名称就能落到同一锚点），其余名称
+        交给同一次语义裁决，由模型给出 reuse / create_new / unresolved。
+        """
+        facts = [fact for fact in (proposal.graph_facts or []) if fact.is_complete()]
+        if not facts:
+            return
+        names: list[str] = []
+        seen: set[str] = set()
+        for fact in facts:
+            for name in (fact.subject, fact.object):
+                normalized = normalize_entity_name(name)
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    names.append(name)
+        if not names:
+            return
+
+        # 绑定只允许落在"与这条记忆同一 Scope"的实体上：实体锚点按 Scope 唯一，
+        # 跨 Scope 复用会让事实挂到别的隔离域，投影阶段也会被拒绝。
+        own_chain = [(proposal.scope_type or "global", proposal.scope_id)]
+        pending: list[str] = []
+        for name in names:
+            matches = self._find_entities(name, own_chain)
+            if not matches:
+                pending.append(name)
+            elif len(matches) > 1:
+                # 同一名称/别名命中多个实体：不按查询顺序挑一个，交给模型在候选里判断。
+                pending.append(name)
+                result.notes.append(
+                    f"entity_name_ambiguous:{normalize_entity_name(name)}"
+                )
+            elif normalize_entity_name(matches[0].normalized_name) != normalize_entity_name(name):
+                # 唯一命中的已确认别名：属确定性复用，不需要再问模型。
+                result.resolved_entity_bindings[name] = matches[0].id
+        result.pending_entity_names = pending
+        if not pending:
+            return
+
+        collected: dict[str, EntityCandidate] = {}
+
+        def _add(
+            entity: GraphEntity, name: str, matched_by: str, relation_id: str = "",
+        ) -> None:
+            candidate = collected.get(entity.id)
+            if candidate is None:
+                candidate = EntityCandidate(
+                    entity_id=entity.id,
+                    display_name=entity.display_name,
+                    normalized_name=entity.normalized_name,
+                    entity_type=entity.entity_type or "unknown",
+                    aliases=list(entity.aliases or []),
+                    scope_type=entity.scope_type or "global",
+                    scope_id=entity.scope_id,
+                )
+                collected[entity.id] = candidate
+            if matched_by not in candidate.matched_by:
+                candidate.matched_by.append(matched_by)
+            if name not in candidate.matched_names:
+                candidate.matched_names.append(name)
+            if relation_id and relation_id not in candidate.relation_ids:
+                candidate.relation_ids.append(relation_id)
+
+        # 1) 本次冲突证据里已经出现过的实体（关系两端）：与事实直接相关，优先。
+        for item in result.graph_evidence:
+            relation_id = str(item.get("relation_id", "") or "")
+            for key in ("subject_entity_id", "object_entity_id"):
+                entity_id = str(item.get(key, "") or "")
+                if not entity_id:
+                    continue
+                entity = self._db.get(GraphEntity, entity_id)
+                if entity is None:
+                    continue
+                if (entity.scope_type or "global") != (proposal.scope_type or "global"):
+                    continue
+                if (entity.scope_id or None) != (proposal.scope_id or None):
+                    continue
+                for name in pending:
+                    if self._match_entity(entity, name):
+                        _add(entity, name, ENTITY_MATCH_RELATION, relation_id)
+
+        # 2) 同 Scope 内有界扫描（与 _find_entity 的别名兜底同一口径）。
+        entities = (
+            self._db.query(GraphEntity)
+            .filter(_scope_clause(GraphEntity, own_chain))
+            .limit(_ALIAS_SCAN_LIMIT)
+            .all()
+        )
+        for entity in entities:
+            for name in pending:
+                matched = self._match_entity(entity, name)
+                if matched:
+                    _add(entity, name, matched)
+
+        ranked = sorted(
+            collected.values(),
+            key=lambda item: (
+                -max(_MATCH_STRENGTH.get(tag, 0) for tag in item.matched_by),
+                item.entity_id,
+            ),
+        )
+        result.entity_candidates = ranked[:_ENTITY_CANDIDATE_LIMIT]
+        if len(ranked) > _ENTITY_CANDIDATE_LIMIT:
+            result.notes.append(
+                f"entity_candidates_truncated:{len(ranked) - _ENTITY_CANDIDATE_LIMIT}"
+            )
+
+    @staticmethod
+    def _match_entity(entity: GraphEntity, name: str) -> str:
+        """确定性的候选相关性判断（决定"给不给模型看"，不决定合并）。"""
+        target = normalize_entity_name(name)
+        if not target:
+            return ""
+        if entity.normalized_name == target:
+            return ENTITY_MATCH_EXACT
+        if any(
+            normalize_entity_name(alias) == target for alias in (entity.aliases or [])
+        ):
+            return ENTITY_MATCH_ALIAS
+        base = entity.normalized_name or ""
+        if len(base) >= 2 and len(target) >= 2 and (base in target or target in base):
+            return ENTITY_MATCH_CONTAINS
+        if _token_overlap(base, target) >= 0.5:
+            return ENTITY_MATCH_TOKEN
+        return ""
+
+    def _find_entities(
         self, name: str, scope_chain: list[tuple[str, str | None]],
-    ) -> GraphEntity | None:
-        """按规范化名找实体；未命中时做有界别名匹配（与 graph_expansion 同口径）。"""
+    ) -> list[GraphEntity]:
+        """找出所有匹配该名称的实体：精确名最多一个，别名可能有多个。
+
+        精确名优先（DB 唯一约束保证最多一条）；没有精确名时再做有界别名匹配。
+        返回全部匹配而不是第一个，调用方据此判断是否存在歧义。
+        """
         normalized = normalize_entity_name(name)
         if not normalized:
-            return None
+            return []
         clause = _scope_clause(GraphEntity, scope_chain)
         exact = (
             self._db.query(GraphEntity)
             .filter(GraphEntity.normalized_name == normalized, clause)
             .order_by(GraphEntity.updated_at.desc())
-            .first()
+            .all()
         )
-        if exact is not None:
-            return exact
+        if exact:
+            return exact[:1]
         candidates = (
             self._db.query(GraphEntity)
             .filter(clause)
+            .order_by(GraphEntity.updated_at.desc())
             .limit(_ALIAS_SCAN_LIMIT)
             .all()
         )
-        for entity in candidates:
-            aliases = entity.aliases or []
-            if any(normalize_entity_name(alias) == normalized for alias in aliases):
-                return entity
-        return None
+        return [
+            entity for entity in candidates
+            if any(
+                normalize_entity_name(alias) == normalized
+                for alias in (entity.aliases or [])
+            )
+        ]
+
+    def _find_entity(
+        self, name: str, scope_chain: list[tuple[str, str | None]],
+    ) -> GraphEntity | None:
+        """唯一匹配才返回；多个匹配视为歧义，返回 None（绝不按返回顺序挑一个）。"""
+        matches = self._find_entities(name, scope_chain)
+        return matches[0] if len(matches) == 1 else None
 
     def _entity_display(self, entity_id: str) -> str:
         entity = self._db.get(GraphEntity, entity_id)

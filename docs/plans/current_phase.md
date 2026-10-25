@@ -495,3 +495,60 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - 候选发现依赖 `graph_facts` 与实体名归一，实体别名覆盖不足时会漏掉图谱路候选（精确命中与语义召回仍在）。
 - 澄清轮次上限（默认 3）后不再追问，案例停留在 asking 直到 TTL 过期（默认 72h）。
 - `keep_both` 对单值谓词一律拒绝，即使两条事实其实描述不同时间段；需用户改用 revise/merge。
+
+## V44 长期记忆图谱的实体绑定（完成）
+
+### Implemented
+
+- 复用现有候选：`ConflictCandidateFinder._collect_entities` 在候选发现阶段同时收集实体候选
+  （`EntityCandidate`）：来源包括本次冲突证据里已出现的关系两端实体，以及同 Scope 内有界扫描
+  命中的实体；匹配依据只用来决定"要不要给模型看"（精确名 / 别名 / 词重叠 / 字符串包含 / 关系端点），
+  不据此合并。名称已被精确名或已确认别名命中时直接产确定性绑定（`resolved_entity_bindings`），
+  不占用模型判断。实体候选严格限制在与记忆相同的 Scope（实体锚点按 Scope 唯一）。
+- 同一次 LLM 调用：`SemanticConflictAdjudicator.adjudicate` 的输出在原 verdict 之外增加
+  `entity_bindings`（reuse / create_new / unresolved），提示词给出待绑定名称、关系事实、实体候选
+  （含 ID、别名、Scope、候选依据），并明确要求"名称包含/相似度不是身份依据"。没有记忆冲突但存在
+  实体消歧需求时也走这一次调用（不再新增独立调用）。
+- 服务端校验：`validate_entity_bindings` 拒绝编造 ID（必须属于本次候选集合）、越界名称（必须属于
+  待绑定集合）、不属于本次证据的 evidence ID，重复名称只保留第一条；任何不满足都降级为 unresolved，
+  不回退成按名称强制合并。`apply_entity_bindings` 只把已通过的 reuse 回填到 `graph_facts`。
+- 持久化：绑定写在 `GraphFact.subject_entity_id` / `object_entity_id`，随 canonical 记录落在
+  `memory_records.graph_facts`（JSON 列），不需要新表、新列或迁移；`conflict_pending` 阶段随
+  `memory_conflict_cases.proposal_payload` 快照保存，用户确认后重建提案即带回绑定，不再调用 LLM。
+- 投影：`GraphProjectionService._resolve_entity` 优先复用绑定，但必须复核实体仍存在且 Scope 与
+  记录一致；失败则退回按名称解析（安全的新建路径），并把新写法追加进实体 `aliases`，后续同义名称
+  可直接确定性复用。`relation_key` 仍由三元组决定，重复投影不会产生重复关系或实体。
+- 重建：`GraphRebuildService.rebuild` 逐条走 `refresh`，绑定随 canonical 记录一起恢复。
+
+### Observable Result
+
+- `tests/unit/backend/test_memory_entity_binding.py` 12 例：校验矩阵（编造 ID / 越界名称 / 重复名称 /
+  未提供的证据 ID / create_new / 无法解析条目）、回填（主体+客体、跳过未通过项）、单次调用返回
+  verdict + bindings、提示词包含候选 ID 与名称、降级无绑定。
+- `tests/integration/backend/test_memory_entity_binding.py` 11 例：AIive / AIive 项目 复用同一实体、
+  仅字符串包含时不合并、多候选歧义保持 unresolved、编造 ID 被拒、跨 Scope 实体不进候选、实体被删除后
+  退回按名称、conflict_pending 期间不写图谱且确认后复用绑定、投影幂等、冲突与绑定共用一次调用、
+  别名后续免调用、重建保留绑定。
+- 记忆相关回归：`122 passed`（冲突 30 + 裁决 19 + 图谱 46 + 上下文扩展 4 + 绑定 23）。
+- 全量离线：见交付报告；`basedpyright backend/aiive` 0 errors / 0 warnings / 0 notes。
+
+### Known Gaps
+
+- 实体候选的别名/包含匹配是有界扫描（上限 300 个实体），稠密 Scope 下可能漏候选，此时按名称新建。
+- 绑定以 canonical 事实为单位；同一名称在不同记忆里若一次被判为不同实体，会各自建节点（不做全局别名表，
+  这是刻意的边界）。
+- 实体被遗忘级联删除后，旧绑定失效并退回按名称解析，历史记忆不会自动重新绑定。
+
+### V44.1 名称歧义审查与修正
+
+- 发现并修正三处边界：
+  1. **别名多命中**：`_find_entity` 原先返回第一个别名匹配（依赖数据库返回顺序）。改为
+     `_find_entities` 返回全部匹配，>1 视为歧义：不做确定性绑定、名称进入待绑定集合、
+     记 `entity_name_ambiguous`，由同一次裁决在候选里判断；`_collect_graph` 对歧义主体同样跳过。
+  2. **同一名称多次出现**：绑定原为纯名称键，无法表达"两条事实指向不同实体"。`EntityBinding`
+     增加可选 `fact_index` + `role`（0 基，与提示词 `[F0]` 对应）；名称级绑定作用于全部出现，
+     事实级只作用于指定位置，并校验该位置上的名称与绑定名称一致；两者并存时事实级优先。
+  3. **重复/矛盾输出**：同一目标（名称级或事实级）出现不同 decision 或不同 entity_id 时整条作废
+     （`conflicting_bindings`，清空 entity_id），结果与数组顺序无关；完全相同的重复条目去重。
+- 无新增 LLM 调用、无新表/新列、无迁移。
+- 测试：unit 22 例、integration 14 例；记忆相关回归 135 例；全量见交付报告。

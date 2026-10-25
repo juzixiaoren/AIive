@@ -103,6 +103,7 @@
 | 记忆写入 Saga / supersede | `memory/memory_write_service.py` | `memory/conflict_resolver.py`、`memory/memory_gate.py`、`memory/memory_mutation.py` | `test_memory_write*.py`、`test_conflict*.py` |
 | 冲突消解策略 | `memory/conflict_resolver.py` | `memory/memory_key_registry.py` | `test_conflict_resolver*.py` |
 | 记忆冲突待确认闭环（召回+图谱候选 → 语义裁决 → 用户确认 → 正式写入） | `memory/conflict_confirmation.py` | `memory/conflict_candidates.py`、`memory/conflict_adjudication.py`、`worker/handlers_conflict.py`、`memory/memory_write_service.py`（`conflict_plan` / `decision`）、`runtime/turn_execution.py`（回复入队）、`api/routes_memories.py`（`GET /memories/conflicts`） | `test_memory_conflict_confirmation.py`、`test_memory_conflict_adjudication.py` |
+| 图谱实体绑定（同一次裁决复用既有实体锚点，避免同实体多节点；同名/同别名多实体保留歧义，绑定可定位到具体事实位置） | `memory/conflict_adjudication.py`（`validate_entity_bindings` / `apply_entity_bindings`） | `memory/conflict_candidates.py`（`EntityCandidate` 收集）、`memory/graph_types.py`（`GraphFact.subject_entity_id` / `object_entity_id`）、`memory/graph_projection.py`（`_resolve_entity` 投影前复核）、`memory/conflict_confirmation.py`（`decide` 回填） | `test_memory_entity_binding.py`（unit + integration） |
 | 记忆 key 注册表（唯一真相源） | `memory/memory_key_registry.py` | `prompts/`（MEMORY_KEY_GUIDE） | `test_memory_key*.py` |
 | 记忆召回（四路由 + 融合） | `memory/automatic_recall.py`、`memory/recall_fusion.py` | `memory/recall_config.py`、`memory/vector_projection.py`、`retrieval/` | `test_recall*.py` |
 | 时序知识图谱（关系事实 → 投影 → 读侧扩展） | `memory/graph_projection.py`、`memory/graph_expansion.py`、`memory/graph_rebuild.py`、`memory/graph_predicates.py`（关系基数/谓词族） | `memory/graph_types.py`、`memory/memory_extractor.py::_verified_graph_facts`、`memory/memory_mutation.py::enqueue_projection`、`runtime/context_assembler.py::_expand_relations`、`worker/outbox_handlers.py::handle_memory_graph_refresh` | `test_memory_graph.py`、`test_context_assembler_graph_expansion.py` |
@@ -259,11 +260,11 @@
 | `memory_extractor.py` / `proposal_normalizer.py` / `extraction_policy.py` | `UnifiedMemoryExtractor`（同一次调用产出 `graph_facts`，`_verified_graph_facts` 做原文证据校验）；提案规范化；提取信号枚举 |
 | `graph_types.py` | 图谱契约：`GraphFact`/`GraphFactPayload`/`GraphRelationView`/`GraphConfig`；实体与 predicate 规范化、`make_relation_key`、事实时间解析（未知保持 None） |
 | `graph_predicates.py` | 谓词基数配置：单值谓词表 + 别名族 + settings 扩展；`is_single_valued`/`predicate_family`/`conflicted_group_keys`（未知谓词默认多值） |
-| `graph_projection.py` | `GraphProjectionService.refresh`：按 `(memory_id, record_version)` 幂等投影；candidate 不投影、失效关闭、遗忘物理删除；仅单值谓词 + 记忆层权威取代（`has_authoritative_supersede`）才结束旧关系，版本删事实记为 `retracted` |
+| `graph_projection.py` | `GraphProjectionService.refresh`：按 `(memory_id, record_version)` 幂等投影；candidate 不投影、失效关闭、遗忘物理删除；仅单值谓词 + 记忆层权威取代（`has_authoritative_supersede`）才结束旧关系，版本删事实记为 `retracted`；`_resolve_entity` 优先复用 `graph_facts` 的实体绑定，投影前复核实体存在且 Scope 与记录一致，失败退回按名称解析并把新写法记入 `aliases` |
 | `graph_expansion.py` | `GraphExpansionService.expand`：召回种子 + 查询实体匹配 → 有界 BFS（visited/max_hops/batch）→ 来源校验/打分/历史对照/单值多客体冲突标记（`mark_single_valued_conflicts`）；`render_expansion_block` 预算内整条装配（当前/冲突/历史/低置信分组） |
 | `graph_rebuild.py` | `GraphRebuildService.rebuild/verify/repair_overclosed`：从 `memory_records.graph_facts` 重建、清理孤儿行、修复旧规则误关（只恢复来源仍有效且仍主张的事实）；CLI `[--verify-only\|--repair-only] [--dry-run]` |
-| `conflict_candidates.py` | `ConflictCandidateFinder.discover`：三路候选发现（精确 key+Scope、`UnifiedRetriever` 语义召回、`graph_facts` 反查同主体同谓词族同 Scope 的关系），合并去重 + 回源校验（lifecycle/validity/遗忘屏蔽）+ 剔除 content_hash 相同项；图谱关系只作证据 |
-| `conflict_adjudication.py` | `SemanticConflictAdjudicator`（LLM 六类结论：compatible/complementary/conditional/temporal_change/contradiction/uncertain）、`adjudication_to_plan`（确定性自动处理 vs 转确认）、`ConflictQuestionGenerator`、`ConflictReplyParser`（9 类决策）；提示词内联构造 |
+| `conflict_candidates.py` | `ConflictCandidateFinder.discover`：三路候选发现（精确 key+Scope、`UnifiedRetriever` 语义召回、`graph_facts` 反查同主体同谓词族同 Scope 的关系），合并去重 + 回源校验（lifecycle/validity/遗忘屏蔽）+ 剔除 content_hash 相同项；图谱关系只作证据；`_collect_entities` 复用同一批关系证据收集同 Scope 的实体候选（`EntityCandidate`，按精确名/别名/词重叠/包含/关系端点标注依据），别名命中直接产确定性绑定；同名/同别名命中多个实体时（`_find_entities` 返回 >1）不按顺序挑一个，改为保留待绑定并记 `entity_name_ambiguous` 交给模型判断 |
+| `conflict_adjudication.py` | `SemanticConflictAdjudicator`（LLM 六类结论：compatible/complementary/conditional/temporal_change/contradiction/uncertain）、`adjudication_to_plan`（确定性自动处理 vs 转确认）、`ConflictQuestionGenerator`、`ConflictReplyParser`（9 类决策）；同一次调用附带 `entity_bindings`（reuse/create_new/unresolved），`validate_entity_bindings` 校验 ID 必须来自本次候选集合、名称必须在待绑定集合、证据 ID 必须来自本次证据，`apply_entity_bindings` 只回填已通过的 reuse；绑定目标支持名称级（作用于该名称全部出现）与事实级（`fact_index` + `role` 只作用于某条事实的某个位置），同一目标出现矛盾结论时整条作废（`conflicting_bindings`），与数组顺序无关；提示词内联构造 |
 | `conflict_confirmation.py` | `MemoryConflictService`：`collect_candidates`/`decide`（两阶段，LLM 在事务外）、`park`（建案例+入队问题任务，幂等）、`publish_question`（通知）、`enqueue_reply_jobs`（回合入口入队）、`apply_decision`（版本/过期复核后经 `MemoryWriteService`/`Forget` 落库） |
 | `memory_policy.py` / `memory_access_tracker.py` | 敏感度/读取/authority 策略；访问 touch（recency 去抖） |
 | `projection.py` / `vector_projection.py` / `vector_bootstrap.py` / `embedding_provider.py` | markdown/json 落盘投影（可丢失）；pgvector 投影+fail-closed 校验；provider 工厂与运行时校验 |
@@ -538,8 +539,12 @@ api/routes_agent_tasks.py 创建任务 → task_runtime/repository.py::create_ta
 ```
 handle_memory_extraction (worker/outbox_handlers.py L106)
   Phase B  UnifiedMemoryExtractor.extract → proposals（含 graph_facts）
-  Phase B2 MemoryConflictService.collect_candidates   （短只读会话：精确键 + UnifiedRetriever + graph_relations）
-           MemoryConflictService.decide              （无会话：SemanticConflictAdjudicator → adjudication_to_plan）
+  Phase B2 MemoryConflictService.collect_candidates   （短只读会话：精确键 + UnifiedRetriever + graph_relations
+                                                       + 同 Scope 实体候选 EntityCandidate / pending_entity_names）
+           MemoryConflictService.decide              （无会话：SemanticConflictAdjudicator → adjudication_to_plan
+                                                       同一次调用还产出 entity_bindings：reuse / create_new / unresolved
+                                                       → validate_entity_bindings → 回填 graph_facts 的
+                                                         subject_entity_id / object_entity_id）
   Phase C  MemoryWriteService.write_batch(conflict_plan=...)
              ├ plan=proceed → 原有 Gate/ConflictResolver/写入/投影
              └ plan=defer   → MemoryConflictService.park

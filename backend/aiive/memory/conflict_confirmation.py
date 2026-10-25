@@ -40,6 +40,7 @@ from aiive.db.models import (
 from aiive.memory.conflict_adjudication import (
     ACTION_DEFER,
     ACTION_PROCEED,
+    BIND_REUSE,
     DECISION_ACCEPT_NEW,
     DECISION_CLARIFY,
     DECISION_FORGET_OLD,
@@ -52,9 +53,12 @@ from aiive.memory.conflict_adjudication import (
     ConflictAdjudication,
     ConflictQuestionGenerator,
     ConflictReplyParser,
+    EntityBinding,
     ReplyDecision,
     SemanticConflictAdjudicator,
     adjudication_to_plan,
+    apply_entity_bindings,
+    validate_entity_bindings,
 )
 from aiive.memory.conflict_candidates import CandidateDiscovery, ConflictCandidate
 from aiive.memory.memory_key_registry import get_memory_key_registry
@@ -108,6 +112,8 @@ class ProposalConflictPlan:
     adjudication: ConflictAdjudication = field(default_factory=ConflictAdjudication)
     candidates: list[ConflictCandidate] = field(default_factory=list)
     graph_evidence: list[dict[str, Any]] = field(default_factory=list)
+    # 实体绑定建议（已通过服务端校验；同时已回填到 proposal.graph_facts）
+    entity_bindings: list[dict[str, Any]] = field(default_factory=list)
     old_memory_id: str = ""
     old_record_version: int = 0
     old_content: str = ""
@@ -195,15 +201,51 @@ class MemoryConflictService:
             discovery = discoveries.get(proposal.proposal_id)
             if discovery is None:
                 continue
-            if discovery.is_empty():
+            # 别名命中是此前的裁决结果：确定性复用，不占用本次模型判断。
+            resolved = [
+                EntityBinding(
+                    name=name, decision=BIND_REUSE, entity_id=entity_id,
+                    confidence=1.0, reason="alias_match", accepted=True,
+                )
+                for name, entity_id in discovery.resolved_entity_bindings.items()
+            ]
+            if resolved:
+                apply_entity_bindings(proposal, resolved)
+                plan.entity_bindings.extend(item.to_dict() for item in resolved)
+            if discovery.is_empty() and not discovery.needs_entity_binding():
                 plan.adjudication.notes.extend(discovery.notes)
                 continue
 
+            # 一次调用同时产出"记忆冲突裁决"和"实体绑定建议"：
+            # 没有记忆冲突但有实体消歧需求时也走这里（同一次 LLM 调用）。
             adjudication = adjudicator.adjudicate(
                 proposal=proposal,
                 candidates=discovery.candidates,
                 graph_evidence=discovery.graph_evidence,
+                entity_candidates=discovery.entity_candidates,
+                pending_entity_names=discovery.pending_entity_names,
                 trace_id=trace_id,
+            )
+            adjudication.entity_bindings = validate_entity_bindings(
+                adjudication.entity_bindings,
+                pending_names=discovery.pending_entity_names,
+                candidate_ids={
+                    item.entity_id for item in discovery.entity_candidates
+                },
+                relation_ids={
+                    str(item.get("relation_id", ""))
+                    for item in discovery.graph_evidence
+                    if item.get("relation_id")
+                },
+                fact_names=[
+                    (fact.subject, fact.object)
+                    for fact in (proposal.graph_facts or [])
+                ],
+            )
+            # 只回填已通过校验的 reuse 绑定；三元组本身不变。
+            apply_entity_bindings(proposal, adjudication.entity_bindings)
+            plan.entity_bindings.extend(
+                item.to_dict() for item in adjudication.entity_bindings
             )
             adjudication.notes.extend(discovery.notes)
             plan.adjudication = adjudication_to_plan(
