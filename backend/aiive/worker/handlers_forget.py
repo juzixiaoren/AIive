@@ -1507,8 +1507,27 @@ def _scrub_batch(db: Session, memory_ids: list[str]) -> None:
     # --- memory layer ---
     db.execute(sa_text(
         "UPDATE memory_records SET content = '[forgotten]', structured_value = NULL, "
-        + "updated_at = :now WHERE id IN :ids"
+        + "graph_facts = NULL, updated_at = :now WHERE id IN :ids"
     ).bindparams(ids_bind), {"now": now, "ids": memory_ids})
+    # --- 时序知识图谱：关系行必须物理删除（隐私承诺），实体锚点随后清理 ---
+    graph_entity_ids = [
+        row[0] for row in db.execute(sa_text(
+            "SELECT DISTINCT subject_entity_id FROM graph_relations "
+            + "WHERE source_memory_id IN :ids "
+            + "UNION SELECT DISTINCT object_entity_id FROM graph_relations "
+            + "WHERE source_memory_id IN :ids"
+        ).bindparams(ids_bind), {"ids": memory_ids}).all()
+    ]
+    db.execute(sa_text(
+        "DELETE FROM graph_relations WHERE source_memory_id IN :ids"
+    ).bindparams(ids_bind), {"ids": memory_ids})
+    for entity_id in graph_entity_ids:
+        still_used = db.execute(sa_text(
+            "SELECT 1 FROM graph_relations WHERE subject_entity_id = :eid "
+            + "OR object_entity_id = :eid LIMIT 1"
+        ), {"eid": entity_id}).first()
+        if still_used is None:
+            db.execute(sa_text("DELETE FROM graph_entities WHERE id = :eid"), {"eid": entity_id})
     db.execute(sa_text(
         "UPDATE memory_proposals SET raw_payload = NULL, normalized_payload = NULL "
         + "WHERE final_memory_id IN :ids"

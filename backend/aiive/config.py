@@ -53,6 +53,38 @@ class Settings(BaseSettings):
     aiive_memory_file_projection_enabled: bool = True
     aiive_memory_file_projection_dir: str = ".data/memory_projection"
 
+    # 时序知识图谱（派生投影 + 读侧关系扩展）。关闭后不投影、不扩展，
+    # 已有图谱行保持原样（可随时重新开启或整库重建）。
+    aiive_memory_graph_enabled: bool = True
+    # 关系扩展的最大跳数（visited 集合保证不循环）
+    aiive_memory_graph_max_hops: int = 2
+    # 单次 BFS 每层的查询批大小（有界查询，不是最终关系条数上限）
+    aiive_memory_graph_batch_size: int = 200
+    # 查询侧参与扩展的种子实体上限
+    aiive_memory_graph_max_seed_entities: int = 32
+    # 低于该置信度的关系不投影为可用事实、也不注入上下文
+    aiive_memory_graph_min_confidence: float = 0.6
+    # 图谱在 retrieved_memory 分区中的动态预算占比（随窗口与裁剪轮次变化）
+    aiive_memory_graph_budget_ratio: float = 0.35
+    # 单次扩展最多收集的关系数（安全阀，防止极端稠密图）
+    aiive_memory_graph_max_relations: int = 2000
+    # 额外声明为单值的谓词（逗号分隔 canonical 名）。未声明的谓词一律按多值处理，
+    # 只有单值谓词才可能因出现不同客体而结束旧关系（仍需记忆层权威取代）。
+    aiive_memory_graph_single_valued_predicates: str = ""
+
+    # 长期记忆冲突处理闭环：新提案与既有记忆语义冲突、无法可靠自动裁决时，
+    # 持久化待确认案例并通过通知向用户提问，用户自然语言回复后再走正式写入。
+    # enabled: 总开关；关闭后退回旧的确定性写入流程（不建案例、不提问）。
+    aiive_memory_conflict_confirmation_enabled: bool = True
+    # 单次冲突判定最多比较的候选记忆条数（有界，避免稠密记忆下 LLM 上下文失控）。
+    aiive_memory_conflict_max_candidates: int = 5
+    # 统一检索候选进入语义裁决的最低分；低于该分不送裁决（图谱证据不受此限）。
+    aiive_memory_conflict_retrieval_min_score: float = 0.3
+    # 待确认案例的有效期（小时）：超时未回复视为放弃新提案，不污染现有记忆。
+    aiive_memory_conflict_ttl_hours: int = 72
+    # 同一冲突最多追问轮数；超过后保留旧记忆并结束案例（不无限打扰用户）。
+    aiive_memory_conflict_max_clarify_rounds: int = 3
+
     # 数据库连接配置
     database_url: str = "postgresql+psycopg://aiive:aiive_dev@localhost:5432/aiive"
     # 连接池配置（PostgreSQL）。单个聊天回合峰值可能同时占用约 8 个会话

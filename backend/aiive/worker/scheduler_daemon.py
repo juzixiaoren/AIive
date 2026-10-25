@@ -62,6 +62,9 @@ _KNOWLEDGE_MAINTENANCE_POLICY_VERSION = 1
 _KNOWLEDGE_DAILY_INTERVAL_SECONDS = 86400
 _AGENT_TASK_SCAN_INTERVAL = 10
 _RELEASE_MONITOR_INTERVAL = 60
+# 冲突案例过期清扫：只改案例与通知，不碰记忆与图谱
+_CONFLICT_EXPIRY_INTERVAL = 900   # 秒：过期案例扫描周期（按小时分桶入队）
+_CONFLICT_CLEANUP_BATCH = 200     # 单个 job 处理的最大案例数（超出则 CONTINUE 分页）
 
 
 def _poll_job():
@@ -135,6 +138,12 @@ def start_daemon():
     scheduler.add_job(
         _retention_scanner_job, IntervalTrigger(seconds=_RETENTION_INTERVAL),
         id="phase6b_retention_scanner", replace_existing=True,
+    )
+
+    # 冲突案例过期清扫扫描器
+    scheduler.add_job(
+        _conflict_expiry_scanner_job, IntervalTrigger(seconds=_CONFLICT_EXPIRY_INTERVAL),
+        id="memory_conflict_expiry_scanner", replace_existing=True,
     )
     # 知识库维护扫描器
     scheduler.add_job(
@@ -588,6 +597,64 @@ def _retention_scanner_job() -> None:
                 db.close()
             except Exception:
                 logger.debug("retention_scanner Session 关闭失败", exc_info=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 冲突案例过期清扫
+# ═══════════════════════════════════════════════════════════════════
+
+def enqueue_conflict_cleanup_job(
+    db: Session,
+    window_bucket: str | None = None,
+    now: datetime | None = None,
+) -> str | None:
+    """入队一个 `memory_conflict_cleanup` OutboxJob。
+
+    operation_id = `conflict_expiry:{window_bucket}`（默认按小时分桶）：
+    同一窗口只跑一次，UNIQUE 约束保证幂等。
+    """
+    now = now or datetime.now(timezone.utc)
+    window_bucket = window_bucket or now.strftime("%Y-%m-%dT%H")
+    op_id = f"conflict_expiry:{window_bucket}"
+
+    exists = db.query(OutboxJob).filter(OutboxJob.operation_id == op_id).count()
+    if exists > 0:
+        return op_id
+
+    if _outbox_worker is None:
+        return None
+    try:
+        _outbox_worker.enqueue(
+            db, "memory_conflict_cleanup",
+            {"schema_version": 1, "batch_size": _CONFLICT_CLEANUP_BATCH},
+            operation_id=op_id,
+        )
+    except ValueError:
+        logger.warning("memory_conflict_cleanup enqueue 不在 allowlist，跳过")
+        return None
+    return op_id
+
+
+def _conflict_expiry_scanner_job() -> None:
+    """定期把 TTL 过期的待确认冲突案例置为 expired（幂等、不碰记忆与图谱）。"""
+    db: Session | None = None
+    try:
+        db = SessionLocal()
+        enqueue_conflict_cleanup_job(db)
+        db.commit()
+    except Exception:
+        logger.exception("conflict_expiry_scanner 异常")
+        if db is not None:
+            try:
+                db.rollback()
+            except Exception:
+                logger.debug("conflict_expiry_scanner rollback 失败", exc_info=True)
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                logger.debug("conflict_expiry_scanner Session 关闭失败", exc_info=True)
 
 
 # ═══════════════════════════════════════════════════════════════════

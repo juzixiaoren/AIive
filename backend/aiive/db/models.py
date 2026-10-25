@@ -353,6 +353,10 @@ class MemoryRecord(Base):
     # 显式检索关键词（同义词/上位词）。参与词汇召回（lexical / MemorySearch）
     # 匹配，使「记下霸王茶姬 + 关键词奶茶」能被「想喝奶茶」召回。
     keywords: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    # 时序知识图谱的结构化关系事实（canonical 数据，随记录版本一起演进）。
+    # 图谱表 graph_entities / graph_relations 只是本列的可查询派生投影，
+    # 因此重建图谱永远不需要重新调用 LLM；forget 时必须与本列一起 scrub。
+    graph_facts: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
@@ -1914,5 +1918,160 @@ class DesktopActionReceipt(Base):
         CheckConstraint(
             "status IN ('received','started','committed','failed','unknown')",
             name="ck_desktop_receipt_status",
+        ),
+    )
+
+
+class GraphEntity(Base):
+    """图谱实体投影：规范化名称 + Scope 唯一。
+
+    实体只是关系两端的锚点，不是独立记忆；名称规范化后同一 Scope 内唯一，
+    别名（aliases）由同一实体的其他写法累积而来，用于查询侧确定性匹配。
+    """
+
+    __tablename__: str = "graph_entities"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    normalized_name: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    display_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    entity_type: Mapped[str] = mapped_column(String(32), nullable=False, default="unknown")
+    aliases: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    scope_type: Mapped[str] = mapped_column(String(32), nullable=False, default="global")
+    scope_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__: tuple[UniqueConstraint | Index, ...] = (
+        UniqueConstraint(
+            "normalized_name", "scope_type", "scope_id",
+            name="uq_graph_entities_identity",
+        ),
+        Index("ix_graph_entities_scope", "scope_type", "scope_id"),
+    )
+
+
+class GraphRelation(Base):
+    """图谱关系投影：一条来源记忆支持的、带有效期的三元组。
+
+    与 memory_records 的关系是**派生**：relation 永远指向来源记忆与来源版本，
+    读侧必须回查来源记录的 lifecycle / validity / 遗忘状态，不能只信本表。
+    valid_from / valid_to 是事实有效时间；recorded_at 是系统记录时间。
+    """
+
+    __tablename__: str = "graph_relations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    relation_key: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    subject_entity_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("graph_entities.id", ondelete="CASCADE"), nullable=False
+    )
+    object_entity_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("graph_entities.id", ondelete="CASCADE"), nullable=False
+    )
+    predicate: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    source_memory_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("memory_records.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    source_record_version: Mapped[int] = mapped_column(nullable=False, default=1)
+    scope_type: Mapped[str] = mapped_column(String(32), nullable=False, default="global")
+    scope_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    confidence: Mapped[float] = mapped_column(nullable=False, default=0.5)
+    source_span: Mapped[str | None] = mapped_column(Text, nullable=True)
+    valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    closed_reason: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    superseded_by_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__: tuple[Index | CheckConstraint, ...] = (
+        Index("ix_graph_relations_subject_status", "subject_entity_id", "status"),
+        Index("ix_graph_relations_object_status", "object_entity_id", "status"),
+        Index("ix_graph_relations_source_version", "source_memory_id", "source_record_version"),
+        CheckConstraint(
+            "status IN ('active','closed','retracted')",
+            name="ck_graph_relation_status",
+        ),
+    )
+
+
+class MemoryConflictCase(Base):
+    """记忆冲突待确认案例（长期记忆冲突处理闭环的持久化状态）。
+
+    语义边界（刻意保持"待确认不污染"）：
+    - 案例只是**提案的暂存与裁决记录**，不是记忆记录：pending 期间不产生
+      MemoryRecord，也不产生任何 graph_relations，当前有效记忆与关系完全不变；
+    - 旧记忆与现有有效图谱关系在 pending 期间保持不变（只读快照 old_memory_id /
+      old_record_version，用于回复执行前的一致性复核）；
+    - 只有用户明确决策后才经 MemoryWriteService（Gate + ConflictResolver）或
+      Forget Saga 正式落库，本表从不直接改 memory_records / graph_relations。
+
+    幂等与重放：
+    - idempotency_key = 提案幂等键 + 冲突旧记忆 id，唯一约束保证同一冲突只建一个案例；
+    - status 是唯一状态机真相源，回复重放按 status 判定 no-op；
+    - clarify_rounds 与 question_event_id 支持多轮澄清且不重复通知。
+    """
+
+    __tablename__: str = "memory_conflict_cases"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    # pending(已建案，待生成问题) / asking(已向用户提问) / resolved(已按用户决策落库)
+    # / rejected(用户拒绝新提案) / stale(旧记忆版本已变，放弃) / expired(超时未答)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", index=True)
+    thread_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    scope_type: Mapped[str] = mapped_column(String(32), nullable=False, default="global")
+    scope_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    canonical_key: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    memory_type: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    sensitivity: Mapped[str] = mapped_column(String(32), nullable=False, default="normal")
+
+    # --- 冲突双方 ---
+    old_memory_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    old_record_version: Mapped[int] = mapped_column(nullable=False, default=0)
+    old_content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    new_content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    # --- 新提案快照（唯一可重建来源；pending 期间不写入 memory_records）---
+    proposal_id: Mapped[str] = mapped_column(String(36), nullable=False, default="")
+    proposal_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
+    # --- 裁决结果（LLM 语义裁决 + 图谱证据）---
+    verdict: Mapped[str] = mapped_column(String(32), nullable=False, default="uncertain")
+    verdict_reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    evidence: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    graph_evidence: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+
+    # --- 澄清问题与通知 ---
+    question: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    question_event_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    clarify_rounds: Mapped[int] = mapped_column(nullable=False, default=0)
+
+    # --- 用户决策与执行结果 ---
+    decision: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    decision_source: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+    decision_span: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    resolved_memory_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    resolution_reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__: tuple[Index | CheckConstraint, ...] = (
+        Index("ix_memory_conflict_cases_thread_status", "thread_id", "status"),
+        Index("ix_memory_conflict_cases_status_expiry", "status", "expires_at"),
+        CheckConstraint(
+            "status IN ('pending','asking','resolved','rejected','stale','expired')",
+            name="ck_memory_conflict_cases_status",
         ),
     )

@@ -19,6 +19,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from aiive.core.text_utils import strip_code_fence
 
 from aiive.core.llm_client import LLMClient, LLMResponse
+from aiive.memory.graph_types import (
+    MAX_FACTS_PER_MEMORY,
+    GraphFact,
+    GraphFactPayload,
+)
 from aiive.memory.memory_types import MEMORY_KEY_GUIDE, MemoryProposal, TrustLevel
 from aiive.memory.proposal_normalizer import ProposalNormalizer, NormalizationResult
 from aiive.prompts import get_prompt_registry
@@ -44,11 +49,19 @@ class ExtractedMemory(BaseModel):
     signal_type: str = ""  # routine / preference / habit / schedule (steward enrichment)
     # 兼容旧 Steward 输出；规范化阶段仍以 content/source_span 为事实来源。
     schedule_text: str = ""
+    # 可选：与本次提取同源的实体关系事实。缺省为空表示该记忆不进入图谱，
+    # 旧模型输出（无该字段）完全兼容。
+    graph_facts: list[GraphFactPayload] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
 # UnifiedMemoryExtractor
 # ---------------------------------------------------------------------------
+
+def _fold_ws(text: str) -> str:
+    """折叠空白，用于 source_span 的子串定位（不改变字符内容）。"""
+    return " ".join(str(text or "").split())
+
 
 class UnifiedMemoryExtractor:
     """Unified memory extractor: single LLM call for all memory signal types.
@@ -130,7 +143,42 @@ class UnifiedMemoryExtractor:
             extracted, thread_id, trace_id,
             source_event_ids=source_event_ids,
             assistant_event_ids=assistant_event_ids,
+            user_message=user_message,
         )
+
+    # ------------------------------------------------------------------
+    # Graph facts（关系事实证据校验）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _verified_graph_facts(
+        payloads: list[GraphFactPayload],
+        *,
+        user_message: str,
+        content: str,
+    ) -> list[GraphFact]:
+        """把 LLM 给的关系事实收敛为"有原文依据"的 GraphFact 列表。
+
+        规则（fail-closed，绝不凭空生成）：
+        - 三元组不完整、时间无法解析 → 丢弃该条；
+        - source_span 必须能在用户原文或记忆内容中定位（空白折叠后子串匹配）；
+          定位不到说明该关系没有可追溯依据，直接丢弃，而不是补一个猜测的 span；
+        - 单条记忆最多保留 MAX_FACTS_PER_MEMORY 条，按置信度降序截断。
+        """
+        if not payloads:
+            return []
+        haystack = _fold_ws(user_message) + "\n" + _fold_ws(content)
+        kept: list[GraphFact] = []
+        for payload in payloads:
+            fact = payload.to_fact()
+            if fact is None:
+                continue
+            span = _fold_ws(fact.source_span)
+            if not span or span not in haystack:
+                continue
+            kept.append(fact)
+        kept.sort(key=lambda item: item.confidence, reverse=True)
+        return kept[:MAX_FACTS_PER_MEMORY]
 
     # ------------------------------------------------------------------
     # Parsing
@@ -185,6 +233,7 @@ class UnifiedMemoryExtractor:
         trace_id: str | None = None,
         source_event_ids: list[str] | None = None,
         assistant_event_ids: list[str] | None = None,
+        user_message: str = "",
     ) -> list[MemoryProposal]:
         """Normalize all extracted items through ProposalNormalizer.
 
@@ -244,10 +293,14 @@ class UnifiedMemoryExtractor:
                     "content_span": em.source_span,
                 })
 
+            facts = self._verified_graph_facts(
+                em.graph_facts, user_message=user_message, content=em.content,
+            )
             result: NormalizationResult = self._normalizer.normalize(
                 content=em.content,
                 memory_type_hint=em.memory_type or None,
                 memory_key_hint=em.memory_key or None,
+                graph_facts=facts,
                 confidence=em.confidence,
                 importance=em.importance,
                 trust_level=TrustLevel.TRUSTED.value,

@@ -148,6 +148,8 @@ class MemoryWriteService:
         WriteOutcome.GATE_REJECTED,
         WriteOutcome.IGNORED,
         WriteOutcome.REINFORCE_SKIPPED,
+        # 待确认冲突是"挂起"而非失败：提案已进案例表，等用户回复再正式写入。
+        WriteOutcome.CONFLICT_PENDING,
     })
 
     def write_batch(
@@ -155,12 +157,17 @@ class MemoryWriteService:
         proposals: list[MemoryProposal],
         ingestion_run: MemoryIngestionRun,
         run_context: RunContext,
+        conflict_plan: dict[str, Any] | None = None,
     ) -> list[WriteResult]:
         """原子写入一个提取批次。
 
         前置: ingestion_run 已通过 SELECT FOR UPDATE 锁定，status='running'。
         事务: 所有 Proposal 在同一 Session 中，不自行 commit。
         锁: 在事务开头一次性按序获取所有 advisory lock。
+
+        conflict_plan: 事务外预判的冲突处理计划（proposal_id → ProposalConflictPlan）。
+            计划为 defer 的提案只建待确认案例（不写记忆、不写图谱关系），
+            由用户回复后再走本服务的正式写入路径。为空时行为与历史完全一致。
         """
         # Step 0: 收集并排序所有 lock_id
         lock_ids: list[int] = []
@@ -185,7 +192,9 @@ class MemoryWriteService:
             p.source_turn_record_id = run_context.turn_record_id
             p.execution_mode = run_context.execution_mode
 
-            result = self._write_single_in_transaction(p, run_context)
+            result = self._write_single_in_transaction(
+                p, run_context, conflict_plan=conflict_plan,
+            )
             results.append(result)
 
             if result.outcome not in self._VALID_NOOP_OUTCOMES and result.outcome != WriteOutcome.WRITTEN:
@@ -227,6 +236,7 @@ class MemoryWriteService:
 
     def _write_single_in_transaction(
         self, proposal: MemoryProposal, run_context: RunContext,
+        conflict_plan: dict[str, Any] | None = None,
     ) -> WriteResult:
         """单个 Proposal 的 Gate → Resolve → Execute → Persist 流程。
 
@@ -252,6 +262,26 @@ class MemoryWriteService:
                     outcome=WriteOutcome.GATE_REJECTED,
                     reason="Reingestion blocked: all source events are tombstone-blocked",
                 )
+
+        # 1.6. 语义冲突待确认：只建案例（含提案审计行 + 澄清问题任务），
+        # 不写 memory_records、不写图谱关系，现有记忆与有效关系保持原样。
+        plan = (conflict_plan or {}).get(proposal.proposal_id)
+        if plan is not None and getattr(plan, "action", "") == "defer":
+            from aiive.memory.conflict_confirmation import MemoryConflictService
+
+            case_id = MemoryConflictService.park(
+                self._db, proposal=proposal, plan=plan, run_context=run_context,
+            )
+            self._persist_proposal(
+                proposal, gate_decision, final_op="conflict_pending",
+            )
+            return WriteResult(
+                outcome=WriteOutcome.CONFLICT_PENDING,
+                operation="conflict_pending",
+                memory_id=case_id,
+                state="pending_confirmation",
+                reason=plan.adjudication.reason or "semantic_conflict_needs_confirmation",
+            )
 
         existing_active = self._load_existing_or_wake_sleeping(proposal, run_context)
         resolution = self._resolver.resolve(proposal, existing_active)
@@ -353,11 +383,19 @@ class MemoryWriteService:
         proposal: MemoryProposal,
         run_context: RunContext | None = None,
         _enqueue_projections: bool = True,
+        decision: str = "",
+        decision_target_id: str = "",
     ) -> WriteResult:
         """Write a normalized MemoryProposal through the full pipeline.
 
         LLM extraction must happen OUTSIDE the database transaction.
         This method only does deterministic gate/resolve/persist.
+
+        decision: 用户已明确表态时传入的强制决策（accept_new / revise / merge /
+            keep_both / keep_old / reject_new）。为空时走原有确定性解析流程。
+            强制决策仍然经过 Gate 与本服务的事务/版本/投影语义，不做旁路写入。
+        decision_target_id: 强制决策要取代/保留的既有记忆 id（跨 canonical_key
+            的语义冲突必须显式指定，否则只能按同键记录处理）。
         """
         if run_context is None or not run_context.thread_id:
             raise RuntimeError("MemoryWriteService.write() requires valid RunContext")
@@ -393,13 +431,34 @@ class MemoryWriteService:
         lock_id: int = self._compute_lock_id(
             proposal.canonical_key, proposal.scope_type, proposal.scope_id
         )
-        self._acquire_lock(lock_id)
+        # 强制决策可能作用于另一个 canonical_key 的旧记忆（跨键语义冲突），
+        # 一并加锁并按 id 升序获取，避免与并发写入交叉死锁。
+        lock_ids: set[int] = {lock_id}
+        if decision and decision_target_id:
+            target_record = self._store.get_by_id(decision_target_id)
+            if target_record is not None:
+                lock_ids.add(self._compute_lock_id(
+                    target_record.canonical_key or "",
+                    target_record.scope_type or "global",
+                    target_record.scope_id,
+                ))
+        for lid in sorted(lock_ids):
+            self._acquire_lock(lid)
 
         try:
             # 3. SELECT FOR UPDATE existing active records（无 active 则先唤醒 sleeping 同键记录）
             existing_active: Sequence[MemoryRecord] = self._load_existing_or_wake_sleeping(
                 proposal, run_context
             )
+
+            # 3.5 用户已明确决策：按决策执行，不再重复语义裁决。
+            if decision:
+                forced = self._execute_forced_decision(
+                    proposal, decision, decision_target_id, existing_active,
+                    gate_decision, tid,
+                )
+                if forced is not None:
+                    return forced
 
             # 4. Conflict resolution
             resolution: ResolutionResult = self._resolver.resolve(
@@ -649,6 +708,78 @@ class MemoryWriteService:
     # ------------------------------------------------------------------
     # Internal execution helpers
     # ------------------------------------------------------------------
+
+    def _execute_forced_decision(
+        self,
+        proposal: MemoryProposal,
+        decision: str,
+        target_id: str,
+        existing_active: Sequence[MemoryRecord],
+        gate_decision: GateDecision,
+        thread_id: str,
+    ) -> WriteResult | None:
+        """按用户明确决策执行（仍走 Gate / 事务 / lineage / 投影）。
+
+        返回 None 表示该决策不在这里处理（交给普通解析流程）。
+        """
+        if decision in ("keep_old", "reject_new"):
+            # 保留旧记忆 / 拒绝新提案：不产生新记录，因此也不产生任何新关系。
+            self._persist_proposal(proposal, gate_decision, final_op=decision)
+            return WriteResult(
+                outcome=WriteOutcome.IGNORED,
+                operation=decision,
+                reason="用户决策：不写入新记忆，旧记忆与现有关系保持不变",
+            )
+
+        if decision == "keep_both":
+            # 两条事实并存：新记录独立落库，旧记录与其关系一律不动。
+            # Gate 判为 candidate 时不得越过准入直接 active（准入仍由 Gate 决定）。
+            target_state = (
+                LifecycleState.CANDIDATE.value
+                if gate_decision.decision == "candidate"
+                else LifecycleState.ACTIVE.value
+            )
+            record = self._store.create_record(
+                proposal=proposal,
+                lifecycle_state=target_state,
+                validity_state=ValidityState.VALID.value,
+            )
+            self._write_evidence_batch(record.id, proposal.evidence)
+            self._persist_proposal(
+                proposal, gate_decision, final_op="create", final_memory_id=record.id,
+            )
+            self._log_event(thread_id, proposal, "memory.created", record.id)
+            self._enqueue_projection(record, "memory.created")
+            return WriteResult(
+                outcome=WriteOutcome.WRITTEN,
+                operation="create",
+                memory_id=record.id,
+                state=LifecycleState.ACTIVE.value,
+                reason="用户决策：两条事实并存",
+            )
+
+        if decision in ("accept_new", "revise", "merge"):
+            target: MemoryRecord | None = None
+            if target_id:
+                target = self._store.get_by_id(target_id)
+            if target is None and existing_active:
+                target = existing_active[0]
+            if target is None:
+                return WriteResult(
+                    outcome=WriteOutcome.FAILED,
+                    reason="没有可取代的现有记忆",
+                )
+            operation = "revise" if decision in ("revise", "merge") else "supersede"
+            resolution = ResolutionResult(
+                operation=operation,
+                existing_record=target,
+                reason=f"用户决策：{decision}",
+            )
+            return self._execute_supersede_or_revise(
+                proposal, resolution, gate_decision, thread_id,
+            )
+
+        return None
 
     def _execute_promote_candidate(
         self,

@@ -248,6 +248,9 @@ class ContextAssembler:
         history_msgs: list[Any] = []
         tools_schema: list[Any] = []
         history_summary_text: str = ""
+        # 召回 + 图谱的最终注入文本（报告/快照用）；循环内每轮重新计算，
+        # 预置空串是为了让循环外的预算超限分支也有确定值。
+        retrieved_text: str = agent_ctx.get("recall_text", "")
         epoch_cp_text: str = ""
         seg_sum_text: str = ""
         bridge_text: str = ""
@@ -291,8 +294,23 @@ class ContextAssembler:
                 trim_plan.limit("retrieved_history_summary"),
             )
 
-            # 召回记忆注入按 retrieved_memory 预算截断（round 3 起收紧）
-            recall_budget_left = trim_plan.limit("retrieved_memory")
+            # 召回记忆与图谱关系共享 retrieved_memory 预算：
+            # 1) 先按动态比例给图谱预留（比例 × 本轮真实预算，随窗口与裁剪轮次变化，
+            #    不是固定 token 数）；2) 记忆用不满的余量再回补给图谱；
+            # 3) 图谱按价值顺序整条装配，预算不足时丢弃低价值关系而不是截断关系定义。
+            retrieved_limit = trim_plan.limit("retrieved_memory")
+            graph_result = agent_ctx.get("graph_expansion")
+            graph_relations = list(getattr(graph_result, "relations", []) or [])
+            graph_demand = sum(item.token_cost for item in graph_relations)
+            graph_reserve = 0
+            if graph_relations and retrieved_limit > 0:
+                from aiive.memory.graph_types import GraphConfig as _GraphConfig
+
+                graph_reserve = min(
+                    graph_demand,
+                    int(retrieved_limit * _GraphConfig.from_settings().budget_ratio),
+                )
+            recall_budget_left = max(0, retrieved_limit - graph_reserve)
             recall_messages: list[dict[str, Any]] = []
             for rm in recall_msgs_raw:
                 content = rm.get("content", "") if isinstance(rm, dict) else str(rm)
@@ -302,6 +320,20 @@ class ContextAssembler:
                 if content:
                     recall_budget_left -= used
                     recall_messages.append({"role": "system", "content": content})
+
+            graph_text = ""
+            if graph_relations:
+                from aiive.memory.graph_expansion import render_expansion_block
+
+                memory_used = max(0, retrieved_limit - graph_reserve) - recall_budget_left
+                graph_text, _graph_used = render_expansion_block(
+                    graph_relations, max(0, retrieved_limit - memory_used),
+                )
+                if graph_text:
+                    recall_messages.append({"role": "system", "content": graph_text})
+            retrieved_text = "\n".join(
+                part for part in [agent_ctx.get("recall_text", ""), graph_text] if part
+            )
 
             # 当前轮次的消息角色由来源决定：system 类来源（system_command /
             # runtime_event）以 system 角色注入，让模型明确其为系统消息而非用户输入。
@@ -360,7 +392,7 @@ class ContextAssembler:
                     segment_summary_text=seg_sum_text,
                     sealing_bridge_text=bridge_text,
                     history_summary_text=history_summary_text,
-                    recall_text=agent_ctx["recall_text"],
+                    recall_text=retrieved_text,
                     history_msgs=history_msgs,
                     tools_schema=tools_schema,
                     user_message=message,
@@ -382,7 +414,7 @@ class ContextAssembler:
                         epoch_checkpoint_text=epoch_cp_text,
                         segment_summary_text=seg_sum_text,
                         sealing_bridge_text=bridge_text,
-                        recall_text=agent_ctx["recall_text"],
+                        recall_text=retrieved_text,
                         history_summary_text=history_summary_text,
                         history_msgs=history_msgs,
                         tools_schema=tools_schema,
@@ -409,7 +441,7 @@ class ContextAssembler:
                 epoch_checkpoint_text=epoch_cp_text,
                 segment_summary_text=seg_sum_text,
                 sealing_bridge_text=bridge_text,
-                recall_text=agent_ctx["recall_text"],
+                recall_text=retrieved_text,
                 history_summary_text=history_summary_text,
                 history_msgs=history_msgs,
                 tools_schema=tools_schema,
@@ -483,6 +515,9 @@ class ContextAssembler:
             db, message, scope, thread_id, config, exclude_source_ids=hot_ids,
             trace_id=trace_id,
         )
+        # 关系扩展必须发生在普通召回之后：召回结果既是种子，也是本轮的"相关事实"；
+        # 图谱只补关系与时间变化，不替代召回，也不额外调用 LLM 判断是否需要扩展。
+        graph_expansion = self._expand_relations(db, message, scope, pack)
 
         system_content = assemble_system_content(stable_contract, core_blocks, pack)
 
@@ -508,12 +543,41 @@ class ContextAssembler:
             "policies": policies,
             "core_blocks": core_blocks,
             "recall_pack": pack,
+            "graph_expansion": graph_expansion,
             "recall_messages": recall_messages,
             "history_summary_text": history_summary_text,
             "stable_contract_text": stable_contract,
             "core_memory_text": core_memory_text,
             "recall_text": recall_text,
         }
+
+    def _expand_relations(
+        self, db: Session, message: str, scope: Any, pack: Any,
+    ) -> Any:
+        """用本轮召回结果 + 查询实体做有界关系扩展。
+
+        失败只降级为"本轮没有图谱证据"，绝不阻断 Turn，也不影响普通召回结果。
+        """
+        try:
+            from aiive.memory.graph_expansion import GraphExpansionService
+            from aiive.memory.graph_types import GraphConfig
+
+            config = GraphConfig.from_settings()
+            if not config.enabled:
+                return None
+            chain: list[tuple[str, str | None]] = (
+                list(scope.chain()) if scope is not None
+                else [("global", None)]
+            )
+            seed_ids = [item.memory_id for item in (getattr(pack, "items", None) or [])]
+            return GraphExpansionService(db, config).expand(
+                seed_memory_ids=seed_ids,
+                query=message,
+                scope_chain=chain,
+            )
+        except Exception:
+            logger.warning("关系扩展失败，本轮跳过图谱证据", exc_info=True)
+            return None
 
     def _unified_recall(
         self, db: Session, message: str, scope: Any, thread_id: str,

@@ -529,6 +529,23 @@ class TurnExecutionService:
                 db.add(event)
                 db.flush()
                 turn.request_event_id = event.id
+                # 记忆冲突待确认：若该 Thread 有未决冲突，把本轮用户消息作为
+                # "对澄清问题的回复"入队后台解析（与用户消息事件同事务提交，
+                # 进程重启也不会丢失"回复—案例"关联）。仅真实用户消息参与。
+                if self._message_source is MessageSource.USER:
+                    try:
+                        from aiive.memory.conflict_confirmation import MemoryConflictService
+
+                        MemoryConflictService.enqueue_reply_jobs(
+                            db,
+                            thread_id=committed_tid,
+                            user_message=message,
+                            turn_id=turn_id,
+                            turn_record_id=turn.id,
+                            source_event_ids=[event.id],
+                        )
+                    except Exception:
+                        logger.exception("记忆冲突回复入队失败（不影响本轮对话）")
                 db.commit()
                 db.refresh(turn)
                 turn_record_id = turn.id

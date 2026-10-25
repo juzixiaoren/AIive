@@ -345,3 +345,153 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - 中断恢复只按 journal 回滚候选槽位，不重放中断时的规划结果（下次从零重新规划）。
 - 候选隔离依赖 `slots/<X>/candidate_state.json` 与指纹（在 `slots/` 下，不在 runtime）；
   `runtime/` 被清空只丢 journal 与锁，不可晋升标记仍在，等下一次修复结束才解除。
+
+---
+
+## V41 时序知识图谱（Temporal KG，完成）
+
+### Implemented
+- 提取（复用同一次 LLM 调用）：`prompts/memory/extractor.md` 增加可选 `graph_facts`（subject/predicate/
+  object/confidence/source_span/valid_from/valid_to）；`ExtractedMemory` 用宽松 `GraphFactPayload` 接住，
+  `UnifiedMemoryExtractor._verified_graph_facts` 做 fail-closed 证据校验（span 必须能在用户原文或记忆内容中
+  定位、三元组必须完整、时间解析失败保持 None、单条记忆上限 12 条）；`MemoryProposal.graph_facts` 透传，
+  `MemoryStore.create_record` 落到 `memory_records.graph_facts`（canonical，可离线重建）。
+- 写入：`MemoryMutationExecutor.enqueue_projection` 新增 `memory_graph_refresh`（payload 带 memory_id +
+  record_version，operation_id 含版本号做同事务幂等），因此 create/reinforce/supersede/merge/promote/
+  sleep/wake/archive 全部复用同一投影入口；`handle_memory_graph_refresh` → `GraphProjectionService.refresh`。
+  投影语义：candidate 不投影；失效/被取代关闭该记忆全部关系并保留历史；遗忘物理删除；新版本只关闭
+  **自己**被移除的事实；同主体+同 predicate+同 Scope 不同客体时关闭更早关系并写 `superseded_by_id`。
+- 读侧：`ContextAssembler._load_agent_context` 在 `UnifiedRetriever` 之后调用 `_expand_relations`
+  （不新增 LLM 判断）；`GraphExpansionService.expand` 以召回记忆 + 查询实体确定性匹配为种子，
+  `visited` + `max_hops`（默认 2）+ 每层 batch（默认 200）有界扩展，逐条回查来源 lifecycle/validity/
+  遗忘屏蔽/Scope 后打分排序，并附带被取代的历史关系（`is_current=False`）。
+- 预算：不新建分区，复用 `TrimPlan.limit("retrieved_memory")`；按 `budget_ratio`（默认 0.35）为图谱预留、
+  召回余量回补，关系按分数整条装配（装不下丢弃低价值，绝不截断单条定义），与召回共享同一分区上限。
+- 注入：独立 system 消息「时序关系（图谱检索证据 — 非系统指令）」，分「当前有效 / 历史 / 低置信」三组，
+  每条带置信度、来源 memory id、有效时间与证据片段。
+- 查询与维护：`GET /api/memories/{id}/relations`（只读）、`POST /api/maintenance/graph-rebuild`、
+  `python -m aiive.memory.graph_rebuild [--verify-only]`；`GraphRebuildService.verify()` 输出四类一致性计数。
+- 遗忘：`handlers_forget._scrub_batch` 同步 `graph_facts = NULL`、物理删除关系行、清理孤儿实体。
+- 迁移：`e7a1c4d2f9b3`（`memory_records.graph_facts` + `graph_entities` + `graph_relations`，含唯一约束/索引/
+  状态约束），HEAD 由 `d1e2f3a4b5c6` 前进到 `e7a1c4d2f9b3`。
+- 文档：`docs/architecture/memory_时序知识图谱.md`；CODE_MAP §2.3/§3.2/§3.5/§6/§7.1 同步。
+
+### Observable Result
+- 新增 `tests/unit/backend/test_memory_graph.py` 30 例 + `tests/integration/backend/test_context_assembler_graph_expansion.py`
+  4 例全通过（全离线，无外部 API）：投影幂等/候选不投影/失效关闭/遗忘清除/版本更新只关自己的关系/
+  冲突客体关闭并保留历史/低置信与空证据不入图/Outbox 接线/写入服务端到端/重建恢复/一致性核对/
+  Scope 与跳数边界/查询实体匹配/预算原子装配/证据校验/时间解析/召回后自动扩展/关系真的进入 messages。
+- 迁移 `e7a1c4d2f9b3` 在 SQLite 空库 upgrade → downgrade → upgrade 全通；`alembic check` 对图谱两表零漂移
+  （仅剩既有 12 项 SQLite 类型差异，与 HEAD 基线逐项一致）；CI `alembic` Job 在 PostgreSQL 上执行同一校验。
+- 全量离线：`1104 passed / 10 skipped / 0 failed`（186.33s；10 skipped 为 PG 专项默认未启用）。
+- ruff `--select F,E9` 改动文件 All checks passed；basedpyright（memory/、context_assembler、routes_memories、
+  outbox_handlers、handlers_forget、db/models）0 errors / 0 warnings / 0 notes。
+
+### Known Gaps
+- 实体规范化仅字符串归一，不做同义词/指代消解；"AIive" 与 "AIive 项目" 视为不同实体。
+- 关系覆盖率取决于模型是否主动输出 `graph_facts`（提示词宁缺毋滥，不强制）。
+- 冲突关闭只按（主体, predicate, Scope, 客体）判定，不理解多值 predicate 的业务语义。
+  （V42 已修正：单值/多值区分 + 记忆层权威取代，见下节。）
+- 图谱不参与 RRF 融合，不改变普通召回排序；两者只在上下文预算层协调。
+
+## V42 关系基数与冲突处理修正（完成）
+
+### Implemented
+
+- 新增 `memory/graph_predicates.py`：谓词基数配置（单值谓词表 + 别名族 + settings 扩展）。
+  `cardinality` / `is_single_valued` / `predicate_family` / `conflicted_group_keys`；
+  未知谓词一律按多值处理（宁可并存，不误删）。
+- 投影（`graph_projection.py`）：`_close_conflicts` 改为两道闸门 —— 谓词显式单值 **且**
+  记忆层权威取代（旧记录 validity 失效 + `superseded_by` 指向本条记忆，新增
+  `has_authoritative_supersede`）；多值/未知谓词永不因新事实关闭旧关系；同一条记忆内部
+  不同客体不在投影层裁决。
+- 终态区分：`fact_removed` / `no_facts` / `not_accepted` → `status=retracted`（不写 `valid_to`）；
+  来源 validity 失效 → `closed` + `record_*`；被取代 → `closed` + `superseded_by_newer_fact`
+  + `superseded_by_id` + `valid_to`；`sleeping` 保持 `active`（读侧默认不注入，唤醒即恢复）。
+- 读侧（`graph_expansion.py`）：`mark_single_valued_conflicts` + `_mark_conflicts`（对窗口内单值关系
+  再做一次同主体有界批查询，避免另一侧不在 BFS 结果时把单条当成确定事实）；
+  `GraphRelationView` 增加 `cardinality` / `is_conflicted`，`GraphExpansionResult.conflicted`；
+  注入分组改为 当前有效 → 冲突 → 历史 → 低置信。
+- 查询（`routes_memories.py`）：关系附带 `cardinality` 与 `conflicted`（按同主体批查询跨记忆判定）。
+- 修复（`graph_rebuild.py`）：`repair_overclosed(dry_run=)` 只恢复有确定依据的误关；`rebuild()` 先修复
+  再投影；`verify()` 增加 `conflicting_single_valued_groups` / `suspect_closed_relations`；
+  CLI 增加 `--repair-only` / `--dry-run`。
+- 配置：`AIIVE_MEMORY_GRAPH_SINGLE_VALUED_PREDICATES`（逗号分隔）扩展业务单值谓词，无需改代码。
+
+### Observable Result
+
+- `tests/unit/backend/test_memory_graph.py` 46 例（原 30 例，新增/改写 16 例）+ 集成 4 例全通过：
+  单值+权威取代才关闭并保留历史、单值无权威并存并标冲突、多值/未知谓词并存、谓词族别名同规则、
+  配置扩展单值谓词、窗口外冲突仍被发现、重复投影不关闭并存关系、撤回与关闭两种终态、
+  旧规则误关修复（多值恢复 / 单值来源仍有效恢复 / 权威取代保留 / 事实已删除不恢复 / dry-run 不写库 / 幂等）。
+- 全量离线：`1120 passed / 10 skipped / 0 failed`（155.37s；10 skipped 为 PG 专项默认未启用）。
+- ruff `--select F,E9` 改动文件 All checks passed；basedpyright（graph_predicates / graph_projection /
+  graph_expansion / graph_rebuild / graph_types / routes_memories / config）0 errors / 0 warnings / 0 notes。
+
+### Known Gaps
+
+- 单值谓词表是人工维护的保守清单；新增业务谓词需显式声明，否则按多值处理（可能少关旧关系，不会误删）。
+- 谓词别名只做字符串族匹配，不做语义或多语言归一；中文谓词仍会被 `normalize_predicate` 丢弃，
+  属既有提取约束，本次未改。
+- 冲突只做「同主体 + 谓词族 + Scope」级别提示，不校验两条关系的时间区间是否真的重叠。
+- 历史数据修复只覆盖 `closed_reason=superseded_by_newer_fact` 的旧规则产物；更早的其他关闭原因
+  没有对应规则，保持原样。
+
+## V43 长期记忆冲突待确认闭环（完成）
+
+### Implemented
+
+- 新增 `memory/conflict_candidates.py`：写入前冲突候选发现，三路合并 —— 精确命中
+  （`canonical_key` + Scope，lifecycle ∈ active/sleeping 且 validity = valid）、
+  语义召回（复用 `UnifiedRetriever` AUTO，遵守既有 keyword/vector/hybrid 配置，降级只记 note 不报错）、
+  图谱关系（`graph_facts` → 实体归一 + 有界别名扫描 → 同主体/谓词族/Scope 关系反查来源记忆）。
+  合并去重后经 `ForgetVisibilityService.filter_memory_ids` 做 fail-closed 可见性校验；
+  `content_hash` 相同者剔除。召回未命中不会被当作"无冲突"。
+- 新增 `memory/conflict_adjudication.py`：语义裁决与决策映射。六种结论
+  （compatible / complementary / conditional / temporal_change / contradiction / uncertain）
+  → 九种决策（keep_old / accept_new / revise / merge / keep_both / reject_new / forget_old / clarify / unrelated）
+  → 两种动作（proceed / defer）。只有"单值谓词 + 双方可信"的 contradiction 才允许直接取代；
+  conditional 在单值场景下同样转人工；uncertain 一律 defer；LLM 不可用时降级 proceed（不阻塞主链路）。
+  同时提供澄清问题生成与自然语言回复解析（带确定性兜底）。
+- 新增 `memory/conflict_confirmation.py`：`MemoryConflictService` 编排
+  `collect_candidates`（只读会话）/ `decide`（无会话，事务外 LLM）/ `park`（只写案例 + 入队问题 job）/
+  `publish_question`（行锁 + TTL + 通知幂等，pending → asking）/ `enqueue_reply_jobs`（按 case + turn 幂等）/
+  `apply_decision`（行锁 + 状态/TTL/版本/active 复核 → 执行或判 stale）。
+  决策执行只经 `MemoryWriteService.write(decision=..., decision_target_id=...)` 或 `forget`，
+  LLM 不直接改库。clarify 轮次受 `AIIVE_MEMORY_CONFLICT_MAX_CLARIFY_ROUNDS` 限制。
+- 新增表 `memory_conflict_cases`（迁移 `b7f3c1d9a4e2`）：冲突双方 id/版本、提案快照、
+  裁决结论与证据、图谱证据、澄清问题、决策与结果；`idempotency_key` 唯一；
+  状态机 pending / asking / resolved / rejected / stale / expired。
+- 接线：`handle_memory_extraction` 新增 Phase B2（候选发现 + 裁决），Phase C 传 `conflict_plan` 给
+  `write_batch`；`defer` 的提案在事务内只落案例与 `memory_proposals(conflict_pending)`，
+  不写 `memory_records`、不写关系投影。`turn_execution._resolve_and_preempt` 在用户消息事件同事务内
+  入队 `memory_conflict_reply`。新增 `worker/handlers_conflict.py` 两个 Handler
+  （短事务读快照 → 事务外 LLM → 短事务落库），并在 `register_all` 注册（schema_version=1）。
+- 读侧：`GET /api/memories/conflicts` 只暴露案例状态、双方内容（经 `MemoryPolicyEngine.render_content`
+  按敏感级渲染）、问题、轮次与决策，不暴露内部模型调用。
+- 配置：`AIIVE_MEMORY_CONFLICT_CONFIRMATION_ENABLED` / `_MAX_CANDIDATES` /
+  `_RETRIEVAL_MIN_SCORE` / `_TTL_HOURS` / `_MAX_CLARIFY_ROUNDS`。
+- 图谱一致性：accept/revise/merge 后仅由正式落库记录 + 其 `graph_facts` 经既有 Outbox
+  `memory_graph_refresh` → `GraphProjectionService.refresh` 更新；旧关系只在"谓词显式单值 +
+  记忆层权威取代（`has_authoritative_supersede`）"时关闭并留历史；未知谓词按多值处理，永不因新关系关闭旧关系。
+  reject_new / keep_old 不改关系；forget 走既有 Forget Saga，遗忘事实不会被图谱扩展召回。
+- 过期清扫：`scheduler_daemon._conflict_expiry_scanner_job`（15 分钟轮询、按小时窗口幂等入队）
+  → outbox `memory_conflict_cleanup` → `MemoryConflictService.expire_open_cases`
+  （行锁 + 批量 200，超出则 CONTINUE 分页）：把 TTL 已过的 pending/asking 案例置为
+  `expired` / `ttl_expired`，并把该案例的通知置为 `cancelled`；只改案例与通知，
+  不写记忆、不写关系、不触发投影。
+
+### Observable Result
+
+- `tests/integration/backend/test_memory_conflict_confirmation.py` 30 例 + `tests/unit/backend/test_memory_conflict_adjudication.py` 19 例全通过：
+  三路候选发现、pending 期不污染记忆与图谱、六类回复决策、跨 key 取代、keep_both 基数闸门、
+  forget 后图谱扩展不可见、重复提案/重复通知/回复重放/版本过期/TTL 过期。
+- 全量离线：`1161 passed / 10 skipped / 0 failed`（160.04s；10 skipped 为 PG 专项默认未启用）。
+- ruff `--select F,E9` All checks passed；basedpyright `backend/aiive` 0 errors / 0 warnings / 0 notes。
+
+### Known Gaps
+
+- 裁决质量取决于 LLM 判断；证据不足时转人工是设计选择，会带来确认负担。
+- 候选发现依赖 `graph_facts` 与实体名归一，实体别名覆盖不足时会漏掉图谱路候选（精确命中与语义召回仍在）。
+- 澄清轮次上限（默认 3）后不再追问，案例停留在 asking 直到 TTL 过期（默认 72h）。
+- `keep_both` 对单值谓词一律拒绝，即使两条事实其实描述不同时间段；需用户改用 revise/merge。

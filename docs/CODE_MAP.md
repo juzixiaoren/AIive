@@ -52,7 +52,7 @@
 │  supervisor/  进程托管 (daemon / process_control / release_manager)│
 └───────────────────────────┬────────────────────────────────────┘
                             ▼
-        db/ (SQLAlchemy 71 表)  +  alembic/ (schema 唯一真相源)
+        db/ (SQLAlchemy 73 表)  +  alembic/ (schema 唯一真相源)
         PostgreSQL 16 + pgvector
 ```
 
@@ -102,8 +102,10 @@
 |---|---|---|---|
 | 记忆写入 Saga / supersede | `memory/memory_write_service.py` | `memory/conflict_resolver.py`、`memory/memory_gate.py`、`memory/memory_mutation.py` | `test_memory_write*.py`、`test_conflict*.py` |
 | 冲突消解策略 | `memory/conflict_resolver.py` | `memory/memory_key_registry.py` | `test_conflict_resolver*.py` |
+| 记忆冲突待确认闭环（召回+图谱候选 → 语义裁决 → 用户确认 → 正式写入） | `memory/conflict_confirmation.py` | `memory/conflict_candidates.py`、`memory/conflict_adjudication.py`、`worker/handlers_conflict.py`、`memory/memory_write_service.py`（`conflict_plan` / `decision`）、`runtime/turn_execution.py`（回复入队）、`api/routes_memories.py`（`GET /memories/conflicts`） | `test_memory_conflict_confirmation.py`、`test_memory_conflict_adjudication.py` |
 | 记忆 key 注册表（唯一真相源） | `memory/memory_key_registry.py` | `prompts/`（MEMORY_KEY_GUIDE） | `test_memory_key*.py` |
 | 记忆召回（四路由 + 融合） | `memory/automatic_recall.py`、`memory/recall_fusion.py` | `memory/recall_config.py`、`memory/vector_projection.py`、`retrieval/` | `test_recall*.py` |
+| 时序知识图谱（关系事实 → 投影 → 读侧扩展） | `memory/graph_projection.py`、`memory/graph_expansion.py`、`memory/graph_rebuild.py`、`memory/graph_predicates.py`（关系基数/谓词族） | `memory/graph_types.py`、`memory/memory_extractor.py::_verified_graph_facts`、`memory/memory_mutation.py::enqueue_projection`、`runtime/context_assembler.py::_expand_relations`、`worker/outbox_handlers.py::handle_memory_graph_refresh` | `test_memory_graph.py`、`test_context_assembler_graph_expansion.py` |
 | 记忆提取（LLM） | `memory/memory_extractor.py`、`memory/proposal_normalizer.py` | `core/action_planner.py`、`worker/outbox_handlers.py::handle_memory_extraction` | `test_memory_extract*.py` |
 | 记忆生命周期（wake/promote/sleep/archive） | `memory/memory_lifecycle_service.py` | `api/routes_memories.py` | `test_memory_lifecycle*.py` |
 | 记忆维护扫描 | `memory/memory_maintenance.py`、`memory/memory_maintenance_planner.py` | `worker/outbox_handlers.py::handle_memory_maintenance` | `test_maintenance*.py` |
@@ -182,7 +184,7 @@
 | 路由文件 | 前缀 / 端点 |
 |---|---|
 | `routes_chat.py` | `/api/chat` L116、`/chat/system` L136、`/chat/stream` L163（SSE 核心入口） |
-| `routes_memories.py` | `/api/memories` CRUD + `/{id}/forget|sleep|archive` + `/maintenance/*` |
+| `routes_memories.py` | `/api/memories` CRUD + `/{id}/forget|sleep|archive` + `/{id}/relations`（时序图谱关系，只读）+ `GET /memories/conflicts`（待确认冲突案例，只读）+ `/maintenance/*`（含 `POST /maintenance/graph-rebuild`） |
 | `routes_tools.py` | `/api/tools`、`/tool-operations/{id}`、`POST /tools/safe-delete` |
 | `routes_agent_tasks.py` | `/api/agent-tasks` 增删查改 + `WS /ws/{task_id}` |
 | `routes_approval.py` | `POST /api/approval/respond` |
@@ -254,7 +256,15 @@
 | `recall_fusion.py` / `recall_config.py` / `recall_models.py` | `fuse_and_pack` L32（RRF k=60+6 信号加权+阈值 0.08+top_k 8）；全部预算权重阈值；Pydantic 契约 |
 | `core_memory_projection.py` / `memory_read_model.py` | L1 Core Memory Block 构建；L0 精确 key 读取 |
 | `scope_resolver.py` / `context_assembly.py` | Scope Chain（thread→global）；`render_core_memory`/`assemble_system_content` |
-| `memory_extractor.py` / `proposal_normalizer.py` / `extraction_policy.py` | `UnifiedMemoryExtractor`；提案规范化；提取信号枚举 |
+| `memory_extractor.py` / `proposal_normalizer.py` / `extraction_policy.py` | `UnifiedMemoryExtractor`（同一次调用产出 `graph_facts`，`_verified_graph_facts` 做原文证据校验）；提案规范化；提取信号枚举 |
+| `graph_types.py` | 图谱契约：`GraphFact`/`GraphFactPayload`/`GraphRelationView`/`GraphConfig`；实体与 predicate 规范化、`make_relation_key`、事实时间解析（未知保持 None） |
+| `graph_predicates.py` | 谓词基数配置：单值谓词表 + 别名族 + settings 扩展；`is_single_valued`/`predicate_family`/`conflicted_group_keys`（未知谓词默认多值） |
+| `graph_projection.py` | `GraphProjectionService.refresh`：按 `(memory_id, record_version)` 幂等投影；candidate 不投影、失效关闭、遗忘物理删除；仅单值谓词 + 记忆层权威取代（`has_authoritative_supersede`）才结束旧关系，版本删事实记为 `retracted` |
+| `graph_expansion.py` | `GraphExpansionService.expand`：召回种子 + 查询实体匹配 → 有界 BFS（visited/max_hops/batch）→ 来源校验/打分/历史对照/单值多客体冲突标记（`mark_single_valued_conflicts`）；`render_expansion_block` 预算内整条装配（当前/冲突/历史/低置信分组） |
+| `graph_rebuild.py` | `GraphRebuildService.rebuild/verify/repair_overclosed`：从 `memory_records.graph_facts` 重建、清理孤儿行、修复旧规则误关（只恢复来源仍有效且仍主张的事实）；CLI `[--verify-only\|--repair-only] [--dry-run]` |
+| `conflict_candidates.py` | `ConflictCandidateFinder.discover`：三路候选发现（精确 key+Scope、`UnifiedRetriever` 语义召回、`graph_facts` 反查同主体同谓词族同 Scope 的关系），合并去重 + 回源校验（lifecycle/validity/遗忘屏蔽）+ 剔除 content_hash 相同项；图谱关系只作证据 |
+| `conflict_adjudication.py` | `SemanticConflictAdjudicator`（LLM 六类结论：compatible/complementary/conditional/temporal_change/contradiction/uncertain）、`adjudication_to_plan`（确定性自动处理 vs 转确认）、`ConflictQuestionGenerator`、`ConflictReplyParser`（9 类决策）；提示词内联构造 |
+| `conflict_confirmation.py` | `MemoryConflictService`：`collect_candidates`/`decide`（两阶段，LLM 在事务外）、`park`（建案例+入队问题任务，幂等）、`publish_question`（通知）、`enqueue_reply_jobs`（回合入口入队）、`apply_decision`（版本/过期复核后经 `MemoryWriteService`/`Forget` 落库） |
 | `memory_policy.py` / `memory_access_tracker.py` | 敏感度/读取/authority 策略；访问 touch（recency 去抖） |
 | `projection.py` / `vector_projection.py` / `vector_bootstrap.py` / `embedding_provider.py` | markdown/json 落盘投影（可丢失）；pgvector 投影+fail-closed 校验；provider 工厂与运行时校验 |
 
@@ -263,7 +273,10 @@
 **记忆数据流**：
 - 写入：`tools/remember_or_update` / chat 收尾入队 `memory_extraction` → `worker/outbox_handlers.handle_memory_extraction` → `MemoryWriteService.write_batch` → conflict_resolver → memory_store + lineage + 投影入队（vector/markdown/core_memory refresh 均为独立 outbox job）
 - 召回：每轮 `ContextAssembler._unified_recall` → `AutomaticRecallEngine`（L0 精确/L1 core/L2 四路由/L3 recent）→ `recall_fusion` → `MemoryRecallPack` 注入上下文
+- 图谱写入：`memory_records.graph_facts` → `MemoryMutationExecutor.enqueue_projection` 入队 `memory_graph_refresh` → `handle_memory_graph_refresh` → `GraphProjectionService.refresh` → `graph_entities`/`graph_relations`
+- 图谱读取：`ContextAssembler._load_agent_context` 在 `UnifiedRetriever` 之后调用 `_expand_relations` → `GraphExpansionService.expand` → 与召回共享 `retrieved_memory` 动态预算，注入“时序关系（图谱检索证据）”块
 - 遗忘：`forget` 工具 → `MemoryWriteService.forget` 起 Saga → `worker/handlers_forget` 五阶段（cascade→rebuild→purge→verify→reconcile），tombstone+shield 保证 fail-closed
+- 冲突待确认：`handle_memory_extraction` Phase B2 → `collect_candidates`（短只读会话）+ `decide`（无会话 LLM 裁决）→ 需确认时 `write_batch` 只写 `memory_conflict_cases` + `memory_conflict_question` job（不写记忆/图谱）→ 用户回复 → `memory_conflict_reply` → `apply_decision` → `MemoryWriteService.write(decision=...)` / `forget`
 
 ### 3.6 `tools/` — 工具注册表与执行层（核心枢纽）
 
@@ -315,11 +328,12 @@
 | `outbox_worker.py` | `OutboxWorker` L47：`claim_one` L69（skip_locked+双重 lease+claim_token）、`enqueue` L152（allowlist 强校验）、`poll` L182、`_dispatch_one` L218；终态 `_finalize_job` L366 / 重试 `_retry_later` L405 / 死信 L519 / forget 阶段死信 L677 |
 | `handler_registry.py` | `HandlerRegistry` L10：job_type→handler + schema_version 白名单 |
 | `outbox_dto.py` | `HandlerOutcome` 枚举 L16（COMPLETED/RETRY_LATER/NON_RETRYABLE/RETRYABLE_ERROR/CLAIM_LOST/CONTINUE）；`ClaimedJob`/`HandlerResult`/`ActiveClaim`；`FencingViolationError` L102 |
-| `outbox_handlers.py`（96KB） | 装配 `register_all` L1338（17 类 job_type，schema_version=1）；`handle_memory_extraction` L106、`handle_reminder_delivery` L350、`handle_core_memory_refresh` L617、`handle_memory_vector_refresh` L639、`handle_memory_markdown_project` L664、`handle_retrieval_index_refresh` L697、`handle_memory_maintenance` L1165、`handle_segment_sealing` L1622、`handle_epoch_rollover` L1961、`handle_epoch_checkpoint` L2055 |
+| `outbox_handlers.py`（100KB） | 装配 `register_all` L1398（22 类 job_type，schema_version=1；含 `memory_conflict_question` / `memory_conflict_reply` / `memory_conflict_cleanup`）；`handle_memory_extraction` L106、`handle_reminder_delivery` L350、`handle_core_memory_refresh` L617、`handle_memory_vector_refresh` L639、`handle_memory_markdown_project` L664、`handle_retrieval_index_refresh` L697、`handle_memory_maintenance` L1165、`handle_segment_sealing` L1622、`handle_epoch_rollover` L1961、`handle_epoch_checkpoint` L2055 |
 | `handlers_forget.py`（71KB） | 遗忘 Saga：`handle_forget_cascade` L133（目标物化 L239/墓碑 L435/依赖发现 L619）、`handle_forget_rebuild` L807、`handle_forget_purge` L1356（`_scrub_wide` L1535）、`handle_forget_verify` L1677、`handle_forget_reconcile` L1801；`BATCH_SIZE=200` |
 | `handlers_retention.py` / `handlers_agent_tasks.py` | `handle_retention_cleanup` L27 分批驱动 RetentionEngine；`handle_agent_task_run` L16 驱动 PersistentTaskRuntime |
 | `handlers_knowledge.py` | `handle_knowledge_maintenance` L29：扫描→分批清理→commit，无进展时 COMPLETED(partial) 而非空转；`MAX_MAINTENANCE_BATCHES=5` |
-| `scheduler_daemon.py`（27KB） | 模块级 `scheduler` L33；`start_daemon` L90（9 个周期 job）；`schedule_outbox_poll` L149；`_poll_tool_operations` L193（独立线程防饿死）；`_agent_task_scanner_job` L216（stale run 恢复/锁过期/watcher/审批过期）；`_idle_scanner_job` L263；`_forget_reconcile_scanner_job` L423；`enqueue_maintenance_job` L453、`enqueue_retention_job` L509、`enqueue_knowledge_maintenance_job`、`knowledge_needs_maintenance`、`_knowledge_maintenance_scanner_job`（在途判定只认 pending/running；DB 侧不一致即时入队 + 每日对象对账；终态任务不阻塞，补跑分配 `#n` 后缀 operation_id） |
+| `handlers_conflict.py` | 冲突闭环两个 Handler，均按"短事务读快照 → 事务外 LLM → 短事务落库"：`handle_memory_conflict_question`（生成澄清问题并写 `notification_created`，状态 pending→asking）、`handle_memory_conflict_reply`（解析回复后调 `MemoryConflictService.apply_decision`） |
+| `scheduler_daemon.py`（27KB） | 模块级 `scheduler` L33；`start_daemon` L90（9 个周期 job）；`schedule_outbox_poll` L149；`_poll_tool_operations` L193（独立线程防饿死）；`_agent_task_scanner_job` L216（stale run 恢复/锁过期/watcher/审批过期）；`_idle_scanner_job` L263；`_forget_reconcile_scanner_job` L423；`_conflict_expiry_scanner_job`（冲突案例 TTL 清扫，`enqueue_conflict_cleanup_job` 按小时窗口幂等入队）；`enqueue_maintenance_job` L453、`enqueue_retention_job` L509、`enqueue_knowledge_maintenance_job`、`knowledge_needs_maintenance`、`_knowledge_maintenance_scanner_job`（在途判定只认 pending/running；DB 侧不一致即时入队 + 每日对象对账；终态任务不阻塞，补跑分配 `#n` 后缀 operation_id） |
 | `outbox_heartbeat.py` / `job_types.py` / `task_worker.py` | 租约续期线程 + `ActiveClaimRegistry`；`ENABLED_OUTBOX_JOB_TYPES` allowlist；到期提醒原子入队 `reminder_delivery`（FOR UPDATE SKIP LOCKED） |
 
 ### 3.9 `task_runtime/` + `control/` — 持久任务与执行边界
@@ -416,9 +430,9 @@
 
 ---
 
-## 6. 数据库表地图（71 表）
+## 6. 数据库表地图（74 表）
 
-> 模型定义：`db/models.py`（59）+ `db/forget_models.py`（10）+ `db/retention_models.py`（2）。迁移：baseline `69da20d1e47c`，HEAD `e2f6a8c4d1b7`。
+> 模型定义：`db/models.py`（62）+ `db/forget_models.py`（10）+ `db/retention_models.py`（2）。迁移：baseline `69da20d1e47c`，HEAD `b7f3c1d9a4e2`。
 
 | 域 | 表 | 说明 |
 |---|---|---|
@@ -427,6 +441,8 @@
 | 上下文压缩 | `epochs`、`segments`、`segment_summaries`、`epoch_checkpoints`、`working_states`、`compaction_inputs`、`compaction_runs`、`epoch_compaction_inputs`、`checkpoint_runs` | Epoch/Segment/摘要/检查点/工作状态/压缩流水线 |
 | 记忆 V2 | `memory_records`、`memory_proposals`、`memory_ingestion_runs`、`memory_evidence`、`memory_lineage` | 记忆主档/提案/摄取运行/证据/血缘 |
 | 记忆向量 | `memory_vector_projections` | pgvector 512 维投影 |
+| 记忆图谱 | `graph_entities`、`graph_relations` | 时序知识图谱派生投影（实体规范化 / 三元组 + 有效期 + 来源记忆版本）；真相源是 `memory_records.graph_facts` |
+| 记忆冲突待确认 | `memory_conflict_cases` | 待确认案例：冲突双方 id/版本、提案快照、裁决结论与证据、澄清问题、决策与结果；pending 期间不写记忆、不写关系（状态机 pending/asking/resolved/rejected/stale/expired，`idempotency_key` 唯一） |
 | 记忆召回 | `memory_recall_runs`、`memory_recall_candidates`、`core_memory_blocks` | 召回运行/候选/核心记忆块 |
 | 记忆维护 | `memory_maintenance_runs`、`_batches`、`_inputs`、`_actions` | 维护 run/batch/input/action |
 | 检索索引 | `retrieval_index_generations`、`_entries`、`_tokens`、`_runs` | 索引代次/条目/倒排 token/运行 |
@@ -457,6 +473,9 @@ routes_chat.py (L163)
               → context_budget.py 分区预算裁剪
               → _unified_recall (L518) → memory/automatic_recall.py::recall (L136)
                     → recall_fusion.py::fuse_and_pack (L32) → MemoryRecallPack
+              → _expand_relations（召回之后）→ memory/graph_expansion.py::expand
+                    → 关系 + 历史对照，与召回共享 retrieved_memory 动态预算
+                    → 注入「时序关系（图谱检索证据）」system 消息
       → agent_graph.py::AgentGraph._execute_graph_stream (L1084)
           → _assistant (L546, llm_client.chat + bind_tools)
           → _policy_check (L569, policy_engine.check_tool_calls)
@@ -514,7 +533,48 @@ api/routes_agent_tasks.py 创建任务 → task_runtime/repository.py::create_ta
       → watchers.py 到期唤醒 / scheduler._agent_task_scanner_job (L216) 恢复 stale run
 ```
 
-### 7.5 启动装配（`main.py::lifespan`）
+### 7.5 记忆冲突待确认闭环（自动写入 ↔ 用户确认）
+
+```
+handle_memory_extraction (worker/outbox_handlers.py L106)
+  Phase B  UnifiedMemoryExtractor.extract → proposals（含 graph_facts）
+  Phase B2 MemoryConflictService.collect_candidates   （短只读会话：精确键 + UnifiedRetriever + graph_relations）
+           MemoryConflictService.decide              （无会话：SemanticConflictAdjudicator → adjudication_to_plan）
+  Phase C  MemoryWriteService.write_batch(conflict_plan=...)
+             ├ plan=proceed → 原有 Gate/ConflictResolver/写入/投影
+             └ plan=defer   → MemoryConflictService.park
+                               ├ memory_conflict_cases(pending) + memory_proposals(conflict_pending)
+                               └ outbox memory_conflict_question（不写 memory_records / graph_relations）
+
+memory_conflict_question (worker/handlers_conflict.py)
+  短事务读快照 → ConflictQuestionGenerator（事务外 LLM）→ publish_question
+  → Event(notification_created, status=pending) + 角标广播 → case.status=asking
+
+用户回复（会话入口）
+  TurnExecutionService._resolve_and_preempt
+  → MemoryConflictService.enqueue_reply_jobs（同 Turn 幂等）→ outbox memory_conflict_reply
+
+memory_conflict_reply (worker/handlers_conflict.py)
+  短事务读快照 → ConflictReplyParser（事务外 LLM，9 类决策）
+  → MemoryConflictService.apply_decision（复核 status / expires_at / old_record_version）
+      ├ keep_old | reject_new   → 只关案例，不写记忆、不改关系
+      ├ accept_new | revise | merge → MemoryWriteService.write(decision=..., decision_target_id=old)
+      │      → 旧记录 validity=superseded + superseded_by=新记录
+      │      → Outbox memory_graph_refresh → GraphProjectionService.refresh
+      │        （仅单值谓词 + has_authoritative_supersede 才关闭旧关系并记 valid_to）
+      ├ keep_both               → 单值键/单值谓词且无明确条件时继续询问；否则 create
+      ├ forget_old              → MemoryWriteService.forget（Phase A shield → 五阶段 Saga，图谱关系清空）
+      └ clarify                 → 轮次+1 再入队问题任务（超上限则保留旧记忆并结束）
+
+过期清扫（后台，不依赖用户在场）
+  scheduler_daemon._conflict_expiry_scanner_job（15min 轮询，按小时窗口幂等入队）
+  → outbox memory_conflict_cleanup → handlers_conflict.handle_memory_conflict_cleanup
+      → MemoryConflictService.expire_open_cases（行锁 + 批量 200，超出则 CONTINUE 分页）
+        → status=expired / resolution_reason=ttl_expired + 该案例通知置 cancelled
+        → 只改案例与通知：不写 memory_records、不写 graph_relations、不触发投影
+```
+
+### 7.6 启动装配（`main.py::lifespan`）
 
 ```
 绑定事件循环 → validate_prompt_catalog → _ensure_schema (Alembic upgrade head)

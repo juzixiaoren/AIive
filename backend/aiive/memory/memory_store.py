@@ -92,6 +92,11 @@ class MemoryStore:
             content_hash=content_hash,
             structured_value_hash=structured_value_hash,
             keywords=proposal.keywords or None,
+            # 关系事实与内容同源落库：图谱可由此列重建，无需再次调用 LLM。
+            graph_facts=(
+                [fact.model_dump(mode="json") for fact in proposal.graph_facts]
+                if proposal.graph_facts else None
+            ),
             lifecycle_state=lifecycle_state,
             validity_state=validity_state,
             trust_level=proposal.trust_level,

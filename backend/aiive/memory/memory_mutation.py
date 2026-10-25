@@ -263,6 +263,30 @@ class MemoryMutationExecutor:
                     max_retries=3,
                 ))
 
+        # 时序知识图谱投影：与记录版本绑定，candidate 不是事实来源不投影。
+        # 遗忘/归档/取代同样入队，由投影服务按记录最终状态关闭或删除关系。
+        if (
+            settings.aiive_memory_graph_enabled
+            and record.lifecycle_state != LifecycleState.CANDIDATE.value
+        ):
+            op_id = f"memory_graph_refresh:{record.id}:{record.record_version}"
+            if not any(
+                isinstance(obj, OutboxJob) and obj.operation_id == op_id
+                for obj in self._db.new
+            ) and self._db.query(OutboxJob).filter_by(operation_id=op_id).first() is None:
+                self._db.add(OutboxJob(
+                    operation_id=op_id,
+                    job_type="memory_graph_refresh",
+                    status="pending",
+                    payload={
+                        "schema_version": 1,
+                        "memory_id": record.id,
+                        "record_version": record.record_version,
+                    },
+                    trace_id=record.id,
+                    max_retries=3,
+                ))
+
         # Phase 5: 统一检索索引刷新（memory_record）—— candidate 不进入索引
         self._enqueue_retrieval_refresh(record, event_type)
 

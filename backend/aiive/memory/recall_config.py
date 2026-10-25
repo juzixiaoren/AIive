@@ -138,6 +138,13 @@ ENABLED_OUTBOX_JOB_TYPES: frozenset[str] = frozenset({
     "core_memory_refresh",
     "memory_vector_refresh",
     "memory_markdown_project",
+    # 时序知识图谱投影：由 MemoryMutationExecutor 统一入队，随记录版本幂等刷新
+    "memory_graph_refresh",
+    # 长期记忆冲突闭环：后台生成澄清问题 / 后台解析用户回复
+    "memory_conflict_question",
+    "memory_conflict_reply",
+    # 过期冲突案例清扫：只改案例与通知，不碰记忆与图谱
+    "memory_conflict_cleanup",
     # 提醒投递：到期任务必须由 Agent 生成真实回复
     "reminder_delivery",
     # Phase 3: Segment sealing / Epoch rollover / Epoch checkpoint

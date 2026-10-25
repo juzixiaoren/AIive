@@ -19,6 +19,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
+from aiive.memory.graph_types import GraphFact
+
 
 # ============================================================================
 # Canonical MemoryType (8 types)
@@ -200,6 +202,9 @@ class WriteOutcome(StrEnum):
     IGNORED = "ignored"
     REINFORCE_SKIPPED = "reinforce_skipped"
     FAILED = "failed"
+    # 语义冲突无法可靠裁决 → 已持久化为待确认案例，等用户回复后再正式写入。
+    # 这是合法 no-op：提案被"挂起"而不是失败，批次不应回滚。
+    CONFLICT_PENDING = "conflict_pending"
 
 
 # Per-type allowed evidence sources.
@@ -288,6 +293,11 @@ class MemoryProposal(BaseModel):
 
     content: str = ""
     structured_value: dict[str, object] | None = None
+
+    # --- 时序知识图谱：本提案携带的结构化关系事实 ---
+    # 与 content 同源（来自同一次提取），写入时落到 MemoryRecord.graph_facts，
+    # 再由 Outbox 投影到 graph_relations。空列表表示该记忆不产生关系事实。
+    graph_facts: list[GraphFact] = Field(default_factory=list)
 
     # --- 检索关键词（同义词/上位词）---
     # agent 显式附加，用于词汇召回命中同义/上位查询。不进入 content 文本。

@@ -111,6 +111,176 @@ def list_memories(db: Session = Depends(get_db)):
     ]
 
 
+@router.get("/memories/{memory_id}/relations")
+def get_memory_relations(memory_id: str, db: Session = Depends(get_db)):
+    """查询一条记忆支撑的实体关系（含有效期与来源证据）。
+
+    只读、复用既有 /api/memories 路由前缀；不新建图谱管理后台。
+    关系是派生投影，因此这里同时回查来源记忆状态，已失效/遗忘的关系不会被
+    当作当前事实返回。
+    """
+    from aiive.db.models import GraphEntity, GraphRelation, MemoryRecord
+    from aiive.forget.visibility_service import ForgetVisibilityService
+    from aiive.memory.graph_predicates import (
+        cardinality,
+        conflict_group_key,
+        conflicted_group_keys,
+        is_single_valued,
+    )
+
+    record = db.get(MemoryRecord, memory_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="记忆不存在")
+
+    blocked = ForgetVisibilityService.filter_memory_ids(db, [memory_id])
+    visible = memory_id in blocked
+    policy = MemoryPolicyEngine()
+    relations = (
+        db.query(GraphRelation)
+        .filter(GraphRelation.source_memory_id == memory_id)
+        .order_by(
+            GraphRelation.status.asc(),
+            GraphRelation.recorded_at.desc(),
+            GraphRelation.id.asc(),
+        )
+        .limit(200)
+        .all()
+    )
+    # 单值谓词出现多个有效客体 = 冲突：如实返回标记，不隐藏、也不替记忆层裁决。
+    # 冲突对方可能属于别的记忆，因此按同主体做一次有界批查询再判定。
+    single_subjects = {
+        r.subject_entity_id
+        for r in relations
+        if r.status == "active" and is_single_valued(r.predicate)
+    }
+    peers = (
+        db.query(GraphRelation)
+        .filter(
+            GraphRelation.status == "active",
+            GraphRelation.subject_entity_id.in_(single_subjects),
+        )
+        .limit(1000)
+        .all()
+    ) if single_subjects else []
+    conflict_keys = conflicted_group_keys([
+        (
+            r.subject_entity_id, r.predicate, r.object_entity_id,
+            r.status, r.scope_type, r.scope_id,
+        )
+        for r in peers
+    ])
+    entity_ids = {r.subject_entity_id for r in relations} | {r.object_entity_id for r in relations}
+    entities = {
+        entity.id: entity
+        for entity in db.query(GraphEntity).filter(GraphEntity.id.in_(entity_ids)).all()
+    } if entity_ids else {}
+
+    return {
+        "memory_id": memory_id,
+        "memory_type": record.memory_type,
+        "lifecycle_state": record.lifecycle_state,
+        "validity_state": record.validity_state,
+        "record_version": record.record_version,
+        "visible": visible and (record.lifecycle_state or "") != "forgotten",
+        "entities": [
+            {
+                "id": entity.id,
+                "display_name": entity.display_name,
+                "normalized_name": entity.normalized_name,
+                "aliases": entity.aliases or [],
+                "scope_type": entity.scope_type,
+                "scope_id": entity.scope_id,
+            }
+            for entity in entities.values()
+        ],
+        "relations": [
+            {
+                "id": relation.id,
+                "subject": getattr(entities.get(relation.subject_entity_id), "display_name", ""),
+                "predicate": relation.predicate,
+                "object": getattr(entities.get(relation.object_entity_id), "display_name", ""),
+                "status": relation.status,
+                "confidence": relation.confidence,
+                "scope_type": relation.scope_type,
+                "scope_id": relation.scope_id,
+                "valid_from": relation.valid_from.isoformat() if relation.valid_from else None,
+                "valid_to": relation.valid_to.isoformat() if relation.valid_to else None,
+                "recorded_at": relation.recorded_at.isoformat() if relation.recorded_at else None,
+                "source_record_version": relation.source_record_version,
+                "source_span": policy.render_content(
+                    relation.source_span or "", record.sensitivity, MemoryReadChannel.API,
+                ),
+                "closed_reason": relation.closed_reason,
+                "superseded_by_id": relation.superseded_by_id,
+                "cardinality": cardinality(relation.predicate),
+                "conflicted": relation.status == "active" and conflict_group_key(
+                    relation.subject_entity_id, relation.predicate,
+                    relation.scope_type, relation.scope_id,
+                ) in conflict_keys,
+            }
+            for relation in relations
+        ],
+    }
+
+
+@router.get("/memories/conflicts")
+def list_memory_conflicts(
+    thread_id: str = "",
+    status: str = "",
+    limit: int = 50,
+    db: Session = Depends(get_db),
+):
+    """列出记忆冲突待确认案例（只读）。
+
+    待确认期间这些案例**不是**记忆：不会出现在 /memories 列表、不会被召回、
+    也不会产生图谱关系。这里只暴露"用户需要决定什么"，不含任何内部模型调用细节。
+    """
+    from aiive.memory.conflict_confirmation import MemoryConflictService
+
+    policy = MemoryPolicyEngine()
+    cases = MemoryConflictService.list_cases(
+        db, thread_id=thread_id, status=status, limit=limit,
+    )
+    return [
+        {
+            "id": case.id,
+            "status": case.status,
+            "thread_id": case.thread_id,
+            "canonical_key": case.canonical_key,
+            "memory_type": case.memory_type,
+            "old_memory_id": case.old_memory_id,
+            "old_content": policy.render_content(
+                case.old_content, case.sensitivity, MemoryReadChannel.API,
+            ),
+            "new_content": policy.render_content(
+                case.new_content, case.sensitivity, MemoryReadChannel.API,
+            ),
+            "verdict": case.verdict,
+            "question": case.question,
+            "clarify_rounds": case.clarify_rounds,
+            "decision": case.decision,
+            "resolved_memory_id": case.resolved_memory_id,
+            "created_at": case.created_at.isoformat() if case.created_at else "",
+            "expires_at": case.expires_at.isoformat() if case.expires_at else "",
+            "resolved_at": case.resolved_at.isoformat() if case.resolved_at else "",
+        }
+        for case in cases
+    ]
+
+
+@router.post("/maintenance/graph-rebuild")
+def rebuild_graph(db: Session = Depends(get_db)):
+    """从 canonical 记忆记录重建图谱投影（可重复执行、幂等）。
+
+    用于关系索引丢失、Outbox 重试失败或维护中断后的恢复；不调用 LLM。
+    """
+    from aiive.memory.graph_rebuild import GraphRebuildService
+
+    report = GraphRebuildService(db).rebuild()
+    db.commit()
+    return report
+
+
 @router.post("/memories", response_model=CreateMemoryResponse)
 def create_memory(request: CreateMemoryRequest,
                    db: Session = Depends(get_db),

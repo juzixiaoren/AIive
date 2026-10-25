@@ -186,6 +186,32 @@ def handle_memory_extraction(claimed: ClaimedJob) -> HandlerResult:
                              ingestion_run_id=run_id)
 
     # ════════════════════════════════════════════════
+    # Phase B2: 冲突预判（事务外）
+    #   候选发现用一条短只读会话（精确键 + 统一检索 + 图谱关系），
+    #   语义裁决完全在会话之外调用 LLM；任何失败都降级为既有写入流程。
+    # ════════════════════════════════════════════════
+    conflict_plan: dict[str, Any] = {}
+    if proposals:
+        try:
+            from aiive.memory.conflict_confirmation import MemoryConflictService
+            from aiive.memory.scope_resolver import build_scope_context
+
+            db_b = SessionLocal()
+            try:
+                scope_ctx = build_scope_context(db_b, None, thread_id)
+                discoveries = MemoryConflictService.collect_candidates(
+                    db_b, proposals, scope_context=scope_ctx,
+                )
+            finally:
+                db_b.close()
+            conflict_plan = MemoryConflictService.decide(
+                proposals, discoveries, llm_client=llm, trace_id=claimed.trace_id,
+            )
+        except Exception:
+            logger.exception("冲突预判失败，降级为既有写入流程")
+            conflict_plan = {}
+
+    # ════════════════════════════════════════════════
     # Phase C: 短事务 —— 双重 fencing + 写入 + 标记成功
     # ════════════════════════════════════════════════
     db_c = SessionLocal()
@@ -277,7 +303,10 @@ def handle_memory_extraction(claimed: ClaimedJob) -> HandlerResult:
             if source_event_ids:
                 p.source_event_ids = list(source_event_ids)
             p.execution_mode = "system_best_effort"
-        writer.write_batch(proposals=proposals, ingestion_run=run_c, run_context=run_ctx)
+        writer.write_batch(
+            proposals=proposals, ingestion_run=run_c, run_context=run_ctx,
+            conflict_plan=conflict_plan,
+        )
 
         # C4: 标记 succeeded
         affected = db_c.query(MemoryIngestionRun).filter(
@@ -656,6 +685,37 @@ def handle_memory_vector_refresh(claimed: ClaimedJob) -> HandlerResult:
     except Exception as exc:
         db.rollback()
         logger.exception("memory_vector_refresh failed")
+        return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, str(exc))
+    finally:
+        db.close()
+
+
+def handle_memory_graph_refresh(claimed: ClaimedJob) -> HandlerResult:
+    """按 canonical 记忆记录刷新时序知识图谱投影。
+
+    幂等：同一 (memory_id, record_version) 重复执行只更新同一批关系行；
+    旧版本任务迟到时直接跳过（新版本任务负责正确内容）。
+    """
+    if not settings.aiive_memory_graph_enabled:
+        return HandlerResult(HandlerOutcome.COMPLETED, "知识图谱已关闭")
+    memory_id = str(claimed.payload.get("memory_id", ""))
+    record_version = int(claimed.payload.get("record_version", 0) or 0)
+    if not memory_id or record_version <= 0:
+        return HandlerResult(
+            HandlerOutcome.NON_RETRYABLE,
+            "图谱投影任务缺少 memory_id 或 record_version",
+            terminal_reason="invalid_payload",
+        )
+    db = SessionLocal()
+    try:
+        from aiive.memory.graph_projection import GraphProjectionService
+
+        result = GraphProjectionService(db).refresh(memory_id, record_version)
+        db.commit()
+        return HandlerResult(HandlerOutcome.COMPLETED, str(result))
+    except Exception as exc:
+        db.rollback()
+        logger.exception("memory_graph_refresh failed")
         return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, str(exc))
     finally:
         db.close()
@@ -1351,7 +1411,21 @@ def register_all(registry: HandlerRegistry) -> None:
                        supported_schema_versions=frozenset({1}))
     registry.register("memory_vector_refresh", handle_memory_vector_refresh,
                        supported_schema_versions=frozenset({1}))
+    registry.register("memory_graph_refresh", handle_memory_graph_refresh,
+                      frozenset({1}))
     registry.register("memory_markdown_project", handle_memory_markdown_project,
+                       supported_schema_versions=frozenset({1}))
+    # 长期记忆冲突闭环：澄清问题生成 / 用户回复解析 / 过期案例清扫
+    from aiive.worker.handlers_conflict import (
+        handle_memory_conflict_cleanup,
+        handle_memory_conflict_question,
+        handle_memory_conflict_reply,
+    )
+    registry.register("memory_conflict_question", handle_memory_conflict_question,
+                       supported_schema_versions=frozenset({1}))
+    registry.register("memory_conflict_reply", handle_memory_conflict_reply,
+                       supported_schema_versions=frozenset({1}))
+    registry.register("memory_conflict_cleanup", handle_memory_conflict_cleanup,
                        supported_schema_versions=frozenset({1}))
     # Phase 3
     registry.register("segment_sealing", handle_segment_sealing,
