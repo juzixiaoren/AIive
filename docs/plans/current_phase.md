@@ -552,3 +552,25 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
      （`conflicting_bindings`，清空 entity_id），结果与数组顺序无关；完全相同的重复条目去重。
 - 无新增 LLM 调用、无新表/新列、无迁移。
 - 测试：unit 22 例、integration 14 例；记忆相关回归 135 例；全量见交付报告。
+
+### V45 运行证据驱动的改进候选发现
+
+- 目标：补齐 `SelfDevRepairLoop` 的上游——系统如何从真实运行结果里发现下一件值得改进的事。
+- 证据：`selfdev/improvement_evidence.py` 只读采集任务终态（failed/partial）、Action 失败、
+  Outbox 死信、自进化修复失败、Eval 安全门失败；按"能力 + 归一化错误签名"聚合，
+  单次出现、单次瞬态故障（超时/连接重置/限流）、超出组上限的噪声在进入模型前被丢弃。
+  不扫描聊天原文；用户纠正只在已有结构化记录时才进入证据。
+- 生成：`selfdev/improvement_discovery.py` 用 `Event(improvement_discovery_run)` 水位做进度记录；
+  没有新证据不调用模型；有证据时一次 `chat(json_mode)` 产出不超过 3 个候选；
+  服务端校验证据 ID 必须属于本次输入、occurrences 不得超过证据支撑、验收标准非空，
+  否则整条候选作废并记录原因；同一证据组只保留一个候选。
+- 持久化：复用 `selfdev_requests`（**不新增表**）：`id = uuid5(dedupe_key)` 天然幂等，
+  `status` 用 `candidate_pending/accepted/rejected` 与修复运行状态区分，正文与证据存 `plan`。
+  候选落库同时写 `notification_created`（category=`selfdev_improvement`），复用现有通知读模型。
+- 调度：`improvement_discovery` 进入 Outbox allowlist 与 HandlerRegistry；
+  `_improvement_discovery_scanner_job` 每 6 小时按窗口 `operation_id` 幂等入队，
+  Handler 遵循"短事务读 → 事务外模型 → 短事务写"。
+- 接受：`POST /api/selfdev/candidates/{id}/accept` 需要 trusted core token，
+  固定 `promote=False` 调用既有 `SelfDevRepairLoop`，安全门、候选槽位与回滚全部沿用；
+  `reject` 只改候选状态。默认不晋升、不修改活跃槽位、不新增任务引擎。
+- 测试：unit 33 例（证据 12 + 发现 21）、integration 8 例，全部离线。

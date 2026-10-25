@@ -1427,6 +1427,13 @@ def register_all(registry: HandlerRegistry) -> None:
                        supported_schema_versions=frozenset({1}))
     registry.register("memory_conflict_cleanup", handle_memory_conflict_cleanup,
                        supported_schema_versions=frozenset({1}))
+    # 自进化上游：运行证据驱动的改进候选发现（只产出候选，不自动修改代码）
+    from aiive.worker.handlers_improvement import (
+        JOB_IMPROVEMENT_DISCOVERY,
+        handle_improvement_discovery,
+    )
+    registry.register(JOB_IMPROVEMENT_DISCOVERY, handle_improvement_discovery,
+                       supported_schema_versions=frozenset({1}))
     # Phase 3
     registry.register("segment_sealing", handle_segment_sealing,
                        supported_schema_versions=frozenset({1}))

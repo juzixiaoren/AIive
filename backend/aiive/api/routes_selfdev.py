@@ -184,6 +184,109 @@ def run_repair(
     return record
 
 
+# ===================== V45: 运行证据驱动的改进候选 =====================
+
+class CandidateRejectRequest(BaseModel):
+    """拒绝候选的请求体。"""
+
+    reason: str = Field("", max_length=300)
+
+
+@router.get("/candidates")
+def list_improvement_candidates(
+    status: str | None = None,
+    limit: int = 50,
+    db: Session = Depends(get_db),
+):
+    """列出改进候选（默认只返回候选状态，不混入修复运行记录）。
+
+    候选来自真实运行证据的周期聚合，跨进程重启保留；证据可逐条回溯。
+    """
+    from aiive.selfdev.improvement_discovery import (
+        CANDIDATE_STATUSES,
+        ImprovementDiscovery,
+    )
+
+    if status is not None and status not in CANDIDATE_STATUSES:
+        raise HTTPException(status_code=400, detail="unknown_candidate_status")
+    return {"candidates": ImprovementDiscovery.list_candidates(db, status=status, limit=limit)}
+
+
+@router.get("/candidates/{candidate_id}")
+def get_improvement_candidate(candidate_id: str, db: Session = Depends(get_db)):
+    """候选详情：问题、证据组、验收标准与决策记录。"""
+    from aiive.selfdev.improvement_discovery import CandidateNotFound, ImprovementDiscovery
+
+    try:
+        return ImprovementDiscovery.get_candidate(db, candidate_id)
+    except CandidateNotFound:
+        raise HTTPException(status_code=404, detail="候选不存在")
+
+
+@router.post("/candidates/{candidate_id}/accept")
+def accept_improvement_candidate(
+    candidate_id: str,
+    db: Session = Depends(get_db),
+    _authorized: None = Depends(require_trusted_core_admin),
+) -> dict[str, Any]:
+    """接受候选：作为明确目标接入既有 SelfDevRepairLoop。
+
+    仍然走既有的读码→补丁→定向测试→安全门流程，只改非活跃槽位；
+    本接口固定不晋升（promote=False），晋升仍需显式调用 /{request_id}/promote。
+    """
+    from aiive.selfdev.improvement_discovery import (
+        CandidateNotFound,
+        CandidateStateError,
+        ImprovementDiscovery,
+    )
+
+    try:
+        return ImprovementDiscovery().accept(db, candidate_id, trace_id=Trace.new().trace_id)
+    except CandidateNotFound:
+        raise HTTPException(status_code=404, detail="候选不存在")
+    except CandidateStateError as exc:
+        raise HTTPException(status_code=409, detail=f"candidate_state:{exc}")
+
+
+@router.post("/candidates/{candidate_id}/reject")
+def reject_improvement_candidate(
+    candidate_id: str,
+    req: CandidateRejectRequest,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """拒绝候选：只改候选状态，不触发任何代码修改。"""
+    from aiive.selfdev.improvement_discovery import (
+        CandidateNotFound,
+        CandidateStateError,
+        ImprovementDiscovery,
+    )
+
+    try:
+        return ImprovementDiscovery.reject(db, candidate_id, reason=req.reason)
+    except CandidateNotFound:
+        raise HTTPException(status_code=404, detail="候选不存在")
+    except CandidateStateError as exc:
+        raise HTTPException(status_code=409, detail=f"candidate_state:{exc}")
+
+
+@router.post("/candidates/discover")
+def trigger_improvement_discovery(
+    db: Session = Depends(get_db),
+    _authorized: None = Depends(require_trusted_core_admin),
+) -> dict[str, Any]:
+    """手动入队一轮改进发现（与调度器同一条 Outbox 链路，按 6 小时窗口幂等）。
+
+    只入队，不在请求线程里调用模型：候选生成仍由后台 Worker 完成。
+    """
+    from aiive.worker.scheduler_daemon import enqueue_improvement_discovery_job
+
+    operation_id = enqueue_improvement_discovery_job(db)
+    db.commit()
+    if operation_id is None:
+        raise HTTPException(status_code=503, detail="outbox_worker_unavailable")
+    return {"operation_id": operation_id, "status": "enqueued"}
+
+
 @router.get("/requests/{request_id}")
 def get_request(request_id: str, db: Session = Depends(get_db)):
     """获取自进化请求的详细信息

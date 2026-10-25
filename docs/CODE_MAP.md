@@ -133,6 +133,7 @@
 | 自进化：修复并发锁 / 候选隔离 / 中断恢复 | `selfdev/repair_guard.py`（`RepairLock` owner-token 锁、`CandidateSlotGuard` 基线+指纹+恢复+不可晋升标记、`RepairJournal` 阶段日志、`recover_interrupted`）、`supervisor/slot_manager.py`（`tree_fingerprint`/`sync_app_tree`/`candidate_state.json` 读写） | `selfdev/repair_loop.py::run`（取锁→恢复→闭环，失败回滚）、`supervisor/release_manager.py::_candidate_block`（晋升前核对不可晋升标记与指纹） | `test_selfdev_repair_guard.py` |
 | 自进化：槽位 promote/rollback | `supervisor/release_manager.py`（生产晋升入口）、`selfdev/promote_rollback.py`、`selfdev/patch_executor.py` | `supervisor/slot_manager.py` | `test_release_manager.py`、`test_selfdev_slot*.py` |
 | 自进化：进程托管（真实启停/健康/回滚） | `supervisor/daemon.py`（`Supervisor` 守护循环）、`supervisor/process_control.py`（`ProcessController` 启停与所有权）、`supervisor/health_http.py`（HTTP 探针）、`supervisor/control.py`（请求/事件/锁）、`supervisor/client.py`（应用侧客户端） | `api/routes_selfdev.py::supervisor_status`、`release_manager.py::promote`（`client` 注入）、`worker/scheduler_daemon.py::_release_monitor_job` | `test_supervisor_lifecycle.py` |
+| 自进化：运行证据驱动的改进候选发现（调度器→Outbox→候选→用户接受） | `selfdev/improvement_evidence.py`（`EvidenceCollector.collect`：任务/Action/死信/修复失败/Eval 失败 → 按能力+错误签名聚合，一次性故障丢弃）、`selfdev/improvement_discovery.py`（`ImprovementDiscovery.run`：水位游标→单次 LLM→服务端校验→`uuid5` 去重落 `selfdev_requests`；`accept`/`reject`） | `worker/handlers_improvement.py::handle_improvement_discovery`、`worker/scheduler_daemon.py::_improvement_discovery_scanner_job`（6h 窗口幂等入队）、`api/routes_selfdev.py::/candidates*`（accept 需 trusted core token） | `tests/unit/backend/test_improvement_{evidence,discovery}.py`、`tests/integration/backend/test_improvement_discovery_flow.py` |
 | 自进化：安全闸门（Replay Eval + Kernel Contract Checks） | `eval/`（`contracts.py`/`replay.py`/`gate.py`/`scenarios.py`/`persistence.py`/`cli.py`/`models.py`） | `supervisor/release_manager.py::promote` 与 `selfdev/promote_rollback.py::promote`（共用 `eval/gate.py::evaluate_promotion_gate`，fail-closed）、`api/routes_eval.py`（只读查询 `/api/eval/runs`、`/runs/latest`） | `tests/unit/backend/test_eval_*.py`、`test_release_manager.py` |
 
 ### 2.5 任务 / 桌面 / 知识库 / 通知
@@ -320,7 +321,7 @@
 - `skills/catalog.py`：`SkillDefinition` L10（`as_dict(include_instructions=False)` L23）；`_DEFINITIONS` L35-92（4 个：document_processing/web_research/knowledge_base/mcp_management）；`list_skills()` L100、`get_skill()` L108；指令文本在 `skills/builtin/<id>/SKILL.md`。被 `task_runtime/tools.py:43`、`task_runtime/context_assembler.py:111`、`api/routes_skills.py` 使用。
 - `mcp/`：`discovery.py`（`_BUILTIN_CATALOG` L61-110、`search_mcp_candidates` L113、`allowed_npm_packages` L193）；`capability_planner.py`（`plan_from_goal` L118、`_compute_risk` L170）；`installer.py`（`SANDBOX_ROOT` L39=`<repo>/.data/mcp_sandbox`、`install_to_dir` L169（装到指定/版本化目录，供升级）、`install_sandbox` L253、`run_smoke` L375（`auto_activate=False` 只到 verified））；`runtime_client.py`（`MCPRuntimeClient` L361、每能力长驻 `_SessionWorker`、`get_runtime_client` L534）；`bootstrap.py`（`register_capability_tools` L121 untrusted 包装、`capability_tool_ids` L195、`registered_tool_ids` L208、`unregister_capability_tools` L227、`activate_capability_tools` L243、`restore_active_capabilities` L283 启动恢复）；`builtin.py`（`ensure_builtin_mcp_capability` L83、`BUILTIN_MCP_TOOLS` L17-57）；`builtin_server.py`（FastMCP stdio server，3 工具）。
 - `capability/`：`states.py`（`CapabilityState` L22、`LIFECYCLE_TRANSITIONS`、`ensure_transition`——非法转换抛 `InvalidCapabilityTransition`）；`lifecycle.py`（`CapabilityLifecycleService` L143：`status/verify/probe/enable/disable/upgrade/rollback/uninstall/audit/reconcile`，进程内 `_capability_lock` L75 + DB `FOR UPDATE`，生命周期元数据写 `definition["lifecycle"]`，历史有界 20 条）。
-- `selfdev/`：`trusted_core.py`（`TRUSTED_CORE_PREFIXES` L9-23，13 条受保护路径，fail-closed）；`planner.py`（LLM 生成 patch plan+逐条校验；`plan(..., context=, previous_plan=, failure_feedback=)` 复用同一提示词注入只读代码与真实测试错误）；`project_reader.py`（`ProjectReader`：仓库范围内只读、有界检索/读取，拒绝密钥与 `.data/runtime/slots`；`format_context_for_prompt`）；`patch_executor.py`（`apply_to_inactive`：复制活跃槽位基线→应用）；`targeted_test_runner.py`（按变更文件前缀匹配测试，frontend 变更跑 `npm run build`）；`repair_loop.py`（`SelfDevRepairLoop`：读码→规划→应用→定向测试→有限修复→安全门→可选晋升；`patch_fingerprint` 去重、`persist_repair_run` 落库；`run` 先取 `RepairLock`（占用时返回 `repair_busy`）→ `recover_interrupted` 恢复上次中断 → 闭环，失败走 `_abort` 回滚候选槽位）；`repair_guard.py`（`RepairLock`：`O_EXCL` + owner token，只有持有者能释放、持有进程存活时绝不抢占、进程死亡后可接管；`CandidateSlotGuard`：`capture_baseline` 记活跃槽位版本+指纹、`mark_not_promotable`/`mark_promotable` 写 `slots/<X>/candidate_state.json`、`restore` 整树回滚并复核指纹；`RepairJournal`：`runtime/selfdev/runs/<run_id>.json` 阶段快照（随槽位 runtime 目录，无基线时不写）+ 7 天终态清理；`recover_interrupted`：跳过存活持有者，按日志回滚/隔离，状态只写 `interrupted*`）；`promote_rollback.py`（health check + 安全门后切活跃槽位指针；与 `release_manager.promote` 共用 `evaluate_promotion_gate`，无生产调用方）。
+- `selfdev/`：`trusted_core.py`（`TRUSTED_CORE_PREFIXES` L9-23，13 条受保护路径，fail-closed）；`planner.py`（LLM 生成 patch plan+逐条校验；`plan(..., context=, previous_plan=, failure_feedback=)` 复用同一提示词注入只读代码与真实测试错误）；`project_reader.py`（`ProjectReader`：仓库范围内只读、有界检索/读取，拒绝密钥与 `.data/runtime/slots`；`format_context_for_prompt`）；`patch_executor.py`（`apply_to_inactive`：复制活跃槽位基线→应用）；`targeted_test_runner.py`（按变更文件前缀匹配测试，frontend 变更跑 `npm run build`）；`repair_loop.py`（`SelfDevRepairLoop`：读码→规划→应用→定向测试→有限修复→安全门→可选晋升；`patch_fingerprint` 去重、`persist_repair_run` 落库；`run` 先取 `RepairLock`（占用时返回 `repair_busy`）→ `recover_interrupted` 恢复上次中断 → 闭环，失败走 `_abort` 回滚候选槽位）；`repair_guard.py`（`RepairLock`：`O_EXCL` + owner token，只有持有者能释放、持有进程存活时绝不抢占、进程死亡后可接管；`CandidateSlotGuard`：`capture_baseline` 记活跃槽位版本+指纹、`mark_not_promotable`/`mark_promotable` 写 `slots/<X>/candidate_state.json`、`restore` 整树回滚并复核指纹；`RepairJournal`：`runtime/selfdev/runs/<run_id>.json` 阶段快照（随槽位 runtime 目录，无基线时不写）+ 7 天终态清理；`recover_interrupted`：跳过存活持有者，按日志回滚/隔离，状态只写 `interrupted*`）；`promote_rollback.py`（health check + 安全门后切活跃槽位指针；与 `release_manager.promote` 共用 `evaluate_promotion_gate`，无生产调用方）；`improvement_evidence.py`（`EvidenceCollector`：只读采集任务/Action/死信/修复失败/Eval 失败，`normalize_signature` 归一错误签名后聚合；单次出现、单次瞬态故障与超量组被确定性丢弃，`is_transient` 识别超时/连接重置/限流等）；`improvement_discovery.py`（`ImprovementDiscovery.run`：事件游标→无新证据不调模型→一次调用产出候选→`validate` 校验证据 ID/次数/验收标准→`uuid5(dedupe_key)` 幂等落 `selfdev_requests`（`candidate_pending/accepted/rejected`）；`accept` 复用 `SelfDevRepairLoop` 且固定 `promote=False`；`_ensure_system_thread` 保证进度事件可落）。**复用 `selfdev_requests`，不新增表。**
 
 ### 3.8 `worker/` — Outbox 事务队列 + 调度守护
 
@@ -329,12 +330,13 @@
 | `outbox_worker.py` | `OutboxWorker` L47：`claim_one` L69（skip_locked+双重 lease+claim_token）、`enqueue` L152（allowlist 强校验）、`poll` L182、`_dispatch_one` L218；终态 `_finalize_job` L366 / 重试 `_retry_later` L405 / 死信 L519 / forget 阶段死信 L677 |
 | `handler_registry.py` | `HandlerRegistry` L10：job_type→handler + schema_version 白名单 |
 | `outbox_dto.py` | `HandlerOutcome` 枚举 L16（COMPLETED/RETRY_LATER/NON_RETRYABLE/RETRYABLE_ERROR/CLAIM_LOST/CONTINUE）；`ClaimedJob`/`HandlerResult`/`ActiveClaim`；`FencingViolationError` L102 |
-| `outbox_handlers.py`（100KB） | 装配 `register_all` L1398（22 类 job_type，schema_version=1；含 `memory_conflict_question` / `memory_conflict_reply` / `memory_conflict_cleanup`）；`handle_memory_extraction` L106、`handle_reminder_delivery` L350、`handle_core_memory_refresh` L617、`handle_memory_vector_refresh` L639、`handle_memory_markdown_project` L664、`handle_retrieval_index_refresh` L697、`handle_memory_maintenance` L1165、`handle_segment_sealing` L1622、`handle_epoch_rollover` L1961、`handle_epoch_checkpoint` L2055 |
+| `outbox_handlers.py`（100KB） | 装配 `register_all` L1398（25 类 job_type，schema_version=1；含 `memory_conflict_question` / `memory_conflict_reply` / `memory_conflict_cleanup` / `improvement_discovery`）；`handle_memory_extraction` L106、`handle_reminder_delivery` L350、`handle_core_memory_refresh` L617、`handle_memory_vector_refresh` L639、`handle_memory_markdown_project` L664、`handle_retrieval_index_refresh` L697、`handle_memory_maintenance` L1165、`handle_segment_sealing` L1622、`handle_epoch_rollover` L1961、`handle_epoch_checkpoint` L2055 |
 | `handlers_forget.py`（71KB） | 遗忘 Saga：`handle_forget_cascade` L133（目标物化 L239/墓碑 L435/依赖发现 L619）、`handle_forget_rebuild` L807、`handle_forget_purge` L1356（`_scrub_wide` L1535）、`handle_forget_verify` L1677、`handle_forget_reconcile` L1801；`BATCH_SIZE=200` |
 | `handlers_retention.py` / `handlers_agent_tasks.py` | `handle_retention_cleanup` L27 分批驱动 RetentionEngine；`handle_agent_task_run` L16 驱动 PersistentTaskRuntime |
 | `handlers_knowledge.py` | `handle_knowledge_maintenance` L29：扫描→分批清理→commit，无进展时 COMPLETED(partial) 而非空转；`MAX_MAINTENANCE_BATCHES=5` |
+| `handlers_improvement.py` | `handle_improvement_discovery`：改进候选发现的 Outbox 入口（`discovery` 参数仅供测试注入）；模型调用在事务外，`llm_failed` 返回 RETRYABLE_ERROR 且不推进水位，非法输出记 COMPLETED 不重试 |
 | `handlers_conflict.py` | 冲突闭环两个 Handler，均按"短事务读快照 → 事务外 LLM → 短事务落库"：`handle_memory_conflict_question`（生成澄清问题并写 `notification_created`，状态 pending→asking）、`handle_memory_conflict_reply`（解析回复后调 `MemoryConflictService.apply_decision`） |
-| `scheduler_daemon.py`（27KB） | 模块级 `scheduler` L33；`start_daemon` L90（9 个周期 job）；`schedule_outbox_poll` L149；`_poll_tool_operations` L193（独立线程防饿死）；`_agent_task_scanner_job` L216（stale run 恢复/锁过期/watcher/审批过期）；`_idle_scanner_job` L263；`_forget_reconcile_scanner_job` L423；`_conflict_expiry_scanner_job`（冲突案例 TTL 清扫，`enqueue_conflict_cleanup_job` 按小时窗口幂等入队）；`enqueue_maintenance_job` L453、`enqueue_retention_job` L509、`enqueue_knowledge_maintenance_job`、`knowledge_needs_maintenance`、`_knowledge_maintenance_scanner_job`（在途判定只认 pending/running；DB 侧不一致即时入队 + 每日对象对账；终态任务不阻塞，补跑分配 `#n` 后缀 operation_id） |
+| `scheduler_daemon.py`（27KB） | 模块级 `scheduler` L33；`start_daemon` L90（10 个周期 job；含 `improvement_discovery_scanner` 6h 窗口）；`schedule_outbox_poll` L149；`_poll_tool_operations` L193（独立线程防饿死）；`_agent_task_scanner_job` L216（stale run 恢复/锁过期/watcher/审批过期）；`_idle_scanner_job` L263；`_forget_reconcile_scanner_job` L423；`_conflict_expiry_scanner_job`（冲突案例 TTL 清扫，`enqueue_conflict_cleanup_job` 按小时窗口幂等入队）；`enqueue_maintenance_job` L453、`enqueue_retention_job` L509、`enqueue_knowledge_maintenance_job`、`knowledge_needs_maintenance`、`_knowledge_maintenance_scanner_job`（在途判定只认 pending/running；DB 侧不一致即时入队 + 每日对象对账；终态任务不阻塞，补跑分配 `#n` 后缀 operation_id） |
 | `outbox_heartbeat.py` / `job_types.py` / `task_worker.py` | 租约续期线程 + `ActiveClaimRegistry`；`ENABLED_OUTBOX_JOB_TYPES` allowlist；到期提醒原子入队 `reminder_delivery`（FOR UPDATE SKIP LOCKED） |
 
 ### 3.9 `task_runtime/` + `control/` — 持久任务与执行边界
@@ -586,9 +588,32 @@ memory_conflict_reply (worker/handlers_conflict.py)
   → HMAC 密钥 → _ensure_system_thread → _ensure_retrieval_generation
   → ContextBudget 校验 → 向量运行时 (vector_bootstrap)
   → mcp/bootstrap.py::restore_active_capabilities (L235) + ensure_builtin_mcp_capability
-  → supervisor start_daemon (scheduler_daemon.py L90, 9 个周期 job)
+  → supervisor start_daemon (scheduler_daemon.py L90, 10 个周期 job)
   → OutboxWorker + OutboxHeartbeat + ws_manager + desktop_connection_manager
 ```
+
+---
+
+### 7.7 改进候选发现闭环（运行证据 → 候选 → 用户接受）
+
+```
+scheduler(_improvement_discovery_scanner_job, 6h)
+  → enqueue_improvement_discovery_job: operation_id=improvement_discovery:{policy}:{bucket} 幂等
+  → OutboxWorker claim → handle_improvement_discovery
+      Phase A 短事务: Event(improvement_discovery_run) 取水位 → EvidenceCollector.collect
+                      （任务终态/Action 失败/Outbox 死信/修复失败/Eval 失败 → 按能力+签名聚合）
+      Phase B 事务外: 无新证据 → 不调用模型；有证据 → 一次 chat(json_mode) 生成候选
+      Phase C 短事务: 服务端校验（证据 ID 属于本次输入、occurrences 不超过证据支撑、验收标准非空）
+                      → uuid5(dedupe_key) 写 selfdev_requests(candidate_pending)
+                      → notification_created(category=selfdev_improvement) + 运行事件推进水位
+  → 用户 GET /api/selfdev/candidates → POST /candidates/{id}/reject（直接拒绝）
+                                     → POST /candidates/{id}/accept（需 trusted core token）
+                                         → SelfDevRepairLoop(promote=False, run_gate=True)
+                                         → persist_repair_run 写修复记录，候选转 candidate_accepted
+```
+
+不变量：候选只描述目标、不产生补丁；接受前不触碰候选槽位；任何路径都不自动晋升；
+同一批证据重复处理由 uuid5 主键与"待处理候选同组去重"共同保证不新增行。
 
 ---
 

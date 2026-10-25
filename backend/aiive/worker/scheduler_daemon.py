@@ -65,6 +65,9 @@ _RELEASE_MONITOR_INTERVAL = 60
 # 冲突案例过期清扫：只改案例与通知，不碰记忆与图谱
 _CONFLICT_EXPIRY_INTERVAL = 900   # 秒：过期案例扫描周期（按小时分桶入队）
 _CONFLICT_CLEANUP_BATCH = 200     # 单个 job 处理的最大案例数（超出则 CONTINUE 分页）
+# 运行证据驱动的改进发现：每 6 小时最多一轮，只产出候选，不改代码
+_IMPROVEMENT_DISCOVERY_INTERVAL = 21600
+_IMPROVEMENT_DISCOVERY_POLICY_VERSION = 1
 
 
 def _poll_job():
@@ -144,6 +147,12 @@ def start_daemon():
     scheduler.add_job(
         _conflict_expiry_scanner_job, IntervalTrigger(seconds=_CONFLICT_EXPIRY_INTERVAL),
         id="memory_conflict_expiry_scanner", replace_existing=True,
+    )
+    # 运行证据驱动的改进发现扫描器
+    scheduler.add_job(
+        _improvement_discovery_scanner_job,
+        IntervalTrigger(seconds=_IMPROVEMENT_DISCOVERY_INTERVAL),
+        id="improvement_discovery_scanner", replace_existing=True,
     )
     # 知识库维护扫描器
     scheduler.add_job(
@@ -655,6 +664,65 @@ def _conflict_expiry_scanner_job() -> None:
                 db.close()
             except Exception:
                 logger.debug("conflict_expiry_scanner Session 关闭失败", exc_info=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 运行证据驱动的改进发现
+# ═══════════════════════════════════════════════════════════════════
+
+def enqueue_improvement_discovery_job(
+    db: Session,
+    window_bucket: str | None = None,
+    now: datetime | None = None,
+) -> str | None:
+    """入队一个 improvement_discovery OutboxJob。
+
+    operation_id = improvement_discovery:{policy_version}:{window_bucket}，
+    默认按 6 小时分桶：同一窗口只跑一次，UNIQUE 约束保证幂等。
+    没有 OutboxWorker 时返回 None（不直接写库，避免绕过 Worker 语义）。
+    """
+    now = now or datetime.now(timezone.utc)
+    if window_bucket is None:
+        window_bucket = f"{now.strftime('%Y-%m-%d')}T{now.hour // 6}"
+    op_id = (
+        f"improvement_discovery:{_IMPROVEMENT_DISCOVERY_POLICY_VERSION}:"
+        f"{window_bucket}"
+    )
+    exists = db.query(OutboxJob).filter(OutboxJob.operation_id == op_id).count()
+    if exists > 0:
+        return op_id
+    if _outbox_worker is None:
+        return None
+    try:
+        _outbox_worker.enqueue(
+            db, "improvement_discovery", {"schema_version": 1}, operation_id=op_id,
+        )
+    except ValueError:
+        logger.warning("improvement_discovery enqueue 不在 allowlist，跳过")
+        return None
+    return op_id
+
+
+def _improvement_discovery_scanner_job() -> None:
+    """定期入队一轮改进发现（无新证据时 Handler 不会调用模型）。"""
+    db: Session | None = None
+    try:
+        db = SessionLocal()
+        enqueue_improvement_discovery_job(db)
+        db.commit()
+    except Exception:
+        logger.exception("improvement_discovery_scanner 异常")
+        if db is not None:
+            try:
+                db.rollback()
+            except Exception:
+                logger.debug("improvement_discovery_scanner rollback 失败", exc_info=True)
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                logger.debug("improvement_discovery_scanner Session 关闭失败", exc_info=True)
 
 
 # ═══════════════════════════════════════════════════════════════════

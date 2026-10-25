@@ -80,6 +80,24 @@ def load_runs(directory: str | Path | None = None) -> list[dict[str, object]]:
     return out
 
 
+def load_runs_with_mtime(
+    directory: str | Path | None = None,
+) -> list[tuple[dict[str, object], float]]:
+    """同 load_runs，但同时给出文件修改时间（证据采集需要观察时间）。"""
+    directory = Path(directory) if directory else _default_dir()
+    if not directory.exists():
+        return []
+    out: list[tuple[dict[str, object], float]] = []
+    for p in sorted(directory.glob("eval_*.json"), reverse=True):
+        try:
+            summary = json.loads(p.read_text(encoding="utf-8"))
+            mtime = p.stat().st_mtime
+        except Exception:  # noqa: BLE001, S112
+            continue
+        out.append((summary, mtime))
+    return out
+
+
 def latest(directory: str | Path | None = None) -> dict[str, object] | None:
     runs = load_runs(directory)
     return runs[0] if runs else None
