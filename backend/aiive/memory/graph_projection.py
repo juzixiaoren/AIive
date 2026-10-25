@@ -193,8 +193,8 @@ class GraphProjectionService:
     def _upsert_relation(
         self, record: MemoryRecord, fact: GraphFact,
     ) -> tuple[GraphRelation, bool]:
-        subject = self._upsert_entity(record, fact.subject)
-        object_entity = self._upsert_entity(record, fact.object)
+        subject = self._resolve_entity(record, fact.subject, fact.subject_entity_id)
+        object_entity = self._resolve_entity(record, fact.object, fact.object_entity_id)
         key = fact.normalized_key(record.id)
         existing = (
             self._db.query(GraphRelation)
@@ -241,6 +241,48 @@ class GraphProjectionService:
         self._db.flush()
         self._close_conflicts(record, fact, subject, object_entity, relation)
         return relation, True
+
+    def _resolve_entity(
+        self,
+        record: MemoryRecord,
+        name: str,
+        bound_entity_id: str | None,
+    ) -> GraphEntity:
+        """优先复用裁决阶段确认过的实体锚点，不可用时退回按名称解析。
+
+        绑定只是提示，投影阶段必须重新校验：实体可能已被遗忘级联删除，
+        也可能属于别的 Scope。任一不满足就放弃绑定，走原有的按名称新建/复用
+        路径——绝不因为"曾经绑定过"就把事实挂到无效或越界的锚点上。
+        """
+        if bound_entity_id:
+            entity = self._db.get(GraphEntity, bound_entity_id)
+            if entity is not None and self._scope_matches(record, entity):
+                # 把新写法记成别名，后续同义名称可以直接按别名确定性复用。
+                self._remember_alias(entity, name)
+                return entity
+            logger.debug(
+                "实体绑定失效，退回按名称解析: memory_id=%s name=%s bound=%s",
+                record.id, name, bound_entity_id,
+            )
+        return self._upsert_entity(record, name)
+
+    @staticmethod
+    def _scope_matches(record: MemoryRecord, entity: GraphEntity) -> bool:
+        if (entity.scope_type or "global") != (record.scope_type or "global"):
+            return False
+        return (entity.scope_id or None) == (record.scope_id or None)
+
+    @staticmethod
+    def _remember_alias(entity: GraphEntity, name: str) -> None:
+        display = display_entity_name(name)
+        if not display or display == entity.display_name:
+            return
+        aliases = list(entity.aliases or [])
+        if display in aliases:
+            return
+        aliases.append(display)
+        entity.aliases = aliases[:12]
+        entity.updated_at = _utcnow()
 
     def _upsert_entity(self, record: MemoryRecord, name: str) -> GraphEntity:
         normalized = normalize_entity_name(name)

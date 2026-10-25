@@ -123,6 +123,12 @@ class GraphFact(BaseModel):
     source_span: str = Field(default="", max_length=SOURCE_SPAN_MAX)
     valid_from: datetime | None = None
     valid_to: datetime | None = None
+    # 实体绑定建议（可选）：语义裁决阶段由 LLM 提出、服务端校验后落到 canonical
+    # 记录里，投影时优先复用该 graph_entities.id。它只是"复用哪个锚点"的提示，
+    # 三元组本身仍是唯一事实；投影必须重新校验实体存在且 Scope 一致，失败就退回
+    # 按名称解析（安全的新建路径），绝不按名称强制合并。
+    subject_entity_id: str | None = None
+    object_entity_id: str | None = None
 
     @field_validator("subject", "object", mode="before")
     @classmethod
