@@ -190,15 +190,15 @@ def delete_document(document_id: str, db: Session = Depends(get_db)):
 
 @router.get("/search")
 def search(q: str = Query(...), limit: int = Query(5), db: Session = Depends(get_db)):
-    """知识库检索搜索
+    """知识库检索（关键词 + 向量混合召回）
 
     Args:
-        q: 搜索关键词
+        q: 检索语句（精确术语与自然语言问法都支持）
         limit: 返回结果数量，默认5
         db: 数据库会话
 
     Returns:
-        匹配的知识块列表
+        匹配的知识块列表；向量通道不可用时自动退化为纯关键词检索
     """
     return search_chunks(db, q, limit)
 

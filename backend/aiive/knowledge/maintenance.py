@@ -17,7 +17,7 @@ import logging
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +53,9 @@ ISSUE_MISSING_CHUNKS = "missing_chunks"
 ISSUE_MISSING_OBJECT = "missing_object"
 ISSUE_ORPHAN_OBJECTS = "orphan_objects"
 ISSUE_EXPIRED_SUPERSEDED_OBJECTS = "expired_superseded_objects"
+# 分块向量是派生投影：缺失可回填，孤儿可清理，均不影响真相源。
+ISSUE_MISSING_CHUNK_VECTORS = "missing_chunk_vectors"
+ISSUE_ORPHAN_CHUNK_VECTORS = "orphan_chunk_vectors"
 
 ISSUE_CODES: tuple[str, ...] = (
     ISSUE_ORPHAN_CHUNKS,
@@ -62,12 +65,14 @@ ISSUE_CODES: tuple[str, ...] = (
     ISSUE_MISSING_OBJECT,
     ISSUE_ORPHAN_OBJECTS,
     ISSUE_EXPIRED_SUPERSEDED_OBJECTS,
+    ISSUE_MISSING_CHUNK_VECTORS,
+    ISSUE_ORPHAN_CHUNK_VECTORS,
 )
 
 
 def _now() -> datetime:
     """返回当前 UTC 时间。"""
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 @dataclass
@@ -286,6 +291,24 @@ def _expired_superseded_ids(db: Session, limit: int) -> list[str]:
     return [str(row[0]) for row in rows]
 
 
+def _chunk_vector_issues(db: Session, sample_limit: int) -> list[KnowledgeIssue]:
+    """扫描分块向量一致性；向量通道关闭时返回空列表（不报告无意义问题）。"""
+    from aiive.knowledge.chunk_vectors import (
+        missing_vector_document_ids,
+        orphan_vector_count,
+        vector_table_ready,
+    )
+
+    if not vector_table_ready(db):
+        return []
+    missing = missing_vector_document_ids(db, 1000)
+    orphan = orphan_vector_count(db)
+    return [
+        KnowledgeIssue(ISSUE_MISSING_CHUNK_VECTORS, len(missing), missing[:sample_limit]),
+        KnowledgeIssue(ISSUE_ORPHAN_CHUNK_VECTORS, orphan, []),
+    ]
+
+
 def _last_maintenance_at(db: Session) -> str | None:
     """返回最近一次成功的知识库维护完成时间。"""
     job = (
@@ -324,6 +347,7 @@ def scan_knowledge_base(
         KnowledgeIssue(ISSUE_MISSING_OBJECT, len(missing_objects), missing_objects[:sample_limit]),
         KnowledgeIssue(ISSUE_ORPHAN_OBJECTS, len(orphan_objects), orphan_objects[:sample_limit]),
         KnowledgeIssue(ISSUE_EXPIRED_SUPERSEDED_OBJECTS, len(expired), expired[:sample_limit]),
+        *_chunk_vector_issues(db, sample_limit),
     ]
     return KnowledgeMaintenanceReport(
         generated_at=_now().isoformat(),
@@ -439,6 +463,31 @@ def _remove_orphan_objects(db: Session, limit: int) -> int:
     return removed
 
 
+def _repair_chunk_vectors(db: Session, limit: int) -> dict[str, int]:
+    """回填缺失向量并清理孤儿向量；向量通道关闭时全部为 0。
+
+    回填按有界批次进行（`limit` 篇文档），每篇独立保存点，失败不影响其余文档。
+    """
+    from aiive.knowledge.chunk_vectors import (
+        ChunkVectorService,
+        purge_orphan_vectors,
+        vector_table_ready,
+    )
+
+    if not vector_table_ready(db):
+        return {
+            "chunk_vectors_backfilled": 0,
+            "chunk_vectors_backfill_failed": 0,
+            "orphan_chunk_vectors_purged": 0,
+        }
+    backfilled, failed = ChunkVectorService(db).backfill_missing(limit)
+    return {
+        "chunk_vectors_backfilled": backfilled,
+        "chunk_vectors_backfill_failed": failed,
+        "orphan_chunk_vectors_purged": purge_orphan_vectors(db, limit),
+    }
+
+
 def apply_report(
     db: Session, report: KnowledgeMaintenanceReport, *, limit: int = DEFAULT_BATCH_LIMIT
 ) -> dict[str, Any]:
@@ -456,6 +505,8 @@ def apply_report(
     rebuilt, failed = _rebuild_missing_chunks(db, limit)
     actions["documents_rebuilt"] = rebuilt
     actions["documents_rebuild_failed"] = failed
+    vector_actions = _repair_chunk_vectors(db, limit)
+    actions.update(vector_actions)
     actions["documents_marked_unavailable"] = _mark_missing_objects(db)
     actions["superseded_objects_released"] = _release_expired_superseded_objects(db, limit)
     actions["orphan_objects_removed"] = _remove_orphan_objects(db, limit)
@@ -469,6 +520,8 @@ def apply_report(
         "documents_marked_unavailable",
         "superseded_objects_released",
         "orphan_objects_removed",
+        "chunk_vectors_backfilled",
+        "orphan_chunk_vectors_purged",
     )
     actions["changed"] = any(int(actions[key]) > 0 for key in progress_keys)
     actions["report"] = report.to_dict()

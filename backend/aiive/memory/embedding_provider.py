@@ -1,9 +1,11 @@
-"""记忆向量使用的 OpenAI-compatible Embeddings 客户端。"""
+"""记忆/知识库向量使用的 OpenAI-compatible Embeddings 客户端。"""
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
+
+InputType = Literal["query", "document"]
 
 
 class EmbeddingProviderError(RuntimeError):
@@ -45,20 +47,61 @@ class OpenAIEmbeddingProvider:
         self,
         text: str,
         *,
-        input_type: Literal["query", "document"] = "document",
+        input_type: InputType = "document",
     ) -> list[float]:
         """为单段文本生成向量，并严格校验响应维度。"""
         if not text.strip():
             raise ValueError("Embedding 输入不能为空")
-        embedding_text = text
+        embedding_text = self._prepare_text(text, input_type)
+        payload = self._post([embedding_text])
+        return self._parse(payload, expected=1)[0]
+
+    def embed_batch(
+        self,
+        texts: list[str],
+        *,
+        input_type: InputType = "document",
+        batch_size: int = 8,
+    ) -> list[list[float]]:
+        """按批生成向量；顺序与输入一致，逐条校验维度。
+
+        TEI 的 `max_batch_requests` 受后端限制（cpu 后端通常 ≤4），批次过大
+        只会被服务端拒绝或排队；调用方用 `batch_size` 控制并发与内存峰值。
+        """
+        if not texts:
+            return []
+        if batch_size <= 0:
+            raise ValueError("Embedding batch_size 必须大于 0")
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), batch_size):
+            window = texts[start : start + batch_size]
+            for text in window:
+                if not text.strip():
+                    raise ValueError("Embedding 输入不能为空")
+            prepared = [self._prepare_text(text, input_type) for text in window]
+            payload = self._post(prepared)
+            vectors.extend(self._parse(payload, expected=len(prepared)))
+        return vectors
+
+    # ── 内部实现 ────────────────────────────────────────────────
+
+    def _prepare_text(self, text: str, input_type: InputType) -> str:
+        """按输入类型拼接查询指令前缀（本地 BGE 的非对称检索要求）。"""
         if input_type == "query" and self._query_prefix:
-            embedding_text = f"{self._query_prefix}{text}"
+            return f"{self._query_prefix}{text}"
+        return text
+
+    def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
         if self._api_key.strip():
             headers["Authorization"] = f"Bearer {self._api_key}"
+        return headers
+
+    def _post(self, inputs: list[str]) -> Any:
+        """发送一次请求：单条输入仍以字符串提交，保持既有契约。"""
         request_payload: dict[str, object] = {
             "model": self._model,
-            "input": embedding_text,
+            "input": inputs[0] if len(inputs) == 1 else inputs,
             "encoding_format": "float",
         }
         # TEI 的维度由模型固定输出；远端 OpenAI-compatible API 则允许显式请求维度。
@@ -67,18 +110,41 @@ class OpenAIEmbeddingProvider:
         try:
             response = httpx.post(
                 self._url,
-                headers=headers,
+                headers=self._headers(),
                 json=request_payload,
                 timeout=self._timeout_seconds,
             )
             response.raise_for_status()
-            payload = response.json()
-            vector = payload["data"][0]["embedding"]
-        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
+            return response.json()
+        except (httpx.HTTPError, ValueError) as exc:
             raise EmbeddingProviderError(f"Embedding 服务调用失败: {exc}") from exc
-        if not isinstance(vector, list) or len(vector) != self._dimensions:
-            actual = len(vector) if isinstance(vector, list) else 0
+
+    def _parse(self, payload: Any, *, expected: int) -> list[list[float]]:
+        """校验响应条目数、维度，并按 index 还原输入顺序。"""
+        try:
+            rows = payload["data"]
+        except (KeyError, TypeError) as exc:
+            raise EmbeddingProviderError(f"Embedding 服务调用失败: {exc}") from exc
+        if not isinstance(rows, list) or len(rows) != expected:
+            actual = len(rows) if isinstance(rows, list) else 0
             raise EmbeddingProviderError(
-                f"Embedding 维度不匹配: expected={self._dimensions}, actual={actual}"
+                f"Embedding 响应条数不匹配: expected={expected}, actual={actual}"
             )
-        return [float(value) for value in vector]
+        ordered: list[list[float] | None] = [None] * expected
+        for position, row in enumerate(rows):
+            try:
+                index = row.get("index", position)
+                vector = row["embedding"]
+            except (AttributeError, KeyError, TypeError) as exc:
+                raise EmbeddingProviderError(f"Embedding 服务调用失败: {exc}") from exc
+            if not isinstance(index, int) or not 0 <= index < expected:
+                raise EmbeddingProviderError(f"Embedding 响应 index 非法: {index}")
+            if not isinstance(vector, list) or len(vector) != self._dimensions:
+                actual = len(vector) if isinstance(vector, list) else 0
+                raise EmbeddingProviderError(
+                    f"Embedding 维度不匹配: expected={self._dimensions}, actual={actual}"
+                )
+            ordered[index] = [float(value) for value in vector]
+        if any(item is None for item in ordered):
+            raise EmbeddingProviderError("Embedding 响应缺少条目")
+        return [item for item in ordered if item is not None]

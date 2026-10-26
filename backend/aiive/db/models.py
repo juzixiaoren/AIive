@@ -6,22 +6,32 @@
 - 每个模型通过 Mapped 和 mapped_column 声明字段类型和约束
 """
 import uuid
-from datetime import datetime, timezone
-
-from sqlalchemy import BigInteger, CheckConstraint, DateTime, ForeignKey, Index, JSON, String, Text, UniqueConstraint, text
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from pgvector.sqlalchemy import Vector
+from datetime import UTC, datetime
 from typing import Any
+
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 class Base(DeclarativeBase):
     """SQLAlchemy 声明式基类，所有 ORM 模型均继承此类。"""
-    pass
 
 
 def _utcnow() -> datetime:
     """返回当前 UTC 时间，作为时间戳字段的默认值工厂函数。"""
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _new_uuid() -> str:
@@ -666,6 +676,41 @@ class Chunk(Base):
     __table_args__: tuple[UniqueConstraint, ...] = (
         # 同一文档内分块序号唯一：重建时不会因并发/中断留下重复分块
         UniqueConstraint("document_id", "chunk_index", name="uq_chunks_document_chunk_index"),
+    )
+
+
+class KnowledgeChunkVector(Base):
+    """知识分块的 pgvector 派生投影；`chunks` 仍是唯一真相源。
+
+    向量永远是可重建的派生数据：删除分块（级联）或重新分块时同步清理，
+    检索侧只把它当作召回通道，命中后仍回源读取 `chunks`/`documents`。
+    """
+
+    __tablename__: str = "knowledge_chunk_vectors"
+    __table_args__: tuple[Index, ...] = (
+        # HNSW 索引由 Alembic 迁移以裸 DDL 创建（与 memory_vector_projections 一致），
+        # 此处同步声明使 ORM metadata 与迁移后的库结构一致。
+        Index(
+            "ix_knowledge_chunk_vector_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ).ddl_if(dialect="postgresql"),
+    )
+
+    chunk_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("chunks.id", ondelete="CASCADE"), primary_key=True,
+    )
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    embedding_model: Mapped[str] = mapped_column(String(128), nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(
+        Vector(512).with_variant(JSON(), "sqlite"), nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow,
     )
 
 

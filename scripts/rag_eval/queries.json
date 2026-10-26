@@ -1,0 +1,216 @@
+{
+  "top_k": 5,
+  "queries": [
+    {
+      "id": "s1",
+      "category": "semantic",
+      "query": "上线前要做哪些验证",
+      "expected": [
+        "deploy-rollout"
+      ]
+    },
+    {
+      "id": "s2",
+      "category": "semantic",
+      "query": "服务出问题怎么退回到上一个版本",
+      "expected": [
+        "deploy-rollout"
+      ]
+    },
+    {
+      "id": "s3",
+      "category": "semantic",
+      "query": "用户让我别记住的事情要怎么彻底清掉",
+      "expected": [
+        "memory-architecture"
+      ]
+    },
+    {
+      "id": "s4",
+      "category": "semantic",
+      "query": "怎样把数据库恢复到某个时间点",
+      "expected": [
+        "ops-backup"
+      ]
+    },
+    {
+      "id": "s5",
+      "category": "semantic",
+      "query": "哪些配置决定用哪个向量模型",
+      "expected": [
+        "deploy-env"
+      ]
+    },
+    {
+      "id": "t1",
+      "category": "exact_term",
+      "query": "request_latency_p95",
+      "expected": [
+        "ops-monitoring"
+      ]
+    },
+    {
+      "id": "t2",
+      "category": "exact_term",
+      "query": "pg_dump",
+      "expected": [
+        "ops-backup"
+      ]
+    },
+    {
+      "id": "t3",
+      "category": "exact_term",
+      "query": "chunk_index",
+      "expected": [
+        "knowledge-chunks"
+      ]
+    },
+    {
+      "id": "t4",
+      "category": "exact_term",
+      "query": "AIIVE_EMBEDDING_MODEL_REVISION",
+      "expected": [
+        "deploy-env"
+      ]
+    },
+    {
+      "id": "t5",
+      "category": "exact_term",
+      "query": "vector_cosine_ops",
+      "expected": [
+        "knowledge-vectors"
+      ]
+    },
+    {
+      "id": "m1",
+      "category": "mixed",
+      "query": "pgvector 的 HNSW 索引怎么建",
+      "expected": [
+        "knowledge-vectors"
+      ]
+    },
+    {
+      "id": "m2",
+      "category": "mixed",
+      "query": "outbox_jobs 和记忆向量回填的关系",
+      "expected": [
+        "memory-vector"
+      ]
+    },
+    {
+      "id": "m3",
+      "category": "mixed",
+      "query": "GitHub Actions 里怎么做 alembic check",
+      "expected": [
+        "ci-pipeline"
+      ]
+    },
+    {
+      "id": "m4",
+      "category": "mixed",
+      "query": "TEI 服务的 max_concurrent_requests 怎么配",
+      "expected": [
+        "deploy-env"
+      ]
+    },
+    {
+      "id": "n1",
+      "category": "similar",
+      "query": "知识库文档删除之后旧分块怎么处理",
+      "expected": [
+        "knowledge-chunks"
+      ]
+    },
+    {
+      "id": "n2",
+      "category": "similar",
+      "query": "记忆归档以后向量还会保留吗",
+      "expected": [
+        "memory-vector"
+      ]
+    },
+    {
+      "id": "n3",
+      "category": "similar",
+      "query": "中文没有空格时关键词检索怎么处理",
+      "expected": [
+        "retrieval-lexical"
+      ]
+    },
+    {
+      "id": "n4",
+      "category": "similar",
+      "query": "两路检索结果怎么合并排序",
+      "expected": [
+        "retrieval-hybrid"
+      ]
+    },
+    {
+      "id": "u1",
+      "category": "unrelated",
+      "query": "今天上海的天气怎么样",
+      "expected": []
+    },
+    {
+      "id": "u2",
+      "category": "unrelated",
+      "query": "推荐一部科幻电影",
+      "expected": []
+    },
+    {
+      "id": "u3",
+      "category": "unrelated",
+      "query": "红烧肉怎么做才好吃",
+      "expected": []
+    },
+    {
+      "id": "u4",
+      "category": "unrelated",
+      "query": "马拉松训练计划怎么安排",
+      "expected": []
+    },
+    {
+      "id": "p1",
+      "category": "permission",
+      "query": "旧报销政策要求纸质发票原件吗",
+      "expected": [],
+      "forbidden": [
+        "legacy-reimbursement"
+      ]
+    },
+    {
+      "id": "p2",
+      "category": "permission",
+      "query": "临时测试文档里的部署密钥",
+      "expected": [],
+      "forbidden": [
+        "legacy-temp-key"
+      ]
+    },
+    {
+      "id": "p3",
+      "category": "permission",
+      "query": "内网跳板机地址是多少",
+      "expected": [],
+      "forbidden": [
+        "legacy-temp-key"
+      ]
+    },
+    {
+      "id": "t6",
+      "category": "exact_term",
+      "query": "AIIVE_KNOWLEDGE_VECTOR_MIN_SIMILARITY 的作用",
+      "expected": [
+        "knowledge-vectors"
+      ]
+    },
+    {
+      "id": "n5",
+      "category": "similar",
+      "query": "memory.current 和 memory.peak 在哪里看",
+      "expected": [
+        "ops-monitoring"
+      ]
+    }
+  ]
+}

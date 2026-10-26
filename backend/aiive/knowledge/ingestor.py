@@ -15,8 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy.orm import Session
 from sqlalchemy import or_
+from sqlalchemy.orm import Session
 
 from aiive.db.models import Chunk, Document
 from aiive.knowledge.chunker import chunk_text
@@ -61,7 +61,8 @@ class KnowledgeIngestor:
     # ── 分块与对象 ────────────────────────────────────────────────
 
     def _replace_chunks(self, document: Document, content: str) -> int:
-        """在当前事务中用持久原文重建全部分块。"""
+        """在当前事务中用持久原文重建全部分块，并刷新分块向量。"""
+        self._purge_chunk_vectors(document.id)
         self._db.query(Chunk).filter(Chunk.document_id == document.id).delete(
             synchronize_session=False
         )
@@ -76,15 +77,53 @@ class KnowledgeIngestor:
                 token_estimate=max(1, len(item["content"]) // 4),
             ))
         self._db.flush()
+        self._refresh_chunk_vectors(document.id)
         return len(chunks)
 
     def purge_chunks(self, document_id: str) -> int:
-        """删除指定文档的全部分块（派生数据，可由原文重建）。"""
+        """删除指定文档的全部分块与派生向量（可由原文重建）。"""
+        self._purge_chunk_vectors(document_id)
         return int(
             self._db.query(Chunk).filter(Chunk.document_id == document_id).delete(
                 synchronize_session=False
             )
         )
+
+    # ── 分块向量（派生数据，失败降级为纯关键词检索）────────────────
+
+    def _refresh_chunk_vectors(self, document_id: str) -> None:
+        """为当前分块生成向量；失败只告警，不影响摄取结果。
+
+        向量通道不可用（未开启 / SQLite / 模型服务故障）时静默跳过：分块与
+        关键词检索仍然有效，不会产生伪造或越权结果。
+        """
+        from aiive.knowledge.chunk_vectors import (
+            ChunkVectorService,
+            knowledge_vector_enabled,
+        )
+
+        if not knowledge_vector_enabled(self._db):
+            return
+        try:
+            with self._db.begin_nested():
+                ChunkVectorService(self._db).refresh_document(document_id)
+        except Exception:
+            logger.warning("知识分块向量生成失败，降级为关键词检索：%s", document_id, exc_info=True)
+
+    def _purge_chunk_vectors(self, document_id: str) -> None:
+        """删除文档分块对应的向量投影；失败只告警（残留由维护任务回收）。"""
+        from aiive.knowledge.chunk_vectors import (
+            ChunkVectorService,
+            knowledge_vector_enabled,
+        )
+
+        if not knowledge_vector_enabled(self._db):
+            return
+        try:
+            with self._db.begin_nested():
+                ChunkVectorService(self._db).delete_document(document_id)
+        except Exception:
+            logger.warning("知识分块向量清理失败，留给维护任务回收：%s", document_id, exc_info=True)
 
     def release_object(self, document: Document) -> bool:
         """释放文档独占的对象存储原文，并清空其对象引用。
@@ -331,15 +370,31 @@ class KnowledgeIngestor:
 
 
 def search_chunks(db: Session, query: str, limit: int = 5) -> list[dict[str, Any]]:
-    """边界化多关键词检索，并按命中覆盖度排序。
+    """知识分块检索：词法 + 向量混合召回（向量不可用时自动退化为纯词法）。
 
     只返回活跃状态文档的分块：已取代（superseded）与已删除（deleted）的文档
-    即使残留分块也不会被召回。
+    即使残留分块或向量也不会被召回。两路结果按 RRF 融合去重，词法命中优先级
+    不低于向量命中，因此纯关键词查询的排序与接入向量前一致。
     """
     normalized = query.strip().casefold()
     if not normalized:
         return []
     limit = max(1, min(int(limit), 100))
+    # 两路各取更深的候选再融合：融合层需要"另一路排名"才有意义，
+    # 只取 limit 条会让 RRF 退化为单路排序的并集。深度有界，避免大库全扫。
+    depth = min(limit * 4, 100)
+    lexical_hits = _lexical_chunk_hits(db, normalized, depth)
+    vector_hits = _vector_chunk_hits(db, query.strip(), depth)
+    return _fuse_chunk_hits(lexical_hits, vector_hits, limit)
+
+
+# 混合检索融合参数：RRF 让两路排名可比，权重表达"词法不弱于向量"的既有排序契约。
+_HYBRID_RRF_K = 60
+_HYBRID_WEIGHTS: dict[str, float] = {"lexical": 0.5, "vector": 0.5}
+
+
+def _lexical_chunk_hits(db: Session, normalized: str, limit: int) -> list[dict[str, Any]]:
+    """按边界化多关键词匹配与命中覆盖度排序（原有检索语义）。"""
     tokens = list(dict.fromkeys(token for token in re.split(r"\s+", normalized) if token))[:12]
 
     def escaped(token: str) -> str:
@@ -364,9 +419,75 @@ def search_chunks(db: Session, query: str, limit: int = 5) -> list[dict[str, Any
         ),
         reverse=True,
     )[:limit]
-    return [{
+    return [_chunk_hit(chunk, document, [
+        token for token in tokens if token in chunk.content.casefold()
+    ]) for chunk, document in results]
+
+
+def _vector_chunk_hits(db: Session, query: str, limit: int) -> list[dict[str, Any]]:
+    """按语义相似度召回分块；任何失败都降级为空结果（保留关键词检索）。"""
+    from aiive.config import settings
+    from aiive.knowledge.chunk_vectors import ChunkVectorService, vector_table_ready
+
+    try:
+        if not vector_table_ready(db):
+            return []
+        rows = ChunkVectorService(db).search(
+            query, min(limit, settings.aiive_knowledge_vector_top_k),
+        )
+    except Exception:
+        logger.warning("知识向量召回失败，降级为关键词检索", exc_info=True)
+        return []
+    threshold = settings.aiive_knowledge_vector_min_similarity
+    return [
+        _chunk_hit(chunk, document, [], score=round(score, 6))
+        for chunk, document, score in rows
+        if score >= threshold
+    ]
+
+
+def _chunk_hit(
+    chunk: Chunk,
+    document: Document,
+    matched_terms: list[str],
+    *,
+    score: float | None = None,
+) -> dict[str, Any]:
+    """构造统一的分块命中结构（词法/向量共用，附加字段不破坏既有契约）。"""
+    hit: dict[str, Any] = {
         "chunk_id": chunk.id, "document_id": document.id,
         "source_path": document.source_path, "content_preview": chunk.content[:200],
         "line_start": chunk.line_start, "line_end": chunk.line_end,
-        "matched_terms": [token for token in tokens if token in chunk.content.casefold()],
-    } for chunk, document in results]
+        "matched_terms": matched_terms,
+    }
+    if score is not None:
+        hit["vector_score"] = score
+    return hit
+
+
+def _fuse_chunk_hits(
+    lexical_hits: list[dict[str, Any]],
+    vector_hits: list[dict[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """RRF 融合两路命中并按 chunk_id 去重；词法命中保留 matched_terms。"""
+    scores: dict[str, float] = {}
+    merged: dict[str, dict[str, Any]] = {}
+    for route, hits in (("lexical", lexical_hits), ("vector", vector_hits)):
+        for rank, hit in enumerate(hits, start=1):
+            chunk_id = str(hit["chunk_id"])
+            scores[chunk_id] = scores.get(chunk_id, 0.0) + _HYBRID_WEIGHTS[route] / (
+                _HYBRID_RRF_K + rank
+            )
+            if chunk_id not in merged:
+                merged[chunk_id] = dict(hit)
+            elif route == "vector" and hit.get("vector_score") is not None:
+                merged[chunk_id]["vector_score"] = hit["vector_score"]
+    ranked = sorted(
+        merged.values(),
+        key=lambda hit: scores[str(hit["chunk_id"])],
+        reverse=True,
+    )[:limit]
+    for hit in ranked:
+        hit["hybrid_score"] = round(scores[str(hit["chunk_id"])], 6)
+    return ranked

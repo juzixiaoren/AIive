@@ -50,31 +50,37 @@ if ! docker compose version >/dev/null 2>&1; then
     exit 1
 fi
 
-vector_enabled=${AIIVE_MEMORY_VECTOR_ENABLED:-$(read_env AIIVE_MEMORY_VECTOR_ENABLED)}
+memory_vector=$(read_env AIIVE_MEMORY_VECTOR_ENABLED)
+memory_vector=${AIIVE_MEMORY_VECTOR_ENABLED:-${memory_vector:-false}}
+knowledge_vector=$(read_env AIIVE_KNOWLEDGE_VECTOR_ENABLED)
+knowledge_vector=${AIIVE_KNOWLEDGE_VECTOR_ENABLED:-${knowledge_vector:-false}}
 embedding_provider=${AIIVE_EMBEDDING_PROVIDER:-$(read_env AIIVE_EMBEDDING_PROVIDER)}
 embedding_provider=${embedding_provider:-openai_compatible}
 
-if is_true "${vector_enabled:-false}" && [ "$embedding_provider" = "local" ]; then
-    mkdir -p .data/models/embeddings
+# 记忆向量或知识库向量任一开启、且使用本地模型时，才拉起 TEI 服务。
+local_vector=false
+if [ "$embedding_provider" = "local" ]; then
+    if is_true "$memory_vector" || is_true "$knowledge_vector"; then
+        local_vector=true
+    fi
+fi
+
+if [ "$local_vector" = "true" ]; then
     # 后端容器必须通过 Compose 服务名访问，不能使用宿主机的 127.0.0.1。
     export AIIVE_DOCKER_EMBEDDING_BASE_URL=http://embedding:80/v1
-
-    configured_tag=${AIIVE_TEI_IMAGE_TAG:-$(read_env AIIVE_TEI_IMAGE_TAG)}
-    if [ -z "$configured_tag" ]; then
-        case "$(uname -m)" in
-            arm64|aarch64) configured_tag=cpu-arm64-1.9 ;;
-            *) configured_tag=cpu-1.9 ;;
-        esac
-    fi
-    export AIIVE_TEI_IMAGE_TAG=$configured_tag
+    export AIIVE_TEI_IMAGE_TAG=$(sh "$SCRIPT_DIR/embedding_model.sh" image-tag)
 
     embedding_port=${AIIVE_LOCAL_EMBEDDING_PORT:-$(read_env AIIVE_LOCAL_EMBEDDING_PORT)}
     embedding_port=${embedding_port:-8081}
     wait_seconds=${AIIVE_LOCAL_EMBEDDING_STARTUP_TIMEOUT_SECONDS:-$(read_env AIIVE_LOCAL_EMBEDDING_STARTUP_TIMEOUT_SECONDS)}
     wait_seconds=${wait_seconds:-600}
 
-    echo "启动 PostgreSQL 和本地 Embedding 服务（首次运行会自动下载模型）..."
-    docker compose --profile local-embedding up -d postgres embedding
+    echo "启动 PostgreSQL..."
+    docker compose up -d postgres
+
+    # 检测本地模型缓存：缺失时自动下载（约 92MB），已有缓存直接复用；
+    # 随后幂等启动 embedding 容器（下载由该容器完成）。
+    sh "$SCRIPT_DIR/embedding_model.sh" ensure
 
     if ! command -v curl >/dev/null 2>&1; then
         echo "错误：启动检查需要 curl。" >&2

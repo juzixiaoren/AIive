@@ -48,6 +48,19 @@ class Settings(BaseSettings):
     aiive_embedding_query_prefix: str = ""
     aiive_embedding_timeout_seconds: int = 30
     aiive_memory_vector_top_k: int = 16
+    # 单次 Embeddings 请求的最大文本条数：本地 TEI cpu 后端的
+    # max_batch_requests 通常为 4，批越大只会排队；同时控制回填内存峰值。
+    aiive_embedding_batch_size: int = 4
+
+    # 知识库分块向量检索（与记忆共用同一 Embedding 模型与 pgvector）。
+    # 关闭时知识检索只走关键词路径；开启后为词法 + 向量混合召回。
+    aiive_knowledge_vector_enabled: bool = False
+    aiive_knowledge_vector_top_k: int = 16
+    # 向量召回的相似度下限：低于该值的分块不进入混合结果，避免无关查询
+    # 也被语义近邻"兜底"出噪声。按本地 bge-small-zh 的实测分布标定。
+    aiive_knowledge_vector_min_similarity: float = 0.30
+    # 单次回填/修复最多处理的分块数（有界批次，避免长事务与内存尖峰）。
+    aiive_knowledge_vector_backfill_batch: int = 200
 
     # 记忆文件投影：输出目录只能来自服务端配置，Outbox payload 不接受路径。
     aiive_memory_file_projection_enabled: bool = True
@@ -225,9 +238,13 @@ class Settings(BaseSettings):
             and self.aiive_trusted_core_admin_token == "aiive-trusted-core-dev-token"
         ):
             raise ValueError("非 loopback 部署必须更换 Trusted Core 默认管理令牌")
-        if not self.aiive_memory_vector_enabled:
+        if self.aiive_embedding_batch_size <= 0:
+            raise ValueError("AIIVE_EMBEDDING_BATCH_SIZE 必须大于 0")
+        if not (self.aiive_memory_vector_enabled or self.aiive_knowledge_vector_enabled):
             return self
-        if not self.database_url.startswith("postgresql"):
+        # 记忆向量是强依赖：开启即要求 PostgreSQL。知识分块向量属于可降级的
+        # 派生通道（SQLite / 迁移未执行时自动退回关键词检索），因此不在此阻断启动。
+        if self.aiive_memory_vector_enabled and not self.database_url.startswith("postgresql"):
             raise ValueError("记忆向量能力仅支持 PostgreSQL + pgvector")
         if (
             self.aiive_embedding_provider == "openai_compatible"
@@ -235,7 +252,7 @@ class Settings(BaseSettings):
         ):
             raise ValueError("启用记忆向量能力时必须配置 AIIVE_EMBEDDING_API_KEY")
         if self.aiive_embedding_dimensions != 512:
-            raise ValueError("当前 memory_vector_projections schema 要求 512 维 embedding")
+            raise ValueError("当前向量投影表 schema 要求 512 维 embedding")
         if not self.aiive_embedding_model.strip():
             raise ValueError("启用记忆向量能力时必须配置 AIIVE_EMBEDDING_MODEL")
         identity = self.aiive_embedding_model.strip()
@@ -246,6 +263,12 @@ class Settings(BaseSettings):
             raise ValueError("Embedding 模型名与 revision 组合后不能超过 128 字符")
         if self.aiive_memory_vector_top_k <= 0:
             raise ValueError("AIIVE_MEMORY_VECTOR_TOP_K 必须大于 0")
+        if self.aiive_knowledge_vector_top_k <= 0:
+            raise ValueError("AIIVE_KNOWLEDGE_VECTOR_TOP_K 必须大于 0")
+        if self.aiive_knowledge_vector_backfill_batch <= 0:
+            raise ValueError("AIIVE_KNOWLEDGE_VECTOR_BACKFILL_BATCH 必须大于 0")
+        if not 0.0 <= self.aiive_knowledge_vector_min_similarity <= 1.0:
+            raise ValueError("AIIVE_KNOWLEDGE_VECTOR_MIN_SIMILARITY 必须在 0 到 1 之间")
         return self
 
 

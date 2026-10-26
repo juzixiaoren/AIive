@@ -74,7 +74,7 @@ AIive（再次召回，fail-closed 校验）：
 | 后端 | Python 3.12+ / FastAPI / LangChain + LangGraph |
 | LLM | DeepSeek（OpenAI 兼容 API） |
 | 数据库 | PostgreSQL 16 / SQLAlchemy 2.0 / Alembic |
-| 向量检索 | pgvector（PostgreSQL 向量扩展） |
+| 向量检索 | pgvector（PostgreSQL 向量扩展）：记忆向量 + 知识分块向量，本地 TEI（bge-small-zh-v1.5）生成 512 维 |
 | 前端 | React 19 / TypeScript / Vite 6 / TailwindCSS 3 |
 | Android 应用 | React 19 / Capacitor 8 / Android SDK 36（独立 UI） |
 | Desktop 应用 | Electron 37 / Electron Forge / 独立 Node Host |
@@ -106,15 +106,21 @@ AIive（再次召回，fail-closed 校验）：
 # 1. 配置环境变量
 cp .env.example .env
 # 编辑 .env 填入 LLM API Key 等信息
-# 如需本地向量召回，将 AIIVE_MEMORY_VECTOR_ENABLED 改为 true
+# 如需本地向量召回，将 AIIVE_MEMORY_VECTOR_ENABLED / AIIVE_KNOWLEDGE_VECTOR_ENABLED 改为 true
 
 # 2. 启动 Docker 服务
-# 开启本地向量召回时，会自动拉取 TEI 并将模型缓存到 .data/models/embeddings
+# 开启本地向量召回时，会先检测本地模型缓存，缺失则自动下载，再拉起 TEI
 ./scripts/start.sh
 
 # 3. 查看服务状态
 docker compose --profile local-embedding ps
 ```
+
+**本地向量服务的内存口径**：Embedding 模型只在 TEI 容器里加载一次（后端进程不加载模型），
+模型为 `BAAI/bge-small-zh-v1.5`（512 维，固定 revision）。实测整套服务（PostgreSQL +
+TEI + Backend）在单 cgroup 2 GiB、关闭 swap 的限制下峰值 486 MiB（基准负载）/ 526 MiB
+（112 篇文档 + 120 条记忆 + 8 并发），无 OOM、无 swap。复现方式见
+`scripts/memtest/run_memtest.sh`，结论见 `docs/reports/2026-10-26_V46_embedding_hybrid_rag_report.md`。
 
 本地开发若希望后端和前端直接运行在宿主机：
 
@@ -181,9 +187,19 @@ Web、Android 或 Electron 界面发出的自然语言指令都由后端 Agent �
 删除。详细协议、节点绑定、权限与构建说明见
 [Desktop 应用与本地执行节点指南](docs/guides/DESKTOP_APP.md)。
 
-启用本地 Embedding 时应通过 `./scripts/start.sh` 启动模型服务。模型权重和
-Hugging Face 缓存均位于 `.data/models/embeddings/`，该目录不会进入 Git 或
-Docker 构建上下文。首次启动需要联网下载镜像与模型，之后复用本地缓存。
+启用本地 Embedding 时应通过 `./scripts/start.sh` 启动模型服务。脚本读取 `.env` 中的
+`AIIVE_MEMORY_VECTOR_ENABLED` / `AIIVE_KNOWLEDGE_VECTOR_ENABLED` 与
+`AIIVE_EMBEDDING_PROVIDER`：任一向量检索开启且 provider 为 `local` 时，先检查
+`.data/models/embeddings/` 下固定 revision 的模型是否完整，缺失则自动下载
+（`BAAI/bge-small-zh-v1.5`，约 92MB），已有缓存直接复用，随后启动 TEI 并等待就绪。
+
+- 下载源：`AIIVE_HF_ENDPOINT_CANDIDATES`（逗号分隔，按顺序尝试，默认官方源 + `hf-mirror`）；
+  只用一个源时设置 `AIIVE_HF_ENDPOINT`。
+- 缓存目录：`AIIVE_LOCAL_EMBEDDING_CACHE_DIR`（默认 `.data/models/embeddings/`），
+  该目录不会进入 Git 或 Docker 构建上下文。
+- 单独预下载 / 查看状态：`./scripts/embedding_model.sh ensure`、
+  `./scripts/embedding_model.sh status`；不使用 `start.sh` 时也可
+  `docker compose --profile local-embedding up -d embedding` 由 TEI 自行下载。
 
 ### Windows（命令提示符 cmd.exe）
 > 推荐使用 **Miniconda** 管理 Python 环境（本仓库实测环境名 `aiive`，Python 3.12）；`curl` 在 Win10+ 自带，否则可用 PowerShell 的 `Invoke-WebRequest`。安装依赖**务必加 `--prefer-binary`**，否则 pip 会选到只有源码包（tar.gz）的 `litellm`，卡在源码构建十几分钟（详见下方注意事项）。
@@ -191,6 +207,9 @@ Docker 构建上下文。首次启动需要联网下载镜像与模型，之后�
 ```cmd
 REM 1. 启动 PostgreSQL（需先安装 Docker Desktop）
 docker compose up -d
+REM    如需本地向量召回：docker compose --profile local-embedding up -d postgres embedding
+REM    首次启动会自动下载模型到 .data/models/embeddings（可用 Git Bash 运行
+REM    ./scripts/embedding_model.sh ensure 预下载并查看进度）
 
 REM 2. 配置环境变量
 copy .env.example .env
@@ -256,7 +275,7 @@ AIive/
 │   ├── mcp/              # MCP 工具集成（发现、安装、沙箱）
 │   ├── selfdev/          # 自进化（补丁规划、槽位管理）
 │   ├── db/               # SQLAlchemy 模型、数据库配置
-│   ├── knowledge/        # 文档知识库（摄入、分块、Qdrant 索引）
+│   ├── knowledge/        # 文档知识库（摄入、分块、pgvector 向量 + 关键词混合召回）
 │   ├── worker/           # 后台 Worker（出站处理、任务调度）
 │   ├── supervisor/       # 守护进程（健康探针、槽位管理）
 │   ├── context/          # 运行上下文

@@ -1,0 +1,88 @@
+{
+  "docs": [
+    {
+      "slug": "deploy-rollout",
+      "title": "发布与回滚流程",
+      "status": "active",
+      "content": "发布纪律\n每次发布必须先在预发环境完成冒烟验证，再由值班同学确认发布时间窗口。\n\n蓝绿发布\n生产环境保留两套槽位，新版本先部署到空闲槽位，健康检查通过后把流量切过去。切换动作只改反向代理的上游配置，不重启正在服务的进程。\n\n回滚\n一旦错误率或延迟超过阈值，立刻把流量切回旧槽位；如果新版本已经写入了不兼容的数据结构，则先回滚代码再执行数据库降级脚本。回滚窗口期保持 30 分钟，期间不允许再次发布。"
+    },
+    {
+      "slug": "deploy-env",
+      "title": "环境变量与模型配置",
+      "status": "active",
+      "content": "模型配置\nAIIVE_EMBEDDING_MODEL 指定向量模型，AIIVE_EMBEDDING_MODEL_REVISION 固定模型提交，两者组合成向量身份，不同身份生成的向量不允许混用。\n\n服务地址\nAIIVE_EMBEDDING_BASE_URL 指向本地 TEI 服务（容器内是 http://embedding:80/v1，宿主机是 http://127.0.0.1:8081/v1）。\n\n并发与批大小\nTEI 的 max_concurrent_requests 控制同时处理的请求数，CPU 后端的 max_batch_requests 通常只有 4，因此客户端批次不要开大。AIIVE_EMBEDDING_BATCH_SIZE 默认 4，AIIVE_LOCAL_EMBEDDING_MAX_CONCURRENCY 控制服务端并发上限。\n\n端口\nAIIVE_LOCAL_EMBEDDING_PORT 默认 8081，只绑定本机回环地址。"
+    },
+    {
+      "slug": "memory-architecture",
+      "title": "长期记忆生命周期",
+      "status": "active",
+      "content": "生命周期状态\n记忆记录有 active、sleeping、archived、forgotten 四种状态，与 valid、superseded、expired 的有效性维度彼此独立。\n\n作用域\nscope 从 thread 逐级放宽到 global，召回只允许在授权链路内查询，越权作用域永远不返回。\n\n遗忘\n用户要求忘记时走遗忘流程：先屏蔽可见性，再级联删除派生投影，最后对账确认没有残留。已遗忘的记忆不允许通过任何检索路径复现。\n\n归档\n长期不用的记忆会进入 archived，需要显式请求才会被召回，不会自动唤醒。"
+    },
+    {
+      "slug": "memory-vector",
+      "title": "记忆向量投影与回填",
+      "status": "active",
+      "content": "投影表\nmemory_vector_projections 保存记忆的 512 维向量，是派生数据，真相源仍然是 memory_records。写入由 outbox_jobs 里的 memory_vector_refresh 任务异步完成。\n\n版本校验\n投影带 record_version 与 content_hash，版本不一致的旧任务直接跳过，避免旧内容覆盖新向量。\n\n历史回填\n启动时扫描缺失或过期的活跃记忆，按代次 generation 幂等入队，每个记忆只入队一次，重复执行不会重复入队。\n\n删除\n记忆进入 sleeping、archived 或失效时，向量立即删除；遗忘与归档都通过同一删除路径清理派生数据。"
+    },
+    {
+      "slug": "knowledge-chunks",
+      "title": "知识库导入与分块",
+      "status": "active",
+      "content": "导入\n知识文档导入时按内容哈希去重，同一路径内容变化时把旧版本标记为 superseded 并立即清空旧分块，避免新旧内容同时被召回。\n\n分块\n分块按行累加，每块不超过 500 字符，记录 chunk_index、行号范围与 token 估算；同一文档内 chunk_index 唯一，重建不会产生重复分块。\n\n重建\nreindex 从对象存储里的持久原文重新生成分块，不依赖原始文件路径；重建失败保留 index_failed 状态，可以再次重试。\n\n删除\n删除是软删除：清空分块、释放原文对象、保留墓碑记录，绝不删除用户磁盘上的原始文件。"
+    },
+    {
+      "slug": "knowledge-vectors",
+      "title": "知识分块向量与 HNSW 索引",
+      "status": "active",
+      "content": "投影表\nknowledge_chunk_vectors 保存分块的 512 维向量，主键是 chunk_id，随分块级联删除，属于可重建的派生数据。\n\n索引\nHNSW 索引使用 vector_cosine_ops 算子类，查询按余弦距离排序，相似度取 1 减去距离。索引由迁移用裸 DDL 创建，ORM 侧同步声明避免结构漂移。\n\n相似度下限\n低于 AIIVE_KNOWLEDGE_VECTOR_MIN_SIMILARITY 的分块不进入混合结果，避免无关查询被语义近邻兜底出噪声。\n\n模型身份\n投影记录 embedding_model，查询只使用与当前模型身份一致的向量，换模型后旧向量不会被误用。"
+    },
+    {
+      "slug": "retrieval-hybrid",
+      "title": "混合检索融合",
+      "status": "active",
+      "content": "融合方式\n关键词与向量两路结果用倒数排名融合（RRF）合并：每路按名次贡献 1/(k+rank)，k 取 60，权重各 0.5，按 chunk_id 去重后取前 K 条。\n\n排序契约\n词法命中保留 matched_terms，向量命中带 vector_score，融合分写入 hybrid_score。纯关键词查询的排序与接入向量之前保持一致。\n\n降级\n向量通道异常时只返回关键词结果，不抛错、不返回伪造数据；向量表不存在时同样退化为纯词法。\n\n预算\nTop-K 由调用方限制，服务端最多返回 100 条。"
+    },
+    {
+      "slug": "retrieval-lexical",
+      "title": "关键词检索实现",
+      "status": "active",
+      "content": "匹配方式\n关键词检索把查询按空白切成最多 12 个 token，每个 token 做大小写无关的子串匹配，百分号与下划线被转义，不会当成通配符。\n\n排序\n先看整串是否出现，再看命中 token 的覆盖度，最后按分块顺序稳定排序。\n\n中文处理\n中文没有空格，长句会整体作为一个 token，因此精确子串匹配对改写过的问法不敏感，需要语义通道补充。\n\n限制\n候选集最多扫描 1000 行，避免大库上全表扫描。"
+    },
+    {
+      "slug": "ops-monitoring",
+      "title": "监控指标与告警",
+      "status": "active",
+      "content": "核心指标\nrequest_latency_p95 是延迟主指标，超过 800ms 触发告警；request_error_rate 超过 1% 触发二级告警。\n\n数据库观测\n开启 pg_stat_statements 观察慢查询，重点关注全表扫描与索引膨胀；连接池使用率超过 80% 时扩容。\n\n内存观测\n容器内存看 cgroup 的 memory.current 与 memory.peak，接近上限前先降低并发与批大小。\n\n日志\n结构化日志保留 trace_id，错误日志必须包含可复现的最小上下文。"
+    },
+    {
+      "slug": "ops-backup",
+      "title": "备份与恢复",
+      "status": "active",
+      "content": "逻辑备份\n每天用 pg_dump 做一次全量逻辑备份，压缩后上传到对象存储，保留 14 天。\n\n物理归档\n开启 WAL 归档，支持按时间点恢复（PITR）；归档目录与数据目录必须分开存放。\n\n恢复演练\n每季度做一次恢复演练：在隔离环境用备份重建数据库，校验行数与关键表校验和，演练结果写入运维记录。\n\n注意事项\n恢复后必须重跑迁移到最新版本，并重建向量投影，因为向量是派生数据，不参与备份。"
+    },
+    {
+      "slug": "security-scope",
+      "title": "权限与作用域隔离",
+      "status": "active",
+      "content": "作用域链\n每次检索都带作用域链，从最紧的 thread 到最松的 global，只允许在当前授权链路内匹配。\n\n失败关闭\n召回失败、向量缺失、权限不明时一律返回空结果，绝不因为检索异常而放宽过滤条件。\n\n过滤点\n记忆向量查询在 SQL 层过滤作用域与生命周期，返回前再用遗忘可见性服务复核一次，双重校验防止越权。\n\n知识库\n知识库没有用户级作用域，但已删除与被取代的文档永远不参与召回。"
+    },
+    {
+      "slug": "ci-pipeline",
+      "title": "持续集成流水线",
+      "status": "active",
+      "content": "任务划分\nCI 分单元测试、集成测试、PostgreSQL 契约测试与前端构建四个 job，离线执行，不调用真实外部 API。\n\n迁移校验\n流水线执行 alembic check，确认模型定义与迁移脚本一致；出现结构漂移直接失败。\n\n静态检查\nruff 与 basedpyright 全仓扫描，类型错误阻断合并。\n\n真实向量测试\n需要真实模型的用例默认跳过，只有显式开启 PostgreSQL 专项测试并提供本地 Embedding 服务时才执行。"
+    },
+    {
+      "slug": "legacy-reimbursement",
+      "title": "旧报销政策（已取代）",
+      "status": "superseded",
+      "content": "旧报销政策\n报销必须提交纸质发票原件，由行政统一归档；电子发票不予受理。出差住宿标准按城市分级，超标部分自理。"
+    },
+    {
+      "slug": "legacy-temp-key",
+      "title": "临时测试文档（已删除）",
+      "status": "deleted",
+      "content": "临时测试文档\n这里记录过一个临时测试用的部署密钥与内网跳板机地址，仅供当天联调使用，联调结束后文档作废。"
+    }
+  ]
+}

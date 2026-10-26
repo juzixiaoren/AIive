@@ -148,8 +148,9 @@
 | 通知 | `api/routes_notifications.py` | `worker/outbox_handlers.py`、`frontend/src/pages/NotificationsPage.tsx` | `test_notification*.py` |
 | 桌面节点服务端 | `desktop/node_service.py`、`desktop/connection_manager.py`、`desktop/protocol.py` | `api/routes_desktop.py`、`desktop/registry_overlay.py` | `test_desktop*.py` |
 | 桌面节点客户端（Electron） | `apps/desktop/src/node-host/client.mjs` | `apps/desktop/src/node-host/locks.mjs`、`journal.mjs` | `apps/desktop/src/node-host/journal.test.mjs` |
-| 知识库摄入 / 分块 / 检索 | `knowledge/ingestor.py`、`knowledge/chunker.py` | `knowledge/document_reader.py`、`api/routes_knowledge.py` | `test_ingestor.py`、`test_knowledge*.py` |
-| 知识库维护闭环（版本/删除/孤儿清理） | `knowledge/maintenance.py`、`knowledge/ingestor.py` | `worker/handlers_knowledge.py`、`worker/scheduler_daemon.py::_knowledge_maintenance_scanner_job`、`api/routes_knowledge.py` | `test_knowledge_maintenance.py` |
+| 知识库摄入 / 分块 / 检索 | `knowledge/ingestor.py`（`search_chunks` 词法+向量 RRF 融合）、`knowledge/chunker.py` | `knowledge/document_reader.py`、`api/routes_knowledge.py`、`tools/builtin_knowledge.py` | `test_ingestor.py`、`test_knowledge*.py` |
+| 知识分块向量（派生投影 + 混合召回） | `knowledge/chunk_vectors.py`（`ChunkVectorService.refresh_document/delete_document/search/backfill_missing`） | `knowledge/ingestor.py::_refresh_chunk_vectors`（摄取/重建后刷新、删除后清理）、`knowledge/maintenance.py::_repair_chunk_vectors`（缺失回填 + 孤儿清理）、`memory/embedding_provider.py::embed_batch`、`db/models.py::KnowledgeChunkVector` | `tests/integration/pg/test_pg_vector_rag.py`（真实 PG+TEI） |
+| 知识库维护闭环（版本/删除/孤儿清理/向量回填） | `knowledge/maintenance.py`、`knowledge/ingestor.py` | `worker/handlers_knowledge.py`、`worker/scheduler_daemon.py::_knowledge_maintenance_scanner_job`、`api/routes_knowledge.py`、`knowledge/chunk_vectors.py`（`missing_chunk_vectors`/`orphan_chunk_vectors`） | `test_knowledge_maintenance.py` |
 | 文档读取（多格式） | `knowledge/document_reader.py` | `tools/builtin_knowledge.py::handle_read_document` | `test_document*.py` |
 
 ### 2.6 前端 / 客户端 / 基础设施
@@ -164,7 +165,7 @@
 | 新增 DB 表 / 改表 | `backend/aiive/db/models.py` + `backend/alembic/versions/` 新建迁移 | `db/forget_models.py`、`db/retention_models.py`、`alembic/env.py`（需显式导入新模型模块） | `test_db_models*.py` |
 | 新增配置项 | `backend/aiive/config.py::Settings` | `.env` / `.env.example` | `test_config*.py` |
 | 启动装配 / 生命周期 | `backend/aiive/main.py` | `worker/scheduler_daemon.py::start_daemon`、`mcp/bootstrap.py::restore_active_capabilities` | `test_main*.py` |
-| 部署 | `docker-compose.yml`、`backend/Dockerfile`、`frontend/Dockerfile` | `frontend/nginx.conf`、`scripts/start.sh` | — |
+| 部署 | `docker-compose.yml`、`backend/Dockerfile`、`frontend/Dockerfile` | `frontend/nginx.conf`、`scripts/start.sh`、`scripts/embedding_model.sh` | — |
 
 ---
 
@@ -268,7 +269,7 @@
 | `conflict_adjudication.py` | `SemanticConflictAdjudicator`（LLM 六类结论：compatible/complementary/conditional/temporal_change/contradiction/uncertain）、`adjudication_to_plan`（确定性自动处理 vs 转确认）、`ConflictQuestionGenerator`、`ConflictReplyParser`（9 类决策）；同一次调用附带 `entity_bindings`（reuse/create_new/unresolved），`validate_entity_bindings` 校验 ID 必须来自本次候选集合、名称必须在待绑定集合、证据 ID 必须来自本次证据，`apply_entity_bindings` 只回填已通过的 reuse；绑定目标支持名称级（作用于该名称全部出现）与事实级（`fact_index` + `role` 只作用于某条事实的某个位置），同一目标出现矛盾结论时整条作废（`conflicting_bindings`），与数组顺序无关；提示词内联构造 |
 | `conflict_confirmation.py` | `MemoryConflictService`：`collect_candidates`/`decide`（两阶段，LLM 在事务外）、`park`（建案例+入队问题任务，幂等）、`publish_question`（通知）、`enqueue_reply_jobs`（回合入口入队）、`apply_decision`（版本/过期复核后经 `MemoryWriteService`/`Forget` 落库） |
 | `memory_policy.py` / `memory_access_tracker.py` | 敏感度/读取/authority 策略；访问 touch（recency 去抖） |
-| `projection.py` / `vector_projection.py` / `vector_bootstrap.py` / `embedding_provider.py` | markdown/json 落盘投影（可丢失）；pgvector 投影+fail-closed 校验；provider 工厂与运行时校验 |
+| `projection.py` / `vector_projection.py` / `vector_bootstrap.py` / `embedding_provider.py` | markdown/json 落盘投影（可丢失）；pgvector 投影+fail-closed 校验；provider 工厂与运行时校验；`embed_batch` 批量推理（`aiive_embedding_batch_size` 控制并发/内存，单条 `embed` 载荷保持字符串不变） |
 
 **其他记忆相关包**：`retrieval/`（lexical 检索索引代次：`retrieval_index_generations/_entries/_tokens/_runs` 表）；`forget/`（`fingerprint.py` 内容指纹、`phase_a_shield.py` 防再摄取盾牌、`selector_normalizer.py`、`visibility_service.py`、`reconcile_service.py`）；`retention/`（`engine.py` RetentionEngine、`config.py`、`maintenance_lease.py`、`safety_predicates.py`、`vacuum.py`）。
 
@@ -450,6 +451,7 @@
 | 记忆维护 | `memory_maintenance_runs`、`_batches`、`_inputs`、`_actions` | 维护 run/batch/input/action |
 | 检索索引 | `retrieval_index_generations`、`_entries`、`_tokens`、`_runs` | 索引代次/条目/倒排 token/运行 |
 | 知识库 | `documents`、`chunks`、`retrieval_runs`、`retrieval_candidates` | 文档/分块/检索运行/候选 |
+| 知识分块向量 | `knowledge_chunk_vectors` | pgvector 512 维派生投影（主键 chunk_id，随分块级联删除；HNSW + vector_cosine_ops；可 TRUNCATE 后由维护任务回填） |
 | 遗忘 Saga | `forget_operations`、`forget_selector_manifests`、`forget_shields`、`forget_targets`、`forget_dependencies`、`forget_batches`、`forget_actions`、`forget_tombstones`、`forget_stage_runs`、`content_provenance_refs` | Phase 6A 遗忘全家桶 |
 | 保留治理 | `retention_cleanup_runs`、`retention_cleanup_batches` | Phase 6B |
 | 能力/MCP | `capabilities`、`capability_versions`（含 `source`/`state`/`sandbox_path`/`definition_snapshot` 生命周期列）、`mcp_install_records`、`capability_plans` | |
@@ -642,11 +644,14 @@ scheduler(_improvement_discovery_scanner_job, 6h)
 
 | 文件 | 用途 |
 |---|---|
-| `scripts/start.sh` | 本地一键启动（检测 local-embedding profile） |
+| `scripts/start.sh` | 本地一键启动：按 `.env` 向量开关 + provider 决定是否拉起 local-embedding profile，模型缺失时先自动下载 |
+| `scripts/embedding_model.sh` | 本地 Embedding 模型缓存管理：`status`/`path`/`image-tag`/`ensure`；按 HF 缓存布局检测快照完整性，缺失时用 TEI 容器下载并支持多下载源回退 |
 | `scripts/build-app.sh` | 统一客户端构建入口（`list`/`android debug|release`/`desktop debug|release`），分发到 `scripts/app-builders/` |
 | `scripts/dump_agent_context.py` | 导出 Agent 上下文（调试） |
 | `scripts/prepare_brand_assets.py` | 品牌资源派生 |
 | `scripts/smoke/` | 冒烟脚本 |
+| `scripts/rag_eval/` | 检索效果评测：`corpus.json` + `queries.json`（27 条人工标注）+ `run_eval.py`（纯关键词/纯向量/混合三模式 Recall@5、MRR@5、延迟） |
+| `scripts/memtest/` | 单容器 2 GiB cgroup 实测：`Dockerfile`（postgres+pgvector + TEI + backend 同 cgroup）、`supervisord.conf`、`load_test.py`（真实负载 + cgroup 采样）、`run_memtest.sh` |
 | `scripts/check_single_file_tests.sh` | 单文件隔离运行防线：每个测试文件单独进程跑一遍，捕获跨文件顺序依赖（CI 与本地共用） |
 | `docker-compose.yml` | postgres(pgvector:pg16, 127.0.0.1:5432) + backend(8000, env_file .env) + frontend(127.0.0.1:8080) + 可选 embedding(TEI, profile local-embedding) |
 | `backend/Dockerfile` | python:3.12-slim；apt/pip 源由 build-arg 控制（`APT_MIRROR` 默认阿里云、`PIP_INDEX_URL` 默认腾讯云，CI 传官方源）；uvicorn `aiive.main:app` |
