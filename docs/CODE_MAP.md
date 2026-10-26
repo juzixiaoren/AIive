@@ -144,6 +144,7 @@
 | 任务 API + WS 事件 | `api/routes_agent_tasks.py` | `task_runtime/repository.py`（commit 后广播） | 同上 |
 | 任务能力边界（Broker） | `control/capability_broker.py`、`control/scope.py`、`control/task_policy.py` | `tools/registry.py::execute_brokered`、`task_runtime/resource_locks.py` | `test_capability_broker*.py` |
 | 任务 Watcher / 资源锁 / 证据 | `task_runtime/watchers.py`、`task_runtime/resource_locks.py`、`task_runtime/evidence.py` | `worker/scheduler_daemon.py::_agent_task_scanner_job` | `test_task_watch*.py` |
+| 长期目标（Goal） | `task_runtime/goal_plan.py`、`task_runtime/goal_service.py` | `task_runtime/runtime.py`（执行钩子）、`task_runtime/watchers.py`（`goal_step_id`）、`api/routes_agent_tasks.py`（`/goal/*`）、`worker/scheduler_daemon.py`（`scan_due_reminders`） | `tests/unit/backend/test_long_term_goal.py` |
 | 提醒 / 条件任务 | `runtime/task_manager.py` | `worker/task_worker.py`、`tools/builtin_tools.py`（schedule_reminder 等） | `test_reminder*.py`、`test_task_manager*.py` |
 | 通知 | `api/routes_notifications.py` | `worker/outbox_handlers.py`、`frontend/src/pages/NotificationsPage.tsx` | `test_notification*.py` |
 | 桌面节点服务端 | `desktop/node_service.py`、`desktop/connection_manager.py`、`desktop/protocol.py` | `api/routes_desktop.py`、`desktop/registry_overlay.py` | `test_desktop*.py` |
@@ -346,6 +347,16 @@
 - `task_runtime/repository.py`：`TaskRepository` 唯一写入口：`create_task` L121、`transition_task` L185、`append_event` L217、`checkpoint` L265、`enqueue_run` L310、`start_run` L329、`create_action` L400、`ready_action` L481、`cancel_task` L487、`send_input` L526、`detail` L570；`recover_stale_tasks` L660 / `reconcile_queued_tasks` L704（scheduler 调用）；commit 后 WS 广播 L46（SAVEPOINT 水位防幽灵消息）
 - `task_runtime/tool_injection.py`：`WORKER_RESIDENT_CAPABILITIES`（L0 常驻清单）、`FULL_INJECTION_MAX_TOOLS=12`、`discovery_state/record_search/record_definition/merge_state`（只存 id + 指纹）、`build_tool_view`（执行视图与发现视图分离，`in_scope` 标注；loaded 按当前注册表重建，`definition_changed`/`unavailable` 不返回旧 Schema）
 - `task_runtime/agent_executor.py`（`decide` L31，JSON 修复解析）、`context_assembler.py`（L20，绝不加载会话 raw history；`_bounded_value` 超限降级 sha256+preview；`snapshot` 输出 `tools.*` 而非全量 capabilities）、`tools.py`（`build_main_agent_registry` L190：主 Agent 仅见 delegate/status/cancel/input/list_skills）、`router.py`、`state_machine.py`、`resource_locks.py`（`ResourceLockService` L30，固定顺序获取防死锁）、`evidence.py`（`EvidenceStore` L30 内容寻址）、`watchers.py`（time/file/node 三类，`wake_node_tasks` L95）、`worktree.py`（Git 隔离）、`schemas.py`
+- `task_runtime/goal_plan.py`：`GoalPlan`（status/summary/deadline/timezone/acceptance/steps/current_step_id/revision/reminder/missed_streak）、
+  `GoalStep`（id/kind/status/depends_on/acceptance/schedule/requires_evidence/evidence_refs/attempts/missed_count/next_trigger_at/approved_at）、
+  `GoalStepKind`（autonomous/interactive/approval_required）、`GoalStepStatus`（pending/ready/running/waiting_user/waiting_time/done/failed/skipped/missed）、
+  `next_occurrence`、`dependencies_met`、`next_runnable_step`（READY 优先；无 schedule 的 interactive 不自动起跑）、`upcoming_steps`、`plan_complete`、`summarize`。
+- `task_runtime/goal_service.py`：`GoalService` 唯一目标写入口：`attach_plan`（提案，落 task_state["goal"]+checkpoint）、
+  `confirm/reject/pause/resume/end/modify`、`start_step`（交互步骤用户开始）、`approve_step`（approval_required 审批）、
+  `on_run_started`（无步骤返回 False，运行时不调 LLM）、`on_step_finished`（证据校验/推进/完成）、`on_step_awaiting_user`、
+  `on_watch_due`（到期结算 + 下一场排期）、`schedule_pending_watches`/`cancel_watches`、`scan_due_reminders`（沉默提醒，确定性扫描）。
+  `modify` 区分执行内容（title/kind/acceptance/depends_on/requires_evidence）与调度时间：内容变化清空状态/证据/审批并递归失效下游（`dependency_changed:<dep>`），仅改时间保留已完成步骤；运行中拒绝（`goal_running`）。
+  `approve_step`/`start_step`/`on_run_started` 均校验依赖（`step_dependencies_unmet`），审批不绕过计划顺序；`approve_step` 写 `goal_step_approved` checkpoint。
 - `control/`：`capability_broker.py`（`CapabilityBroker`：TaskScope 校验→TaskPolicyEngine→ResourceLock→`registry.execute_brokered`）；`scope.py`（`TaskScope.from_brief` L47/`validate_arguments` L62/`as_envelope` L97）；`task_policy.py`（allow/approval/block）；`approval_service.py`（审批生命周期）
 
 ### 3.10 `desktop/` — 桌面执行节点通道
@@ -399,7 +410,7 @@
 | 根组件 | `src/App.tsx`（`App` L53） | 9 页 lazy Tab 导航、通知角标、亮/暗主题、`trace_id` 跨页传递、`/aiive/developer` 路径识别 |
 | 样式 | `src/index.css` | Tailwind + 语义色 CSS 变量（`:root`/`[data-theme=dark]`）+ hljs 代码高亮 token |
 | API 客户端 | `src/api/chat.ts` | `getThreadMessages` L64、`sendMessageStream` L124（SSE）、`resetThread` L272、`respondApproval` L303；`ApiError` L89/`StreamIncompleteError` L104 |
-| API 客户端 | `src/api/agentTasks.ts` | `listAgentTasks` L88、`getAgentTask` L94、`createAgentTask` L98、`cancelAgentTask` L113、`sendAgentTaskInput` L117、`decideTaskApproval` L125 |
+| API 客户端 | `src/api/agentTasks.ts` | `listAgentTasks` L88、`getAgentTask` L94、`createAgentTask` L98、`cancelAgentTask` L113、`sendAgentTaskInput` L117、`decideTaskApproval` L125；长期目标：`getAgentTaskGoal`、`controlAgentTaskGoal`（confirm/reject/pause/resume/end/modify）、`approveAgentTaskGoalStep`、`startAgentTaskGoalStep` |
 | Hooks | `src/hooks/useNotificationSocket.ts` | `useNotificationCount` L70 / `useNotificationListener` L77（单例 WS `/ws/__global__`，3s 重连） |
 | Hooks | `src/hooks/useTaskEvents.ts` | `useTaskEvents` L7（每任务 WS，100ms 去抖 refresh） |
 | 组件 | `src/components/Markdown.tsx` | react-markdown + remark-gfm + rehype-highlight（surface/colored 两变体） |
@@ -409,7 +420,7 @@
 | 页面 | Tab | 后端 API |
 |---|---|---|
 | `pages/ChatPage.tsx`（57KB，最复杂） | chat | `POST api/chat/stream`(SSE)、`GET api/threads/{id}/messages`、`POST api/thread/reset`、`POST api/approval/respond`、`POST api/chat/system`；WS `/ws/{threadId}`。含：SSE 打字机、流式纯文本/完成 Markdown 切换、断流恢复、工具状态机 `normalizeToolCallStatus`、`ToolCallCard` L133、reminder/approval/maintenance_report 卡片、`inFlightRef` 防重发、AbortController、离底未读计数、历史分页 |
-| `pages/TaskCenterPage.tsx` | tasks | agent-tasks 全套 + `evidence/{id}`、`artifacts/{id}`；WS `api/agent-tasks/ws/{id}`；4s 轮询兜底 |
+| `pages/TaskCenterPage.tsx` | tasks | agent-tasks 全套 + `evidence/{id}`、`artifacts/{id}`；长期目标面板：`GET {id}/goal` + `POST {id}/goal/{confirm,reject,pause,resume,end}`、`steps/{sid}/{start,approve}`；WS `api/agent-tasks/ws/{id}`；4s 轮询兜底 |
 | `pages/MemoriesPage.tsx` | memories | `api/memories` + `/{id}/{sleep|archive|forget}` |
 | `pages/CapabilitiesPage.tsx` | capabilities | `api/mcp/capabilities`、`api/tools`、`api/skills`、`api/capabilities?state=candidate`、`api/knowledge` |
 | `pages/EventTimeline.tsx` | events | `GET api/inspector/events?trace_id=&limit=50` |
@@ -536,6 +547,21 @@ api/routes_agent_tasks.py 创建任务 → task_runtime/repository.py::create_ta
             → tools/registry.py::execute_brokered (L436)
       → evidence.py 落 Evidence/Artifact → repository.append_event → commit 后 WS 广播 (L46)
       → watchers.py 到期唤醒 / scheduler._agent_task_scanner_job (L216) 恢复 stale run
+```
+
+长期目标（task_type=long_term_goal，无新表）：
+```
+delegate_task(goal_plan) → goal_service.attach_plan → blocked_user(goal_proposed)
+  → POST /api/agent-tasks/{id}/goal/confirm → _advance
+      ├ 可执行步骤 → ready → outbox agent_task_run(trigger=goal_confirmed)
+      └ 仅未来/交互/待审批 → blocked_user + 通知（不调用 LLM）
+AgentTaskWatch(goal_step_id, occurrence) 到期 → WatcherService.poll_due
+  → GoalService.on_watch_due → autonomous=ready / interactive=waiting_user(仅通知)
+  → 下一场 next_occurrence 建新 watch（幂等键含 occurrence）
+POST /goal/modify → 内容变化则清证据+清审批+递归失效下游；仅改时间保留已完成步骤
+PersistentTaskRuntime.run → on_run_started / on_step_finished / on_step_awaiting_user
+  → _advance：下一步 ready 入队；等待写 wake_at；全部完成且证据齐 → completed
+scheduler _agent_task_scanner_job → GoalService.scan_due_reminders（wake_at<=now，确定性）
 ```
 
 ### 7.5 记忆冲突待确认闭环（自动写入 ↔ 用户确认）

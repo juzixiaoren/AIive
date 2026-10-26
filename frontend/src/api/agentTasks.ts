@@ -129,3 +129,74 @@ export async function decideTaskApproval(approvalId: string, action: "approve" |
     body: JSON.stringify({ approval_id: approvalId, action }),
   }));
 }
+
+
+export interface AgentTaskGoalStep {
+  id: string;
+  title: string;
+  kind: string;
+  status: string;
+  depends_on: string[];
+  acceptance: string[];
+  schedule?: Record<string, unknown> | null;
+  requires_evidence: boolean;
+  evidence_refs: string[];
+  attempts: number;
+  missed_count: number;
+  next_trigger_at?: string | null;
+  last_result?: Record<string, unknown> | null;
+  note: string;
+  approved_at?: string | null;
+}
+
+export interface AgentTaskGoal {
+  task_id: string;
+  thread_id: string;
+  task_status: string;
+  plan: {
+    status: string;
+    summary: string;
+    deadline?: string | null;
+    timezone: string;
+    acceptance: string[];
+    steps: AgentTaskGoalStep[];
+    current_step_id?: string | null;
+    revision: number;
+    blocked_reason: string;
+  };
+  summary: {
+    status: string;
+    summary: string;
+    deadline?: string | null;
+    progress: { total: number; done: number; failed: number; pending: number; waiting: number };
+    current_step?: { id: string; title: string; kind: string; status: string } | null;
+    next_trigger_at?: string | null;
+    blocked_reason: string;
+    steps: Array<{ id: string; title: string; kind: string; status: string }>;
+  };
+  next_wake_at?: string | null;
+}
+
+export async function getAgentTaskGoal(taskId: string): Promise<AgentTaskGoal> {
+  return json(fetch(`api/agent-tasks/${encodeURIComponent(taskId)}/goal`));
+}
+
+export async function controlAgentTaskGoal(
+  taskId: string,
+  action: "confirm" | "reject" | "pause" | "resume" | "end" | "modify",
+  body?: Record<string, unknown>,
+): Promise<AgentTaskGoal> {
+  return json(fetch(`api/agent-tasks/${encodeURIComponent(taskId)}/goal/${action}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body ?? {}),
+  }));
+}
+
+export async function approveAgentTaskGoalStep(taskId: string, stepId: string): Promise<AgentTaskGoal> {
+  return json(fetch(`api/agent-tasks/${encodeURIComponent(taskId)}/goal/steps/${encodeURIComponent(stepId)}/approve`, { method: "POST" }));
+}
+
+export async function startAgentTaskGoalStep(taskId: string, stepId: string): Promise<AgentTaskGoal> {
+  return json(fetch(`api/agent-tasks/${encodeURIComponent(taskId)}/goal/steps/${encodeURIComponent(stepId)}/start`, { method: "POST" }));
+}

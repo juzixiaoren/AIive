@@ -14,6 +14,7 @@ from aiive.control.capability_broker import CapabilityBroker
 from aiive.db.models import AgentAction, AgentRun, AgentTask, TaskArtifact, TaskEvidence
 from aiive.task_runtime.agent_executor import TaskAgentExecutor
 from aiive.task_runtime.evidence import EvidenceStore
+from aiive.task_runtime.goal_service import GoalService
 from aiive.task_runtime.repository import TaskRepository, utcnow
 from aiive.task_runtime.schemas import (
     ActionProposal,
@@ -60,11 +61,36 @@ class PersistentTaskRuntime:
                 unresolved=[initial_budget_issue],
             )
 
+        goals = GoalService(self.db) if GoalService.is_goal_task(task) else None
+        if goals is not None and not goals.on_run_started(task, run):
+            # 没有可执行的步骤（全部在等待/已完成）：不消耗 LLM，直接回到等待态。
+            self.repo.finish_run(run, summary={"blocked": "goal_waiting"})
+            self.repo.transition_task(
+                task, TaskStatus.BLOCKED_USER.value,
+                event_type="goal_waiting",
+                event_payload={"reason": "no_runnable_step"},
+                visibility="conversation",
+            )
+            self.repo.checkpoint(task.id, reason="goal_waiting")
+            self.db.commit()
+            return {"status": task.status, "task_id": task.id, "goal": "waiting"}
+        self.db.commit()
+
         completed_this_run = 0
         last_model: str | None = None
         run_tokens: dict[str, int] = {}
         while completed_this_run < budget.max_actions_per_run:
             self.db.refresh(task)
+            if goals is not None and goals.is_paused(task):
+                # 暂停是用户显式意图：停止本轮推理，保留已完成步骤与证据。
+                self.repo.finish_run(run, status=RunStatus.INTERRUPTED.value, error="goal_paused")
+                self.repo.transition_task(
+                    task, TaskStatus.BLOCKED_USER.value,
+                    event_type="goal_paused", event_payload={}, visibility="conversation",
+                )
+                self.repo.checkpoint(task.id, reason="goal_paused")
+                self.db.commit()
+                return {"status": task.status, "task_id": task.id, "goal": "paused"}
             if task.status == TaskStatus.CANCELLED.value:
                 self.repo.finish_run(run, status=RunStatus.INTERRUPTED.value, error="task_cancelled")
                 self.db.commit()
@@ -170,6 +196,25 @@ class PersistentTaskRuntime:
                     model=last_model, token_usage=run_tokens,
                 )
             if proposal.decision == "ask_user":
+                if goals is not None:
+                    # 只阻塞依赖该输入的步骤：还有独立步骤时继续推进，不冻结目标。
+                    outcome = goals.on_step_awaiting_user(task, run, proposal.question)
+                    if outcome == "advance":
+                        self.repo.finish_run(
+                            run,
+                            summary={"blocked": "user", "question": proposal.question, "continued": True},
+                            token_usage=run_tokens, model=last_model,
+                        )
+                        self.repo.transition_task(
+                            task, TaskStatus.QUEUED.value,
+                            event_type="goal_step_continued",
+                            event_payload={"question": proposal.question},
+                            visibility="conversation",
+                        )
+                        self.repo.enqueue_run(task, trigger="goal_step")
+                        self.repo.checkpoint(task.id, reason="goal_step_continued")
+                        self.db.commit()
+                        return {"status": task.status, "task_id": task.id, "continued": True}
                 self.repo.transition_task(
                     task, TaskStatus.BLOCKED_USER.value,
                     event_type="task_blocked_user",
@@ -420,7 +465,6 @@ class PersistentTaskRuntime:
         if task.status == TaskStatus.QUEUED.value:
             self.repo.transition_task(task, TaskStatus.DISPATCHING.value)
             self.repo.transition_task(task, TaskStatus.RUNNING.value)
-        self.repo.transition_task(task, TaskStatus.VERIFYING.value)
         evidence_ids = [row[0] for row in self.db.query(TaskEvidence.id).filter(TaskEvidence.task_id == task.id).all()]
         artifact_ids = [row[0] for row in self.db.query(TaskArtifact.id).filter(TaskArtifact.task_id == task.id).all()]
         succeeded = self.db.query(AgentAction).filter(
@@ -434,6 +478,41 @@ class PersistentTaskRuntime:
             artifact_refs=artifact_ids,
             unresolved=unresolved or [],
         ).model_dump(mode="json")
+        goals = GoalService(self.db) if GoalService.is_goal_task(task) else None
+        if goals is not None:
+            if status == "succeeded":
+                decision = goals.on_step_finished(task, run, report)
+                if decision in {"advance", "wait"}:
+                    # 单步完成不等于目标完成：结算步骤后继续推进或进入等待。
+                    self.repo.finish_run(
+                        run, status=RunStatus.COMPLETED.value, summary=report,
+                        token_usage=token_usage, model=model,
+                    )
+                    if decision == "advance":
+                        self.repo.transition_task(
+                            task, TaskStatus.QUEUED.value,
+                            event_type="goal_step_completed",
+                            event_payload={"progress": goals.detail(task)["summary"]["progress"]},
+                            visibility="conversation",
+                        )
+                        self.repo.enqueue_run(task, trigger="goal_step")
+                    else:
+                        self.repo.transition_task(
+                            task, TaskStatus.BLOCKED_USER.value,
+                            event_type="goal_waiting",
+                            event_payload={"reason": "waiting_next_step"},
+                            visibility="conversation",
+                        )
+                    self.repo.checkpoint(task.id, reason=f"goal_{decision}")
+                    self.db.commit()
+                    return {"status": task.status, "task_id": task.id, "goal": decision}
+            else:
+                goals.on_goal_blocked(task, summary)
+        # 目标钩子可能把任务重新排队/转入等待，因此 VERIFYING 只在真正收敛时进入。
+        if task.status == TaskStatus.QUEUED.value:
+            self.repo.transition_task(task, TaskStatus.DISPATCHING.value)
+            self.repo.transition_task(task, TaskStatus.RUNNING.value)
+        self.repo.transition_task(task, TaskStatus.VERIFYING.value)
         final_status = {
             "succeeded": TaskStatus.SUCCEEDED.value,
             "partial": TaskStatus.PARTIAL.value,

@@ -252,11 +252,16 @@ def _agent_task_scanner_job() -> None:
         from aiive.task_runtime.watchers import WatcherService
         from aiive.control.approval_service import TaskApprovalService
 
+        from aiive.task_runtime.goal_service import GoalService
+
         recover_stale_tasks(db)
         reconcile_queued_tasks(db)
         TaskApprovalService(db).expire_due()
         ResourceLockService().expire(db)
         WatcherService(db).poll_due()
+        # 长期目标的沉默策略：只处理已到期（wake_at <= now）的阻塞任务，
+        # 确定性执行、不调用 LLM；没有到期事项时这里是空扫描。
+        GoalService(db).scan_due_reminders()
         db.commit()
     except Exception:
         db.rollback()

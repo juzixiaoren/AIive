@@ -62,6 +62,15 @@ class Settings(BaseSettings):
     # 单次回填/修复最多处理的分块数（有界批次，避免长事务与内存尖峰）。
     aiive_knowledge_vector_backfill_batch: int = 200
 
+    # 长期目标（Goal）：提案确认与步骤推进的时间阈值。
+    # 计划未确认：24 小时后提醒一次，7 天无回复则保留草稿并停止催促。
+    aiive_goal_proposal_reminder_hours: int = 24
+    aiive_goal_proposal_expire_days: int = 7
+    # 步骤等待用户输入：24 小时后最多提醒一次。
+    aiive_goal_wait_reminder_hours: int = 24
+    # 连续错过同一周期任务达到该次数时，询问是否调整计划。
+    aiive_goal_missed_streak_threshold: int = 3
+
     # 记忆文件投影：输出目录只能来自服务端配置，Outbox payload 不接受路径。
     aiive_memory_file_projection_enabled: bool = True
     aiive_memory_file_projection_dir: str = ".data/memory_projection"
@@ -240,6 +249,14 @@ class Settings(BaseSettings):
             raise ValueError("非 loopback 部署必须更换 Trusted Core 默认管理令牌")
         if self.aiive_embedding_batch_size <= 0:
             raise ValueError("AIIVE_EMBEDDING_BATCH_SIZE 必须大于 0")
+        if self.aiive_goal_proposal_reminder_hours <= 0:
+            raise ValueError("AIIVE_GOAL_PROPOSAL_REMINDER_HOURS 必须大于 0")
+        if self.aiive_goal_proposal_expire_days <= 0:
+            raise ValueError("AIIVE_GOAL_PROPOSAL_EXPIRE_DAYS 必须大于 0")
+        if self.aiive_goal_wait_reminder_hours <= 0:
+            raise ValueError("AIIVE_GOAL_WAIT_REMINDER_HOURS 必须大于 0")
+        if self.aiive_goal_missed_streak_threshold <= 0:
+            raise ValueError("AIIVE_GOAL_MISSED_STREAK_THRESHOLD 必须大于 0")
         if not (self.aiive_memory_vector_enabled or self.aiive_knowledge_vector_enabled):
             return self
         # 记忆向量是强依赖：开启即要求 PostgreSQL。知识分块向量属于可降级的

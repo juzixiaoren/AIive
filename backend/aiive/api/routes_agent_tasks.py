@@ -139,6 +139,122 @@ def send_agent_task_input(
         raise HTTPException(status_code=status, detail=str(error)) from error
 
 
+class GoalRejectRequest(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+    reason: str = Field(default="", max_length=500)
+
+
+class GoalModifyRequest(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+    summary: str | None = Field(default=None, max_length=2000)
+    deadline: str | None = None
+    timezone: str | None = None
+    acceptance: list[str] | None = None
+    steps: list[dict[str, Any]] | None = None
+
+
+def _goal_http_error(error: Exception) -> HTTPException:
+    message = str(error)
+    if message in {"task_not_found", "goal_not_found", "step_not_found"}:
+        return HTTPException(status_code=404, detail=message)
+    return HTTPException(status_code=409, detail=message)
+
+
+def _goal_call(db: Session, task_id: str, action: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """统一的 Goal 写入口：成功提交、可预期拒绝回滚并转 4xx。"""
+    from aiive.task_runtime.goal_service import GoalService
+
+    service = GoalService(db)
+    try:
+        if action == "confirm":
+            result = service.confirm(task_id)
+        elif action == "reject":
+            result = service.reject(task_id, (payload or {}).get("reason", ""))
+        elif action == "pause":
+            result = service.pause(task_id)
+        elif action == "resume":
+            result = service.resume(task_id)
+        elif action == "end":
+            result = service.end(task_id, (payload or {}).get("reason", ""))
+        elif action == "modify":
+            result = service.modify(task_id, payload or {})
+        elif action == "start_step":
+            result = service.start_step(task_id, str((payload or {}).get("step_id") or ""))
+        elif action == "approve_step":
+            result = service.approve_step(task_id, str((payload or {}).get("step_id") or ""))
+        else:  # pragma: no cover - 路由层不会传入未知 action
+            raise ValueError("unknown_goal_action")
+        db.commit()
+        return result
+    except ValueError as error:
+        # 目标服务的拒绝都发生在写入之前；回滚由 get_db 依赖统一负责，
+        # 这里不再 rollback，避免把调用方（如任务中心长轮询）的事务一并撤销。
+        raise _goal_http_error(error) from error
+
+
+@router.get("/{task_id}/goal")
+def get_agent_task_goal(task_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    from aiive.task_runtime.goal_service import GoalService
+
+    task = TaskRepository(db).get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    try:
+        return GoalService(db).detail(task)
+    except ValueError as error:
+        raise _goal_http_error(error) from error
+
+
+@router.post("/{task_id}/goal/confirm")
+def confirm_agent_task_goal(task_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    return _goal_call(db, task_id, "confirm")
+
+
+@router.post("/{task_id}/goal/reject")
+def reject_agent_task_goal(
+    task_id: str, request: GoalRejectRequest | None = None, db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return _goal_call(db, task_id, "reject", {"reason": (request.reason if request else "")})
+
+
+@router.post("/{task_id}/goal/pause")
+def pause_agent_task_goal(task_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    return _goal_call(db, task_id, "pause")
+
+
+@router.post("/{task_id}/goal/resume")
+def resume_agent_task_goal(task_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    return _goal_call(db, task_id, "resume")
+
+
+@router.post("/{task_id}/goal/end")
+def end_agent_task_goal(
+    task_id: str, request: GoalRejectRequest | None = None, db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return _goal_call(db, task_id, "end", {"reason": (request.reason if request else "")})
+
+
+@router.post("/{task_id}/goal/modify")
+def modify_agent_task_goal(
+    task_id: str, request: GoalModifyRequest, db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return _goal_call(db, task_id, "modify", request.model_dump(exclude_none=True))
+
+
+@router.post("/{task_id}/goal/steps/{step_id}/start")
+def start_agent_task_goal_step(
+    task_id: str, step_id: str, db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return _goal_call(db, task_id, "start_step", {"step_id": step_id})
+
+
+@router.post("/{task_id}/goal/steps/{step_id}/approve")
+def approve_agent_task_goal_step(
+    task_id: str, step_id: str, db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """审批 approval_required 步骤；通过后运行时才会执行该步骤。"""
+    return _goal_call(db, task_id, "approve_step", {"step_id": step_id})
+
 @router.get("/{task_id}/evidence/{evidence_id}")
 def read_task_evidence(
     task_id: str,

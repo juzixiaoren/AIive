@@ -11,7 +11,11 @@ class InvalidStateTransition(ValueError):
 
 
 TASK_TRANSITIONS: Mapping[str, frozenset[str]] = {
-    TaskStatus.QUEUED: frozenset({TaskStatus.DISPATCHING, TaskStatus.CANCELLED}),
+    # QUEUED -> BLOCKED_USER：长期目标在提案阶段就入队但必须等用户确认，
+    # 由目标服务把任务停在"等待用户"，确认后才允许 DISPATCHING。
+    TaskStatus.QUEUED: frozenset({
+        TaskStatus.DISPATCHING, TaskStatus.BLOCKED_USER, TaskStatus.CANCELLED,
+    }),
     TaskStatus.DISPATCHING: frozenset({TaskStatus.RUNNING, TaskStatus.QUEUED, TaskStatus.FAILED, TaskStatus.CANCELLED}),
     TaskStatus.RUNNING: frozenset({
         TaskStatus.QUEUED, TaskStatus.BLOCKED_APPROVAL, TaskStatus.BLOCKED_USER,

@@ -33,9 +33,20 @@ def _delegate_task(
     deterministic_action: dict[str, Any] | None = None,
     target_node_id: str = "",
     budgets: dict[str, Any] | None = None,
+    goal_plan: dict[str, Any] | None = None,
     ctx: RunContext | None = None,
 ) -> dict[str, Any]:
     run_ctx = _require_context(ctx)
+    if goal_plan is not None:
+        return _delegate_goal(
+            run_ctx,
+            goal=goal,
+            title=title,
+            raw_plan=goal_plan,
+            acceptance_criteria=acceptance_criteria or [],
+            constraints=constraints or [],
+            budgets=budgets,
+        )
     selected_skill = None
     if skill_id:
         from aiive.skills import get_skill
@@ -102,6 +113,57 @@ def _delegate_task(
     finally:
         db.close()
 
+
+def _delegate_goal(
+    run_ctx: RunContext,
+    *,
+    goal: str,
+    title: str,
+    raw_plan: dict[str, Any],
+    acceptance_criteria: list[str],
+    constraints: list[str],
+    budgets: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """把结构化计划落成"待确认"的长期目标任务（不入执行队列）。"""
+    from aiive.task_runtime.goal_plan import GOAL_TASK_TYPE, GoalPlan, summarize
+    from aiive.task_runtime.goal_service import GoalService
+
+    payload = dict(raw_plan)
+    if acceptance_criteria and not payload.get("acceptance"):
+        payload["acceptance"] = acceptance_criteria
+    # 先做纯模型校验：计划非法时不落库，直接把可读错误返回给主 Agent。
+    GoalPlan.model_validate({**payload, "status": "proposed", "created_at": "1970-01-01T00:00:00+00:00"})
+    db = SessionLocal()
+    try:
+        brief = normalize_task_brief(GOAL_TASK_TYPE, {
+            "acceptance_criteria": list(payload.get("acceptance") or []),
+            "constraints": constraints,
+            "scope": {"allowed_roots": [], "allowed_capabilities": [], "capability_policy": "unified"},
+            "initial_input": {"goal": True},
+        })
+        task = TaskRepository(db).create_task(
+            thread_id=run_ctx.thread_id,
+            source_turn_record_id=run_ctx.turn_record_id or None,
+            goal=goal,
+            title=title or None,
+            task_type=GOAL_TASK_TYPE,
+            task_brief=brief,
+            budgets=budgets,
+            enqueue=False,
+        )
+        plan = GoalService(db).attach_plan(task, payload)
+        db.commit()
+        return {
+            "task_id": task.id,
+            "status": "proposed",
+            "summary": "长期目标计划已生成，等待用户确认后开始执行；确认前不会启动任何执行。",
+            "plan": summarize(plan),
+        }
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 def _get_task_status(task_id: str, ctx: RunContext | None = None) -> dict[str, Any]:
     run_ctx = _require_context(ctx)
@@ -229,6 +291,16 @@ def build_main_agent_registry() -> ToolRegistry:
             },
             "target_node_id": {"type": "str"},
             "budgets": {"type": "dict"},
+            "goal_plan": {
+                "type": "dict",
+                "description": (
+                    "长期目标计划（自然语言里的跨周/跨月目标用这个）："
+                    "{summary, deadline, acceptance, timezone, steps:[{id, title, "
+                    "kind(autonomous|interactive|approval_required), depends_on, acceptance, "
+                    "schedule{kind:once|weekly, at|weekday+time, until}}]}。"
+                    "提供后按提案处理，必须先经用户确认才会执行。"
+                ),
+            },
         },
         _delegate_task,
     ))

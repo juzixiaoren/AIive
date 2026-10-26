@@ -101,6 +101,8 @@ class TaskContextAssembler:
             ],
             "tools": _bounded_value(tool_view, 24_000),
             "skill": skill.as_dict() if skill else None,
+            # 长期目标：只注入当前步骤与进度，避免整份计划挤占工具定义预算。
+            "goal": self._goal_context(task),
         }
 
     def messages(
@@ -120,6 +122,16 @@ class TaskContextAssembler:
         system_content = system.content
         if skill is not None:
             system_content += f"\n\n# Active Skill: {skill.name}\n\n{skill.instructions}"
+        goal = snapshot.get("goal")
+        if isinstance(goal, dict) and goal.get("current_step"):
+            step = goal["current_step"]
+            system_content += (
+                "\n\n# 长期目标模式\n"
+                f"当前执行步骤：{step.get('title')}（{step.get('kind')}，id={step.get('id')}）。\n"
+                "- 这里的 finish 只表示当前步骤完成，由系统结算并推进下一步；目标整体完成由系统校验。\n"
+                "- 自主步骤完成前必须留下可验证 Evidence，不能只凭口头结论宣布完成。\n"
+                "- 不要替其他步骤执行 Action，也不要修改目标计划。\n"
+            )
         user = prompts.render(
             "task_runtime.task_context",
             task_context=json.dumps(snapshot, ensure_ascii=False, default=str),
@@ -146,6 +158,40 @@ class TaskContextAssembler:
             registry if registry is not None else broker.registry_for(task),
             discovery_registry if discovery_registry is not None else broker.available_registry(task),
         )
+
+    @staticmethod
+    def _goal_context(task: AgentTask) -> dict[str, Any] | None:
+        """长期目标的聚焦视图：当前步骤 + 步骤状态清单（不含完整计划正文）。"""
+        raw = (task.task_state or {}).get("goal")
+        if not isinstance(raw, dict):
+            return None
+        steps = [item for item in (raw.get("steps") or []) if isinstance(item, dict)]
+        current_id = raw.get("current_step_id")
+        current = next((item for item in steps if item.get("id") == current_id), None)
+        return {
+            "status": raw.get("status"),
+            "deadline": raw.get("deadline"),
+            "acceptance": list(raw.get("acceptance") or []),
+            "current_step": (
+                {
+                    "id": current.get("id"),
+                    "title": current.get("title"),
+                    "kind": current.get("kind"),
+                    "acceptance": list(current.get("acceptance") or []),
+                }
+                if current
+                else None
+            ),
+            "steps": [
+                {
+                    "id": item.get("id"),
+                    "title": item.get("title"),
+                    "kind": item.get("kind"),
+                    "status": item.get("status"),
+                }
+                for item in steps
+            ],
+        }
 
     @staticmethod
     def _active_skill(task: AgentTask) -> SkillDefinition | None:

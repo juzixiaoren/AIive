@@ -1,13 +1,18 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AgentTaskDetail,
+  AgentTaskGoal,
   AgentTaskSummary,
+  approveAgentTaskGoalStep,
   cancelAgentTask,
+  controlAgentTaskGoal,
   createAgentTask,
   decideTaskApproval,
   getAgentTask,
+  getAgentTaskGoal,
   listAgentTasks,
   sendAgentTaskInput,
+  startAgentTaskGoalStep,
 } from "../api/agentTasks";
 import { useTaskEvents } from "../hooks/useTaskEvents";
 import { BASE_PATH } from "../lib/base";
@@ -18,6 +23,21 @@ const STATUS_LABELS: Record<string, string> = {
   blocked_approval: "等待审批", blocked_user: "等待输入", blocked_node: "节点离线",
   reconciling: "对账中", verifying: "验证中", succeeded: "已完成",
   partial: "部分完成", failed: "失败", cancelled: "已取消",
+};
+
+
+const GOAL_STATUS_LABELS: Record<string, string> = {
+  proposed: "待确认", active: "进行中", paused: "已暂停", blocked: "受阻",
+  completed: "已完成", rejected: "已拒绝", abandoned: "已结束",
+};
+
+const GOAL_STEP_STATUS_LABELS: Record<string, string> = {
+  pending: "待开始", ready: "待执行", running: "执行中", waiting_user: "等待你",
+  waiting_time: "等待触发", done: "已完成", failed: "失败", skipped: "已跳过", missed: "已错过",
+};
+
+const STEP_KIND_LABELS: Record<string, string> = {
+  autonomous: "自动执行", interactive: "需要你参与", approval_required: "需要审批",
 };
 
 function activeThreadId(): string {
@@ -40,6 +60,7 @@ export default function TaskCenterPage() {
   const [busy, setBusy] = useState(false);
   const [goal, setGoal] = useState("");
   const [taskInput, setTaskInput] = useState("");
+  const [goalPlan, setGoalPlan] = useState<AgentTaskGoal | null>(null);
   const eventRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const threadId = useMemo(activeThreadId, []);
 
@@ -71,6 +92,18 @@ export default function TaskCenterPage() {
     if (eventRefreshTimer.current) clearTimeout(eventRefreshTimer.current);
     eventRefreshTimer.current = setTimeout(() => void refresh(), 100);
   });
+
+  const loadGoal = useCallback(async (taskId: string) => {
+    try { setGoalPlan(await getAgentTaskGoal(taskId)); }
+    catch { setGoalPlan(null); }
+  }, []);
+
+  const goalTaskId = detail?.task_type === "long_term_goal" ? detail.id : "";
+
+  useEffect(() => {
+    if (!goalTaskId) { setGoalPlan(null); return; }
+    void loadGoal(goalTaskId);
+  }, [goalTaskId, detail?.updated_at, loadGoal]);
 
   const selectTask = async (taskId: string) => {
     setSelectedId(taskId);
@@ -166,6 +199,68 @@ export default function TaskCenterPage() {
                 <input value={taskInput} onChange={(event) => setTaskInput(event.target.value)} className="flex-1 rounded border border-divider bg-surface-muted px-3 py-2 text-sm text-content" placeholder="补充任务所需信息" />
                 <button className="rounded bg-primary px-3 py-2 text-xs text-on-primary">发送</button>
               </form>}
+
+
+              {goalPlan && (
+                <section className="rounded-lg border border-divider bg-surface-muted p-3 space-y-3">
+                  <div className="flex items-start justify-between gap-2">
+                    <div>
+                      <h4 className="text-sm font-semibold text-content">长期目标</h4>
+                      <p className="mt-1 text-xs text-muted">{goalPlan.plan.summary || "（无摘要）"}</p>
+                    </div>
+                    <span className="shrink-0 rounded-full border border-divider px-2 py-0.5 text-[10px] text-muted">
+                      {GOAL_STATUS_LABELS[goalPlan.plan.status] || goalPlan.plan.status}
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-muted">
+                    进度 {goalPlan.summary.progress.done}/{goalPlan.summary.progress.total}
+                    {goalPlan.plan.deadline ? ` · 截止 ${goalPlan.plan.deadline}` : ""}
+                    {goalPlan.summary.next_trigger_at ? ` · 下次 ${new Date(goalPlan.summary.next_trigger_at).toLocaleString()}` : ""}
+                  </div>
+                  {goalPlan.plan.blocked_reason && (
+                    <div className="text-[11px] text-warning-text">受阻：{goalPlan.plan.blocked_reason}</div>
+                  )}
+                  <div className="space-y-1">
+                    {goalPlan.plan.steps.map((step) => (
+                      <div key={step.id} className="rounded border border-divider bg-surface px-2 py-1.5">
+                        <div className="flex items-center justify-between gap-2 text-xs">
+                          <span className={step.id === goalPlan.plan.current_step_id ? "font-semibold text-content" : "text-content"}>{step.title}</span>
+                          <span className="text-[10px] text-muted">{GOAL_STEP_STATUS_LABELS[step.status] || step.status}</span>
+                        </div>
+                        <div className="mt-1 flex flex-wrap items-center gap-2 text-[10px] text-faint">
+                          <span>{STEP_KIND_LABELS[step.kind] || step.kind}</span>
+                          {step.next_trigger_at && <span>下次 {new Date(step.next_trigger_at).toLocaleString()}</span>}
+                          {step.missed_count > 0 && <span className="text-warning-text">错过 {step.missed_count} 次</span>}
+                          {step.evidence_refs.length > 0 && <span>证据 {step.evidence_refs.length}</span>}
+                          {step.kind === "approval_required" && step.status === "waiting_user" && !step.approved_at && (
+                            <button disabled={busy} onClick={() => void mutate(async () => { await approveAgentTaskGoalStep(goalTaskId, step.id); await loadGoal(goalTaskId); })} className="rounded bg-primary px-2 py-0.5 text-[10px] text-on-primary">审批通过</button>
+                          )}
+                          {step.kind === "interactive" && step.status === "waiting_user" && (
+                            <button disabled={busy} onClick={() => void mutate(async () => { await startAgentTaskGoalStep(goalTaskId, step.id); await loadGoal(goalTaskId); })} className="rounded border border-primary-border px-2 py-0.5 text-[10px] text-primary">开始</button>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    {goalPlan.plan.status === "proposed" && (
+                      <>
+                        <button disabled={busy} onClick={() => void mutate(async () => { await controlAgentTaskGoal(goalTaskId, "confirm"); await loadGoal(goalTaskId); })} className="rounded bg-primary px-3 py-1.5 text-xs text-on-primary">确认计划</button>
+                        <button disabled={busy} onClick={() => void mutate(async () => { await controlAgentTaskGoal(goalTaskId, "reject", { reason: "用户拒绝" }); await loadGoal(goalTaskId); })} className="rounded border border-danger-border px-3 py-1.5 text-xs text-danger-text">拒绝</button>
+                      </>
+                    )}
+                    {["active", "blocked"].includes(goalPlan.plan.status) && (
+                      <button disabled={busy} onClick={() => void mutate(async () => { await controlAgentTaskGoal(goalTaskId, "pause"); await loadGoal(goalTaskId); })} className="rounded border border-divider px-3 py-1.5 text-xs text-content">暂停</button>
+                    )}
+                    {["paused", "blocked"].includes(goalPlan.plan.status) && (
+                      <button disabled={busy} onClick={() => void mutate(async () => { await controlAgentTaskGoal(goalTaskId, "resume"); await loadGoal(goalTaskId); })} className="rounded border border-divider px-3 py-1.5 text-xs text-content">恢复</button>
+                    )}
+                    {!["completed", "rejected", "abandoned"].includes(goalPlan.plan.status) && (
+                      <button disabled={busy} onClick={() => void mutate(async () => { await controlAgentTaskGoal(goalTaskId, "end", { reason: "用户结束目标" }); await loadGoal(goalTaskId); })} className="rounded border border-danger-border px-3 py-1.5 text-xs text-danger-text">结束目标</button>
+                    )}
+                  </div>
+                </section>
+              )}
 
               <section>
                 <h4 className="text-sm font-semibold text-content mb-2">Action 时间线</h4>

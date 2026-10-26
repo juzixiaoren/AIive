@@ -574,3 +574,49 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
   固定 `promote=False` 调用既有 `SelfDevRepairLoop`，安全门、候选槽位与回滚全部沿用；
   `reject` 只改候选状态。默认不晋升、不修改活跃槽位、不新增任务引擎。
 - 测试：unit 33 例（证据 12 + 发现 21）、integration 8 例，全部离线。
+
+### V47 长期目标规划与事件驱动的持续执行
+
+- 目标：让系统能从自然语言识别长期目标，产出可确认的结构化计划，并借助既有任务运行时持续推进，
+  在用户沉默、错过、受阻时给出确定性处理。
+- 复用优先（无新表 / 无新引擎）：目标就是一条 `AgentTask(task_type="long_term_goal")`，
+  `task_state["goal"]` 存 `GoalPlan`（步骤 id/kind/status/depends_on/acceptance/schedule/evidence_refs/
+  attempts/missed_count/next_trigger_at/approved_at），`task_state["plan"]` 存投影，
+  Checkpoint 保存 plan 快照；触发复用 `AgentTaskWatch`（time，config 带 goal_step_id/occurrence/notify_only），
+  执行复用 `PersistentTaskRuntime` + Outbox `agent_task_run`，通知复用 `Event(notification_created)`。
+- 生命周期：`delegate_task(goal_plan)` 只提案（`blocked_user` + `goal_proposed`，确认前不产生 run）；
+  `confirm` 后由 `_advance` 决定入队或停在等待态；步骤完成必须带 Evidence，
+  缺证据即 `failed` + 目标 `blocked` + 通知；全部完成且证据齐才 `completed`。
+- 步骤类型：`autonomous` 到期自动执行；`interactive` 到期只写通知，用户点击开始后在独立任务上下文执行；
+  `approval_required` 需 `approve_step` 审批（`approved_at`）后才允许起跑，工具级审批仍走既有 `TaskApprovalService`。
+- 沉默策略：未确认计划 24h 提醒一次、7 天后休眠；等待用户步骤 24h 提醒一次；周期交互场次未开始记
+  `missed` 且不重启同一 occurrence；连续 3 次发“是否调整”通知，绝不自动改计划；暂停/结束取消全部 watch。
+- 调度：`scheduler_daemon._agent_task_scanner_job` 追加 `scan_due_reminders()`，只处理 `wake_at <= now`，
+  不扫描全部目标、不调用 LLM。
+- 控制面：`GET /api/agent-tasks/{id}/goal`；`POST .../goal/{confirm,reject,pause,resume,end,modify}`；
+  `POST .../goal/steps/{sid}/{start,approve}`。任务中心新增“长期目标”面板（进度、步骤状态、审批/开始、生命周期按钮）。
+- 配置：`aiive_goal_proposal_reminder_hours`、`aiive_goal_proposal_expire_days`、
+  `aiive_goal_wait_reminder_hours`、`aiive_goal_missed_streak_threshold`。
+- 测试：`tests/unit/backend/test_long_term_goal.py` 20 例（Fake LLM，全离线），覆盖确认前不执行/只启动一次、
+  步骤推进与证据校验、等待只阻塞依赖、定时触发幂等、交互只通知、独立上下文、重启恢复、
+  暂停/修改/结束失效、预算耗尽、连续错过、未确认提醒、REST 控制面、Outbox 真实调用链、审批与交互语义。
+- 遗留：步骤级审批未复用 `ApprovalRequest`（该表要求 action_id），审批列表页看不到目标步骤审批；
+  计划修改以 schedule 是否变化判定“步骤未变”。
+
+### V48 长期目标修改一致性与审批有效性
+
+- 目标：修掉“修改计划后旧状态/旧证据/旧审批被错误保留”的漏洞，并核实审批的权限、持久化、审计与幂等。
+- 修改语义（`GoalService.modify`）：把**执行内容**（title/kind/acceptance/depends_on/requires_evidence）
+  与**调度时间**（schedule）分开判定。内容变化 → 步骤回 pending、清空 `evidence_refs` 与 `approved_at`、
+  清触发与 `last_result`，note 记 `content_changed`；依赖图递归到不动点，下游记 `dependency_changed:<dep>`。
+  仅改时间 → 已完成步骤保留 done 与证据，未完成步骤重新排期。
+- 审批有效性：内容变化即作废旧审批，步骤回到 `waiting_user` 并重发 `goal_step_approval`；
+  未重新审批不建 run，排队中的 run 也会因无可用步骤停在 `blocked_user`。重复审批抛 `step_already_approved`
+  且不重复入队。`approve_step` 补写 `goal_step_approved` checkpoint（审计/回放）。
+- 顺序约束：`approve_step`/`start_step`/`on_run_started` 都校验 `dependencies_met`，审批不能绕过依赖；
+  运行中（dispatching/running/verifying/reconciling）拒绝修改（`goal_running`），避免结算与计划错位。
+- 审计：`goal_modified` 事件带 `added / rescheduled / invalidated[{step_id,reason}] / approval_invalidated`。
+- 测试：`test_long_term_goal.py` 增至 27 例，新增内容修改但时间不变、仅改时间、依赖变化、旧证据失效、
+  旧审批失效、重复审批、审批依赖校验、运行中拒绝修改共 7 例。
+- 数据库：无表结构变更、无迁移；`alembic check` 在本机 pgvector/pg16 容器上无 drift，
+  另用事务内真实 PG 校验确认 JSON 计划与审批状态读写正确（回滚，不留数据）。

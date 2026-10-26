@@ -81,7 +81,15 @@ class WatcherService:
                         task.id, "watch_triggered",
                         {"watch_id": watch.id, "watch_type": watch.watch_type, "snapshot": current},
                     )
-                    if task.status in {TaskStatus.BLOCKED_USER.value, TaskStatus.BLOCKED_NODE.value}:
+                    config = watch.config or {}
+                    if config.get("goal_step_id"):
+                        # 长期目标：到期事件交给目标服务结算（错过判定 / 下一次触发）。
+                        from aiive.task_runtime.goal_service import GoalService
+
+                        GoalService(self.db).on_watch_due(task, watch)
+                    if not config.get("notify_only") and task.status in {
+                        TaskStatus.BLOCKED_USER.value, TaskStatus.BLOCKED_NODE.value,
+                    }:
                         self.repo.transition_task(task, TaskStatus.QUEUED.value)
                         self.repo.enqueue_run(task, trigger="watch_triggered")
                     self.repo.checkpoint(task.id, reason="watch_triggered")
