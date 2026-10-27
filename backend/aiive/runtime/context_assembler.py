@@ -27,6 +27,7 @@ from aiive.db.models import (
     MemoryRecallCandidate,
 )
 from aiive.memory.recall_config import RecallConfig
+from aiive.runtime.tool_output_guard import guard_tool_output
 from aiive.memory.memory_read_model import MemoryReadModel
 from aiive.memory.memory_store import MemoryStore
 from aiive.memory.core_memory_projection import load_core_memory
@@ -1183,6 +1184,10 @@ class ContextAssembler:
                 normalized = normalize_tool_result(item)
                 tool_result = normalized["result"]
                 content = tool_result if isinstance(tool_result, str) else _json.dumps(tool_result, ensure_ascii=False, default=str)
+                # 历史回放是工具结果再次进入 LLM 上下文的入口：同样走统一预算。
+                # 守卫对自身产物幂等（already_guarded 直接原样返回），因此新数据不会二次落盘；
+                # 只有 V51 之前写入的超大历史结果会在这里被收口一次。
+                content = guard_tool_output(str(normalized.get("name") or ""), content).content
                 result.append({
                     "role": "tool",
                     "tool_call_id": normalized["id"],

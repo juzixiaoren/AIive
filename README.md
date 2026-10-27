@@ -189,7 +189,11 @@ Web、Android 或 Electron 界面发出的自然语言指令都由后端 Agent �
 
 工具结果在进入模型上下文之前统一过预算：文件读取超过 1000 字符只回填路径、总字符数、
 总行数与分页提示；Shell 输出超过 1000 行只回填首尾各 50 行；其他工具（含 MCP）超过
-1000 字符只回填结构化摘要。完整原始结果落盘到 `TOOL_OUTPUT_DIR`（默认
+1000 字符只回填结构化摘要。聊天、后台任务的 Evidence 摘要、聊天历史回放共用同一个
+`tool_output_guard` 入口，重复处理（回放/重试）不会二次截断或二次落盘。`run_shell` 的
+stdout/stderr 由后台线程边读边写日志（`SHELL_MAX_LOG_BYTES`，默认 8 MiB），内存只留
+`SHELL_OUTPUT_PREVIEW_CHARS`（默认 2000）字符预览、总字节数与续读位置；日志达到容量上限时
+`capture_truncated=true`，不会声称已保存全部内容。完整原始结果落盘到 `TOOL_OUTPUT_DIR`（默认
 `.data/tool_outputs`），模型可用 `read_text_file` 按 `offset`/`limit` 分页读取（流式逐行扫描，
 不受文件总大小限制；单行超长时用 `char_offset` 行内续读）；
 日志保留 `TOOL_OUTPUT_RETENTION_HOURS`（默认 10 小时），由后台调度器每

@@ -191,7 +191,9 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         ("run_shell", _handle_run_shell,
          "在 AIive 所在主机上用真实 bash 执行一条命令，返回退出码、stdout、stderr 与超时状态。"
          + "cwd 必须位于任务允许的根目录内；只读命令可直接执行，其余命令需要审批。"
-         + "输出超过上限会被截断（truncated 标记）；超时会终止整个进程树。",
+         + "stdout/stderr 会流式写入日志，结果里只回填有限预览与总字节数（truncated 标记预览被截）；"
+         + "完整内容用 read_text_file 按 stdout_log/stderr_log + next_offset/next_char_offset 续读，"
+         + "capture_truncated 为 true 表示日志达到容量上限、剩余内容未保存；超时会终止整个进程树。",
          {
              "command": {
                  "type": "str",

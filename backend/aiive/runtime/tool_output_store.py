@@ -12,6 +12,7 @@ import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import BinaryIO
 
 from aiive.config import settings
 
@@ -49,30 +50,101 @@ def is_managed_path(path: str | Path) -> bool:
     return root in resolved.parents
 
 
-def save_tool_output(content: str, tool_name: str) -> Path:
-    """把完整工具输出写入专用目录并返回路径。
-
-    失败时抛异常，由调用方降级为有界预览；绝不写半截文件。
-    """
+def _log_paths(tool_name: str) -> tuple[Path, Path]:
+    """按 时间戳 + 随机后缀 生成本次日志的（目标路径，临时路径）。"""
     root = ensure_tool_output_root()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     slug = _SLUG_RE.sub("-", (tool_name or "tool").lower()).strip("-")[:32] or "tool"
     target = root / f"{stamp}-{uuid.uuid4().hex[:12]}-{slug}{LOG_SUFFIX}"
     tmp_path = root / f"{TMP_PREFIX}{uuid.uuid4().hex}"
-    data = content.encode("utf-8", errors="replace")
-    try:
-        with open(tmp_path, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, target)
-    except BaseException:
+    return target, tmp_path
+
+
+class StreamingLog:
+    """流式工具输出日志：边产生边写盘，容量受限，收尾原子替换。
+
+    与 save_tool_output 共用同一目录与命名规则，不引入第二套存储：
+    - 写入先落 .tmp-*，close() 时 os.replace 原子改名，读者看不到半截文件；
+    - max_bytes 为磁盘上限：超过后停止写盘但继续统计 total_bytes，
+      并把 capture_truncated 置 True，明确表示"磁盘上不是全部内容"；
+    - write() 只写调用方传入的分片，自身不缓存完整内容。
+    """
+
+    def __init__(self, tool_name: str, *, max_bytes: int | None = None) -> None:
+        self.target: Path
+        self.tmp_path: Path
+        self.target, self.tmp_path = _log_paths(tool_name)
+        self.max_bytes: int | None = max_bytes if max_bytes and max_bytes > 0 else None
+        self.total_bytes: int = 0
+        self.written_bytes: int = 0
+        self.capture_truncated: bool = False
+        self.path: Path | None = None
+        self._handle: BinaryIO = open(self.tmp_path, "wb")
+        self._closed: bool = False
+
+    def write(self, chunk: bytes) -> None:
+        """写入一片输出；超过容量上限时丢弃该片剩余部分并标记截断。"""
+        if not chunk or self._closed:
+            return
+        self.total_bytes += len(chunk)
+        if self.max_bytes is not None:
+            remaining = self.max_bytes - self.written_bytes
+            if remaining <= 0:
+                self.capture_truncated = True
+                return
+            if len(chunk) > remaining:
+                chunk = chunk[:remaining]
+                self.capture_truncated = True
+        self._handle.write(chunk)
+        self.written_bytes += len(chunk)
+
+    def flush(self) -> None:
+        """把缓冲写入磁盘；需要在收尾前读取临时文件时调用。"""
+        if not self._closed:
+            self._handle.flush()
+
+    def close(self) -> Path:
+        """落盘收尾：flush + fsync + 原子改名，返回最终路径。"""
+        if self._closed and self.path is not None:
+            return self.path
         try:
-            tmp_path.unlink(missing_ok=True)
+            self._handle.flush()
+            os.fsync(self._handle.fileno())
+            self._handle.close()
+            os.replace(self.tmp_path, self.target)
+        except BaseException:
+            self.abort()
+            raise
+        self._closed = True
+        self.path = self.target
+        return self.target
+
+    def abort(self) -> None:
+        """放弃本次日志：关闭句柄并删除临时文件，绝不留下半截日志。"""
+        if not self._closed:
+            try:
+                self._handle.close()
+            except OSError:
+                pass
+            self._closed = True
+        try:
+            self.tmp_path.unlink(missing_ok=True)
         except OSError:
-            logger.warning("清理未完成的临时文件失败: %s", tmp_path)
+            logger.warning("清理未完成的临时文件失败: %s", self.tmp_path)
+
+
+def save_tool_output(content: str, tool_name: str) -> Path:
+    """把完整工具输出写入专用目录并返回路径。
+
+    失败时抛异常，由调用方降级为有界预览；绝不写半截文件。
+    """
+    log = StreamingLog(tool_name)
+    try:
+        log.write(content.encode("utf-8", errors="replace"))
+    except BaseException:
+        log.abort()
         raise
-    return target
+    return log.close()
 
 
 def cleanup_expired_tool_outputs(

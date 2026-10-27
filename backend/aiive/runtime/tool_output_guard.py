@@ -69,19 +69,35 @@ def guard_tool_output(
     thread_id: str = "",
     trace_id: str = "",
     tool_call_id: str = "",
+    max_chars: int = 0,
 ) -> GuardedOutput:
-    """对单个工具结果做统一预算；任何异常都降级为有界预览。"""
+    """对单个工具结果做统一预算；任何异常都降级为有界预览。
+
+    max_chars：调用方的回填预算（字符）。0 表示沿用 INLINE_CHAR_LIMIT 的聊天默认值；
+    后台任务等预算更紧的调用方传入更小值，此时短于该值的结果原样返回，
+    超限结果按同一套规则生成摘要后，再做一次结构保留的收口（不截断成半截 JSON）。
+    """
     if not content:
         return GuardedOutput(content=content)
     header = _log_header(tool_name, thread_id, trace_id, tool_call_id)
+    limit = max_chars if max_chars and max_chars > 0 else INLINE_CHAR_LIMIT
     try:
-        return _guard(tool_name, content, header)
+        guarded = _guard(tool_name, content, header, limit)
     except Exception:
         logger.exception("工具结果预算失败，降级为有界预览 tool=%s", tool_name)
         return GuardedOutput(
             content=_bounded_fallback(content, "guard_failure"),
             reason="guard_failure",
         )
+    if max_chars and guarded.reason and len(guarded.content) > max_chars:
+        # 只有守卫确实做过预算（reason 非空）时才收口：文件分页等原样透传的结果不动。
+        return GuardedOutput(
+            content=_fit_budget(guarded.content, max_chars),
+            offloaded=guarded.offloaded,
+            log_path=guarded.log_path,
+            reason=f"{guarded.reason}+fitted",
+        )
+    return guarded
 
 
 def _log_header(tool_name: str, thread_id: str, trace_id: str, tool_call_id: str) -> str:
@@ -92,20 +108,38 @@ def _log_header(tool_name: str, thread_id: str, trace_id: str, tool_call_id: str
     )
 
 
-def _guard(tool_name: str, content: str, header: str = "") -> GuardedOutput:
+def _guard(
+    tool_name: str, content: str, header: str = "", inline_limit: int = INLINE_CHAR_LIMIT,
+) -> GuardedOutput:
     name = (tool_name or "").strip()
     # 短结果保持原行为（Bash 行数规则另有下限，不会与字符阈值冲突）。
-    if len(content) <= INLINE_CHAR_LIMIT:
+    if len(content) <= inline_limit:
         return GuardedOutput(content=content)
 
     payload = _parse_object(content)
     if payload is not None:
+        if _is_guarded_payload(payload):
+            # 已经是守卫产物（历史回放 / 重复处理）：原样返回，绝不二次落盘。
+            return GuardedOutput(
+                content=content,
+                offloaded=bool(payload.get("log_path")),
+                log_path=str(payload.get("log_path") or ""),
+                reason="already_guarded",
+            )
         if name in SHELL_TOOL_NAMES:
             return _guard_shell(payload, header)
         if name in FILE_READ_TOOL_NAMES:
             return _guard_file_read(name, payload, header)
         return _guard_payload(payload, name, header)
     return _guard_text(content, name, header)
+
+
+def _is_guarded_payload(payload: dict[str, Any]) -> bool:
+    """识别本模块生成的回填结果：同时带截断标记与不可信标注。
+
+    用于保证重复处理（聊天历史回放、图重试、后台任务重放）不会二次截断或二次落盘。
+    """
+    return payload.get("truncated") is True and payload.get("note") == UNTRUSTED_NOTE
 
 
 def _parse_object(content: str) -> dict[str, Any] | None:
@@ -120,7 +154,10 @@ def _parse_object(content: str) -> dict[str, Any] | None:
 
 
 def _guard_shell(payload: dict[str, Any], header: str = "") -> GuardedOutput:
-    """Bash：按行阈值 + 字符预算做首尾保留，完整输出落盘。"""
+    """Bash：已流式落盘时只回填预览；否则按行阈值 + 字符预算做首尾保留并落盘。"""
+    streamed = _guard_streamed_shell(payload)
+    if streamed is not None:
+        return streamed
     sections: dict[str, dict[str, Any]] = {}
     for key in ("stdout", "stderr"):
         text = payload.get(key)
@@ -177,6 +214,124 @@ def _guard_shell(payload: dict[str, Any], header: str = "") -> GuardedOutput:
         offloaded=bool(log_path),
         log_path=log_path,
         reason="bash_output_budget",
+    )
+
+
+def _guard_streamed_shell(payload: dict[str, Any]) -> GuardedOutput | None:
+    """run_shell 已把完整输出流式写入日志时的回填：不再二次落盘。
+
+    只保留预览、总字节数、是否达到日志容量上限、日志路径与续读位置；
+    没有日志字段（例如日志写入失败）时返回 None，交回既有的首尾回填逻辑。
+    """
+    stdout_log = str(payload.get("stdout_log") or "")
+    stderr_log = str(payload.get("stderr_log") or "")
+    if not stdout_log and not stderr_log:
+        return None
+    raw_truncated = payload.get("truncated")
+    raw_capture = payload.get("capture_truncated")
+    bounded: dict[str, Any] = {key: payload[key] for key in PRESERVED_KEYS if key in payload}
+    bounded["ok"] = bool(payload.get("ok", True))
+    for key in ("stdout", "stderr"):
+        text = payload.get(key)
+        text = text if isinstance(text, str) else ""
+        preview = text[:BASH_SECTION_CHAR_LIMIT]
+        bounded[key] = preview
+        preview_truncated = (
+            bool(raw_truncated.get(key))
+            if isinstance(raw_truncated, dict)
+            else len(text) > len(preview)
+        )
+        capture_truncated = (
+            bool(raw_capture.get(key)) if isinstance(raw_capture, dict) else bool(raw_capture)
+        )
+        bounded[f"{key}_meta"] = {
+            "preview_chars": len(preview),
+            "preview_truncated": preview_truncated or len(text) > len(preview),
+            "total_bytes": int(payload.get(f"{key}_bytes") or len(text.encode("utf-8"))),
+            "capture_truncated": capture_truncated,
+            "log_path": str(payload.get(f"{key}_log") or ""),
+            "next_offset": int(payload.get(f"{key}_next_offset") or 0),
+            "next_char_offset": int(payload.get(f"{key}_next_char_offset") or 0),
+        }
+    bounded["truncated"] = True
+    bounded["log_path"] = stdout_log or stderr_log
+    bounded["hint"] = (
+        "完整输出已流式写入 stdout_log / stderr_log；用 "
+        "read_text_file(path=<log_path>, offset=<next_offset>, char_offset=<next_char_offset>) 续读，"
+        "capture_truncated=true 表示日志达到容量上限、剩余内容未保存。"
+    )
+    bounded["note"] = UNTRUSTED_NOTE
+    return GuardedOutput(
+        content=json.dumps(bounded, ensure_ascii=False),
+        offloaded=True,
+        log_path=bounded["log_path"],
+        reason="bash_streamed_log",
+    )
+
+
+def _clip_strings(value: Any, limit: int) -> Any:
+    """递归裁剪过长的字符串（含嵌套结构），保留结构本身。"""
+    if isinstance(value, str):
+        return value if len(value) <= limit else _clip(value[:limit])
+    if isinstance(value, dict):
+        return {key: _clip_strings(item, limit) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clip_strings(item, limit) for item in value]
+    return value
+
+
+def _fit_budget(content: str, max_chars: int) -> str:
+    """把已生成的摘要收口到调用方预算：先裁剪长文本，再按重要性逐级丢弃字段。
+
+    始终保持 JSON 结构完整，log_path / 错误字段 / 截断标记优先保留，
+    绝不把半截 JSON 交给模型。
+    """
+    if max_chars <= 0 or len(content) <= max_chars:
+        return content
+    payload = _parse_object(content)
+    if payload is None:
+        return _bounded_fallback(content, "inline_budget")
+    trimmed = _clip_strings(payload, PREVIEW_CHARS)
+    if not isinstance(trimmed, dict):  # pragma: no cover - payload 已确认是 dict
+        return _bounded_fallback(content, "inline_budget")
+    trimmed["inline_trimmed"] = True
+    out = json.dumps(trimmed, ensure_ascii=False)
+    if len(out) <= max_chars:
+        return out
+    keep = set(PRESERVED_KEYS) | {
+        "ok", "truncated", "log_path", "note", "inline_trimmed",
+        "result_type", "full_length", "offload_error",
+    }
+    minimal = {
+        key: value
+        for key, value in trimmed.items()
+        if key in keep or key.endswith(("_bytes", "_meta", "_chars", "_lines"))
+    }
+    out = json.dumps(minimal, ensure_ascii=False)
+    if len(out) <= max_chars:
+        return out
+    minimal.pop("hint", None)
+    out = json.dumps(minimal, ensure_ascii=False)
+    if len(out) <= max_chars:
+        return out
+    minimal.pop("note", None)
+    for key in list(minimal):
+        if key not in {"ok", "truncated", "log_path", "inline_trimmed"} and not key.endswith(
+            ("_bytes", "_meta"),
+        ):
+            minimal.pop(key, None)
+    out = json.dumps(minimal, ensure_ascii=False)
+    if len(out) <= max_chars:
+        return out
+    return json.dumps(
+        {
+            "ok": bool(minimal.get("ok", True)),
+            "truncated": True,
+            "log_path": str(minimal.get("log_path", "")),
+            "inline_trimmed": True,
+            "note": UNTRUSTED_NOTE,
+        },
+        ensure_ascii=False,
     )
 
 

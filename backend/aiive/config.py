@@ -144,6 +144,11 @@ class Settings(BaseSettings):
     shell_default_timeout_seconds: int = 60
     shell_max_timeout_seconds: int = 300
     shell_max_output_bytes: int = 65536
+    # shell_max_log_bytes: stdout / stderr 各自流式日志的磁盘上限（字节）。达到上限后
+    #   停止写盘并在结果里标记 capture_truncated=true，绝不声称已保存全部内容。
+    # shell_output_preview_chars: 回填到结果里的预览字符数，完整内容留在日志中按需分页读取。
+    shell_max_log_bytes: int = 8388608
+    shell_output_preview_chars: int = 2000
 
     # 工具结果回填预算与落盘（防止一次性返回大内容撑爆 LLM 上下文）。
     # tool_output_dir: 本功能专用目录，清理只作用于该目录内的日志文件。
@@ -296,6 +301,10 @@ class Settings(BaseSettings):
             raise ValueError("TOOL_OUTPUT_RETENTION_HOURS 必须大于 0")
         if self.tool_output_cleanup_interval_hours <= 0:
             raise ValueError("TOOL_OUTPUT_CLEANUP_INTERVAL_HOURS 必须大于 0")
+        if self.shell_max_log_bytes <= 0:
+            raise ValueError("SHELL_MAX_LOG_BYTES 必须大于 0")
+        if self.shell_output_preview_chars <= 0:
+            raise ValueError("SHELL_OUTPUT_PREVIEW_CHARS 必须大于 0")
         if not self.aiive_auth_enabled and self.host not in {"127.0.0.1", "localhost", "::1"}:
             # 关闭认证会让全部私人数据接口裸奔，只允许在 loopback 调试时使用。
             raise ValueError("非 loopback 部署不允许关闭 AIIVE_AUTH_ENABLED")
