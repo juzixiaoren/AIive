@@ -187,6 +187,14 @@ Web、Android 或 Electron 界面发出的自然语言指令都由后端 Agent �
 删除。详细协议、节点绑定、权限与构建说明见
 [Desktop 应用与本地执行节点指南](docs/guides/DESKTOP_APP.md)。
 
+工具结果在进入模型上下文之前统一过预算：文件读取超过 1000 字符只回填路径、总字符数、
+总行数与分页提示；Shell 输出超过 1000 行只回填首尾各 50 行；其他工具（含 MCP）超过
+1000 字符只回填结构化摘要。完整原始结果落盘到 `TOOL_OUTPUT_DIR`（默认
+`.data/tool_outputs`），模型可用 `read_text_file` 按 `offset`/`limit` 分页读取（流式逐行扫描，
+不受文件总大小限制；单行超长时用 `char_offset` 行内续读）；
+日志保留 `TOOL_OUTPUT_RETENTION_HOURS`（默认 10 小时），由后台调度器每
+`TOOL_OUTPUT_CLEANUP_INTERVAL_HOURS`（默认 5 小时）清理一次，只删该目录内的日志。
+
 启用本地 Embedding 时应通过 `./scripts/start.sh` 启动模型服务。脚本读取 `.env` 中的
 `AIIVE_MEMORY_VECTOR_ENABLED` / `AIIVE_KNOWLEDGE_VECTOR_ENABLED` 与
 `AIIVE_EMBEDDING_PROVIDER`：任一向量检索开启且 provider 为 `local` 时，先检查

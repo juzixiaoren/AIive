@@ -26,6 +26,7 @@ from aiive.db.models import (
 )
 from aiive.memory.recall_config import MaintenanceConfig, RecallConfig
 from aiive.worker.job_types import ENABLED_OUTBOX_JOB_TYPES
+from aiive.config import settings
 from aiive.runtime.epoch_manager import EpochManager
 from aiive.runtime.task_manager import TaskManager
 from aiive.worker.task_worker import enqueue_due_tasks
@@ -68,6 +69,9 @@ _CONFLICT_CLEANUP_BATCH = 200     # 单个 job 处理的最大案例数（超出
 # 运行证据驱动的改进发现：每 6 小时最多一轮，只产出候选，不改代码
 _IMPROVEMENT_DISCOVERY_INTERVAL = 21600
 _IMPROVEMENT_DISCOVERY_POLICY_VERSION = 1
+# 工具输出日志过期清理：只扫本功能专用目录（settings.tool_output_dir），
+# 每 5 小时一次，删除创建时间超过 10 小时的日志。
+_TOOL_OUTPUT_CLEANUP_INTERVAL = int(settings.tool_output_cleanup_interval_hours * 3600)
 
 
 def _poll_job():
@@ -97,6 +101,18 @@ def _poll_job():
         id="task_poll",
         replace_existing=True,
     )
+
+
+def _tool_output_cleanup_job() -> None:
+    """删除工具输出专用目录内超过保留期的日志（只碰本目录的 .log）。"""
+    try:
+        from aiive.runtime.tool_output_store import cleanup_expired_tool_outputs
+
+        removed = cleanup_expired_tool_outputs()
+        if removed:
+            logger.info("工具输出日志清理完成: removed=%d", removed)
+    except Exception:
+        logger.exception("工具输出日志清理失败")
 
 
 def start_daemon():
@@ -147,6 +163,12 @@ def start_daemon():
     scheduler.add_job(
         _conflict_expiry_scanner_job, IntervalTrigger(seconds=_CONFLICT_EXPIRY_INTERVAL),
         id="memory_conflict_expiry_scanner", replace_existing=True,
+    )
+
+    # 工具输出日志生命周期：定期删除过期日志，避免临时目录无限增长。
+    scheduler.add_job(
+        _tool_output_cleanup_job, IntervalTrigger(seconds=_TOOL_OUTPUT_CLEANUP_INTERVAL),
+        id="tool_output_cleanup", replace_existing=True,
     )
     # 运行证据驱动的改进发现扫描器
     scheduler.add_job(

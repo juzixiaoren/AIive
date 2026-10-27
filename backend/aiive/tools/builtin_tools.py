@@ -334,10 +334,16 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
               "description": "trash / quarantine / hard_delete_for_test_only",
               "enum": ["trash", "quarantine", "hard_delete_for_test_only"],
           }}, "high", True, True),
-        ("read_text_file", _handle_read_text_file, "读取 ~/Documents 下的文本文件（最多 50 行）",
+        ("read_text_file", _handle_read_text_file,
+         "分页读取文本文件（限 ~/Documents 与工具输出日志目录）。"
+         + "单页受字符预算约束，返回 total_lines/total_chars/next_offset；"
+         + "大文件或大日志必须用 offset/limit 分页读取，不要一次读全文。",
          {
-             "path": {"type": "str", "description": "限 ~/Documents", "minLength": 1},
-             "max_lines": {"type": "int", "description": "默认 50", "minimum": 1, "maximum": 1000},
+             "path": {"type": "str", "description": "文件路径（~/Documents 或工具日志目录）", "minLength": 1, "required": True},
+             "offset": {"type": "int", "description": "起始行号，从 0 开始；默认 0", "minimum": 0},
+             "limit": {"type": "int", "description": "本次最多读取行数，默认 50，上限 1000", "minimum": 1, "maximum": 1000},
+             "max_chars": {"type": "int", "description": "单页字符预算，默认 1000，上限 8000", "minimum": 1, "maximum": 8000},
+             "char_offset": {"type": "int", "description": "超长行的行内续读偏移；默认 0", "minimum": 0},
          }, "low", False, False),
         # 知识库
         ("read_document", _handle_read_document,

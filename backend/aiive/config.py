@@ -145,6 +145,14 @@ class Settings(BaseSettings):
     shell_max_timeout_seconds: int = 300
     shell_max_output_bytes: int = 65536
 
+    # 工具结果回填预算与落盘（防止一次性返回大内容撑爆 LLM 上下文）。
+    # tool_output_dir: 本功能专用目录，清理只作用于该目录内的日志文件。
+    # tool_output_retention_hours: 日志保留小时数，超期由调度器删除。
+    # tool_output_cleanup_interval_hours: 过期日志扫描周期。
+    tool_output_dir: str = ".data/tool_outputs"
+    tool_output_retention_hours: int = 10
+    tool_output_cleanup_interval_hours: int = 5
+
     # Supervisor 进程托管（自进化 A/B 槽位晋升的真实进程切换）。
     # enabled: 是否启用独立守护进程托管应用进程；关闭时 promote 只切 active_slot 指针
     #   （兼容 docker compose 由容器编排负责重启的部署方式）。
@@ -284,6 +292,10 @@ class Settings(BaseSettings):
             raise ValueError("AIIVE_AUTH_LOGIN_MAX_ATTEMPTS 必须大于 0")
         if self.aiive_auth_login_window_seconds <= 0:
             raise ValueError("AIIVE_AUTH_LOGIN_WINDOW_SECONDS 必须大于 0")
+        if self.tool_output_retention_hours <= 0:
+            raise ValueError("TOOL_OUTPUT_RETENTION_HOURS 必须大于 0")
+        if self.tool_output_cleanup_interval_hours <= 0:
+            raise ValueError("TOOL_OUTPUT_CLEANUP_INTERVAL_HOURS 必须大于 0")
         if not self.aiive_auth_enabled and self.host not in {"127.0.0.1", "localhost", "::1"}:
             # 关闭认证会让全部私人数据接口裸奔，只允许在 loopback 调试时使用。
             raise ValueError("非 loopback 部署不允许关闭 AIIVE_AUTH_ENABLED")

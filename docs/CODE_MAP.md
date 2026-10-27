@@ -7,7 +7,7 @@
 > - **路径约定**：均相对项目根（`AIive/`），如 `backend/aiive/main.py`、`frontend/src/pages/ChatPage.tsx`
 > - **行号**：基于建图时的代码版本，仅供快速跳转，以实际代码为准
 > - **维护规则**：见文末第 9 节。**新增/删除/移动文件、改 key 符号行号、改表结构后必须同步更新本文档**
-> - 建图日期：2026-10-21；最近更新：2026-10-27（V49 单用户认证、V50 目标步骤触发规则 + 主动消息）
+> - 建图日期：2026-10-21；最近更新：2026-10-27（V49 单用户认证、V50 目标步骤触发规则 + 主动消息、V51 工具结果回填预算）
 
 ---
 
@@ -93,6 +93,7 @@
 | 副作用工具 Outbox 化执行 | `tools/operation_executor.py` | `worker/scheduler_daemon.py::_poll_tool_operations` | `test_tool_operation*.py` |
 | 安全删除 | `tools/safe_delete.py` | `tools/builtin_files.py::handle_safe_delete` | `test_safe_delete*.py` |
 | 工具结果引用化（大结果→Artifact） | `runtime/tool_normalizer.py`、`runtime/tool_executor.py` | `storage/object_store.py`、`runtime/action_cards.py` | — |
+| 工具结果回填预算（V51，大结果→临时日志 + 有界回填） | `runtime/tool_output_guard.py`（唯一入口 `guard_tool_output`）、`runtime/tool_output_store.py`（落盘/清理） | `runtime/agent_graph.py::_tools_node`、`tools/builtin_files.py::handle_read_text_file`、`worker/scheduler_daemon.py::_tool_output_cleanup_job`、`config.py` | `test_tool_output_guard.py`（17 例） |
 | 工具注入方案（分层/tool_plan/检索选型分析） | `docs/architecture/工具注入方案分析.md` | 下述注入面实证 | — |
 
 **工具注入面（改绑定/可见性前必读）**：对话 Agent 每轮**只绑定 5 个任务元工具**（`task_runtime/tools.py::build_main_agent_registry`，`context_assembler.py:256` 固定注入，`tool_definitions` 分区 4000/6000 token 前缀截断），架构不变。持久任务 Worker 采用**分层注入 + 自主发现**（`task_runtime/tool_injection.py`）：L0 常驻能力（长期记忆读取、基础搜索、本机 `run_shell`、`desktop_exec`、任务管理）始终注入完整定义；其余能力由 Worker 通过 `search_capabilities` / `describe_capability` 两个只读决策按需发现，`TaskContextAssembler` 只注入 `tools.resident / available / discovered / loaded`，**不再整段注入 `list_all()` 清单**；目录 ≤12 个工具时直接全量注入 Schema，超过则转为发现模式。发现范围覆盖全部可用能力（内置 + 在线桌面 + MCP + 自进化），**不受 task_type / Skill Profile 收窄**（`TaskScope.capability_policy=unified`）；执行仍由 `CapabilityBroker` 的授权视图 + `TaskPolicyEngine` + 审批 + 资源锁 + `descriptor_hash` 裁决，发现不扩大权限。方案与实施记录见 `docs/architecture/工具注入方案分析.md`。
@@ -183,7 +184,7 @@
 | 文件 | 职责 |
 |---|---|
 | `main.py` | FastAPI 装配：`create_app()` L131；`lifespan` L142（启动序列：事件循环绑定→prompt catalog 校验→`_ensure_schema` L87 Alembic upgrade→HMAC 密钥→`_ensure_system_thread` L51→检索 generation→backfill→ContextBudget 校验→向量运行时→MCP 恢复 `restore_active_capabilities`→`start_daemon`→OutboxWorker+Heartbeat+APScheduler）；26 个 `include_router` L322-347；全局认证中间件 `auth_guard` 在 CORS 之前注册（后注册者位于外层，OPTIONS 预检先被 CORS 处理） |
-| `config.py` | `Settings` L13（pydantic-settings，`.env` 加载）；`validate_memory_features()` L126 启动校验；单例 `settings` L186；V50 新增 `aiive_goal_trigger_max_decisions_per_day`（默认 12，>0 校验）作为主动决策的每日硬上限。**几乎所有模块 `from aiive.config import settings`** |
+| `config.py` | `Settings` L13（pydantic-settings，`.env` 加载）；`validate_memory_features()` L126 启动校验；单例 `settings` L186；V50 新增 `aiive_goal_trigger_max_decisions_per_day`（默认 12，>0 校验）作为主动决策的每日硬上限；V51 新增 `tool_output_dir`（默认 `.data/tool_outputs`）、`tool_output_retention_hours`（10）、`tool_output_cleanup_interval_hours`（5），均 >0 校验。**几乎所有模块 `from aiive.config import settings`** |
 | `auth/` | 单用户登录（V49）：`guard.py` 全局 HTTP 中间件 + WS 首帧认证；`security.py` Argon2id / HS256 / 持久签名密钥；`service.py` 初始化、注册、登录、限流。`aiive_auth_enabled` 默认开，非 loopback 禁止关闭 |
 
 ### 3.2 `api/` — REST/WS 路由层
@@ -253,6 +254,8 @@
 | `epoch_manager.py` / `compaction.py` | Epoch/Segment 生命周期+密封冻结；Segment 压缩（source_hash+LLM 输出校验） |
 | `thread_state.py` | `ThreadState`：历史消息有界读取分页 |
 | `tool_normalizer.py` / `tool_executor.py` / `action_cards.py` | 大工具结果→`Artifact` 引用化；`build_action_cards`/`build_pending_operations`；`ActionCard`/`PendingOperation`/`ChatResponse` 契约 |
+| `tool_output_guard.py` | V51 统一回填预算：`INLINE_CHAR_LIMIT=1000`；`guard_tool_output(tool_name, content)` 按工具分流——`run_shell` 走 `_guard_shell`（两种模式：**>1000 行 → 必回填前 50 + 后 50 行**，单行裁剪到 200 字符，`omitted_lines=[50,total-50]`；≤1000 行但单段 >4000 字符 → `char_budget` 前缀预算，不重复首尾；两种模式都落盘 + `mode`/`total_lines`/`omitted_lines`/`log_path`），`read_text_file`/`read_document` 走 `_guard_file_read`（>1000 字符只回填 path/total_chars/total_lines/hint），其余（含 MCP）走 `_guard_payload`/`_guard_text`（完整结果落盘 + 摘要 + 类型 + 长度 + 日志）。保留 `ok`/`error`/`error_type`/`exit_code`/`operation_id`/`execution_status`；落盘失败降级为有界预览并标 `offload_error`；回填内容一律标注不可信。 |
+| `tool_output_store.py` | V51 落盘与生命周期：`tool_output_root`/`ensure_tool_output_root`（`settings.tool_output_dir`，默认 `.data/tool_outputs`）、`is_managed_path`（目录包含关系校验，供读取授权）、`save_tool_output`（时间戳 + uuid 唯一名、临时文件 + `os.replace` 原子写）、`cleanup_expired_tool_outputs`（只删本目录一层 `.log`/残留 `.tmp-*`，超 `tool_output_retention_hours` 默认 10h）。 |
 | `token_counter.py` / `token_models.py` | LiteLLM token 计数；`TokenCount`/`ModelProfile` |
 | `task_manager.py` | `TaskManager`：提醒/条件监视/例行任务 CRUD 与 Outbox 原子入队 |
 | `rhythm_manager.py` / `thread_bootstrap.py` / `context_inspector.py` | 节奏摘要；Thread 行独立短事务；离线上下文导出（debug） |
@@ -321,7 +324,7 @@
 | `builtin_reminders.py` | `schedule_reminder`、`remind_alert`、`confirm_reminder`、`snooze_reminder`、`list_tasks`、`cancel_task`、`dismiss_notifications`、`show_notifications` |
 | `builtin_memory_write.py` | `remember_or_update`、`run_memory_maintenance` |
 | `builtin_memory_recall.py` | `memory_search`、`memory_timeline`、`memory_event_log`、`history_search` |
-| `builtin_files.py` | `safe_delete`、`read_text_file` |
+| `builtin_files.py` | `safe_delete`、`read_text_file`（V51 分页：`offset`/`limit`/`max_chars`/`char_offset`，返回 `total_lines`/`total_chars`/`lines_read`/`line_range`/`char_range`（行内续读窗口，左闭右开）/`next_offset`/`next_char_offset`/`has_more`/`hint`；**流式逐行扫描，无整文件大小上限**，超长行按 1M 字符切为续行；允许根目录为 `~/Documents` + 工具输出目录，`realpath` 后做包含判断，符号链接与 `..` 逃逸一律拒绝） |
 | `builtin_knowledge.py` | `read_document`、`ingest_document`、`reindex_document`、`search_knowledge` |
 | `builtin_web.py` | `web_search`、`fetch_web_page` |
 | `builtin_mcp.py` | `search_mcp`、`install_mcp_sandbox`、`plan_capability` |
@@ -355,7 +358,7 @@
 | `handlers_knowledge.py` | `handle_knowledge_maintenance` L29：扫描→分批清理→commit，无进展时 COMPLETED(partial) 而非空转；`MAX_MAINTENANCE_BATCHES=5` |
 | `handlers_improvement.py` | `handle_improvement_discovery`：改进候选发现的 Outbox 入口（`discovery` 参数仅供测试注入）；模型调用在事务外，`llm_failed` 返回 RETRYABLE_ERROR 且不推进水位，非法输出记 COMPLETED 不重试 |
 | `handlers_conflict.py` | 冲突闭环两个 Handler，均按"短事务读快照 → 事务外 LLM → 短事务落库"：`handle_memory_conflict_question`（生成澄清问题并写 `notification_created`，状态 pending→asking）、`handle_memory_conflict_reply`（解析回复后调 `MemoryConflictService.apply_decision`） |
-| `scheduler_daemon.py`（27KB） | 模块级 `scheduler` L33；`start_daemon` L90（10 个周期 job；含 `improvement_discovery_scanner` 6h 窗口）；`schedule_outbox_poll` L149；`_poll_tool_operations` L193（独立线程防饿死）；`_agent_task_scanner_job` L216（stale run 恢复/锁过期/watcher/审批过期；V50 追加 `GoalService.scan_due_reminders()` + `GoalTriggerService(db).scan()` 确定性触发扫描）；`_idle_scanner_job` L263；`_forget_reconcile_scanner_job` L423；`_conflict_expiry_scanner_job`（冲突案例 TTL 清扫，`enqueue_conflict_cleanup_job` 按小时窗口幂等入队）；`enqueue_maintenance_job` L453、`enqueue_retention_job` L509、`enqueue_knowledge_maintenance_job`、`knowledge_needs_maintenance`、`_knowledge_maintenance_scanner_job`（在途判定只认 pending/running；DB 侧不一致即时入队 + 每日对象对账；终态任务不阻塞，补跑分配 `#n` 后缀 operation_id） |
+| `scheduler_daemon.py`（27KB） | 模块级 `scheduler` L33；`start_daemon` L90（11 个周期 job；含 `improvement_discovery_scanner` 6h 窗口、V51 `tool_output_cleanup` 每 5h 清理过期工具日志）；`schedule_outbox_poll` L149；`_poll_tool_operations` L193（独立线程防饿死）；`_agent_task_scanner_job` L216（stale run 恢复/锁过期/watcher/审批过期；V50 追加 `GoalService.scan_due_reminders()` + `GoalTriggerService(db).scan()` 确定性触发扫描）；`_idle_scanner_job` L263；`_forget_reconcile_scanner_job` L423；`_conflict_expiry_scanner_job`（冲突案例 TTL 清扫，`enqueue_conflict_cleanup_job` 按小时窗口幂等入队）；`enqueue_maintenance_job` L453、`enqueue_retention_job` L509、`enqueue_knowledge_maintenance_job`、`knowledge_needs_maintenance`、`_knowledge_maintenance_scanner_job`（在途判定只认 pending/running；DB 侧不一致即时入队 + 每日对象对账；终态任务不阻塞，补跑分配 `#n` 后缀 operation_id） |
 | `outbox_heartbeat.py` / `job_types.py` / `task_worker.py` | 租约续期线程 + `ActiveClaimRegistry`；`ENABLED_OUTBOX_JOB_TYPES` allowlist；到期提醒原子入队 `reminder_delivery`（FOR UPDATE SKIP LOCKED） |
 
 ### 3.9 `task_runtime/` + `control/` — 持久任务与执行边界
@@ -665,7 +668,7 @@ memory_conflict_reply (worker/handlers_conflict.py)
   → HMAC 密钥 → _ensure_system_thread → _ensure_retrieval_generation
   → ContextBudget 校验 → 向量运行时 (vector_bootstrap)
   → mcp/bootstrap.py::restore_active_capabilities (L235) + ensure_builtin_mcp_capability
-  → supervisor start_daemon (scheduler_daemon.py L90, 10 个周期 job)
+  → supervisor start_daemon (scheduler_daemon.py L90, 11 个周期 job)
   → OutboxWorker + OutboxHeartbeat + ws_manager + desktop_connection_manager
 ```
 
@@ -690,7 +693,35 @@ scheduler(_improvement_discovery_scanner_job, 6h)
 ```
 
 不变量：候选只描述目标、不产生补丁；接受前不触碰候选槽位；任何路径都不自动晋升；
+不变量：候选只描述目标、不产生补丁；接受前不触碰候选槽位；任何路径都不自动晋升；
 同一批证据重复处理由 uuid5 主键与"待处理候选同组去重"共同保证不新增行。
+
+---
+
+### 7.8 工具结果回填预算（V51，大结果不撑爆上下文）
+
+```
+LLM 决定调用工具
+  → ToolNode.invoke → langchain_adapter → ToolRegistry.execute → handler
+      → run_shell: local_shell.run_bash（stdout/stderr 落临时文件，最多 shell_max_output_bytes）
+      → read_text_file: 按 offset/limit/max_chars 分页，返回 total_lines/total_chars/next_offset
+      → MCP: mcp/runtime_client → 远端结果 JSON
+  → agent_graph._tools_node
+      → guard_tool_output(tool_name, raw_content)          # 唯一预算入口
+          ├ run_shell：>1000 行 → 首 50 + 尾 50 行（单行裁剪 200 字符，omitted=[50,total-50]）
+          │            ≤1000 行但 >4000 字符 → char_budget 前缀预算（不重复首尾）
+          │            两者都落盘 + total_lines / omitted_lines / log_path
+          ├ read_text_file/read_document：>1000 字符 → path/total_chars/total_lines/hint（分页由 read_text_file 流式承担）
+          └ 其他（含 MCP）：>1000 字符 → 完整结果落盘 + 摘要/类型/长度/log_path
+      → ToolResultNormalizer.normalize（Token 级 Artifact 引用化，兜底）
+      → ToolMessage 进入下一轮 LLM
+  → 模型按需 read_text_file(path=log_path, offset=..., limit=...)
+  → scheduler(_tool_output_cleanup_job, 5h) → cleanup_expired_tool_outputs（>10h 的 .log）
+```
+
+不变量：短结果（<=1000 字符）原样回填；完整内容只落盘不回填；ok/error/error_type/
+exit_code/operation_id 等结构化字段始终保留；落盘失败降级为有界预览并标 offload_error；
+清理只作用于 settings.tool_output_dir 一层内的日志，不触碰其他临时文件与项目文件。
 
 ---
 
@@ -735,13 +766,14 @@ POST /api/auth/login（失败统一 invalid_credentials；同 (client, username)
 
 | 位置 | 层级 | 说明 |
 |---|---|---|
-| `tests/unit/backend/` | 单元 | 后端单元测试（83 个 `test_*.py`），命名 `test_<被测试模块>.py`；`tests/unit/conftest.py` 经"分发式 SessionLocal"把模块级 DB 绑定重定向到按用例隔离的测试库 |
+| `tests/unit/backend/` | 单元 | 后端单元测试（84 个 `test_*.py`），命名 `test_<被测试模块>.py`；`tests/unit/conftest.py` 经"分发式 SessionLocal"把模块级 DB 绑定重定向到按用例隔离的测试库 |
 | `tests/integration/backend/` | 本地集成 | 多组件组合测试（Worker/Handler/调度/检索/生命周期），共享进程级 SQLite + 每用例重建表；`_util.py` 为共享夹具辅助 |
 | `tests/flow/` | 关键流程 | 跨模块高价值链路（Turn 执行、提醒闭环），外部边界离线模拟 |
 | `tests/conftest.py` | 公共 | 从 `.env` 仅加载 `AIIVE_` 前缀变量；`db_session` 夹具；按目录自动标注层级 marker |
 | `tests/support.py` | 公共 | SessionLocal 分发器安装（先于 aiive 模块导入） |
 | `apps/desktop/src/node-host/journal.test.mjs` | Node | Node 内置 `node --test`（`npm run test:node-host`） |
 | `tests/unit/backend/test_auth.py` | 单元（认证验收） | 23 例：初始化状态、唯一注册、Argon2id 哈希、登录失败不可区分、限流、Token 过期/签名错误、重启后仍有效、全部路由匿名访问矩阵、WS 首帧认证、桌面节点用户级认证 |
+| `tests/unit/backend/test_tool_output_guard.py` | 单元（V51 回填预算验收） | 26 例：短结果原样回填、Bash >1000 行首尾+省略区间+日志、Bash 长行字符预算、超长 MCP 结果摘要、非 JSON 文本落盘、read_document 超限只回填路径/总数、短文件保持原行为、offset/limit 分页与 next_offset、超长行 char_offset 续读、路径安全拒绝、落盘失败降级有界预览、重复调用稳定且日志唯一、错误字段与退出码保留、过期清理只删本目录、重启后日志仍可读、清理不越界、原子写入无残留、>5MB 大文件翻页到末尾、逐页范围与 next_offset 一致、符号链接逃逸拒绝、`..` 穿越拒绝、MCP 信封结果摘要、Bash 超长行下仍回填 50+50 行且省略区间正确、行内续读 `line_range`/`char_range` 语义、多行页不返回 `char_range` |
 | `tests/unit/backend/test_goal_triggers.py` | 单元（V50 触发验收） | 19 例：once_at 幂等/重启、recurring 时区落点与下一场、window_once 首次命中与过期、event_condition、opportunistic 冷却/日上限/无事件不调 LLM、运行中任务跳过、no_action+完整 Trace、run_step 只入队一次、modify_plan 版本递增、complete_goal 证据门槛、ask_user 真实助手消息、聊天不泄露 system 提示词而 Trace 保留、前台 Turn 占用 → RETRY_LATER 后按序补发、用户沉默只阻塞依赖步骤、旧 schedule 归一化、window_once 同窗口不重复触发、显式规则不被时间路径起跑、modify 保留触发状态 |
 | `tests/unit/backend/test_auth_frontend_contract.py` | 静态守卫 | 11 例源码扫描：页面禁止裸 `fetch`、WS 必须发认证帧、页面/API 模块不得自管 Token、App 登录门禁与安全回跳、桌面 IPC 只传 Token 不落盘 |
 
