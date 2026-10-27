@@ -1,6 +1,7 @@
 /**
  * 能力页面：展示已安装能力和 ToolRegistry 的真实安全元数据。
  */
+import { apiFetch } from "../api/client";
 import { useEffect, useState } from "react";
 import { BASE_PATH } from "../lib/base";
 
@@ -74,23 +75,23 @@ export default function CapabilitiesPage() {
 
   useEffect(() => {
     Promise.all([
-      fetch(`${BASE_PATH}api/mcp/capabilities`).then(response => {
+      apiFetch(`${BASE_PATH}api/mcp/capabilities`).then(response => {
         if (!response.ok) throw new Error(`能力 HTTP ${response.status}`);
         return response.json() as Promise<InstalledCapability[]>;
       }),
-      fetch(`${BASE_PATH}api/tools`).then(response => {
+      apiFetch(`${BASE_PATH}api/tools`).then(response => {
         if (!response.ok) throw new Error(`工具 HTTP ${response.status}`);
         return response.json() as Promise<RegisteredTool[]>;
       }),
-      fetch(`${BASE_PATH}api/skills`).then(response => {
+      apiFetch(`${BASE_PATH}api/skills`).then(response => {
         if (!response.ok) throw new Error(`Skill HTTP ${response.status}`);
         return response.json() as Promise<Skill[]>;
       }),
-      fetch(`${BASE_PATH}api/capabilities?state=candidate`).then(response => {
+      apiFetch(`${BASE_PATH}api/capabilities?state=candidate`).then(response => {
         if (!response.ok) throw new Error(`MCP catalog HTTP ${response.status}`);
         return response.json() as Promise<MCPCandidate[]>;
       }),
-      fetch(`${BASE_PATH}api/knowledge`).then(response => {
+      apiFetch(`${BASE_PATH}api/knowledge`).then(response => {
         if (!response.ok) throw new Error(`知识库 HTTP ${response.status}`);
         return response.json() as Promise<KnowledgeCatalog>;
       }),

@@ -4,6 +4,7 @@
  * - 事件类型包括：对话开始、用户消息、模型回复、记忆激活/候选、管家信号、上下文截断、删除请求等
  */
 
+import { apiFetch } from "../api/client";
 import { useEffect, useState } from "react";
 
 /** 事件项数据结构 */
@@ -93,7 +94,7 @@ export default function EventTimeline({ traceId }: { traceId?: string }) {
       setLoading(true);
       setError(null);
       try {
-        const response = await fetch(url, { signal: controller.signal });
+        const response = await apiFetch(url, { signal: controller.signal });
         if (!response.ok) throw new Error(`事件加载失败 HTTP ${response.status}`);
         const data: unknown = await response.json();
         if (!Array.isArray(data)) throw new Error("事件响应格式无效");

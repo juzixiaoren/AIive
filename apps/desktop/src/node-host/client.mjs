@@ -16,6 +16,11 @@ const nodeName = process.env.AIIVE_DESKTOP_NODE_NAME || os.hostname();
 const backendUrl = (process.env.AIIVE_DESKTOP_BACKEND_URL || "http://127.0.0.1:8000").replace(/\/+$/, "");
 const appVersion = process.env.AIIVE_DESKTOP_APP_VERSION || "0.1.0";
 const authToken = process.env.AIIVE_DESKTOP_NODE_AUTH_TOKEN || "aiive-desktop-dev-token";
+// 单用户登录（V49）签发的用户 access_token：由 Electron 主进程经 IPC 转发，
+// 只在内存与环境变量中流转，不写日志、不出现在命令行参数里。
+let accessToken = (process.env.AIIVE_AUTH_ACCESS_TOKEN || "").trim();
+// 后端整体关闭认证时（仅 loopback 调试）不要求用户令牌，其余情况必须有。
+const authRequired = process.env.AIIVE_AUTH_ENABLED !== "false";
 const protocolVersion = 2;
 
 if (!nodeId) throw new Error("AIIVE_DESKTOP_NODE_ID is required");
@@ -681,8 +686,33 @@ async function handleOperation(socket, request) {
   });
 }
 
+let running = false;
+let activeSocket = null;
+
+function stopConnection() {
+  running = false;
+  if (activeSocket) {
+    const socket = activeSocket;
+    activeSocket = null;
+    socket.close();
+  }
+}
+
+function startConnection() {
+  if (running) return;
+  if (authRequired && !accessToken) {
+    console.error("等待登录凭证：未取得有效 access_token 前不连接后端");
+    return;
+  }
+  running = true;
+  retryMs = 1000;
+  connect();
+}
+
 function connect() {
+  if (!running) return;
   const socket = new WebSocket(websocketUrl());
+  activeSocket = socket;
   let heartbeat;
   socket.addEventListener("open", () => {
     retryMs = 1000;
@@ -690,7 +720,8 @@ function connect() {
       type: "hello", protocol_version: protocolVersion,
       data: {
         node_id: nodeId, name: nodeName, platform: process.platform, arch: process.arch,
-        app_version: appVersion, protocol_version: protocolVersion, auth_token: authToken, capabilities,
+        app_version: appVersion, protocol_version: protocolVersion, auth_token: authToken,
+        access_token: accessToken, capabilities,
       },
     });
     heartbeat = setInterval(() => {
@@ -733,10 +764,27 @@ function connect() {
   });
   socket.addEventListener("close", () => {
     clearInterval(heartbeat);
+    if (activeSocket === socket) activeSocket = null;
+    // 已登出（running=false）时不再重连，避免带着失效令牌无限重试。
+    if (!running) return;
     setTimeout(connect, retryMs);
     retryMs = Math.min(30000, retryMs * 2);
   });
   socket.addEventListener("error", () => socket.close());
 }
 
-connect();
+// Electron 主进程在登录态变化时推送新令牌；令牌变化需要重新握手。
+const parentPort = process.parentPort;
+if (parentPort) {
+  parentPort.on("message", (event) => {
+    const message = event && typeof event === "object" && "data" in event ? event.data : event;
+    if (!message || message.type !== "auth-token" || typeof message.token !== "string") return;
+    const next = message.token.trim();
+    if (next === accessToken) return;
+    accessToken = next;
+    stopConnection();
+    if (next) startConnection();
+  });
+}
+
+startConnection();

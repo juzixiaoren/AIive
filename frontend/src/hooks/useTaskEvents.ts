@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { BASE_PATH } from "../lib/base";
+import { sendWsAuth } from "../api/client";
 import type { AgentTaskEvent } from "../api/agentTasks";
 
 
@@ -23,6 +24,9 @@ export function useTaskEvents(taskId: string, callback: (event: AgentTaskEvent) 
         `${protocol}//${window.location.host}${BASE_PATH}api/agent-tasks/ws/${encodeURIComponent(taskId)}`
         + `?after_sequence=${cursorRef.current > 0 ? cursorRef.current : "latest"}`,
       );
+      socket.onopen = () => {
+        if (socket) sendWsAuth(socket);
+      };
       socket.onmessage = (message) => {
         try {
           const envelope = JSON.parse(String(message.data));

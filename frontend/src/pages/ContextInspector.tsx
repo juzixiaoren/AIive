@@ -6,6 +6,7 @@
  * - 支持弹窗查看完整内容
  */
 
+import { apiFetch } from "../api/client";
 import { useEffect, useRef, useState } from "react";
 
 /** 上下文项数据结构 */
@@ -120,7 +121,7 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
     }
 
     setLoadState("loading");
-    fetch(`api/context-runs/${encodeURIComponent(traceId)}`, { signal: controller.signal })
+    apiFetch(`api/context-runs/${encodeURIComponent(traceId)}`, { signal: controller.signal })
       .then(async response => {
         if (response.status === 404) {
           setLoadState("not_found");
@@ -148,7 +149,7 @@ export default function ContextInspector({ traceId }: { traceId?: string }) {
     if (fullContents[itemId] !== undefined || loadingItems.has(itemId)) return;
     const requestTraceId = traceId || "";
     setLoadingItems(prev => new Set(prev).add(itemId));
-    fetch(`api/context-runs/${encodeURIComponent(requestTraceId)}/items/${encodeURIComponent(itemId)}`)
+    apiFetch(`api/context-runs/${encodeURIComponent(requestTraceId)}/items/${encodeURIComponent(itemId)}`)
       .then(async response => {
         if (response.status === 404) throw new Error("上下文项不存在");
         if (!response.ok) throw new Error(`HTTP ${response.status}`);

@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, WebSocke
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
+from aiive.auth.guard import authenticate_websocket
 from aiive.db.base import SessionLocal, get_db
 from aiive.db.models import AgentTask, AgentTaskEvent, TaskArtifact, TaskEvidence
 from aiive.task_runtime.evidence import EvidenceStore, artifact_bytes
@@ -313,6 +314,9 @@ def read_task_artifact(
 async def agent_task_event_socket(websocket: WebSocket, task_id: str) -> None:
     """轻量事件流；断线后客户端使用 sequence 从 REST 补齐。"""
     await websocket.accept()
+    # 首帧认证通过后才读取任务事件；认证失败直接关闭，不泄露任何任务数据。
+    if await authenticate_websocket(websocket) is None:
+        return
     raw_cursor = websocket.query_params.get("after_sequence", "0")
     cursor: int | None
     if raw_cursor == "latest":

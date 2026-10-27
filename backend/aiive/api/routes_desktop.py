@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from aiive.db.base import SessionLocal, get_db
+from aiive.auth.security import AuthError, decode_access_token
 from aiive.config import settings
 from aiive.desktop.connection_manager import desktop_connection_manager
 from aiive.desktop.node_service import desktop_node_service
@@ -86,6 +87,13 @@ async def desktop_node_socket(websocket: WebSocket, node_id: str) -> None:
         if not hmac.compare_digest(hello.auth_token, settings.aiive_desktop_node_auth_token):
             await websocket.close(code=1008, reason="desktop node authentication failed")
             return
+        if settings.aiive_auth_enabled:
+            # 用户级认证：Node Host 必须先拿到有效 access_token 才能连上后端。
+            try:
+                decode_access_token(hello.access_token)
+            except AuthError:
+                await websocket.close(code=1008, reason="unauthorized")
+                return
         unsupported = [cap.name for cap in hello.capabilities if definition_for(cap.name) is None]
         if unsupported:
             await websocket.close(code=1008, reason="unsupported desktop capabilities")

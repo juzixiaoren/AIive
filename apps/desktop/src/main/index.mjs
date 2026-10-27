@@ -16,6 +16,9 @@ let nodeHostRestartTimer;
 let nodeHostStableTimer;
 let nodeHostRestartMs = 1000;
 let nodeId = "";
+// 用户 access_token 只在主进程内存中保存，再经 utilityProcess.postMessage 下发给 Node Host；
+// 不写入磁盘、日志或子进程命令行参数。
+let authToken = "";
 
 function statePath() {
   return path.join(app.getPath("userData"), "desktop-node.json");
@@ -88,6 +91,8 @@ function startNodeHost() {
       AIIVE_DESKTOP_NODE_NAME: process.env.AIIVE_DESKTOP_NODE_NAME || app.getName(),
       AIIVE_DESKTOP_BACKEND_URL: backendUrl,
       AIIVE_DESKTOP_APP_VERSION: app.getVersion(),
+      AIIVE_AUTH_ACCESS_TOKEN: authToken,
+      AIIVE_AUTH_ENABLED: process.env.AIIVE_AUTH_ENABLED || "",
     },
   });
   nodeHostStableTimer = setTimeout(() => { nodeHostRestartMs = 1000; }, 30000);
@@ -101,6 +106,13 @@ function startNodeHost() {
     }
   });
 }
+
+ipcMain.handle("aiive-desktop:set-auth-token", (_event, token) => {
+  authToken = typeof token === "string" ? token : "";
+  // 登录/登出/令牌变化时通知已在运行的 Node Host 重新握手。
+  nodeHost?.postMessage({ type: "auth-token", token: authToken });
+  return true;
+});
 
 ipcMain.handle("aiive-desktop:runtime-info", () => ({
   desktop: true,

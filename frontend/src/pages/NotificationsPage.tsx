@@ -5,6 +5,7 @@
  * - 通知状态包括：待提醒、提醒中、已确认、已延时
  */
 
+import { apiFetch } from "../api/client";
 import { useEffect, useRef, useState } from "react";
 import { useNotificationListener } from "../hooks/useNotificationSocket";
 
@@ -51,7 +52,7 @@ export default function NotificationsPage() {
   const refresh = (cat?: "pending" | "done") => {
     const c = cat ?? category;
     const seq = ++refreshSeqRef.current;
-    fetch(`api/notifications?category=${c}`)
+    apiFetch(`api/notifications?category=${c}`)
       .then(async (r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
@@ -86,7 +87,7 @@ export default function NotificationsPage() {
   const handleDelete = async (n: Notif) => {
     setBusyId(n.id);
     try {
-      const res = await fetch(`api/notifications/${n.id}`, { method: "DELETE" });
+      const res = await apiFetch(`api/notifications/${n.id}`, { method: "DELETE" });
       if (res.status === 404) {
         // 已被其他入口删除：直接从列表移除
         setNotifs((prev) => prev.filter((item) => item.id !== n.id));

@@ -18,6 +18,7 @@ import {
   StreamIncompleteError,
 } from "../api/chat";
 import { BASE_PATH } from "../lib/base";
+import { apiFetch, sendWsAuth } from "../api/client";
 import Markdown from "../components/Markdown";
 
 const STORAGE_KEY = "aiive_active_thread";
@@ -408,6 +409,10 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
 
     const connect = () => {
       ws = new WebSocket(wsUrl);
+      // 首帧认证：认证完成前后端不会推送任何消息事件。
+      ws.onopen = () => {
+        if (ws) sendWsAuth(ws);
+      };
       ws.onmessage = (event) => {
         try {
           const msg = JSON.parse(event.data);
@@ -605,7 +610,7 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
     };
     setMessages(prev => [...prev, placeholderMsg]);
     try {
-      const res = await fetch("api/chat/system", {
+      const res = await apiFetch("api/chat/system", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: text, thread_id: threadId }),

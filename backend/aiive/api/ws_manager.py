@@ -35,6 +35,10 @@ class ConnectionManager:
     async def connect(self, thread_id: str, ws: WebSocket) -> None:
         """接受 WebSocket 连接并注册到指定线程。"""
         await ws.accept()
+        self.attach(thread_id, ws)
+
+    def attach(self, thread_id: str, ws: WebSocket) -> None:
+        """注册已 accept（且已完成认证）的连接，不再重复 accept。"""
         if thread_id not in self._connections:
             self._connections[thread_id] = set()
         self._connections[thread_id].add(ws)

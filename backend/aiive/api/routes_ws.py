@@ -5,6 +5,7 @@ import json
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from aiive.api.routes_notifications import count_pending_notifications
+from aiive.auth.guard import authenticate_websocket
 from aiive.api.ws_manager import GLOBAL_THREAD_ID, ws_manager
 from aiive.db.base import SessionLocal
 
@@ -22,7 +23,12 @@ async def websocket_endpoint(ws: WebSocket, thread_id: str):
         ws: WebSocket 连接对象
         thread_id: 会话线程 ID
     """
-    await ws_manager.connect(thread_id, ws)
+    # 浏览器无法给 WebSocket 设置 Authorization 头，统一用首帧认证；
+    # 认证完成前不注册连接、不推送任何业务数据（含未读数量快照）。
+    await ws.accept()
+    if await authenticate_websocket(ws) is None:
+        return
+    ws_manager.attach(thread_id, ws)
     try:
         if thread_id == GLOBAL_THREAD_ID:
             # 连接即推送当前 pending 数量，避免角标空窗（用短生命周期会话，不占用连接）

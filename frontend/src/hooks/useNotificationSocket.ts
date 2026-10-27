@@ -7,6 +7,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { BASE_PATH } from "../lib/base";
+import { getToken, sendWsAuth } from "../api/client";
 
 type NotificationData = { pending_count: number };
 
@@ -18,6 +19,8 @@ let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 const listeners = new Set<(data: NotificationData) => void>();
 
 function ensureSocket() {
+  // 未登录时不建立连接，避免无意义的 1008 关闭与重连风暴。
+  if (!getToken()) return;
   if (
     socket &&
     (socket.readyState === WebSocket.OPEN ||
@@ -28,6 +31,10 @@ function ensureSocket() {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const url = `${protocol}//${window.location.host}${BASE_PATH}ws/${WS_PATH}`;
   socket = new WebSocket(url);
+  // 首帧认证：服务端验证通过前不会推送任何通知数据。
+  socket.onopen = () => {
+    if (socket) sendWsAuth(socket);
+  };
 
   socket.onmessage = (event) => {
     try {
@@ -78,4 +85,18 @@ export function useNotificationListener(cb: (data: NotificationData) => void) {
   const ref = useRef(cb);
   ref.current = cb;
   useEffect(() => subscribe((d) => ref.current(d)), []);
+}
+
+/** 退出登录时断开全局通知通道，避免带着旧 Token 继续重连。 */
+export function disconnectNotificationSocket() {
+  if (reconnectTimer !== null) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  if (socket) {
+    const current = socket;
+    socket = null;
+    current.onclose = null;
+    current.close();
+  }
 }

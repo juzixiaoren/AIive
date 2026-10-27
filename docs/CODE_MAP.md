@@ -162,6 +162,8 @@
 | 前端导航 / 主题 / 角标 | `frontend/src/App.tsx` | `frontend/src/hooks/useNotificationSocket.ts`、`frontend/src/lib/base.ts` | — |
 | 任务中心页 | `frontend/src/pages/TaskCenterPage.tsx` | `frontend/src/api/agentTasks.ts`、`frontend/src/hooks/useTaskEvents.ts` | — |
 | 新增一个前端页面 | `frontend/src/pages/XxxPage.tsx` + `App.tsx`（lazy + Tab） | `frontend/src/api/` 加客户端函数 | — |
+| 登录 / 认证（V49） | `frontend/src/hooks/useAuth.tsx`、`frontend/src/pages/LoginPage.tsx` | `frontend/src/api/auth.ts`、`frontend/src/api/client.ts`（统一注入 Bearer、401 触发过期事件）、`backend/aiive/auth/` | `test_auth.py`、`test_auth_frontend_contract.py` |
+| 新增受保护接口 | 后端无需额外代码：`auth/guard.py` 默认拦截白名单外全部路径 | 前端一律经 `api/client.ts`，页面与业务模块不得直接 `fetch` | `test_auth_frontend_contract.py` |
 | Android 客户端 | `apps/android/src/App.tsx`、`apps/android/src/api/chat.ts` | `apps/android/src/config.ts`（后端地址） | — |
 | 新增 DB 表 / 改表 | `backend/aiive/db/models.py` + `backend/alembic/versions/` 新建迁移 | `db/forget_models.py`、`db/retention_models.py`、`alembic/env.py`（需显式导入新模型模块） | `test_db_models*.py` |
 | 新增配置项 | `backend/aiive/config.py::Settings` | `.env` / `.env.example` | `test_config*.py` |
@@ -178,8 +180,9 @@
 
 | 文件 | 职责 |
 |---|---|
-| `main.py` | FastAPI 装配：`create_app()` L131；`lifespan` L142（启动序列：事件循环绑定→prompt catalog 校验→`_ensure_schema` L87 Alembic upgrade→HMAC 密钥→`_ensure_system_thread` L51→检索 generation→backfill→ContextBudget 校验→向量运行时→MCP 恢复 `restore_active_capabilities`→`start_daemon`→OutboxWorker+Heartbeat+APScheduler）；25 个 `include_router` L308-332 |
+| `main.py` | FastAPI 装配：`create_app()` L131；`lifespan` L142（启动序列：事件循环绑定→prompt catalog 校验→`_ensure_schema` L87 Alembic upgrade→HMAC 密钥→`_ensure_system_thread` L51→检索 generation→backfill→ContextBudget 校验→向量运行时→MCP 恢复 `restore_active_capabilities`→`start_daemon`→OutboxWorker+Heartbeat+APScheduler）；26 个 `include_router` L322-347；全局认证中间件 `auth_guard` 在 CORS 之前注册（后注册者位于外层，OPTIONS 预检先被 CORS 处理） |
 | `config.py` | `Settings` L13（pydantic-settings，`.env` 加载）；`validate_memory_features()` L126 启动校验；单例 `settings` L186。**几乎所有模块 `from aiive.config import settings`** |
+| `auth/` | 单用户登录（V49）：`guard.py` 全局 HTTP 中间件 + WS 首帧认证；`security.py` Argon2id / HS256 / 持久签名密钥；`service.py` 初始化、注册、登录、限流。`aiive_auth_enabled` 默认开，非 loopback 禁止关闭 |
 
 ### 3.2 `api/` — REST/WS 路由层
 
@@ -211,8 +214,20 @@
 | `routes_eval.py` | `GET /api/eval/runs`、`/runs/latest`（只读安全门结果，`require_local_developer`） |
 | `routes_personal.py` | `GET /api/personal-signals` |
 | `routes_health.py` | `GET /health` |
+| `routes_auth.py` | `GET /api/auth/status`、`POST /api/auth/register`、`POST /api/auth/login`、`GET /api/auth/me`（前三个匿名，其余接口全部要求 Bearer） |
 
 设计约定：路由函数只做"解析请求→调用 runtime/service→转 HTTP/SSE 错误契约"，业务逻辑不下沉到路由。
+
+#### 3.2.1 `auth/` — 单用户登录（V49）
+
+| 文件 | 职责 / 关键符号 |
+|---|---|
+| `guard.py` | `EXEMPT_PATHS`（仅 `/health`、`/api/auth/{status,register,login}` 匿名）；`auth_guard` 作为 HTTP 中间件在 CORS **之前**注册（后注册者在外层，OPTIONS 预检先被 CORS 处理）；`authenticate_websocket` 在 accept 后 10s 内等首帧 `{"type":"auth","access_token":...}`，失败 `close(1008)`，成功回 `auth_ok` |
+| `security.py` | `hash_password`/`verify_password`（Argon2id）、`create_access_token`/`decode_access_token`（HS256，issuer=aiive，强制校验 sub/iat/exp）、`signing_secret`（配置优先，留空则生成一次并落盘 `.data/auth_secret`，重启后旧 Token 仍有效）、`AuthError`（code + status_code） |
+| `service.py` | `status`/`register`/`login`/`me`；`auth_owners.singleton` 唯一约束是"只允许一个账号"的最终裁决（并发注册 409）；登录失败按 `(client, username)` 进程内滑动窗口限流（默认 5 次 / 900s，429）；账号不存在时用固定 dummy hash 做等价耗时校验 |
+| `routes_auth.py` | `/api/auth/status|register|login|me`；错误统一 `{"detail": code}`，登录失败不区分"密码错"与"账号不存在" |
+
+**边界**：认证只回答"是不是本人"，不替代授权——操作权限与审批仍由 `TaskPolicyEngine` / 工具审批决定（403 由业务层返回）。前端所有请求必须经 `api/client.ts`，页面不得直接 `fetch` 或自行拼 Authorization。
 
 ### 3.3 `core/` — LLM 与规划原语
 
@@ -393,9 +408,9 @@
 ### 3.12 `db/` 与 `alembic/`
 
 - `db/base.py`：`engine` L18、`SessionLocal` L27、`get_db()` L30（FastAPI 依赖）、`create_all()` L43
-- `db/models.py`（59 表，`Base` L17）、`db/forget_models.py`（10 表）、`db/retention_models.py`（2 表）—— 表清单见第 6 节
+- `db/models.py`（63 表，`Base` L17）、`db/forget_models.py`（10 表）、`db/retention_models.py`（2 表）—— 表清单见第 6 节
 - `alembic/env.py`：`target_metadata = Base.metadata` L29，**显式导入 forget/retention 模型** L12-13 防漏表；URL 取自 `settings.database_url`
-- 迁移链：baseline `69da20d1e47c`（全量 schema）→ … → HEAD `e2f6a8c4d1b7`（persistent_agent_tasks），现行链 15 个；`versions/_archive_migrations_20260717/` 为历史归档（已被 baseline squash）
+- 迁移链：baseline `69da20d1e47c`（全量 schema）→ … → HEAD `a7c4e9f1b8d2`（auth_owners，V49），现行链 22 个；`versions/_archive_migrations_20260717/` 为历史归档（已被 baseline squash）
 - **新增表流程**：`db/models.py` 加模型 → `alembic/env.py` 确认导入 → `alembic revision --autogenerate` → 检查生成的迁移（尤其索引/约束）→ 应用
 
 ---
@@ -407,7 +422,11 @@
 | 层 | 文件 | 说明 |
 |---|---|---|
 | 入口 | `src/main.tsx` | createRoot + StrictMode |
-| 根组件 | `src/App.tsx`（`App` L53） | 9 页 lazy Tab 导航、通知角标、亮/暗主题、`trace_id` 跨页传递、`/aiive/developer` 路径识别 |
+| 根组件 | `src/App.tsx`（`AppGate` + `AuthenticatedApp`） | 认证门禁：`loading` 占位、`anonymous` 只渲染 `LoginPage`、登录后回跳 `safeInternalPath` 校验过的原路径；10 页 lazy Tab 导航、通知角标、亮/暗主题、`trace_id` 跨页传递、`/aiive/developer` 路径识别、退出登录 |
+| 认证门禁 | `src/hooks/useAuth.tsx`（`AuthProvider`/`useAuth`） | `phase: loading|anonymous|authenticated`、登录/注册/登出、启动时 `GET api/auth/me` 恢复会话、监听 `AUTH_EXPIRED_EVENT` 被动登出 |
+| 登录页 | `src/pages/LoginPage.tsx` | 首次使用走注册（`GET api/auth/status` 判 `initialized`），之后走登录；错误码文案映射，密码最短 8 位 |
+| API 统一客户端 | `src/api/client.ts` | 唯一允许调用 `fetch` 的地方：注入 `Authorization: Bearer`、JSON 编解码、`status === 401` 时清 Token 并派发 `AUTH_EXPIRED_EVENT` |
+| API 客户端 | `src/api/auth.ts` | `getAuthStatus`、`register`、`login`、`getMe`；Token 只经 `client.ts` 存取 |
 | 样式 | `src/index.css` | Tailwind + 语义色 CSS 变量（`:root`/`[data-theme=dark]`）+ hljs 代码高亮 token |
 | API 客户端 | `src/api/chat.ts` | `getThreadMessages` L64、`sendMessageStream` L124（SSE）、`resetThread` L272、`respondApproval` L303；`ApiError` L89/`StreamIncompleteError` L104 |
 | API 客户端 | `src/api/agentTasks.ts` | `listAgentTasks` L88、`getAgentTask` L94、`createAgentTask` L98、`cancelAgentTask` L113、`sendAgentTaskInput` L117、`decideTaskApproval` L125；长期目标：`getAgentTaskGoal`、`controlAgentTaskGoal`（confirm/reject/pause/resume/end/modify）、`approveAgentTaskGoalStep`、`startAgentTaskGoalStep` |
@@ -419,6 +438,7 @@
 
 | 页面 | Tab | 后端 API |
 |---|---|---|
+| `pages/LoginPage.tsx` | —（`/aiive/login`，匿名可访问） | `GET api/auth/status`、`POST api/auth/register`、`POST api/auth/login` |
 | `pages/ChatPage.tsx`（57KB，最复杂） | chat | `POST api/chat/stream`(SSE)、`GET api/threads/{id}/messages`、`POST api/thread/reset`、`POST api/approval/respond`、`POST api/chat/system`；WS `/ws/{threadId}`。含：SSE 打字机、流式纯文本/完成 Markdown 切换、断流恢复、工具状态机 `normalizeToolCallStatus`、`ToolCallCard` L133、reminder/approval/maintenance_report 卡片、`inFlightRef` 防重发、AbortController、离底未读计数、历史分页 |
 | `pages/TaskCenterPage.tsx` | tasks | agent-tasks 全套 + `evidence/{id}`、`artifacts/{id}`；长期目标面板：`GET {id}/goal` + `POST {id}/goal/{confirm,reject,pause,resume,end}`、`steps/{sid}/{start,approve}`；WS `api/agent-tasks/ws/{id}`；4s 轮询兜底 |
 | `pages/MemoriesPage.tsx` | memories | `api/memories` + `/{id}/{sleep|archive|forget}` |
@@ -437,17 +457,17 @@
 
 ### 5.1 `apps/android/` — Capacitor 遥控端
 纯遥控：HTTP/SSE 对话 + 远程放行桌面高危操作审批。不承载 Agent 逻辑、不本地执行工具。
-`src/main.tsx` → `src/App.tsx`（消息列表/输入/主题/流式/审批卡，localStorage 最近 200 条）；`src/api/chat.ts`（`streamMessage` SSE 事件 started/token/done/error、`resetConversation`、`respondApproval`）；`src/config.ts`（后端地址 `VITE_AIIVE_API_BASE_URL`，默认空防误连）；`capacitor.config.ts`（appId `com.aiive.companion`，cleartext 允许 http）；`android/app/src/main/java/com/aiive/companion/MainActivity.java`（Capacitor 壳）。无鉴权头，依赖后端 CORS 白名单（含 `capacitor://localhost`）。
+`src/main.tsx` → `src/App.tsx`（登录门禁 + 消息列表/输入/主题/流式/审批卡，localStorage 最近 200 条）；`src/api/chat.ts`（`streamMessage` SSE 事件 started/token/done/error、`resetConversation`、`respondApproval`）；`src/api/auth.ts`（status/register/login/me + 统一 `authFetch` 注入 Bearer，401 清 Token 回登录页）；`src/LoginScreen.tsx`（首次注册 / 日常登录）；`src/config.ts`（后端地址 `VITE_AIIVE_API_BASE_URL`，默认空防误连）；`capacitor.config.ts`（appId `com.aiive.companion`，cleartext 允许 http）；`android/app/src/main/java/com/aiive/companion/MainActivity.java`（Capacitor 壳）。Token 存 Capacitor Preferences（键 `aiive_access_token`），不再匿名访问。
 
 ### 5.2 `apps/desktop/` — Electron + 本地执行节点
 双重身份：(a) BrowserWindow 壳（`webUrl = {backend}/aiive/`）；(b) utilityProcess 子进程 Node Host，把本机 14 个能力以 WS 长连接注册给后端。
-`src/main/index.mjs`（窗口/托盘/开机自启 + fork node-host，崩溃指数退避 1s→30s）；`src/preload/index.cjs`（contextBridge `getRuntimeInfo`）；`src/node-host/client.mjs`（27KB 核心：声明能力、连 `ws://{backend}/ws/desktop/{nodeId}` protocol v2、收 `operation` 指令本地执行、回 ack/result；hello/heartbeat/operation.ack/operation.result/journal.snapshot）；`src/node-host/journal.mjs`（`~/.aiive/action-journal.json` + InFlightActionCoordinator 合并同 Action）；`src/node-host/locks.mjs`（`assertTaskScope`/`assertResolvedPathScope` realpath 防逃逸/租约）；`src/node-host/journal.test.mjs`（`node --test`）。鉴权 `AIIVE_DESKTOP_NODE_AUTH_TOKEN`。
+`src/main/index.mjs`（窗口/托盘/开机自启 + fork node-host，崩溃指数退避 1s→30s；`aiive-desktop:set-auth-token` IPC 把用户 Token 经 `postMessage` 下发给 Node Host，只驻留内存）；`src/preload/index.cjs`（contextBridge `getRuntimeInfo` + `setAuthToken`）；`src/node-host/client.mjs`（27KB 核心：声明能力、连 `ws://{backend}/ws/desktop/{nodeId}` protocol v2、hello 里带 `access_token`、收 `operation` 指令本地执行、回 ack/result；无 Token 时不连接、登出即停连；hello/heartbeat/operation.ack/operation.result/journal.snapshot）；`src/node-host/journal.mjs`（`~/.aiive/action-journal.json` + InFlightActionCoordinator 合并同 Action）；`src/node-host/locks.mjs`（`assertTaskScope`/`assertResolvedPathScope` realpath 防逃逸/租约）；`src/node-host/journal.test.mjs`（`node --test`）。双重凭据：节点令牌 `AIIVE_DESKTOP_NODE_AUTH_TOKEN`（证明节点）+ 用户 `access_token`（证明本人）。
 
 ---
 
-## 6. 数据库表地图（74 表）
+## 6. 数据库表地图（75 表）
 
-> 模型定义：`db/models.py`（62）+ `db/forget_models.py`（10）+ `db/retention_models.py`（2）。迁移：baseline `69da20d1e47c`，HEAD `b7f3c1d9a4e2`。
+> 模型定义：`db/models.py`（63）+ `db/forget_models.py`（10）+ `db/retention_models.py`（2）。迁移：baseline `69da20d1e47c`，HEAD `a7c4e9f1b8d2`。
 
 | 域 | 表 | 说明 |
 |---|---|---|
@@ -472,6 +492,7 @@
 | Outbox/工具 | `outbox_jobs`、`tool_operations` | 事务发件箱/工具操作（幂等） |
 | 任务/Agent | `tasks`、`attention_states`、`agent_tasks`、`agent_runs`、`agent_actions`、`agent_task_events`、`agent_task_checkpoints`、`task_evidence`、`task_artifacts`、`task_resource_locks`、`agent_task_watches` | 条件任务/注意力/持久 Agent 任务全家桶 |
 | 工件 | `artifacts` | 通用工件存储 |
+| 认证 | `auth_owners` | 单用户所有者账号（V49）：`singleton` 恒 1 且唯一（整库最多一行）、`username` 唯一、Argon2id `password_hash`、`last_login_at` |
 
 ---
 
@@ -645,6 +666,39 @@ scheduler(_improvement_discovery_scanner_job, 6h)
 
 ---
 
+### 7.8 认证链路（V49）
+
+HTTP：
+
+```
+前端 api/client.ts 注入 Authorization: Bearer <access_token>
+  → auth_guard（白名单外全部路径）
+      无/坏 Token → 401 {"detail": "not_authenticated" | "token_expired" | "invalid_token"} + WWW-Authenticate: Bearer
+      有效       → request.state.username = sub → 业务路由（权限/审批仍由 TaskPolicyEngine 决定）
+  → 前端收到 401：清 Token + 派发 AUTH_EXPIRED_EVENT → useAuth 置 anonymous → 渲染登录页
+```
+
+WebSocket（3 个入口：`/ws/{thread_id}`、`/ws/__global__`、`/ws/{task_id}`）：
+
+```
+accept → 服务端 10s 内等首帧 {"type":"auth","access_token":...}
+  成功 → 回 {"type":"auth_ok","data":{"username"}} → 之后才接受业务消息
+  失败/超时/非 auth 首帧 → close(1008)，不发送任何业务数据
+```
+
+桌面节点 `/ws/desktop/{node_id}`：hello 帧同时带节点令牌与用户 `access_token`（节点身份 + 用户身份双凭据）；
+无用户 Token 时 Node Host 不连接，登出后停止重连。
+
+首次使用与登录：
+
+```
+GET  /api/auth/status → {"initialized": false} → 注册页
+POST /api/auth/register（仅未初始化时可用；singleton 唯一约束兜住并发，后到者 409）
+POST /api/auth/login（失败统一 invalid_credentials；同 (client, username) 超 5 次/15min → 429 too_many_attempts）
+```
+
+---
+
 ## 8. 测试与脚本地图
 
 ### 8.1 测试
@@ -659,6 +713,8 @@ scheduler(_improvement_discovery_scanner_job, 6h)
 | `tests/conftest.py` | 公共 | 从 `.env` 仅加载 `AIIVE_` 前缀变量；`db_session` 夹具；按目录自动标注层级 marker |
 | `tests/support.py` | 公共 | SessionLocal 分发器安装（先于 aiive 模块导入） |
 | `apps/desktop/src/node-host/journal.test.mjs` | Node | Node 内置 `node --test`（`npm run test:node-host`） |
+| `tests/unit/backend/test_auth.py` | 单元（认证验收） | 23 例：初始化状态、唯一注册、Argon2id 哈希、登录失败不可区分、限流、Token 过期/签名错误、重启后仍有效、全部路由匿名访问矩阵、WS 首帧认证、桌面节点用户级认证 |
+| `tests/unit/backend/test_auth_frontend_contract.py` | 静态守卫 | 11 例源码扫描：页面禁止裸 `fetch`、WS 必须发认证帧、页面/API 模块不得自管 Token、App 登录门禁与安全回跳、桌面 IPC 只传 Token 不落盘 |
 
 跑测试：
 - 默认快速（单元+流程，无需任何外部服务）：`python -m pytest tests/unit tests/flow`

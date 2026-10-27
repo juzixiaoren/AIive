@@ -24,6 +24,9 @@ dependencies = [
     "mcp>=1.0,<2.0",
     "pillow>=10.0",
     "pypdf>=5.0",
+    # 单用户登录（V49）：HS256 JWT 与 Argon2id 密码哈希
+    "pyjwt>=2.8",
+    "argon2-cffi>=23.1",
 ]
 
 [project.optional-dependencies]

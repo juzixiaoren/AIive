@@ -64,6 +64,9 @@ def _cleanup_test_db() -> None:
 os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DB}"
 # pgvector 为 PostgreSQL 专属能力，SQLite 下必须关闭，否则 Settings 校验直接失败
 os.environ["AIIVE_MEMORY_VECTOR_ENABLED"] = "false"
+# 认证默认开启，但既有用例都以匿名方式调用 API；测试层统一关闭，
+# 认证行为由 tests/unit/backend/test_auth.py 显式打开 settings.aiive_auth_enabled 验证。
+os.environ["AIIVE_AUTH_ENABLED"] = "false"
 
 # ── 1.5 进程级测试库建表 ──────────────────────────────────────────────────
 

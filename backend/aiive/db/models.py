@@ -2120,3 +2120,25 @@ class MemoryConflictCase(Base):
             name="ck_memory_conflict_cases_status",
         ),
     )
+
+
+class AuthOwner(Base):
+    """单用户所有者账号（V49）：整库最多一行，用唯一约束保证并发注册只成功一次。"""
+
+    __tablename__: str = "auth_owners"
+    # 约束名与 alembic 迁移保持一致，避免 alembic check 把"匿名唯一约束"判成结构漂移。
+    __table_args__: tuple[UniqueConstraint, ...] = (
+        UniqueConstraint("singleton", name="uq_auth_owners_singleton"),
+        UniqueConstraint("username", name="uq_auth_owners_username"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    # singleton 恒为 1 且唯一：数据库层面拒绝第二个所有者账号，
+    # 不依赖"先查后插"的应用层判断（并发注册会同时通过存在性检查）。
+    singleton: Mapped[int] = mapped_column(nullable=False, default=1)
+    username: Mapped[str] = mapped_column(String(64), nullable=False)
+    password_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    last_login_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )

@@ -1,6 +1,7 @@
 /**
  * 记忆管理页面：展示数据库中的可见记忆，并调用真实生命周期 API。
  */
+import { apiFetch } from "../api/client";
 import { FormEvent, useCallback, useEffect, useState } from "react";
 
 type MemoryItem = {
@@ -38,7 +39,7 @@ export default function MemoriesPage() {
     setLoading(true);
     setError("");
     try {
-      const response = await fetch("api/memories");
+      const response = await apiFetch("api/memories");
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       setMemories(await response.json() as MemoryItem[]);
     } catch (err) {
@@ -56,7 +57,7 @@ export default function MemoriesPage() {
     setSaving(true);
     setError("");
     try {
-      const response = await fetch("api/memories", {
+      const response = await apiFetch("api/memories", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -93,7 +94,7 @@ export default function MemoriesPage() {
     setActingId(memory.id);
     setError("");
     try {
-      const response = await fetch(`api/memories/${memory.id}/${action}`, {
+      const response = await apiFetch(`api/memories/${memory.id}/${action}`, {
         method: "POST",
         headers: action === "forget" ? { "Content-Type": "application/json" } : undefined,
         body: action === "forget" ? JSON.stringify({ reason: "用户从记忆管理页面请求遗忘" }) : undefined,

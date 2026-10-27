@@ -1,3 +1,4 @@
+import { apiFetch } from "./client";
 export interface AgentTaskEvent {
   id: string;
   sequence: number;
@@ -88,11 +89,11 @@ async function json<T>(pending: Response | Promise<Response>): Promise<T> {
 export async function listAgentTasks(threadId?: string): Promise<AgentTaskSummary[]> {
   const params = new URLSearchParams();
   if (threadId) params.set("thread_id", threadId);
-  return json(fetch(`api/agent-tasks${params.size ? `?${params}` : ""}`));
+  return json(apiFetch(`api/agent-tasks${params.size ? `?${params}` : ""}`));
 }
 
 export async function getAgentTask(taskId: string): Promise<AgentTaskDetail> {
-  return json(fetch(`api/agent-tasks/${encodeURIComponent(taskId)}`));
+  return json(apiFetch(`api/agent-tasks/${encodeURIComponent(taskId)}`));
 }
 
 export async function createAgentTask(input: {
@@ -103,7 +104,7 @@ export async function createAgentTask(input: {
   target_node_id?: string;
   task_brief?: Record<string, unknown>;
 }): Promise<AgentTaskDetail> {
-  return json(fetch("api/agent-tasks", {
+  return json(apiFetch("api/agent-tasks", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
@@ -111,11 +112,11 @@ export async function createAgentTask(input: {
 }
 
 export async function cancelAgentTask(taskId: string): Promise<void> {
-  await json(fetch(`api/agent-tasks/${encodeURIComponent(taskId)}/cancel`, { method: "POST" }));
+  await json(apiFetch(`api/agent-tasks/${encodeURIComponent(taskId)}/cancel`, { method: "POST" }));
 }
 
 export async function sendAgentTaskInput(taskId: string, content: string): Promise<void> {
-  await json(fetch(`api/agent-tasks/${encodeURIComponent(taskId)}/input`, {
+  await json(apiFetch(`api/agent-tasks/${encodeURIComponent(taskId)}/input`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ content }),
@@ -123,7 +124,7 @@ export async function sendAgentTaskInput(taskId: string, content: string): Promi
 }
 
 export async function decideTaskApproval(approvalId: string, action: "approve" | "deny"): Promise<void> {
-  await json(fetch("api/approval/respond", {
+  await json(apiFetch("api/approval/respond", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ approval_id: approvalId, action }),
@@ -178,7 +179,7 @@ export interface AgentTaskGoal {
 }
 
 export async function getAgentTaskGoal(taskId: string): Promise<AgentTaskGoal> {
-  return json(fetch(`api/agent-tasks/${encodeURIComponent(taskId)}/goal`));
+  return json(apiFetch(`api/agent-tasks/${encodeURIComponent(taskId)}/goal`));
 }
 
 export async function controlAgentTaskGoal(
@@ -186,7 +187,7 @@ export async function controlAgentTaskGoal(
   action: "confirm" | "reject" | "pause" | "resume" | "end" | "modify",
   body?: Record<string, unknown>,
 ): Promise<AgentTaskGoal> {
-  return json(fetch(`api/agent-tasks/${encodeURIComponent(taskId)}/goal/${action}`, {
+  return json(apiFetch(`api/agent-tasks/${encodeURIComponent(taskId)}/goal/${action}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body ?? {}),
@@ -194,9 +195,9 @@ export async function controlAgentTaskGoal(
 }
 
 export async function approveAgentTaskGoalStep(taskId: string, stepId: string): Promise<AgentTaskGoal> {
-  return json(fetch(`api/agent-tasks/${encodeURIComponent(taskId)}/goal/steps/${encodeURIComponent(stepId)}/approve`, { method: "POST" }));
+  return json(apiFetch(`api/agent-tasks/${encodeURIComponent(taskId)}/goal/steps/${encodeURIComponent(stepId)}/approve`, { method: "POST" }));
 }
 
 export async function startAgentTaskGoalStep(taskId: string, stepId: string): Promise<AgentTaskGoal> {
-  return json(fetch(`api/agent-tasks/${encodeURIComponent(taskId)}/goal/steps/${encodeURIComponent(stepId)}/start`, { method: "POST" }));
+  return json(apiFetch(`api/agent-tasks/${encodeURIComponent(taskId)}/goal/steps/${encodeURIComponent(stepId)}/start`, { method: "POST" }));
 }

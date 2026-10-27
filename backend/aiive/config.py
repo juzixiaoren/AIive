@@ -190,6 +190,20 @@ class Settings(BaseSettings):
     # 旧 selfdev 直接变更 API 的 Trusted Core 管理令牌；Task 路径仍需 Action 审批。
     aiive_trusted_core_admin_token: str = "aiive-trusted-core-dev-token"
 
+    # 单用户登录（V49）：唯一所有者账号 + 单个长期 access_token。
+    # auth_enabled: 全局 HTTP/WebSocket 认证开关。默认开启；关闭仅用于本地
+    #   测试与单机调试，非 loopback 部署会在启动校验中直接拒绝关闭。
+    # auth_secret: HS256 签名密钥。留空时自动生成一次并写入 auth_secret_file，
+    #   重启读取同一文件，保证已签发 Token 继续有效；更换密钥会使全部旧 Token 失效。
+    # auth_token_days: Token 有效期（天），默认 365。
+    # auth_login_max_attempts / auth_login_window_seconds: 登录失败限流窗口。
+    aiive_auth_enabled: bool = True
+    aiive_auth_secret: str = ""
+    aiive_auth_secret_file: str = ".data/auth_secret"
+    aiive_auth_token_days: int = 365
+    aiive_auth_login_max_attempts: int = 5
+    aiive_auth_login_window_seconds: int = 900
+
     # 服务器监听配置
     host: str = "127.0.0.1"
     port: int = 8000
@@ -257,6 +271,18 @@ class Settings(BaseSettings):
             raise ValueError("AIIVE_GOAL_WAIT_REMINDER_HOURS 必须大于 0")
         if self.aiive_goal_missed_streak_threshold <= 0:
             raise ValueError("AIIVE_GOAL_MISSED_STREAK_THRESHOLD 必须大于 0")
+        if self.aiive_auth_secret.strip() and len(self.aiive_auth_secret.strip()) < 32:
+            # HS256 密钥短于 32 字节会显著降低暴力破解成本。
+            raise ValueError("AIIVE_AUTH_SECRET 至少需要 32 个字符")
+        if self.aiive_auth_token_days <= 0:
+            raise ValueError("AIIVE_AUTH_TOKEN_DAYS 必须大于 0")
+        if self.aiive_auth_login_max_attempts <= 0:
+            raise ValueError("AIIVE_AUTH_LOGIN_MAX_ATTEMPTS 必须大于 0")
+        if self.aiive_auth_login_window_seconds <= 0:
+            raise ValueError("AIIVE_AUTH_LOGIN_WINDOW_SECONDS 必须大于 0")
+        if not self.aiive_auth_enabled and self.host not in {"127.0.0.1", "localhost", "::1"}:
+            # 关闭认证会让全部私人数据接口裸奔，只允许在 loopback 调试时使用。
+            raise ValueError("非 loopback 部署不允许关闭 AIIVE_AUTH_ENABLED")
         if not (self.aiive_memory_vector_enabled or self.aiive_knowledge_vector_enabled):
             return self
         # 记忆向量是强依赖：开启即要求 PostgreSQL。知识分块向量属于可降级的

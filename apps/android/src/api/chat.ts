@@ -1,4 +1,5 @@
 import { appConfig } from "../config";
+import { apiFetch } from "./auth";
 
 export interface ChatMessage {
   id: string;
@@ -37,13 +38,6 @@ export interface ApprovalResponse {
   error?: string;
 }
 
-function apiUrl(path: string): string {
-  if (!appConfig.backendBaseUrl) {
-    throw new Error("尚未配置服务器地址，请先填写 apps/android/src/config.ts");
-  }
-  return `${appConfig.backendBaseUrl}/api/${path.replace(/^\/+/, "")}`;
-}
-
 async function responseError(response: Response): Promise<Error> {
   const detail = await response.text();
   return new Error(`服务器请求失败 (${response.status})${detail ? `：${detail}` : ""}`);
@@ -59,7 +53,7 @@ export async function streamMessage(
   callbacks: StreamCallbacks,
   signal: AbortSignal,
 ): Promise<StreamResult> {
-  const response = await fetch(apiUrl("chat/stream"), {
+  const response = await apiFetch("chat/stream", {
     method: "POST",
     headers: {
       Accept: "text/event-stream",
@@ -158,7 +152,7 @@ export async function streamMessage(
 
 export async function resetConversation(threadId?: string): Promise<void> {
   if (!threadId || !hasBackendConfig()) return;
-  const response = await fetch(apiUrl("thread/reset"), {
+  const response = await apiFetch("thread/reset", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ thread_id: threadId }),
@@ -170,7 +164,7 @@ export async function respondApproval(
   approvalId: string,
   action: "approve" | "deny",
 ): Promise<ApprovalResponse> {
-  const response = await fetch(apiUrl("approval/respond"), {
+  const response = await apiFetch("approval/respond", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ approval_id: approvalId, action }),

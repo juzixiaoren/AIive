@@ -9,6 +9,8 @@ import {
   streamMessage,
 } from "./api/chat";
 import { appConfig } from "./config";
+import LoginScreen from "./LoginScreen";
+import { AUTH_EXPIRED_EVENT, getAuthStatus, getMe, getToken, logout } from "./api/auth";
 
 type Theme = "light" | "dark";
 
@@ -88,7 +90,7 @@ function StopIcon() {
   );
 }
 
-export default function App() {
+function ChatApp({ username, onLogout }: { username: string; onLogout: () => void }) {
   const [initialChat] = useState(loadChat);
   const [messages, setMessages] = useState<ChatMessage[]>(initialChat.messages);
   const [threadId, setThreadId] = useState(initialChat.threadId);
@@ -262,6 +264,16 @@ export default function App() {
           </div>
         </div>
         <div className="header-actions">
+          <span className="account-chip" title={username}>{username}</span>
+          <button
+            type="button"
+            className="icon-button"
+            onClick={onLogout}
+            aria-label="退出登录"
+            title="退出登录"
+          >
+            退出
+          </button>
           <button
             type="button"
             className="icon-button"
@@ -394,5 +406,84 @@ export default function App() {
         </div>
       </footer>
     </div>
+  );
+}
+
+
+/**
+ * 应用入口（V49）：先确定认证状态，再决定渲染登录界面还是聊天界面。
+ * - 未初始化：显示一次性创建所有者账号表单
+ * - 已初始化且本地有有效 Token：直接进入聊天
+ * - 任意受保护请求返回 401：清除凭证并回到登录界面（不无限重试）
+ */
+export default function App() {
+  const [phase, setPhase] = useState<"loading" | "anonymous" | "authenticated">("loading");
+  const [initialized, setInitialized] = useState(true);
+  const [username, setUsername] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    const bootstrap = async () => {
+      try {
+        const status = await getAuthStatus();
+        if (cancelled) return;
+        setInitialized(status.initialized);
+        if (!status.initialized || !getToken()) {
+          setPhase("anonymous");
+          return;
+        }
+        const me = await getMe();
+        if (cancelled) return;
+        setUsername(me.username);
+        setPhase("authenticated");
+      } catch {
+        if (!cancelled) setPhase("anonymous");
+      }
+    };
+    void bootstrap();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    const handler = () => {
+      setUsername("");
+      setPhase("anonymous");
+    };
+    window.addEventListener(AUTH_EXPIRED_EVENT, handler);
+    return () => window.removeEventListener(AUTH_EXPIRED_EVENT, handler);
+  }, []);
+
+  if (phase === "loading") {
+    return (
+      <div className="auth-shell">
+        <p className="auth-hint">正在验证登录状态…</p>
+      </div>
+    );
+  }
+
+  if (phase === "anonymous") {
+    return (
+      <LoginScreen
+        initialized={initialized}
+        onAuthenticated={(name) => {
+          setUsername(name);
+          setPhase("authenticated");
+        }}
+        onInitialized={() => setInitialized(true)}
+      />
+    );
+  }
+
+  return (
+    <ChatApp
+      username={username}
+      onLogout={() => {
+        logout();
+        setUsername("");
+        setPhase("anonymous");
+      }}
+    />
   );
 }

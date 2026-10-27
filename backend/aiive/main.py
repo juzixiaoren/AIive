@@ -22,6 +22,7 @@ logging.basicConfig(
 from aiive.api.routes_agent_tasks import router as agent_tasks_router
 from aiive.api.routes_approval import router as approval_router
 from aiive.api.routes_attention import router as attention_router
+from aiive.api.routes_auth import router as auth_router
 from aiive.api.routes_capabilities import router as capabilities_router
 from aiive.api.routes_chat import router as chat_router
 from aiive.api.routes_debug import router as debug_router
@@ -296,6 +297,11 @@ def create_app() -> FastAPI:
             )
 
     app.middleware("http")(catch_unhandled_exceptions)
+    # 认证守卫必须早于 CORS 注册：Starlette 后注册的中间件在外层，
+    # 这样 OPTIONS 预检由 CORS 先处理，不会被 401 拦截。
+    from aiive.auth.guard import auth_guard
+
+    app.middleware("http")(auth_guard)
 
     # 配置 CORS 中间件，允许 Web 开发服务器和 Android Capacitor WebView 访问。
     # 生产域名可通过 AIIVE_CORS_ORIGINS 追加或替换，避免使用通配符来源。
@@ -314,6 +320,7 @@ def create_app() -> FastAPI:
 
     # 注册所有 API 路由
     app.include_router(health_router)
+    app.include_router(auth_router)
     app.include_router(chat_router)
     app.include_router(debug_router)
     app.include_router(eval_router)

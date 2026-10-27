@@ -1,6 +1,7 @@
 /**
  * 开发者只读诊断页面：查看 Thread、Trace、LLM 调用、Outbox 和 Epoch 状态。
  */
+import { apiFetch } from "../api/client";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
 type DebugEvent = {
@@ -81,8 +82,8 @@ export default function DeveloperPage({ selectedTraceId }: { selectedTraceId?: s
     setError("");
     try {
       const [eventResponse, epochResponse] = await Promise.all([
-        fetch(`api/debug/events?thread_id=${encodeURIComponent(threadId.trim())}`),
-        fetch(`api/epochs/${encodeURIComponent(threadId.trim())}`),
+        apiFetch(`api/debug/events?thread_id=${encodeURIComponent(threadId.trim())}`),
+        apiFetch(`api/epochs/${encodeURIComponent(threadId.trim())}`),
       ]);
       if (!eventResponse.ok || !epochResponse.ok) throw new Error(`HTTP ${eventResponse.status}/${epochResponse.status}`);
       const threadEvents = await eventResponse.json() as DebugEvent[];
@@ -102,9 +103,9 @@ export default function DeveloperPage({ selectedTraceId }: { selectedTraceId?: s
     setError("");
     try {
       const [eventResponse, callResponse, jobResponse] = await Promise.all([
-        fetch(`api/debug/events?trace_id=${encodeURIComponent(traceId.trim())}`),
-        fetch(`api/debug/llm_calls?trace_id=${encodeURIComponent(traceId.trim())}`),
-        fetch(`api/outbox/jobs?trace_id=${encodeURIComponent(traceId.trim())}`),
+        apiFetch(`api/debug/events?trace_id=${encodeURIComponent(traceId.trim())}`),
+        apiFetch(`api/debug/llm_calls?trace_id=${encodeURIComponent(traceId.trim())}`),
+        apiFetch(`api/outbox/jobs?trace_id=${encodeURIComponent(traceId.trim())}`),
       ]);
       if (!eventResponse.ok || !callResponse.ok || !jobResponse.ok) throw new Error("诊断接口返回错误");
       setEvents(await eventResponse.json() as DebugEvent[]);

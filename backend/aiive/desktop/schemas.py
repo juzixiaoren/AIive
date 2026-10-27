@@ -58,6 +58,9 @@ class DesktopHello(BaseModel):
     app_version: str = Field(default="", max_length=32)
     protocol_version: int = Field(default=2, ge=1, le=100)
     auth_token: str = Field(default="", max_length=512)
+    # 单用户登录（V49）签发的 access_token：由 Electron 主进程经 IPC 取得后
+    # 传给 Node Host，再随 hello 一起发送；节点令牌与用户令牌是两层独立校验。
+    access_token: str = Field(default="", max_length=4096)
     capabilities: list[DesktopCapability] = Field(default_factory=list, max_length=64)
 
 
