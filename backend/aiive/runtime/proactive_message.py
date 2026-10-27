@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 
 from aiive.db.models import Event, Thread, TurnRecord
 from aiive.runtime.epoch_manager import EpochManager, peek_next_turn_sequence
+from aiive.runtime.event_logger import EventLogger
 
 MESSAGE_SOURCE = "runtime_event"
 MAX_MESSAGE_CHARS = 4000
@@ -98,8 +99,8 @@ class ProactiveMessageService:
             epoch_id=epoch.id,
             segment_id=segment.id,
         )
-        event = Event(
-            id=str(uuid.uuid4()),
+        self.db.add(record)
+        event = EventLogger(self.db).log_event(
             trace_id=trace_id,
             thread_id=thread_id,
             event_type="llm_response",
@@ -112,8 +113,6 @@ class ProactiveMessageService:
                 "trigger": dict(metadata or {}),
             },
         )
-        self.db.add(record)
-        self.db.add(event)
         thread.last_activity_at = now
         self.db.flush()
         return {

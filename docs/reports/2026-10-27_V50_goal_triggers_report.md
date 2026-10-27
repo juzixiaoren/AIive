@@ -186,3 +186,54 @@ ACTIVE 目标（QUEUED/BLOCKED_USER/BLOCKED_NODE/BLOCKED_APPROVAL，跳过运行
 - 观察点：`AgentTaskEvent(goal_trigger_fired)` 与 `goal_decision` 的成对出现率；`goal_trigger_decision` 的死信率；
   `ProactiveBlocked` 重试次数（持续偏高说明前台 Turn 长时间占用）。
 - 回滚：删除 allowlist 中的 `goal_trigger_decision` 即可停用触发决策，计划与历史数据不受影响（无迁移）。
+
+## 11. 提交后代码复审（2026-10-27）
+
+对 V50 全部新增/改动代码逐文件复审，重点查逻辑错误、边界缺失、死代码与多套实现。
+以下问题已修复并补 3 个回归用例（`test_goal_triggers.py` 16 → 19 例）。
+
+### 11.1 逻辑错误
+
+| # | 问题 | 位置 | 修复 |
+|---|---|---|---|
+| 1 | `window_once` 在同一窗口内可被**第二个匹配事件**再次触发（键含 event_id，第二次键不同） | `goal_triggers.evaluate_rule` | 命中前先看 `expired_at`/`trigger_count>0`，窗口内只触发一次 |
+| 2 | 带显式 `trigger` 的步骤会被旧时间路径自动起跑：`next_runnable_step` 按 `next_trigger_at` 放行、`schedule_pending_watches` 仍按 `schedule` 建 watch、`_advance` 的 interactive 分支也会接管 | `goal_plan.next_runnable_step`、`goal_service.schedule_pending_watches/_advance` | 显式 trigger 步骤一律 `continue`：只由扫描器命中后置 READY；watch/wake_at/interactive 分支只处理旧 `schedule` |
+| 3 | `modify` 通过 `_copy_step_state` 复制步骤时**丢掉 V50 触发状态**（trigger_count/last_trigger_key/armed_at/cooldown…），改计划后同一规则会二次触发并重复发消息 | `goal_service._copy_step_state` | 补齐 8 个触发字段；`trigger` 变化视同重排期（清 next_trigger_at、未完成步骤回 pending） |
+| 4 | 主动消息在决策**校验之前**发出：决策被拒（如证据不足的 complete_goal、非 ACTIVE 目标）时用户已收到消息 | `handlers_goal_triggers` | 消息写入合并进 `apply` 的同一事务：被拒不发消息；`ProactiveBlocked` 时计划变更一并回滚，由 Outbox 重试 |
+| 5 | `goal_step_completed` 同时出现在"注入的评估时机"和"自触发黑名单"里，`evaluate_on_step_done` 形同虚设 | `goal_triggers.match_event` | 移出黑名单，改由规则自身的 `evaluate_on_step_done` 开关决定是否参与 |
+| 6 | 过期标记（MISSED/`expired_at`）只 flush 不落计划：`_scan_task` 的 `changed` 只由 arm/fire 置位，`save_plan` 被跳过，重启后过期状态丢失 | `goal_trigger_service._scan_task` | 过期与触发都置 `changed=True`；`_fire` 即使命中已有 job 也算变更 |
+| 7 | `_record` 的幂等键只含 step+trigger_key：同一触发先被拒后被接受时，接受记录被去重吞掉 | `goal_decision._record` | 键追加 `action` 与 `accepted` |
+| 8 | `trigger_count` 在重复扫描/回放时虚增（先加后判 job 是否存在） | `goal_trigger_service._fire` | 只在新建 OutboxJob 时 +1，并返回 `created` 作为真实触发计数 |
+
+### 11.2 边界与守卫
+
+- `mark_step_waiting_user` 缺 `plan.status == ACTIVE` 校验：已结束/已暂停的目标仍会被改写 → 补 `goal_not_active`。
+- `complete_goal` 直接 `transition_task(VERIFYING)`：任务处于运行中/已终结时会抛 `InvalidStateTransition` → 限定只接受 BLOCKED_*/QUEUED，其余返回 `goal_running`。
+
+### 11.3 死代码与多套实现
+
+| 项 | 处理 |
+|---|---|
+| `goal_plan._zone` 兼容别名（唯一调用点就在同文件） | 删除，调用点改用 `timezone_for` |
+| `next_occurrence` 与 `next_time_trigger` 两套日历计算 | `next_occurrence` 改为委托 `next_time_trigger(trigger_from_schedule(...))`，只保留一处日历数学 |
+| `goal_trigger_service._parse` 包装 + 函数内 import | 删除，模块顶部直接 import `parse_datetime` |
+| `arm_rule` 中 `if start > now / elif start` 两个分支完全相同 | 合并为单分支，并返回"是否发生变更" |
+| `scan` 里 `if task.status in SKIP_TASK_STATES` | 与查询条件互斥、永不成立 → 删除常量与分支 |
+| `goal_step_done` 事件类型（全仓从未产生） | 从 `_step_done_event` 过滤条件移除，改用 `STEP_DONE_EVENT_TYPE` |
+| `goal_reminder` 自触发黑名单条目（全仓从未产生） | 删除 |
+| 直接构造 `Event(...)` 与既有 `EventLogger.log_event` 两套写法 | `proactive_message`、`goal_decision.write_trace` 改用 `EventLogger` |
+| 记忆召回条件硬编码 `"active"/"valid"` | 改用 `LifecycleState.ACTIVE.value` / `ValidityState.VALID.value`，与召回引擎默认集一致 |
+
+### 11.4 已知未改（记录为遗留）
+
+1. `ProactiveBlocked` 重试会**重新调用模型**（决策未缓存进 job payload）：成本可接受但存在"两次决策不同"的可能；后续可把结构化决策写入 payload 复用。
+2. `decisions_today` 按任务计数（与配置注释"单个目标"一致），多目标并发时额度不共享。
+3. `WAITING_USER` 步骤仍可被周期规则再次触发（用作提醒），是设计选择而非缺陷。
+4. `context()` 超过 12k 字符时直接截断 JSON 文本，模型可能看到不完整结构（已标注 truncated）。
+
+### 11.5 复审后验证
+
+- `pytest tests/unit/backend/test_goal_triggers.py` → 19 passed（新增 17/18/19 三例分别覆盖窗口重复触发、显式规则不被时间路径起跑、modify 保留触发状态）
+- `pytest tests` → **1328 passed, 23 skipped**
+- `ruff check backend/aiive --select F,E9` → All checks passed
+- `basedpyright backend/aiive` → 0 errors, 0 warnings, 0 notes

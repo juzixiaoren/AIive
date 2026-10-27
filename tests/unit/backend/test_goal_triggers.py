@@ -16,6 +16,7 @@ import pytest
 from aiive.db.models import (
     AgentTask,
     AgentTaskEvent,
+    AgentTaskWatch,
     ContextSnapshot,
     Event,
     LLMCall,
@@ -32,6 +33,7 @@ from aiive.task_runtime.goal_decision import (
 from aiive.task_runtime.goal_plan import (
     GoalStepStatus,
     TriggerRule,
+    next_runnable_step,
     next_time_trigger,
     parse_datetime,
     trigger_of,
@@ -630,3 +632,64 @@ def test_legacy_schedule_is_normalized_to_trigger(db_session) -> None:
     rule = trigger_of(plan.step("legacy"))
     assert rule is not None and rule.kind.value == "once_at"
     assert GoalTriggerService(db_session).scan() == 1
+
+# ----------------------------------------------------------------------
+# 17. window_once：同一窗口内只触发一次（第二个匹配事件不再重复入队）
+# ----------------------------------------------------------------------
+def test_window_once_fires_only_once_per_window(db_session) -> None:
+    thread = _thread(db_session)
+    start = (utcnow() - timedelta(minutes=5)).isoformat()
+    end = (utcnow() + timedelta(hours=1)).isoformat()
+    task = _confirmed(db_session, thread, _plan([
+        {"id": "watch", "title": "窗口观察", "kind": "autonomous",
+         "trigger": {"kind": "window_once", "start": start, "end": end,
+                     "event_types": ["user_message"]}},
+    ]))
+    _event(db_session, _object_id(thread), "user_message", {"content": "第一条"})
+    assert GoalTriggerService(db_session).scan() == 1
+
+    # 窗口仍未结束，又来了一个匹配事件：不得二次触发。
+    _event(db_session, _object_id(thread), "user_message", {"content": "第二条"})
+    assert GoalTriggerService(db_session).scan() == 0
+    assert len(_jobs(db_session, _object_id(task))) == 1
+
+
+# ----------------------------------------------------------------------
+# 18. 显式触发规则不会被旧的时间排期路径自动起跑，也不建 time watch
+# ----------------------------------------------------------------------
+def test_explicit_trigger_step_never_auto_starts(db_session) -> None:
+    thread = _thread(db_session)
+    start = (utcnow() - timedelta(minutes=5)).isoformat()
+    end = (utcnow() + timedelta(hours=1)).isoformat()
+    task = _confirmed(db_session, thread, _plan([
+        {"id": "watch", "title": "窗口观察", "kind": "autonomous",
+         "trigger": {"kind": "window_once", "start": start, "end": end}},
+    ]))
+    assert GoalTriggerService(db_session).scan() == 1
+
+    plan = _plan_of(db_session, _object_id(task))
+    # 窗口起点已经过去，但步骤仍应由规则命中驱动，不能按时间自动起跑。
+    assert next_runnable_step(plan, utcnow()) is None
+    assert db_session.query(AgentTaskWatch).count() == 0
+
+
+# ----------------------------------------------------------------------
+# 19. 修改计划不得重置触发状态，否则同一规则会二次触发并重复发消息
+# ----------------------------------------------------------------------
+def test_modify_keeps_trigger_state(db_session) -> None:
+    thread = _thread(db_session)
+    at = (utcnow() - timedelta(minutes=1)).isoformat()
+    task = _confirmed(db_session, thread, _plan([
+        {"id": "report", "title": "交周报", "kind": "autonomous",
+         "trigger": {"kind": "once_at", "at": at}},
+    ]))
+    assert GoalTriggerService(db_session).scan() == 1
+    key = _plan_of(db_session, _object_id(task)).step("report").last_trigger_key
+    assert key
+
+    GoalService(db_session).modify(_object_id(task), {"summary": "新的目标摘要"})
+    db_session.commit()
+
+    plan = _plan_of(db_session, _object_id(task))
+    assert plan.step("report").last_trigger_key == key
+    assert GoalTriggerService(db_session).scan() == 0

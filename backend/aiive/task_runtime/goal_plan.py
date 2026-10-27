@@ -57,10 +57,6 @@ def timezone_for(name: str) -> timezone | Any:
         return timezone.utc
 
 
-# 兼容旧调用点：内部一律使用 timezone_for，保留别名避免一次性大改。
-_zone = timezone_for
-
-
 def parse_datetime(value: Any) -> datetime | None:
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
@@ -117,28 +113,18 @@ class GoalSchedule(BaseModel):
 
 
 def next_occurrence(schedule: GoalSchedule | None, after: datetime) -> datetime | None:
-    """计算 after 之后的下一次触发时间；已过期或超出 until 时返回 None。"""
+    """旧版 schedule 的下一次触发时间；统一委托给 TriggerRule 的排期实现。
+
+    日历计算只保留 next_time_trigger 一处，避免 once/weekly 两套实现漂移。
+    """
     if schedule is None:
         return None
-    zone = _zone(schedule.timezone)
-    moment = after.astimezone(zone)
     if schedule.kind == "once":
-        target = parse_datetime(schedule.at)
-        if target is None:
+        if parse_datetime(schedule.at) is None:
             return None
-        return target if target > moment else None
-    if schedule.weekday is None or not schedule.time:
+    elif schedule.weekday is None or not schedule.time:
         return None
-    clock = dtime.fromisoformat(schedule.time)
-    candidate = datetime.combine(moment.date(), clock, tzinfo=zone)
-    delta = (schedule.weekday - moment.weekday()) % 7
-    candidate = candidate + timedelta(days=delta)
-    if candidate <= moment:
-        candidate = candidate + timedelta(days=7)
-    until = parse_date(schedule.until)
-    if until is not None and candidate.date() > until:
-        return None
-    return candidate
+    return next_time_trigger(trigger_from_schedule(schedule), after)
 
 
 class TriggerKind(StrEnum):
@@ -411,12 +397,14 @@ def next_runnable_step(plan: GoalPlan, now: datetime) -> GoalStep | None:
             continue
         if step.status == GoalStepStatus.READY.value:
             return step
-        trigger = trigger_of(step)
         # 交互步骤必须由用户点击开始（置为 READY）后才可执行，不能自动起跑。
         if step.kind == GoalStepKind.INTERACTIVE.value:
             continue
-        # 有触发规则的步骤只能由规则触发（READY）后执行，避免绕过 once_at/事件条件。
-        if trigger is not None:
+        # 显式触发规则（V50）只由 GoalTriggerService 命中后置 READY，
+        # 这里不能按时间自动起跑，否则 window_once / event_condition 会被绕过。
+        if step.trigger is not None:
+            continue
+        if step.schedule is not None:
             due = parse_datetime(step.next_trigger_at)
             if due is None or due > now:
                 continue

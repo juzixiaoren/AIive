@@ -21,6 +21,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
 from aiive.core.llm_client import LLMClient, default_llm_client
+from aiive.memory.memory_types import LifecycleState, ValidityState
+from aiive.runtime.event_logger import EventLogger
+from aiive.runtime.proactive_message import ProactiveMessageService
 from aiive.db.models import (
     AgentTask,
     AgentTaskEvent,
@@ -175,8 +178,8 @@ class GoalDecisionEngine:
 
     def _memories(self, task: AgentTask) -> list[dict[str, Any]]:
         rows = self.db.query(MemoryRecord).filter(
-            MemoryRecord.lifecycle_state == "active",
-            MemoryRecord.validity_state == "valid",
+            MemoryRecord.lifecycle_state == LifecycleState.ACTIVE.value,
+            MemoryRecord.validity_state == ValidityState.VALID.value,
             (MemoryRecord.scope_type == "global")
             | ((MemoryRecord.scope_type == "thread") & (MemoryRecord.scope_id == task.thread_id)),
         ).order_by(MemoryRecord.observed_at.desc()).limit(8).all()
@@ -298,9 +301,14 @@ class GoalDecisionEngine:
         step_id: str,
         trigger_key: str,
         decision: GoalDecision,
-        message_event_id: str = "",
+        message_text: str = "",
+        trace_id: str = "",
     ) -> dict[str, Any]:
-        """在短事务中执行决策；任何拒绝都只记录事件，不改计划。"""
+        """在短事务中执行决策；任何拒绝都只记录事件，不改计划。
+
+        主动消息与计划变更在**同一事务**内写入：被拒绝的决策不会先给用户发消息，
+        写入失败（如前台 Turn 持租约）时计划变更也会一起回滚，由 Outbox 重试。
+        """
         task = self.repo.get_task(task_id, for_update=True)
         if task is None:
             return {"status": "rejected", "reason": "task_not_found"}
@@ -340,11 +348,29 @@ class GoalDecisionEngine:
             self._record(task, step, decision, accepted=False, reason=str(error))
             return {"status": "rejected", "reason": str(error)}
 
+        message_event_id = ""
+        message_turn_id = ""
+        if decision.action in MESSAGE_ACTIONS and message_text.strip():
+            posted = ProactiveMessageService(self.db).post(
+                thread_id=task.thread_id,
+                content=message_text,
+                trace_id=trace_id or str(uuid.uuid4()),
+                metadata={
+                    "task_id": task.id,
+                    "step_id": step.id,
+                    "trigger_key": trigger_key,
+                    "action": decision.action,
+                },
+            )
+            message_event_id = str(posted.get("event_id") or "")
+            message_turn_id = str(posted.get("turn_id") or "")
+
         self._record(task, step, decision, accepted=True, reason="")
         return {
             "status": "applied",
             "action": decision.action,
             "message_event_id": message_event_id,
+            "message_turn_id": message_turn_id,
         }
 
     def _record(
@@ -367,7 +393,12 @@ class GoalDecisionEngine:
                 "has_message": bool(decision.message),
             },
             visibility="internal",
-            dedupe_key=f"decision:{step.id}:{step.last_trigger_key}",
+            # 同一触发可能先被拒、后被接受：幂等键必须区分动作与结论，
+            # 否则接受结果会被去重掉，审计里只剩拒绝记录。
+            dedupe_key=(
+                f"decision:{step.id}:{step.last_trigger_key}:"
+                f"{decision.action}:{int(accepted)}"
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -416,8 +447,7 @@ class GoalDecisionEngine:
             input_preview=json.dumps(messages, ensure_ascii=False),
             output_preview=str(meta.get("raw") or "")[:20_000],
         ))
-        self.db.add(Event(
-            id=str(uuid.uuid4()),
+        EventLogger(self.db).log_event(
             trace_id=trace_id,
             thread_id=task.thread_id,
             event_type="goal_trigger_decision",
@@ -429,7 +459,7 @@ class GoalDecisionEngine:
                 "decision": decision.model_dump(mode="json"),
                 "outcome": outcome,
             },
-        ))
+        )
 
 
 def decisions_today(db: Session, task_id: str, *, now: datetime | None = None) -> int:

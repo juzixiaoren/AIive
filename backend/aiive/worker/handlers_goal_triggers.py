@@ -15,7 +15,7 @@ from typing import Any
 from aiive.config import settings
 from aiive.db.base import SessionLocal
 from aiive.db.models import Event
-from aiive.runtime.proactive_message import ProactiveBlocked, ProactiveMessageService
+from aiive.runtime.proactive_message import ProactiveBlocked
 from aiive.task_runtime.goal_decision import (
     MESSAGE_ACTIONS,
     GoalDecisionEngine,
@@ -119,44 +119,20 @@ def handle_goal_trigger_decision(claimed: ClaimedJob) -> HandlerResult:
 
     message_event_id = ""
     message_turn_id = ""
-    if decision.action in MESSAGE_ACTIONS:
-        db_message = SessionLocal()
-        try:
-            posted = ProactiveMessageService(db_message).post(
-                thread_id=thread_id,
-                content=decision.message,
-                trace_id=trace_id,
-                metadata={
-                    "task_id": task_id,
-                    "step_id": step_id,
-                    "trigger_key": trigger_key,
-                    "reason": trigger["reason"],
-                },
-            )
-            db_message.commit()
-            message_event_id = str(posted.get("event_id") or "")
-            message_turn_id = str(posted.get("turn_id") or "")
-        except ProactiveBlocked:
-            # post() 在写入前就拒绝，没有任何待提交变更，无需 rollback（close 即可释放事务）。
-            # 前台 Turn 持有租约：不并发插入，交给 Outbox 稍后重试，保持时间线顺序。
-            return _retry_later("foreground_turn_active")
-        except Exception:
-            db_message.rollback()
-            logger.exception("主动消息写入失败: task_id=%s", task_id)
-            return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, "proactive_message_failed")
-        finally:
-            db_message.close()
-
     db_apply = SessionLocal()
     try:
         apply_engine = GoalDecisionEngine(db_apply)
+        # 主动消息与计划变更同一事务：被拒的决策不会先发消息，写消息失败则整体回滚。
         outcome = apply_engine.apply(
             task_id=task_id,
             step_id=step_id,
             trigger_key=trigger_key,
             decision=decision,
-            message_event_id=message_event_id,
+            message_text=decision.message if decision.action in MESSAGE_ACTIONS else "",
+            trace_id=trace_id,
         )
+        message_event_id = str(outcome.get("message_event_id") or "")
+        message_turn_id = str(outcome.get("message_turn_id") or "")
         task = TaskRepository(db_apply).get_task(task_id)
         if task is not None:
             apply_engine.write_trace(
@@ -170,6 +146,10 @@ def handle_goal_trigger_decision(claimed: ClaimedJob) -> HandlerResult:
                 outcome=outcome,
             )
         db_apply.commit()
+    except ProactiveBlocked:
+        # 前台 Turn 持有租约：本次事务的所有变更都未提交，finally 的 close() 即回滚，
+        # 交给 Outbox 稍后重试，保持时间线顺序。
+        return _retry_later("foreground_turn_active")
     except Exception:
         db_apply.rollback()
         logger.exception("目标决策执行失败: task_id=%s", task_id)

@@ -19,15 +19,17 @@ from aiive.task_runtime.goal_plan import (
 )
 
 # 触发自身产生的内部事件不能反过来触发规则，否则会形成自激循环。
+# 注意：goal_step_completed 是"已定义的评估时机"，是否参与由规则自身的
+# evaluate_on_step_done 决定，不能无条件排除。
 SELF_TRIGGER_EVENT_TYPES = frozenset({
     "goal_trigger_fired",
     "goal_trigger_decision",
     "goal_decision",
-    "goal_step_completed",
     "goal_step_running",
     "goal_step_due",
-    "goal_reminder",
 })
+
+STEP_DONE_EVENT_TYPE = "goal_step_completed"
 
 
 @dataclass(frozen=True)
@@ -60,21 +62,31 @@ class TriggerExpiry:
     expired_at: datetime
 
 
-def arm_rule(step: GoalStep, rule: TriggerRule, now: datetime) -> None:
-    """首次评估前补齐 armed_at 与时间型规则的 next_trigger_at。"""
+def _set_next_trigger(step: GoalStep, value: str) -> bool:
+    if step.next_trigger_at == value:
+        return False
+    step.next_trigger_at = value
+    return True
+
+
+def arm_rule(step: GoalStep, rule: TriggerRule, now: datetime) -> bool:
+    """首次评估前补齐 armed_at 与时间型规则的 next_trigger_at；返回是否发生变更。"""
+    changed = False
     if not step.armed_at:
         step.armed_at = now.astimezone(timezone.utc).isoformat()
-    if rule.kind in {TriggerKind.ONCE_AT, TriggerKind.RECURRING, TriggerKind.WINDOW_ONCE}:
-        due = next_time_trigger(rule, now)
-        if rule.kind == TriggerKind.WINDOW_ONCE:
-            start = parse_datetime(rule.start)
-            if start is not None and start > now:
-                step.next_trigger_at = start.astimezone(timezone.utc).isoformat()
-            elif start is not None:
-                step.next_trigger_at = start.astimezone(timezone.utc).isoformat()
-            return
-        if due is not None:
-            step.next_trigger_at = due.astimezone(timezone.utc).isoformat()
+        changed = True
+    if rule.kind not in {TriggerKind.ONCE_AT, TriggerKind.RECURRING, TriggerKind.WINDOW_ONCE}:
+        return changed
+    if rule.kind == TriggerKind.WINDOW_ONCE:
+        # 窗口只表达"从何时开始评估"，真正触发由条件命中决定。
+        start = parse_datetime(rule.start)
+        if start is not None:
+            changed = _set_next_trigger(step, start.astimezone(timezone.utc).isoformat()) or changed
+        return changed
+    due = next_time_trigger(rule, now)
+    if due is not None:
+        changed = _set_next_trigger(step, due.astimezone(timezone.utc).isoformat()) or changed
+    return changed
 
 
 def _parse(value: Any) -> datetime | None:
@@ -84,6 +96,8 @@ def _parse(value: Any) -> datetime | None:
 def match_event(rule: TriggerRule, event: TriggerEvent) -> bool:
     """事件类型 + payload 子集匹配；空 match 表示只看类型。"""
     if event.event_type in SELF_TRIGGER_EVENT_TYPES:
+        return False
+    if event.event_type == STEP_DONE_EVENT_TYPE and not rule.evaluate_on_step_done:
         return False
     if rule.event_types and event.event_type not in rule.event_types:
         return False
@@ -168,6 +182,9 @@ def evaluate_rule(
         nxt = next_time_trigger(rule, now)
         metadata["next_trigger_at"] = nxt.astimezone(timezone.utc).isoformat() if nxt else None
     elif rule.kind == TriggerKind.WINDOW_ONCE:
+        if step.expired_at or step.trigger_count > 0:
+            # 窗口内只触发一次：已触发过或已过期都不再重新判定。
+            return None
         start = _parse(rule.start)
         end = _parse(rule.end)
         if start is None or end is None or now < start:

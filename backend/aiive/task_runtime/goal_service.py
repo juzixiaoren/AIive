@@ -284,7 +284,7 @@ class GoalService:
                     approval_invalidated.add(step.id)
                 continue
             self._copy_step_state(step, old)
-            if step.schedule != old.schedule:
+            if step.schedule != old.schedule or step.trigger != old.trigger:
                 step.next_trigger_at = None
                 rescheduled.append(step.id)
                 if old.status not in FINISHED_STEP_STATES:
@@ -361,6 +361,15 @@ class GoalService:
         step.note = old.note
         step.approved_at = old.approved_at
         step.next_trigger_at = old.next_trigger_at
+        # V50 触发状态：修改计划不能重置，否则同一规则会被重复触发并重复发消息。
+        step.trigger_count = old.trigger_count
+        step.last_trigger_key = old.last_trigger_key
+        step.last_trigger_at = old.last_trigger_at
+        step.armed_at = old.armed_at
+        step.expired_at = old.expired_at
+        step.cooldown_until = old.cooldown_until
+        step.opportunistic_hits = list(old.opportunistic_hits)
+        step.last_message_key = old.last_message_key
 
     @staticmethod
     def _invalidate_step(step: GoalStep, reason: str, now: datetime) -> None:
@@ -486,6 +495,8 @@ class GoalService:
         """LLM 决定等待用户：只阻塞该步骤，其他独立步骤继续可执行。"""
         task = self._require_task(task_id)
         plan = self._require_plan(task)
+        if plan.status != GoalStatus.ACTIVE:
+            raise GoalError("goal_not_active")
         step = plan.step(step_id)
         if step is None:
             raise GoalError("step_not_found")
@@ -512,6 +523,12 @@ class GoalService:
         plan = self._require_plan(task)
         if plan.status not in {GoalStatus.ACTIVE, GoalStatus.BLOCKED}:
             raise GoalError("goal_not_completable")
+        if task.status not in {
+            TaskStatus.BLOCKED_USER.value, TaskStatus.BLOCKED_NODE.value,
+            TaskStatus.BLOCKED_APPROVAL.value, TaskStatus.QUEUED.value,
+        }:
+            # 运行中/已终结的任务不能由决策直接收敛到 SUCCEEDED（状态机会拒绝）。
+            raise GoalError("goal_running")
         if not plan_complete(plan):
             raise GoalError("goal_not_complete")
         missing = [
@@ -700,7 +717,9 @@ class GoalService:
         now = utcnow()
         created = 0
         for step in plan.steps:
-            if step.schedule is None:
+            # 显式触发规则（V50）由 GoalTriggerService 驱动，不再建 time watch，
+            # 否则同一规则会出现"watch 到点 + 扫描器命中"两条启动路径。
+            if step.schedule is None or step.trigger is not None:
                 continue
             # WAITING_USER 也要排下一次：周期交互步骤本次已通知，但下一场仍需触发。
             if step.status not in {
@@ -930,7 +949,8 @@ class GoalService:
             plan.blocked_reason = ""
             self._save(task, plan)
             return "advance"
-        upcoming = upcoming_steps(plan)
+        # 只有旧版 schedule 步骤需要 wake_at 定时唤醒；显式触发规则由扫描器轮询。
+        upcoming = [item for item in upcoming_steps(plan) if item.trigger is None]
         if upcoming:
             plan.current_step_id = None
             plan.last_progress_at = _iso(now)
@@ -943,6 +963,7 @@ class GoalService:
             if item.kind == GoalStepKind.INTERACTIVE.value
             and item.status == GoalStepStatus.PENDING.value
             and item.schedule is None
+            and item.trigger is None
             and dependencies_met(plan, item)
         ]
         if interactive:

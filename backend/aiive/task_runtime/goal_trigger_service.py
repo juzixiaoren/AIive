@@ -25,11 +25,13 @@ from aiive.task_runtime.goal_plan import (
     GoalStatus,
     GoalStep,
     GoalStepStatus,
+    parse_datetime,
     trigger_of,
 )
 from aiive.task_runtime.goal_service import GoalService
 from aiive.task_runtime.goal_triggers import (
     SELF_TRIGGER_EVENT_TYPES,
+    STEP_DONE_EVENT_TYPE,
     TriggerEvent,
     arm_rule,
     evaluate_rule,
@@ -42,12 +44,7 @@ logger = logging.getLogger(__name__)
 
 JOB_TYPE = "goal_trigger_decision"
 TRIGGER_EVENT_LIMIT = 300
-SKIP_TASK_STATES = frozenset({
-    TaskStatus.DISPATCHING.value,
-    TaskStatus.RUNNING.value,
-    TaskStatus.VERIFYING.value,
-    TaskStatus.RECONCILING.value,
-})
+# 只扫描"空闲/等用户"的目标：运行中的任务让出本轮，下一轮重新评估（事件不会丢）。
 ACTIVE_TASK_STATES = frozenset({
     TaskStatus.QUEUED.value,
     TaskStatus.BLOCKED_USER.value,
@@ -89,8 +86,6 @@ class GoalTriggerService:
         ).order_by(AgentTask.updated_at.asc()).limit(limit).with_for_update(skip_locked=True).all()
         fired = 0
         for task in tasks:
-            if task.status in SKIP_TASK_STATES:
-                continue
             try:
                 fired += self._scan_task(task, moment)
             except Exception:
@@ -119,18 +114,19 @@ class GoalTriggerService:
             # 依赖未满足时不能触发：否则会绕过计划顺序（用户沉默只阻塞依赖它的步骤）。
             if not dependencies_met(plan, step):
                 continue
-            arm_rule(step, rule, now)
-            changed = True
+            changed = arm_rule(step, rule, now) or changed
             expired = expiry_of(step, rule, now)
             if expired is not None:
                 self._mark_expired(task, step, now)
+                changed = True
                 continue
             firing = evaluate_rule(step, rule, now, events)
             if firing is None:
                 continue
+            # _fire 一定会改写 last_trigger_key，因此无论是否新建 job 都要落盘计划。
             if self._fire(task, step, rule, firing, now):
                 fired += 1
-                changed = True
+            changed = True
         if changed:
             self.goals.save_plan(task, plan)
         return fired
@@ -148,7 +144,6 @@ class GoalTriggerService:
     ) -> bool:
         operation_id = _trigger_operation_id(task.id, step.id, firing.key)
         trace_id = _trigger_trace_id(operation_id)
-        step.trigger_count += 1
         step.last_trigger_key = firing.key
         step.last_trigger_at = _iso(now)
         if firing.next_trigger_at is not None:
@@ -178,7 +173,10 @@ class GoalTriggerService:
         existing = self.db.query(OutboxJob).filter(
             OutboxJob.operation_id == operation_id,
         ).one_or_none()
-        if existing is None:
+        created = existing is None
+        if created:
+            # 只在真正新入队时累加次数，重复扫描/回放不虚增统计。
+            step.trigger_count += 1
             self.db.add(OutboxJob(
                 operation_id=operation_id,
                 job_type=JOB_TYPE,
@@ -197,7 +195,7 @@ class GoalTriggerService:
                 max_retries=3,
             ))
         self.db.flush()
-        return True
+        return created
 
     def _mark_expired(self, task: AgentTask, step: GoalStep, now: datetime) -> None:
         step.expired_at = _iso(now)
@@ -220,7 +218,7 @@ class GoalTriggerService:
         armed_candidates = []
         for step in plan.steps:
             if step.armed_at:
-                moment = _parse(step.armed_at)
+                moment = parse_datetime(step.armed_at)
                 if moment is not None:
                     armed_candidates.append(moment)
         since = min(armed_candidates) if armed_candidates else None
@@ -247,12 +245,12 @@ class GoalTriggerService:
     def _step_done_event(self, task: AgentTask, plan: GoalPlan) -> TriggerEvent | None:
         """把"某一步刚完成"当作一次评估时机（仍由规则自身的冷却/上限把关）。"""
         armed = [
-            _parse(step.armed_at) for step in plan.steps if step.armed_at
+            parse_datetime(step.armed_at) for step in plan.steps if step.armed_at
         ]
         since = min((item for item in armed if item is not None), default=None)
         query = self.db.query(AgentTaskEvent).filter(
             AgentTaskEvent.task_id == task.id,
-            AgentTaskEvent.event_type.in_(["goal_step_completed", "goal_step_done"]),
+            AgentTaskEvent.event_type == STEP_DONE_EVENT_TYPE,
         )
         if since is not None:
             query = query.filter(AgentTaskEvent.created_at >= since)
@@ -269,9 +267,3 @@ class GoalTriggerService:
             payload=payload,
             created_at=created,
         )
-
-
-def _parse(value: Any) -> datetime | None:
-    from aiive.task_runtime.goal_plan import parse_datetime
-
-    return parse_datetime(value)

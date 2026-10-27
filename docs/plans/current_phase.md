@@ -650,10 +650,15 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - 调度与配额：`scheduler_daemon._agent_task_scanner_job`（10s）追加 `GoalTriggerService(db).scan()`，
   只做确定性匹配（无事件不调 LLM）；Handler 侧 `aiive_goal_trigger_max_decisions_per_day`（默认 12）为硬上限。
 - 用户沉默：`wait_user`/`ask_user` 只把**该步骤**置 `waiting_user`，依赖它的步骤阻塞，独立步骤照常触发。
-- 测试：`tests/unit/backend/test_goal_triggers.py` 16 例（Fake LLM，全离线）：五类规则 + 时区 + 重复事件 +
+- 测试：`tests/unit/backend/test_goal_triggers.py` 19 例（Fake LLM，全离线）：五类规则 + 时区 + 重复事件 +
   重启恢复、no_action/run_step/modify_plan/complete_goal/ask_user/send_message 决策、用户沉默、主动消息插入与
-  前台 Turn 占用重试、聊天不泄露 system 提示词而 Trace 保留完整上下文、旧 schedule 归一化。
-- 全量回归：1325 passed / 23 skipped（PG 与本地 Embedding 专项跳过）。
+  前台 Turn 占用重试、聊天不泄露 system 提示词而 Trace 保留完整上下文、旧 schedule 归一化、
+  window_once 同窗口不重复触发、显式规则不被旧时间路径起跑、modify 保留触发状态。
+- 提交后复审（见交付报告第 11 节）修掉 8 处逻辑错误与 2 处边界缺失：窗口重复触发、旧时间路径与触发规则
+  双启动、modify 重置触发状态、主动消息先于校验发出、step-done 评估时机被黑名单屏蔽、过期/触发未落计划、
+  决策审计幂等键吞掉接受记录、trigger_count 虚增；并清理 7 处死代码/重复实现（含日历排期统一到
+  `next_time_trigger`、Event 统一走 `EventLogger`）。
+- 全量回归：1328 passed / 23 skipped（PG 与本地 Embedding 专项跳过）。
 - 遗留风险：`event_condition`/`opportunistic` 的事件来源限定在线程 `Event` 与 `goal_step_completed` 任务事件，
   其他来源需显式接入；`window_once` 过期只置 MISSED，不会自动改计划；`recurring` 仅支持 daily/weekly
   （无 cron 表达式）；主动消息与前台 Turn 的冲突用 Outbox 重试解决，未做用户级“稍后再说”抑制。

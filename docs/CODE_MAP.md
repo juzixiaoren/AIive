@@ -146,7 +146,7 @@
 | 任务能力边界（Broker） | `control/capability_broker.py`、`control/scope.py`、`control/task_policy.py` | `tools/registry.py::execute_brokered`、`task_runtime/resource_locks.py` | `test_capability_broker*.py` |
 | 任务 Watcher / 资源锁 / 证据 | `task_runtime/watchers.py`、`task_runtime/resource_locks.py`、`task_runtime/evidence.py` | `worker/scheduler_daemon.py::_agent_task_scanner_job` | `test_task_watch*.py` |
 | 长期目标（Goal） | `task_runtime/goal_plan.py`、`task_runtime/goal_service.py` | `task_runtime/runtime.py`（执行钩子）、`task_runtime/watchers.py`（`goal_step_id`）、`api/routes_agent_tasks.py`（`/goal/*`）、`worker/scheduler_daemon.py`（`scan_due_reminders`） | `tests/unit/backend/test_long_term_goal.py` |
-| 目标步骤触发规则 + 决策闭环（V50） | `task_runtime/goal_triggers.py`（纯规则求值：once_at/recurring/window_once/event_condition/opportunistic）、`task_runtime/goal_trigger_service.py`（确定性扫描 → Outbox 入队）、`task_runtime/goal_decision.py`（上下文/LLM 结构化决策/服务端校验/执行/Trace） | `task_runtime/goal_plan.py`（`TriggerRule`/`trigger_of`）、`worker/handlers_goal_triggers.py`（`goal_trigger_decision`）、`runtime/proactive_message.py`（真实时间线消息）、`worker/scheduler_daemon.py::_agent_task_scanner_job`、`worker/job_types.py` | `tests/unit/backend/test_goal_triggers.py`（16 例） |
+| 目标步骤触发规则 + 决策闭环（V50） | `task_runtime/goal_triggers.py`（纯规则求值：once_at/recurring/window_once/event_condition/opportunistic）、`task_runtime/goal_trigger_service.py`（确定性扫描 → Outbox 入队）、`task_runtime/goal_decision.py`（上下文/LLM 结构化决策/服务端校验/执行/Trace） | `task_runtime/goal_plan.py`（`TriggerRule`/`trigger_of`）、`worker/handlers_goal_triggers.py`（`goal_trigger_decision`）、`runtime/proactive_message.py`（真实时间线消息）、`worker/scheduler_daemon.py::_agent_task_scanner_job`、`worker/job_types.py` | `tests/unit/backend/test_goal_triggers.py`（19 例） |
 | 提醒 / 条件任务 | `runtime/task_manager.py` | `worker/task_worker.py`、`tools/builtin_tools.py`（schedule_reminder 等） | `test_reminder*.py`、`test_task_manager*.py` |
 | 通知 | `api/routes_notifications.py` | `worker/outbox_handlers.py`、`frontend/src/pages/NotificationsPage.tsx` | `test_notification*.py` |
 | 桌面节点服务端 | `desktop/node_service.py`、`desktop/connection_manager.py`、`desktop/protocol.py` | `api/routes_desktop.py`、`desktop/registry_overlay.py` | `test_desktop*.py` |
@@ -369,20 +369,21 @@
   以及 V50 触发字段 trigger/trigger_count/last_trigger_key/last_trigger_at/armed_at/expired_at/cooldown_until/opportunistic_hits/last_message_key）、
   `GoalStepKind`（autonomous/interactive/approval_required）、`GoalStepStatus`（pending/ready/running/waiting_user/waiting_time/done/failed/skipped/missed）、
   `TriggerKind`（once_at/recurring/window_once/event_condition/opportunistic）、`TriggerRule`（at/start/end/frequency/weekday/time/timezone/until/event_types/match/cooldown_hours/max_per_day/max_per_week/evaluate_on_step_done，`validate_shape` 逐 kind 校验）、
-  `timezone_for`、`next_occurrence`、`trigger_from_schedule`/`trigger_of`（旧 `schedule` 归一化为 TriggerRule，向后兼容）、`next_time_trigger`、`dependencies_met`、`next_runnable_step`（READY 优先；无 schedule 的 interactive 不自动起跑）、`upcoming_steps`、`plan_complete`、`summarize`。
+  `timezone_for`、`next_occurrence`、`trigger_from_schedule`/`trigger_of`（旧 `schedule` 归一化为 TriggerRule，向后兼容）、`next_time_trigger`（唯一的日历排期实现，旧 `next_occurrence` 委托给它）、`dependencies_met`、`next_runnable_step`（READY 优先；interactive 与显式 trigger 步骤都不按时间自动起跑，后者只由触发扫描器置 READY）、`upcoming_steps`、`plan_complete`、`summarize`。
 - `task_runtime/goal_service.py`：`GoalService` 唯一目标写入口：`attach_plan`（提案，落 task_state["goal"]+checkpoint）、
   `confirm/reject/pause/resume/end/modify`、`start_step`（交互步骤用户开始）、`approve_step`（approval_required 审批）、
   `on_run_started`（无步骤返回 False，运行时不调 LLM）、`on_step_finished`（证据校验/推进/完成）、`on_step_awaiting_user`、
   `on_watch_due`（到期结算 + 下一场排期）、`schedule_pending_watches`/`cancel_watches`、`scan_due_reminders`（沉默提醒，确定性扫描）、
   V50 触发入口：`save_plan`（决策改计划后回写）、`begin_step_from_trigger`（规则触发起跑：校验 ACTIVE/依赖/审批 → ready → queued + `enqueue_run` + checkpoint `goal_step_triggered`）、
-  `mark_step_waiting_user`（LLM 判定需用户输入时只阻塞该步）、`complete_goal`（校验 `plan_complete` + 证据后强制走完状态机到 SUCCEEDED）。
+  `mark_step_waiting_user`（LLM 判定需用户输入时只阻塞该步，要求目标 ACTIVE）、`complete_goal`（校验 `plan_complete` + 证据，且任务必须处于 BLOCKED_*/QUEUED，再走完状态机到 SUCCEEDED）。
+  `modify` 的 `_copy_step_state` 会保留全部 V50 触发状态（trigger_count/last_trigger_key/armed_at/cooldown_until/opportunistic_hits 等），避免改计划后重复触发。
   `modify` 区分执行内容（title/kind/acceptance/depends_on/requires_evidence）与调度时间：内容变化清空状态/证据/审批并递归失效下游（`dependency_changed:<dep>`），仅改时间保留已完成步骤；运行中拒绝（`goal_running`）。
   `approve_step`/`start_step`/`on_run_started` 均校验依赖（`step_dependencies_unmet`），审批不绕过计划顺序；`approve_step` 写 `goal_step_approved` checkpoint。
 - `task_runtime/goal_triggers.py`（V50，纯函数、无 DB）：`TriggerEvent`（thread 事件 / 步骤完成事件）、`TriggerFiring`（`key`/`reason`/`fired_at`/`next_trigger_at`）、`arm_rule`（首次装载 armed_at）、
   `match_event`（事件类型 + payload 子集匹配）、`_within_caps`（日/周频率上限）、`_latest_occurrence`（时区感知的最近一次日历落点）、`evaluate_rule`（返回**稳定幂等键**：`once_at:<iso>`、`recurring:<iso>`、`window_once:<start>:<event_id>`、`event_condition:<event_id>`、`opportunistic:<event_id>`）、`expiry_of`（window_once 到期未满足）。
   所有触发都要求「有真实事件或已定义评估时机」，绝不做无条件周期 LLM 调用。
 - `task_runtime/goal_trigger_service.py`（V50）：`GoalTriggerService.scan(now, limit)` 在 scheduler 里确定性扫描 ACTIVE 目标（QUEUED/BLOCKED_*，跳过运行中）；逐步骤 `trigger_of` → 已完成/运行中/依赖未满足跳过 → `arm_rule` → `expiry_of`（MISSED + `expired_at`）→ `evaluate_rule` → `_fire`：写 `goal_trigger_fired` AgentTaskEvent（`dedupe_key=trigger:<operation_id>`）+ 入队 `OutboxJob(job_type=goal_trigger_decision, operation_id=goal_trigger:<task>:<step>:<sha1(key)[:16]>, trace_id=uuid5(operation_id))`。事件来源：线程 `Event`（排除自触发类型）与 `goal_step_completed` 任务事件。
-- `task_runtime/goal_decision.py`（V50）：`GoalDecisionEngine.context`（目标/步骤/依赖/触发原因/证据/相关记忆/近期对话/当前时间）→ `messages`（system + user，system 只进 Trace 不进聊天）→ `decide`（复用 `default_llm_client`，json_mode）→ `parse`（json_repair 兜底）→ `validate`（服务端复核 action/步骤状态/依赖/审批/证据，LLM 不能绕过）→ `apply`（先校验 `step.last_trigger_key`，过期决策返回 `stale_trigger`，再分发到 `GoalService`）。`_record` 写 `goal_decision` 事件（dedupe_key 幂等），`write_trace` 写 `ContextSnapshot`（含完整 system/历史/触发事件）+ `LLMCall` + `goal_trigger_decision` 事件。`decisions_today` 供每日硬上限。
+- `task_runtime/goal_decision.py`（V50）：`GoalDecisionEngine.context`（目标/步骤/依赖/触发原因/证据/相关记忆/近期对话/当前时间）→ `messages`（system + user，system 只进 Trace 不进聊天）→ `decide`（复用 `default_llm_client`，json_mode）→ `parse`（json_repair 兜底）→ `validate`（服务端复核 action/步骤状态/依赖/审批/证据，LLM 不能绕过）→ `apply`（先校验 `step.last_trigger_key`，过期决策返回 `stale_trigger`，再分发到 `GoalService`；主动消息在同一事务内写入，被拒不发消息、写失败整体回滚）。`_record` 写 `goal_decision` 事件（dedupe_key 幂等），`write_trace` 写 `ContextSnapshot`（含完整 system/历史/触发事件）+ `LLMCall` + `goal_trigger_decision` 事件。`decisions_today` 供每日硬上限。
 - `runtime/proactive_message.py`（V50）：`ProactiveMessageService.post` 把主动消息写成 `TurnRecord(source=runtime_event, status=completed, turn_sequence=peek_next_turn_sequence)` + `Event(llm_response)`，与用户消息共用唯一时间线；检测到同线程有活跃租约的 running Turn 时抛 `ProactiveBlocked`，由 Outbox 重试，避免并发乱序。
 - `control/`：`capability_broker.py`（`CapabilityBroker`：TaskScope 校验→TaskPolicyEngine→ResourceLock→`registry.execute_brokered`）；`scope.py`（`TaskScope.from_brief` L47/`validate_arguments` L62/`as_envelope` L97）；`task_policy.py`（allow/approval/block）；`approval_service.py`（审批生命周期）
 
@@ -741,7 +742,7 @@ POST /api/auth/login（失败统一 invalid_credentials；同 (client, username)
 | `tests/support.py` | 公共 | SessionLocal 分发器安装（先于 aiive 模块导入） |
 | `apps/desktop/src/node-host/journal.test.mjs` | Node | Node 内置 `node --test`（`npm run test:node-host`） |
 | `tests/unit/backend/test_auth.py` | 单元（认证验收） | 23 例：初始化状态、唯一注册、Argon2id 哈希、登录失败不可区分、限流、Token 过期/签名错误、重启后仍有效、全部路由匿名访问矩阵、WS 首帧认证、桌面节点用户级认证 |
-| `tests/unit/backend/test_goal_triggers.py` | 单元（V50 触发验收） | 16 例：once_at 幂等/重启、recurring 时区落点与下一场、window_once 首次命中与过期、event_condition、opportunistic 冷却/日上限/无事件不调 LLM、运行中任务跳过、no_action+完整 Trace、run_step 只入队一次、modify_plan 版本递增、complete_goal 证据门槛、ask_user 真实助手消息、聊天不泄露 system 提示词而 Trace 保留、前台 Turn 占用 → RETRY_LATER 后按序补发、用户沉默只阻塞依赖步骤、旧 schedule 归一化 |
+| `tests/unit/backend/test_goal_triggers.py` | 单元（V50 触发验收） | 19 例：once_at 幂等/重启、recurring 时区落点与下一场、window_once 首次命中与过期、event_condition、opportunistic 冷却/日上限/无事件不调 LLM、运行中任务跳过、no_action+完整 Trace、run_step 只入队一次、modify_plan 版本递增、complete_goal 证据门槛、ask_user 真实助手消息、聊天不泄露 system 提示词而 Trace 保留、前台 Turn 占用 → RETRY_LATER 后按序补发、用户沉默只阻塞依赖步骤、旧 schedule 归一化、window_once 同窗口不重复触发、显式规则不被时间路径起跑、modify 保留触发状态 |
 | `tests/unit/backend/test_auth_frontend_contract.py` | 静态守卫 | 11 例源码扫描：页面禁止裸 `fetch`、WS 必须发认证帧、页面/API 模块不得自管 Token、App 登录门禁与安全回跳、桌面 IPC 只传 Token 不落盘 |
 
 跑测试：
