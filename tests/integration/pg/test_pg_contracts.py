@@ -17,6 +17,7 @@ FOR UPDATE 语义）。默认快速测试不启用；设置 ``AIIVE_PG_TESTS=1``
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -461,6 +462,21 @@ def test_concurrent_ingest_same_path_yields_single_active_version(
     """并发导入同一 source_path：无论哪个约束拦截后提交方，最终只剩一条活跃文档。"""
     source = tmp_path / "kb-concurrent.md"
     source.write_text("第一版内容", encoding="utf-8")
+    # 第二版先写到独立文件，线程内用 os.replace 原子换入。
+    # 直接在 source 上 write_text 会先截断再写，另一个线程可能读到空文件并抛
+    # DocumentReadError(document_has_no_extractable_text)，把竞态用例变成随机失败。
+    second_version = tmp_path / "kb-concurrent-v2.md"
+    second_version.write_text("第二版内容-1", encoding="utf-8")
+
+    def swap_to_second_version() -> None:
+        for _ in range(200):
+            try:
+                os.replace(second_version, source)
+                return
+            except PermissionError:
+                # Windows 上读线程短暂持有句柄时无法重命名，等它关闭后重试。
+                time.sleep(0.01)
+        raise RuntimeError("无法原子替换并发导入用例的源文件")
 
     n = 2
     barrier = threading.Barrier(n)
@@ -471,8 +487,8 @@ def test_concurrent_ingest_same_path_yields_single_active_version(
         except threading.BrokenBarrierError:
             return "ERR:barrier"
         if index == 1:
-            # 第二个线程改写文件，尽量触发 source_path 部分唯一索引而非 content_hash
-            source.write_text(f"第二版内容-{index}", encoding="utf-8")
+            # 第二个线程原子换入不同内容，尽量触发 source_path 部分唯一索引而非 content_hash
+            swap_to_second_version()
         session = pg_sessionmaker()
         try:
             result = KnowledgeIngestor(session).ingest(str(source))
