@@ -7,7 +7,7 @@
 > - **路径约定**：均相对项目根（`AIive/`），如 `backend/aiive/main.py`、`frontend/src/pages/ChatPage.tsx`
 > - **行号**：基于建图时的代码版本，仅供快速跳转，以实际代码为准
 > - **维护规则**：见文末第 9 节。**新增/删除/移动文件、改 key 符号行号、改表结构后必须同步更新本文档**
-> - 建图日期：2026-10-21；最近更新：2026-10-27（V49 单用户认证、V50 目标步骤触发规则 + 主动消息、V51 工具结果回填预算、V52 后台回填统一 + Bash 流式日志）
+> - 建图日期：2026-10-21；最近更新：2026-10-27（V49 单用户认证、V50 目标步骤触发规则 + 主动消息、V51 工具结果回填预算、V52 后台回填统一 + Bash 流式日志、V53 通用计划事件源扩展）
 
 ---
 
@@ -148,6 +148,7 @@
 | 任务 Watcher / 资源锁 / 证据 | `task_runtime/watchers.py`、`task_runtime/resource_locks.py`、`task_runtime/evidence.py` | `worker/scheduler_daemon.py::_agent_task_scanner_job` | `test_task_watch*.py` |
 | 长期目标（Goal） | `task_runtime/goal_plan.py`、`task_runtime/goal_service.py` | `task_runtime/runtime.py`（执行钩子）、`task_runtime/watchers.py`（`goal_step_id`）、`api/routes_agent_tasks.py`（`/goal/*`）、`worker/scheduler_daemon.py`（`scan_due_reminders`） | `tests/unit/backend/test_long_term_goal.py` |
 | 目标步骤触发规则 + 决策闭环（V50） | `task_runtime/goal_triggers.py`（纯规则求值：once_at/recurring/window_once/event_condition/opportunistic）、`task_runtime/goal_trigger_service.py`（确定性扫描 → Outbox 入队）、`task_runtime/goal_decision.py`（上下文/LLM 结构化决策/服务端校验/执行/Trace） | `task_runtime/goal_plan.py`（`TriggerRule`/`trigger_of`）、`worker/handlers_goal_triggers.py`（`goal_trigger_decision`）、`runtime/proactive_message.py`（真实时间线消息）、`worker/scheduler_daemon.py::_agent_task_scanner_job`、`worker/job_types.py` | `tests/unit/backend/test_goal_triggers.py`（19 例） |
+| 通用计划事件源（V53） | `task_runtime/goal_events.py`（`GoalEvent`/`publish_goal_event`：真实运行事件 → Outbox `goal_event_dispatch`）、`worker/handlers_goal_events.py`（事件 → 活动计划确定性匹配） | `task_runtime/goal_trigger_service.py::dispatch_event`、`task_runtime/repository.py::transition_task`（任务终态）、`worker/handlers_knowledge.py`（知识维护完成/失败）、`selfdev/repair_loop.py::persist_repair_run`（修复结果）、`worker/job_types.py` | `tests/unit/backend/test_goal_event_sources.py`（13 例） |
 | 提醒 / 条件任务 | `runtime/task_manager.py` | `worker/task_worker.py`、`tools/builtin_tools.py`（schedule_reminder 等） | `test_reminder*.py`、`test_task_manager*.py` |
 | 通知 | `api/routes_notifications.py` | `worker/outbox_handlers.py`、`frontend/src/pages/NotificationsPage.tsx` | `test_notification*.py` |
 | 桌面节点服务端 | `desktop/node_service.py`、`desktop/connection_manager.py`、`desktop/protocol.py` | `api/routes_desktop.py`、`desktop/registry_overlay.py` | `test_desktop*.py` |
@@ -352,14 +353,14 @@
 | `outbox_worker.py` | `OutboxWorker` L47：`claim_one` L69（skip_locked+双重 lease+claim_token）、`enqueue` L152（allowlist 强校验）、`poll` L182、`_dispatch_one` L218；终态 `_finalize_job` L366 / 重试 `_retry_later` L405 / 死信 L519 / forget 阶段死信 L677 |
 | `handler_registry.py` | `HandlerRegistry` L10：job_type→handler + schema_version 白名单 |
 | `outbox_dto.py` | `HandlerOutcome` 枚举 L16（COMPLETED/RETRY_LATER/NON_RETRYABLE/RETRYABLE_ERROR/CLAIM_LOST/CONTINUE）；`ClaimedJob`/`HandlerResult`/`ActiveClaim`；`FencingViolationError` L102 |
-| `outbox_handlers.py`（100KB） | 装配 `register_all` L1398（26 类 job_type，schema_version=1；含 `memory_conflict_question` / `memory_conflict_reply` / `memory_conflict_cleanup` / `improvement_discovery` / `goal_trigger_decision`→`worker/handlers_goal_triggers.py`）；`handle_memory_extraction` L106、`handle_reminder_delivery` L350、`handle_core_memory_refresh` L617、`handle_memory_vector_refresh` L639、`handle_memory_markdown_project` L664、`handle_retrieval_index_refresh` L697、`handle_memory_maintenance` L1165、`handle_segment_sealing` L1622、`handle_epoch_rollover` L1961、`handle_epoch_checkpoint` L2055 |
+| `outbox_handlers.py`（100KB） | 装配 `register_all` L1398（27 类 job_type，schema_version=1；含 `memory_conflict_question` / `memory_conflict_reply` / `memory_conflict_cleanup` / `improvement_discovery` / `goal_trigger_decision`→`worker/handlers_goal_triggers.py` / `goal_event_dispatch`→`worker/handlers_goal_events.py`）；`handle_memory_extraction` L106、`handle_reminder_delivery` L350、`handle_core_memory_refresh` L617、`handle_memory_vector_refresh` L639、`handle_memory_markdown_project` L664、`handle_retrieval_index_refresh` L697、`handle_memory_maintenance` L1165、`handle_segment_sealing` L1622、`handle_epoch_rollover` L1961、`handle_epoch_checkpoint` L2055 |
 | `handlers_forget.py`（71KB） | 遗忘 Saga：`handle_forget_cascade` L133（目标物化 L239/墓碑 L435/依赖发现 L619）、`handle_forget_rebuild` L807、`handle_forget_purge` L1356（`_scrub_wide` L1535）、`handle_forget_verify` L1677、`handle_forget_reconcile` L1801；`BATCH_SIZE=200` |
 | `handlers_retention.py` / `handlers_agent_tasks.py` | `handle_retention_cleanup` L27 分批驱动 RetentionEngine；`handle_agent_task_run` L16 驱动 PersistentTaskRuntime |
 | `handlers_knowledge.py` | `handle_knowledge_maintenance` L29：扫描→分批清理→commit，无进展时 COMPLETED(partial) 而非空转；`MAX_MAINTENANCE_BATCHES=5` |
 | `handlers_improvement.py` | `handle_improvement_discovery`：改进候选发现的 Outbox 入口（`discovery` 参数仅供测试注入）；模型调用在事务外，`llm_failed` 返回 RETRYABLE_ERROR 且不推进水位，非法输出记 COMPLETED 不重试 |
 | `handlers_conflict.py` | 冲突闭环两个 Handler，均按"短事务读快照 → 事务外 LLM → 短事务落库"：`handle_memory_conflict_question`（生成澄清问题并写 `notification_created`，状态 pending→asking）、`handle_memory_conflict_reply`（解析回复后调 `MemoryConflictService.apply_decision`） |
 | `scheduler_daemon.py`（27KB） | 模块级 `scheduler` L33；`start_daemon` L90（11 个周期 job；含 `improvement_discovery_scanner` 6h 窗口、V51 `tool_output_cleanup` 每 5h 清理过期工具日志）；`schedule_outbox_poll` L149；`_poll_tool_operations` L193（独立线程防饿死）；`_agent_task_scanner_job` L216（stale run 恢复/锁过期/watcher/审批过期；V50 追加 `GoalService.scan_due_reminders()` + `GoalTriggerService(db).scan()` 确定性触发扫描）；`_idle_scanner_job` L263；`_forget_reconcile_scanner_job` L423；`_conflict_expiry_scanner_job`（冲突案例 TTL 清扫，`enqueue_conflict_cleanup_job` 按小时窗口幂等入队）；`enqueue_maintenance_job` L453、`enqueue_retention_job` L509、`enqueue_knowledge_maintenance_job`、`knowledge_needs_maintenance`、`_knowledge_maintenance_scanner_job`（在途判定只认 pending/running；DB 侧不一致即时入队 + 每日对象对账；终态任务不阻塞，补跑分配 `#n` 后缀 operation_id） |
-| `outbox_heartbeat.py` / `job_types.py` / `task_worker.py` | 租约续期线程 + `ActiveClaimRegistry`；`ENABLED_OUTBOX_JOB_TYPES` allowlist；到期提醒原子入队 `reminder_delivery`（FOR UPDATE SKIP LOCKED） |
+| `outbox_heartbeat.py` / `job_types.py` / `task_worker.py` | 租约续期线程 + `ActiveClaimRegistry`；`ENABLED_OUTBOX_JOB_TYPES` allowlist（`GOAL_TRIGGER_JOB_TYPES` = `goal_trigger_decision` + `goal_event_dispatch`）；到期提醒原子入队 `reminder_delivery`（FOR UPDATE SKIP LOCKED） |
 
 ### 3.9 `task_runtime/` + `control/` — 持久任务与执行边界
 
@@ -383,9 +384,11 @@
   `modify` 区分执行内容（title/kind/acceptance/depends_on/requires_evidence）与调度时间：内容变化清空状态/证据/审批并递归失效下游（`dependency_changed:<dep>`），仅改时间保留已完成步骤；运行中拒绝（`goal_running`）。
   `approve_step`/`start_step`/`on_run_started` 均校验依赖（`step_dependencies_unmet`），审批不绕过计划顺序；`approve_step` 写 `goal_step_approved` checkpoint。
 - `task_runtime/goal_triggers.py`（V50，纯函数、无 DB）：`TriggerEvent`（thread 事件 / 步骤完成事件）、`TriggerFiring`（`key`/`reason`/`fired_at`/`next_trigger_at`）、`arm_rule`（首次装载 armed_at）、
-  `match_event`（事件类型 + payload 子集匹配）、`_within_caps`（日/周频率上限）、`_latest_occurrence`（时区感知的最近一次日历落点）、`evaluate_rule`（返回**稳定幂等键**：`once_at:<iso>`、`recurring:<iso>`、`window_once:<start>:<event_id>`、`event_condition:<event_id>`、`opportunistic:<event_id>`）、`expiry_of`（window_once 到期未满足）。
+  `match_event`（事件类型 + payload 子集匹配）、`_within_caps`（日/周频率上限）、`_latest_occurrence`（时区感知的最近一次日历落点）、`evaluate_rule`（返回**稳定幂等键**：`once_at:<iso>`、`recurring:<iso>`、`window_once:<start>:<event_id>`、`event_condition:<event_id>`、`opportunistic:<event_id>`）、`expiry_of`（window_once 到期未满足 → `window_once_expired:<start>` 稳定键）、`TriggerExpiry.key`（过期也要一次决策）。
   所有触发都要求「有真实事件或已定义评估时机」，绝不做无条件周期 LLM 调用。
-- `task_runtime/goal_trigger_service.py`（V50）：`GoalTriggerService.scan(now, limit)` 在 scheduler 里确定性扫描 ACTIVE 目标（QUEUED/BLOCKED_*，跳过运行中）；逐步骤 `trigger_of` → 已完成/运行中/依赖未满足跳过 → `arm_rule` → `expiry_of`（MISSED + `expired_at`）→ `evaluate_rule` → `_fire`：写 `goal_trigger_fired` AgentTaskEvent（`dedupe_key=trigger:<operation_id>`）+ 入队 `OutboxJob(job_type=goal_trigger_decision, operation_id=goal_trigger:<task>:<step>:<sha1(key)[:16]>, trace_id=uuid5(operation_id))`。事件来源：线程 `Event`（排除自触发类型）与 `goal_step_completed` 任务事件。
+- `task_runtime/goal_trigger_service.py`（V50）：`GoalTriggerService.scan(now, limit)` 在 scheduler 里确定性扫描 ACTIVE 目标（QUEUED/BLOCKED_*，跳过运行中）；逐步骤 `trigger_of` → 已完成/运行中/依赖未满足跳过 → `arm_rule` → `expiry_of`（MISSED + `expired_at`）→ `evaluate_rule` → `_fire`：写 `goal_trigger_fired` AgentTaskEvent（`dedupe_key=trigger:<operation_id>`）+ 入队 `OutboxJob(job_type=goal_trigger_decision, operation_id=goal_trigger:<task>:<step>:<sha1(key)[:16]>, trace_id=uuid5(operation_id))`。事件来源：线程 `Event`（排除自触发类型）与 `goal_step_completed` 任务事件；V53 新增 `dispatch_event(event)`：由 `goal_event_dispatch` 作业驱动，按事件类型 + 目标关联（线程级/全局）+ 规则条件确定性匹配活动计划，逐目标提交，无匹配时不产生决策。
+- `task_runtime/goal_events.py`（V53）：`GoalEvent`（event_id/event_type/source/payload/occurred_at/thread_id）、`publish_goal_event`（事件 → `OutboxJob(goal_event_dispatch, operation_id=goal_event:<source>:<event_id>)`，重复发布返回 None，载荷裁剪到 2000 字符）、`has_active_goal_subscribers`（无活跃目标直接丢弃，不制造 Outbox 噪声）、`event_from_job_payload`（消费者还原事件视图）、`publish_task_terminal_event`（任务终态；目标自身任务不发布，避免自激）。事件类型：`task_completed` / `task_cancelled` / `knowledge_maintenance_completed|failed` / `selfdev_repair_completed|failed`（未知类型直接拒绝）。
+- `worker/handlers_goal_events.py`（V53）：`handle_goal_event_dispatch` 从载荷还原事件 → `GoalTriggerService.dispatch_event` 确定性匹配 → COMPLETED（`goal_event_matched:<n>`）；载荷不合法 → NON_RETRYABLE；异常 → RETRYABLE_ERROR 交给 Outbox 重试。
 - `task_runtime/goal_decision.py`（V50）：`GoalDecisionEngine.context`（目标/步骤/依赖/触发原因/证据/相关记忆/近期对话/当前时间）→ `messages`（system + user，system 只进 Trace 不进聊天）→ `decide`（复用 `default_llm_client`，json_mode）→ `parse`（json_repair 兜底）→ `validate`（服务端复核 action/步骤状态/依赖/审批/证据，LLM 不能绕过）→ `apply`（先校验 `step.last_trigger_key`，过期决策返回 `stale_trigger`，再分发到 `GoalService`；主动消息在同一事务内写入，被拒不发消息、写失败整体回滚）。`_record` 写 `goal_decision` 事件（dedupe_key 幂等），`write_trace` 写 `ContextSnapshot`（含完整 system/历史/触发事件）+ `LLMCall` + `goal_trigger_decision` 事件。`decisions_today` 供每日硬上限。
 - `runtime/proactive_message.py`（V50）：`ProactiveMessageService.post` 把主动消息写成 `TurnRecord(source=runtime_event, status=completed, turn_sequence=peek_next_turn_sequence)` + `Event(llm_response)`，与用户消息共用唯一时间线；检测到同线程有活跃租约的 running Turn 时抛 `ProactiveBlocked`，由 Outbox 重试，避免并发乱序。
 - `control/`：`capability_broker.py`（`CapabilityBroker`：TaskScope 校验→TaskPolicyEngine→ResourceLock→`registry.execute_brokered`）；`scope.py`（`TaskScope.from_brief` L47/`validate_arguments` L62/`as_envelope` L97）；`task_policy.py`（allow/approval/block）；`approval_service.py`（审批生命周期）
@@ -616,6 +619,20 @@ worker/handlers_goal_triggers.py::handle_goal_trigger_decision
   → ws_manager.broadcast_to_thread_sync(new_message)
 ```
 
+真实运行事件 → 目标匹配 → 决策（V53，复用同一 Outbox/决策闭环，不新建事件总线）：
+```
+生产者（同事务投递）：repository.transition_task 终态 → publish_task_terminal_event（非目标任务）
+                     worker/handlers_knowledge.py（healthy/partial → completed，最后一次失败尝试 → failed）
+                     selfdev/repair_loop.py::persist_repair_run（ok → completed，否则 failed）
+  → goal_events.publish_goal_event：无活跃目标直接丢弃；否则 OutboxJob(goal_event_dispatch,
+    operation_id=goal_event:<source>:<event_id>, payload={event_id,event_type,source,thread_id,occurred_at,event_payload})
+worker/handlers_goal_events.py::handle_goal_event_dispatch
+  → GoalTriggerService.dispatch_event：按线程（或全局）取活动目标 → trigger_of → 仅事件型规则
+    （event_condition / window_once / opportunistic）→ arm_rule → match_event → evaluate_rule → _fire
+  → 命中：AgentTaskEvent(goal_trigger_fired) + OutboxJob(goal_trigger_decision, 带 trigger_event_type/payload)
+  → 无匹配：COMPLETED(goal_event_matched:0)，不调用 LLM
+```
+
 ### 7.5 记忆冲突待确认闭环（自动写入 ↔ 用户确认）
 
 ```
@@ -776,7 +793,7 @@ POST /api/auth/login（失败统一 invalid_credentials；同 (client, username)
 
 | 位置 | 层级 | 说明 |
 |---|---|---|
-| `tests/unit/backend/` | 单元 | 后端单元测试（86 个 `test_*.py`），命名 `test_<被测试模块>.py`；`tests/unit/conftest.py` 经"分发式 SessionLocal"把模块级 DB 绑定重定向到按用例隔离的测试库 |
+| `tests/unit/backend/` | 单元 | 后端单元测试（87 个 `test_*.py`），命名 `test_<被测试模块>.py`；`tests/unit/conftest.py` 经"分发式 SessionLocal"把模块级 DB 绑定重定向到按用例隔离的测试库 |
 | `tests/integration/backend/` | 本地集成 | 多组件组合测试（Worker/Handler/调度/检索/生命周期），共享进程级 SQLite + 每用例重建表；`_util.py` 为共享夹具辅助 |
 | `tests/flow/` | 关键流程 | 跨模块高价值链路（Turn 执行、提醒闭环），外部边界离线模拟 |
 | `tests/conftest.py` | 公共 | 从 `.env` 仅加载 `AIIVE_` 前缀变量；`db_session` 夹具；按目录自动标注层级 marker |
@@ -787,6 +804,7 @@ POST /api/auth/login（失败统一 invalid_credentials；同 (client, username)
 | `tests/unit/backend/test_shell_output_capture.py` | 单元（V52 Bash 流式日志验收，真实 bash） | 9 例：大输出完整落盘且内存只有前缀预览、预览位置可用 read_text_file 续读（尾段+本页=日志连续片段）、日志容量上限置 `capture_truncated` 且仍报真实总字节数、日志不可用退化为有界内存 + `log_error`、stdout/stderr 同时 2000 行两路都完整、超时保留已产生日志、守卫复用流式日志不二次落盘、后台预算 1200 字符收口后仍是合法 JSON、小输出保持原行为 |
 | `tests/unit/backend/test_worker_tool_result_backfill.py` | 单元（V52 后台回填验收） | 6 例：大结果 Evidence 摘要走守卫且可在预算内、小结果摘要原样且不落盘、失败结果保留 `error_type`/`error`/`exit_code`、完整结果仍进对象存储可按范围读取、摘要不被装配层二次截断（≤1600 且等于 `action.result_summary`）、分页读取结果不被预算收口 |
 | `tests/unit/backend/test_goal_triggers.py` | 单元（V50 触发验收） | 19 例：once_at 幂等/重启、recurring 时区落点与下一场、window_once 首次命中与过期、event_condition、opportunistic 冷却/日上限/无事件不调 LLM、运行中任务跳过、no_action+完整 Trace、run_step 只入队一次、modify_plan 版本递增、complete_goal 证据门槛、ask_user 真实助手消息、聊天不泄露 system 提示词而 Trace 保留、前台 Turn 占用 → RETRY_LATER 后按序补发、用户沉默只阻塞依赖步骤、旧 schedule 归一化、window_once 同窗口不重复触发、显式规则不被时间路径起跑、modify 保留触发状态 |
+| `tests/unit/backend/test_goal_event_sources.py` | 单元（V53 事件源验收） | 13 例：任务成功事件→匹配→决策→主动消息、条件不匹配零决策零 LLM、无订阅者丢弃事件、重复事件/重投幂等、消费失败交 Outbox 重试后只产生一条决策、进程重启后待处理作业可恢复且不重复、用户结束目标不被唤醒、窗口过期决策只送达一次、知识维护完成事件（全局匹配）、知识维护失败只在最后一次尝试发布、自进化修复成功/失败事件、未知事件类型拒绝 |
 | `tests/unit/backend/test_auth_frontend_contract.py` | 静态守卫 | 11 例源码扫描：页面禁止裸 `fetch`、WS 必须发认证帧、页面/API 模块不得自管 Token、App 登录门禁与安全回跳、桌面 IPC 只传 Token 不落盘 |
 
 跑测试：

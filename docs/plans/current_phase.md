@@ -662,3 +662,29 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - 遗留风险：`event_condition`/`opportunistic` 的事件来源限定在线程 `Event` 与 `goal_step_completed` 任务事件，
   其他来源需显式接入；`window_once` 过期只置 MISSED，不会自动改计划；`recurring` 仅支持 daily/weekly
   （无 cron 表达式）；主动消息与前台 Turn 的冲突用 Outbox 重试解决，未做用户级“稍后再说”抑制。
+
+### V53 通用计划事件源扩展
+- 目标：让长期目标响应**任务执行、知识维护、自进化修复**等真实运行事件，仍由既有事件/Outbox/计划规则/
+  主动消息闭环决定下一步，不新建事件总线或任务引擎。
+- 事件生产（都发生在业务写入的同一事务里）：
+  `task_runtime/repository.py::transition_task` 终态 → `publish_task_terminal_event`（`task_completed` /
+  `task_cancelled`；目标自身任务不发布，避免自激）；`worker/handlers_knowledge.py` 维护结束 →
+  `knowledge_maintenance_completed`（healthy/partial），仅最后一次重试失败 → `knowledge_maintenance_failed`；
+  `selfdev/repair_loop.py::persist_repair_run` → `selfdev_repair_completed` / `selfdev_repair_failed`。
+- 投递与匹配：`task_runtime/goal_events.py::publish_goal_event` 只写最小标识与元数据
+  （`OutboxJob(goal_event_dispatch, operation_id=goal_event:<source>:<event_id>)`，载荷 2000 字符封顶），
+  无活跃目标订阅时直接丢弃；`worker/handlers_goal_events.py` → `GoalTriggerService.dispatch_event` 按
+  **事件类型 + 目标关联（线程级 / 全局）+ 规则条件**确定性匹配，仅 `event_condition`/`window_once`/
+  `opportunistic` 参与，逐目标提交；无匹配返回 `goal_event_matched:0`，零 LLM 调用。
+- 决策：匹配后仍用既有 `goal_trigger_decision` 作业（稳定幂等键 `event_condition:<event_id>`），
+  决策作业额外携带 `trigger_event_type`/`trigger_event_payload`，消费者无需回查不存在的聊天事件行；
+  服务端校验（依赖/审批/预算/每日上限）与主动消息写入路径完全复用。
+- 窗口过期：`expiry_of` 现在返回 `window_once_expired:<start>` 稳定键，`_scan_task` 在置 MISSED +
+  `expired_at` 后**再触发一次决策**；重复扫描与进程重启都不会二次唤醒。
+- 可靠性：事件消费失败 → `RETRYABLE_ERROR` 交 Outbox 重试；重复事件由 `operation_id` 唯一键去重，
+  同一事件对同一规则由 `step.last_trigger_key` 去重；用户暂停/结束目标后不再被唤醒（计划非 ACTIVE 直接跳过）。
+- 测试：新增 `tests/unit/backend/test_goal_event_sources.py` 13 例（Fake LLM，全离线）；`test_goal_triggers.py`
+  的窗口过期用例按新契约更新为“过期触发一次决策、重复扫描不重复”。
+- 全量回归：1383 passed / 23 skipped / 0 failed（PG 与本地 Embedding 专项跳过）；basedpyright 0 errors。
+- 遗留风险：任务事件只在**同一线程**内唤醒目标（跨线程不做广播）；知识维护/自进化事件是全局事件，
+  所有订阅该类型的活跃目标都会各决策一次（受每日上限约束）；Outbox 死信后的事件不重放，需要人工重跑维护任务。

@@ -59,12 +59,14 @@ def handle_goal_trigger_decision(claimed: ClaimedJob) -> HandlerResult:
             terminal_reason="invalid_goal_trigger_payload",
         )
 
+    raw_event_payload = payload.get("trigger_event_payload")
     trigger: dict[str, Any] = {
         "trigger_key": trigger_key,
         "reason": str(payload.get("reason") or ""),
         "fired_at": str(payload.get("fired_at") or ""),
-        "event_type": None,
-        "event_payload": None,
+        # 外部运行事件没有聊天 Event 行：类型与元数据直接由触发作业携带。
+        "event_type": str(payload.get("trigger_event_type") or "") or None,
+        "event_payload": dict(raw_event_payload) if isinstance(raw_event_payload, dict) else None,
     }
 
     db = SessionLocal()
@@ -94,7 +96,7 @@ def handle_goal_trigger_decision(claimed: ClaimedJob) -> HandlerResult:
             return HandlerResult(HandlerOutcome.COMPLETED, "当日决策次数已达上限")
 
         event_id = str(payload.get("trigger_event_id") or "")
-        if event_id:
+        if event_id and trigger["event_payload"] is None:
             source_event = db.get(Event, event_id)
             if source_event is not None:
                 trigger["event_type"] = source_event.event_type

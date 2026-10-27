@@ -10,12 +10,19 @@ from __future__ import annotations
 
 import logging
 
+from sqlalchemy.orm import Session
+
 from aiive.db.base import SessionLocal
 from aiive.knowledge.maintenance import (
     DEFAULT_BATCH_LIMIT,
     KnowledgeMaintenanceReport,
     apply_report,
     scan_knowledge_base,
+)
+from aiive.task_runtime.goal_events import (
+    KNOWLEDGE_MAINTENANCE_COMPLETED,
+    KNOWLEDGE_MAINTENANCE_FAILED,
+    publish_goal_event,
 )
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome, HandlerResult
 
@@ -39,6 +46,7 @@ def handle_knowledge_maintenance(claimed: ClaimedJob) -> HandlerResult:
         for _ in range(MAX_MAINTENANCE_BATCHES):
             report = scan_knowledge_base(db)
             if report.healthy:
+                _publish(db, operation_id, status="healthy", totals=totals)
                 db.commit()
                 return HandlerResult(
                     outcome=HandlerOutcome.COMPLETED,
@@ -56,6 +64,8 @@ def handle_knowledge_maintenance(claimed: ClaimedJob) -> HandlerResult:
                     "知识库维护无进展，保留剩余问题：%s",
                     [issue.to_dict() for issue in report.issues if issue.count],
                 )
+                _publish(db, operation_id, status="partial", totals=totals)
+                db.commit()
                 return HandlerResult(
                     outcome=HandlerOutcome.COMPLETED,
                     reason=_summary(totals, report),
@@ -68,12 +78,45 @@ def handle_knowledge_maintenance(claimed: ClaimedJob) -> HandlerResult:
     except Exception as exc:
         db.rollback()
         logger.exception("knowledge_maintenance 处理异常: %s", exc)
+        # 只有最后一次尝试才对外发布"失败"，避免每次重试都产生一条失败事件。
+        if claimed.retry_count + 1 >= claimed.max_retries:
+            _publish(db, operation_id, status="failed", totals={}, error=str(exc)[:300])
+            db.commit()
         return HandlerResult(
             outcome=HandlerOutcome.RETRYABLE_ERROR,
             reason=str(exc),
         )
     finally:
         db.close()
+
+
+def _publish(
+    db: Session,
+    operation_id: str,
+    *,
+    status: str,
+    totals: dict[str, int],
+    error: str = "",
+) -> None:
+    """把维护结果作为真实运行事件投递给长期目标（失败不影响维护本身）。"""
+    event_type = (
+        KNOWLEDGE_MAINTENANCE_FAILED if status == "failed" else KNOWLEDGE_MAINTENANCE_COMPLETED
+    )
+    try:
+        publish_goal_event(
+            db,
+            event_type=event_type,
+            event_id=f"{operation_id}:{status}",
+            source="knowledge",
+            payload={
+                "operation_id": operation_id,
+                "status": status,
+                "repaired": {key: value for key, value in totals.items() if value},
+                **({"error": error} if error else {}),
+            },
+        )
+    except Exception:  # noqa: BLE001 - 事件投递失败不阻断维护
+        logger.warning("知识维护事件投递失败: operation_id=%s status=%s", operation_id, status, exc_info=True)
 
 
 def _summary(totals: dict[str, int], report: KnowledgeMaintenanceReport) -> str:

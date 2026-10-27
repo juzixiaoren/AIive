@@ -1398,11 +1398,14 @@ def _mark_maintenance_run_failed(run_id: str, execution_token: str, error: str) 
 def register_all(registry: HandlerRegistry) -> None:
     from aiive.tools.operation_executor import handle_tool_operation
     from aiive.worker.handlers_agent_tasks import handle_agent_task_run
+    from aiive.worker.handlers_goal_events import handle_goal_event_dispatch
     from aiive.worker.handlers_goal_triggers import handle_goal_trigger_decision
 
     registry.register("agent_task_run", handle_agent_task_run,
                        supported_schema_versions=frozenset({1}))
     registry.register("goal_trigger_decision", handle_goal_trigger_decision,
+                       supported_schema_versions=frozenset({1}))
+    registry.register("goal_event_dispatch", handle_goal_event_dispatch,
                        supported_schema_versions=frozenset({1}))
     registry.register("tool_operation", handle_tool_operation,
                        supported_schema_versions=frozenset({1}))

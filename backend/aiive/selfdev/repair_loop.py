@@ -860,5 +860,33 @@ def persist_repair_run(db: Session, record: dict[str, Any]) -> SelfDevRequest:
             ))
 
     record["request_id"] = request.id
+    _publish_repair_event(db, record, request)
     db.commit()
     return request
+
+
+def _publish_repair_event(db: Session, record: dict[str, Any], request: SelfDevRequest) -> None:
+    """把修复结果作为真实运行事件投递给长期目标（失败不影响落库）。"""
+    try:
+        from aiive.task_runtime.goal_events import (
+            SELFDEV_REPAIR_COMPLETED,
+            SELFDEV_REPAIR_FAILED,
+            publish_goal_event,
+        )
+
+        event_type = SELFDEV_REPAIR_COMPLETED if record.get("ok") else SELFDEV_REPAIR_FAILED
+        publish_goal_event(
+            db,
+            event_type=event_type,
+            event_id=str(record.get("run_id") or request.id),
+            source="selfdev",
+            payload={
+                "run_id": record.get("run_id"),
+                "request_id": request.id,
+                "status": record.get("status"),
+                "goal": str(record.get("goal") or "")[:200],
+                "failure_reason": record.get("failure_reason"),
+            },
+        )
+    except Exception:  # noqa: BLE001 - 事件投递失败不阻断修复记录落库
+        logger.warning("自进化修复事件投递失败: request_id=%s", request.id, exc_info=True)

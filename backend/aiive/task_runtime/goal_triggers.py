@@ -56,10 +56,15 @@ class TriggerFiring:
 
 @dataclass(frozen=True)
 class TriggerExpiry:
-    """窗口到期仍未满足条件：只记录过期，不触发 LLM。"""
+    """窗口到期仍未满足条件：记录过期状态，并产生一次决策触发键。
+
+    过期本身是"值得让 LLM 判断"的真实事件（是否告知用户/调整计划/结束步骤），
+    因此这里给出稳定幂等键；是否真正调用模型仍由服务端每日上限与目标状态把关。
+    """
 
     reason: str
     expired_at: datetime
+    key: str
 
 
 def _set_next_trigger(step: GoalStep, value: str) -> bool:
@@ -238,12 +243,17 @@ def evaluate_rule(
 
 
 def expiry_of(step: GoalStep, rule: TriggerRule, now: datetime) -> TriggerExpiry | None:
-    """窗口到期且从未触发：标记过期，不调用 LLM、不再排期。"""
+    """窗口到期且从未触发：标记过期，并给出一次决策触发键。
+
+    幂等键只由窗口起点决定：重复扫描、进程重启都不会让同一窗口二次唤醒模型。
+    """
     if rule.kind != TriggerKind.WINDOW_ONCE:
         return None
     if step.expired_at or step.trigger_count > 0:
         return None
+    start = _parse(rule.start)
     end = _parse(rule.end)
-    if end is None or now <= end:
+    if start is None or end is None or now <= end:
         return None
-    return TriggerExpiry(reason="window_expired", expired_at=now)
+    key = f"window_once_expired:{start.astimezone(timezone.utc).isoformat()}"
+    return TriggerExpiry(reason="window_expired", expired_at=now, key=key)

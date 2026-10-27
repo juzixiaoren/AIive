@@ -249,7 +249,7 @@ def test_window_once_fires_on_first_matching_event_only(db_session) -> None:
 
 
 # ----------------------------------------------------------------------
-# 4. window_once：窗口结束仍未满足 -> 过期，不调用模型
+# 4. window_once：窗口结束仍未满足 -> 过期并触发一次决策（重复扫描不重复触发）
 # ----------------------------------------------------------------------
 def test_window_once_expires_without_condition(db_session) -> None:
     thread = _thread(db_session)
@@ -264,12 +264,19 @@ def test_window_once_expires_without_condition(db_session) -> None:
          }},
     ]))
 
-    assert GoalTriggerService(db_session).scan() == 0
+    # V53：窗口到期本身是值得决策一次的真实事件（告知用户/调整计划/结束步骤）。
+    assert GoalTriggerService(db_session).scan() == 1
     plan = _plan_of(db_session, task)
     step = plan.step("late")
     assert step.status == GoalStepStatus.MISSED.value
     assert step.expired_at is not None
-    assert _jobs(db_session, task.id) == []
+    assert step.last_trigger_key.startswith("window_once_expired:")
+    jobs = _jobs(db_session, task.id)
+    assert len(jobs) == 1
+    assert jobs[0].payload["reason"] == "window_expired"
+    # 重复扫描不得重复触发。
+    assert GoalTriggerService(db_session).scan() == 0
+    assert len(_jobs(db_session, task.id)) == 1
 
 
 # ----------------------------------------------------------------------

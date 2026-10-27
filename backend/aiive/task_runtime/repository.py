@@ -212,7 +212,22 @@ class TaskRepository:
                 event_payload or {"status": status},
                 visibility=visibility,
             )
+        if status in TERMINAL_TASK_STATES:
+            self._publish_terminal_event(task, status)
         return task
+
+    def _publish_terminal_event(self, task: AgentTask, status: str) -> None:
+        """任务终态是长期目标可订阅的真实事件：与状态变更同事务投递。
+
+        目标自身任务不发布（避免自激）；没有活跃目标时发布器直接丢弃。
+        发布失败不能影响任务终态落库，因此只记录告警。
+        """
+        try:
+            from aiive.task_runtime.goal_events import publish_task_terminal_event
+
+            publish_task_terminal_event(self.db, task, status)
+        except Exception:  # noqa: BLE001 - 事件投递失败不阻断任务终态
+            logger.warning("任务终态事件投递失败: task_id=%s status=%s", task.id, status, exc_info=True)
 
     def append_event(
         self,
