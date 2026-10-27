@@ -1,0 +1,277 @@
+"""长期目标触发扫描：把"规则满足"确定性转成 Outbox 决策任务。
+
+职责边界：
+- 只做确定性判断（时间/事件/冷却/上限），不调用 LLM、不执行步骤；
+- 触发即写稳定幂等键（step.last_trigger_key）与 AgentTaskEvent，再入队
+  goal_trigger_decision；重复扫描、进程重启都不会重复调用模型；
+- 任务正在执行时跳过本轮，下一轮重新评估，事件不会被丢掉。
+"""
+from __future__ import annotations
+
+import hashlib
+import logging
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from sqlalchemy.orm import Session
+
+from aiive.db.models import AgentTask, AgentTaskEvent, Event, OutboxJob
+from aiive.task_runtime.goal_plan import (
+    FINISHED_STEP_STATES,
+    dependencies_met,
+    GOAL_TASK_TYPE,
+    GoalPlan,
+    GoalStatus,
+    GoalStep,
+    GoalStepStatus,
+    trigger_of,
+)
+from aiive.task_runtime.goal_service import GoalService
+from aiive.task_runtime.goal_triggers import (
+    SELF_TRIGGER_EVENT_TYPES,
+    TriggerEvent,
+    arm_rule,
+    evaluate_rule,
+    expiry_of,
+)
+from aiive.task_runtime.repository import TaskRepository, utcnow
+from aiive.task_runtime.schemas import TaskStatus
+
+logger = logging.getLogger(__name__)
+
+JOB_TYPE = "goal_trigger_decision"
+TRIGGER_EVENT_LIMIT = 300
+SKIP_TASK_STATES = frozenset({
+    TaskStatus.DISPATCHING.value,
+    TaskStatus.RUNNING.value,
+    TaskStatus.VERIFYING.value,
+    TaskStatus.RECONCILING.value,
+})
+ACTIVE_TASK_STATES = frozenset({
+    TaskStatus.QUEUED.value,
+    TaskStatus.BLOCKED_USER.value,
+    TaskStatus.BLOCKED_NODE.value,
+    TaskStatus.BLOCKED_APPROVAL.value,
+})
+
+
+def _iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def _trigger_operation_id(task_id: str, step_id: str, key: str) -> str:
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+    return f"goal_trigger:{task_id}:{step_id}:{digest}"
+
+
+def _trigger_trace_id(operation_id: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, operation_id))
+
+
+class GoalTriggerService:
+    """目标步骤触发规则的唯一确定性扫描入口。"""
+
+    def __init__(self, db: Session):
+        self.db: Session = db
+        self.repo: TaskRepository = TaskRepository(db)
+        self.goals: GoalService = GoalService(db)
+
+    # ------------------------------------------------------------------
+    # 扫描
+    # ------------------------------------------------------------------
+    def scan(self, *, now: datetime | None = None, limit: int = 50) -> int:
+        """扫描活跃目标并触发到期规则；返回本轮新触发的数量。"""
+        moment = now or utcnow()
+        tasks = self.db.query(AgentTask).filter(
+            AgentTask.task_type == GOAL_TASK_TYPE,
+            AgentTask.status.in_(tuple(ACTIVE_TASK_STATES)),
+        ).order_by(AgentTask.updated_at.asc()).limit(limit).with_for_update(skip_locked=True).all()
+        fired = 0
+        for task in tasks:
+            if task.status in SKIP_TASK_STATES:
+                continue
+            try:
+                fired += self._scan_task(task, moment)
+            except Exception:
+                # 单个目标失败不影响其他目标；下一轮会重新评估同一触发键。
+                self.db.rollback()
+                logger.exception("目标触发扫描失败: task_id=%s", task.id)
+        self.db.flush()
+        return fired
+
+    def _scan_task(self, task: AgentTask, now: datetime) -> int:
+        plan = self.goals.load_plan(task)
+        if plan is None or plan.status != GoalStatus.ACTIVE:
+            return 0
+        events = self._thread_events(task, plan)
+        done_event = self._step_done_event(task, plan)
+        if done_event is not None:
+            events = [*events, done_event]
+        changed = False
+        fired = 0
+        for step in plan.steps:
+            rule = trigger_of(step)
+            if rule is None:
+                continue
+            if step.status in FINISHED_STEP_STATES or step.status == GoalStepStatus.RUNNING.value:
+                continue
+            # 依赖未满足时不能触发：否则会绕过计划顺序（用户沉默只阻塞依赖它的步骤）。
+            if not dependencies_met(plan, step):
+                continue
+            arm_rule(step, rule, now)
+            changed = True
+            expired = expiry_of(step, rule, now)
+            if expired is not None:
+                self._mark_expired(task, step, now)
+                continue
+            firing = evaluate_rule(step, rule, now, events)
+            if firing is None:
+                continue
+            if self._fire(task, step, rule, firing, now):
+                fired += 1
+                changed = True
+        if changed:
+            self.goals.save_plan(task, plan)
+        return fired
+
+    # ------------------------------------------------------------------
+    # 触发落库
+    # ------------------------------------------------------------------
+    def _fire(
+        self,
+        task: AgentTask,
+        step: GoalStep,
+        rule: Any,
+        firing: Any,
+        now: datetime,
+    ) -> bool:
+        operation_id = _trigger_operation_id(task.id, step.id, firing.key)
+        trace_id = _trigger_trace_id(operation_id)
+        step.trigger_count += 1
+        step.last_trigger_key = firing.key
+        step.last_trigger_at = _iso(now)
+        if firing.next_trigger_at is not None:
+            step.next_trigger_at = _iso(firing.next_trigger_at)
+        elif rule.kind.value in {"once_at", "event_condition", "opportunistic"}:
+            step.next_trigger_at = None
+        if rule.kind.value == "opportunistic":
+            step.cooldown_until = _iso(now + timedelta(hours=rule.cooldown_hours))
+            step.opportunistic_hits = [
+                *step.opportunistic_hits[-(rule.max_per_week * 2):],
+                _iso(now),
+            ]
+        self.repo.append_event(
+            task.id,
+            "goal_trigger_fired",
+            {
+                "step_id": step.id,
+                "trigger_key": firing.key,
+                "reason": firing.reason,
+                "event_id": firing.event_id,
+                "next_trigger_at": step.next_trigger_at,
+                "trigger_count": step.trigger_count,
+            },
+            visibility="internal",
+            dedupe_key=f"trigger:{operation_id}",
+        )
+        existing = self.db.query(OutboxJob).filter(
+            OutboxJob.operation_id == operation_id,
+        ).one_or_none()
+        if existing is None:
+            self.db.add(OutboxJob(
+                operation_id=operation_id,
+                job_type=JOB_TYPE,
+                status="pending",
+                payload={
+                    "task_id": task.id,
+                    "step_id": step.id,
+                    "trigger_key": firing.key,
+                    "reason": firing.reason,
+                    "trigger_event_id": firing.event_id,
+                    "fired_at": _iso(now),
+                    "trace_id": trace_id,
+                },
+                trace_id=trace_id,
+                schema_version=1,
+                max_retries=3,
+            ))
+        self.db.flush()
+        return True
+
+    def _mark_expired(self, task: AgentTask, step: GoalStep, now: datetime) -> None:
+        step.expired_at = _iso(now)
+        if step.status not in FINISHED_STEP_STATES:
+            step.status = GoalStepStatus.MISSED
+            step.missed_count += 1
+        self.repo.append_event(
+            task.id,
+            "goal_trigger_expired",
+            {"step_id": step.id, "expired_at": step.expired_at},
+            visibility="conversation",
+            dedupe_key=f"trigger_expired:{step.id}",
+        )
+
+    # ------------------------------------------------------------------
+    # 事件视图
+    # ------------------------------------------------------------------
+    def _thread_events(self, task: AgentTask, plan: GoalPlan) -> list[TriggerEvent]:
+        """读取线程内与规则相关的事件；只保留最老 armed_at 之后的部分。"""
+        armed_candidates = []
+        for step in plan.steps:
+            if step.armed_at:
+                moment = _parse(step.armed_at)
+                if moment is not None:
+                    armed_candidates.append(moment)
+        since = min(armed_candidates) if armed_candidates else None
+        query = self.db.query(Event).filter(
+            Event.thread_id == task.thread_id,
+            Event.event_type.notin_(tuple(SELF_TRIGGER_EVENT_TYPES)),
+        )
+        if since is not None:
+            query = query.filter(Event.created_at >= since)
+        rows = query.order_by(Event.created_at.desc()).limit(TRIGGER_EVENT_LIMIT).all()
+        events: list[TriggerEvent] = []
+        for row in reversed(rows):
+            created = row.created_at
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            events.append(TriggerEvent(
+                id=row.id,
+                event_type=row.event_type,
+                payload=dict(row.payload or {}),
+                created_at=created,
+            ))
+        return events
+
+    def _step_done_event(self, task: AgentTask, plan: GoalPlan) -> TriggerEvent | None:
+        """把"某一步刚完成"当作一次评估时机（仍由规则自身的冷却/上限把关）。"""
+        armed = [
+            _parse(step.armed_at) for step in plan.steps if step.armed_at
+        ]
+        since = min((item for item in armed if item is not None), default=None)
+        query = self.db.query(AgentTaskEvent).filter(
+            AgentTaskEvent.task_id == task.id,
+            AgentTaskEvent.event_type.in_(["goal_step_completed", "goal_step_done"]),
+        )
+        if since is not None:
+            query = query.filter(AgentTaskEvent.created_at >= since)
+        row = query.order_by(AgentTaskEvent.created_at.desc()).first()
+        if row is None:
+            return None
+        created = row.created_at
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        payload = dict(row.payload or {})
+        return TriggerEvent(
+            id=f"step-done:{row.id}",
+            event_type="goal_step_completed",
+            payload=payload,
+            created_at=created,
+        )
+
+
+def _parse(value: Any) -> datetime | None:
+    from aiive.task_runtime.goal_plan import parse_datetime
+
+    return parse_datetime(value)

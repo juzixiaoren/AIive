@@ -6,6 +6,12 @@ AGENT_TASK_JOB_TYPES: frozenset[str] = frozenset({"agent_task_run"})
 KNOWLEDGE_JOB_TYPES: frozenset[str] = frozenset({"knowledge_maintenance"})
 # 自进化上游：从真实运行证据中发现改进候选（只生成候选，不改代码、不晋升）
 IMPROVEMENT_JOB_TYPES: frozenset[str] = frozenset({"improvement_discovery"})
+# 长期目标：规则满足后的一次决策（入队即幂等，重试不重复调用模型）
+GOAL_TRIGGER_JOB_TYPES: frozenset[str] = frozenset({"goal_trigger_decision"})
 ENABLED_OUTBOX_JOB_TYPES: frozenset[str] = (
-    _LEGACY_TYPES | AGENT_TASK_JOB_TYPES | KNOWLEDGE_JOB_TYPES | IMPROVEMENT_JOB_TYPES
+    _LEGACY_TYPES
+    | AGENT_TASK_JOB_TYPES
+    | KNOWLEDGE_JOB_TYPES
+    | IMPROVEMENT_JOB_TYPES
+    | GOAL_TRIGGER_JOB_TYPES
 )

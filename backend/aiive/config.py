@@ -70,6 +70,8 @@ class Settings(BaseSettings):
     aiive_goal_wait_reminder_hours: int = 24
     # 连续错过同一周期任务达到该次数时，询问是否调整计划。
     aiive_goal_missed_streak_threshold: int = 3
+    # 目标触发决策：单个目标 24 小时内最多调用模型的次数（硬上限，防止触发风暴）。
+    aiive_goal_trigger_max_decisions_per_day: int = 12
 
     # 记忆文件投影：输出目录只能来自服务端配置，Outbox payload 不接受路径。
     aiive_memory_file_projection_enabled: bool = True
@@ -271,6 +273,8 @@ class Settings(BaseSettings):
             raise ValueError("AIIVE_GOAL_WAIT_REMINDER_HOURS 必须大于 0")
         if self.aiive_goal_missed_streak_threshold <= 0:
             raise ValueError("AIIVE_GOAL_MISSED_STREAK_THRESHOLD 必须大于 0")
+        if self.aiive_goal_trigger_max_decisions_per_day <= 0:
+            raise ValueError("AIIVE_GOAL_TRIGGER_MAX_DECISIONS_PER_DAY 必须大于 0")
         if self.aiive_auth_secret.strip() and len(self.aiive_auth_secret.strip()) < 32:
             # HS256 密钥短于 32 字节会显著降低暴力破解成本。
             raise ValueError("AIIVE_AUTH_SECRET 至少需要 32 个字符")

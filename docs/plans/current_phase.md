@@ -620,3 +620,40 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
   旧审批失效、重复审批、审批依赖校验、运行中拒绝修改共 7 例。
 - 数据库：无表结构变更、无迁移；`alembic check` 在本机 pgvector/pg16 容器上无 drift，
   另用事务内真实 PG 校验确认 JSON 计划与审批状态读写正确（回滚，不留数据）。
+
+### V50 目标步骤触发规则与触发决策闭环
+
+- 目标：一个长期目标可包含多个子任务，每个子任务带**独立触发规则**；规则命中后经确定性校验 →
+  Outbox → 复用现有 LLM 产出结构化决策 → 服务端复核执行，并能主动向用户发送真实助手消息。
+- 复用优先（无新表、无新引擎）：计划仍存 `task_state["goal"]`，触发复用 `AgentTaskEvent`（幂等键）+
+  `OutboxJob`（`operation_id` 唯一）+ HandlerRegistry；执行复用 `GoalService`/`PersistentTaskRuntime`；
+  主动消息复用 `TurnRecord` + `Event(llm_response)`（唯一聊天时间线）；Trace 复用
+  `ContextSnapshot`/`LLMCall`/`Event`。
+- 触发规则（`task_runtime/goal_plan.py::TriggerRule` + `goal_triggers.py` 纯函数求值）：
+  `once_at`（定点一次）、`recurring`（daily/weekly + 时区 + until）、`window_once`（时间窗内条件首次满足，
+  到期未满足 → MISSED + `expired_at`）、`event_condition`（事件类型 + payload 子集）、
+  `opportunistic`（仅在相关事件或已定义评估时机触发，受 `cooldown_hours`/`max_per_day`/`max_per_week` 约束）。
+  旧 `schedule` 经 `trigger_of` 归一化为 `TriggerRule`，历史计划与测试零改动。
+- 幂等与恢复：每个触发有稳定键（`once_at:<iso>` / `recurring:<iso>` / `window_once:<start>:<event_id>` /
+  `event_condition:<event_id>` / `opportunistic:<event_id>`），落 `AgentTaskEvent(dedupe_key)` +
+  `OutboxJob(operation_id=goal_trigger:<task>:<step>:<sha1(key)[:16]>, trace_id=uuid5(operation_id))`；
+  步骤上的 `last_trigger_key`/`trigger_count`/`armed_at` 让扫描在重启后从计划状态恢复，不重复触发。
+- 决策闭环：`goal_decision.py::GoalDecisionEngine` 收集目标/步骤/依赖/触发原因/证据/相关记忆/近期对话/当前时间 →
+  `chat(json_mode)` → `GoalDecision`（extra=forbid，7 种 action）→ `validate`（权限/依赖/步骤状态/审批/证据）→
+  `apply`（先校验 `last_trigger_key`，过期返回 `stale_trigger`）→ 调 `GoalService` 的
+  `begin_step_from_trigger` / `mark_step_waiting_user` / `save_plan` / `complete_goal`。LLM 不直接写库、不绕过安全内核。
+- 主动消息：`runtime/proactive_message.py::ProactiveMessageService.post` 写 `TurnRecord(source=runtime_event,
+  status=completed, turn_sequence=peek_next_turn_sequence)` + `Event(llm_response, payload.proactive=True)`；
+  前台 Turn 持活跃租约时抛 `ProactiveBlocked` → Handler 返回 `RETRY_LATER`，由 Outbox 重试后按序补发，避免乱序/丢失。
+- 可见性边界：`ThreadState.list_thread_messages_page` 只渲染用户可见事件，system 提示词/内部决策指令不进聊天；
+  `ContextSnapshot.context_items` 保留完整 system + 历史 + 触发事件，`/api/debug/traces/{id}` 可查。
+- 调度与配额：`scheduler_daemon._agent_task_scanner_job`（10s）追加 `GoalTriggerService(db).scan()`，
+  只做确定性匹配（无事件不调 LLM）；Handler 侧 `aiive_goal_trigger_max_decisions_per_day`（默认 12）为硬上限。
+- 用户沉默：`wait_user`/`ask_user` 只把**该步骤**置 `waiting_user`，依赖它的步骤阻塞，独立步骤照常触发。
+- 测试：`tests/unit/backend/test_goal_triggers.py` 16 例（Fake LLM，全离线）：五类规则 + 时区 + 重复事件 +
+  重启恢复、no_action/run_step/modify_plan/complete_goal/ask_user/send_message 决策、用户沉默、主动消息插入与
+  前台 Turn 占用重试、聊天不泄露 system 提示词而 Trace 保留完整上下文、旧 schedule 归一化。
+- 全量回归：1325 passed / 23 skipped（PG 与本地 Embedding 专项跳过）。
+- 遗留风险：`event_condition`/`opportunistic` 的事件来源限定在线程 `Event` 与 `goal_step_completed` 任务事件，
+  其他来源需显式接入；`window_once` 过期只置 MISSED，不会自动改计划；`recurring` 仅支持 daily/weekly
+  （无 cron 表达式）；主动消息与前台 Turn 的冲突用 Outbox 重试解决，未做用户级“稍后再说”抑制。

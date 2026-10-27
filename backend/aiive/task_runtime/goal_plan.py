@@ -47,7 +47,7 @@ TERMINAL_GOAL_STATES = frozenset({
 FINISHED_STEP_STATES = frozenset({GoalStepStatus.DONE.value, GoalStepStatus.SKIPPED.value})
 
 
-def _zone(name: str) -> timezone | Any:
+def timezone_for(name: str) -> timezone | Any:
     """返回时区对象；缺少 tzdata 时回退到 UTC，避免计划读取因环境差异失败。"""
     try:
         from zoneinfo import ZoneInfo
@@ -55,6 +55,10 @@ def _zone(name: str) -> timezone | Any:
         return ZoneInfo(name or DEFAULT_TIMEZONE)
     except Exception:  # noqa: BLE001 - 时区数据缺失时退化为 UTC
         return timezone.utc
+
+
+# 兼容旧调用点：内部一律使用 timezone_for，保留别名避免一次性大改。
+_zone = timezone_for
 
 
 def parse_datetime(value: Any) -> datetime | None:
@@ -137,6 +141,131 @@ def next_occurrence(schedule: GoalSchedule | None, after: datetime) -> datetime 
     return candidate
 
 
+class TriggerKind(StrEnum):
+    """步骤触发规则的五种形态（与 GoalSchedule 并存，schedule 视为旧写法）。"""
+
+    ONCE_AT = "once_at"
+    RECURRING = "recurring"
+    WINDOW_ONCE = "window_once"
+    EVENT_CONDITION = "event_condition"
+    OPPORTUNISTIC = "opportunistic"
+
+
+class TriggerRule(BaseModel):
+    """单个步骤的独立触发规则。
+
+    与 GoalSchedule 的区别：schedule 只表达"一次性/每周"的时间点，
+    TriggerRule 额外支持窗口条件、事件条件与受冷却约束的不定期跟进。
+    schedule 保留用于向后兼容，读取时由 trigger_of 统一转换。
+    """
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    kind: TriggerKind
+    # once_at / window_once
+    at: str | None = None
+    start: str | None = None
+    end: str | None = None
+    # recurring
+    frequency: Literal["daily", "weekly"] = "weekly"
+    weekday: int | None = Field(default=None, ge=0, le=6)
+    time: str | None = None
+    timezone: str = DEFAULT_TIMEZONE
+    until: str | None = None
+    # event_condition / opportunistic（window_once 也用它表达"条件"）
+    event_types: list[str] = Field(default_factory=list, max_length=16)
+    match: dict[str, Any] = Field(default_factory=dict)
+    # opportunistic：不定期跟进必须受冷却与频率上限约束，禁止无条件周期调用。
+    cooldown_hours: int = Field(default=24, ge=1, le=24 * 30)
+    max_per_day: int = Field(default=2, ge=1, le=50)
+    max_per_week: int = Field(default=5, ge=1, le=100)
+    # 允许把"某一步完成"当作评估时机（仍受冷却/上限约束）。
+    evaluate_on_step_done: bool = True
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> "TriggerRule":
+        if self.kind == TriggerKind.ONCE_AT:
+            if parse_datetime(self.at) is None:
+                raise ValueError("once_at requires ISO8601 at")
+        elif self.kind == TriggerKind.RECURRING:
+            if not self.time:
+                raise ValueError("recurring requires time (HH:MM)")
+            try:
+                dtime.fromisoformat(self.time)
+            except ValueError as error:
+                raise ValueError("recurring time must be HH:MM") from error
+            if self.frequency == "weekly" and self.weekday is None:
+                raise ValueError("weekly recurring requires weekday")
+            if self.until is not None and parse_date(self.until) is None:
+                raise ValueError("until must be a date")
+        elif self.kind == TriggerKind.WINDOW_ONCE:
+            start = parse_datetime(self.start)
+            end = parse_datetime(self.end)
+            if start is None or end is None:
+                raise ValueError("window_once requires start and end")
+            if start >= end:
+                raise ValueError("window_once start must be before end")
+        elif self.kind == TriggerKind.EVENT_CONDITION:
+            if not self.event_types:
+                raise ValueError("event_condition requires event_types")
+        elif self.kind == TriggerKind.OPPORTUNISTIC:
+            if not self.event_types and not self.evaluate_on_step_done:
+                raise ValueError("opportunistic requires event_types or evaluate_on_step_done")
+        return self
+
+
+def trigger_from_schedule(schedule: GoalSchedule | None) -> TriggerRule | None:
+    """把旧版 GoalSchedule 归一化成 TriggerRule；无计划返回 None。"""
+    if schedule is None:
+        return None
+    if schedule.kind == "once":
+        return TriggerRule(kind=TriggerKind.ONCE_AT, at=schedule.at, timezone=schedule.timezone)
+    return TriggerRule(
+        kind=TriggerKind.RECURRING,
+        frequency="weekly",
+        weekday=schedule.weekday,
+        time=schedule.time,
+        timezone=schedule.timezone,
+        until=schedule.until,
+    )
+
+
+def trigger_of(step: GoalStep) -> TriggerRule | None:
+    """返回步骤的生效触发规则：显式 trigger 优先，其次兼容旧 schedule。"""
+    return step.trigger if step.trigger is not None else trigger_from_schedule(step.schedule)
+
+
+def next_time_trigger(rule: TriggerRule | None, after: datetime) -> datetime | None:
+    """计算时间型规则在 after 之后的下一次触发；事件型规则返回 None。"""
+    if rule is None:
+        return None
+    zone = timezone_for(rule.timezone)
+    moment = after.astimezone(zone)
+    if rule.kind == TriggerKind.ONCE_AT:
+        target = parse_datetime(rule.at)
+        return target if target is not None and target > moment else None
+    if rule.kind == TriggerKind.WINDOW_ONCE:
+        start = parse_datetime(rule.start)
+        end = parse_datetime(rule.end)
+        if start is None or end is None:
+            return None
+        # 窗口内由扫描器按"条件是否满足"决定，不产生固定时间点。
+        return start if moment < start else None
+    if rule.kind == TriggerKind.RECURRING:
+        clock = dtime.fromisoformat(rule.time or "00:00")
+        candidate = datetime.combine(moment.date(), clock, tzinfo=zone)
+        if rule.frequency == "weekly":
+            delta = ((rule.weekday if rule.weekday is not None else 0) - moment.weekday()) % 7
+            candidate = candidate + timedelta(days=delta)
+        if candidate <= moment:
+            candidate = candidate + timedelta(days=7 if rule.frequency == "weekly" else 1)
+        until = parse_date(rule.until)
+        if until is not None and candidate.date() > until:
+            return None
+        return candidate
+    return None
+
+
 class GoalStep(BaseModel):
     """目标的一个可独立推进步骤；id 在目标内稳定，状态与证据随执行更新。"""
 
@@ -159,6 +288,18 @@ class GoalStep(BaseModel):
     note: str = Field(default="", max_length=2000)
     # approval_required 步骤的人工审批时间；为空表示尚未审批。
     approved_at: str | None = None
+
+    # 触发规则（V50）：显式 trigger 优先，schedule 仅作旧写法兼容。
+    trigger: TriggerRule | None = None
+    # 触发状态：幂等键、次数、冷却与频率窗口，全部随计划持久化，重启可恢复。
+    trigger_count: int = Field(default=0, ge=0, le=10000)
+    last_trigger_key: str = Field(default="", max_length=128)
+    last_trigger_at: str | None = None
+    armed_at: str | None = None
+    expired_at: str | None = None
+    cooldown_until: str | None = None
+    opportunistic_hits: list[str] = Field(default_factory=list, max_length=200)
+    last_message_key: str = Field(default="", max_length=128)
 
     @model_validator(mode="after")
     def validate_step(self) -> "GoalStep":
@@ -270,10 +411,12 @@ def next_runnable_step(plan: GoalPlan, now: datetime) -> GoalStep | None:
             continue
         if step.status == GoalStepStatus.READY.value:
             return step
+        trigger = trigger_of(step)
         # 交互步骤必须由用户点击开始（置为 READY）后才可执行，不能自动起跑。
-        if step.kind == GoalStepKind.INTERACTIVE.value and step.schedule is None:
+        if step.kind == GoalStepKind.INTERACTIVE.value:
             continue
-        if step.schedule is not None:
+        # 有触发规则的步骤只能由规则触发（READY）后执行，避免绕过 once_at/事件条件。
+        if trigger is not None:
             due = parse_datetime(step.next_trigger_at)
             if due is None or due > now:
                 continue
@@ -285,7 +428,7 @@ def upcoming_steps(plan: GoalPlan) -> list[GoalStep]:
     return [
         step for step in plan.steps
         if step.status in {GoalStepStatus.PENDING.value, GoalStepStatus.WAITING_TIME.value}
-        and step.schedule is not None
+        and trigger_of(step) is not None
         and step.next_trigger_at is not None
     ]
 
@@ -324,6 +467,10 @@ def _step_brief(step: GoalStep) -> dict[str, Any]:
         "depends_on": list(step.depends_on),
         "acceptance": list(step.acceptance),
         "next_trigger_at": step.next_trigger_at,
+        "trigger": (
+            step.trigger.kind.value if step.trigger is not None else None
+        ),
+        "trigger_count": step.trigger_count,
         "evidence_count": len(step.evidence_refs),
         "missed_count": step.missed_count,
         "note": step.note,

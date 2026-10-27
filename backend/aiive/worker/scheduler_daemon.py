@@ -262,6 +262,11 @@ def _agent_task_scanner_job() -> None:
         # 长期目标的沉默策略：只处理已到期（wake_at <= now）的阻塞任务，
         # 确定性执行、不调用 LLM；没有到期事项时这里是空扫描。
         GoalService(db).scan_due_reminders()
+        # 步骤触发规则（once_at / recurring / window_once / 事件 / 不定期）：
+        # 只做确定性判断并入队，模型调用发生在 Outbox Handler 中。
+        from aiive.task_runtime.goal_trigger_service import GoalTriggerService
+
+        GoalTriggerService(db).scan()
         db.commit()
     except Exception:
         db.rollback()

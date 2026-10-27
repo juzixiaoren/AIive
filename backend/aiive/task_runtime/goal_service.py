@@ -28,6 +28,7 @@ from aiive.task_runtime.goal_plan import (
     GoalStepStatus,
     dependencies_met,
     next_occurrence,
+    trigger_of,
     next_runnable_step,
     parse_datetime,
     plan_complete,
@@ -101,6 +102,8 @@ class GoalService:
         })
         for step in plan.steps:
             step.status = GoalStepStatus.PENDING
+            # 规则从提案时刻开始生效：避免确认后到首次扫描之间的事件被漏掉。
+            step.armed_at = _iso(now)
         task.task_type = GOAL_TASK_TYPE
         task.task_state = self._state_with_plan(task, plan)
         self.repo.transition_task(
@@ -429,6 +432,125 @@ class GoalService:
         if task.status == TaskStatus.BLOCKED_USER.value:
             self.repo.transition_task(task, TaskStatus.QUEUED.value)
             self.repo.enqueue_run(task, trigger="goal_step_approved")
+        return self.detail(task)
+
+    # ------------------------------------------------------------------
+    # 触发决策钩子（由 goal_trigger_decision Handler 调用）
+    # ------------------------------------------------------------------
+    def save_plan(self, task: AgentTask, plan: GoalPlan) -> None:
+        """公开的计划持久化入口：触发扫描与决策执行共用同一序列化。"""
+        self._save(task, plan)
+
+    def begin_step_from_trigger(self, task_id: str, step_id: str, *, trigger: str = "goal_trigger") -> dict[str, Any]:
+        """LLM 决定执行某一步：服务端复核依赖/审批后再起跑，LLM 不能绕过。"""
+        task = self._require_task(task_id)
+        plan = self._require_plan(task)
+        if plan.status != GoalStatus.ACTIVE:
+            raise GoalError("goal_not_active")
+        step = plan.step(step_id)
+        if step is None:
+            raise GoalError("step_not_found")
+        if step.status in {GoalStepStatus.DONE, GoalStepStatus.SKIPPED}:
+            raise GoalError("step_already_finished")
+        if step.status == GoalStepStatus.RUNNING:
+            raise GoalError("step_running")
+        if not dependencies_met(plan, step):
+            raise GoalError("step_dependencies_unmet")
+        if self._needs_approval(step):
+            # 需要人工审批的步骤只能停在用户侧，触发决策不得代替审批。
+            step.status = GoalStepStatus.WAITING_USER
+            plan.current_step_id = step.id
+            self._save(task, plan)
+            raise GoalError("step_requires_approval")
+        now = utcnow()
+        step.status = GoalStepStatus.READY
+        plan.current_step_id = step.id
+        plan.last_progress_at = _iso(now)
+        self._save(task, plan)
+        self.repo.append_event(
+            task.id, "goal_step_triggered",
+            {"step_id": step.id, "trigger": trigger},
+            visibility="conversation",
+        )
+        if task.status in {
+            TaskStatus.BLOCKED_USER.value, TaskStatus.BLOCKED_NODE.value,
+            TaskStatus.BLOCKED_APPROVAL.value,
+        }:
+            self.repo.transition_task(task, TaskStatus.QUEUED.value)
+        if task.status == TaskStatus.QUEUED.value:
+            self.repo.enqueue_run(task, trigger=trigger)
+        self.repo.checkpoint(task.id, reason="goal_step_triggered", plan=plan.model_dump(mode="json"))
+        return self.detail(task)
+
+    def mark_step_waiting_user(self, task_id: str, step_id: str, question: str) -> dict[str, Any]:
+        """LLM 决定等待用户：只阻塞该步骤，其他独立步骤继续可执行。"""
+        task = self._require_task(task_id)
+        plan = self._require_plan(task)
+        step = plan.step(step_id)
+        if step is None:
+            raise GoalError("step_not_found")
+        if step.status in {GoalStepStatus.DONE, GoalStepStatus.SKIPPED}:
+            raise GoalError("step_already_finished")
+        now = utcnow()
+        step.status = GoalStepStatus.WAITING_USER
+        step.note = question[:500]
+        plan.reminder.pop(f"wait_reminded:{step.id}", None)
+        if plan.current_step_id == step.id:
+            plan.current_step_id = None
+        self._save(task, plan)
+        task.wake_at = now + timedelta(hours=max(1, settings.aiive_goal_wait_reminder_hours))
+        self.repo.append_event(
+            task.id, "goal_step_waiting_user",
+            {"step_id": step.id, "question": question},
+            visibility="conversation",
+        )
+        return self.detail(task)
+
+    def complete_goal(self, task_id: str) -> dict[str, Any]:
+        """LLM 判定目标完成：服务端复核全部步骤与证据后才真正结束。"""
+        task = self._require_task(task_id)
+        plan = self._require_plan(task)
+        if plan.status not in {GoalStatus.ACTIVE, GoalStatus.BLOCKED}:
+            raise GoalError("goal_not_completable")
+        if not plan_complete(plan):
+            raise GoalError("goal_not_complete")
+        missing = [
+            item.id for item in plan.steps
+            if item.requires_evidence and not item.evidence_refs
+        ]
+        if missing:
+            raise GoalError("goal_missing_evidence:" + ",".join(missing))
+        now = utcnow()
+        plan.status = GoalStatus.COMPLETED
+        plan.current_step_id = None
+        plan.last_progress_at = _iso(now)
+        self._save(task, plan)
+        self.cancel_watches(task)
+        task.wake_at = None
+        self.repo.append_event(
+            task.id, "goal_completed", summarize(plan), visibility="conversation",
+        )
+        report = {
+            "status": "succeeded",
+            "summary": plan.summary or task.title,
+            "progress": plan.progress(),
+        }
+        # 任务状态机不允许 QUEUED/BLOCKED 直接跳到 SUCCEEDED，沿既有路径收敛到 VERIFYING。
+        if task.status in {
+            TaskStatus.BLOCKED_USER.value, TaskStatus.BLOCKED_NODE.value,
+            TaskStatus.BLOCKED_APPROVAL.value, TaskStatus.QUEUED.value,
+        }:
+            if task.status != TaskStatus.QUEUED.value:
+                self.repo.transition_task(task, TaskStatus.QUEUED.value)
+            self.repo.transition_task(task, TaskStatus.DISPATCHING.value)
+            self.repo.transition_task(task, TaskStatus.RUNNING.value)
+        self.repo.transition_task(task, TaskStatus.VERIFYING.value)
+        self.repo.transition_task(
+            task, TaskStatus.SUCCEEDED.value, report=report,
+            event_type="task_completed", event_payload=report,
+            visibility="conversation",
+        )
+        self.repo.checkpoint(task.id, reason="goal_completed", plan=plan.model_dump(mode="json"))
         return self.detail(task)
 
     # ------------------------------------------------------------------
@@ -839,6 +961,18 @@ class GoalService:
             task.wake_at = task.wake_at or (
                 now + timedelta(hours=max(1, settings.aiive_goal_wait_reminder_hours))
             )
+            return "wait"
+        triggered = [
+            item for item in plan.steps
+            if trigger_of(item) is not None
+            and item.status not in FINISHED_STEP_STATES
+        ]
+        if triggered:
+            # 还有等待规则触发的步骤：保持 active，由触发扫描器唤醒，不误判为受阻。
+            plan.current_step_id = None
+            plan.last_progress_at = _iso(now)
+            self._save(task, plan)
+            task.wake_at = None
             return "wait"
         waiting = [item for item in plan.steps if item.status == GoalStepStatus.WAITING_USER]
         if waiting:
