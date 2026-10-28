@@ -14,6 +14,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from aiive.db.models import Event, Thread, TurnRecord
@@ -31,6 +32,86 @@ class ProactiveBlocked(RuntimeError):
 class ProactiveMessageService:
     def __init__(self, db: Session):
         self.db: Session = db
+
+    def post_in_turn(
+        self,
+        *,
+        thread_id: str,
+        turn_id: str,
+        turn_record_id: str,
+        content: str,
+        trace_id: str,
+        dedupe_key: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """在正在执行的 Turn 内写入一条真实助手消息（不新建 TurnRecord）。
+
+        与 post 的区别：post 面向后台主动消息，遇到前台 Turn 会阻塞重试；
+        post_in_turn 由当前 Turn 的 notify_user 工具调用，消息作为同一 Turn 的
+        llm_response 事件插入，turn_event_index 递增，因此最终答复仍在它之后。
+        同一 dedupe_key 生成稳定 Event.id，重复调用不会重复落库。
+        """
+        text = (content or "").strip()
+        if not text:
+            raise ValueError("empty_message")
+        if len(text) > MAX_MESSAGE_CHARS:
+            text = text[:MAX_MESSAGE_CHARS]
+        if not dedupe_key:
+            raise ValueError("dedupe_key_required")
+
+        event_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"proactive:{thread_id}:{dedupe_key}"))
+        existing = self.db.get(Event, event_id)
+        if existing is not None:
+            return {
+                "event_id": existing.id,
+                "turn_id": turn_id,
+                "turn_event_index": existing.turn_event_index,
+                "created": False,
+            }
+
+        turn = self.db.query(TurnRecord).filter(
+            TurnRecord.thread_id == thread_id,
+            TurnRecord.turn_id == turn_id,
+        ).one_or_none()
+        if turn is None or turn.id != turn_record_id:
+            raise ValueError("turn_not_found")
+        if turn.status != "running":
+            raise ValueError("turn_not_running")
+
+        thread = self.db.query(Thread).filter(Thread.id == thread_id).with_for_update().one_or_none()
+        if thread is None:
+            raise ValueError("thread_not_found")
+
+        max_index = self.db.query(func.max(Event.turn_event_index)).filter(
+            Event.thread_id == thread_id,
+            Event.turn_id == turn_id,
+        ).scalar()
+        next_index = int(max_index or 0) + 1
+        now = datetime.now(timezone.utc)
+        event = Event(
+            id=event_id,
+            trace_id=trace_id,
+            thread_id=thread_id,
+            event_type="llm_response",
+            turn_id=turn_id,
+            turn_event_index=next_index,
+            payload={
+                "content": text,
+                "message_source": MESSAGE_SOURCE,
+                "proactive": True,
+                "trigger": dict(metadata or {}),
+            },
+            created_at=now,
+        )
+        self.db.add(event)
+        thread.last_activity_at = now
+        self.db.flush()
+        return {
+            "event_id": event.id,
+            "turn_id": turn_id,
+            "turn_event_index": next_index,
+            "created": True,
+        }
 
     def post(
         self,

@@ -16,6 +16,13 @@ from aiive.config import settings
 from aiive.db.base import SessionLocal
 from aiive.db.models import Event
 from aiive.runtime.proactive_message import ProactiveBlocked
+from aiive.runtime.turn_events import (
+    OPEN_STATUSES,
+    STATUS_HANDLED,
+    active_turn_for_thread,
+    expire_pending_event,
+    inbox_state,
+)
 from aiive.task_runtime.goal_decision import (
     MESSAGE_ACTIONS,
     GoalDecisionEngine,
@@ -78,6 +85,22 @@ def handle_goal_trigger_decision(claimed: ClaimedJob) -> HandlerResult:
                 "目标任务不存在",
                 terminal_reason="goal_task_not_found",
             )
+        pending_key = str(payload.get("pending_event_dedupe_key") or "")
+        if pending_key:
+            state = inbox_state(db, pending_key)
+            if state == STATUS_HANDLED:
+                # 前台 Turn 已在安全边界内处理该事件（可能已主动提醒用户）：
+                # 不再发起第二次模型决策，也不重复写主动消息。
+                return HandlerResult(HandlerOutcome.COMPLETED, "handled_in_turn")
+            if state in OPEN_STATUSES or not state:
+                if active_turn_for_thread(db, task.thread_id) is not None:
+                    # 前台 Run 正在执行：让出本轮，等 Turn 结束或事件被注入处理。
+                    # 收件箱行可能因“入队时无活跃 Turn”尚未创建，同样不能并发决策。
+                    return _retry_later("foreground_turn_active")
+                if state in OPEN_STATUSES:
+                    # Turn 已结束但未处理（崩溃/中断/延后）：交回原决策路径。
+                    expire_pending_event(db, pending_key)
+                    db.commit()
         goals = GoalService(db)
         plan = goals.load_plan(task)
         if plan is None or plan.status != GoalStatus.ACTIVE:

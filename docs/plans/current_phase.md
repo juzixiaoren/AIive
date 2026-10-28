@@ -688,3 +688,13 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - 全量回归：1383 passed / 23 skipped / 0 failed（PG 与本地 Embedding 专项跳过）；basedpyright 0 errors。
 - 遗留风险：任务事件只在**同一线程**内唤醒目标（跨线程不做广播）；知识维护/自进化事件是全局事件，
   所有订阅该类型的活跃目标都会各决策一次（受每日上限约束）；Outbox 死信后的事件不重放，需要人工重跑维护任务。
+
+### V54 安全边界上的主动事件注入与协作式处理（2026-10-28）
+- 目标：计划事件在 Agent 执行任务期间到达时，不并发启动第二个 LLM Run、不强制中断工具；事件先持久化，等当前工具调用批次完成、下一轮 LLM 决策前以内部上下文注入，由同一个 LLM 决定立即处理 / 延后 / 继续 / 无需行动，并可主动向用户发送真实助手消息。
+- 数据与去重：新增 turn_event_inbox（db/models.py::TurnEventInbox + 迁移 f7a1c3d5e9b2），dedupe_key 唯一；GoalTriggerService._fire 在存在活跃前台 Turn 时入箱（priority：window_once 90 / event_condition 80 / opportunistic 60 / 其他 50），Outbox 仍是唯一可靠投递与重试通道；线程级积压上限 50，单次注入上限 5，超出部分留待下一次 assistant 调用，优先淘汰最老 pending。
+- 注入边界：agent_graph._assistant 在每次 LLM 调用前检查 _tool_calls_paired；只有 assistant tool-call 与对应 ToolMessage 全部配对后才 claim 事件，把 build_internal_context 生成的 SystemMessage 追加到本次请求（不新增 LLM 请求、不写入聊天时间线），并从回复剥离 [[EVENT_DECISION: ...]] 标记；流式路径由 _DecisionMarkerStreamFilter 在 token 级剥离。内部上下文包含事件类型/来源/优先级/关联目标与步骤/触发原因/事件元数据/目标状态/TaskEvidence，并要求模型显式给出四选一决策。
+- 主动消息：runtime/proactive_tool.py::notify_user 只注册到单 Turn registry 快照，服务端按 turn_record_id 校验“本 Turn 已领取事件”后才允许发送；ProactiveMessageService.post_in_turn 把消息写成同一 Turn 的 Event(llm_response, payload.proactive=True)，Event.id 由 uuid5(dedupe_key) 稳定生成，重复调用只落一次；通过既有 ws_manager 推送 new_message，工具返回后 Agent 继续原工具循环，最终答复由 _finalize_turn 以更大的 turn_event_index 追加，因此主动消息不会被误认为最终答案。
+- 可靠性：claim 置 injected；Turn 正常收尾 mark_turn_handled（defer 保留给 Outbox，其余 handled）；notify_user 成功即标记 handled + message_event_id；Turn 中断/进程重启后 Outbox 看到 pending/injected/deferred 且无活跃 Turn → expire 并走原 GoalDecisionEngine；决策作业看到 handled → 直接 COMPLETED，绝不二次调用模型或重复发消息；前台 Turn 活跃时决策作业返回 RETRY_LATER，避免并发 LLM。取消/修改/审批仍走既有工具与安全内核。
+- Trace 与可见性：turn_event_injection Event 保留完整内部上下文、决策与工具名；ThreadState 只渲染 user_message/tool_call/tool_result/llm_response，内部 SystemMessage 与 trace Event 不进入普通聊天。
+- 测试：tests/unit/backend/test_turn_event_injection.py 9 例（Fake LLM，全离线）：工具执行期间事件到达、连续工具调用、多事件合并/优先级/注入上限、流式标记过滤、主动消息插入/顺序/幂等、原任务恢复、重复事件、Outbox 让出与重启恢复、handled 事件不二次决策、内部提示不泄露而 Trace 完整。
+- 遗留风险：事件注入只在 assistant 节点入口发生，若模型单轮不再调用工具（直接结束），事件由 Outbox 在 Turn 结束后兜底决策，不会在本次 Turn 内提醒；notify_user 的授权依赖 turn_record_id，跨 Turn 的事件只能走后台主动消息路径；流式标记过滤只处理回复开头，模型若把标记写在正文中间仍会在最终答复前被剥离，但实时 token 可能短暂可见。

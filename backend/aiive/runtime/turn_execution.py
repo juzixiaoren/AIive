@@ -57,6 +57,7 @@ from aiive.runtime.thread_bootstrap import ThreadBootstrapService
 from aiive.runtime.token_counter import LiteLLMTokenCounter
 from aiive.runtime.token_models import ModelProfile, TokenSafetyConfig
 from aiive.runtime.tool_normalizer import ToolResultNormalizer
+from aiive.runtime.turn_events import mark_turn_handled
 from aiive.runtime.working_state import WorkingStateService
 
 from functools import lru_cache
@@ -799,7 +800,13 @@ class TurnExecutionService:
             # Events：pending_approval 工具不写入 tool_call/tool_result，等待审批后补充；
             # blocked 工具从未执行，也不写入（避免孤儿 tool_call 破坏历史配对），
             # 其事实由 llm_response 事件内的 tool_blocked action card 承载。
-            idx = 1
+            # 主动消息可能在 Turn 执行期间已写入同一 Turn（turn_event_index 递增）；
+            # 后续工具/最终答复必须接在它后面，不能从 1 重新编号造成乱序。
+            max_index = db.query(func.max(Event.turn_event_index)).filter(
+                Event.thread_id == turn.thread_id,
+                Event.turn_id == turn.turn_id,
+            ).scalar()
+            idx = int(max_index or 0) + 1
             executed_records = [
                 r for r in ag_result.tool_records
                 if r.status not in ("pending_approval", "blocked")
@@ -912,6 +919,21 @@ class TurnExecutionService:
                     },
                     trace_id=ag_result.trace_id, max_retries=3,
                 ))
+
+            # 事件收口：defer 留给 Outbox 稍后决策，其余标记 handled，
+            # 避免同一事件在 Turn 结束后被决策作业二次调用模型。
+            try:
+                mark_turn_handled(
+                    db,
+                    turn.id,
+                    {
+                        str(item.get("event_id") or ""): str(item.get("decision") or "")
+                        for item in ag_result.event_decisions
+                    },
+                )
+            except Exception:
+                # 收件箱收口失败不应阻断 Turn 提交；未收口事件由 Outbox 兜底。
+                logger.exception("Turn 事件收件箱收口失败: turn_id=%s", turn.turn_id)
 
             db.commit()
             return response_dict

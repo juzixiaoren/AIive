@@ -65,6 +65,54 @@ from aiive.runtime.tool_output_guard import guard_tool_output
 from aiive.runtime.token_counter import LiteLLMTokenCounter
 from aiive.runtime.working_state import WorkingStateService
 from aiive.runtime.message_normalizer import normalize_tool_call, normalize_tool_result
+from aiive.runtime.proactive_tool import NOTIFY_USER_TOOL_ID, register_notify_user
+from aiive.runtime.turn_events import (
+    INTERNAL_CONTEXT_HEADER,
+    build_internal_context,
+    claim_pending_events,
+    decision_from_response,
+    set_decisions,
+)
+
+
+def _tool_calls_paired(messages: list[Any]) -> bool:
+    """工具调用与 ToolMessage 是否全部配对。
+
+    事件只能注入在安全边界：存在未回填的 tool_call 时不追加任何消息，
+    避免破坏 assistant tool-call → tool-result 的严格配对。
+    """
+    pending: set[str] = set()
+    for message in messages:
+        if isinstance(message, AIMessage):
+            for call in getattr(message, "tool_calls", None) or []:
+                call_id = str(call.get("id", "") or "")
+                if call_id:
+                    pending.add(call_id)
+        elif isinstance(message, ToolMessage):
+            pending.discard(str(message.tool_call_id or ""))
+    return not pending
+
+
+def _notify_user_schema() -> dict[str, Any]:
+    """notify_user 的展示用 schema（实际绑定由 build_langchain_tools 生成）。"""
+    return {
+        "type": "function",
+        "function": {
+            "name": NOTIFY_USER_TOOL_ID,
+            "description": (
+                "在当前任务执行过程中主动给用户发一条独立聊天消息（不结束任务）。"
+                "仅在内部事件上下文要求时调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "提醒正文"},
+                    "event_id": {"type": "string", "description": "内部事件 id"},
+                },
+                "required": ["content"],
+            },
+        },
+    }
 
 
 def _ws_commit(mutate: "Callable[[Session], None]") -> None:
@@ -94,6 +142,55 @@ class _AgentState(TypedDict):
     tool_validation_ok: bool
     tool_validation_attempts: int
     tool_validation_records: list[dict[str, Any]]
+    event_decisions: Annotated[list[dict[str, Any]], operator.add]
+
+
+class _DecisionMarkerStreamFilter:
+    """从流式 token 中剥离 [[EVENT_DECISION: ...]] 内部决策标记。
+
+    标记只会出现在注入事件后的第一次 assistant 输出开头；只缓冲开头片段，
+    一旦确认不是标记就立即透传，避免影响正常流式体验。
+    """
+
+    _START: str = "[[event_decision"
+
+    def __init__(self) -> None:
+        self._buffer: str = ""
+        self._passthrough: bool = False
+
+    def feed(self, text: str) -> str:
+        if self._passthrough:
+            return text
+        self._buffer += text
+        stripped = self._buffer.lstrip()
+        if not stripped:
+            return ""
+        lowered = stripped.lower()
+        if not self._START.startswith(lowered) and not lowered.startswith(self._START):
+            out = self._buffer
+            self._buffer = ""
+            self._passthrough = True
+            return out
+        if self._START.startswith(lowered):
+            return ""
+        end = stripped.find("]]")
+        if end < 0:
+            if len(self._buffer) > 160:
+                out = self._buffer
+                self._buffer = ""
+                self._passthrough = True
+                return out
+            return ""
+        rest = stripped[end + 2:]
+        self._buffer = ""
+        self._passthrough = True
+        return rest.lstrip()
+
+    def flush(self) -> str:
+        out = self._buffer
+        self._buffer = ""
+        self._passthrough = True
+        return out
 
 
 @dataclass
@@ -315,6 +412,7 @@ class AgentGraphResult:
     context_snapshot: ContextSnapshotData = field(default_factory=ContextSnapshotData)
     memory_signal: Any = None  # MemorySignalDecision
     llm_usage: LLMUsageStats = field(default_factory=LLMUsageStats)
+    event_decisions: list[dict[str, Any]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +630,7 @@ class AgentGraph:
         thread_id: str = "",
         turn_record_id: str = "",
         execution_id: str = "",
+        turn_id: str = "",
     ) -> tuple[Any, list[dict[str, Any]], list[dict[str, Any]]]:
         """构建并返回编译后的 StateGraph、工具记录引用列表和待审批列表。
 
@@ -544,11 +643,97 @@ class AgentGraph:
         from aiive.config import settings
         from aiive.tools.tool_validation import validate_tool_params
 
+        def _load_event_injection() -> tuple[str | None, list[dict[str, Any]]]:
+            """在安全边界领取待注入事件；没有事件时不产生任何额外 LLM 调用。"""
+            if not thread_id or not turn_record_id:
+                return None, []
+            db = self._db
+            try:
+                rows = claim_pending_events(
+                    db,
+                    thread_id=thread_id,
+                    turn_record_id=turn_record_id,
+                    turn_id=turn_id,
+                )
+                if not rows:
+                    # 结束本次只读事务，避免长 Turn 持有跨多轮的旧快照。
+                    db.commit()
+                    return None, []
+                text = build_internal_context(db, rows)
+                snapshot = [
+                    {
+                        "event_id": row.id,
+                        "event_type": row.event_type,
+                        "priority": int(row.priority or 0),
+                        "payload": dict(row.payload or {}),
+                    }
+                    for row in rows
+                ]
+                db.commit()
+                logger.info(
+                    "[TRACE:graph] EVENT_INJECT count=%d ids=%s",
+                    len(snapshot), [item["event_id"] for item in snapshot],
+                )
+                return text, snapshot
+            except Exception:
+                db.rollback()
+                logger.exception("[TRACE:graph] 事件注入领取失败（保持待处理）")
+                return None, []
+
+        def _record_event_injection(
+            injected: list[dict[str, Any]],
+            internal_context: str,
+            decision: str,
+            response: Any,
+            tool_names: list[str],
+        ) -> None:
+            """Trace：完整保留注入的系统上下文与模型决策（聊天时间线不读取）。"""
+            from aiive.runtime.event_logger import EventLogger
+
+            db = self._db
+            try:
+                EventLogger(db).log_event(
+                    trace_id=trace_id or "",
+                    thread_id=thread_id,
+                    event_type="turn_event_injection",
+                    turn_id=turn_id or None,
+                    payload={
+                        "events": injected,
+                        "internal_context": internal_context,
+                        "decision": decision,
+                        "tool_calls": tool_names,
+                        "content_preview": str(getattr(response, "content", "") or "")[:2000],
+                    },
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.exception("[TRACE:graph] 事件注入 Trace 写入失败")
+
+        def _persist_event_decisions(injected: list[dict[str, Any]], decision: str) -> None:
+            db = self._db
+            try:
+                ids = [str(item.get("event_id") or "") for item in injected]
+                set_decisions(db, ids, {event_id: decision for event_id in ids if event_id})
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.exception("[TRACE:graph] 事件决策记录失败（finalize 会收口）")
+
         def _assistant(state: _AgentState) -> dict[str, Any]:
-            """assistant 节点：LLM 推理，可生成 tool_calls。"""
+            """assistant 节点：LLM 推理，可生成 tool_calls。
+
+            事件注入边界：只有工具调用与 ToolMessage 全部配对后才追加内部
+            SystemMessage；注入复用本次 LLM 请求，不额外发起模型调用。
+            """
             msgs = state["messages"]
             logger.info("[TRACE:graph] ASSISTANT(ns) msgs_count=%d", len(msgs))
-            resp = llm_with_tools.invoke(msgs)
+            injection_text: str | None = None
+            injected: list[dict[str, Any]] = []
+            if _tool_calls_paired(msgs):
+                injection_text, injected = _load_event_injection()
+            call_messages = [*msgs, SystemMessage(content=injection_text)] if injection_text else msgs
+            resp = llm_with_tools.invoke(call_messages)
             tc_count = len(getattr(resp, "tool_calls", None) or [])
             content_len = len(str(resp.content or ""))
             logger.info("[TRACE:graph] ASSISTANT(ns) tool_calls=%d content_len=%d", tc_count, content_len)
@@ -565,7 +750,27 @@ class AgentGraph:
             # 收集 tool_call 参数，供后续 tool_result 关联
             for tc in getattr(resp, "tool_calls", None) or []:
                 args_by_id[tc.get("id", "") or ""] = tc.get("args", {})
-            return {"messages": [resp]}
+            event_decisions: list[dict[str, Any]] = []
+            if injection_text and injected:
+                tool_names = [str(tc.get("name", "") or "") for tc in (resp.tool_calls or [])]
+                cleaned, decision = decision_from_response(str(resp.content or ""), tool_names)
+                if cleaned != resp.content:
+                    resp.content = cleaned
+                event_decisions = [
+                    {
+                        "event_id": item["event_id"],
+                        "event_type": item["event_type"],
+                        "decision": decision,
+                    }
+                    for item in injected
+                ]
+                _record_event_injection(injected, injection_text, decision, resp, tool_names)
+                _persist_event_decisions(injected, decision)
+                logger.info(
+                    "[TRACE:graph] EVENT_DECISION decision=%s ids=%s",
+                    decision, [item["event_id"] for item in injected],
+                )
+            return {"messages": [resp], "event_decisions": event_decisions}
 
         def _policy_check(state: _AgentState) -> str:
             """策略检查节点：根据 ToolRegistry 元数据校验 tool_calls。"""
@@ -968,6 +1173,10 @@ class AgentGraph:
             from aiive.task_runtime.tools import build_main_agent_registry
 
             registry = build_main_agent_registry()
+        # 单 Turn 快照：notify_user 只在本 Turn 内可见，不改变主 Agent 固定工具面
+        # （build_main_agent_registry 的工具集合仍由测试与契约锁定）。
+        registry = registry.snapshot()
+        register_notify_user(registry)
         run_ctx_exec = RunContext(
             thread_id=thread.id,
             trace_id=trace.trace_id,
@@ -978,7 +1187,9 @@ class AgentGraph:
         tools = build_langchain_tools(registry, run_context=run_ctx_exec)
         if tool_schemas is not None:
             allowed = {s.get("function", {}).get("name") for s in tool_schemas}
+            allowed.add(NOTIFY_USER_TOOL_ID)
             tools = [t for t in tools if getattr(t, "name", None) in allowed]
+            tool_schemas = [*tool_schemas, _notify_user_schema()]
         if not tools:
             logger.warning(
                 "[TRACE:graph] 工具列表为空（tool_schemas=%s），LLM 将无工具可用",
@@ -992,7 +1203,7 @@ class AgentGraph:
             _model=self._llm_client.default_model,
             normalizer=normalizer, ws_service=ws_service,
             thread_id=thread.id, turn_record_id=exec_ctx.turn_record_id,
-            execution_id=exec_ctx.execution_id,
+            execution_id=exec_ctx.execution_id, turn_id=exec_ctx.turn_id,
         )
         return {
             "trace": trace,
@@ -1062,6 +1273,7 @@ class AgentGraph:
         context_snapshot: "ContextSnapshotData",
         llm_usage: "LLMUsageStats",
         signal: "MemorySignalDecision",
+        event_decisions: "list[dict[str, Any]] | None" = None,
     ) -> "AgentGraphResult":
         """Assemble the final AgentGraphResult from the shared post-processing.
 
@@ -1117,6 +1329,7 @@ class AgentGraph:
             pending_approvals=[dict(item) for item in pending_approvals],
             context_snapshot=result_snapshot, memory_signal=signal,
             llm_usage=llm_usage,
+            event_decisions=list(event_decisions or []),
         )
 
     # ------------------------------------------------------------------
@@ -1181,6 +1394,7 @@ class AgentGraph:
             context_snapshot=context_snapshot,
             llm_usage=llm_usage,
             signal=signal,
+            event_decisions=result.get("event_decisions", []),
         )
 
     # ------------------------------------------------------------------
@@ -1217,6 +1431,7 @@ class AgentGraph:
         stream_matcher = _StreamToolCallMatcher()
         stream_params_by_id: dict[str, dict[str, Any]] = {}
         completed_stream_records: list[ToolRecord] = []
+        decision_filters: dict[str, _DecisionMarkerStreamFilter] = {}
         input_state: dict[str, Any] = {"messages": initial_messages, "tool_records": []}
 
         try:
@@ -1240,12 +1455,39 @@ class AgentGraph:
                     if isinstance(output, dict) and "messages" in output:
                         final_state = output
 
+                if kind == "on_chat_model_start":
+                    started = event.get("data", {}).get("input", {})
+                    started_messages = (
+                        started.get("messages", []) if isinstance(started, dict) else started
+                    )
+                    flattened = [
+                        message
+                        for batch in (started_messages if isinstance(started_messages, list) else [])
+                        for message in (batch if isinstance(batch, list) else [batch])
+                    ]
+                    if any(
+                        isinstance(message, SystemMessage)
+                        and str(message.content or "").startswith(INTERNAL_CONTEXT_HEADER)
+                        for message in flattened
+                    ):
+                        decision_filters[run_id] = _DecisionMarkerStreamFilter()
+
+                if kind == "on_chat_model_end" and run_id in decision_filters:
+                    tail = decision_filters.pop(run_id).flush()
+                    if tail:
+                        accumulated.append(tail)
+                        yield {"type": "token", "text": tail}
+
                 if kind == "on_chat_model_stream":
                     chunk = event["data"].get("chunk")
                     if chunk is not None and chunk.content:
                         text = str(chunk.content)
-                        accumulated.append(text)
-                        yield {"type": "token", "text": text}
+                        marker_filter = decision_filters.get(run_id)
+                        if marker_filter is not None:
+                            text = marker_filter.feed(text)
+                        if text:
+                            accumulated.append(text)
+                            yield {"type": "token", "text": text}
 
                 elif kind == "on_tool_start" and node == "tools":
                     input_data = event["data"].get("input", {})
@@ -1380,6 +1622,9 @@ class AgentGraph:
             context_snapshot=context_snapshot,
             llm_usage=self._collect_llm_usage(final_messages),
             signal=signal,
+            event_decisions=(
+                final_state.get("event_decisions", []) if final_state is not None else []
+            ),
         )
         yield {"type": "__graph_result__", "result": result}
 

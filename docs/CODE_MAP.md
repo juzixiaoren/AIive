@@ -7,7 +7,7 @@
 > - **路径约定**：均相对项目根（`AIive/`），如 `backend/aiive/main.py`、`frontend/src/pages/ChatPage.tsx`
 > - **行号**：基于建图时的代码版本，仅供快速跳转，以实际代码为准
 > - **维护规则**：见文末第 9 节。**新增/删除/移动文件、改 key 符号行号、改表结构后必须同步更新本文档**
-> - 建图日期：2026-10-21；最近更新：2026-10-27（V49 单用户认证、V50 目标步骤触发规则 + 主动消息、V51 工具结果回填预算、V52 后台回填统一 + Bash 流式日志、V53 通用计划事件源扩展）
+> - 建图日期：2026-10-21；最近更新：2026-10-28（V49 单用户认证、V50 目标步骤触发规则 + 主动消息、V51 工具结果回填预算、V52 后台回填统一 + Bash 流式日志、V53 通用计划事件源扩展、V54 安全边界事件注入 + 协作式主动消息）
 
 ---
 
@@ -149,6 +149,7 @@
 | 长期目标（Goal） | `task_runtime/goal_plan.py`、`task_runtime/goal_service.py` | `task_runtime/runtime.py`（执行钩子）、`task_runtime/watchers.py`（`goal_step_id`）、`api/routes_agent_tasks.py`（`/goal/*`）、`worker/scheduler_daemon.py`（`scan_due_reminders`） | `tests/unit/backend/test_long_term_goal.py` |
 | 目标步骤触发规则 + 决策闭环（V50） | `task_runtime/goal_triggers.py`（纯规则求值：once_at/recurring/window_once/event_condition/opportunistic）、`task_runtime/goal_trigger_service.py`（确定性扫描 → Outbox 入队）、`task_runtime/goal_decision.py`（上下文/LLM 结构化决策/服务端校验/执行/Trace） | `task_runtime/goal_plan.py`（`TriggerRule`/`trigger_of`）、`worker/handlers_goal_triggers.py`（`goal_trigger_decision`）、`runtime/proactive_message.py`（真实时间线消息）、`worker/scheduler_daemon.py::_agent_task_scanner_job`、`worker/job_types.py` | `tests/unit/backend/test_goal_triggers.py`（19 例） |
 | 通用计划事件源（V53） | `task_runtime/goal_events.py`（`GoalEvent`/`publish_goal_event`：真实运行事件 → Outbox `goal_event_dispatch`）、`worker/handlers_goal_events.py`（事件 → 活动计划确定性匹配） | `task_runtime/goal_trigger_service.py::dispatch_event`、`task_runtime/repository.py::transition_task`（任务终态）、`worker/handlers_knowledge.py`（知识维护完成/失败）、`selfdev/repair_loop.py::persist_repair_run`（修复结果）、`worker/job_types.py` | `tests/unit/backend/test_goal_event_sources.py`（13 例） |
+| 安全边界事件注入（V54） | runtime/turn_events.py（TurnEventInbox 收件箱/领取/收口）、runtime/proactive_tool.py（notify_user 工具） | runtime/agent_graph.py::_assistant（工具批次后、下次 LLM 前注入 SystemMessage）、runtime/turn_execution.py::_finalize_turn（事件收口 + 事件序号接续）、runtime/proactive_message.py::post_in_turn、worker/handlers_goal_triggers.py（前台 Turn 活跃时让出）、db/models.py::TurnEventInbox、backend/alembic/versions/f7a1c3d5e9b2_add_turn_event_inbox.py | tests/unit/backend/test_turn_event_injection.py（9 例） |
 | 提醒 / 条件任务 | `runtime/task_manager.py` | `worker/task_worker.py`、`tools/builtin_tools.py`（schedule_reminder 等） | `test_reminder*.py`、`test_task_manager*.py` |
 | 通知 | `api/routes_notifications.py` | `worker/outbox_handlers.py`、`frontend/src/pages/NotificationsPage.tsx` | `test_notification*.py` |
 | 桌面节点服务端 | `desktop/node_service.py`、`desktop/connection_manager.py`、`desktop/protocol.py` | `api/routes_desktop.py`、`desktop/registry_overlay.py` | `test_desktop*.py` |
@@ -391,6 +392,12 @@
 - `worker/handlers_goal_events.py`（V53）：`handle_goal_event_dispatch` 从载荷还原事件 → `GoalTriggerService.dispatch_event` 确定性匹配 → COMPLETED（`goal_event_matched:<n>`）；载荷不合法 → NON_RETRYABLE；异常 → RETRYABLE_ERROR 交给 Outbox 重试。
 - `task_runtime/goal_decision.py`（V50）：`GoalDecisionEngine.context`（目标/步骤/依赖/触发原因/证据/相关记忆/近期对话/当前时间）→ `messages`（system + user，system 只进 Trace 不进聊天）→ `decide`（复用 `default_llm_client`，json_mode）→ `parse`（json_repair 兜底）→ `validate`（服务端复核 action/步骤状态/依赖/审批/证据，LLM 不能绕过）→ `apply`（先校验 `step.last_trigger_key`，过期决策返回 `stale_trigger`，再分发到 `GoalService`；主动消息在同一事务内写入，被拒不发消息、写失败整体回滚）。`_record` 写 `goal_decision` 事件（dedupe_key 幂等），`write_trace` 写 `ContextSnapshot`（含完整 system/历史/触发事件）+ `LLMCall` + `goal_trigger_decision` 事件。`decisions_today` 供每日硬上限。
 - `runtime/proactive_message.py`（V50）：`ProactiveMessageService.post` 把主动消息写成 `TurnRecord(source=runtime_event, status=completed, turn_sequence=peek_next_turn_sequence)` + `Event(llm_response)`，与用户消息共用唯一时间线；检测到同线程有活跃租约的 running Turn 时抛 `ProactiveBlocked`，由 Outbox 重试，避免并发乱序。
+- runtime/turn_events.py（V54）：运行事件收件箱的唯一读写入口。enqueue_turn_event 只在同线程存在持有有效租约的 running Turn 时入箱（无 Turn 时仍由 Outbox 直接处理），dedupe_key 唯一约束去重，线程级积压上限 50 条且优先淘汰最老 pending；claim_pending_events 按 priority DESC, created_at ASC 领取最多 5 条并置 injected；build_internal_context 组装事件类型/来源/优先级/关联目标与步骤/触发原因/事件元数据/目标状态/TaskEvidence，并给出 act_now/defer/continue/no_action 四种显式决策；mark_turn_handled 在 Turn 正常收尾时把 injected 行收口（defer 保留给 Outbox，其余 handled），expire_pending_event 供 Outbox 兜底。
+- runtime/proactive_tool.py（V54）：notify_user 只注册到单 Turn 的 registry 快照（不改 build_main_agent_registry 固定工具面），服务端按 turn_event_inbox.turn_record_id 授权——本 Turn 没有已领取事件时直接拒绝；消息由 ProactiveMessageService.post_in_turn 写入同一 Turn 的 Event(llm_response, payload.proactive=True)（稳定 uuid5(dedupe_key) 幂等），并通过既有 ws_manager 推送 new_message，工具返回后 Agent 继续原工具循环。
+- runtime/agent_graph.py::_assistant（V54）：仅当最后一条消息不是未回填的 AIMessage tool_calls（_tool_calls_paired）时领取事件；把内部上下文作为 SystemMessage 追加到本次 llm_with_tools.invoke 的输入（不新增 LLM 请求，也不写入聊天时间线），从回复中剥离 [[EVENT_DECISION: ...]] 标记并写 turn_event_injection Trace Event（完整内部上下文 + 决策 + 工具名）；流式路径用 _DecisionMarkerStreamFilter 在 token 级剥离标记。
+- runtime/turn_execution.py::_finalize_turn（V54）：事件序号从该 Turn 现有 max(turn_event_index)+1 续写（主动消息已占 1，工具/最终答复接在其后），并在同一事务内调用 mark_turn_handled；收口失败只记录日志，不阻断 Turn 提交，未收口事件由 Outbox 兜底。
+- worker/handlers_goal_triggers.py（V54）：决策作业携带 pending_event_dedupe_key；若收件箱已 handled → 直接 COMPLETED（不二次调用模型、不重复发消息）；若仍 pending/injected/deferred 且前台 Turn 活跃 → RETRY_LATER（不并发启动第二个 LLM Run）；Turn 结束/租约失效后标记 expired 并走原 GoalDecisionEngine 路径（重启恢复）。
+- db/models.py::TurnEventInbox + 迁移 f7a1c3d5e9b2：thread_id/dedupe_key/event_type/source/priority/payload/status/turn_record_id/turn_id/decision/message_event_id/created_at/injected_at/handled_at；status 为 pending/injected/deferred/handled/expired，(thread_id,status) 索引支撑领取与兜底扫描。
 - `control/`：`capability_broker.py`（`CapabilityBroker`：TaskScope 校验→TaskPolicyEngine→ResourceLock→`registry.execute_brokered`）；`scope.py`（`TaskScope.from_brief` L47/`validate_arguments` L62/`as_envelope` L97）；`task_policy.py`（allow/approval/block）；`approval_service.py`（审批生命周期）
 
 ### 3.10 `desktop/` — 桌面执行节点通道

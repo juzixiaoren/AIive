@@ -201,6 +201,41 @@ class TurnRecord(Base):
     )
 
 
+class TurnEventInbox(Base):
+    """运行事件收件箱：事件在 Turn 执行期间到达时先持久化，等待安全边界注入。
+
+    与 Outbox 的关系：OutboxJob 仍是可靠投递与重试的唯一通道；本表只保存
+    "已投递但尚未被当前 Turn 处理"的事件视图，用于在工具批次结束后、下一次
+    LLM 决策前注入内部上下文。重复事件由 dedupe_key 唯一约束去重。
+    """
+
+    __tablename__: str = "turn_event_inbox"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    thread_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("threads.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    dedupe_key: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    source: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    priority: Mapped[int] = mapped_column(default=50, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # pending（待注入）/ injected（已注入本 Turn）/ deferred（LLM 决定延后）/
+    # handled（本 Turn 已处理）/ expired（Turn 未处理，交回 Outbox）
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", index=True)
+    turn_record_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    turn_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    decision: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    message_event_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    injected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    handled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__: tuple[Index, ...] = (
+        Index("ix_turn_event_inbox_thread_status", "thread_id", "status"),
+    )
+
+
 class ApprovalRequest(Base):
     """工具审批请求：保存不可由客户端修改的原始调用和执行状态。"""
     __tablename__: str = "approval_requests"

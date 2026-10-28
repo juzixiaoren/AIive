@@ -70,6 +70,18 @@ def _trigger_trace_id(operation_id: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, operation_id))
 
 
+def _trigger_priority(rule: Any) -> int:
+    """事件优先级：窗口/事件型规则更紧急，时间型规则按普通处理。"""
+    kind = getattr(getattr(rule, "kind", None), "value", "")
+    if kind == "window_once":
+        return 90
+    if kind == "event_condition":
+        return 80
+    if kind == "opportunistic":
+        return 60
+    return 50
+
+
 class GoalTriggerService:
     """目标步骤触发规则的唯一确定性扫描入口。"""
 
@@ -282,11 +294,36 @@ class GoalTriggerService:
                     "trigger_event_payload": firing.metadata.get("event_payload"),
                     "fired_at": _iso(now),
                     "trace_id": trace_id,
+                    # 前台 Turn 活跃时，事件先进入 turn_event_inbox 等待安全边界
+                    # 注入；决策消费者据此判断是否已被本 Turn 处理，避免二次决策。
+                    "pending_event_dedupe_key": f"goal_trigger:{operation_id}",
                 },
                 trace_id=trace_id,
                 schema_version=1,
                 max_retries=3,
             ))
+            # 只有存在活跃前台 Turn 时才会真正入箱（无 Turn 时由 Outbox 直接处理）。
+            from aiive.runtime.turn_events import enqueue_turn_event
+
+            enqueue_turn_event(
+                self.db,
+                thread_id=task.thread_id,
+                event_type="goal_trigger_fired",
+                source="goal_trigger",
+                dedupe_key=f"goal_trigger:{operation_id}",
+                priority=_trigger_priority(rule),
+                payload={
+                    "task_id": task.id,
+                    "task_title": task.title,
+                    "step_id": step.id,
+                    "step_title": step.title,
+                    "trigger_key": firing.key,
+                    "reason": firing.reason,
+                    "event_type": firing.metadata.get("event_type") or "goal_trigger_fired",
+                    "event_payload": firing.metadata.get("event_payload"),
+                    "outbox_operation_id": operation_id,
+                },
+            )
         self.db.flush()
         return created
 
