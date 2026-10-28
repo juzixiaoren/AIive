@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from aiive.config import settings
@@ -43,13 +43,24 @@ BUSY_TASK_STATES = frozenset({
     TaskStatus.RECONCILING.value,
 })
 BUSY_RETRY_SECONDS = 15
+# 等待前台 Turn 时的重试上限：对齐租约到期时间，但不超过该上限，
+# 避免 Turn 长时间运行时以 15s 级空转刷 Outbox（也避免无限重试的观感）。
+FOREGROUND_WAIT_MAX_SECONDS = 60
 
 
-def _retry_later(reason: str) -> HandlerResult:
+def _retry_later(reason: str, until: datetime | None = None) -> HandlerResult:
+    now = datetime.now(UTC)
+    delay = timedelta(seconds=BUSY_RETRY_SECONDS)
+    if until is not None:
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=UTC)
+        # 稍晚于租约到期：Turn 正常收尾或崩溃失租后，下一次轮询即可接手。
+        wait = until - now + timedelta(seconds=1)
+        delay = min(timedelta(seconds=FOREGROUND_WAIT_MAX_SECONDS), max(delay, wait))
     return HandlerResult(
         HandlerOutcome.RETRY_LATER,
         reason,
-        retry_available_at=datetime.now(timezone.utc) + timedelta(seconds=BUSY_RETRY_SECONDS),
+        retry_available_at=now + delay,
     )
 
 
@@ -92,15 +103,18 @@ def handle_goal_trigger_decision(claimed: ClaimedJob) -> HandlerResult:
                 # 前台 Turn 已在安全边界内处理该事件（可能已主动提醒用户）：
                 # 不再发起第二次模型决策，也不重复写主动消息。
                 return HandlerResult(HandlerOutcome.COMPLETED, "handled_in_turn")
-            if state in OPEN_STATUSES or not state:
-                if active_turn_for_thread(db, task.thread_id) is not None:
-                    # 前台 Run 正在执行：让出本轮，等 Turn 结束或事件被注入处理。
-                    # 收件箱行可能因“入队时无活跃 Turn”尚未创建，同样不能并发决策。
-                    return _retry_later("foreground_turn_active")
-                if state in OPEN_STATUSES:
-                    # Turn 已结束但未处理（崩溃/中断/延后）：交回原决策路径。
-                    expire_pending_event(db, pending_key)
-                    db.commit()
+            # 除 handled 外的任何状态都必须先看前台 Turn：pending/injected/deferred
+            # 是尚未处理，expired 是收件箱溢出淘汰或上一轮让出，空状态是入队时被拒
+            # 或行已被淘汰。只要 Turn 仍持有有效租约，这里就绝不能调用模型——
+            # 否则溢出淘汰恰恰会让 Outbox 绕过前台检查，形成并发决策。
+            turn = active_turn_for_thread(db, task.thread_id)
+            if turn is not None:
+                return _retry_later("foreground_turn_active", until=turn.lease_expires_at)
+            if state in OPEN_STATUSES:
+                # Turn 已结束但事件未处理（崩溃/中断/延后）：标记 expired 后交回
+                # 原决策路径，本次作业继续走一次 GoalDecisionEngine 兜底。
+                expire_pending_event(db, pending_key)
+                db.commit()
         goals = GoalService(db)
         plan = goals.load_plan(task)
         if plan is None or plan.status != GoalStatus.ACTIVE:

@@ -1,5 +1,9 @@
 # Current Phase
 
+## 版本索引
+- 主干最新：**V56 事件收件箱溢出与决策串行化**（2026-10-28）→ 见文末「### V56 …」；上一版为 V55 决策标记全流式防泄漏。
+- 历史阶段：V34 → V54 按时间顺序记录在下方各节；下方 `## Phase` / `## Status` 是 V34 阶段的原始记录，不再代表当前主干。
+
 ## Phase
 project_plan_v34 - Eval Harness 与 Kernel Contract Checks（先刹车，再加能力）
 
@@ -697,4 +701,25 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - 可靠性：claim 置 injected；Turn 正常收尾 mark_turn_handled（defer 保留给 Outbox，其余 handled）；notify_user 成功即标记 handled + message_event_id；Turn 中断/进程重启后 Outbox 看到 pending/injected/deferred 且无活跃 Turn → expire 并走原 GoalDecisionEngine；决策作业看到 handled → 直接 COMPLETED，绝不二次调用模型或重复发消息；前台 Turn 活跃时决策作业返回 RETRY_LATER，避免并发 LLM。取消/修改/审批仍走既有工具与安全内核。
 - Trace 与可见性：turn_event_injection Event 保留完整内部上下文、决策与工具名；ThreadState 只渲染 user_message/tool_call/tool_result/llm_response，内部 SystemMessage 与 trace Event 不进入普通聊天。
 - 测试：tests/unit/backend/test_turn_event_injection.py 9 例（Fake LLM，全离线）：工具执行期间事件到达、连续工具调用、多事件合并/优先级/注入上限、流式标记过滤、主动消息插入/顺序/幂等、原任务恢复、重复事件、Outbox 让出与重启恢复、handled 事件不二次决策、内部提示不泄露而 Trace 完整。
-- 遗留风险：事件注入只在 assistant 节点入口发生，若模型单轮不再调用工具（直接结束），事件由 Outbox 在 Turn 结束后兜底决策，不会在本次 Turn 内提醒；notify_user 的授权依赖 turn_record_id，跨 Turn 的事件只能走后台主动消息路径；流式标记过滤只处理回复开头，模型若把标记写在正文中间仍会在最终答复前被剥离，但实时 token 可能短暂可见。
+- 遗留风险：事件注入只在 assistant 节点入口发生，若模型单轮不再调用工具（直接结束），事件由 Outbox 在 Turn 结束后兜底决策，不会在本次 Turn 内提醒；notify_user 的授权依赖 turn_record_id，跨 Turn 的事件只能走后台主动消息路径；流式标记过滤只处理回复开头（V55 起改为全流式增量扫描，正文中间与跨分片标记同样不会进入实时 token）。
+
+### V55 主动事件决策标记的全流式防泄漏（2026-10-28）
+- 目标：V54 的流式过滤只在回复开头生效，标记出现在正文中间或跨多个 token 分片时会短暂泄漏到实时 token（最终持久化文本已被剥离，形成"流里看得到、库里没有"的不一致）。本轮改为全流式增量扫描，使 SSE token、最终助手消息与 __graph_result__ 回复逐字一致。
+- 协议唯一事实源（runtime/turn_events.py）：DECISION_MARKER_WS_MAX=8、DECISION_DECISIONS、DECISION_MARKER_MAX_LEN；DECISION_MARKER_RE 的空白段改为限长（\s{0,8}），使合法标记长度有上界。新增 remove_decision_markers（最终文本清洗唯一入口，parse_decision_marker 复用）、scan_decision_marker（前缀状态机，返回 match/partial/none）、DecisionMarkerStreamFilter（feed/flush，有界缓冲）。
+- 扫描规则：安全文本立即透传，缓冲尾部最多滞留一个 "[" 以等待跨分片的 "[["；命中完整标记整段剥离；partial 仅在长度 ≤ DECISION_MARKER_MAX_LEN 时等待，超过即判定为普通文本并放行（不会因为半个标记无限吞字）；非法片段与流结束时仍未闭合的片段原样输出，与正则清洗结果一致。
+- 一致性：只有标记先于首个非空白字符时才丢弃前导空白（与 remove_decision_markers 的 lstrip 规则同构），因此流式累计文本与最终持久化助手消息逐字相同；过滤器仍只在本次 chat model 输入含 INTERNAL_CONTEXT_HEADER 时启用，普通聊天文本不受影响。
+- 不改变 V54 语义：不新增 LLM 调用、不改事件决策判定（notify_user > 其他工具 > 显式标记 > continue）、Trace 仍保留完整内部上下文与决策，未删除任何审计记录。
+- 测试：tests/unit/backend/test_decision_marker_stream.py 24 例（全离线）：标记在开头/中间/结尾、任意二分切点与逐字符分片、多标记、普通文本、非法与未完成标记、前导空白语义、缓冲有界、scan 三态，以及驱动真实 _execute_graph_stream 事件循环的 SSE 断言（token 无泄漏且等于最终回复；无注入时不过滤）。
+- 版本索引修正：本文件此前只有 V34 的 Phase 标题，最新阶段靠文末追加，索引与主干不一致；现已在文件头补"版本索引"指向主干最新阶段。
+- 遗留风险：超过 8 个连续空白的标记（如 "[[        EVENT_DECISION: continue]]"）不再被识别，会按普通文本展示且不剥离——这是"宁可展示也不无限缓冲"的确定性取舍；如需放宽，同步调整 DECISION_MARKER_WS_MAX（正则与扫描器共用该常量）。
+
+### V56 事件收件箱溢出与决策串行化（2026-10-28）
+- 问题：V54 的决策作业守卫只在 pending/injected/deferred 或“行不存在”时检查前台 Turn；一旦收件箱溢出把老事件置为 expired，对应作业就跳过前台检查直接走 GoalDecisionEngine——前台 Turn 仍在跑，却并发发起了第二次 LLM 决策。
+- 守卫重写（worker/handlers_goal_triggers.py）：对携带 pending_event_dedupe_key 的作业，**只有 handled 直接 COMPLETED**；其余状态（pending/injected/deferred/expired/行被淘汰/行不存在）一律先查 active_turn_for_thread，Turn 持有有效租约就 RETRY_LATER，绝不调用模型；无活跃 Turn 时 open 状态先 expire 再走原 GoalDecisionEngine 兜底一次。
+- 重试节流：等待前台 Turn 的 retry_available_at 对齐租约到期时间（+1s），并以 FOREGROUND_WAIT_MAX_SECONDS=60 封顶；task_busy 仍用 15s。Turn 正常收尾或崩溃失租后，下一次轮询即可接手，不会无限空转。
+- 溢出与拒收（runtime/turn_events.py）：保留 50 条上限与“淘汰最老 pending”策略，排序改为 (created_at, id) 确定性；淘汰行置 expired 并写 decision=evicted_overflow，同时打带 key/limit 的 warning；无可淘汰 pending 时拒绝新事件，仅记 warning——决策作业本身仍在 Outbox，Turn 结束后按原路径兜底，不静默丢失。
+- 不变项：复用既有 Outbox、幂等 operation_id 与状态机，不新增事件总线/任务引擎；V55 的流式标记过滤与事件决策语义未改动。
+- 测试：tests/unit/backend/test_turn_event_overflow.py 8 例（Fake LLM，全离线）：溢出淘汰与原因、无可淘汰拒收、被淘汰事件在 Turn 活跃期间零 LLM 调用、重试点对齐租约并封顶、Turn 结束后只决策一次、被拒事件恢复、handled 不重复决策、缺失行同样让出、租约过期但状态仍 running（进程重启）能接手且只决策一次。
+- 遗留风险：Outbox 为 at-least-once——若作业在 apply 提交后、finalize 前崩溃，重投可能对 message 类决策二次发言（act_now 类由 last_trigger_key 拦截）；彻底消除需要把“已决策”标记与 apply 写在同一事务（会改动 V54 既有断言，本轮未做）。
+
+

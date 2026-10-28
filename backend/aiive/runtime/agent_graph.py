@@ -68,6 +68,7 @@ from aiive.runtime.message_normalizer import normalize_tool_call, normalize_tool
 from aiive.runtime.proactive_tool import NOTIFY_USER_TOOL_ID, register_notify_user
 from aiive.runtime.turn_events import (
     INTERNAL_CONTEXT_HEADER,
+    DecisionMarkerStreamFilter as _DecisionMarkerStreamFilter,
     build_internal_context,
     claim_pending_events,
     decision_from_response,
@@ -143,54 +144,6 @@ class _AgentState(TypedDict):
     tool_validation_attempts: int
     tool_validation_records: list[dict[str, Any]]
     event_decisions: Annotated[list[dict[str, Any]], operator.add]
-
-
-class _DecisionMarkerStreamFilter:
-    """从流式 token 中剥离 [[EVENT_DECISION: ...]] 内部决策标记。
-
-    标记只会出现在注入事件后的第一次 assistant 输出开头；只缓冲开头片段，
-    一旦确认不是标记就立即透传，避免影响正常流式体验。
-    """
-
-    _START: str = "[[event_decision"
-
-    def __init__(self) -> None:
-        self._buffer: str = ""
-        self._passthrough: bool = False
-
-    def feed(self, text: str) -> str:
-        if self._passthrough:
-            return text
-        self._buffer += text
-        stripped = self._buffer.lstrip()
-        if not stripped:
-            return ""
-        lowered = stripped.lower()
-        if not self._START.startswith(lowered) and not lowered.startswith(self._START):
-            out = self._buffer
-            self._buffer = ""
-            self._passthrough = True
-            return out
-        if self._START.startswith(lowered):
-            return ""
-        end = stripped.find("]]")
-        if end < 0:
-            if len(self._buffer) > 160:
-                out = self._buffer
-                self._buffer = ""
-                self._passthrough = True
-                return out
-            return ""
-        rest = stripped[end + 2:]
-        self._buffer = ""
-        self._passthrough = True
-        return rest.lstrip()
-
-    def flush(self) -> str:
-        out = self._buffer
-        self._buffer = ""
-        self._passthrough = True
-        return out
 
 
 @dataclass
@@ -686,6 +639,7 @@ class AgentGraph:
             decision: str,
             response: Any,
             tool_names: list[str],
+            raw_content: str = "",
         ) -> None:
             """Trace：完整保留注入的系统上下文与模型决策（聊天时间线不读取）。"""
             from aiive.runtime.event_logger import EventLogger
@@ -703,6 +657,8 @@ class AgentGraph:
                         "decision": decision,
                         "tool_calls": tool_names,
                         "content_preview": str(getattr(response, "content", "") or "")[:2000],
+                        # 清洗前的真实模型输出（含决策标记），保证审计不因过滤丢失执行记录。
+                        "content_raw_preview": raw_content[:2000],
                     },
                 )
                 db.commit()
@@ -753,7 +709,8 @@ class AgentGraph:
             event_decisions: list[dict[str, Any]] = []
             if injection_text and injected:
                 tool_names = [str(tc.get("name", "") or "") for tc in (resp.tool_calls or [])]
-                cleaned, decision = decision_from_response(str(resp.content or ""), tool_names)
+                raw_content = str(resp.content or "")
+                cleaned, decision = decision_from_response(raw_content, tool_names)
                 if cleaned != resp.content:
                     resp.content = cleaned
                 event_decisions = [
@@ -764,7 +721,9 @@ class AgentGraph:
                     }
                     for item in injected
                 ]
-                _record_event_injection(injected, injection_text, decision, resp, tool_names)
+                _record_event_injection(
+                    injected, injection_text, decision, resp, tool_names, raw_content=raw_content,
+                )
                 _persist_event_decisions(injected, decision)
                 logger.info(
                     "[TRACE:graph] EVENT_DECISION decision=%s ids=%s",

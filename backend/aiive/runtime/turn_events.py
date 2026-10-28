@@ -33,16 +33,204 @@ STATUS_EXPIRED = "expired"
 
 OPEN_STATUSES = (STATUS_PENDING, STATUS_INJECTED, STATUS_DEFERRED)
 
+# 收件箱溢出淘汰的可识别处置原因：写入 decision 列（该行不会再有模型决策），
+# 使排障与 Outbox 兜底路径能区分“Turn 内已处理”与“被溢出淘汰”。
+DECISION_EVICTED_OVERFLOW = "evicted_overflow"
+
 # 单次注入上限：超出部分留在收件箱，等下一次 assistant 调用再合并，避免一次
 # 注入无限膨胀；同时限制线程级积压总量，防止 Outbox 重试风暴造成无界增长。
 MAX_INJECT_PER_CALL = 5
 MAX_PENDING_PER_THREAD = 50
 
 INTERNAL_CONTEXT_HEADER = "[内部事件上下文 · 非用户消息]"
+
+# 决策标记协议的唯一事实源：正则清洗（最终持久化文本）与流式过滤器必须共用同一套
+# 边界，否则"流里已经展示、落库却已剥离"会产出两份不一致的用户可见文本。
+# 空白段限长让合法标记长度有上界，流式扫描才能在有限缓冲内确定性判定，
+# 而不是为了等一个可能永不闭合的标记无限吞字。
+DECISION_MARKER_WS_MAX = 8
+DECISION_DECISIONS = ("act_now", "defer", "continue", "no_action")
+DECISION_MARKER_MAX_LEN = (
+    2  # [[
+    + DECISION_MARKER_WS_MAX
+    + len("EVENT_DECISION")
+    + DECISION_MARKER_WS_MAX
+    + 1  # :
+    + DECISION_MARKER_WS_MAX
+    + max(len(word) for word in DECISION_DECISIONS)
+    + DECISION_MARKER_WS_MAX
+    + 2  # ]]
+)
 DECISION_MARKER_RE = re.compile(
-    r"\[\[\s*EVENT_DECISION\s*:\s*(act_now|defer|continue|no_action)\s*\]\]",
+    r"\[\[\s{{0,{ws}}}EVENT_DECISION\s{{0,{ws}}}:\s{{0,{ws}}}({decisions})\s{{0,{ws}}}\]\]".format(
+        ws=DECISION_MARKER_WS_MAX,
+        decisions="|".join(DECISION_DECISIONS),
+    ),
     re.IGNORECASE,
 )
+
+MARKER_HEAD_WORD = "event_decision"
+MARKER_CLOSE = "]]"
+
+
+def scan_decision_marker(text: str) -> tuple[str, int]:
+    """扫描 text 开头的一个决策标记，返回 (状态, 结束下标)。
+
+    状态取值：
+    - `match`：完整合法标记，结束下标为其后一位，整段应剥离；
+    - `partial`：当前内容是某个合法标记的严格前缀，需要更多字符才能判定；
+    - `none`：确定不是标记，应按普通文本处理。
+
+    合法标记长度不超过 `DECISION_MARKER_MAX_LEN`，因此 partial 状态的缓冲
+    天然有界——调用方可以据此给出确定性的等待/放弃策略。
+    """
+    length = len(text)
+    if not text.startswith("[["):
+        return ("none", 0)
+    pos = 2
+
+    def literal(word: str) -> str:
+        nonlocal pos
+        remaining = length - pos
+        for offset in range(min(len(word), remaining)):
+            if text[pos + offset].lower() != word[offset]:
+                return "none"
+        if remaining < len(word):
+            return "partial"
+        pos += len(word)
+        return "ok"
+
+    def space() -> str:
+        nonlocal pos
+        start = pos
+        while pos < length and text[pos].isspace():
+            pos += 1
+            if pos - start > DECISION_MARKER_WS_MAX:
+                return "none"
+        return "partial" if pos >= length else "ok"
+
+    def decision() -> str:
+        nonlocal pos
+        tail = text[pos:].lower()
+        matched = [word for word in DECISION_DECISIONS if tail.startswith(word)]
+        if matched:
+            pos += max(len(word) for word in matched)
+            return "ok"
+        if any(word.startswith(tail) for word in DECISION_DECISIONS):
+            return "partial"
+        return "none"
+
+    steps = (
+        space,
+        lambda: literal(MARKER_HEAD_WORD),
+        space,
+        lambda: literal(":"),
+        space,
+        decision,
+        space,
+        lambda: literal(MARKER_CLOSE),
+    )
+    for step in steps:
+        status = step()
+        if status != "ok":
+            return (status, 0)
+    return ("match", pos)
+
+
+class DecisionMarkerStreamFilter:
+    """流式剥离内部决策标记，输出与 `remove_decision_markers` 逐字一致。
+
+    设计要点：
+    - 安全文本立即透传，缓冲尾部最多滞留一个 `[`，用于等待跨分片的 `[[`；
+    - 命中完整标记即整段丢弃；未完成标记只在长度不超过
+      `DECISION_MARKER_MAX_LEN` 时继续等待，超过即判定为普通文本，
+      因此缓冲始终有界，不会因为模型输出了半个标记而无限吞字；
+    - 非法片段与"流结束时仍未闭合"的片段原样输出，与正则清洗结果一致；
+    - 只有当标记出现在首个非空白字符之前时才丢弃其前导空白，
+      与 `remove_decision_markers` 的 lstrip 规则相同，保证流式累计文本
+      与最终持久化文本逐字相同。
+    """
+
+    def __init__(self) -> None:
+        self._buffer: str = ""
+        self._lead: str = ""
+        self._emitted: bool = False
+        self._dropped_lead: bool = False
+
+    @property
+    def pending_chars(self) -> int:
+        """当前仍在等待判定的字符数（有界性断言与排障用）。"""
+        return len(self._buffer)
+
+    def feed(self, text: str) -> str:
+        """喂入一个流式分片，返回可立即透传给用户的文本。"""
+        if text:
+            self._buffer += text
+        return self._drain(final=False)
+
+    def flush(self) -> str:
+        """流结束时收尾：未完成标记按普通文本输出，暂存的前导空白按需保留。"""
+        tail = self._drain(final=True)
+        if self._emitted or not self._lead:
+            return tail
+        lead = self._lead
+        self._lead = ""
+        self._emitted = True
+        return tail + lead
+
+    def _drain(self, *, final: bool) -> str:
+        out: list[str] = []
+        while True:
+            buffer = self._buffer
+            if not buffer:
+                break
+            index = buffer.find("[[")
+            if index < 0:
+                if final:
+                    out.append(buffer)
+                    self._buffer = ""
+                    break
+                keep = 1 if buffer.endswith("[") else 0
+                if keep:
+                    out.append(buffer[:-1])
+                    self._buffer = buffer[-1:]
+                else:
+                    out.append(buffer)
+                    self._buffer = ""
+                break
+            if index > 0:
+                out.append(buffer[:index])
+                self._buffer = buffer[index:]
+                continue
+            status, end = scan_decision_marker(buffer)
+            if status == "match":
+                if not self._emitted:
+                    self._dropped_lead = True
+                    self._lead = ""
+                self._buffer = buffer[end:]
+                continue
+            if status == "partial" and not final and len(buffer) <= DECISION_MARKER_MAX_LEN:
+                break
+            out.append(buffer[:1])
+            self._buffer = buffer[1:]
+        return self._emit("".join(out))
+
+    def _emit(self, text: str) -> str:
+        if not text:
+            return ""
+        if self._emitted:
+            return text
+        if not text.strip():
+            if not self._dropped_lead:
+                self._lead += text
+            return ""
+        self._emitted = True
+        if self._dropped_lead:
+            self._lead = ""
+            return text.lstrip()
+        lead = self._lead
+        self._lead = ""
+        return lead + text
 
 
 def _now() -> datetime:
@@ -108,17 +296,25 @@ def enqueue_turn_event(
         oldest = db.query(TurnEventInbox).filter(
             TurnEventInbox.thread_id == thread_id,
             TurnEventInbox.status == STATUS_PENDING,
-        ).order_by(TurnEventInbox.created_at.asc()).limit(need).all()
+        ).order_by(
+            TurnEventInbox.created_at.asc(), TurnEventInbox.id.asc(),
+        ).limit(need).all()
         if len(oldest) < need:
             # 没有可淘汰的 pending（都在本 Turn 处理中）：拒绝新事件，避免无界增长。
+            # 决策作业本身仍在 Outbox，会在前台 Turn 结束后按原路径兜底决策一次。
             logger.warning(
-                "turn_event_inbox 已满且无可淘汰事件，丢弃新事件: thread_id=%s key=%s",
-                thread_id, dedupe_key,
+                "turn_event_inbox 已满且无可淘汰事件，拒绝新事件（由 Outbox 在 Turn 结束后兜底）: thread_id=%s key=%s limit=%d",
+                thread_id, dedupe_key, MAX_PENDING_PER_THREAD,
             )
             return None
         for row in oldest:
             row.status = STATUS_EXPIRED
+            row.decision = DECISION_EVICTED_OVERFLOW
             row.handled_at = _now()
+            logger.warning(
+                "turn_event_inbox 溢出淘汰: thread_id=%s key=%s reason=overflow limit=%d",
+                thread_id, row.dedupe_key, MAX_PENDING_PER_THREAD,
+            )
 
     row = TurnEventInbox(
         thread_id=thread_id,
@@ -322,15 +518,28 @@ def build_internal_context(db: Session, rows: list[TurnEventInbox]) -> str:
     return "\n".join(lines)
 
 
+def remove_decision_markers(text: str) -> str:
+    """剥离全部决策标记，返回与流式过滤器一致的清洗结果。
+
+    只有标记出现在首个非空白字符之前时才丢弃前导空白——该规则可由流式
+    过滤器增量复现，因此"流式累计文本"与"最终持久化文本"逐字相同。
+    """
+    raw = str(text or "")
+    match = DECISION_MARKER_RE.search(raw)
+    if match is None:
+        return raw
+    cleaned = DECISION_MARKER_RE.sub("", raw)
+    if not raw[: match.start()].strip():
+        cleaned = cleaned.lstrip()
+    return cleaned
+
+
 def parse_decision_marker(text: str) -> tuple[str, str | None]:
     """从模型输出中提取显式决策标记；返回 (清洗后文本, decision)。"""
     raw = str(text or "")
     match = DECISION_MARKER_RE.search(raw)
     decision = match.group(1).lower() if match else None
-    cleaned = DECISION_MARKER_RE.sub("", raw)
-    if decision is not None:
-        cleaned = cleaned.lstrip()
-    return cleaned, decision
+    return remove_decision_markers(raw), decision
 
 
 def decision_from_response(content: str, tool_names: list[str]) -> tuple[str, str]:
