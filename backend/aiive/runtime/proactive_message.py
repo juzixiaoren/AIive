@@ -121,13 +121,38 @@ class ProactiveMessageService:
         trace_id: str,
         turn_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        dedupe_key: str | None = None,
     ) -> dict[str, Any]:
-        """写入一条用户可见的助手消息；重复调用同一 turn_id 返回已有事件。"""
+        """写入一条用户可见的助手消息；重复调用同一 turn_id 返回已有事件。
+
+        dedupe_key 用于后台决策：turn_id 与 Event.id 都由该稳定标识派生，
+        因此不依赖生成文案，重放同一决策也只会有一条时间线消息。
+        """
         text = (content or "").strip()
         if not text:
             raise ValueError("empty_message")
         if len(text) > MAX_MESSAGE_CHARS:
             text = text[:MAX_MESSAGE_CHARS]
+        event_id = ""
+        if dedupe_key:
+            turn_id = turn_id or str(uuid.uuid5(
+                uuid.NAMESPACE_URL, f"proactive-turn:{thread_id}:{dedupe_key}",
+            ))
+            event_id = str(uuid.uuid5(
+                uuid.NAMESPACE_URL, f"proactive:{thread_id}:{dedupe_key}",
+            ))
+            existing_event = self.db.get(Event, event_id)
+            if existing_event is not None:
+                existing_turn = self.db.query(TurnRecord).filter(
+                    TurnRecord.thread_id == thread_id,
+                    TurnRecord.turn_id == existing_event.turn_id,
+                ).one_or_none()
+                return {
+                    "event_id": existing_event.id,
+                    "turn_id": str(existing_event.turn_id or ""),
+                    "turn_sequence": existing_turn.turn_sequence if existing_turn else 0,
+                    "created": False,
+                }
         turn_id = turn_id or str(uuid.uuid5(uuid.NAMESPACE_URL, f"{trace_id}:{text[:200]}"))
         now = datetime.now(timezone.utc)
 
@@ -181,19 +206,34 @@ class ProactiveMessageService:
             segment_id=segment.id,
         )
         self.db.add(record)
-        event = EventLogger(self.db).log_event(
-            trace_id=trace_id,
-            thread_id=thread_id,
-            event_type="llm_response",
-            turn_id=turn_id,
-            turn_event_index=0,
-            payload={
-                "content": text,
-                "message_source": MESSAGE_SOURCE,
-                "proactive": True,
-                "trigger": dict(metadata or {}),
-            },
-        )
+        event_payload = {
+            "content": text,
+            "message_source": MESSAGE_SOURCE,
+            "proactive": True,
+            "trigger": dict(metadata or {}),
+        }
+        if event_id:
+            event = Event(
+                id=event_id,
+                trace_id=trace_id,
+                thread_id=thread_id,
+                event_type="llm_response",
+                turn_id=turn_id,
+                turn_event_index=0,
+                payload=event_payload,
+                created_at=now,
+            )
+            self.db.add(event)
+            self.db.flush()
+        else:
+            event = EventLogger(self.db).log_event(
+                trace_id=trace_id,
+                thread_id=thread_id,
+                event_type="llm_response",
+                turn_id=turn_id,
+                turn_event_index=0,
+                payload=event_payload,
+            )
         thread.last_activity_at = now
         self.db.flush()
         return {

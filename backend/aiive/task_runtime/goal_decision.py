@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, ClassVar, Literal
 
@@ -47,6 +48,11 @@ from aiive.task_runtime.repository import TaskRepository, utcnow
 logger = logging.getLogger(__name__)
 
 DECISION_EVENT_TYPE = "goal_trigger_decision"
+# 决策持久化：同一 (task_id, step_id, trigger_key) 只允许一条结构化决策，
+# 以及一条"已应用"标记。两者都用 AgentTaskEvent 的 dedupe_key 幂等，
+# 因此 Outbox 重投不会二次调用模型，也不会重复改计划/重复发消息。
+DECISION_RECORDED_EVENT = "goal_trigger_decision_recorded"
+DECISION_APPLIED_EVENT = "goal_trigger_decision_applied"
 SYSTEM_PROMPT = """你是 AIive 的长期目标守护进程。系统刚刚触发了一个目标步骤的规则，你需要判断现在是否值得行动。
 
 严格遵守：
@@ -303,6 +309,7 @@ class GoalDecisionEngine:
         decision: GoalDecision,
         message_text: str = "",
         trace_id: str = "",
+        decision_id: str = "",
     ) -> dict[str, Any]:
         """在短事务中执行决策；任何拒绝都只记录事件，不改计划。
 
@@ -355,6 +362,9 @@ class GoalDecisionEngine:
                 thread_id=task.thread_id,
                 content=message_text,
                 trace_id=trace_id or str(uuid.uuid4()),
+                # 消息 ID 由稳定决策标识派生（不依赖生成文案）：即使 apply 被
+                # 重放，也不会插入第二条时间线消息。
+                dedupe_key=f"goal_decision:{decision_id or decision_id_for(task.id, step.id, trigger_key)}",
                 metadata={
                     "task_id": task.id,
                     "step_id": step.id,
@@ -460,6 +470,107 @@ class GoalDecisionEngine:
                 "outcome": outcome,
             },
         )
+
+
+@dataclass
+class PersistedDecision:
+    """一次触发的已持久化决策视图：重试时直接复用，不再调用模型。"""
+
+    decision_id: str
+    decision: GoalDecision
+    meta: dict[str, Any] = field(default_factory=dict)
+    applied: bool = False
+    outcome: dict[str, Any] = field(default_factory=dict)
+
+
+def decision_id_for(task_id: str, step_id: str, trigger_key: str) -> str:
+    """稳定决策标识：task_id + step_id + trigger_key 的确定性派生。"""
+    return str(uuid.uuid5(
+        uuid.NAMESPACE_URL, f"goal_decision:{task_id}:{step_id}:{trigger_key}",
+    ))
+
+
+def _decision_event_key(decision_id: str) -> str:
+    return f"goal_decision:{decision_id}"
+
+
+def _applied_event_key(decision_id: str) -> str:
+    return f"goal_decision_applied:{decision_id}"
+
+
+def load_persisted_decision(
+    db: Session, task_id: str, step_id: str, trigger_key: str,
+) -> PersistedDecision | None:
+    """读取已持久化的决策；不存在返回 None（调用方据此决定是否调用模型）。"""
+    if not task_id or not step_id or not trigger_key:
+        return None
+    decision_id = decision_id_for(task_id, step_id, trigger_key)
+    recorded = db.query(AgentTaskEvent).filter(
+        AgentTaskEvent.task_id == task_id,
+        AgentTaskEvent.dedupe_key == _decision_event_key(decision_id),
+    ).one_or_none()
+    if recorded is None:
+        return None
+    payload = dict(recorded.payload or {})
+    try:
+        decision = GoalDecision.model_validate(payload.get("decision") or {})
+    except Exception:
+        logger.warning(
+            "已持久化决策无法解析，按未决策处理: task_id=%s decision_id=%s",
+            task_id, decision_id,
+        )
+        return None
+    applied_row = db.query(AgentTaskEvent).filter(
+        AgentTaskEvent.task_id == task_id,
+        AgentTaskEvent.dedupe_key == _applied_event_key(decision_id),
+    ).one_or_none()
+    return PersistedDecision(
+        decision_id=decision_id,
+        decision=decision,
+        meta=dict(payload.get("meta") or {}),
+        applied=applied_row is not None,
+        outcome=dict((applied_row.payload or {}).get("outcome") or {}) if applied_row else {},
+    )
+
+
+def persist_decision(
+    db: Session,
+    *,
+    task_id: str,
+    step_id: str,
+    trigger_key: str,
+    decision: GoalDecision,
+    meta: dict[str, Any] | None = None,
+) -> str:
+    """在短事务中保存结构化决策（幂等）；调用方负责 commit。"""
+    decision_id = decision_id_for(task_id, step_id, trigger_key)
+    TaskRepository(db).append_event(
+        task_id,
+        DECISION_RECORDED_EVENT,
+        {
+            "decision_id": decision_id,
+            "step_id": step_id,
+            "trigger_key": trigger_key,
+            "decision": decision.model_dump(mode="json"),
+            "meta": dict(meta or {}),
+        },
+        visibility="internal",
+        dedupe_key=_decision_event_key(decision_id),
+    )
+    return decision_id
+
+
+def mark_decision_applied(
+    db: Session, *, task_id: str, decision_id: str, outcome: dict[str, Any],
+) -> None:
+    """标记决策已应用（与计划变更同一事务）；重投只做收尾，不再产生副作用。"""
+    TaskRepository(db).append_event(
+        task_id,
+        DECISION_APPLIED_EVENT,
+        {"decision_id": decision_id, "outcome": dict(outcome or {})},
+        visibility="internal",
+        dedupe_key=_applied_event_key(decision_id),
+    )
 
 
 def decisions_today(db: Session, task_id: str, *, now: datetime | None = None) -> int:

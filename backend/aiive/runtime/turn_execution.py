@@ -54,6 +54,14 @@ from aiive.runtime.context_budget import ContextBudget
 from aiive.runtime.epoch_manager import EpochManager
 from aiive.runtime.execution_context import TurnExecutionContext
 from aiive.runtime.thread_bootstrap import ThreadBootstrapService
+from aiive.runtime.thread_lease import (
+    FOREGROUND_WAIT_SECONDS,
+    OWNER_TURN,
+    TURN_LEASE_SECONDS,
+    acquire_thread_lease,
+    release_thread_lease,
+    renew_thread_lease,
+)
 from aiive.runtime.token_counter import LiteLLMTokenCounter
 from aiive.runtime.token_models import ModelProfile, TokenSafetyConfig
 from aiive.runtime.tool_normalizer import ToolResultNormalizer
@@ -99,9 +107,15 @@ class FencingViolationError(Exception):
 
 
 class TurnHeartbeat:
-    def __init__(self, turn_record_id: str, execution_id: str):
+    def __init__(
+        self, turn_record_id: str, execution_id: str,
+        thread_id: str | None = None, fencing_token: int | None = None,
+    ):
         self._turn_record_id: str = turn_record_id
         self._execution_id: str = execution_id
+        # 线程级占用凭证：与 TurnRecord 租约同时续期，丢失即视为执行权被接管。
+        self._thread_id: str | None = thread_id
+        self._fencing_token: int | None = fencing_token
         self._stop_event: threading.Event = threading.Event()
         self._lease_lost: threading.Event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -140,6 +154,20 @@ class TurnHeartbeat:
                 }, synchronize_session=False)
                 db.commit()
                 if affected == 0:
+                    self._lease_lost.set()
+                elif (
+                    self._thread_id
+                    and self._fencing_token is not None
+                    # 线程级占用必须同步续租：否则长 Turn 会让占用先过期，
+                    # 后台决策在 Turn 仍在调用模型时抢到占用，重新打开并发窗口。
+                    and not renew_thread_lease(
+                        self._thread_id,
+                        owner_kind=OWNER_TURN,
+                        owner_id=self._turn_record_id,
+                        fencing_token=self._fencing_token,
+                        ttl_seconds=TURN_LEASE_SECONDS,
+                    )
+                ):
                     self._lease_lost.set()
             except Exception:
                 logger.exception("Heartbeat error")
@@ -242,7 +270,7 @@ class TurnExecutionService:
         # 事件循环。每段内部各自新建并关闭 DB 会话，会话生命周期不跨线程，
         # 满足 SQLAlchemy Session 的线程约束。
         try:
-            turn, execution_id = await asyncio.to_thread(
+            turn, execution_id, lease_token = await asyncio.to_thread(
                 self._resolve_and_preempt, message, thread_id, turn_id,
             )
         except TurnConflictError as e:
@@ -260,7 +288,9 @@ class TurnExecutionService:
             yield {"type": "error", "error": err_msg}
             return
 
-        heartbeat = TurnHeartbeat(turn.id, execution_id)
+        heartbeat = TurnHeartbeat(
+            turn.id, execution_id, thread_id=turn.thread_id, fencing_token=lease_token,
+        )
         heartbeat.start()
         trace_id = str(_uuid.uuid4())
         exec_ctx = TurnExecutionContext(
@@ -451,7 +481,7 @@ class TurnExecutionService:
 
     def _resolve_and_preempt(
         self, message: str, thread_id: str | None, turn_id: str | None,
-    ) -> tuple[TurnRecord, str]:
+    ) -> tuple[TurnRecord, str, int]:
         turn_id = turn_id or str(_uuid.uuid4())
         fingerprint = _compute_request_fingerprint(message, thread_id)
         committed_tid = ThreadBootstrapService.ensure_committed_thread(thread_id)
@@ -573,6 +603,22 @@ class TurnExecutionService:
         finally:
             db.close()
 
+        # ── Thread-level mutual exclusion (V57) ──
+        # “检查没有活跃 Turn → 调用 LLM”之间仍有窗口：后台目标决策可能在检查
+        # 通过后立刻开始。这里用持久化租约做真正的互斥——前台 Turn 与后台决策
+        # 抢占同一行，后台持有时前台短暂让路（用户消息已在上面的短事务里落库，
+        # 不会丢失输入）。超过等待上限仍未拿到占用则返回既有可重试冲突，
+        # 前端按 202 契约重试同一 turn_id 即可继续，不会产生第二条用户消息。
+        lease = acquire_thread_lease(
+            committed_tid,
+            owner_kind=OWNER_TURN,
+            owner_id=turn_record_id,
+            ttl_seconds=TURN_LEASE_SECONDS,
+            wait_seconds=FOREGROUND_WAIT_SECONDS,
+        )
+        if lease is None:
+            raise TurnConflictError("turn_in_progress")
+
         # ── Atomic preemption ──
         db2 = SessionLocal()
         try:
@@ -611,7 +657,7 @@ class TurnExecutionService:
                 epoch_id=turn.epoch_id, segment_id=turn.segment_id,
                 source=turn.source,
             )
-            return result, execution_id
+            return result, execution_id, lease.fencing_token
         finally:
             db3.close()
 
@@ -631,8 +677,11 @@ class TurnExecutionService:
         finally:
             db.close()
 
-    def _mark_interrupted(self, db: Session, turn_record_id: str, execution_id: str) -> None:
-        db.query(TurnRecord).filter(
+    def _mark_interrupted(
+        self, db: Session, turn_record_id: str, execution_id: str,
+        thread_id: str | None = None,
+    ) -> None:
+        affected = db.query(TurnRecord).filter(
             TurnRecord.id == turn_record_id,
             TurnRecord.execution_id == execution_id,
             TurnRecord.status == "running",
@@ -641,6 +690,16 @@ class TurnExecutionService:
             TurnRecord.lease_expires_at: None,
             TurnRecord.updated_at: datetime.now(timezone.utc),
         }, synchronize_session=False)
+        if affected:
+            if thread_id is None:
+                thread_id = db.query(TurnRecord.thread_id).filter(
+                    TurnRecord.id == turn_record_id,
+                ).scalar()
+            if thread_id:
+                # 中断即交还线程级占用：后台目标决策不必等到租约自然过期。
+                release_thread_lease(
+                    db, str(thread_id), owner_kind=OWNER_TURN, owner_id=turn_record_id,
+                )
 
     def _mark_turn_interrupted_safely(
         self, turn_record_id: str, execution_id: str, stage: str,
@@ -682,6 +741,9 @@ class TurnExecutionService:
             }, synchronize_session=False)
             if affected != 1:
                 raise FencingViolationError("中断工具事实持久化时执行租约已失效")
+            release_thread_lease(
+                db, turn.thread_id, owner_kind=OWNER_TURN, owner_id=turn.id,
+            )
 
             for index, record in enumerate(tool_records):
                 event_index = 1 + index * 2
@@ -935,6 +997,12 @@ class TurnExecutionService:
                 # 收件箱收口失败不应阻断 Turn 提交；未收口事件由 Outbox 兜底。
                 logger.exception("Turn 事件收件箱收口失败: turn_id=%s", turn.turn_id)
 
+            # 线程级占用与 Turn 完成同一事务释放：提交成功即让出，后台决策
+            # 可以立刻接手；提交失败则由租约自然过期兜底。
+            release_thread_lease(
+                db, turn.thread_id, owner_kind=OWNER_TURN, owner_id=turn.id,
+            )
+
             db.commit()
             return response_dict
         except Exception:
@@ -1017,7 +1085,9 @@ class TurnExecutionService:
         self, message: str, thread_id: str | None, turn_id: str | None,
     ):
         try:
-            turn, execution_id = self._resolve_and_preempt(message, thread_id, turn_id)
+            turn, execution_id, lease_token = self._resolve_and_preempt(
+                message, thread_id, turn_id,
+            )
         except TurnConflictError as e:
             err_msg = str(e)
             if err_msg == "turn_cached":
@@ -1029,7 +1099,9 @@ class TurnExecutionService:
                 return {"reply": "", "error": "turn_in_progress", "_status": 202}
             return {"reply": "", "error": err_msg, "_status": 409}
 
-        heartbeat = TurnHeartbeat(turn.id, execution_id)
+        heartbeat = TurnHeartbeat(
+            turn.id, execution_id, thread_id=turn.thread_id, fencing_token=lease_token,
+        )
         heartbeat.start()
 
         try:

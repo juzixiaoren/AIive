@@ -236,6 +236,35 @@ class TurnEventInbox(Base):
     )
 
 
+class ThreadExecutionLease(Base):
+    """线程级 LLM 执行占用：前台 Turn 与后台目标决策共用的互斥事实源。
+
+    只表达“谁有权在该线程调用 LLM 并写入时间线”，不保存业务状态。
+    原子抢占靠 lease_expires_at 条件更新（不跨 LLM 调用持有数据库事务）；
+    owner_kind/owner_id 标识持有者，fencing_token 单调递增用于拒绝过期写入，
+    进程崩溃后租约到期即可被其他持有者接管。
+    """
+
+    __tablename__: str = "thread_execution_leases"
+
+    thread_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("threads.id", ondelete="CASCADE"), primary_key=True
+    )
+    # turn：前台 Turn（owner_id=turn_records.id）；goal_decision：后台目标决策（owner_id=稳定决策标识）。
+    owner_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    owner_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    fencing_token: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1)
+    lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    acquired_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__: tuple[Index, ...] = (
+        Index("ix_thread_execution_leases_expiry", "lease_expires_at"),
+    )
+
+
 class ApprovalRequest(Base):
     """工具审批请求：保存不可由客户端修改的原始调用和执行状态。"""
     __tablename__: str = "approval_requests"

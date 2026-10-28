@@ -1,7 +1,7 @@
 # Current Phase
 
 ## 版本索引
-- 主干最新：**V56 事件收件箱溢出与决策串行化**（2026-10-28）→ 见文末「### V56 …」；上一版为 V55 决策标记全流式防泄漏。
+- 主干最新：**V57 前后台 LLM 串行化与目标决策幂等**（2026-10-28）→ 见文末「### V57 …」；上一版为 V56 事件收件箱溢出与决策串行化。
 - 历史阶段：V34 → V54 按时间顺序记录在下方各节；下方 `## Phase` / `## Status` 是 V34 阶段的原始记录，不再代表当前主干。
 
 ## Phase
@@ -722,4 +722,46 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - 测试：tests/unit/backend/test_turn_event_overflow.py 8 例（Fake LLM，全离线）：溢出淘汰与原因、无可淘汰拒收、被淘汰事件在 Turn 活跃期间零 LLM 调用、重试点对齐租约并封顶、Turn 结束后只决策一次、被拒事件恢复、handled 不重复决策、缺失行同样让出、租约过期但状态仍 running（进程重启）能接手且只决策一次。
 - 遗留风险：Outbox 为 at-least-once——若作业在 apply 提交后、finalize 前崩溃，重投可能对 message 类决策二次发言（act_now 类由 last_trigger_key 拦截）；彻底消除需要把“已决策”标记与 apply 写在同一事务（会改动 V54 既有断言，本轮未做）。
 
-
+### V57 前后台 LLM 串行化与目标决策幂等（2026-10-28）
+- 问题（两处真实并发/幂等缺口）：
+  1. 决策作业是“查有没有活跃 Turn → 调模型”的**读检查**，检查通过到真正调用 LLM 之间前台 Turn 可能刚好启动，
+     同一线程出现两个 LLM 调用；V54/V56 的 `active_turn_for_thread` 只是快照，无法关闭这个窗口。
+  2. Outbox 是 at-least-once：作业在 apply 提交后、finalize 前崩溃时重投会**再调一次模型**，message 类决策会二次发言，
+     `modify_plan` 会把 revision 推两次；V56 遗留风险里已登记此项。
+- 线程级互斥（新 `runtime/thread_lease.py` + `db/models.py::ThreadExecutionLease` + 迁移 `a9d3e5f7b1c4`）：
+  一行 `thread_execution_leases`（thread_id 主键、owner_kind、owner_id、fencing_token、lease_expires_at）表达
+  “谁有权在该线程调用 LLM 并写时间线”。抢占是**条件更新**（租约到期或同 owner 重入才成功），每次抢占/续租/释放都是
+  独立短事务，**不跨模型调用持有数据库事务**；`fencing_token` 单调递增，旧持有者续租/释放会被拒绝；进程崩溃后租约
+  自然过期即可被接管（无人工清理）。
+- 前台 Turn（`turn_execution.py`）：`_resolve_and_preempt` 在把 TurnRecord 置 running 之前抢占占用；后台决策持有
+  时按 `ACQUIRE_POLL_SECONDS` 轮询等待（`FOREGROUND_WAIT_SECONDS=35s`，覆盖单次模型 30s 超时），超时返回既有
+  `turn_in_progress`（HTTP 202 可重试）。**用户输入不丢失**：TurnRecord(not_started) 与 user_message 事件在更早的
+  短事务里已经提交，同一 turn_id 重试走 `attempt_no += 1` 续跑，不会产生第二条用户消息。
+  `TurnHeartbeat` 与 TurnRecord 租约一起续租线程占用（续租失败即 `lease_lost`，避免长 Turn 占用过期被后台抢走）；
+  `_finalize_turn` / `_mark_interrupted` / `_persist_interrupted_tool_facts` 在各自事务内释放占用。
+- 后台决策（`worker/handlers_goal_triggers.py`）：守卫（V56）通过后**先抢占占用**才允许调用模型，失败
+  `RETRY_LATER(thread_lease_busy)`；占用一直持有到 apply、主动消息落库、Trace 写入提交完成。拿到占用后再用
+  `active_turn_for_thread` 兜底，识别“升级前启动、没有占用行”的旧 Turn（让路，不并发）。
+- 决策持久化与幂等（`task_runtime/goal_decision.py`）：稳定决策标识
+  `decision_id_for(task_id, step_id, trigger_key) = uuid5`。模型返回后先 `persist_decision` 写
+  `AgentTaskEvent(goal_trigger_decision_recorded, dedupe_key=goal_decision:<id>)`（复用既有表，不加新结构）；
+  `load_persisted_decision` 读回结构化决策与“是否已应用”。重投时：已应用 → `COMPLETED(decision_already_applied)`
+  只收尾；已决策未应用 → 直接复用决策，**不再调用模型**。
+- 事务一致性：计划变更、`goal_decision` 记录、主动消息、`goal_trigger_decision_applied` 标记、Trace 在同一个短事务提交
+  （`apply` 内部沿用 `ProactiveMessageService.post` 的 `ProactiveBlocked` 回滚语义）；apply 提交后崩溃，重投只能看到
+  已应用标记，不会重复副作用。
+- 主动消息唯一性：`ProactiveMessageService.post(dedupe_key=...)` 的 turn_id 与 `Event.id` 都由
+  `uuid5(thread_id + dedupe_key)` 派生（`dedupe_key = goal_decision:<decision_id>`），不依赖生成文案；同一决策重放
+  先按 `Event.id` 幂等返回 `created=False`。
+- 不变项：V55 流式标记过滤、V56 收件箱溢出与事件恢复语义、V54 注入边界与 notify_user 授权均未改动；仍只有一次触发一次模型
+  调用，不新增 LLM 请求；Outbox/幂等键/状态机全部复用。
+- 测试：`tests/unit/backend/test_goal_decision_serialization.py` 8 例（Fake LLM，全离线）：占用互斥 + fencing + 按 owner
+  释放、崩溃后租约过期被接管且旧 token 续租失败、后台让路前台占用（零 LLM 调用）、前台等待时用户输入已落库且重试续跑同一
+  Turn、决策持久化后崩溃重投复用决策（模型只调用一次）、应用后重复投递只收尾（revision 只涨一次）、主动消息 ID 由决策标识
+  派生且换文案不产生第二条、前台 Turn 正常收尾释放占用。
+- 全量回归：1433 passed / 23 skipped / 0 failed（1425 基线 + 8 新增；跳过项为 PG 与本地 Embedding 专项）；相关套件
+  （goal_triggers / goal_event_sources / turn_event_injection / turn_event_overflow / decision_marker_stream / chat_api /
+  flow turn_execution / outbox_worker）102 passed。ruff --select F,E9 全通过；basedpyright 改动源文件 0 errors / 0 warnings。
+- 遗留风险：① 前台最多等待 35s，超时后前端需要重试（消息已落库，不会丢；但用户会看到一次“稍后再试”）；
+  ② 租约表按线程串行化，同一线程上的多个目标决策会排队（设计如此，代价是低频触发场景下的额外延迟）；
+  ③ SQLite 下 `with_for_update` 不生效，跨进程抢占依赖单写者 + 条件更新；Postgres 路径由行锁 + 条件更新共同保证。
