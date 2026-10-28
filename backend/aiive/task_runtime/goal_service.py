@@ -517,6 +517,101 @@ class GoalService:
         )
         return self.detail(task)
 
+    def answer_step_question(
+        self,
+        task_id: str,
+        step_id: str,
+        *,
+        answer: str,
+        question_id: str = "",
+        user_event_id: str = "",
+        intent: str = "answer",
+        plan_changes: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """把用户回复关联到某一步：解除等待 / 修改计划 / 记录拒绝（服务端校验）。
+
+        审批步骤不在本路径放行：即使问题来自审批步骤，也必须继续走原有审批机制。
+        回答内容按既有输入语义进入 task_state.inputs，下一次 Run 能读到。
+        """
+        text = (answer or "").strip()
+        if not text:
+            raise GoalError("answer_required")
+        if intent not in {"answer", "modify_plan", "reject"}:
+            raise GoalError("intent_invalid")
+        task = self._require_task(task_id)
+        plan = self._require_plan(task)
+        if plan.status != GoalStatus.ACTIVE:
+            raise GoalError("goal_not_active")
+        step = plan.step(step_id)
+        if step is None:
+            raise GoalError("step_not_found")
+        if step.status in FINISHED_STEP_STATES:
+            raise GoalError("step_already_finished")
+        if self._needs_approval(step):
+            # 审批边界：对话里的回答不能替代人工审批。
+            raise GoalError("step_requires_approval")
+        now = utcnow()
+        if intent == "modify_plan":
+            if not plan_changes:
+                raise GoalError("plan_changes_invalid")
+            self.modify(task.id, dict(plan_changes))
+            return {"status": "applied", "action": "modify_plan", "step_id": step.id}
+        if step.status != GoalStepStatus.WAITING_USER:
+            raise GoalError("step_not_waiting_user")
+        if intent == "reject":
+            step.status = GoalStepStatus.SKIPPED
+            step.note = f"用户拒绝：{text}"[:500]
+            plan.reminder.pop(f"wait_reminded:{step.id}", None)
+            if plan.current_step_id == step.id:
+                plan.current_step_id = None
+            plan.last_progress_at = _iso(now)
+            self._save(task, plan)
+            self.repo.append_event(
+                task.id, "goal_step_answered",
+                {
+                    "step_id": step.id, "question_id": question_id,
+                    "user_event_id": user_event_id, "intent": "reject",
+                    "answer": text[:500], "result": "skipped",
+                },
+                visibility="conversation",
+            )
+            self.repo.checkpoint(
+                task.id, reason="goal_question_rejected",
+                plan=plan.model_dump(mode="json"),
+            )
+            return {"status": "applied", "action": "reject", "step_id": step.id}
+
+        # answer：先按既有输入语义记录回答（BLOCKED_USER → QUEUED 并唤醒），
+        # 再把步骤从 waiting_user 解除，让回答进入下一次 Run 的上下文。
+        was_blocked = task.status == TaskStatus.BLOCKED_USER.value
+        task = self.repo.send_input(task.id, text)
+        plan = self._require_plan(task)
+        step = plan.step(step_id)
+        if step is None:
+            raise GoalError("step_not_found")
+        if step.status != GoalStepStatus.WAITING_USER:
+            raise GoalError("step_not_waiting_user")
+        step.status = GoalStepStatus.READY
+        plan.current_step_id = step.id
+        plan.last_progress_at = _iso(now)
+        self._save(task, plan)
+        self.repo.append_event(
+            task.id, "goal_step_answered",
+            {
+                "step_id": step.id, "question_id": question_id,
+                "user_event_id": user_event_id, "intent": "answer",
+                "answer": text[:500], "result": "ready",
+            },
+            visibility="conversation",
+        )
+        # send_input 只在 BLOCKED_USER 时唤醒任务；其余状态需要补一次显式入队。
+        if not was_blocked and task.status == TaskStatus.QUEUED.value:
+            self.repo.enqueue_run(task, trigger="goal_question_answer")
+        self.repo.checkpoint(
+            task.id, reason="goal_question_answered", plan=plan.model_dump(mode="json"),
+        )
+        return {"status": "applied", "action": "answer", "step_id": step.id}
+
     def complete_goal(self, task_id: str) -> dict[str, Any]:
         """LLM 判定目标完成：服务端复核全部步骤与证据后才真正结束。"""
         task = self._require_task(task_id)

@@ -229,6 +229,23 @@ class ContextAssembler:
         system_content = agent_ctx["system_content"]
         recall_msgs_raw = agent_ctx.get("recall_messages") or []
 
+        # 待回答的问题（V58）：只在该线程确有未关闭问题时注入，供本轮模型判断
+        # 用户是否在回答；普通聊天不增加任何上下文，也不额外调用模型。
+        open_questions: list[Any] = []
+        questions_text = ""
+        # 只有真实用户消息才参与关联：系统/运行时事件不是用户回答。
+        if _source in (None, "user"):
+            try:
+                from aiive.task_runtime.goal_questions import (
+                    list_open_questions,
+                    render_questions_block,
+                )
+
+                open_questions = list_open_questions(db, thread_id)
+                questions_text = render_questions_block(open_questions)
+            except Exception:
+                logger.warning("待回答问题加载失败，本轮跳过关联上下文", exc_info=True)
+
         attention_text = ""
         try:
             with db.begin_nested():
@@ -349,6 +366,7 @@ class ContextAssembler:
                 sealing_bridge_text=bridge_text,
                 history_summary_text=history_summary_text,
                 recall_messages=recall_messages,
+                questions_text=questions_text,
                 current_role=current_role,
                 current_message=message,
             )
@@ -403,6 +421,8 @@ class ContextAssembler:
                 snapshot.injected_memory_ids = self._collect_injected_memory_ids(
                     agent_ctx.get("recall_pack")
                 )
+                # 供 AgentGraph 决定是否为本 Turn 绑定 answer_goal_question。
+                agent_ctx["open_questions"] = open_questions
                 return AssembledContext(
                     messages=messages,
                     tools_schema=tools_schema,
@@ -464,8 +484,9 @@ class ContextAssembler:
         sealing_bridge_text: str,
         history_summary_text: str,
         recall_messages: list[dict[str, Any]],
-        current_role: str,
-        current_message: str,
+        questions_text: str = "",
+        current_role: str = "user",
+        current_message: str = "",
     ) -> list[dict[str, Any]]:
         """按缓存友好的稳定性层级组装最终消息。
 
@@ -490,6 +511,9 @@ class ContextAssembler:
             if content:
                 messages.append({"role": "system", "content": content})
         messages.extend(recall_messages)
+        if questions_text:
+            # 紧邻当前消息注入：待回答问题只在本轮有效，不进入稳定前缀。
+            messages.append({"role": "system", "content": questions_text})
         messages.append({"role": current_role, "content": current_message})
         return messages
 

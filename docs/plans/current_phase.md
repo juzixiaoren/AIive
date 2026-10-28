@@ -1,7 +1,7 @@
 # Current Phase
 
 ## 版本索引
-- 主干最新：**V57 前后台 LLM 串行化与目标决策幂等**（2026-10-28）→ 见文末「### V57 …」；上一版为 V56 事件收件箱溢出与决策串行化。
+- 主干最新：**V58 主动提问与用户回复关联闭环**（2026-10-28）→ 见文末「### V58 …」；上一版为 V57 前后台 LLM 串行化与目标决策幂等。
 - 历史阶段：V34 → V54 按时间顺序记录在下方各节；下方 `## Phase` / `## Status` 是 V34 阶段的原始记录，不再代表当前主干。
 
 ## Phase
@@ -765,3 +765,38 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - 遗留风险：① 前台最多等待 35s，超时后前端需要重试（消息已落库，不会丢；但用户会看到一次“稍后再试”）；
   ② 租约表按线程串行化，同一线程上的多个目标决策会排队（设计如此，代价是低频触发场景下的额外延迟）；
   ③ SQLite 下 `with_for_update` 不生效，跨进程抢占依赖单写者 + 条件更新；Postgres 路径由行锁 + 条件更新共同保证。
+
+### V58 主动提问与用户回复关联闭环（2026-10-28）
+- 问题：V50 的 ask_user / wait_user 只把步骤置 waiting_user 并写一条主动消息，**问题本身没有生命周期**——
+  用户随后的自然语言回复只是一条普通聊天消息，系统无法把它关联回“哪个目标、哪一步、哪个问题”，
+  闭环停在“提问 → 等待”，回答只能靠用户去任务中心点按钮。
+- 持久化待回答问题（新 `task_runtime/goal_questions.py`，复用 `agent_task_events`，不加表）：
+  `GoalDecisionEngine.apply` 在 ask_user / wait_user 时登记 `goal_question_asked`
+  （dedupe_key `goal_question:<id>`，payload 含 task/step/decision/trigger/message_event_id/expires_at）；
+  question_id = `uuid5(task_id + step_id + trigger_key)`，与 V57 决策标识同源，Outbox 重投不会开第二个问题。
+  生命周期用事件表达：`goal_question_resolved`（一次解析）/ `goal_question_expired`（审计标记）；
+  状态（open/resolved/expired/stale）在读取时推导，有效期 72h，**不新增调度器**，过期后一律不改目标。
+- 关联用户回复（不加一次 LLM 调用）：`ContextAssembler.assemble` 在该线程有未关闭问题时把
+  `render_questions_block`（≤1200 字符，含 question_id 与处理规则）作为 system 消息紧邻当前消息注入，
+  并把列表放进 `agent_ctx["open_questions"]`；`agent_graph` 据此**只在该轮**把 `answer_goal_question`
+  注册到 registry 快照（与 notify_user 同一模式，不改 `build_main_agent_registry` 固定工具面）。
+  判定由本轮对话模型在同一次调用里完成：回答 / 修改计划 / 拒绝 / 普通聊天。
+- 执行与校验（新 `runtime/question_tool.py`）：工具只接受服务端已登记的问题——
+  多候选且未给 question_id → `clarification_required`（**绝不猜测绑定**）；已关闭 → `already_answered` /
+  `question_expired`；审批步骤 → `step_requires_approval`（问题保持打开，仍走原审批机制）；
+  成功则 `GoalService.answer_step_question`：answer 复用 `send_input` 记录回答 + `waiting_user→ready` + 入队，
+  modify_plan 复用 `modify`，reject 标记 skipped 并写 `goal_step_answered`。
+- 幂等与恢复：解析事件 `goal_question_resolved` 带 user_event_id / answer / intent / outcome，
+  同一问题只写一次；重复消息（同 user_event_id）或 Outbox 重投只回报已处理，不重复改计划；
+  问题与回答都在数据库里，进程重启后仍可关联；回答内容进入 `task_state.inputs`，下一次 Run 能读到。
+- 不变项：V50 提醒与沉默策略、V54 事件注入、V55 流式过滤、V56 收件箱、V57 线程级占用与决策幂等全部未改动；
+  不新建消息系统、不新增 Agent、不为每条用户消息额外调用模型。
+- 测试：`tests/unit/backend/test_goal_question_answer.py` 11 例（Fake 会话，全离线）：单问题回答解除等待并记录
+  user_event_id、多候选必须澄清且显式绑定只影响对应步骤、普通聊天不误关联（无问题 / 模型不调用）、
+  modify_plan 复用 GoalService、reject 记录拒绝并 skipped、审批步骤拒绝、过期问题只标记不改目标、
+  同 user_event_id 重投只应用一次、决策重放不产生第二个问题、重启后仍可关联且不可重复应用、上下文只注入 open 问题。
+- 全量回归：见交付报告 `docs/reports/2026-10-28_V58_question_answer_loop_report.md`；ruff --select F,E9 全通过；
+  basedpyright 改动源文件 0 errors / 0 warnings。
+- 遗留风险：① 问题与回答的关联依赖模型在本轮主动调用工具，模型不调用时问题保持打开（用户可再发一条或去任务中心）；
+  ② 同一线程同时存在多个问题且用户表述含糊时，需要用户再说一句确认（这是刻意的，不做猜测绑定）；
+  ③ 问题生命周期仍存放在 `agent_task_events`，按线程查询依赖 (task_id, created_at) 索引，规模随线程任务数增长。

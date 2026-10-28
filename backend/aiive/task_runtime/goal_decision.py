@@ -42,6 +42,7 @@ from aiive.task_runtime.goal_plan import (
     GoalStepStatus,
     trigger_of,
 )
+from aiive.task_runtime.goal_questions import record_question
 from aiive.task_runtime.goal_service import GoalError, GoalService
 from aiive.task_runtime.repository import TaskRepository, utcnow
 
@@ -375,12 +376,33 @@ class GoalDecisionEngine:
             message_event_id = str(posted.get("event_id") or "")
             message_turn_id = str(posted.get("turn_id") or "")
 
+        # ask_user / wait_user 会开启一个"待回答的问题"生命周期：问题 ID 由
+        # (task, step, trigger) 派生，与决策标识同源，重放不会登记第二个问题。
+        # 用户后续回复由聊天 Agent 通过 answer_goal_question 关联回来（V58）。
+        question_id = ""
+        if decision.action in {"ask_user", "wait_user"}:
+            if decision.action == "ask_user":
+                question_text = message_text.strip() or decision.message.strip()
+            else:
+                question_text = decision.reason or step.note or ""
+            question_text = question_text or "等待你的输入"
+            question_id = record_question(
+                self.db,
+                task_id=task.id,
+                step_id=step.id,
+                decision_id=decision_id or decision_id_for(task.id, step.id, trigger_key),
+                trigger_key=trigger_key,
+                question=question_text,
+                message_event_id=message_event_id,
+            )
+
         self._record(task, step, decision, accepted=True, reason="")
         return {
             "status": "applied",
             "action": decision.action,
             "message_event_id": message_event_id,
             "message_turn_id": message_turn_id,
+            "question_id": question_id,
         }
 
     def _record(

@@ -7,7 +7,7 @@
 > - **路径约定**：均相对项目根（`AIive/`），如 `backend/aiive/main.py`、`frontend/src/pages/ChatPage.tsx`
 > - **行号**：基于建图时的代码版本，仅供快速跳转，以实际代码为准
 > - **维护规则**：见文末第 9 节。**新增/删除/移动文件、改 key 符号行号、改表结构后必须同步更新本文档**
-> - 建图日期：2026-10-21；最近更新：2026-10-28（V49 单用户认证、V50 目标步骤触发规则 + 主动消息、V51 工具结果回填预算、V52 后台回填统一 + Bash 流式日志、V53 通用计划事件源扩展、V54 安全边界事件注入 + 协作式主动消息、V55 决策标记全流式防泄漏、V56 收件箱溢出与决策串行化、V57 前后台 LLM 串行化 + 目标决策幂等）
+> - 建图日期：2026-10-21；最近更新：2026-10-28（V49 单用户认证、V50 目标步骤触发规则 + 主动消息、V51 工具结果回填预算、V52 后台回填统一 + Bash 流式日志、V53 通用计划事件源扩展、V54 安全边界事件注入 + 协作式主动消息、V55 决策标记全流式防泄漏、V56 收件箱溢出与决策串行化、V57 前后台 LLM 串行化 + 目标决策幂等、V58 主动提问与用户回复关联闭环）
 
 ---
 
@@ -151,6 +151,7 @@
 | 通用计划事件源（V53） | `task_runtime/goal_events.py`（`GoalEvent`/`publish_goal_event`：真实运行事件 → Outbox `goal_event_dispatch`）、`worker/handlers_goal_events.py`（事件 → 活动计划确定性匹配） | `task_runtime/goal_trigger_service.py::dispatch_event`、`task_runtime/repository.py::transition_task`（任务终态）、`worker/handlers_knowledge.py`（知识维护完成/失败）、`selfdev/repair_loop.py::persist_repair_run`（修复结果）、`worker/job_types.py` | `tests/unit/backend/test_goal_event_sources.py`（13 例） |
 | 安全边界事件注入（V54） | runtime/turn_events.py（TurnEventInbox 收件箱/领取/收口）、runtime/proactive_tool.py（notify_user 工具） | runtime/agent_graph.py::_assistant（工具批次后、下次 LLM 前注入 SystemMessage）、runtime/turn_execution.py::_finalize_turn（事件收口 + 事件序号接续）、runtime/proactive_message.py::post_in_turn、worker/handlers_goal_triggers.py（前台 Turn 活跃时让出）、db/models.py::TurnEventInbox、backend/alembic/versions/f7a1c3d5e9b2_add_turn_event_inbox.py | tests/unit/backend/test_turn_event_injection.py（9 例） |
 | 决策标记全流式防泄漏（V55） | runtime/turn_events.py（`DecisionMarkerStreamFilter`/`scan_decision_marker`/`remove_decision_markers`：标记协议唯一事实源，有界前缀状态机 + 与最终清洗一致的 lstrip 规则） | runtime/agent_graph.py::_execute_graph_stream（token 级过滤，仅注入事件协议生效时启用）、runtime/agent_graph.py::_assistant（最终文本清洗） | tests/unit/backend/test_decision_marker_stream.py（24 例） |
+| 主动提问与用户回复关联闭环（V58） | `task_runtime/goal_questions.py`（待回答问题生命周期：稳定 question_id、asked/resolved/expired 事件、72h 有效期、状态推导）、`runtime/question_tool.py`（`answer_goal_question` 工具：多候选必须显式绑定、审批步骤拒绝、幂等关闭） | `task_runtime/goal_decision.py::apply`（ask_user/wait_user 登记问题）、`task_runtime/goal_service.py::answer_step_question`（解除等待/修改计划/记录拒绝）、`runtime/context_assembler.py`（只注入 open 问题块 + `agent_ctx[open_questions]`）、`runtime/agent_graph.py`（按轮次条件绑定工具） | `tests/unit/backend/test_goal_question_answer.py`（11 例） |
 | 提醒 / 条件任务 | `runtime/task_manager.py` | `worker/task_worker.py`、`tools/builtin_tools.py`（schedule_reminder 等） | `test_reminder*.py`、`test_task_manager*.py` |
 | 通知 | `api/routes_notifications.py` | `worker/outbox_handlers.py`、`frontend/src/pages/NotificationsPage.tsx` | `test_notification*.py` |
 | 桌面节点服务端 | `desktop/node_service.py`、`desktop/connection_manager.py`、`desktop/protocol.py` | `api/routes_desktop.py`、`desktop/registry_overlay.py` | `test_desktop*.py` |
@@ -382,7 +383,8 @@
   `on_run_started`（无步骤返回 False，运行时不调 LLM）、`on_step_finished`（证据校验/推进/完成）、`on_step_awaiting_user`、
   `on_watch_due`（到期结算 + 下一场排期）、`schedule_pending_watches`/`cancel_watches`、`scan_due_reminders`（沉默提醒，确定性扫描）、
   V50 触发入口：`save_plan`（决策改计划后回写）、`begin_step_from_trigger`（规则触发起跑：校验 ACTIVE/依赖/审批 → ready → queued + `enqueue_run` + checkpoint `goal_step_triggered`）、
-  `mark_step_waiting_user`（LLM 判定需用户输入时只阻塞该步，要求目标 ACTIVE）、`complete_goal`（校验 `plan_complete` + 证据，且任务必须处于 BLOCKED_*/QUEUED，再走完状态机到 SUCCEEDED）。
+  `mark_step_waiting_user`（LLM 判定需用户输入时只阻塞该步，要求目标 ACTIVE）、`complete_goal`（校验 `plan_complete` + 证据，且任务必须处于 BLOCKED_*/QUEUED，再走完状态机到 SUCCEEDED）、
+  V58 `answer_step_question`（用户回复关联入口：审批步骤直接 `step_requires_approval` 拒绝；`answer` 走 `send_input` 记录回答 + `waiting_user→ready` + 入队；`modify_plan` 复用 `modify`；`reject` 标记 skipped 并写 `goal_step_answered`）。
   `modify` 的 `_copy_step_state` 会保留全部 V50 触发状态（trigger_count/last_trigger_key/armed_at/cooldown_until/opportunistic_hits 等），避免改计划后重复触发。
   `modify` 区分执行内容（title/kind/acceptance/depends_on/requires_evidence）与调度时间：内容变化清空状态/证据/审批并递归失效下游（`dependency_changed:<dep>`），仅改时间保留已完成步骤；运行中拒绝（`goal_running`）。
   `approve_step`/`start_step`/`on_run_started` 均校验依赖（`step_dependencies_unmet`），审批不绕过计划顺序；`approve_step` 写 `goal_step_approved` checkpoint。
@@ -393,6 +395,8 @@
 - `task_runtime/goal_events.py`（V53）：`GoalEvent`（event_id/event_type/source/payload/occurred_at/thread_id）、`publish_goal_event`（事件 → `OutboxJob(goal_event_dispatch, operation_id=goal_event:<source>:<event_id>)`，重复发布返回 None，载荷裁剪到 2000 字符）、`has_active_goal_subscribers`（无活跃目标直接丢弃，不制造 Outbox 噪声）、`event_from_job_payload`（消费者还原事件视图）、`publish_task_terminal_event`（任务终态；目标自身任务不发布，避免自激）。事件类型：`task_completed` / `task_cancelled` / `knowledge_maintenance_completed|failed` / `selfdev_repair_completed|failed`（未知类型直接拒绝）。
 - `worker/handlers_goal_events.py`（V53）：`handle_goal_event_dispatch` 从载荷还原事件 → `GoalTriggerService.dispatch_event` 确定性匹配 → COMPLETED（`goal_event_matched:<n>`）；载荷不合法 → NON_RETRYABLE；异常 → RETRYABLE_ERROR 交给 Outbox 重试。
 - `task_runtime/goal_decision.py`（V50）：`GoalDecisionEngine.context`（目标/步骤/依赖/触发原因/证据/相关记忆/近期对话/当前时间）→ `messages`（system + user，system 只进 Trace 不进聊天）→ `decide`（复用 `default_llm_client`，json_mode）→ `parse`（json_repair 兜底）→ `validate`（服务端复核 action/步骤状态/依赖/审批/证据，LLM 不能绕过）→ `apply`（先校验 `step.last_trigger_key`，过期决策返回 `stale_trigger`，再分发到 `GoalService`；主动消息在同一事务内写入，被拒不发消息、写失败整体回滚）。`_record` 写 `goal_decision` 事件（dedupe_key 幂等），`write_trace` 写 `ContextSnapshot`（含完整 system/历史/触发事件）+ `LLMCall` + `goal_trigger_decision` 事件。`decisions_today` 供每日硬上限。V57 幂等层：`decision_id_for(task_id, step_id, trigger_key)` 给出稳定决策标识（uuid5），`persist_decision` 把结构化决策写进 `AgentTaskEvent(goal_trigger_decision_recorded, dedupe_key=goal_decision:<id>)`，`load_persisted_decision` 读回决策 + 是否已应用，`mark_decision_applied` 写 `goal_trigger_decision_applied`（与计划变更、主动消息同一事务）；`apply(decision_id=...)` 让主动消息 ID 由决策标识派生而不是生成文案。
+- `task_runtime/goal_questions.py`（V58）：待回答问题的唯一读写入口，复用 `agent_task_events` 表达生命周期——`record_question`（`goal_question_asked`，dedupe_key `goal_question:<id>`，payload 含 task/step/decision/trigger/message_event_id/expires_at）、`list_open_questions(thread_id)`（按线程取未关闭问题，状态由「是否有 resolved 事件 / 是否超 expires_at / 任务是否终态」推导）、`load_question`（含已关闭状态，供幂等判定）、`resolve_question`（`goal_question_resolved`，带 user_event_id/answer/intent/outcome，一个问题只解析一次）、`mark_expired`（`goal_question_expired` 审计标记）、`render_questions_block`（有界上下文块，≤1200 字符）。question_id = `uuid5(task_id+step_id+trigger_key)`，与决策标识同源；有效期常量 72h，过期不需要调度器。
+- `runtime/question_tool.py`（V58）：`answer_goal_question` 工具——只在当前线程存在未关闭问题时注册到单 Turn registry 快照（普通聊天不出现该工具），判定由本轮对话模型完成（不额外调用 LLM）。服务端守卫：无待回答问题 → `no_pending_question`；多候选且未给 question_id → `clarification_required`（绝不猜测绑定）；已关闭 → `already_answered`/`question_expired`；审批步骤 → `step_requires_approval`；成功则同事务写计划变更 + 解析事件，重复调用不改计划。`_user_event_id` 从 `ctx.source_event_ids` 或当前 turn 的 `user_message` 事件取幂等键。
 - `runtime/proactive_message.py`（V50）：`ProactiveMessageService.post` 把主动消息写成 `TurnRecord(source=runtime_event, status=completed, turn_sequence=peek_next_turn_sequence)` + `Event(llm_response)`，与用户消息共用唯一时间线；检测到同线程有活跃租约的 running Turn 时抛 `ProactiveBlocked`，由 Outbox 重试，避免并发乱序。V57：`post(dedupe_key=...)` 时 turn_id 与 `Event.id` 都由 `uuid5(thread_id + dedupe_key)` 派生，先按 `Event.id` 幂等返回（`created=False`），因此同一决策重放不会插入第二条时间线消息，也不依赖生成文案。
 - runtime/thread_lease.py（V57）：线程级 LLM 执行占用的唯一入口——`acquire_thread_lease(thread_id, owner_kind, owner_id, ttl, wait_seconds)`（条件更新抢占：租约过期或同 owner 重入才成功；每次尝试都是独立短事务，返回后不持有事务）、`renew_thread_lease`（fencing_token 必须匹配，否则返回 False 表示执行权已被接管）、`release_thread_lease`（使用调用方事务，与 Turn 收尾/决策应用同一提交；只把租约置为过期而不删行，保证 fencing 单调）、`lease_holder`（排障/测试）。owner_kind：`turn`（owner_id=turn_records.id）/ `goal_decision`（owner_id=稳定决策标识）。
 - runtime/turn_events.py（V54）：运行事件收件箱的唯一读写入口。enqueue_turn_event 只在同线程存在持有有效租约的 running Turn 时入箱（无 Turn 时仍由 Outbox 直接处理），dedupe_key 唯一约束去重，线程级积压上限 50 条且优先淘汰最老 pending（created_at, id 确定性排序），淘汰行置 expired 并写 decision=evicted_overflow 供排障；无可淘汰 pending 时拒绝新事件（只记 warning，决策作业仍留在 Outbox，Turn 结束后兜底）；claim_pending_events 按 priority DESC, created_at ASC 领取最多 5 条并置 injected；build_internal_context 组装事件类型/来源/优先级/关联目标与步骤/触发原因/事件元数据/目标状态/TaskEvidence，并给出 act_now/defer/continue/no_action 四种显式决策；mark_turn_handled 在 Turn 正常收尾时把 injected 行收口（defer 保留给 Outbox，其余 handled），expire_pending_event 供 Outbox 兜底。
@@ -635,6 +639,24 @@ worker/handlers_goal_triggers.py::handle_goal_trigger_decision
   → 释放线程级占用 → ws_manager.broadcast_to_thread_sync(new_message)
 ```
 
+主动提问 → 用户回复 → 关联 → 推进（V58，不新增消息系统、不新增调度器、不为每条消息多调一次模型）：
+```
+GoalDecisionEngine.apply(action=ask_user|wait_user)
+  → ProactiveMessageService.post(dedupe_key=goal_decision:<id>)（ask_user 才发消息）
+  → goal_questions.record_question（goal_question_asked，question_id=uuid5(task+step+trigger_key)，expires_at=+72h）
+聊天 Turn（ContextAssembler.assemble）
+  → list_open_questions(thread_id) → render_questions_block → 作为 system 消息紧邻当前消息注入
+  → agent_ctx["open_questions"] → AgentGraph 条件注册 answer_goal_question（无问题不绑定）
+本轮对话模型（同一次调用）判断：回答 / 修改计划 / 拒绝 / 普通聊天
+  → 工具 answer_goal_question(answer, question_id?, intent, plan_changes?)
+      → 多候选未指明 → clarification_required（不改计划）
+      → 过期 → question_expired + goal_question_expired（不改计划）
+      → 审批步骤 → step_requires_approval（走原审批）
+      → GoalService.answer_step_question：send_input + waiting_user→ready + enqueue_run / modify / skipped
+      → resolve_question（goal_question_resolved：user_event_id + answer + intent + outcome）
+      → 同一事务提交；重投按 question_id 幂等，只回报 already_answered
+```
+
 真实运行事件 → 目标匹配 → 决策（V53，复用同一 Outbox/决策闭环，不新建事件总线）：
 ```
 生产者（同事务投递）：repository.transition_task 终态 → publish_task_terminal_event（非目标任务）
@@ -823,6 +845,7 @@ POST /api/auth/login（失败统一 invalid_credentials；同 (client, username)
 | `tests/unit/backend/test_goal_event_sources.py` | 单元（V53 事件源验收） | 13 例：任务成功事件→匹配→决策→主动消息、条件不匹配零决策零 LLM、无订阅者丢弃事件、重复事件/重投幂等、消费失败交 Outbox 重试后只产生一条决策、进程重启后待处理作业可恢复且不重复、用户结束目标不被唤醒、窗口过期决策只送达一次、知识维护完成事件（全局匹配）、知识维护失败只在最后一次尝试发布、自进化修复成功/失败事件、未知事件类型拒绝 |
 | `tests/unit/backend/test_turn_event_overflow.py` | 单元（V56 溢出与串行化验收） | 8 例：50 条 pending 溢出淘汰最老事件并写 evicted_overflow、无可淘汰时拒绝新事件且不动既有行、被淘汰事件的决策作业在前台 Turn 活跃期间 RETRY_LATER 且零 LLM 调用、重试点对齐租约并受 60s 封顶、Turn 结束后只决策一次、被拒事件 Turn 结束后仍能恢复、handled 不重复决策、收件箱行缺失同样让出、租约过期但状态仍 running（进程重启）能接手且只决策一次 |
 | `tests/unit/backend/test_decision_marker_stream.py` | 单元（V55 决策标记防泄漏验收） | 24 例：标记在开头/中间/结尾、任意二分与逐字符分片、多标记、普通文本、非法与未完成标记、前导空白语义、缓冲有界（未闭合标记不无限吞字、超长类标记立即放行）、scan 三态、SSE token 流与最终回复逐字一致且无标记泄漏、无注入时不过滤 |
+| `tests/unit/backend/test_goal_question_answer.py` | 单元（V58 提问—回复闭环验收） | 11 例：单问题回答解除等待并记录 user_event_id、多候选未指明必须澄清（显式绑定才生效）、普通聊天不误关联（无问题/模型不调用）、modify_plan 复用 GoalService、reject 记录拒绝并 skipped、审批步骤拒绝（问题保持打开）、过期问题只标记不改目标、同 user_event_id 重投只应用一次、决策重放不产生第二个问题、重启后仍可关联且不可重复应用、上下文只注入 open 问题 |
 | `tests/unit/backend/test_goal_decision_serialization.py` | 单元（V57 串行化与幂等验收） | 8 例：线程级占用互斥/fencing/按 owner 释放、崩溃后租约过期被接管且旧 token 续租失败、后台决策让路前台占用（零 LLM 调用）、前台等待后台决策时用户输入已落库且重试续跑同一 Turn、决策持久化后崩溃重投复用决策（模型只调用一次）、应用提交后重复投递只收尾（计划版本只涨一次）、主动消息 ID 由决策标识派生且换文案不产生第二条、前台 Turn 正常收尾释放占用后台可立即接手 |
 | `tests/unit/backend/test_auth_frontend_contract.py` | 静态守卫 | 11 例源码扫描：页面禁止裸 `fetch`、WS 必须发认证帧、页面/API 模块不得自管 Token、App 登录门禁与安全回跳、桌面 IPC 只传 Token 不落盘 |
 

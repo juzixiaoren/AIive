@@ -66,6 +66,10 @@ from aiive.runtime.token_counter import LiteLLMTokenCounter
 from aiive.runtime.working_state import WorkingStateService
 from aiive.runtime.message_normalizer import normalize_tool_call, normalize_tool_result
 from aiive.runtime.proactive_tool import NOTIFY_USER_TOOL_ID, register_notify_user
+from aiive.runtime.question_tool import (
+    ANSWER_QUESTION_TOOL_ID,
+    register_answer_goal_question,
+)
 from aiive.runtime.turn_events import (
     INTERNAL_CONTEXT_HEADER,
     DecisionMarkerStreamFilter as _DecisionMarkerStreamFilter,
@@ -111,6 +115,37 @@ def _notify_user_schema() -> dict[str, Any]:
                     "event_id": {"type": "string", "description": "内部事件 id"},
                 },
                 "required": ["content"],
+            },
+        },
+    }
+
+
+def _answer_question_schema() -> dict[str, Any]:
+    """answer_goal_question 的展示用 schema（实际绑定由 build_langchain_tools 生成）。"""
+    return {
+        "type": "function",
+        "function": {
+            "name": ANSWER_QUESTION_TOOL_ID,
+            "description": (
+                "把用户这条消息关联到此前主动提出的问题，并推进对应目标步骤。"
+                "仅在上下文列出待回答问题、且用户确实在回答/修改/拒绝时调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "answer": {"type": "string", "description": "用户回答原文摘要"},
+                    "question_id": {"type": "string", "description": "待回答问题的 id"},
+                    "intent": {
+                        "type": "string",
+                        "enum": ["answer", "modify_plan", "reject"],
+                        "description": "回答/修改计划/拒绝",
+                    },
+                    "plan_changes": {
+                        "type": "object",
+                        "description": "intent=modify_plan 时的计划字段",
+                    },
+                },
+                "required": ["answer"],
             },
         },
     }
@@ -1136,6 +1171,13 @@ class AgentGraph:
         # （build_main_agent_registry 的工具集合仍由测试与契约锁定）。
         registry = registry.snapshot()
         register_notify_user(registry)
+        # 待回答问题（V58）：只有本轮确有未关闭问题时才绑定回答工具。
+        # 普通聊天不出现该工具，从源头避免把闲聊误判成回答。
+        open_questions = list(
+            getattr(assembled_ctx, "agent_ctx", {}).get("open_questions") or [],
+        )
+        if open_questions:
+            register_answer_goal_question(registry)
         run_ctx_exec = RunContext(
             thread_id=thread.id,
             trace_id=trace.trace_id,
@@ -1147,8 +1189,12 @@ class AgentGraph:
         if tool_schemas is not None:
             allowed = {s.get("function", {}).get("name") for s in tool_schemas}
             allowed.add(NOTIFY_USER_TOOL_ID)
+            if open_questions:
+                allowed.add(ANSWER_QUESTION_TOOL_ID)
             tools = [t for t in tools if getattr(t, "name", None) in allowed]
             tool_schemas = [*tool_schemas, _notify_user_schema()]
+            if open_questions:
+                tool_schemas = [*tool_schemas, _answer_question_schema()]
         if not tools:
             logger.warning(
                 "[TRACE:graph] 工具列表为空（tool_schemas=%s），LLM 将无工具可用",
