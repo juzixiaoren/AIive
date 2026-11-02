@@ -6,11 +6,15 @@
 - question_id 由 (task_id, step_id, trigger_key) 确定性派生，Outbox 重投/进程重启
   不会产生第二个问题，也不会把同一问题的回答应用两次；
 - 状态是**推导值**（有 resolution → resolved；超过 expires_at → expired；
-  任务已终结 → stale），因此过期不需要独立调度器；
+  任务已终结 / 目标暂停或结束 / 步骤不存在或已不再等待用户 → stale），
+  因此过期与失效都不需要独立调度器，也不会在恢复目标后误判；
+- 失效问题的状态同样从既有 task_state["goal"] 推导：目标恢复为 active 且步骤仍
+  在 waiting_user 时问题自动重新有效，因此暂停期间不需要写任何标记事件；
 - 过期后一律不允许改目标，只记录标记，提醒与沉默继续沿用 V50 的既有策略。
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -19,7 +23,10 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from aiive.db.models import AgentTask, AgentTaskEvent
+from aiive.task_runtime.goal_plan import GoalPlan, GoalStatus, GoalStepStatus
 from aiive.task_runtime.repository import TERMINAL_TASK_STATES, TaskRepository, utcnow
+
+logger = logging.getLogger(__name__)
 
 QUESTION_ASKED_EVENT = "goal_question_asked"
 QUESTION_RESOLVED_EVENT = "goal_question_resolved"
@@ -35,6 +42,14 @@ STATUS_OPEN = "open"
 STATUS_RESOLVED = "resolved"
 STATUS_EXPIRED = "expired"
 STATUS_STALE = "stale"
+
+# 失效原因（同样是读取时推导的派生值，不落库）：让调用方能明确知道问题为什么
+# 不再可回答，而不是只看到一个笼统的 stale。
+INVALID_TASK_TERMINAL = "task_terminal"
+INVALID_GOAL_MISSING = "goal_not_found"
+INVALID_STEP_MISSING = "step_not_found"
+INVALID_STEP_NOT_WAITING = "step_not_waiting_user"
+INVALID_SUPERSEDED = "superseded"
 
 INTENTS = frozenset({"answer", "modify_plan", "reject"})
 
@@ -58,6 +73,8 @@ class PendingQuestion:
     intent: str = ""
     user_event_id: str = ""
     task_status: str = ""
+    # 仅当 status=stale 时有意义：说明目标/步骤已经不在可回答的状态上。
+    invalid_reason: str = ""
 
     @property
     def is_open(self) -> bool:
@@ -165,12 +182,84 @@ def _resolution_rows(db: Session, question_ids: list[str]) -> tuple[dict[str, Ag
     return resolved, expired
 
 
+def _plan_snapshot(task: AgentTask) -> tuple[str, dict[str, str]]:
+    """读取目标的真实状态与各步骤状态（计划缺失/损坏时返回空 → 问题一律失效）。
+
+    目标暂停、结束，或步骤被修改/重置后，历史问题不能再被当作可回答问题注入，
+    这些状态全部来自既有的 task_state["goal"]，不需要新增表或事件。
+    """
+    raw = (task.task_state or {}).get("goal")
+    if not isinstance(raw, dict):
+        return "", {}
+    try:
+        plan = GoalPlan.model_validate(raw)
+    except Exception:  # noqa: BLE001 - 计划被写坏时按失效处理，不影响其它线程
+        logger.warning("目标计划解析失败，待回答问题按失效处理: task_id=%s", task.id, exc_info=True)
+        return "", {}
+    return str(plan.status), {str(step.id): str(step.status) for step in plan.steps}
+
+
+def _superseded_ids(rows: list[tuple[AgentTaskEvent, AgentTask]]) -> set[str]:
+    """同一 (task, step) 只保留最后一次提问：更早的问题被新提问取代。
+
+    步骤被重置后重新提问会生成新的 question_id；若不收敛，旧问题会在 72h 内
+    一直挂在上下文里，用户回答它只会被服务端拒绝。
+    """
+    latest: dict[tuple[str, str], tuple[datetime, str]] = {}
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    for event, task in rows:
+        payload = dict(event.payload or {})
+        question_id = str(payload.get("question_id") or "")
+        if not question_id:
+            continue
+        asked_at = _parse_dt(payload.get("asked_at")) or _as_utc(event.created_at) or epoch
+        key = (str(task.id), str(payload.get("step_id") or ""))
+        current = latest.get(key)
+        if current is None or asked_at >= current[0]:
+            latest[key] = (asked_at, question_id)
+    kept = {question_id for _asked_at, question_id in latest.values()}
+    return {
+        str(dict(event.payload or {}).get("question_id") or "")
+        for event, _task in rows
+    } - kept - {""}
+
+
+def _invalid_reason(
+    task: AgentTask,
+    *,
+    plan_status: str,
+    step_statuses: dict[str, str],
+    step_id: str,
+    question_id: str,
+    superseded: set[str],
+) -> str:
+    """问题当前是否还有效：空串表示仍可回答，否则返回明确的失效原因。"""
+    if str(task.status) in TERMINAL_TASK_STATES:
+        return INVALID_TASK_TERMINAL
+    if not plan_status:
+        return INVALID_GOAL_MISSING
+    if plan_status != GoalStatus.ACTIVE.value:
+        # 暂停/阻塞/已结束：计划状态变化后旧问题不再进上下文；恢复后自动重新有效。
+        return f"goal_{plan_status}"
+    if not step_id or step_id not in step_statuses:
+        return INVALID_STEP_MISSING
+    if step_statuses[step_id] != GoalStepStatus.WAITING_USER.value:
+        return INVALID_STEP_NOT_WAITING
+    if question_id in superseded:
+        return INVALID_SUPERSEDED
+    return ""
+
+
 def _to_question(
     event: AgentTaskEvent,
     task: AgentTask,
     resolved: dict[str, AgentTaskEvent],
     expired: set[str],
     now: datetime,
+    *,
+    plan_status: str = "",
+    step_statuses: dict[str, str] | None = None,
+    superseded: set[str] | None = None,
 ) -> PendingQuestion:
     payload = dict(event.payload or {})
     question_id = str(payload.get("question_id") or event.dedupe_key or "").replace(
@@ -179,10 +268,12 @@ def _to_question(
     created_at = _parse_dt(payload.get("asked_at")) or _as_utc(event.created_at) or now
     expires_at = _parse_dt(payload.get("expires_at")) or (created_at + timedelta(hours=QUESTION_TTL_HOURS))
     status = STATUS_OPEN
+    invalid_reason = ""
     answer = ""
     intent = ""
     user_event_id = ""
     resolution = resolved.get(question_id)
+    step_id = str(payload.get("step_id") or "")
     if resolution is not None:
         status = STATUS_RESOLVED
         resolution_payload = dict(resolution.payload or {})
@@ -191,13 +282,23 @@ def _to_question(
         user_event_id = str(resolution_payload.get("user_event_id") or "")
     elif question_id in expired or now >= expires_at:
         status = STATUS_EXPIRED
-    elif str(task.status) in TERMINAL_TASK_STATES:
-        status = STATUS_STALE
+    else:
+        # 已回答/已过期之外，还要核实目标与步骤是否仍允许回答。
+        invalid_reason = _invalid_reason(
+            task,
+            plan_status=plan_status,
+            step_statuses=step_statuses or {},
+            step_id=step_id,
+            question_id=question_id,
+            superseded=superseded or set(),
+        )
+        if invalid_reason:
+            status = STATUS_STALE
     return PendingQuestion(
         question_id=question_id,
         task_id=str(task.id),
         thread_id=str(task.thread_id),
-        step_id=str(payload.get("step_id") or ""),
+        step_id=step_id,
         decision_id=str(payload.get("decision_id") or ""),
         trigger_key=str(payload.get("trigger_key") or ""),
         question=str(payload.get("question") or ""),
@@ -209,6 +310,7 @@ def _to_question(
         intent=intent,
         user_event_id=user_event_id,
         task_status=str(task.status),
+        invalid_reason=invalid_reason,
     )
 
 
@@ -231,11 +333,20 @@ def list_open_questions(
         if question_id:
             question_ids.append(question_id)
     resolved, expired = _resolution_rows(db, question_ids)
-    open_questions = [
-        item for item in (
-            _to_question(event, task, resolved, expired, moment) for event, task in rows
-        ) if item.is_open
-    ]
+    superseded = _superseded_ids(rows)
+    snapshots: dict[str, tuple[str, dict[str, str]]] = {}
+    open_questions: list[PendingQuestion] = []
+    for event, task in rows:
+        snapshot = snapshots.get(str(task.id))
+        if snapshot is None:
+            snapshot = _plan_snapshot(task)
+            snapshots[str(task.id)] = snapshot
+        item = _to_question(
+            event, task, resolved, expired, moment,
+            plan_status=snapshot[0], step_statuses=snapshot[1], superseded=superseded,
+        )
+        if item.is_open:
+            open_questions.append(item)
     return open_questions[-limit:]
 
 
@@ -253,7 +364,17 @@ def load_question(db: Session, question_id: str, *, now: datetime | None = None)
         return None
     moment = _as_utc(now) or utcnow()
     resolved, expired = _resolution_rows(db, [question_id])
-    return _to_question(row, task, resolved, expired, moment)
+    # 同一 (task, step) 的后续提问会让本问题失效：需要连同该任务近期的问题一起看。
+    recent = _asked_rows(
+        db, task_id=str(row.task_id), since=moment - timedelta(hours=QUESTION_TTL_HOURS),
+    )
+    plan_status, step_statuses = _plan_snapshot(task)
+    return _to_question(
+        row, task, resolved, expired, moment,
+        plan_status=plan_status,
+        step_statuses=step_statuses,
+        superseded=_superseded_ids(recent or [(row, task)]),
+    )
 
 
 def resolve_question(

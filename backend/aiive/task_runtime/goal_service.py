@@ -547,6 +547,17 @@ class GoalService:
             raise GoalError("step_not_found")
         if step.status in FINISHED_STEP_STATES:
             raise GoalError("step_already_finished")
+        if question_id:
+            # 旧 question_id 的直接调用也必须由服务端校验：问题已失效（暂停/结束/
+            # 步骤变化/被新提问取代）时只拒绝，不改目标。
+            from aiive.task_runtime.goal_questions import load_question
+
+            question = load_question(self.db, question_id)
+            if question is not None:
+                if question.task_id != str(task.id) or question.step_id != step.id:
+                    raise GoalError("question_mismatch")
+                if not question.is_open:
+                    raise GoalError(f"question_{question.status}:{question.invalid_reason}")
         if self._needs_approval(step):
             # 审批边界：对话里的回答不能替代人工审批。
             raise GoalError("step_requires_approval")

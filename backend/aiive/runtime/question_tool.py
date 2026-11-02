@@ -20,7 +20,14 @@ from aiive.context.run_context import RunContext
 from aiive.db.base import SessionLocal
 from aiive.db.models import Event
 from aiive.task_runtime.goal_questions import (
+    INVALID_GOAL_MISSING,
+    INVALID_STEP_MISSING,
+    INVALID_STEP_NOT_WAITING,
+    INVALID_SUPERSEDED,
+    INVALID_TASK_TERMINAL,
     MAX_ANSWER_CHARS,
+    STATUS_EXPIRED,
+    STATUS_RESOLVED,
     PendingQuestion,
     list_open_questions,
     load_question,
@@ -84,6 +91,61 @@ def _candidate(item: PendingQuestion) -> dict[str, str]:
     }
 
 
+def _stale_hint(reason: str) -> str:
+    """按失效原因给出不同提示：暂停可恢复、步骤变化要等新提问、被取代要回答最新的。"""
+    if reason == "goal_paused":
+        return (
+            "目标已暂停，这个问题暂时不可回答，目标不会被修改；"
+            "恢复目标后若该步骤仍在等待你，原问题会重新有效，不需要重新发起。"
+        )
+    if reason == INVALID_GOAL_MISSING:
+        return "目标计划已不存在，这个问题不再有效，目标不会被修改。"
+    if reason.startswith("goal_"):
+        return (
+            "目标已不在进行中（阻塞或已结束），这个问题不再有效，目标不会被修改；"
+            "如需继续，请重新发起目标。"
+        )
+    if reason in {INVALID_STEP_MISSING, INVALID_STEP_NOT_WAITING}:
+        return (
+            "对应步骤已被修改或重置，这个问题不再有效，目标不会被修改；"
+            "该步骤再次需要你时会有新的提问。"
+        )
+    if reason == INVALID_SUPERSEDED:
+        return "这个问题已被同一步骤的新提问取代，请回答最新的那个问题；本次没有改动计划。"
+    if reason == INVALID_TASK_TERMINAL:
+        return "目标已结束，这个问题不再有效，目标不会被修改；如需继续，请重新发起目标。"
+    return "该问题已失效，目标不会被修改；如需继续，请重新发起目标或等待新的提问。"
+
+
+def _closed_result(db: Session, question: PendingQuestion) -> dict[str, Any]:
+    """已关闭/已失效的问题：只回报明确状态，绝不改动目标。
+
+    状态全部由 goal_questions 从事件与计划推导，这里不做任何推断：
+    resolved → 已回答；expired → 过期（补一条审计标记）；stale → 目标或步骤已变化。
+    """
+    if question.status == STATUS_EXPIRED:
+        mark_expired(db, question)
+        db.commit()
+        return {
+            "status": "question_expired",
+            "question_id": question.question_id,
+            "hint": "该问题已过期，目标不会被修改；如需继续，请重新发起目标。",
+        }
+    if question.status == STATUS_RESOLVED:
+        return {
+            "status": "already_answered",
+            "question_id": question.question_id,
+            "hint": "该问题已经回答过，不要重复修改计划。",
+        }
+    reason = question.invalid_reason or "question_stale"
+    return {
+        "status": "question_stale",
+        "question_id": question.question_id,
+        "reason": reason,
+        "hint": _stale_hint(reason),
+    }
+
+
 def answer_goal_question(
     answer: str,
     question_id: str = "",
@@ -110,28 +172,11 @@ def answer_goal_question(
                 (item for item in open_questions if item.question_id == question_id), None,
             )
             if target is None:
-                # 已关闭的问题：重复投递/重复消息一律不改计划，只回报既有状态。
+                # 已关闭/已失效的问题：重复投递、目标暂停或步骤被改动后的一律不改计划，
+                # 只回报既有状态（服务端推导，模型无法绕过）。
                 closed = load_question(db, question_id)
-                if closed is not None and closed.status == "expired":
-                    mark_expired(db, closed)
-                    db.commit()
-                    return {
-                        "status": "question_expired",
-                        "question_id": closed.question_id,
-                        "hint": "该问题已过期，目标不会被修改；如需继续，请重新发起目标。",
-                    }
-                if closed is not None and closed.status == "resolved":
-                    return {
-                        "status": "already_answered",
-                        "question_id": closed.question_id,
-                        "hint": "该问题已经回答过，不要重复修改计划。",
-                    }
                 if closed is not None:
-                    return {
-                        "status": closed.status,
-                        "question_id": closed.question_id,
-                        "hint": "该问题已失效，不要修改计划。",
-                    }
+                    return _closed_result(db, closed)
                 return {
                     "status": "question_not_open",
                     "candidates": [_candidate(item) for item in open_questions],
@@ -155,15 +200,7 @@ def answer_goal_question(
                 ),
             }
 
-        if target.status == "expired":
-            mark_expired(db, target)
-            db.commit()
-            return {
-                "status": "question_expired",
-                "question_id": target.question_id,
-                "hint": "该问题已过期，目标不会被修改；如需继续，请重新发起目标。",
-            }
-
+        # target 一定来自 open 列表：失效/过期/已回答的问题在上面的分支就已返回。
         user_event_id = _user_event_id(db, ctx)
         # 拒绝路径只回滚本工具自己的写入（保存点），不影响调用方事务。
         savepoint = db.begin_nested()
@@ -180,6 +217,18 @@ def answer_goal_question(
         except GoalError as error:
             savepoint.rollback()
             reason = str(error)
+            if reason.startswith("question_"):
+                # 服务端复核发现问题已失效（并发暂停/修改）：只回报状态，不改目标。
+                closed = load_question(db, target.question_id)
+                if closed is not None and not closed.is_open:
+                    return _closed_result(db, closed)
+                detail = reason.split(":", 1)[1] if ":" in reason else reason
+                return {
+                    "status": "question_stale",
+                    "question_id": target.question_id,
+                    "reason": detail,
+                    "hint": _stale_hint(detail),
+                }
             hint = "目标或步骤状态已变化，本次回答没有改动计划。"
             if reason == "step_requires_approval":
                 hint = "该步骤需要人工审批，请在任务中心走原有审批流程。"

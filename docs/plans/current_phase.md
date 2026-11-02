@@ -1,7 +1,7 @@
 # Current Phase
 
 ## 版本索引
-- 主干最新：**V58 主动提问与用户回复关联闭环**（2026-10-28）→ 见文末「### V58 …」；上一版为 V57 前后台 LLM 串行化与目标决策幂等。
+- 主干最新：**V59 待回答问题的状态一致性**（2026-11-02）→ 见文末「### V59 …」；上一版为 V58 主动提问与用户回复关联闭环。
 - 历史阶段：V34 → V54 按时间顺序记录在下方各节；下方 `## Phase` / `## Status` 是 V34 阶段的原始记录，不再代表当前主干。
 
 ## Phase
@@ -800,3 +800,28 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - 遗留风险：① 问题与回答的关联依赖模型在本轮主动调用工具，模型不调用时问题保持打开（用户可再发一条或去任务中心）；
   ② 同一线程同时存在多个问题且用户表述含糊时，需要用户再说一句确认（这是刻意的，不做猜测绑定）；
   ③ 问题生命周期仍存放在 `agent_task_events`，按线程查询依赖 (task_id, created_at) 索引，规模随线程任务数增长。
+
+### V59 待回答问题的状态一致性（2026-11-02）
+- 问题：V58 的待回答问题只判断「是否已回答 / 是否过期 / 任务是否终态」。目标暂停、结束，或步骤被修改、重置后，
+  旧问题仍满足这三个条件，于是继续被注入聊天上下文并绑定回答工具；用户回复后才在服务端被拒——过期业务状态污染正常对话。
+- 修复（只改读取侧的派生判定，不加表 / 不加调度器 / 不加 LLM 调用）：
+  - `goal_questions._plan_snapshot` 从既有 `task_state["goal"]` 读目标状态与全部步骤状态；
+  - `_invalid_reason` 依次校验：任务终态 → 计划缺失 → 计划非 active（paused/blocked/completed/rejected/abandoned）
+    → 步骤不存在 → 步骤不是 waiting_user → 被同步骤新提问取代；
+  - `_superseded_ids` 让同一 (task, step) 只保留最后一次提问（步骤重置后重新提问不会让旧问题继续挂着）；
+  - 失效仍是读取时推导的 `stale`，原因写进 `PendingQuestion.invalid_reason`（goal_paused / step_not_waiting_user / superseded 等）。
+- 注入面：`ContextAssembler.assemble` 与 `agent_graph` 都以 `list_open_questions` 结果为准，因此目标暂停后普通聊天
+  既不注入问题块、也不绑定 `answer_goal_question`；恢复目标且步骤仍在 waiting_user 时问题自动重新有效（不写任何标记事件）。
+- 服务端校验：`GoalService.answer_step_question` 在写计划前复核 question_id（存在则要求 task/step 匹配且问题仍 open），
+  旧 id 直接调用抛 `question_stale:<reason>`；`runtime/question_tool.py` 把已关闭/失效问题统一映射为
+  `already_answered` / `question_expired` / `question_stale` + reason，一律不改目标；审批步骤仍先走 `step_requires_approval`，
+  审批边界没有被本次修复绕过。
+- 测试：`tests/unit/backend/test_goal_question_state_consistency.py` 10 例（全离线）：暂停后不注入且回答只回报 question_stale、
+  直接服务端调用被拒、步骤改内容只让该步骤问题失效（同线程其它问题仍可答）、同步骤新提问取代旧问题、
+  恢复后有效问题可答、恢复后已变化步骤的问题仍失效、审批步骤恢复后仍需审批、失效/过期/重复回复都不改目标。
+- hint 按失效原因分支（`_stale_hint`）：暂停说明「恢复后原问题重新有效、不需要重新发起」，步骤变化说明「等新提问」，被取代说明「回答最新的那个」——避免暂停场景误导用户重建目标。
+- 全量回归：1453 passed / 23 skipped（PG 与 TEI 专项按环境跳过）/ 0 failed；ruff `--select F,E9` 全通过；
+  basedpyright backend 0 errors / 0 warnings。
+- 遗留风险：① 判定依据是 `task_state["goal"]` 的步骤状态，绕过 GoalService 直接改写计划会让判定跟着脏数据走；
+  ② 同一 (task, step) 的旧问题会被新提问取代，模型拿旧 question_id 回答只会得到 question_stale（刻意 fail-closed）；
+  ③ 暂停期间不写失效事件，审计依据是 `goal_paused`/`goal_resumed` 与问题状态推导结果。
