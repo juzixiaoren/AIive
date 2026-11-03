@@ -2,6 +2,9 @@
 
 > 范围：文档导入 / 内容更新 / 删除 / 重索引 / 失败恢复，以及分块、原文对象与派生索引的一致性清理。
 > 不涉及 Reranker、Retrieval Planner、Temporal Graph、Model Router。
+>
+> 解析与切分规则见 `knowledge_structure_chunking.md`：分块内容、标题路径与
+> Embedding 输入由解析/切分版本决定，版本升级后本闭环负责触发重建。
 
 ## 1. 为什么需要维护闭环
 
@@ -93,7 +96,7 @@
 
 ### 6.1 `scan_knowledge_base(db)` —— 只读
 
-返回 `KnowledgeMaintenanceReport`：状态计数、分块总数、7 类问题、最近一次维护完成时间。
+返回 `KnowledgeMaintenanceReport`：状态计数、分块总数、8 类问题、最近一次维护完成时间。
 
 | issue code | 含义 | 修复动作 |
 |---|---|---|
@@ -104,6 +107,7 @@
 | `missing_object` | 原文对象文件不存在 | 标记 `source_unavailable` |
 | `orphan_objects` | 桶内对象无人引用 | 移入回收站 |
 | `expired_superseded_objects` | 超过保留期的旧版本原文 | 释放对象并清空引用 |
+| `stale_chunking` | `parser_version`/`chunker_version` 落后（含历史库空版本） | 从原文重新解析、切分并刷新向量 |
 
 扫描本身不写库，可以随时调用（`GET /api/knowledge/maintenance`）。
 

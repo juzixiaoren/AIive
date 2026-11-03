@@ -74,7 +74,7 @@ AIive（再次召回，fail-closed 校验）：
 | 后端 | Python 3.12+ / FastAPI / LangChain + LangGraph |
 | LLM | DeepSeek（OpenAI 兼容 API） |
 | 数据库 | PostgreSQL 16 / SQLAlchemy 2.0 / Alembic |
-| 向量检索 | pgvector（PostgreSQL 向量扩展）：记忆向量 + 知识分块向量，本地 TEI（bge-small-zh-v1.5）生成 512 维 |
+| 向量检索 | pgvector（PostgreSQL 向量扩展）：记忆向量 + 知识分块向量（结构感知递归切分：标题路径 / 块类型 / 页码定位），本地 TEI（bge-small-zh-v1.5）生成 512 维 |
 | 前端 | React 19 / TypeScript / Vite 6 / TailwindCSS 3 |
 | Android 应用 | React 19 / Capacitor 8 / Android SDK 36（独立 UI） |
 | Desktop 应用 | Electron 37 / Electron Forge / 独立 Node Host |
@@ -291,7 +291,7 @@ AIive/
 │   ├── mcp/              # MCP 工具集成（发现、安装、沙箱）
 │   ├── selfdev/          # 自进化（补丁规划、槽位管理）
 │   ├── db/               # SQLAlchemy 模型、数据库配置
-│   ├── knowledge/        # 文档知识库（摄入、分块、pgvector 向量 + 关键词混合召回）
+│   ├── knowledge/        # 文档知识库（结构化解析 → 递归切分 → pgvector 向量 + 关键词混合召回）
 │   ├── worker/           # 后台 Worker（出站处理、任务调度）
 │   ├── supervisor/       # 守护进程（健康探针、槽位管理）
 │   ├── context/          # 运行上下文

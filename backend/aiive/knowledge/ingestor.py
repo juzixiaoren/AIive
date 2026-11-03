@@ -19,8 +19,10 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from aiive.db.models import Chunk, Document
-from aiive.knowledge.chunker import chunk_text
+from aiive.knowledge.blocks import PARSER_VERSION, heading_path_text, parse_document_blocks
+from aiive.knowledge.chunker import CHUNKER_VERSION, chunk_blocks
 from aiive.knowledge.document_reader import extract_document_bytes
+from aiive.knowledge.embedding_input import build_embedding_input, embedding_input_hash
 from aiive.storage.object_store import (
     ObjectRef,
     delete as delete_object,
@@ -60,25 +62,56 @@ class KnowledgeIngestor:
 
     # ── 分块与对象 ────────────────────────────────────────────────
 
-    def _replace_chunks(self, document: Document, content: str) -> int:
-        """在当前事务中用持久原文重建全部分块，并刷新分块向量。"""
+    def _replace_chunks(self, document: Document, data: bytes, filename: str) -> int:
+        """从持久原文重建全部分块（结构感知递归切分），并刷新分块向量。
+
+        解析与切分都从**持久化原文**出发（不依赖用户本地文件），因此重新导入、
+        reindex 与维护重建走的是同一条链路。写入 parser/chunker 版本，供后续判定
+        是否需要因切分规则升级而重建；Embedding 输入含标题前缀，其哈希落库后，
+        标题或章节变化同样会让旧向量失效。
+        """
         self._purge_chunk_vectors(document.id)
         self._db.query(Chunk).filter(Chunk.document_id == document.id).delete(
             synchronize_session=False
         )
-        chunks = chunk_text(content)
-        for item in chunks:
+        blocks = parse_document_blocks(data, filename)
+        drafts = chunk_blocks(blocks)
+        for draft in drafts:
+            embedding_input = build_embedding_input(
+                title=document.title,
+                heading_path=draft.heading_path,
+                content=draft.content,
+            )
             self._db.add(Chunk(
                 document_id=document.id,
-                content=item["content"],
-                line_start=item["line_start"],
-                line_end=item["line_end"],
-                chunk_index=item["chunk_index"],
-                token_estimate=max(1, len(item["content"]) // 4),
+                content=draft.content,
+                line_start=draft.line_start,
+                line_end=draft.line_end,
+                chunk_index=draft.chunk_index,
+                token_estimate=max(1, draft.token_count),
+                heading_path=heading_path_text(draft.heading_path),
+                section_id=draft.section_id,
+                block_type=draft.block_type,
+                source_type=document.doc_type,
+                page_start=draft.page_start,
+                page_end=draft.page_end,
+                parser_version=PARSER_VERSION,
+                chunker_version=CHUNKER_VERSION,
+                embedding_input_hash=embedding_input_hash(embedding_input),
             ))
+        document.parser_version = PARSER_VERSION
+        document.chunker_version = CHUNKER_VERSION
         self._db.flush()
         self._refresh_chunk_vectors(document.id)
-        return len(chunks)
+        return len(drafts)
+
+    @staticmethod
+    def _chunking_stale(document: Document) -> bool:
+        """解析器/切分器版本落后：即使原文没变也必须重新解析、切分与 Embedding。"""
+        return (
+            document.parser_version != PARSER_VERSION
+            or document.chunker_version != CHUNKER_VERSION
+        )
 
     def purge_chunks(self, document_id: str) -> int:
         """删除指定文档的全部分块与派生向量（可由原文重建）。"""
@@ -240,9 +273,11 @@ class KnowledgeIngestor:
                 chunks = self._db.query(Chunk).filter(
                     Chunk.document_id == existing.id
                 ).count()
-                if revived or chunks == 0:
-                    # 去重命中但分块缺失（此前摄取失败/被清理）→ 补建分块
-                    chunks = self._replace_chunks(existing, extracted.text)
+                if revived or chunks == 0 or self._chunking_stale(existing):
+                    # 去重命中但分块缺失（此前摄取失败/被清理），或解析/切分规则已升级
+                    # → 从持久原文重建分块与向量
+                    existing.doc_type = extracted.doc_type
+                    chunks = self._replace_chunks(existing, data, path.name)
                     existing.status = "indexed"
                 self._db.flush()
                 return {
@@ -266,7 +301,7 @@ class KnowledgeIngestor:
             self._db.flush()
             self._db.add(document)
             self._db.flush()
-            count = self._replace_chunks(document, extracted.text)
+            count = self._replace_chunks(document, data, path.name)
             return {
                 "ok": True, "document_id": document.id, "chunks": count,
                 "content_hash": content_hash, "doc_type": extracted.doc_type,
@@ -304,9 +339,10 @@ class KnowledgeIngestor:
             raise ValueError("文档已失效，不能重新索引")
         try:
             data = self.read_source(document_id)
-            extracted = extract_document_bytes(data, document.title or Path(document.source_path).name)
-            count = self._replace_chunks(document, extracted.text)
+            filename = document.title or Path(document.source_path).name
+            extracted = extract_document_bytes(data, filename)
             document.doc_type = extracted.doc_type
+            count = self._replace_chunks(document, data, filename)
             document.mime_type = extracted.mime_type
             document.status = "indexed"
             document.updated_at = _now()
@@ -385,7 +421,8 @@ def search_chunks(db: Session, query: str, limit: int = 5) -> list[dict[str, Any
     depth = min(limit * 4, 100)
     lexical_hits = _lexical_chunk_hits(db, normalized, depth)
     vector_hits = _vector_chunk_hits(db, query.strip(), depth)
-    return _fuse_chunk_hits(lexical_hits, vector_hits, limit)
+    fused = _fuse_chunk_hits(lexical_hits, vector_hits, limit)
+    return _expand_neighbor_hits(db, fused)
 
 
 # 混合检索融合参数：RRF 让两路排名可比，权重表达"词法不弱于向量"的既有排序契约。
@@ -452,17 +489,80 @@ def _chunk_hit(
     matched_terms: list[str],
     *,
     score: float | None = None,
+    expanded_from: str | None = None,
 ) -> dict[str, Any]:
-    """构造统一的分块命中结构（词法/向量共用，附加字段不破坏既有契约）。"""
+    """构造统一的分块命中结构（词法/向量/相邻扩展共用，附加字段不破坏既有契约）。"""
     hit: dict[str, Any] = {
         "chunk_id": chunk.id, "document_id": document.id,
         "source_path": document.source_path, "content_preview": chunk.content[:200],
         "line_start": chunk.line_start, "line_end": chunk.line_end,
         "matched_terms": matched_terms,
+        # 结构定位：让模型知道命中内容在文档的哪一节、哪一页、属于什么块。
+        "heading_path": chunk.heading_path,
+        "section_id": chunk.section_id,
+        "block_type": chunk.block_type,
+        "source_type": chunk.source_type,
+        "page_start": chunk.page_start,
+        "page_end": chunk.page_end,
+        "chunk_index": chunk.chunk_index,
+        "token_estimate": chunk.token_estimate,
     }
     if score is not None:
         hit["vector_score"] = score
+    if expanded_from is not None:
+        hit["expanded_from"] = expanded_from
     return hit
+
+
+def _expand_neighbor_hits(
+    db: Session, hits: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """按 section_id + chunk_index 扩展相邻分块（同 Section、去重、受 token 预算约束）。
+
+    只在同一文档、同一 section_id 内取前后各 N 个分块，因此不会跨主题拼接；扩展
+    结果追加在原始命中之后，并标注 expanded_from 以便前端区分「命中」与「上下文」。
+    """
+    from aiive.config import settings
+
+    expansion = max(0, int(settings.aiive_knowledge_neighbor_expansion))
+    if not hits or expansion == 0:
+        return hits
+    budget = max(0, int(settings.aiive_knowledge_neighbor_budget_tokens))
+    if budget <= 0:
+        return hits
+    seeds = hits[: max(1, int(settings.aiive_knowledge_neighbor_seed_limit))]
+    seen = {str(hit["chunk_id"]) for hit in hits}
+    extra: list[dict[str, Any]] = []
+    for seed in seeds:
+        if budget <= 0:
+            break
+        section_id = seed.get("section_id")
+        if not section_id:
+            continue
+        neighbors = (
+            db.query(Chunk, Document)
+            .join(Document, Chunk.document_id == Document.id)
+            .filter(
+                Chunk.document_id == seed["document_id"],
+                Chunk.section_id == section_id,
+                Chunk.chunk_index >= int(seed["chunk_index"]) - expansion,
+                Chunk.chunk_index <= int(seed["chunk_index"]) + expansion,
+                Chunk.id.notin_(seen),
+                Document.status.notin_(tuple(INACTIVE_STATUSES)),
+            )
+            .order_by(Chunk.chunk_index.asc())
+            .all()
+        )
+        for chunk, document in neighbors:
+            tokens = max(1, int(chunk.token_estimate or 1))
+            if tokens > budget:
+                continue
+            budget -= tokens
+            seen.add(str(chunk.id))
+            extra.append(_chunk_hit(
+                chunk, document, [], expanded_from=str(seed["chunk_id"]),
+            ))
+    return [*hits, *extra]
 
 
 def _fuse_chunk_hits(

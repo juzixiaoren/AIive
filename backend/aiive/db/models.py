@@ -698,6 +698,9 @@ class Document(Base):
     # 被同路径新版本取代时指向新文档，用于追溯版本链
     superseded_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 最近一次解析/切分使用的版本；与当前常量不一致即视为需要重建（chunker 升级）。
+    parser_version: Mapped[str] = mapped_column(String(32), default="", server_default="")
+    chunker_version: Mapped[str] = mapped_column(String(32), default="", server_default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow,
@@ -735,6 +738,20 @@ class Chunk(Base):
     line_end: Mapped[int] = mapped_column()
     chunk_index: Mapped[int] = mapped_column()
     token_estimate: Mapped[int] = mapped_column(default=0)
+    # 结构元数据：标题路径、章节标识、块类型与解析/切分版本。
+    # 这些字段决定切分结果与 Embedding 输入，版本变化必须触发重建。
+    heading_path: Mapped[str] = mapped_column(String(1024), default="", server_default="")
+    section_id: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    block_type: Mapped[str] = mapped_column(String(32), default="text", server_default="text")
+    source_type: Mapped[str] = mapped_column(String(32), default="text", server_default="text")
+    page_start: Mapped[int | None] = mapped_column(nullable=True)
+    page_end: Mapped[int | None] = mapped_column(nullable=True)
+    parser_version: Mapped[str] = mapped_column(String(32), default="", server_default="")
+    chunker_version: Mapped[str] = mapped_column(String(32), default="", server_default="")
+    # Embedding 输入（含标题前缀）的哈希：标题/章节变化同样让向量失效。
+    embedding_input_hash: Mapped[str] = mapped_column(
+        String(64), default="", server_default="", index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     __table_args__: tuple[UniqueConstraint, ...] = (
@@ -767,6 +784,8 @@ class KnowledgeChunkVector(Base):
     )
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     embedding_model: Mapped[str] = mapped_column(String(128), nullable=False)
+    # Embedding 输入模板版本：模板调整（前缀措辞）后所有向量必须重算。
+    input_version: Mapped[str] = mapped_column(String(32), default="", server_default="")
     embedding: Mapped[list[float]] = mapped_column(
         Vector(512).with_variant(JSON(), "sqlite"), nullable=False,
     )

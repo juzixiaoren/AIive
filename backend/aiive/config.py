@@ -66,6 +66,12 @@ class Settings(BaseSettings):
     aiive_knowledge_vector_min_similarity: float = 0.30
     # 单次回填/修复最多处理的分块数（有界批次，避免长事务与内存尖峰）。
     aiive_knowledge_vector_backfill_batch: int = 200
+    # 知识检索命中后按 section_id 扩展相邻分块：0 表示关闭。
+    # 只取同文档、同 Section 的前后 N 个分块，并受下面的 token 预算约束，
+    # 避免把无关章节拼进上下文。
+    aiive_knowledge_neighbor_expansion: int = 1
+    aiive_knowledge_neighbor_seed_limit: int = 3
+    aiive_knowledge_neighbor_budget_tokens: int = 600
 
     # 长期目标（Goal）：提案确认与步骤推进的时间阈值。
     # 计划未确认：24 小时后提醒一次，7 天无回复则保留草稿并停止催促。

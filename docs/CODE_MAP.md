@@ -7,7 +7,7 @@
 > - **路径约定**：均相对项目根（`AIive/`），如 `backend/aiive/main.py`、`frontend/src/pages/ChatPage.tsx`
 > - **行号**：基于建图时的代码版本，仅供快速跳转，以实际代码为准
 > - **维护规则**：见文末第 9 节。**新增/删除/移动文件、改 key 符号行号、改表结构后必须同步更新本文档**
-> - 建图日期：2026-10-21；最近更新：2026-11-02（V49 单用户认证、V50 目标步骤触发规则 + 主动消息、V51 工具结果回填预算、V52 后台回填统一 + Bash 流式日志、V53 通用计划事件源扩展、V54 安全边界事件注入 + 协作式主动消息、V55 决策标记全流式防泄漏、V56 收件箱溢出与决策串行化、V57 前后台 LLM 串行化 + 目标决策幂等、V58 主动提问与用户回复关联闭环、V59 待回答问题的状态一致性）
+> - 建图日期：2026-10-21；最近更新：2026-11-03（V49 单用户认证、V50 目标步骤触发规则 + 主动消息、V51 工具结果回填预算、V52 后台回填统一 + Bash 流式日志、V53 通用计划事件源扩展、V54 安全边界事件注入 + 协作式主动消息、V55 决策标记全流式防泄漏、V56 收件箱溢出与决策串行化、V57 前后台 LLM 串行化 + 目标决策幂等、V58 主动提问与用户回复关联闭环、V59 待回答问题的状态一致性、V60 记忆检索 pg_search BM25、V61 知识库结构感知递归切分）
 
 ---
 
@@ -157,9 +157,9 @@
 | 通知 | `api/routes_notifications.py` | `worker/outbox_handlers.py`、`frontend/src/pages/NotificationsPage.tsx` | `test_notification*.py` |
 | 桌面节点服务端 | `desktop/node_service.py`、`desktop/connection_manager.py`、`desktop/protocol.py` | `api/routes_desktop.py`、`desktop/registry_overlay.py` | `test_desktop*.py` |
 | 桌面节点客户端（Electron） | `apps/desktop/src/node-host/client.mjs` | `apps/desktop/src/node-host/locks.mjs`、`journal.mjs` | `apps/desktop/src/node-host/journal.test.mjs` |
-| 知识库摄入 / 分块 / 检索 | `knowledge/ingestor.py`（`search_chunks` 词法+向量 RRF 融合）、`knowledge/chunker.py` | `knowledge/document_reader.py`、`api/routes_knowledge.py`、`tools/builtin_knowledge.py` | `test_ingestor.py`、`test_knowledge*.py` |
-| 知识分块向量（派生投影 + 混合召回） | `knowledge/chunk_vectors.py`（`ChunkVectorService.refresh_document/delete_document/search/backfill_missing`） | `knowledge/ingestor.py::_refresh_chunk_vectors`（摄取/重建后刷新、删除后清理）、`knowledge/maintenance.py::_repair_chunk_vectors`（缺失回填 + 孤儿清理）、`memory/embedding_provider.py::embed_batch`、`db/models.py::KnowledgeChunkVector` | `tests/integration/pg/test_pg_vector_rag.py`（真实 PG+TEI） |
-| 知识库维护闭环（版本/删除/孤儿清理/向量回填） | `knowledge/maintenance.py`、`knowledge/ingestor.py` | `worker/handlers_knowledge.py`、`worker/scheduler_daemon.py::_knowledge_maintenance_scanner_job`、`api/routes_knowledge.py`、`knowledge/chunk_vectors.py`（`missing_chunk_vectors`/`orphan_chunk_vectors`） | `test_knowledge_maintenance.py` |
+| 知识库摄入 / 分块 / 检索（V61 结构感知） | `knowledge/ingestor.py`（`search_chunks` 词法+向量 RRF 融合 + 邻居扩展）、`knowledge/chunker.py`（递归切分）、`knowledge/blocks.py`（结构化 Block） | `knowledge/tokenization.py`（确定性 token 计数）、`knowledge/embedding_input.py`（标题上下文）、`knowledge/document_reader.py`、`api/routes_knowledge.py`、`tools/builtin_knowledge.py` | `test_ingestor.py`、`test_structure_chunking.py`、`test_knowledge*.py` |
+| 知识分块向量（派生投影 + 混合召回） | `knowledge/chunk_vectors.py`（`ChunkVectorService.refresh_document/delete_document/search/backfill_missing`；新鲜度 = 输入哈希 + `input_version` + 模型身份） | `knowledge/ingestor.py::_refresh_chunk_vectors`（摄取/重建后刷新、删除后清理）、`knowledge/maintenance.py::_repair_chunk_vectors`（缺失回填 + 孤儿清理）、`memory/embedding_provider.py::embed_batch`、`db/models.py::KnowledgeChunkVector` | `tests/integration/pg/test_pg_vector_rag.py`（真实 PG+TEI）、`tests/integration/pg/test_pg_structure_chunking.py` |
+| 知识库维护闭环（版本/删除/孤儿清理/向量回填/切分版本重建） | `knowledge/maintenance.py`（含 `stale_chunking` 问题码）、`knowledge/ingestor.py` | `worker/handlers_knowledge.py`、`worker/scheduler_daemon.py::_knowledge_maintenance_scanner_job`、`api/routes_knowledge.py`、`knowledge/chunk_vectors.py`（`missing_chunk_vectors`/`orphan_chunk_vectors`） | `test_knowledge_maintenance.py`、`test_structure_chunking.py` |
 | 文档读取（多格式） | `knowledge/document_reader.py` | `tools/builtin_knowledge.py::handle_read_document` | `test_document*.py` |
 
 ### 2.6 前端 / 客户端 / 基础设施
@@ -425,10 +425,15 @@
 ### 3.11 其余包
 
 - `knowledge/`：
-  - `ingestor.py`：`KnowledgeIngestor`（`ingest` 版本感知去重、`delete` 软删除、`reindex`、`read_source`）、`search_chunks`（ILIKE 多词覆盖度排序，**只检索活跃状态文档**）、状态常量 `ACTIVE_STATUSES`/`RECOVERABLE_STATUSES`/`INACTIVE_STATUSES`。写序固定"先置失效旧版本并 flush，再写入/激活新版本"，配合 `documents` 的部分唯一索引 `ix_documents_active_source_path`（活跃三态，根治并发导入同路径竞态；迁移 `d1e2f3a4b5c6`）。
-  - `maintenance.py`：`scan_knowledge_base`（7 类一致性问题）、`apply_report`（幂等清理：失效分块/孤儿分块/重复分块/缺失分块重建/对象丢失标记/过期 superseded 对象/孤儿对象）；`SUPERSEDED_OBJECT_RETENTION_DAYS=30`。
-  - `chunker.py`、`document_reader.py`（TXT/MD/HTML/JSON/CSV/TSV/DOCX/PDF）、`access.py`（访问控制）。
-  - 设计说明见 `docs/architecture/knowledge_维护.md`。
+  - `ingestor.py`：`KnowledgeIngestor`（`ingest` 版本感知去重 + 切分版本落后自动重建、`delete` 软删除、`reindex`、`read_source`）、`search_chunks`（词法 ILIKE 多词覆盖度 + 向量 RRF 融合，命中附 `heading_path`/`section_id`/页码等结构定位，并按 `_expand_neighbor_hits` 在同 Section 内扩展相邻分块；**只检索活跃状态文档**）、状态常量 `ACTIVE_STATUSES`/`RECOVERABLE_STATUSES`/`INACTIVE_STATUSES`。写序固定"先置失效旧版本并 flush，再写入/激活新版本"，配合 `documents` 的部分唯一索引 `ix_documents_active_source_path`（活跃三态，根治并发导入同路径竞态；迁移 `d1e2f3a4b5c6`）。
+  - `maintenance.py`：`scan_knowledge_base`（8 类一致性问题，V61 新增 `stale_chunking`）、`apply_report`（幂等清理：失效分块/孤儿分块/重复分块/缺失或切分版本落后分块重建/对象丢失标记/过期 superseded 对象/孤儿对象/向量回填）；`SUPERSEDED_OBJECT_RETENTION_DAYS=30`。
+  - `blocks.py`（V61）：`Block(content/block_type/heading_path/block_index/line/page/section_id)`、`PARSER_VERSION="structure_v1"`、`parse_document_blocks(data, filename)`；Markdown（H1-H6/段落/列表/表格/引用/围栏代码）、DOCX（`w:pStyle` 与 `w:outlineLvl` 推标题、`w:tbl` → 表格）、PDF（按页，`page_start/page_end`，不伪造标题）、HTML/CSV/JSON/源码；解析失败退回通用文本 Block。
+  - `chunker.py`（V61）：`CHUNKER_VERSION="structure_recursive_v1"`、`ChunkConfig(target 450/max 700/min 100/overlap 60)`、`chunk_blocks(blocks)` → `ChunkDraft`；Section → Block → 句子 → 标点 → 字符窗口逐级降级；代码块按顶层定义边界拆、表格拆分复制表头、Overlap 只在同 Section 文本块之间；`chunk_text` 保留为遗留接口。
+  - `tokenization.py`（V61）：`count_tokens`/`truncate_to_tokens`（CJK 1 字 1 token，非 CJK 每 4 字符 1 token），禁止 `len//4`。
+  - `embedding_input.py`（V61）：`build_embedding_input`（文档/章节/正文三段）+ `embedding_input_hash`；`EMBEDDING_INPUT_VERSION="title_context_v1"` 参与投影新鲜度。
+  - `chunk_vectors.py`：投影新鲜度 = 输入哈希 + `input_version` + 模型身份；`missing_vector_document_ids` 把版本/哈希不一致一并视为待回填。
+  - `document_reader.py`（TXT/MD/HTML/JSON/CSV/TSV/DOCX/PDF）、`access.py`（访问控制）。
+  - 设计说明见 `docs/architecture/knowledge_维护.md`、`docs/architecture/knowledge_structure_chunking.md`。
 - `supervisor/`：
   - `slot_manager.py`：A/B 槽位与 `runtime/active_slot` 原子写（manifest excludes 含 data/postgres/object_store/logs/.env/slots/runtime）；另有 `tree_fingerprint(app)`（相对路径+内容 SHA-256，忽略 `__pycache__`/构建产物，返回 None 表示"无法验证"）、`sync_app_tree`（整树同步，apply 与回滚共用）、`read/write/clear_candidate_state`（`slots/<X>/candidate_state.json`：`promotable`/`fingerprint`/`run_id`/`reason`）。
   - `health_probe.py`：槽位静态健康（manifest、app 目录、槽位内 `import aiive.main`）；`launcher.py`：槽位状态概览。

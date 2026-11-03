@@ -21,10 +21,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from aiive.db.models import Chunk, Document, OutboxJob
+from aiive.knowledge.blocks import PARSER_VERSION
+from aiive.knowledge.chunker import CHUNKER_VERSION
 from aiive.knowledge.ingestor import (
     DOCUMENT_STATUSES,
     INACTIVE_STATUSES,
@@ -54,6 +56,8 @@ ISSUE_MISSING_OBJECT = "missing_object"
 ISSUE_ORPHAN_OBJECTS = "orphan_objects"
 ISSUE_EXPIRED_SUPERSEDED_OBJECTS = "expired_superseded_objects"
 # 分块向量是派生投影：缺失可回填，孤儿可清理，均不影响真相源。
+# 解析器/切分器版本落后：原文没变，但当前代码会切出不同的分块与向量。
+ISSUE_STALE_CHUNKING = "stale_chunking"
 ISSUE_MISSING_CHUNK_VECTORS = "missing_chunk_vectors"
 ISSUE_ORPHAN_CHUNK_VECTORS = "orphan_chunk_vectors"
 
@@ -65,6 +69,7 @@ ISSUE_CODES: tuple[str, ...] = (
     ISSUE_MISSING_OBJECT,
     ISSUE_ORPHAN_OBJECTS,
     ISSUE_EXPIRED_SUPERSEDED_OBJECTS,
+    ISSUE_STALE_CHUNKING,
     ISSUE_MISSING_CHUNK_VECTORS,
     ISSUE_ORPHAN_CHUNK_VECTORS,
 )
@@ -249,6 +254,27 @@ def _missing_chunk_document_ids(db: Session, limit: int) -> list[str]:
     return [str(row[0]) for row in rows]
 
 
+def _stale_chunking_document_ids(db: Session, limit: int) -> list[str]:
+    """返回解析器/切分器版本落后的可修复文档 id。
+
+    原文没变、但切分规则升级（或历史数据从未写过版本）时，分块内容、标题路径与
+    向量都可能过期。这些文档必须重新解析、重新切分并重新 Embedding。
+    """
+    rows = (
+        db.query(Document.id)
+        .filter(
+            Document.status.in_(tuple(RECOVERABLE_STATUSES)),
+            or_(
+                Document.parser_version != PARSER_VERSION,
+                Document.chunker_version != CHUNKER_VERSION,
+            ),
+        )
+        .limit(limit)
+        .all()
+    )
+    return [str(row[0]) for row in rows]
+
+
 def _missing_object_document_ids(db: Session) -> list[str]:
     """返回对象引用指向的文件在本地桶中不存在的活跃文档 id。"""
     rows = (
@@ -335,6 +361,7 @@ def scan_knowledge_base(
     stale_chunks = _stale_chunk_ids(db, 1000)
     duplicate_groups = _duplicate_chunk_groups(db, 1000)
     missing_chunks = _missing_chunk_document_ids(db, 1000)
+    stale_chunking = _stale_chunking_document_ids(db, 1000)
     missing_objects = _missing_object_document_ids(db)
     orphan_objects = _orphan_object_keys(db)
     expired = _expired_superseded_ids(db, 1000)
@@ -344,6 +371,7 @@ def scan_knowledge_base(
                        [f"{group[0]}#{group[1]}" for group in duplicate_groups[:sample_limit]]),
         KnowledgeIssue(ISSUE_STALE_DOCUMENT_CHUNKS, len(stale_chunks), stale_chunks[:sample_limit]),
         KnowledgeIssue(ISSUE_MISSING_CHUNKS, len(missing_chunks), missing_chunks[:sample_limit]),
+        KnowledgeIssue(ISSUE_STALE_CHUNKING, len(stale_chunking), stale_chunking[:sample_limit]),
         KnowledgeIssue(ISSUE_MISSING_OBJECT, len(missing_objects), missing_objects[:sample_limit]),
         KnowledgeIssue(ISSUE_ORPHAN_OBJECTS, len(orphan_objects), orphan_objects[:sample_limit]),
         KnowledgeIssue(ISSUE_EXPIRED_SUPERSEDED_OBJECTS, len(expired), expired[:sample_limit]),
@@ -405,7 +433,11 @@ def _rebuild_missing_chunks(db: Session, limit: int) -> tuple[int, int]:
     ingestor = KnowledgeIngestor(db)
     rebuilt = 0
     failed = 0
-    for document_id in _missing_chunk_document_ids(db, limit):
+    document_ids = list(dict.fromkeys([
+        *_missing_chunk_document_ids(db, limit),
+        *_stale_chunking_document_ids(db, limit),
+    ]))[:limit]
+    for document_id in document_ids:
         try:
             with db.begin_nested():
                 ingestor.reindex(document_id, mark_failure=False)

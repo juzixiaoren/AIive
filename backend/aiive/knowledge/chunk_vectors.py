@@ -9,7 +9,6 @@
 """
 from __future__ import annotations
 
-import hashlib
 import logging
 from collections.abc import Callable
 from typing import Any, cast
@@ -20,6 +19,12 @@ from sqlalchemy.orm import Session
 
 from aiive.config import settings
 from aiive.db.models import Chunk, Document, KnowledgeChunkVector
+from aiive.knowledge.blocks import heading_path_tuple
+from aiive.knowledge.embedding_input import (
+    EMBEDDING_INPUT_VERSION,
+    build_embedding_input,
+    embedding_input_hash,
+)
 from aiive.knowledge.ingestor import INACTIVE_STATUSES
 from aiive.memory.embedding_provider import OpenAIEmbeddingProvider
 from aiive.memory.vector_projection import (
@@ -30,11 +35,6 @@ from aiive.memory.vector_projection import (
 logger = logging.getLogger(__name__)
 
 EmbeddingFactory = Callable[[], OpenAIEmbeddingProvider]
-
-
-def chunk_content_hash(content: str) -> str:
-    """返回分块内容的稳定哈希，用于判断投影是否过期。"""
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def knowledge_vector_enabled(db: Session) -> bool:
@@ -65,28 +65,47 @@ class ChunkVectorService:
     def __init__(
         self,
         db: Session,
-        provider_factory: EmbeddingFactory = build_embedding_provider,
+        provider_factory: EmbeddingFactory | None = None,
     ) -> None:
         self._db: Session = db
-        self._provider_factory: EmbeddingFactory = provider_factory
+        # 默认在实例化时解析，便于维护链路与测试注入替身
+        self._provider_factory: EmbeddingFactory = (
+            provider_factory or build_embedding_provider
+        )
 
     # ── 写入 / 清理 ─────────────────────────────────────────────
 
     def refresh_document(self, document_id: str) -> int:
         """为指定文档的当前分块幂等生成/刷新向量，并清理多余投影。
 
-        分块内容未变且模型身份一致时跳过重算，避免重建文档时重复调用模型。
+        新鲜度由 Embedding 输入哈希、输入模板版本与模型身份共同决定：文档改名、
+        章节调整、切分规则升级或换模型都会让旧向量失效；三者一致时跳过重算，
+        避免重建文档时重复调用模型。
         """
+        document = self._db.get(Document, document_id)
         chunks = (
             self._db.query(Chunk)
             .filter(Chunk.document_id == document_id)
             .order_by(Chunk.chunk_index.asc())
             .all()
         )
-        if not chunks:
+        if document is None or not chunks:
             self.delete_document(document_id)
             return 0
         identity = embedding_model_identity()
+        # Embedding 输入 = 文档标题 + 章节路径 + 正文；哈希覆盖完整输入，
+        # 因此标题/章节变化与模板版本变化都能让旧向量失效。
+        inputs = {
+            chunk.id: build_embedding_input(
+                title=document.title,
+                heading_path=heading_path_tuple(chunk.heading_path),
+                content=chunk.content,
+            )
+            for chunk in chunks
+        }
+        hashes = {
+            chunk_id: embedding_input_hash(text) for chunk_id, text in inputs.items()
+        }
         existing = {
             row.chunk_id: row
             for row in self._db.query(KnowledgeChunkVector)
@@ -96,11 +115,13 @@ class ChunkVectorService:
         pending = [
             chunk
             for chunk in chunks
-            if not self._projection_fresh(existing.get(chunk.id), chunk, identity)
+            if not self._projection_fresh(
+                existing.get(chunk.id), hashes[chunk.id], identity,
+            )
         ]
         if pending:
             vectors = self._provider_factory().embed_batch(
-                [chunk.content for chunk in pending],
+                [inputs[chunk.id] for chunk in pending],
                 input_type="document",
                 batch_size=settings.aiive_embedding_batch_size,
             )
@@ -109,9 +130,11 @@ class ChunkVectorService:
                 if row is None:
                     row = KnowledgeChunkVector(chunk_id=chunk.id)
                     self._db.add(row)
-                row.content_hash = chunk_content_hash(chunk.content)
+                row.content_hash = hashes[chunk.id]
+                row.input_version = EMBEDDING_INPUT_VERSION
                 row.embedding_model = identity
                 row.embedding = vector
+                chunk.embedding_input_hash = hashes[chunk.id]
         keep_ids = {chunk.id for chunk in chunks}
         stale_ids = [chunk_id for chunk_id in existing if chunk_id not in keep_ids]
         if stale_ids:
@@ -180,14 +203,19 @@ class ChunkVectorService:
     @staticmethod
     def _projection_fresh(
         row: KnowledgeChunkVector | None,
-        chunk: Chunk,
+        expected_hash: str,
         identity: str,
     ) -> bool:
-        """投影是否仍然对应当前分块内容与模型身份。"""
+        """投影是否仍然对应当前 Embedding 输入与模型身份。
+
+        三项任一不符即视为过期：输入模板版本、输入哈希（标题前缀 + 正文）、
+        模型身份。这样标题变化、章节调整、模板升级与换模型都会触发重算。
+        """
         return (
             row is not None
             and row.embedding_model == identity
-            and row.content_hash == chunk_content_hash(chunk.content)
+            and row.input_version == EMBEDDING_INPUT_VERSION
+            and row.content_hash == expected_hash
         )
 
 
@@ -217,6 +245,10 @@ def missing_vector_document_ids(db: Session, limit: int) -> list[str]:
             or_(
                 KnowledgeChunkVector.chunk_id.is_(None),
                 KnowledgeChunkVector.embedding_model != identity,
+                KnowledgeChunkVector.input_version != EMBEDDING_INPUT_VERSION,
+                # 历史分块没有记录 Embedding 输入哈希，必须重算才能与当前模板对齐
+                Chunk.embedding_input_hash == "",
+                KnowledgeChunkVector.content_hash != Chunk.embedding_input_hash,
             )
         )
         .subquery()
