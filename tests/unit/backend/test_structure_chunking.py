@@ -441,7 +441,7 @@ class TestIngestStructureMetadata:
             for chunk in db_session.query(Chunk).filter(Chunk.document_id == first["document_id"])
         }
 
-        monkeypatch.setattr("aiive.knowledge.ingestor.CHUNKER_VERSION", "structure_recursive_v2")
+        monkeypatch.setattr("aiive.knowledge.ingestor.CHUNKER_VERSION", "structure_recursive_v9")
         second = ingestor.ingest(str(source))
         db_session.flush()
         document = db_session.get(Document, first["document_id"])
@@ -451,7 +451,7 @@ class TestIngestStructureMetadata:
         }
 
         assert second["duplicate"] is True
-        assert document is not None and document.chunker_version == "structure_recursive_v2"
+        assert document is not None and document.chunker_version == "structure_recursive_v9"
         assert before and after and before.isdisjoint(after)
 
     def test_reindex_rebuilds_structure_from_persisted_source(self, db_session, tmp_path):

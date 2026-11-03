@@ -44,7 +44,7 @@ from aiive.knowledge.document_reader import (
 
 logger = logging.getLogger(__name__)
 
-PARSER_VERSION = "structure_v1"
+PARSER_VERSION = "structure_v2"
 
 # Block 类型：下游切分器按类型决定是否允许 Overlap、如何拆分。
 BLOCK_HEADING = "heading"
@@ -128,11 +128,17 @@ def heading_path_tuple(text: str | None) -> tuple[str, ...]:
     return tuple(part for part in text.split(_HEADING_PATH_SEPARATOR) if part)
 
 
-def section_id_for(heading_path: tuple[str, ...]) -> str:
-    """由标题路径推导稳定的 section 标识（同一路径在重建后保持不变）。"""
-    digest = hashlib.sha1(
-        heading_path_text(heading_path).encode("utf-8")
-    ).hexdigest()
+def section_id_for(heading_path: tuple[str, ...], occurrence: int = 0) -> str:
+    """由标题路径 + 出现序号推导稳定的 section 标识。
+
+    同一文档里可能出现两个完全相同的标题路径（例如重复的「## 概述」），只哈希路径
+    会让两段真实章节共用一个 section_id，进而让切分、Overlap 与邻居扩展跨越章节。
+    这里把「该路径第几次出现」一起哈希：同一标题下的所有 Block 共享同一个序号，
+    因此共享 section_id；不同出现位置得到不同 id。序号来自文档顺序，完全确定性，
+    不依赖随机值或数据库自增 id，重复解析同一原文结果一致。
+    """
+    payload = heading_path_text(heading_path) + chr(0) + str(occurrence)
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()
     return f"s{digest[:16]}"
 
 
@@ -145,6 +151,70 @@ _FENCE = re.compile(r"^\s*(```|~~~)")
 _LIST_ITEM = re.compile(r"^(\s*)([-*+]|\d+[.)])\s+(.*)$")
 _QUOTE_LINE = re.compile(r"^\s*>\s?(.*)$")
 _TABLE_SEPARATOR = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$")
+
+# 无竖线列式文本的识别门槛：连续行、字段起始列一致、不含句读、数据行含数字。
+_COLUMNAR_MIN_LINES = 3
+_COLUMNAR_MAX_LINES = 20
+_COLUMNAR_MAX_LINE_CHARS = 120
+_SENTENCE_PUNCT = re.compile(r"[。！？；，、：.!?;,]")
+
+
+def _table_extent(lines: list[str], index: int) -> int:
+    """识别从 index 开始的 Markdown 表格，返回行数；0 表示不是表格。
+
+    支持三种写法：
+    1. 标准 GFM：表头行 + 分隔行（首尾竖线可有可无）；
+    2. 无首尾竖线：如 "名称 | 年龄" / "--- | ---" / "张三 | 20"；
+    3. 空格对齐的列式文本（无竖线、无分隔行）：连续 ≥3 行、字段起始列完全一致、
+       不含句读标点且数据行含数字，避免把普通段落误判为表格。
+    """
+    if index >= len(lines):
+        return 0
+    header = lines[index]
+    if "|" in header and index + 1 < len(lines) and _TABLE_SEPARATOR.match(lines[index + 1]):
+        end = index + 2
+        while end < len(lines) and lines[end].strip() and "|" in lines[end]:
+            end += 1
+        return end - index
+    return _columnar_extent(lines, index)
+
+
+def _columnar_extent(lines: list[str], index: int) -> int:
+    """识别「空格对齐的多列文本」：字段起始列完全一致才算表格。"""
+    starts: list[int] | None = None
+    count = 0
+    while index + count < len(lines) and count < _COLUMNAR_MAX_LINES:
+        line = lines[index + count]
+        if not line.strip():
+            break
+        fields = _column_starts(line)
+        if fields is None:
+            break
+        if starts is None:
+            starts = fields
+        elif fields != starts:
+            break
+        count += 1
+    if starts is None or len(starts) < 2 or count < _COLUMNAR_MIN_LINES:
+        return 0
+    block = lines[index:index + count]
+    if any(len(line.strip()) > _COLUMNAR_MAX_LINE_CHARS for line in block):
+        return 0
+    if any(_SENTENCE_PUNCT.search(line) for line in block):
+        return 0
+    if not any(char.isdigit() for line in block[1:] for char in line):
+        return 0
+    return count
+
+
+def _column_starts(line: str) -> list[int] | None:
+    """返回行内各字段的起始列；明显不是列式文本时返回 None。"""
+    stripped = line.strip()
+    if not stripped or stripped[0] in "#>-*+|":
+        return None
+    if re.match(r"^\d+[.)]\s", stripped):
+        return None
+    return [match.start() for match in re.finditer(r"[^ ]+", stripped)]
 
 
 def _markdown_blocks(text: str) -> list[_Raw]:
@@ -205,18 +275,17 @@ def _markdown_blocks(text: str) -> list[_Raw]:
             index += 1
             continue
 
-        if stripped.startswith("|") and index + 1 < len(lines) and _TABLE_SEPARATOR.match(lines[index + 1]):
+        table_rows = _table_extent(lines, index)
+        if table_rows:
             flush_paragraph()
             start = index
-            rows: list[str] = []
-            while index < len(lines) and lines[index].strip().startswith("|"):
-                rows.append(lines[index].strip())
-                index += 1
+            rows = [lines[position].strip() for position in range(index, index + table_rows)]
+            index += table_rows
             raws.append(_Raw(
                 content="\n".join(rows),
                 block_type=BLOCK_TABLE,
                 line_start=start,
-                line_end=start + len(rows) - 1,
+                line_end=start + table_rows - 1,
             ))
             continue
 
@@ -621,11 +690,19 @@ def _assign_sequential_lines(raws: list[_Raw]) -> None:
 
 
 def _finalize(raws: list[_Raw], *, sequential_lines: bool) -> list[Block]:
-    """套用标题层级、section_id、block_index，产出最终 Block 列表。"""
+    """套用标题层级、section_id、block_index，产出最终 Block 列表。
+
+    section_id 由「标题路径 + 该路径在文档中的出现序号」决定：同名标题重复出现时
+    序号递增，保证两个真实章节不会共享 id；同一标题下的 Block 复用同一序号。
+    无标题文档使用默认路径 () 的第 0 次出现，同样有稳定 id。
+    """
     if sequential_lines:
         _assign_sequential_lines(raws)
     blocks: list[Block] = []
     stack: list[tuple[int, str]] = []
+    occurrences: dict[tuple[str, ...], int] = {}
+    path: tuple[str, ...] = ()
+    section_id = section_id_for(path, 0)
     for raw in raws:
         # 只裁掉首尾空行与行尾空白：行首缩进是代码与嵌套列表的结构信息。
         content = raw.content.strip("\n").rstrip()
@@ -635,7 +712,10 @@ def _finalize(raws: list[_Raw], *, sequential_lines: bool) -> list[Block]:
             while stack and stack[-1][0] >= raw.level:
                 stack.pop()
             stack.append((raw.level, content))
-        path = tuple(text for _, text in stack)
+            path = tuple(text for _, text in stack)
+            occurrence = occurrences.get(path, 0)
+            occurrences[path] = occurrence + 1
+            section_id = section_id_for(path, occurrence)
         blocks.append(Block(
             content=content,
             block_type=raw.block_type,
@@ -645,7 +725,7 @@ def _finalize(raws: list[_Raw], *, sequential_lines: bool) -> list[Block]:
             line_end=raw.line_end,
             page_start=raw.page_start,
             page_end=raw.page_end,
-            section_id=section_id_for(path),
+            section_id=section_id,
         ))
     return blocks
 

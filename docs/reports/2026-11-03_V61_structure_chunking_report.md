@@ -97,15 +97,15 @@ def append(command):
 
 | # | block_type | heading_path | section_id | lines | tokens |
 |---|---|---|---|---|---|
-| 0 | paragraph | `Redis 技术笔记` | `s0b5487049f04a038` | 2-2 | 11 |
-| 1 | paragraph | `Redis 技术笔记 > 持久化` | `s7799f78d4a0905c4` | 6-6 | 13 |
-| 2 | mixed | `Redis 技术笔记 > 持久化 > AOF` | `sb5e0b35ddaebd2f1` | 10-14 | 25 |
-| 3 | table | `Redis 技术笔记 > 持久化 > AOF` | `sb5e0b35ddaebd2f1` | 16-18 | 27 |
-| 4 | code | `Redis 技术笔记 > 持久化 > AOF` | `sb5e0b35ddaebd2f1` | 21-22 | 9 |
+| 0 | paragraph | `Redis 技术笔记` | `s67aaa9db6ff61513` | 2-2 | 11 |
+| 1 | paragraph | `Redis 技术笔记 > 持久化` | `s3219b294bdbcc718` | 6-6 | 13 |
+| 2 | mixed | `Redis 技术笔记 > 持久化 > AOF` | `s3ee01f85d7bad115` | 10-14 | 25 |
+| 3 | table | `Redis 技术笔记 > 持久化 > AOF` | `s3ee01f85d7bad115` | 16-18 | 27 |
+| 4 | code | `Redis 技术笔记 > 持久化 > AOF` | `s3ee01f85d7bad115` | 21-22 | 9 |
 
 * 标题只进入 `heading_path`，不产生只有标题的空 Chunk；
 * 列表保留缩进子项；表格与代码各自成块（原子块，不参与普通 Overlap）；
-* `section_id` 由标题路径派生，重建后不变。
+* `section_id` 由「标题路径 + 出现序号」派生，重建后不变（V61.1 起同名章节互不相同）。
 
 ## 5. Embedding 输入
 
@@ -170,3 +170,79 @@ PG 验证使用一次性 `pgvector/pgvector:pg16` 容器；向量由确定性假
    在文件被占用时依赖 `os.replace` 重试，与本次改动无关（单跑稳定通过）。
 6. **token 计数是估算**：与具体 BPE 词表存在偏差，口径偏保守（宁少切不多切）；
    若更换模型需要重新标定 `target/max`。
+
+
+## 9. V61.1 正确性修复（2026-11-03 追加）
+
+V61 上线后审计发现四类「不报错、但结果不对」的缺陷。V61.1 只修这些缺陷，不引入
+Parent-Child / LLM 切块，也不改检索架构。
+
+### 9.1 缺陷与修复
+
+| # | 缺陷 | 原实现的问题 | 修复 |
+|---|---|---|---|
+| 1 | 超长表格行 | `_split_table` 只在行与行之间分组，单行超过 `max_chunk_tokens` 时被整行塞进一个 Chunk，输出直接突破上限 | 新增 `_split_row`：按单元格边界（`_cell_spans`）拆行，`_row_fragment` 为续片段补回前导竖线保持列语义；单个单元格仍超限时对该单元格递归 `_split_text`；每段继续复制表头；表头自身超限或剩余预算小于 `min_chunk_tokens` 时整表退化为普通文本拆分 |
+| 2 | 重复标题 Section ID 冲突 | `section_id = sha1(heading_path)`，两个同名「## 概述」共用同一个 id，导致 Chunk 合并、Overlap 与邻居扩展跨章节 | `section_id_for(heading_path, occurrence)` 把「该路径在本文档第几次出现」一起哈希；`_finalize` 按文档顺序维护 `occurrences` 计数；无标题文档用空路径第 0 次。纯文档顺序推导，无 UUID / 自增 |
+| 3 | 递归切分后来源定位漂移 | 拆分函数返回 `list[str]`，拆分后各段沿用整个 Block 的行号，一个 Block 拆成多块时每块都声称覆盖全部行 | 拆分函数统一返回 `_Segment(text, start, end)`（相对 Block 原文的字符区间），`_line_at` / `_piece_of` 由区间换算行号；Overlap 前缀与重复表头标记 `context=True`，只累加 `context_tokens`，不参与 `line_start/line_end` 汇总 |
+| 4 | 无竖线表格漏识别 | `_table_extent` 要求行内含竖线且有分隔行，省略首尾竖线的写法与空格对齐的列式文本被当成普通段落 | `_table_extent` 接受「表头行 + 分隔行」的任意竖线写法；新增 `_columnar_extent` / `_column_starts` 识别空格对齐列式文本（连续 ≥3 行、字段起始列一致、行长 ≤120、无句读标点、数据行含数字），普通段落不误判 |
+| 5 | Token 上限不统一 | 各分支各自判断，Overlap 与短尾合并后仍可能超限 | 新增 `_enforce_budget` 在 `chunk_blocks` 末尾统一兜底拆分，任何超限 draft 都不会落库；文档同步澄清「估算 ≠ 模型 BPE」 |
+
+### 9.2 修改文件
+
+| 文件 | 变更 |
+|---|---|
+| `backend/aiive/knowledge/chunker.py` | 全量重写：`_Segment` 携带字符区间，新增 `_split_text` / `_pack_segments` / `_char_windows` / `_split_row` / `_cell_spans` / `_row_fragment` / `_enforce_budget`；`CHUNKER_VERSION = structure_recursive_v2` |
+| `backend/aiive/knowledge/blocks.py` | `section_id_for(heading_path, occurrence)` + `_finalize` 出现序号；新增 `_table_extent` / `_columnar_extent` / `_column_starts`；`PARSER_VERSION = structure_v2` |
+| `tests/unit/backend/test_chunker_correctness.py` | 新增 22 例回归（超长表格、同名章节、来源定位、无竖线表格、预算不变量） |
+| `tests/unit/backend/test_structure_chunking.py` | 版本重建用例的 monkeypatch 目标改为 `structure_recursive_v9`（原目标与真实常量撞车） |
+| `docs/architecture/knowledge_structure_chunking.md` | 补 section_id 出现序号、表格拆分细则、来源定位小节、Token 口径澄清、V61.1 版本影响 |
+| `docs/reports/2026-11-03_V61_structure_chunking_report.md` | 本节 + 示例 section_id 更新为 V61.1 实际值 |
+
+未改动：`ingestor.py` / `chunk_vectors.py` / `maintenance.py` / `db/models.py` / Alembic
+迁移 / 检索侧代码。`context_tokens` 只是切分期字段，不落库。
+
+### 9.3 实测输出（真实运行）
+
+| 场景 | 输入 | 输出 | 校验 |
+|---|---|---|---|
+| 超长表格行 | 单行 1084 tokens（3 个长单元格） | 4 块：375 / 375 / 375 / 21，均以表头 + 分隔行开头，`context_tokens=13` | 每个单元格标记都出现在某块中；行号落在数据行（2-2 / 2-3） |
+| 超长单元格 | 单元格 1600 tokens | 5 块：456 / 456 / 456 / 265 / 11 | `超长单元格内容。` 出现次数合计 200，与输入一致 |
+| 超长表头 | 表头 724 tokens | 2 块：700 / 35（退化为文本拆分，不再复制表头） | 表头文本 240 个片段全部保留 |
+| 超长代码块 | 1280 tokens / 320 行 | 3 块：448 / 448 / 384，行号 3-114 / 115-226 / 227-322 | 首块从 `def f0(x):` 开始，末块以 `return x + 159` 结束，无内容丢失 |
+| 同名章节 | 两个 `## 概述` | 两个不同 `section_id`，各自 Chunk 不合并 | `search_chunks` 邻居扩展只在同一 `section_id` 内 |
+| 无竖线表格 | 省略首尾竖线的表头 + 分隔行 + 数据行 | 解析为单个 `table` Block | 同目录的散文用例仍为 `paragraph` |
+
+### 9.4 版本与存量数据影响
+
+* `PARSER_VERSION`: `structure_v1` → `structure_v2`；
+* `CHUNKER_VERSION`: `structure_recursive_v1` → `structure_recursive_v2`；
+* `section_id` 推导加入出现序号，同一文档的 id 全部变化。
+
+因此存量文档的 Chunk 会被 `_chunking_stale` 全部判为落后，维护任务按批从持久原文
+重新解析、切分并刷新向量。**数据库 schema 无变化，不需要新的 Alembic 迁移**，
+`b8d2e6f4a1c7` 保持原样；重建失败仍保留 `index_failed` / `source_unavailable`，
+不写半套数据。
+
+### 9.5 验证命令与结果
+
+| 命令 | 结果 |
+|---|---|
+| `pytest tests/unit/backend/test_chunker_correctness.py -q` | 22 passed |
+| `pytest tests/unit/backend/test_structure_chunking.py -q` | 33 passed |
+| `pytest -q`（全量） | **1546 passed, 53 skipped, 52 warnings**（227.83s，EXIT=0） |
+| `ruff check backend/aiive --select F,E9` | All checks passed |
+| `basedpyright backend` | 0 errors, 0 warnings, 0 notes |
+| `AIIVE_PG_TESTS=1 pytest tests/integration/pg -q` | 39 passed / 13 skipped / 1 failed（`test_concurrent_ingest_same_path_yields_single_active_version`，Windows 文件锁既有 flaky，单跑 11.05s 通过） |
+
+### 9.6 剩余风险
+
+1. **表头退化的可读性**：表头本身超 700 tokens 时整表按文本拆，续块没有列名，
+   但内容完整、不超限；这是刻意取舍（优先保证上限与不丢内容）。
+2. **列式文本识别的边界**：靠「列起点一致 + 数据行含数字」区分表格与散文，
+   极端情况下（多行等宽对齐且含数字的散文）仍可能被识别为表格；已加句读与行长
+   约束降低概率，未引入打分模型。
+3. **行内片段的字符区间**：表格续片段会补一个前导竖线，片段的字符区间按原始行计算，
+   行号不受影响（表格行内无换行），但逐字符偏移与原文存在 2 字符偏差。
+4. **token 上限仍按估算口径**：`count_tokens` 是启发式估算，模型侧真实 token 数可能
+   不同；需要严格长度保证时应在 Embedding 客户端按模型 tokenizer 处理。
+
