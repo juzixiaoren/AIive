@@ -109,6 +109,8 @@ cp .env.example .env
 # 如需本地向量召回，将 AIIVE_MEMORY_VECTOR_ENABLED / AIIVE_KNOWLEDGE_VECTOR_ENABLED 改为 true
 # 记忆 BM25 稀疏召回（AIIVE_MEMORY_BM25_ENABLED）默认开启，依赖 postgres 服务自带的
 # pg_search 扩展（deploy/pg/Dockerfile）；扩展缺失时召回自动降级为词法并标记 degraded
+# 旧数据卷（已有 PGDATA）升级时，镜像入口脚本会自动补齐 shared_preload_libraries，不需删卷
+# 若仍提示 degraded，执行：docker compose exec backend python -m aiive.memory.bm25_maintenance status
 
 # 2. 启动 Docker 服务
 # 开启本地向量召回时，会先检测本地模型缓存，缺失则自动下载，再拉起 TEI

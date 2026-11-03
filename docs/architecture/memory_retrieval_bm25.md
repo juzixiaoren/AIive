@@ -2,8 +2,9 @@
 
 > 版本：2026-11-03
 > 范围：backend/aiive/memory/automatic_recall.py、recall_fusion.py、recall_ranking.py、
-> bm25_search.py、vector_projection.py、forget/visibility_service.py、
-> backend/alembic/versions/c3f7b2a9d1e4_add_memory_bm25_index.py、deploy/pg/Dockerfile
+> bm25_search.py、bm25_maintenance.py、vector_projection.py、forget/visibility_service.py、
+> backend/alembic/versions/c3f7b2a9d1e4_add_memory_bm25_index.py、
+> deploy/pg/Dockerfile、deploy/pg/ensure-preload.sh、deploy/pg/docker-entrypoint-bm25.sh
 > 关联：docs/CODE_MAP.md、docs/architecture/phase5.md、docs/architecture/memory_v2_architecture.md
 
 ## 1. 结论与定位
@@ -105,6 +106,21 @@ pg_search 的 bm25 索引是事务性索引（随表 DML 在同一事务内更�
 
 不存在「索引同步任务」：遗忘时 phase_a_shield 把 lifecycle 置 forgotten、purge 阶段把
 content 覆盖为 [forgotten]，索引自动跟随。
+
+### 4.1 查询故障隔离（SAVEPOINT）
+
+BM25 查询与可用性探测都跑在独立 SAVEPOINT 内（`with db.begin_nested()`）。PostgreSQL
+里一条语句失败会把整个事务标记为 aborted，之后同一事务的任何语句都会抛
+`InFailedSqlTransaction`。不做隔离时，一次 BM25 失败会连带打掉随后的词法降级召回与
+ForgetVisibilityService 过滤，还可能回滚上层业务事务。
+
+| 场景 | 无 SAVEPOINT | 有 SAVEPOINT |
+|---|---|---|
+| BM25 SQL 抛错 | 事务 aborted，后续词法 / Forget 过滤全部失败，上层业务写入丢失 | 只回滚该 SAVEPOINT；词法降级与 Forget 过滤正常执行，上层事务不受影响 |
+
+证据：tests/integration/pg/test_pg_bm25_recall.py::test_bm25_sql_failure_rolls_back_only_its_savepoint
+注入真实 SQL 故障（调用不存在的函数）后断言：pack.degraded=True 且 route=lexical、
+SELECT 1 仍可执行、未提交写入仍在。去掉 SAVEPOINT 后该用例失败（事务 aborted）。
 
 ## 5. 统一排序公式
 
@@ -212,6 +228,41 @@ MemoryRecallPack.degraded / degraded_reason        （引擎出口）
 → 检索诊断表 routes_executed 持久化，前端「检索」页可见
 @@@
 
+### 9.1 索引自愈（ensure_memory_bm25_index）
+
+迁移只在升级那一刻执行一次。若当时扩展不可用（镜像没带 pg_search / 未预加载）、或索引
+后来被误删、结构被改坏，数据库会停在「迁移已记录完成、索引却不可用」的状态：
+`alembic upgrade head` 不会重跑，光靠迁移无法自愈。
+
+bm25_search.ensure_memory_bm25_index() 提供幂等修复：
+
+| 现状 | ensure 的动作 |
+|---|---|
+| 扩展未安装 | CREATE EXTENSION IF NOT EXISTS pg_search CASCADE（失败则返回 extension_missing） |
+| 索引缺失 | CREATE INDEX IF NOT EXISTS（BM25_INDEX_DDL） |
+| 同名索引不是 bm25 / 缺少被索引表达式 | DROP INDEX + CREATE INDEX 重建；rebuild_incompatible=False 时只报告 |
+| 索引已正确 | 只做只读检查，不产生任何 DDL（索引 OID 不变） |
+
+调用点：
+
+* 应用启动：main._ensure_bm25_index() 在 alembic upgrade head 之后执行一次，
+  AIIVE_MEMORY_BM25_ENABLED=false 时跳过；失败只记 WARNING，不阻断启动。
+* 运维显式命令：python -m aiive.memory.bm25_maintenance status|ensure。
+* 所有 DDL 都在独立 SAVEPOINT 内执行，不删除、不重建数据库。
+
+### 9.2 旧数据卷升级（shared_preload_libraries）
+
+pg_search 必须预加载，否则 CREATE EXTENSION 直接失败。官方 postgres 镜像只在 initdb 时
+用 postgresql.conf.sample 生成配置，已有数据卷升级镜像不会重跑 initdb，卷里的
+postgresql.conf 仍然没有这一行 —— 表现为「镜像换了、扩展还是装不上」。
+
+deploy/pg/docker-entrypoint-bm25.sh 在容器启动前调用 ensure-preload.sh：
+
+* 只向 postgresql.conf 追加配置，不删除、不重建 PGDATA；
+* 已包含 pg_search 时直接退出（重复启动安全，实测重启后配置行数不变）；
+* 已有其它预加载库（如 pg_stat_statements）时保留原值并追加 pg_search；
+* 全新数据卷（配置文件尚不存在）时静默跳过，由 initdb 生成带预加载的配置。
+
 ## 10. 配置
 
 | 变量 | 默认 | 说明 |
@@ -227,23 +278,56 @@ MemoryRecallPack.degraded / degraded_reason        （引擎出口）
 
 * 迁移：alembic upgrade head 执行 c3f7b2a9d1e4；CREATE EXTENSION 与 CREATE INDEX 都包在
   savepoint 内，扩展缺失时打印 WARNING 并跳过，不阻断升级（运行时显式 degraded）。
+* 迁移只在升级那一刻执行一次；扩展后装、索引被误删或结构被改坏时由 §9.1 的
+  ensure_memory_bm25_index 自愈（启动自动 + 维护命令）。
 * 幂等：CREATE EXTENSION IF NOT EXISTS / CREATE INDEX IF NOT EXISTS，可重复执行。
 * downgrade 只 DROP INDEX，不删扩展（同库可能有其它对象依赖）。
 * 扩展索引不写入 Base.metadata（bm25 AM 无法用 SQLAlchemy Index 表达，SQLite create_all
   也不应创建），因此 backend/alembic/env.py 增加 include_object 忽略该索引名，避免
   alembic check 在已装 pg_search 的库上误报「多余索引」。
 * 部署镜像：deploy/pg/Dockerfile（FROM pgvector/pgvector:pg16 + ParadeDB 官方 .deb），
-  docker-compose.yml 的 postgres 服务改为 build 该 Dockerfile，并把 pg_search 追加到
-  postgresql.conf.sample 的 shared_preload_libraries（缺失会导致 CREATE EXTENSION 失败）。
+  docker-compose.yml 的 postgres 服务改为 build 该 Dockerfile；镜像把 pg_search 追加进
+  postgresql.conf.sample（全新数据卷），并由入口脚本为旧数据卷补齐配置（§9.2）。
+
+### 11.1 全新部署
 
 ```bash
-# 构建 / 更新镜像
 docker compose build postgres
+docker compose up -d postgres
+alembic upgrade head          # 或由应用启动时的 _ensure_schema 自动执行
+python -m aiive.memory.bm25_maintenance status
+```
 
-# 应用迁移（容器内或宿主机）
-alembic upgrade head
+### 11.2 已有数据卷升级（V59 → V60）
 
-# 验证索引存在且访问方法为 bm25
+```bash
+docker compose build postgres        # 重新构建带 pg_search 的镜像
+docker compose up -d postgres        # 入口脚本在启动前补齐 shared_preload_libraries
+docker compose logs postgres | grep 'aiive:'   # 期望：已更新 postgresql.conf
+docker compose exec postgres psql -U aiive -c "SHOW shared_preload_libraries;"  # pg_search
+docker compose exec backend python -m aiive.memory.bm25_maintenance ensure
+```
+
+不删除、不重建数据卷：脚本只向 PGDATA 下的 postgresql.conf 追加配置行。若卷里的配置被
+手工改成了别的预加载库列表，脚本保留原值并追加 pg_search；若 pg_search 仍未生效，
+维护命令 status 会给出明确原因（extension_missing 等）。
+
+### 11.3 维护命令
+
+```bash
+# 只读诊断：status / dialect / shared_preload_libraries / extension / 索引定义
+python -m aiive.memory.bm25_maintenance status
+
+# 幂等修复：扩展后装补建、索引缺失补建、结构不兼容重建
+python -m aiive.memory.bm25_maintenance ensure
+python -m aiive.memory.bm25_maintenance ensure --no-rebuild   # 只报告，不重建
+```
+
+退出码 0 表示 ready，1 表示仍不可用（输出含修复指引）。
+
+### 11.4 验证索引
+
+```bash
 psql -c "SELECT am.amname FROM pg_class c JOIN pg_am am ON am.oid = c.relam
          WHERE c.oid = to_regclass('ix_memory_records_bm25');"
 ```
@@ -276,12 +360,25 @@ memory_recall_candidates.route / raw_score / fused_score 写入检索运行表�
 # 纯数学单测（RRF / Recency / 归一化 / 权重）
 pytest tests/unit/backend/test_recall_ranking.py -q
 
+# 维护命令与旧数据卷预加载脚本（离线；真实执行 ensure-preload.sh）
+pytest tests/unit/backend/test_bm25_index_maintenance.py -q
+
 # 记忆召回单测（SQLite，验证降级路径与融合语义）
 pytest tests/unit/backend/test_v2_recall.py tests/integration/backend/test_phase4_recall_sleeping_and_access.py -q
 
-# 真实 PostgreSQL + pg_search（18 个用例；无 AIIVE_PG_BM25_URL 时自动起容器）
+# 真实 PostgreSQL + pg_search（26 个用例；无 AIIVE_PG_BM25_URL 时自动起容器）
 AIIVE_PG_TESTS=1 pytest tests/integration/pg/test_pg_bm25_recall.py -q
 ```
+
+新增的 5 个用例对应本文档的三处故障场景：
+
+| 用例 | 覆盖 |
+|---|---|
+| test_bm25_sql_failure_rolls_back_only_its_savepoint | §4.1 SAVEPOINT 隔离 |
+| test_ensure_creates_missing_index | §9.1 索引缺失补建 |
+| test_ensure_is_idempotent | §9.1 重复执行安全（索引 OID 不变） |
+| test_ensure_rebuilds_incompatible_index | §9.1 结构不兼容重建 |
+| test_ensure_installs_extension_in_late_enabled_database | §9.1 扩展后装（新库） |
 
 ## 14. 已知限制
 
@@ -291,3 +388,7 @@ AIIVE_PG_TESTS=1 pytest tests/integration/pg/test_pg_bm25_recall.py -q
   存量数据量大时会在建索引期间阻塞写入，需要停机窗口或手工 CONCURRENTLY 预建。
 * bm25 索引不参与 SQLAlchemy metadata，索引结构变更必须新增迁移，不能靠 autogenerate。
 * Recency 的意图判定是关键词表，不含语义理解；新增语言需要补 _TIME_SENSITIVE_MARKERS。
+* ensure 重建索引同样是普通 CREATE INDEX：结构不兼容时会在启动或维护命令执行期间短暂
+  阻塞写入，存量极大时应放到停机窗口执行（先 status 确认，再 ensure）。
+* 入口脚本只处理文件形式的 postgresql.conf；若运维改用 ALTER SYSTEM 或命令行 -c 指定
+  shared_preload_libraries，脚本不会覆盖（以运维配置为准），此时用 status 确认即可。

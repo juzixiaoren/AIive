@@ -651,3 +651,150 @@ def test_vector_disabled_still_recalls_via_bm25(db: Session):
     assert [item.memory_id for item in pack.items] == [record.id]
     assert pack.items[0].route == "bm25"
     assert pack.degraded is False
+
+
+
+# ---------------------------------------------------------------------------
+# 7. 故障隔离：BM25 SQL 失败只回滚自己的 SAVEPOINT
+# ---------------------------------------------------------------------------
+
+def test_bm25_sql_failure_rolls_back_only_its_savepoint(
+    db: Session, monkeypatch: pytest.MonkeyPatch,
+):
+    """BM25 SQL 失败后：词法降级与 Forget 过滤仍可执行，上层事务不被回滚。
+
+    没有 SAVEPOINT 隔离时，PostgreSQL 会把整个事务标记为 aborted，随后的
+    _route_lexical 与 ForgetVisibilityService 查询都会抛 InFailedSqlTransaction。
+    """
+    from aiive.memory import bm25_search
+
+    keep = _mk(db, "用户偏好：每天早上喝一杯手冲咖啡。")
+    db.commit()
+
+    # 同一事务内未提交的写入：若 BM25 失败触发上层 rollback，它会消失。
+    pending = _mk(db, "用户习惯：周末沿河边跑步。")
+    db.flush()
+
+    # 真实 SQL 故障（调用不存在的函数），不是 mock 出来的异常。
+    monkeypatch.setattr(
+        bm25_search,
+        "BM25_STATEMENT_TEMPLATE",
+        "SELECT m.id AS memory_id, paradedb.no_such_function(m.id) AS score "
+        "FROM memory_records m "
+        "WHERE m.lifecycle_state IN :lifecycle_states "
+        "AND m.validity_state IN :validity_states "
+        "AND ({scope_sql}) LIMIT :limit",
+    )
+
+    pack, _ = _recall(db, "手冲咖啡")
+
+    # 1) 失败被识别为降级，词法路由真实生效
+    assert pack.degraded is True
+    assert "bm25_error" in pack.degraded_reason
+    assert [item.memory_id for item in pack.items] == [keep.id]
+    assert pack.items[0].route == "lexical"
+
+    # 2) 会话没有进入 aborted 状态：后续 SQL 仍可执行
+    assert db.execute(text("SELECT 1")).scalar() == 1
+
+    # 3) 上层事务没有被回滚：未提交的写入仍在，提交后依然在
+    count_sql = text("SELECT count(*) FROM memory_records WHERE id = :i")
+    assert db.execute(count_sql, {"i": pending.id}).scalar() == 1
+    db.commit()
+    assert db.execute(count_sql, {"i": pending.id}).scalar() == 1
+
+
+# ---------------------------------------------------------------------------
+# 8. 幂等的索引初始化 / 修复（扩展后装、索引缺失、结构不兼容）
+# ---------------------------------------------------------------------------
+
+def _drop_bm25_index(db: Session) -> None:
+    db.execute(text(f"DROP INDEX IF EXISTS {BM25_INDEX_NAME}"))
+    db.commit()
+
+
+def test_ensure_creates_missing_index(db: Session):
+    """迁移记录已完成但索引不在（被误删 / 建索引失败）：ensure 补建。"""
+    from aiive.memory.bm25_search import detect_bm25_status, ensure_memory_bm25_index
+
+    _drop_bm25_index(db)
+    try:
+        assert detect_bm25_status(db) == "index_missing"
+        assert ensure_memory_bm25_index(db) == "ready"
+        db.commit()
+        assert detect_bm25_status(db) == "ready"
+    finally:
+        db.rollback()
+        ensure_memory_bm25_index(db)
+        db.commit()
+
+
+def test_ensure_is_idempotent(db: Session):
+    """索引结构已正确时 ensure 只做只读检查，不重建（索引 OID 不变）。"""
+    from aiive.memory.bm25_search import ensure_memory_bm25_index
+
+    oid_sql = text("SELECT to_regclass(:name)::oid")
+
+    assert ensure_memory_bm25_index(db) == "ready"
+    db.commit()
+    oid_before = db.execute(oid_sql, {"name": BM25_INDEX_NAME}).scalar()
+
+    assert ensure_memory_bm25_index(db) == "ready"
+    db.commit()
+    oid_after = db.execute(oid_sql, {"name": BM25_INDEX_NAME}).scalar()
+
+    assert oid_before is not None
+    assert oid_before == oid_after
+
+
+def test_ensure_rebuilds_incompatible_index(db: Session):
+    """同名索引是 btree（结构不兼容）：ensure 重建为 bm25 索引。"""
+    from aiive.memory.bm25_search import detect_bm25_status, ensure_memory_bm25_index
+
+    _drop_bm25_index(db)
+    db.execute(text(f"CREATE INDEX {BM25_INDEX_NAME} ON memory_records (content)"))
+    db.commit()
+    try:
+        assert detect_bm25_status(db) == "index_incompatible"
+        # 显式关闭重建时只报告，不删除索引
+        assert ensure_memory_bm25_index(db, rebuild_incompatible=False) == "index_incompatible"
+        # 默认重建
+        assert ensure_memory_bm25_index(db) == "ready"
+        db.commit()
+        assert detect_bm25_status(db) == "ready"
+    finally:
+        db.rollback()
+        _drop_bm25_index(db)
+        ensure_memory_bm25_index(db)
+        db.commit()
+
+
+def test_ensure_installs_extension_in_late_enabled_database(bm25_engine):
+    """扩展后装：迁移当时没有 pg_search，之后装好也能补建索引（不重建数据库）。"""
+    from aiive.memory.bm25_search import detect_bm25_status, ensure_memory_bm25_index
+
+    name = "aiive_bm25_late_" + uuid.uuid4().hex[:8]
+    with bm25_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(text(f"CREATE DATABASE {name}"))
+
+    fresh = create_engine(bm25_engine.url.set(database=name))
+    try:
+        # 新库只有 pgvector：与「迁移已记录完成、pg_search 尚未安装」的状态一致
+        with fresh.begin() as conn:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        Base.metadata.create_all(fresh)
+
+        with Session(fresh) as session:
+            assert detect_bm25_status(session) == "extension_missing"
+            assert ensure_memory_bm25_index(session) == "ready"
+            session.commit()
+            assert detect_bm25_status(session) == "ready"
+            access_method = session.execute(text(
+                "SELECT am.amname FROM pg_class c JOIN pg_am am ON am.oid = c.relam "
+                "WHERE c.oid = to_regclass(:name)"
+            ), {"name": BM25_INDEX_NAME}).scalar()
+            assert access_method == "bm25"
+    finally:
+        fresh.dispose()
+        with bm25_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            conn.execute(text(f"DROP DATABASE IF EXISTS {name}"))

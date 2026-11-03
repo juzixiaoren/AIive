@@ -37,5 +37,17 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 # pg_search 必须通过 shared_preload_libraries 预加载；官方 postgres 镜像会把它
-# 追加进 postgresql.conf.sample，容器 initdb 之后仍然生效。
+# 追加进 postgresql.conf.sample，容器 initdb 之后仍然生效（全新数据卷）。
 RUN echo "shared_preload_libraries = 'pg_search'" >> /usr/share/postgresql/${PG_MAJOR}/postgresql.conf.sample
+
+# 已有数据卷升级：镜像升级不会重跑 initdb，卷里的 postgresql.conf 不会自动出现
+# shared_preload_libraries，pg_search 因而无法加载。入口脚本在 PostgreSQL 启动
+# 前幂等地补齐该配置（只追加配置行，不删除、不重建数据）。
+COPY deploy/pg/ensure-preload.sh /usr/local/bin/ensure-preload.sh
+COPY deploy/pg/docker-entrypoint-bm25.sh /usr/local/bin/docker-entrypoint-bm25.sh
+# 防御 CRLF 检出：Windows 工作区可能把 .sh 检出为 CRLF，shebang 会失效。
+RUN sed -i 's/\r$//' /usr/local/bin/ensure-preload.sh /usr/local/bin/docker-entrypoint-bm25.sh \
+    && chmod +x /usr/local/bin/ensure-preload.sh /usr/local/bin/docker-entrypoint-bm25.sh
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint-bm25.sh"]
+CMD ["postgres"]

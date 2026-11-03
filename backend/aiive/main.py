@@ -129,6 +129,42 @@ def _ensure_schema():
         raise
 
 
+def _ensure_bm25_index():
+    """幂等补建 BM25 索引：扩展后装、索引缺失或结构不兼容时自动修复。
+
+    Alembic 迁移只在升级那一刻执行一次，扩展后装（镜像带上了 pg_search、或
+    运维装好扩展）或索引被误删时迁移不会重跑，数据库里只留下「已迁移但没有
+    索引」的状态。这里在每次启动时做一次只读校验，仅在缺失 / 不兼容时补建，
+    重复执行安全，不会删除或重建数据库。
+
+    失败不阻断启动：BM25 不可用时召回会显式标记 degraded 并降级为词法召回。
+    """
+    from aiive.config import settings
+
+    if not settings.aiive_memory_bm25_enabled:
+        return
+
+    from aiive.db.base import SessionLocal
+    from aiive.memory.bm25_search import ensure_memory_bm25_index, remediation_hint
+
+    db = SessionLocal()
+    try:
+        status = ensure_memory_bm25_index(db)
+        db.commit()
+        if status == "ready":
+            logger.info("BM25 索引就绪（ParadeDB pg_search）")
+        else:
+            logger.warning(
+                "BM25 索引未就绪（%s）：记忆检索降级为词法召回。%s",
+                status, remediation_hint(status),
+            )
+    except Exception:
+        db.rollback()
+        logger.exception("BM25 索引初始化失败（不阻断启动，召回降级为词法）")
+    finally:
+        db.close()
+
+
 def create_app() -> FastAPI:
     """创建并配置 FastAPI 应用实例。
 
@@ -178,6 +214,10 @@ def create_app() -> FastAPI:
             # 带着漂移的 schema 继续运行会产生更难恢复的数据损坏。
             logger.exception("数据库 schema 迁移失败，阻断启动")
             raise
+        try:
+            _ensure_bm25_index()
+        except Exception:
+            logger.exception("BM25 索引初始化失败")
         try:
             from aiive.config import settings
             from aiive.forget.fingerprint import configure_hmac_secret
