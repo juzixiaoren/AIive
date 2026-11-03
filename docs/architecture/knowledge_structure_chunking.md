@@ -137,7 +137,9 @@ line_start, line_end, page_start, page_end, section_id)`。
 2. `content_hash == 期望的 Embedding 输入哈希`（正文/标题/章节任一变化 → 重算）；
 3. `embedding_model == embedding_model_identity()`（模型或 revision 变化 → 重算）。
 
-三者一致时跳过模型调用，重建幂等。
+三者一致时跳过模型调用，重建幂等。检索侧（`ChunkVectorService.search`）同样要求
+`input_version` 与当前模板一致：模板升级后旧向量不参与召回，避免新旧 Embedding
+混合排序，直到维护回填完成。
 
 `missing_vector_document_ids` 同样把「投影缺失、模型不一致、模板版本不一致、
 分块未记录输入哈希、投影哈希与分块哈希不一致」都视为待回填，因此历史库升级后

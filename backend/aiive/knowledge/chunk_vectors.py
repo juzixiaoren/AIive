@@ -190,6 +190,8 @@ class ChunkVectorService:
             .filter(
                 Document.status.notin_(tuple(INACTIVE_STATUSES)),
                 KnowledgeChunkVector.embedding_model == embedding_model_identity(),
+                # 模板升级后旧向量不参与召回，避免新旧 Embedding 混合排序
+                KnowledgeChunkVector.input_version == EMBEDDING_INPUT_VERSION,
             )
             .order_by(distance.asc())
             .limit(limit)

@@ -135,7 +135,9 @@ Chunk 2 的原文 `AOF 追加写命令到文件。…` 对应的 Embedding 输�
 * 摄取去重命中时也会检查 `_chunking_stale`，原文未变同样重建；
 * 维护扫描新增 `stale_chunking`，`apply_report` 走 `reindex(mark_failure=False)`；
 * 失败保留 `index_failed` / `source_unavailable`，不写半套数据；
-* 同内容同版本重复执行幂等（模型调用次数不变）。
+* 同内容同版本重复执行幂等（模型调用次数不变）；
+* 检索侧同样按 `input_version` 过滤：模板升级后旧向量不参与召回，
+  避免新旧 Embedding 混合排序（等维护回填补齐）。
 
 ## 7. 测试与验证（实际结果）
 

@@ -188,6 +188,9 @@ def test_corrupted_projection_is_detected_and_backfilled(pg_session, tmp_path, m
 
     monkeypatch.setattr(settings, "aiive_knowledge_vector_enabled", True)
     assert missing_vector_document_ids(db, 10) == [result["document_id"]]
+    # 版本不一致的投影不参与向量召回（不与新模板向量混合排序）
+    recalled = ChunkVectorService(db, provider_factory=lambda: fake).search("发布流程", 10)
+    assert rows[0].chunk_id not in {chunk.id for chunk, _document, _score in recalled}
     report = scan_knowledge_base(db)
     missing = [item.count for item in report.issues if item.code == ISSUE_MISSING_CHUNK_VECTORS]
     assert missing == [1]
