@@ -107,7 +107,7 @@
 | 记忆冲突待确认闭环（召回+图谱候选 → 语义裁决 → 用户确认 → 正式写入） | `memory/conflict_confirmation.py` | `memory/conflict_candidates.py`、`memory/conflict_adjudication.py`、`worker/handlers_conflict.py`、`memory/memory_write_service.py`（`conflict_plan` / `decision`）、`runtime/turn_execution.py`（回复入队）、`api/routes_memories.py`（`GET /memories/conflicts`） | `test_memory_conflict_confirmation.py`、`test_memory_conflict_adjudication.py` |
 | 图谱实体绑定（同一次裁决复用既有实体锚点，避免同实体多节点；同名/同别名多实体保留歧义，绑定可定位到具体事实位置） | `memory/conflict_adjudication.py`（`validate_entity_bindings` / `apply_entity_bindings`） | `memory/conflict_candidates.py`（`EntityCandidate` 收集）、`memory/graph_types.py`（`GraphFact.subject_entity_id` / `object_entity_id`）、`memory/graph_projection.py`（`_resolve_entity` 投影前复核）、`memory/conflict_confirmation.py`（`decide` 回填） | `test_memory_entity_binding.py`（unit + integration） |
 | 记忆 key 注册表（唯一真相源） | `memory/memory_key_registry.py` | `prompts/`（MEMORY_KEY_GUIDE） | `test_memory_key*.py` |
-| 记忆召回（四路由 + 融合） | `memory/automatic_recall.py`、`memory/recall_fusion.py` | `memory/recall_config.py`、`memory/vector_projection.py`、`retrieval/` | `test_recall*.py` |
+| 记忆召回（Exact + Dense + BM25 + 统一排序） | `memory/automatic_recall.py`、`memory/recall_fusion.py`、`memory/recall_ranking.py` | `memory/bm25_search.py`、`memory/recall_config.py`、`memory/vector_projection.py`、`forget/visibility_service.py`、`retrieval/` | `test_v2_recall.py`、`test_recall_ranking.py`、`test_pg_bm25_recall.py` |
 | 时序知识图谱（关系事实 → 投影 → 读侧扩展） | `memory/graph_projection.py`、`memory/graph_expansion.py`、`memory/graph_rebuild.py`、`memory/graph_predicates.py`（关系基数/谓词族） | `memory/graph_types.py`、`memory/memory_extractor.py::_verified_graph_facts`、`memory/memory_mutation.py::enqueue_projection`、`runtime/context_assembler.py::_expand_relations`、`worker/outbox_handlers.py::handle_memory_graph_refresh` | `test_memory_graph.py`、`test_context_assembler_graph_expansion.py` |
 | 记忆提取（LLM） | `memory/memory_extractor.py`、`memory/proposal_normalizer.py` | `core/action_planner.py`、`worker/outbox_handlers.py::handle_memory_extraction` | `test_memory_extract*.py` |
 | 记忆生命周期（wake/promote/sleep/archive） | `memory/memory_lifecycle_service.py` | `api/routes_memories.py` | `test_memory_lifecycle*.py` |
@@ -282,8 +282,8 @@
 | `memory_mutation.py` | `MemoryMutationExecutor` L64：锁/前置校验/lineage/事件/投影入队 |
 | `memory_maintenance.py` / `memory_maintenance_planner.py` / `maintenance_hashes.py` | 维护扫描（sleep/archive/consolidate 候选）；`plan_batch` L424；state_hash/decision_hash 乐观并发 |
 | `memory_lifecycle_service.py` | wake/promote/sleep/archive |
-| `automatic_recall.py` | `AutomaticRecallEngine.recall` L136；四路由：`_route_exact` L200 / `_route_lexical` L236 / `_route_vector` L268 / `_route_recent_episode` L294 |
-| `recall_fusion.py` / `recall_config.py` / `recall_models.py` | `fuse_and_pack` L32（RRF k=60+6 信号加权+阈值 0.08+top_k 8）；全部预算权重阈值；Pydantic 契约 |
+| `automatic_recall.py` | `AutomaticRecallEngine.recall` L136；三路由：`_route_exact` L232 / `_route_bm25` L268（pg_search，不可用时 `_route_lexical` L332 降级）/ `_route_vector` L368；`_filter_forgotten` L400 统一 Forget 过滤 |
+| `recall_fusion.py` / `recall_config.py` / `recall_models.py` | `fuse_and_pack` L33（RRF k=60 + relevance/recency/importance/trust/scope 加权 + 阈值 0.08 + top_k 8）；`recall_ranking.py` 提供 RRF/Recency/归一化纯函数；全部预算权重阈值；Pydantic 契约 |
 | `core_memory_projection.py` / `memory_read_model.py` | L1 Core Memory Block 构建；L0 精确 key 读取 |
 | `scope_resolver.py` / `context_assembly.py` | Scope Chain（thread→global）；`render_core_memory`/`assemble_system_content` |
 | `memory_extractor.py` / `proposal_normalizer.py` / `extraction_policy.py` | `UnifiedMemoryExtractor`（同一次调用产出 `graph_facts`，`_verified_graph_facts` 做原文证据校验）；提案规范化；提取信号枚举 |
@@ -302,7 +302,7 @@
 
 **记忆数据流**：
 - 写入：`tools/remember_or_update` / chat 收尾入队 `memory_extraction` → `worker/outbox_handlers.handle_memory_extraction` → `MemoryWriteService.write_batch` → conflict_resolver → memory_store + lineage + 投影入队（vector/markdown/core_memory refresh 均为独立 outbox job）
-- 召回：每轮 `ContextAssembler._unified_recall` → `AutomaticRecallEngine`（L0 精确/L1 core/L2 四路由/L3 recent）→ `recall_fusion` → `MemoryRecallPack` 注入上下文
+- 召回：每轮 `ContextAssembler._unified_recall` → `AutomaticRecallEngine`（Exact + Dense + BM25，Recent Episode 已并入统一排序）→ `recall_fusion` → `MemoryRecallPack` 注入上下文
 - 图谱写入：`memory_records.graph_facts` → `MemoryMutationExecutor.enqueue_projection` 入队 `memory_graph_refresh` → `handle_memory_graph_refresh` → `GraphProjectionService.refresh` → `graph_entities`/`graph_relations`
 - 图谱读取：`ContextAssembler._load_agent_context` 在 `UnifiedRetriever` 之后调用 `_expand_relations` → `GraphExpansionService.expand` → 与召回共享 `retrieved_memory` 动态预算，注入“时序关系（图谱检索证据）”块
 - 遗忘：`forget` 工具 → `MemoryWriteService.forget` 起 Saga → `worker/handlers_forget` 五阶段（cascade→rebuild→purge→verify→reconcile），tombstone+shield 保证 fail-closed

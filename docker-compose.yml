@@ -1,6 +1,13 @@
 services:
   postgres:
-    image: pgvector/pgvector:pg16
+    # 记忆检索专用镜像：pgvector（Dense）+ ParadeDB pg_search（BM25）。
+    # 构建定义见 deploy/pg/Dockerfile；镜像不存在时 compose 会自动构建。
+    # 若沿用不带 pg_search 的旧镜像，迁移会跳过 BM25 索引，运行时召回自动
+    # 降级为词法并在 MemoryRecallPack 上标记 degraded。
+    build:
+      context: .
+      dockerfile: deploy/pg/Dockerfile
+    image: ${AIIVE_PG_IMAGE:-aiive-postgres-bm25:pg16}
     environment:
       POSTGRES_USER: aiive
       POSTGRES_PASSWORD: aiive_dev
@@ -59,6 +66,10 @@ services:
       HOST: "0.0.0.0"
       PORT: "8000"
       DATABASE_URL: "postgresql+psycopg://aiive:aiive_dev@postgres:5432/aiive"
+      # BM25 稀疏召回（pg_search）：postgres 服务由上面的镜像提供扩展。
+      # 置 false 时召回退化为词法路由（route=lexical），不再标记 degraded。
+      AIIVE_MEMORY_BM25_ENABLED: "${AIIVE_MEMORY_BM25_ENABLED:-true}"
+      AIIVE_MEMORY_BM25_TOP_K: "${AIIVE_MEMORY_BM25_TOP_K:-16}"
       # 宿主机直连用 127.0.0.1:8081；容器内通过 Compose 服务名访问。
       AIIVE_EMBEDDING_BASE_URL: "${AIIVE_DOCKER_EMBEDDING_BASE_URL:-${AIIVE_EMBEDDING_BASE_URL:-http://embedding:80/v1}}"
     depends_on:

@@ -107,6 +107,8 @@ AIive（再次召回，fail-closed 校验）：
 cp .env.example .env
 # 编辑 .env 填入 LLM API Key 等信息
 # 如需本地向量召回，将 AIIVE_MEMORY_VECTOR_ENABLED / AIIVE_KNOWLEDGE_VECTOR_ENABLED 改为 true
+# 记忆 BM25 稀疏召回（AIIVE_MEMORY_BM25_ENABLED）默认开启，依赖 postgres 服务自带的
+# pg_search 扩展（deploy/pg/Dockerfile）；扩展缺失时召回自动降级为词法并标记 degraded
 
 # 2. 启动 Docker 服务
 # 开启本地向量召回时，会先检测本地模型缓存，缺失则自动下载，再拉起 TEI

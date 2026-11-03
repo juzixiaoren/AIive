@@ -29,15 +29,27 @@ class RecallConfig:
 
     # --- Route / fusion ---
     vector_top_k: int = 16
+    # BM25（pg_search）稀疏召回的有界 Top-K；实际取值与
+    # AIIVE_MEMORY_BM25_TOP_K 取较小值。
+    bm25_top_k: int = 16
     route_timeout_ms: int = 500
     rrf_k: int = 60
-    route_weights: dict[str, float] = field(default_factory=lambda: {
+    # 统一排序的信号权重（和为 1.0）。RRF 只用排名，relevance 用各路由
+    # 归一化后的 0..1 分数，两者都不直接相加 cosine / BM25 原始分。
+    signal_weights: dict[str, float] = field(default_factory=lambda: {
         "rrf": 0.40,
-        "relevance": 0.30,
-        "scope": 0.15,
-        "recency": 0.05,
-        "importance": 0.05,
+        "relevance": 0.20,
+        "recency": 0.20,
+        "importance": 0.10,
         "trust": 0.05,
+        "scope": 0.05,
+    })
+    # 每条召回路由在 RRF 中的权重；未列出的路由按 1.0 处理。
+    route_multipliers: dict[str, float] = field(default_factory=lambda: {
+        "exact": 1.0,
+        "bm25": 1.0,
+        "vector": 1.0,
+        "lexical": 1.0,
     })
 
     # --- Core projection refresh debounce ---

@@ -1,7 +1,7 @@
 # Current Phase
 
 ## 版本索引
-- 主干最新：**V59 待回答问题的状态一致性**（2026-11-02）→ 见文末「### V59 …」；上一版为 V58 主动提问与用户回复关联闭环。
+- 主干最新：**V60 记忆检索架构升级（pg_search BM25 + 统一排序）**（2026-11-03）→ 见文末「### V60 …」；上一版为 V59 待回答问题的状态一致性。
 - 历史阶段：V34 → V54 按时间顺序记录在下方各节；下方 `## Phase` / `## Status` 是 V34 阶段的原始记录，不再代表当前主干。
 
 ## Phase
@@ -825,3 +825,37 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - 遗留风险：① 判定依据是 `task_state["goal"]` 的步骤状态，绕过 GoalService 直接改写计划会让判定跟着脏数据走；
   ② 同一 (task, step) 的旧问题会被新提问取代，模型拿旧 question_id 回答只会得到 question_stale（刻意 fail-closed）；
   ③ 暂停期间不写失效事件，审计依据是 `goal_paused`/`goal_resumed` 与问题状态推导结果。
+
+### V60 记忆检索架构升级：pg_search BM25 + 统一排序（2026-11-03）
+- 问题：原 Lexical 路由是 ILIKE + CJK bigram 词重叠，不是 BM25（无词频饱和/IDF），
+  且每条候选都要把正文拉回 Python 打分；Recent Episode 是独立路由，按时间倒序，
+  容易出现「最近事件无条件压过长期偏好」。
+- 索引：ParadeDB pg_search 0.26.4（PostgreSQL 16.15 + pgvector 0.8.7），BM25 索引直接
+  建在权威表 memory_records：content / keywords 用 pdb.jieba，canonical_key 用
+  pdb.literal_normalized（保留标识符整串匹配）。与表同事务维护，无第二份事实源。
+- 召回：AutomaticRecallEngine = Exact + Dense(pgvector) + Sparse(pg_search BM25)；
+  _route_recent_episode 删除，情节记忆改由两路召回、时间特征进统一排序；
+  _route_lexical 仅作 BM25 不可用时的降级路径。
+- 排序：recall_fusion 用 RRF（k=60）融合排名，不直接相加 cosine 与 BM25 原始分；
+  最终分 = 0.40*rrf + 0.20*relevance + 0.20*recency + 0.10*importance
+  + 0.05*trust + 0.05*scope；recency 用类型半衰期（episodic 3d / knowledge 180d /
+  profile 365d）乘查询意图系数（情节记忆在非时间敏感查询下折减 0.35）。Exact 候选
+  跳过相关性阈值，只受 token 预算约束。
+- 安全：所有路由候选在融合前统一经 ForgetVisibilityService 批量过滤（fail-closed），
+  BM25 只返回 ID/分数并回源复核 lifecycle/validity/scope，遗忘后 content scrub、
+  物理删除、事务回滚都由 PG 保证索引一致。
+- 降级：扩展/索引不可用时 route=lexical，MemoryRecallPack.degraded=true +
+  degraded_reason，并经 UnifiedRetriever notes 传到 RetrievalResult.degraded 与
+  检索诊断，不谎称 BM25 生效。
+- 部署：deploy/pg/Dockerfile（pgvector + pg_search）、compose postgres 改 build、
+  AIIVE_MEMORY_BM25_ENABLED / AIIVE_MEMORY_BM25_TOP_K；迁移
+  c3f7b2a9d1e4_add_memory_bm25_index 幂等，扩展缺失时 WARNING 跳过不阻断升级。
+- 验证：全量 1472 passed / 44 skipped / 0 failed；真实 PG+pg_search 21 passed
+  （中英混排、标识符、双路去重与 RRF、Recency、Scope、forgotten/archived、
+  Shield/Tombstone、UPDATE/DELETE/ROLLBACK、降级、AUTO 全链路）；PG 契约 10 passed；
+  alembic check 无漂移；改动文件 ruff 全通过、新模块 basedpyright 0 errors。
+- 交付报告：docs/reports/2026-11-03_V60_bm25_recall_report.md；
+  实现细节：docs/architecture/memory_retrieval_bm25.md。
+- 遗留风险：① 本机 .env 未改，需手动开启 BM25 并重建 postgres 镜像；
+  ② 索引为普通 CREATE INDEX，大表需停机窗口；③ 单字中文查询不命中；
+  ④ pg_search 版本与 PG 主版本强绑定。

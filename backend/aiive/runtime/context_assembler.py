@@ -631,10 +631,17 @@ class ContextAssembler:
             if h.source_type in ("segment_summary", "epoch_checkpoint")
         ]
         items = [UnifiedRetriever.memory_hit_to_recall_item(h) for h in memory_hits]
+        # 降级事实随 pack 一起向上传递：BM25 不可用时 notes 里带
+        # memory_recall_degraded:<原因>，调用方不得把它当成「BM25 已生效」。
+        recall_degraded_notes = [
+            note for note in result.notes if note.startswith("memory_recall_degraded")
+        ]
         pack = MemoryRecallPack(
             request_id=result.request_id,
             items=items,
             token_count=sum(item.token_cost for item in items),
+            degraded=bool(recall_degraded_notes) or result.degraded,
+            degraded_reason=",".join(recall_degraded_notes),
         )
         self._persist_retrieval_diagnostics(
             result=result,

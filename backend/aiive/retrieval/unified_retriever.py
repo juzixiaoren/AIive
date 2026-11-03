@@ -131,13 +131,23 @@ class UnifiedRetriever:
             degraded_routes += 1
             notes.append("exact_route_degraded")
 
+        memory_recall_degraded = ""
         try:
-            memory_hits = self._memory_route(request, include_sleeping, overfetch) if memory_enabled else []
+            if memory_enabled:
+                memory_hits, memory_recall_degraded = self._memory_route(
+                    request, include_sleeping, overfetch,
+                )
+            else:
+                memory_hits = []
         except Exception:
             logger.exception("UnifiedRetriever 记忆路由失败，降级为空")
             memory_hits = []
             degraded_routes += 1
             notes.append("memory_route_degraded")
+        if memory_recall_degraded:
+            # 记忆召回内部某条路由未按设计生效（如 pg_search 不可用）：
+            # 显式写入 notes，绝不把降级结果当成 BM25 已生效。
+            notes.append(f"memory_recall_degraded:{memory_recall_degraded}")
 
         try:
             index_hits = self._index_route(request, include_sleeping, overfetch) if index_enabled else []
@@ -186,7 +196,10 @@ class UnifiedRetriever:
             request_id=request.request_id,
             hits=hits,
             token_count=sum(h.token_count for h in hits),
-            degraded=any(note in degradation_notes for note in notes),
+            degraded=any(
+                note in degradation_notes or note.startswith("memory_recall_degraded")
+                for note in notes
+            ),
             notes=notes,
         )
 
@@ -223,12 +236,17 @@ class UnifiedRetriever:
 
     def _memory_route(
         self, request: RetrievalRequest, include_sleeping: bool, top_k: int,
-    ) -> list[RetrievalHit]:
+    ) -> tuple[list[RetrievalHit], str]:
+        """记忆路由适配器：返回 (命中, 降级原因)。
+
+        降级原因来自 AutomaticRecallEngine 的 MemoryRecallPack.degraded_reason，
+        调用方必须把它写进检索 notes，避免把词法兜底当成 BM25 生效。
+        """
         if request.source_types and "memory_record" not in request.source_types:
-            return []
+            return [], ""
         scope = request.scope_context
         if scope is None:
-            return []
+            return [], ""
         rc = RecallConfig(
             automatic_recall_top_k=top_k,
             automatic_recall_token_budget=self._config.auto_token_budget,
@@ -245,7 +263,8 @@ class UnifiedRetriever:
             include_sleeping=include_sleeping,
             include_archived=request.include_archived,
         )
-        return [self.memory_item_to_hit(it) for it in pack.items]
+        hits = [self.memory_item_to_hit(it) for it in pack.items]
+        return hits, (pack.degraded_reason if pack.degraded else "")
 
     # ── Lexical index route（倒排 + entry 查询）──
 

@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     aiive_embedding_query_prefix: str = ""
     aiive_embedding_timeout_seconds: int = 30
     aiive_memory_vector_top_k: int = 16
+    # 记忆 BM25 稀疏召回（ParadeDB pg_search，索引建在 memory_records 上）。
+    # 需要 PostgreSQL 镜像内已安装 pg_search 并预加载（deploy/pg/Dockerfile）。
+    # 扩展/索引不可用时自动降级为词法召回，并在召回结果上标记 degraded。
+    aiive_memory_bm25_enabled: bool = False
+    aiive_memory_bm25_top_k: int = 16
     # 单次 Embeddings 请求的最大文本条数：本地 TEI cpu 后端的
     # max_batch_requests 通常为 4，批越大只会排队；同时控制回填内存峰值。
     aiive_embedding_batch_size: int = 4
@@ -308,6 +313,11 @@ class Settings(BaseSettings):
         if not self.aiive_auth_enabled and self.host not in {"127.0.0.1", "localhost", "::1"}:
             # 关闭认证会让全部私人数据接口裸奔，只允许在 loopback 调试时使用。
             raise ValueError("非 loopback 部署不允许关闭 AIIVE_AUTH_ENABLED")
+        if self.aiive_memory_bm25_enabled and self.aiive_memory_bm25_top_k <= 0:
+            raise ValueError("AIIVE_MEMORY_BM25_TOP_K 必须大于 0")
+        # 非 PostgreSQL（如 SQLite 开发库）不在此阻断启动：BM25 是可降级能力，
+        # 运行时会检测为 unsupported_dialect、降级为词法召回并在召回结果上标记
+        # degraded，不会「以为生效其实没生效」。
         if not (self.aiive_memory_vector_enabled or self.aiive_knowledge_vector_enabled):
             return self
         # 记忆向量是强依赖：开启即要求 PostgreSQL。知识分块向量属于可降级的

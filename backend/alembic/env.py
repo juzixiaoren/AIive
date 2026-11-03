@@ -1,16 +1,13 @@
 from logging.config import fileConfig
 
-from sqlalchemy import pool
-
-from alembic import context
-
-from aiive.db.models import Base
-
 # 确保全部 ORM 模型都注册到 Base.metadata：forget_models / retention_models
 # 定义在独立模块且未被 models.py 导入，若不在此显式导入，autogenerate 与
 # create_all 都会遗漏这些表（Phase 6A Forget Saga、Phase 6B 保留治理）。
-import aiive.db.forget_models  # noqa: F401  # pyright: ignore[reportUnusedImport]
+import aiive.db.forget_models  # pyright: ignore[reportUnusedImport]
 import aiive.db.retention_models  # noqa: F401  # pyright: ignore[reportUnusedImport]
+from aiive.db.models import Base
+from alembic import context
+from sqlalchemy import pool
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -34,6 +31,20 @@ target_metadata = Base.metadata
 # ... etc.
 
 
+# BM25 索引由原生 DDL 创建（pg_search 的 bm25 访问方法 + 表达式索引无法用
+# SQLAlchemy Index 表达，SQLite 下 create_all 也不应尝试创建它），因此它
+# 故意不出现在 Base.metadata 中；autogenerate 必须忽略这个对象，否则在已装
+# pg_search 的库上 alembic check 会把真实索引误判为「多余索引」并要求删除。
+_RAW_DDL_INDEXES = frozenset({"ix_memory_records_bm25"})
+
+
+def _include_object(
+    obj: object, name: str | None, type_: str, reflected: bool, compare_to: object,
+) -> bool:
+    del obj, reflected, compare_to
+    return not (type_ == "index" and name in _RAW_DDL_INDEXES)
+
+
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode.
 
@@ -52,6 +63,7 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        include_object=_include_object,
     )
 
     with context.begin_transaction():
@@ -72,7 +84,8 @@ def run_migrations_online() -> None:
 
     with connectable.connect() as connection:
         context.configure(
-            connection=connection, target_metadata=target_metadata
+            connection=connection, target_metadata=target_metadata,
+            include_object=_include_object,
         )
 
         with context.begin_transaction():

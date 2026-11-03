@@ -30,7 +30,7 @@ AIive 是一个面向个人用户的长期运行 Agent（"个人管家"）。核
 | Token 计量 | LiteLLM token counter |
 | ORM/数据库 | SQLAlchemy 2.0 Declarative / PostgreSQL 16（psycopg 3） |
 | 迁移 | Alembic（同时存在运行时 `create_all` + 手工 `ALTER`，见问题 2.1） |
-| 向量检索 | Qdrant（知识库嵌入） |
+| 记忆/知识检索 | PostgreSQL 16 + pgvector（Dense，512 维 HNSW）+ ParadeDB pg_search（BM25 Sparse），见 docs/architecture/memory_retrieval_bm25.md |
 | 定时/后台 | APScheduler（BackgroundScheduler）+ Outbox Worker + 心跳租约 |
 | 对象存储 | 本地文件系统实现（接口兼容 S3/MinIO），删除统一走 `safe_delete` |
 | 前端 | React + TypeScript + Vite + TailwindCSS + WebSocket |

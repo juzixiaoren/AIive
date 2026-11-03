@@ -1,19 +1,25 @@
 """Automatic Recall 引擎：每轮执行 query-aware 的多路召回。
 
-当前生产路由：
-  1. Exact / Structured —— canonical_key / entity / scope-id 精确匹配
-  2. Lexical            —— query 参与 ILIKE 与 token overlap 匹配
-  3. Recent Episode     —— scope 内与 query 相关的近期 episodic 记录
+生产路由（Exact Lookup + Dense Vector + Sparse BM25 + Unified Ranking）：
 
-各路由均执行 scope 约束的 SQL，不先全量读取再在 Python 中过滤。候选统一由
-`recall_fusion.fuse_and_pack` 融合。
+  1. Exact   —— canonical_key / scope-id 精确匹配（确定性候选，不因分数被丢弃）
+  2. BM25    —— ParadeDB pg_search 稀疏检索（真正的 BM25，索引建在 memory_records）
+  3. Dense   —— pgvector HNSW 语义召回（MemoryVectorProjectionService）
+  4. Fallback—— pg_search 不可用（SQLite / 扩展未装 / 索引缺失）时降级为词法召回，
+                并在 MemoryRecallPack 上标记 degraded
+
+各路由均执行 scope 约束的 SQL，不先全量读取再在 Python 中过滤；所有路由结果在
+融合前统一经过 ForgetVisibilityService 批量过滤（fail-closed），最后由
+recall_fusion.fuse_and_pack 做 RRF + 多维信号统一排序。
+
+Recent Episode 不再是独立召回路由：情节记忆由 BM25 / Dense 召回，其时间特征
+通过 recall_ranking.recency_signal 在统一排序中体现（类型半衰期 × 查询意图）。
 """
 from __future__ import annotations
 
 import logging
 import re
 from collections.abc import Sequence
-from datetime import datetime, timezone
 from typing import Protocol
 
 # ---------------------------------------------------------------------------
@@ -30,6 +36,9 @@ def tokenize_cjk_aware(text: str, min_len: int = 2) -> list[str]:
     """Split text into tokens: \\W+ for Latin/punctuation, overlapping bigrams for CJK.
 
     Example: "我喜欢咖啡 preference" → ["我喜欢咖啡", "我喜", "喜欢", "欢咖", "咖啡", "preference"]
+
+    该分词仅用于 BM25 不可用时的词法降级路由与检索索引；生产 BM25 路径由
+    pg_search 的 jieba tokenizer 在数据库侧完成分词。
     """
     tokens: list[str] = []
     for raw_token in re.split(r"\W+", text):
@@ -44,10 +53,14 @@ def tokenize_cjk_aware(text: str, min_len: int = 2) -> list[str]:
                 tokens.append(cjk[i:i + min_len])
     return tokens
 
-from sqlalchemy import cast, or_, Text
+
+from sqlalchemy import Text, cast, or_
 from sqlalchemy.orm import Session
 
+from aiive.config import settings
 from aiive.db.models import MemoryRecord
+from aiive.forget.visibility_service import ForgetVisibilityService
+from aiive.memory.bm25_search import Bm25SearchService
 from aiive.memory.memory_policy import MemoryPolicyEngine, MemoryReadChannel
 from aiive.memory.memory_store import MemoryStore
 from aiive.memory.memory_types import LifecycleState, ValidityState
@@ -59,6 +72,7 @@ from aiive.memory.recall_models import (
     MemoryRecallRequest,
     RecallCandidateTrace,
 )
+from aiive.memory.recall_ranking import normalize_scores, recency_signal
 
 logger = logging.getLogger(__name__)
 
@@ -76,15 +90,6 @@ class VectorSearchService(Protocol):
         include_archived: bool,
         limit: int,
     ) -> Sequence[tuple[MemoryRecord, float]]: ...
-
-
-def _recency_score(r: MemoryRecord) -> float:
-    """Recency in 0..1 over a 30-day window."""
-    ref = r.observed_at or r.updated_at or r.created_at
-    if ref.tzinfo is None:
-        ref = ref.replace(tzinfo=timezone.utc)
-    age_days = (datetime.now(timezone.utc) - ref).total_seconds() / 86400.0
-    return round(max(0.0, 1.0 - age_days / 30.0), 3)
 
 
 def _scope_score(actual_scope_type: str, actual_scope_id: str | None, chain: list[tuple[str, str | None]]) -> float:
@@ -117,17 +122,19 @@ class AutomaticRecallEngine:
         db: Session,
         config: RecallConfig | None = None,
         vector_service: VectorSearchService | None = None,
+        bm25_service: Bm25SearchService | None = None,
     ) -> None:
         self._db: Session = db
         self._store: MemoryStore = MemoryStore(db)
         self._policy: MemoryPolicyEngine = MemoryPolicyEngine()
         self._config: RecallConfig = config or RecallConfig()
         self._vector_service: VectorSearchService | None = vector_service
-        if self._vector_service is None:
-            from aiive.config import settings
-            if settings.aiive_memory_vector_enabled:
-                from aiive.memory.vector_projection import MemoryVectorProjectionService
-                self._vector_service = MemoryVectorProjectionService(db)
+        if self._vector_service is None and settings.aiive_memory_vector_enabled:
+            from aiive.memory.vector_projection import MemoryVectorProjectionService
+            self._vector_service = MemoryVectorProjectionService(db)
+        self._bm25_service: Bm25SearchService | None = bm25_service
+        if self._bm25_service is None and settings.aiive_memory_bm25_enabled:
+            self._bm25_service = Bm25SearchService(db)
 
     # ------------------------------------------------------------------
     # Public API
@@ -139,28 +146,53 @@ class AutomaticRecallEngine:
     ) -> tuple[MemoryRecallPack, list[RecallCandidateTrace]]:
         """执行全部启用的召回路由并融合为一个 pack。
 
-        include_sleeping=True 时（J.5「扩大召回/高相关」），exact / lexical
-        高相关路由放宽到 `lifecycle_state IN (active, sleeping)`；episode 兜底路由
-        始终仅 active，避免陈旧、低价值的情节记忆被重新带回上下文。
-        include_archived=True 时追加 archived（仅经统一检索显式请求，不自动
-        wake），且 validity 放宽为 IN (valid, expired) —— archived 记录的
-        validity 通常已是 expired，仅追加 lifecycle 状态无法命中；superseded
-        仍排除（已被新记录取代）。
+        include_sleeping=True 时（J.5「扩大召回/高相关」），exact / bm25 / 词法
+        路由放宽到 lifecycle_state IN (active, sleeping)。include_archived=True
+        时追加 archived（仅经统一检索显式请求，不自动 wake），且 validity 放宽为
+        IN (valid, expired) —— archived 记录的 validity 通常已是 expired，仅追加
+        lifecycle 状态无法命中；superseded 仍排除（已被新记录取代）。
 
-        注意：vector 路由的 include_sleeping / include_archived 仅为接口透传。
-        向量投影按现状设计只为 active+valid 记录维护向量（sleeping / archived
-        时删除向量），因此该路由实际只返回 active+valid 结果。
+        安全：所有路由的候选在融合前统一经过 ForgetVisibilityService 批量过滤
+        （Shield / Tombstone，fail-closed）。BM25 因此不可能成为绕过遗忘的入口。
+
+        降级：BM25 已启用但不可用（扩展缺失 / 索引缺失 / SQL 失败）时，改用词法
+        召回并在 pack 上标记 degraded=True + 原因；绝不谎称 BM25 已生效。
         """
         candidates: list[MemoryRecallItem] = []
+        degraded_reasons: list[str] = []
+
         candidates += self._route_exact(request, include_sleeping, include_archived)
-        candidates += self._route_lexical(request, include_sleeping, include_archived)
+
+        if not settings.aiive_memory_bm25_enabled:
+            # 显式关闭 BM25：词法路由作为稀疏召回替代（非降级，属配置选择）。
+            candidates += self._route_lexical(
+                request, include_sleeping, include_archived,
+            )
+        else:
+            bm25_items, bm25_degraded = self._route_bm25(
+                request, include_sleeping, include_archived,
+            )
+            if bm25_degraded:
+                degraded_reasons.append(bm25_degraded)
+                candidates += self._route_lexical(
+                    request, include_sleeping, include_archived,
+                )
+            else:
+                candidates += bm25_items
+
         try:
             candidates += self._route_vector(request, include_sleeping, include_archived)
         except Exception:
-            logger.exception("向量召回失败，降级为 exact / lexical / episode")
-        candidates += self._route_recent_episode(request)
+            degraded_reasons.append("vector_error")
+            logger.exception("向量召回失败，降级为 exact / bm25")
+
+        candidates = self._filter_forgotten(candidates)
         candidates = [item for item in candidates if item.content]
-        return fuse_and_pack(candidates, request, self._config)
+        pack, traces = fuse_and_pack(candidates, request, self._config)
+        if degraded_reasons:
+            pack.degraded = True
+            pack.degraded_reason = ",".join(degraded_reasons)
+        return pack, traces
 
     @staticmethod
     def _lifecycle_states(
@@ -221,23 +253,91 @@ class AutomaticRecallEngine:
                     (MemoryRecord.canonical_key == q) | (MemoryRecord.scope_id == q),
                 )
             )
-            # scope_id 必须与 chain 中的取值一致（与 _route_lexical 相同），
+            # scope_id 必须与 chain 中的取值一致（与 _route_bm25 / _route_lexical 相同），
             # 否则仅按 scope_type 过滤会把其他 thread/project 的记忆跨界召回。
             if scope_id is not None:
                 query = query.filter(MemoryRecord.scope_id == scope_id)
             else:
                 query = query.filter(MemoryRecord.scope_id.is_(None))
             recs = query.order_by(MemoryRecord.importance.desc()).limit(5).all()
-            out.extend(self._to_items(recs, "exact", 1.0, chain))
+            out.extend(self._to_items(recs, "exact", 1.0, chain, request.query))
             if out:
                 break
         return out
+
+    def _route_bm25(
+        self, request: MemoryRecallRequest, include_sleeping: bool = False,
+        include_archived: bool = False,
+    ) -> tuple[list[MemoryRecallItem], str]:
+        """pg_search BM25 稀疏召回；返回 (候选, 降级原因)。
+
+        降级原因非空表示 BM25 未生效（已启用但不可用），调用方必须改用词法
+        召回并在 pack 上标记 degraded。
+        """
+        if not settings.aiive_memory_bm25_enabled:
+            return [], ""
+        if self._bm25_service is None:
+            return [], "bm25_unavailable"
+
+        limit = min(self._config.bm25_top_k, settings.aiive_memory_bm25_top_k)
+        hits = self._bm25_service.search(
+            request.query,
+            scope_chain=request.scope_context.chain(),
+            lifecycle_states=self._lifecycle_states(include_sleeping, include_archived),
+            validity_states=self._validity_states(include_archived),
+            limit=limit,
+        )
+        if hits is None:
+            status = getattr(self._bm25_service, "status", "error")
+            logger.warning("BM25 不可用（%s），本轮降级为词法召回", status)
+            return [], f"bm25_{status}"
+        if not hits:
+            return [], ""
+
+        # 回源读取权威记录：BM25 只提供 ID 与排名，内容与状态以 memory_records 为准。
+        ids = [hit.memory_id for hit in hits]
+        records = self._db.query(MemoryRecord).filter(MemoryRecord.id.in_(ids)).all()
+        by_id = {record.id: record for record in records}
+
+        states = set(self._lifecycle_states(include_sleeping, include_archived))
+        validity = set(self._validity_states(include_archived))
+        chain = request.scope_context.chain()
+        allowed_scopes = {(scope_type, scope_id) for scope_type, scope_id in chain}
+
+        ordered: list[MemoryRecord] = []
+        scores: list[float] = []
+        for hit in hits:
+            record = by_id.get(hit.memory_id)
+            if record is None:
+                continue  # 并发删除：索引命中但权威记录已不存在
+            if record.lifecycle_state not in states:
+                continue
+            if record.validity_state not in validity:
+                continue
+            if (record.scope_type or "global", record.scope_id) not in allowed_scopes:
+                continue
+            ordered.append(record)
+            scores.append(hit.score)
+
+        relevance = normalize_scores(scores)
+        out: list[MemoryRecallItem] = []
+        for record, score, rel in zip(ordered, scores, relevance):
+            item = self._to_item(
+                record, "bm25", rel, chain, request.query, raw_score=score,
+            )
+            if item is not None:
+                out.append(item)
+        return out, ""
 
     def _route_lexical(
         self, request: MemoryRecallRequest, include_sleeping: bool = False,
         include_archived: bool = False,
     ) -> list[MemoryRecallItem]:
-        """执行 PostgreSQL/SQLite 可移植的词汇检索，query 真实参与匹配。"""
+        """BM25 不可用时的词法降级路由（ILIKE + CJK bigram 词重叠）。
+
+        该路由只在 degraded 状态下运行，其结果在 pack 上带 degraded 标记；
+        正常部署（PostgreSQL + pg_search）不应走到这里。
+        """
         q = request.query.strip()
         if len(q) < 2:
             return []
@@ -259,7 +359,7 @@ class AutomaticRecallEngine:
                 rel = self._text_relevance(r, tokens, qlow)
                 if rel <= 0:
                     continue
-                item = self._to_item(r, "lexical", rel, chain)
+                item = self._to_item(r, "lexical", rel, chain, request.query)
                 if item is not None:
                     out.append(item)
         out.sort(key=lambda x: x.relevance_score, reverse=True)
@@ -274,7 +374,6 @@ class AutomaticRecallEngine:
         """通过已配置的 pgvector 服务执行语义召回。"""
         if self._vector_service is None:
             return []
-        from aiive.config import settings
         rows = self._vector_service.search(
             request,
             include_sleeping=include_sleeping,
@@ -286,64 +385,36 @@ class AutomaticRecallEngine:
         for record, relevance in rows:
             if relevance <= 0:
                 continue
-            item = self._to_item(record, "vector", relevance, chain)
+            item = self._to_item(
+                record, "vector", relevance, chain, request.query,
+                raw_score=relevance,
+            )
             if item is not None:
                 out.append(item)
         return out
 
-    def _route_recent_episode(
-        self, request: MemoryRecallRequest, limit: int = 3
-    ) -> list[MemoryRecallItem]:
-        """Query-aware fallback: recent episodic records in scope that actually
-        relate to the query.
-
-        Must NOT inject episodic memory every turn. Relevance is scored from
-        query-token overlap (same scale as FTS) so the fusion threshold applies
-        naturally; when nothing matches, the route returns empty and Automatic
-        Recall may legitimately yield an empty pack (V2 §L2 / §762). Recent
-        episodes already live in Thread Working State (history messages), so
-        they must not be force-injected as long-term recall.
-        """
-        q = request.query.strip().lower()
-        if len(q) < 2:
-            return []
-        tokens = tokenize_cjk_aware(q)
-        if not tokens:
-            return []
-        chain = request.scope_context.chain()
-        seen: set[str] = set()
-        out: list[MemoryRecallItem] = []
-        for scope_type, scope_id in chain:
-            recs = (
-                self._db.query(MemoryRecord)
-                .filter(
-                    MemoryRecord.lifecycle_state == LifecycleState.ACTIVE.value,
-                    MemoryRecord.validity_state == ValidityState.VALID.value,
-                    MemoryRecord.scope_type == scope_type,
-                    MemoryRecord.memory_type == "episodic",
-                )
-            )
-            if scope_id is not None:
-                recs = recs.filter(MemoryRecord.scope_id == scope_id)
-            else:
-                recs = recs.filter(MemoryRecord.scope_id.is_(None))
-            recs = recs.order_by(MemoryRecord.observed_at.desc()).limit(limit * 3).all()
-            for r in recs:
-                if r.id in seen:
-                    continue
-                seen.add(r.id)
-                rel = self._text_relevance(r, tokens, q)
-                if rel <= 0:
-                    continue
-                item = self._to_item(r, "episode", rel, chain)
-                if item is not None:
-                    out.append(item)
-        out.sort(key=lambda x: x.relevance_score, reverse=True)
-        return out[:limit]
-
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _filter_forgotten(
+        self, candidates: list[MemoryRecallItem],
+    ) -> list[MemoryRecallItem]:
+        """统一 Forget 安全过滤：所有路由的候选在此一次性 fail-closed 过滤。
+
+        Shield（选择器级）/ Tombstone（实体级）判定统一委托
+        ForgetVisibilityService；过滤本身异常时丢弃全部候选，宁可空召回也不
+        泄露已遗忘内容。
+        """
+        if not candidates:
+            return candidates
+        memory_ids = sorted({item.memory_id for item in candidates})
+        try:
+            allowed = set(ForgetVisibilityService.filter_memory_ids(self._db, memory_ids))
+        except Exception:
+            logger.exception("Forget 可见性批量过滤失败，本轮候选按 fail-closed 丢弃")
+            return []
+        return [item for item in candidates if item.memory_id in allowed]
 
     def _query_scope_text(
         self, scope_type: str, scope_id: str | None, qlow: str, tokens: list[str],
@@ -397,14 +468,15 @@ class AutomaticRecallEngine:
 
     def _to_items(
         self, recs: Sequence[MemoryRecord], route: str,
-        relevance: float, chain: list[tuple[str, str | None]],
+        relevance: float, chain: list[tuple[str, str | None]], query: str,
     ) -> list[MemoryRecallItem]:
-        items = [self._to_item(r, route, relevance, chain) for r in recs]
+        items = [self._to_item(r, route, relevance, chain, query) for r in recs]
         return [item for item in items if item is not None]
 
     def _to_item(
         self, r: MemoryRecord, route: str, relevance: float,
-        chain: list[tuple[str, str | None]],
+        chain: list[tuple[str, str | None]], query: str,
+        raw_score: float = 0.0,
     ) -> MemoryRecallItem | None:
         content = self._policy.render_content(
             r.content or "", r.sensitivity, MemoryReadChannel.LLM_CONTEXT,
@@ -420,7 +492,11 @@ class AutomaticRecallEngine:
             scope_id=r.scope_id,
             relevance_score=round(relevance, 3),
             scope_score=_scope_score(r.scope_type or "global", r.scope_id, chain),
-            recency_score=_recency_score(r),
+            recency_score=recency_signal(
+                r.memory_type or "",
+                r.observed_at or r.updated_at or r.created_at,
+                query,
+            ),
             importance_score=r.importance or 0.5,
             trust_level=r.trust_level or "semi_trusted",
             validity_state=r.validity_state or "valid",
@@ -428,4 +504,5 @@ class AutomaticRecallEngine:
             token_cost=max(1, len(r.content or "") // 4),
             route=route,
             lifecycle_state=r.lifecycle_state or "",
+            raw_route_score=round(raw_score, 6),
         )

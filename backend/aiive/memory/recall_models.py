@@ -79,9 +79,12 @@ class MemoryRecallItem(BaseModel):
     source_refs: list[str] = Field(default_factory=list)
     record_version: int = 1
     token_cost: int = 0
-    route: str = ""          # which route produced this candidate (exact/fts/episode/vector/graph)
+    route: str = ""          # which route produced this candidate (exact/dense/sparse/lexical/graph)
     fused_score: float = 0.0  # final fused score after fusion
     lifecycle_state: str = ""  # 源记录的 lifecycle（active/sleeping/archived/forgotten 等）
+    # 路由原始分（BM25 分数 / cosine 相似度 / 词重叠比例），仅用于可解释性与诊断；
+    # 融合时只使用归一化后的 relevance_score 与 RRF 排名，不直接相加不同量纲的原始分。
+    raw_route_score: float = 0.0
 
 
 class MemoryRecallPack(BaseModel):
@@ -91,6 +94,11 @@ class MemoryRecallPack(BaseModel):
     items: list[MemoryRecallItem] = Field(default_factory=list)
     token_count: int = 0
     excluded_count: int = 0
+    # 降级标记：某条召回路由未能按设计生效（如 pg_search 未安装、索引缺失、
+    # 向量服务异常）时为 True，并给出原因。调用方不得把 degraded 结果当作
+    # 「该路由已生效」来展示或统计。
+    degraded: bool = False
+    degraded_reason: str = ""
 
 
 class RecallCandidateTrace(BaseModel):
@@ -98,7 +106,8 @@ class RecallCandidateTrace(BaseModel):
 
     memory_id: str
     route: str
-    raw_score: float = 0.0
+    raw_score: float = 0.0          # 归一化 relevance（0..1），与阈值比较的同一口径
+    route_raw_score: float = 0.0    # 路由原始分（BM25 分数 / cosine），仅诊断用
     fused_score: float = 0.0
     selected: bool = False
     exclusion_reason: str = ""
