@@ -246,3 +246,75 @@ Parent-Child / LLM 切块，也不改检索架构。
 4. **token 上限仍按估算口径**：`count_tokens` 是启发式估算，模型侧真实 token 数可能
    不同；需要严格长度保证时应在 Embedding 客户端按模型 tokenizer 处理。
 
+
+## 10. V61.2 边界正确性修复（2026-11-03 追加）
+
+V61.1 之后继续审计，发现三处只在边界条件下出现的缺陷：不报错，但来源定位或列结构
+会静默变错。V61.2 只修这三处，不改架构、不动 Section ID / Overlap / 检索 / 向量机制。
+
+### 10.1 缺陷与修复
+
+| # | 缺陷 | 原实现的问题 | 修复 |
+|---|---|---|---|
+| 1 | 代码超长行的来源偏移重复累加 | `_split_code_by_lines` 的超长单行分支在生成 `_Segment` 时已经算成 `base + offset + ...`，函数返回时又统一加一次 `base`。`base` 是函数在代码块中的字符偏移，第二次累加会把片段推到后面的行上，甚至越过块尾被 clamp | 统一坐标语义：`_Segment.start/end` 一律相对「当前函数入参文本」。`_split_code_by_lines` 只返回局部偏移，由 `_split_code` 的函数边界分支 rebase 一次；普通代码行、函数边界拆分、字符窗口拆分共用同一套换算 |
+| 2 | 兜底拆分丢失来源映射 | `_enforce_budget` 把最终 `content` 当成原文重新 `_split_text`，用「draft.line_start + 内容内换行数」推行号。但 content 可能以 Overlap 前缀或重复表头开头，行号被整体前移；同时 `context_tokens` 被清零，上下文被冒充成本 Chunk 的来源 | `ChunkDraft` 新增 `parts: tuple[ChunkPart, ...]`（正文 / 行范围 / 是否上下文），`_assemble` 汇总时填充；`_enforce_budget` 按片段拆分、按片段换算行号、重新装箱，上下文片段只累加 `context_tokens`。没有 parts 的历史 draft 退化为「整块一个来源片段」，行为与旧实现一致 |
+| 3 | 超长表格行拆分丢空单元格 | `_cell_spans` 过滤掉空串与纯竖线片段，「张三 + 两个空列 + 超长值」这类行进入单元格拆分路径后两个空列消失，列数与列序都变了 | 保留全部单元格（行首竖线并入首格），`_row_fragment` 的续片段连带前一单元格的结尾竖线，片段文本始终是原始行的连续子串——列结构完整，顺带消除了 V61.1 遗留的「人工补竖线造成 2 字符偏移漂移」 |
+
+### 10.2 修改文件
+
+| 文件 | 变更 |
+|---|---|
+| `backend/aiive/knowledge/chunker.py` | 新增 `ChunkPart`、`ChunkDraft.parts`、`_Piece.parts`、`_piece_parts`、`_split_draft`、`_line_in_part`、`_pack_parts`、`_draft_from_parts`；`_split_code_by_lines` 去掉 `base` 参数只返回局部偏移；`_cell_spans` / `_row_fragment` 保留空单元格与精确偏移；`CHUNKER_VERSION = structure_recursive_v3` |
+| `tests/unit/backend/test_chunker_boundaries.py` | 新增 13 例回归（代码行号 4 例、兜底拆分 4 例、空单元格与列结构 4 例、混合文档预算 1 例） |
+| `docs/architecture/knowledge_structure_chunking.md` | 补坐标语义、兜底拆分的来源片段、空单元格保留、V61.2 版本影响 |
+| `docs/CODE_MAP.md` | 图谱同步 `ChunkPart` / `_enforce_budget` / 新测试文件 |
+| `docs/reports/2026-11-03_V61_structure_chunking_report.md` | 本节 |
+
+未改动：`blocks.py`（`PARSER_VERSION` 仍为 `structure_v2`）、`ingestor.py`、
+`chunk_vectors.py`、`maintenance.py`、`db/models.py`、Alembic 迁移、检索侧代码。
+
+### 10.3 实测输出（真实运行）
+
+| 场景 | 输入 | 输出 | 校验 |
+|---|---|---|---|
+| 后续函数中的超长代码行 | 代码块 1674 tokens，超长行在第 67 行 | 4 块：697（3-53）/ 159（54-66）/ 700（67-67）/ 118（67-71） | 超长行的两块都指向 67 行；第三个函数的 `return value * two` 仍落在 71 行 |
+| 兜底拆分（Overlap） | Overlap 8 tokens + 12 行正文（约 1700 tokens） | 4 块：440（20-22，`context_tokens=8`）/ 432（23-25）/ 432（26-28）/ 432（29-31） | 首块保留上下文长度，行号从 20 起，不回到 Overlap 的 10 行 |
+| 兜底拆分（重复表头） | 表头 17 tokens + 10 行数据 | 多块，首块 `context_tokens=17`，其余 0 | 行号全部落在 7-16 的数据行，表头不计入来源 |
+| 超长表格行 + 连续空列 | 含两个空列、单个 900 tokens 单元格的数据行 | 3 块：23 / 700 / 235 | 首块保留「张三 + 两个空列」的行片段，空列不丢，`context_tokens=17` |
+
+### 10.4 版本与存量数据影响
+
+`CHUNKER_VERSION` 由 `structure_recursive_v2` 升到 `structure_recursive_v3`
+（`PARSER_VERSION` 不变）。触发原因是切分结果本身变化：表格空列不再丢失、续片段不再
+人工补竖线、代码行号被修正。存量文档会被 `_chunking_stale` 判为落后并按批重建；
+数据库 schema 与 Alembic 迁移均无变化，不需要新迁移。重建完成前，旧 Chunk 的内容与
+行号仍是旧规则产物，检索可用但结构定位不可全信。
+
+### 10.5 验证命令与结果
+
+| 命令 | 结果 |
+|---|---|
+| `pytest tests/unit/backend/test_chunker_boundaries.py -q` | 13 passed |
+| `pytest tests/unit/backend/test_chunker_correctness.py tests/unit/backend/test_structure_chunking.py -q` | 55 passed（V61.1 全部保持通过） |
+| `pytest -q`（全量） | **1559 passed, 53 skipped, 52 warnings**（279.31s，EXIT=0） |
+| `ruff check backend/aiive --select F,E9` | All checks passed |
+| `basedpyright backend` | 0 errors, 0 warnings, 0 notes |
+| `AIIVE_PG_TESTS=1 pytest tests/integration/pg -q` | 40 passed / 13 skipped（211.37s，真实 PG + pgvector 容器） |
+
+**回归有效性（变异验证）**：把三处修复分别改回旧行为后，对应测试均失败——代码偏移
+重复累加 → `TestCodeSourceOffsets` 2 例失败；`_cell_spans` 恢复过滤 → `TestEmptyTableCells`
+2 例失败；`_enforce_budget` 忽略 parts → `TestEnforceBudgetProvenance` 2 例失败。
+说明新测试确实覆盖缺陷，而不是只跟着新实现走。
+
+### 10.6 剩余风险
+
+1. **兜底拆分不重复表头**：`_enforce_budget` 只把表头放进第一个新块（后续块没有列名）。
+   正常路径不会触发——`_split_table` 已保证输出 `<= max`；该路径只在未来新增切分
+   分支时兜底。
+2. **续片段重复一个竖线**：表格续片段连带前一单元格的结尾竖线，字符上多一个 `|`，
+   这是保持列语义的必要代价，不影响列数与内容完整性。
+3. **代码块仍会跨函数合并短行**：`_pack_segments` 会把后续函数的短行并入同一 Chunk
+   （V61 既有行为），V61.2 只保证行号准确，不改变切分粒度。
+4. **token 仍是估算口径**：`count_tokens` 是启发式估算，模型侧真实 token 数可能不同。
+
+

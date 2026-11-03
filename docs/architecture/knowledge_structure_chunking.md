@@ -89,6 +89,8 @@ NUL + occurrence)` 前 16 位，`occurrence` 是该标题路径在**本文档内
   复制出来的表头属于上下文，计入 `context_tokens` 但不计入来源行号；
   * 单行本身超预算时按**单元格边界**拆成多段，每段仍带表头；单元格内容不截断、
     不丢弃（拆分只发生在单元格之间，不切开单元格）；
+  * **空单元格同样保留**：`| 张三 |  |  | 值` 这类行拆开后列数与列序不变，
+    续片段连带前一个单元格的结尾竖线，片段文本始终是原始行的连续子串；
   * 单个单元格仍超预算时，对该单元格内容递归走文本拆分（句子 → 标点 → 字符窗口）；
   * 表头本身超预算，或扣掉表头后剩余预算已小于 `min_chunk_tokens` 时，整表退化为
     普通文本拆分（不再复制表头），优先保证 `max_chunk_tokens` 不被突破；
@@ -97,7 +99,7 @@ NUL + occurrence)` 前 16 位，`occurrence` 是该标题路径在**本文档内
 * **Overlap**：只在同一 Section 的相邻文本 Chunk 之间、且只在句子边界取尾部；
   代码与表格前后不做 Overlap。
 
-`CHUNKER_VERSION = "structure_recursive_v2"` 随切分规则变化递增。
+`CHUNKER_VERSION = "structure_recursive_v3"` 随切分规则变化递增。
 
 ### 来源定位
 
@@ -107,12 +109,19 @@ Chunk 的行号由该区间换算得到，因此**一个 Block 被拆成多个 C
 
 * 段落按句子 / 标点拆开时，片段区间来自分隔符在原串中的位置，行号不重叠、不倒退；
 * 代码按顶层定义或按行拆开时，每个片段记录自己覆盖的行区间；
+  **坐标语义统一为「相对入参文本」**：`_split_code_by_lines` 只返回局部偏移，由
+  `_split_code` 的函数边界分支统一 rebase 一次，禁止「内部加一次、返回时再加一次」
+  （V61.2 修复的重复累加缺陷）；
 * 表格按行拆开时，数据行片段指向真实数据行，复制出来的表头不计入区间；
 * PDF 文本按页切块，拆分不改变 `page_start / page_end`；
 * 多个 Block 合并成一个 Chunk 时，取首个片段起点与末个片段终点，不把中间的间隔算进来；
 * **Overlap 前缀是上下文**：它由上一 Chunk 的尾部复制而来，标记为 `context=True`，
   只累加 `context_tokens`，不参与 `line_start / line_end` 汇总，因此不会把本 Chunk 的
   来源伪装成上一段的位置；重复的表格表头同理。
+* **兜底拆分沿用来源片段**：Chunk 落库前还会经过 `_enforce_budget` 统一校验上限。
+  它按 Chunk 自带的 `ChunkPart`（正文 / 行范围 / 是否上下文）重新拆分，而不是把最终
+  正文当成原文重新数换行——因此 Overlap 与重复表头不会被算成本 Chunk 的来源，
+  `context_tokens` 也不会被清零。
 
 ### Token 口径
 
@@ -219,6 +228,16 @@ Chunk 的行号由该区间换算得到，因此**一个 Block 被拆成多个 C
 * 若希望立即生效而不等定时维护，可对知识库执行一次重建（reindex），语义与
   `maintenance.scan_knowledge_base` 的 `stale_chunking` 处理一致。
 
+**V61.2 的版本与存量数据影响**：`CHUNKER_VERSION` 由 `structure_recursive_v2` 升到
+`structure_recursive_v3`（`PARSER_VERSION` 不变，仍是 `structure_v2`）。触发原因是
+切分结果本身变化：超长表格行拆分不再丢空单元格、续片段不再人工补 `| `、后续函数中
+超长代码行的行号被修正。因此：
+
+* 存量文档会再次被 `_chunking_stale` 判为落后并按批重建，行为与 V61.1 相同；
+* 数据库 schema 与 Alembic 迁移均无变化，不需要新迁移；
+* 重建完成前，旧 Chunk 的内容仍是旧规则产物（表格可能缺空列、代码行号可能偏移），
+  检索可用但结构定位不可全信，重建后收敛。
+
 ## 7. 检索
 
 保留现有架构（词法 + 向量 RRF 融合，k=60，各 0.5），只增强命中信息：
@@ -249,6 +268,9 @@ Chunk 的行号由该区间换算得到，因此**一个 Block 被拆成多个 C
 * `tests/unit/backend/test_chunker_correctness.py`：V61.1 正确性回归——超长表格行 /
   单元格 / 表头、同名标题的 `section_id` 分离与确定性、拆分后的行号与页码、
   Overlap 不伪造来源、无竖线表格识别与散文不误判、统一 token 上限不变量；
+* `tests/unit/backend/test_chunker_boundaries.py`：V61.2 边界回归——后续函数中超长
+  代码行的行号、兜底拆分保留 `ChunkPart` 来源与 `context_tokens`、空单元格在表格
+  拆分中的保留与列结构完整性；
 * `tests/unit/backend/test_structure_chunking_migration.py`：空库升级、存量库补列与
   降级回滚（数据不丢、默认值正确）；
 * `tests/integration/pg/test_pg_structure_chunking.py`：真实 PG + pgvector 上的

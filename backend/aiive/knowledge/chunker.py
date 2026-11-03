@@ -49,7 +49,7 @@ from aiive.knowledge.blocks import (
 )
 from aiive.knowledge.tokenization import count_tokens
 
-CHUNKER_VERSION = "structure_recursive_v2"
+CHUNKER_VERSION = "structure_recursive_v3"
 
 # 遗留字符窗口切分的默认宽度（仅 chunk_text 使用）。
 CHUNK_SIZE = 500
@@ -76,11 +76,27 @@ class ChunkConfig:
 
 
 @dataclass(frozen=True)
+class ChunkPart:
+    """Chunk 内的一个来源片段：正文 + 它在原始文档中的行范围。
+
+    `context=True` 表示该片段是 Overlap 前缀或重复表头，属于「上下文」而不是本 Chunk
+    的原始内容，因此不参与 `line_start / line_end` 汇总。
+    """
+
+    text: str
+    line_start: int
+    line_end: int
+    context: bool = False
+
+
+@dataclass(frozen=True)
 class ChunkDraft:
     """切分结果（尚未落库）：正文 + 结构元数据 + 来源定位。
 
     line_start / line_end 只覆盖 Chunk 自身的原始内容；context_tokens 记录 Overlap
-    前缀或重复表头这类「不属于来源范围」的上下文长度。
+    前缀或重复表头这类「不属于来源范围」的上下文长度。`parts` 保留组成该 Chunk 的
+    来源片段（含上下文标记），供 `_enforce_budget` 兜底拆分时继续使用同一套来源映射，
+    避免把重新切分的字符串当成原文重新计算行号。
     """
 
     content: str
@@ -94,6 +110,7 @@ class ChunkDraft:
     chunk_index: int
     token_count: int
     context_tokens: int = 0
+    parts: tuple[ChunkPart, ...] = ()
 
     @property
     def heading_text(self) -> str:
@@ -103,7 +120,12 @@ class ChunkDraft:
 
 @dataclass(frozen=True)
 class _Segment:
-    """Block 原文中的一段连续内容（字符区间相对 Block.content）。"""
+    """一段连续内容及其字符区间。
+
+    坐标语义：`start/end` **相对当前函数入参文本**（通常就是 Block.content），
+    而不是相对某个中间切片。任何「把局部偏移换算成更外层偏移」的动作只能在调用方
+    做一次，禁止在被调函数内部先加一次、返回时又加一次。
+    """
 
     text: str
     start: int
@@ -125,6 +147,8 @@ class _Piece:
     # True 表示这段文字是上下文（Overlap 前缀），不参与来源范围汇总
     context: bool = False
     context_tokens: int = 0
+    # 组成该片段的来源片段（_assemble 汇总时填充），供兜底拆分复用
+    parts: tuple[ChunkPart, ...] = ()
 
 
 # 由粗到细的分隔层级：段落 → 行 → 句末标点 → 句中标点。
@@ -204,6 +228,7 @@ def _chunk_section(section: list[Block], config: ChunkConfig) -> list[ChunkDraft
             chunk_index=0,
             token_count=count_tokens(piece.text),
             context_tokens=piece.context_tokens,
+            parts=piece.parts,
         )
         for piece in assembled
         if piece.text.strip()
@@ -235,6 +260,7 @@ def _pack(pieces: list[_Piece], config: ChunkConfig) -> list[_Piece]:
             line_end=piece.line_start,
             context=True,
             context_tokens=count_tokens(prefix),
+            parts=(),
         )
 
     for piece in pieces:
@@ -253,6 +279,7 @@ def _pack(pieces: list[_Piece], config: ChunkConfig) -> list[_Piece]:
                     text=segment.text,
                     line_start=_line_at(piece, segment.start),
                     line_end=_line_at(piece, segment.end),
+                    parts=(),
                 )
                 if previous_part is not None:
                     prefix = _overlap_prefix(previous_part.text, config)
@@ -305,7 +332,20 @@ def _assemble(parts: list[_Piece]) -> _Piece:
         page_end=max(pages) if pages else None,
         block_type=_dominant_type(parts),
         context_tokens=context_tokens,
+        parts=tuple(
+            chunk_part
+            for part in parts
+            if part.text.strip()
+            for chunk_part in _piece_parts(part)
+        ),
     )
+
+
+def _piece_parts(piece: _Piece) -> tuple[ChunkPart, ...]:
+    """展开片段的来源片段：已汇总过的直接用其 parts，否则把自身视为一个来源片段。"""
+    if piece.parts:
+        return piece.parts
+    return (ChunkPart(piece.text, piece.line_start, piece.line_end, piece.context),)
 
 
 def _join_texts(texts: list[str]) -> str:
@@ -362,26 +402,78 @@ def _merge_short_tail(pieces: list[_Piece], config: ChunkConfig) -> list[_Piece]
 # ---------------------------------------------------------------------------
 
 def _enforce_budget(drafts: list[ChunkDraft], config: ChunkConfig) -> list[ChunkDraft]:
-    """兜底拆分任何超过 max 的 Chunk（覆盖 Overlap、短尾合并与所有特殊路径）。"""
+    """兜底拆分任何超过 max 的 Chunk（覆盖 Overlap、短尾合并与所有特殊路径）。
+
+    拆分基于 Chunk 自带的来源片段（`ChunkPart`），而不是把最终正文当成原文重新推算
+    行号：上下文片段（Overlap 前缀、重复表头）保留 `context` 标记，只累计
+    `context_tokens`，不冒充本 Chunk 的原始内容；正文片段的行号由「片段起点 + 片段内
+    换行数」换算，始终指向真实原文。没有片段信息的历史 draft 退化为「整块即一个来源
+    片段」，行为与旧实现一致。
+    """
     result: list[ChunkDraft] = []
     for draft in drafts:
         if count_tokens(draft.content) <= config.max_chunk_tokens:
             result.append(draft)
             continue
-        for segment in _split_text(draft.content, config):
-            line_start = draft.line_start + draft.content.count("\n", 0, segment.start)
-            line_end = draft.line_start + draft.content.count(
-                "\n", 0, min(segment.end, len(draft.content))
-            )
-            result.append(replace(
-                draft,
-                content=segment.text,
-                line_start=min(line_start, draft.line_end),
-                line_end=min(line_end, draft.line_end),
-                token_count=count_tokens(segment.text),
-                context_tokens=0,
-            ))
+        result.extend(_split_draft(draft, config))
     return result
+
+
+def _split_draft(draft: ChunkDraft, config: ChunkConfig) -> list[ChunkDraft]:
+    """按来源片段拆分超限 Chunk，保留行号、页码与上下文元数据。"""
+    parts = draft.parts or (ChunkPart(draft.content, draft.line_start, draft.line_end),)
+    segments: list[ChunkPart] = []
+    for part in parts:
+        for segment in _split_text(part.text, config):
+            segments.append(ChunkPart(
+                text=segment.text,
+                line_start=_line_in_part(part, segment.start),
+                line_end=_line_in_part(part, segment.end),
+                context=part.context,
+            ))
+    return [_draft_from_parts(draft, group) for group in _pack_parts(segments, config)]
+
+
+def _line_in_part(part: ChunkPart, offset: int) -> int:
+    """把片段内的字符偏移换算成原文行号（不越出片段自身的行范围）。"""
+    if offset <= 0:
+        return part.line_start
+    lines = part.text.count("\n", 0, min(offset, len(part.text)))
+    return min(part.line_start + lines, part.line_end)
+
+
+def _pack_parts(parts: list[ChunkPart], config: ChunkConfig) -> list[list[ChunkPart]]:
+    """把来源片段重新装箱成不超过 max 的组（保持顺序，不丢上下文标记）。"""
+    groups: list[list[ChunkPart]] = []
+    current: list[ChunkPart] = []
+    for part in parts:
+        candidate = _join_texts([item.text for item in [*current, part]])
+        if current and count_tokens(candidate) > config.max_chunk_tokens:
+            groups.append(current)
+            current = [part]
+            continue
+        current.append(part)
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _draft_from_parts(draft: ChunkDraft, parts: list[ChunkPart]) -> ChunkDraft:
+    """由一组来源片段生成新 ChunkDraft（行号取正文片段，上下文长度单独累计）。"""
+    texts = [part.text for part in parts if part.text.strip()]
+    source = [part for part in parts if part.text.strip() and not part.context] or parts
+    content = _join_texts(texts)
+    return replace(
+        draft,
+        content=content,
+        line_start=min(part.line_start for part in source),
+        line_end=max(part.line_end for part in source),
+        token_count=count_tokens(content),
+        context_tokens=sum(
+            count_tokens(part.text) for part in parts if part.context and part.text.strip()
+        ),
+        parts=tuple(parts),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -602,16 +694,23 @@ def _split_table(text: str, config: ChunkConfig) -> list[_Segment]:
 
 
 def _cell_spans(line: str) -> list[tuple[int, int]]:
-    """按竖线切出单元格片段（保留分隔符，返回行内偏移）。"""
+    """按竖线切出单元格片段（含结尾竖线，返回行内偏移）。
+
+    **空单元格同样保留**：`| a |  | b |` 得到 3 个单元格（`a`、空、`b`），
+    依次拼接正好还原原始行，列数与列序都不会因为拆分而改变。行首竖线是行边框，
+    并入第一个单元格，避免拼回时丢字符。
+    """
     spans: list[tuple[int, int]] = []
     start = 0
     for match in re.finditer(r"\|", line):
-        end = match.end()
-        spans.append((start, end))
-        start = end
+        position = match.start()
+        if position == 0:
+            continue
+        spans.append((start, position + 1))
+        start = position + 1
     if start < len(line):
         spans.append((start, len(line)))
-    return [span for span in spans if line[span[0]:span[1]].strip() not in {"", "|"}]
+    return spans
 
 
 def _split_row(line: str, budget: int, config: ChunkConfig) -> list[_Segment]:
@@ -648,12 +747,15 @@ def _split_row(line: str, budget: int, config: ChunkConfig) -> list[_Segment]:
 
 
 def _row_fragment(line: str, spans: list[tuple[int, int]]) -> _Segment:
-    """把若干相邻单元格拼成一个行片段；续片段补回前导竖线，保持列语义。"""
+    """把若干相邻单元格拼成一个行片段（片段文本是原始行的连续子串）。
+
+    续片段（不从行首开始）连带前一个单元格的结尾竖线，因此列结构保持完整，
+    `start/end` 也仍是准确的行内偏移——不再靠人工补 `| ` 造成偏移漂移。
+    """
     start, end = spans[0][0], spans[-1][1]
-    fragment = line[start:end]
-    if not fragment.lstrip().startswith("|"):
-        fragment = "| " + fragment.lstrip()
-    return _Segment(fragment, start, end)
+    if start > 0 and line[start - 1] == "|":
+        start -= 1
+    return _Segment(line[start:end], start, end)
 
 
 def _split_code(text: str, config: ChunkConfig) -> list[_Segment]:
@@ -673,7 +775,11 @@ def _split_code(text: str, config: ChunkConfig) -> list[_Segment]:
             if segment is None:
                 continue
             if count_tokens(segment.text) > config.max_chunk_tokens:
-                chunks.extend(_split_code_by_lines(segment.text, config, segment.start))
+                # 子拆分返回的是相对 segment.text 的局部偏移，这里统一 rebase 一次。
+                chunks.extend(
+                    _Segment(sub.text, segment.start + sub.start, segment.start + sub.end)
+                    for sub in _split_code_by_lines(segment.text, config)
+                )
             else:
                 chunks.append(segment)
         return _pack_segments(chunks, config, config.max_chunk_tokens)
@@ -695,10 +801,13 @@ def _line_range_segment(
     return _Segment(text, begin, begin + len(text))
 
 
-def _split_code_by_lines(
-    text: str, config: ChunkConfig, base: int = 0,
-) -> list[_Segment]:
-    """按行累积拆分代码；单行仍超限时按字符窗口兜底。"""
+def _split_code_by_lines(text: str, config: ChunkConfig) -> list[_Segment]:
+    """按行累积拆分代码；单行仍超限时按字符窗口兜底。
+
+    返回的 `_Segment.start/end` 一律是**相对入参 `text` 的局部偏移**。需要相对
+    Block 原文的偏移时由调用方（`_split_code` 的函数边界分支）统一 rebase 一次，
+    本函数内部不再做任何 base 换算。
+    """
     lines = _lines_with_offsets(text)
     chunks: list[_Segment] = []
     buffer: list[tuple[str, int]] = []
@@ -711,7 +820,7 @@ def _split_code_by_lines(
                 buffer, buffer_tokens = [], 0
             for segment in _char_windows(line, config.max_chunk_tokens):
                 chunks.append(_Segment(
-                    segment.text, base + offset + segment.start, base + offset + segment.end,
+                    segment.text, offset + segment.start, offset + segment.end,
                 ))
             continue
         if buffer and buffer_tokens + line_tokens > config.max_chunk_tokens:
@@ -721,11 +830,7 @@ def _split_code_by_lines(
         buffer_tokens += line_tokens
     if buffer:
         chunks.append(_buffer_segment(buffer))
-    return [
-        _Segment(chunk.text, base + chunk.start, base + chunk.end)
-        for chunk in chunks
-        if chunk.text.strip()
-    ]
+    return [chunk for chunk in chunks if chunk.text.strip()]
 
 
 def _buffer_segment(buffer: list[tuple[str, int]]) -> _Segment:
