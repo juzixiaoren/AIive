@@ -261,8 +261,7 @@ def ensure_memory_bm25_index(
                 db.execute(text("CREATE EXTENSION IF NOT EXISTS pg_search CASCADE"))
         except SQLAlchemyError:
             logger.warning(
-                "pg_search 扩展安装失败：镜像未包含扩展，或 shared_preload_libraries "
-                "未包含 pg_search（需重启 PostgreSQL）",
+                "pg_search 扩展不可用：镜像未带扩展或 shared_preload_libraries 未预加载",
                 exc_info=True,
             )
             return "extension_missing"
