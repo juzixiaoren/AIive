@@ -440,8 +440,10 @@ def _write_tombstones_for_targets(db: Session, operation_id: str) -> None:
       删向量投影；
     - event 目标：tombstone 带 source_event_id（与 visibility/reingestion 查询对齐）；
     - turn_record 目标：tombstone 带 source_turn_record_id；
-    - 由 event/turn 反查 MemoryEvidence.source_event_id 派生 memory_record 目标
-      一并处理（由被忘 turn/event 抽取出的派生记忆也要遗忘）。
+    - 由 event/turn 反查 MemoryEvidence / ContentProvenanceRef 派生 memory_record
+      目标一并处理（由被忘 turn/event 抽取出的派生记忆也要遗忘）；
+    - 持久化来源 Event Tombstone：被忘 MemoryRecord 的来源 Event、被忘 Turn 下
+      的全部子 Event 均写 event Tombstone，作为 Shield 退休后的长期屏蔽依据。
 
     bounded explicit IDs 已由 Phase A 处理（此处按已有 tombstone 幂等跳过）。
     """
@@ -474,11 +476,20 @@ def _write_tombstones_for_targets(db: Session, operation_id: str) -> None:
         ).all()
         derived_event_ids.extend(r[0] for r in turn_event_rows)
     if derived_event_ids:
-        derived_memory_ids = {
+        # MemoryEvidence（purge 前存在）+ ContentProvenanceRef（持久，Evidence
+        # 被删除后仍可反查）双来源，保证 Cascade 重跑也能定位派生记忆。
+        derived_memory_ids: set[str] = {
             r[0] for r in db.query(MemoryEvidence.memory_id).filter(
                 MemoryEvidence.source_event_id.in_(derived_event_ids),
-            ).distinct().all()
+            ).distinct().all() if r[0]
         }
+        derived_memory_ids.update(
+            r[0] for r in db.query(ContentProvenanceRef.owner_id).filter(
+                ContentProvenanceRef.owner_type == "memory_record",
+                ContentProvenanceRef.source_type == "event",
+                ContentProvenanceRef.source_id.in_(derived_event_ids),
+            ).distinct().all() if r[0]
+        )
         existing_target_keys = {(t.target_type, t.target_id) for t in targets}
         for mid in sorted(derived_memory_ids):
             if ("memory_record", mid) in existing_target_keys:
@@ -495,6 +506,29 @@ def _write_tombstones_for_targets(db: Session, operation_id: str) -> None:
     memory_target_ids = [
         t.target_id for t in targets if t.target_type == "memory_record"
     ]
+
+    # ── 来源 Event 派生（Shield 退休后的长期屏蔽依据）──
+    #  Cascade 阶段把「被忘 MemoryRecord 的来源 Event」与「被忘 Turn 下的全部
+    #  子 Event」一并持久化为 event Tombstone：这些是普通读取路径的长期屏蔽
+    #  依据，不依赖 Phase A 的临时 Shield。allow_audit_read 由 Forget Mode 决定。
+    source_event_ids: set[str] = set()
+    if memory_target_ids:
+        for row in db.query(ContentProvenanceRef.source_id).filter(
+            ContentProvenanceRef.owner_type == "memory_record",
+            ContentProvenanceRef.source_type == "event",
+            ContentProvenanceRef.owner_id.in_(memory_target_ids),
+        ).all():
+            if row[0]:
+                source_event_ids.add(row[0])
+        for row in db.query(MemoryEvidence.source_event_id).filter(
+            MemoryEvidence.memory_id.in_(memory_target_ids),
+            MemoryEvidence.source_event_id.isnot(None),
+        ).all():
+            eid = row[0]
+            if eid:
+                source_event_ids.add(eid)
+    # derived_event_ids 已含 event 目标 + turn 子 Event；并入来源 Event 去重
+    event_tombstone_ids = set(derived_event_ids) | source_event_ids
 
     # ── memory_record tombstone：回读记录填充可匹配字段（#15） ──
     mem_by_id: dict[str, MemoryRecord] = {}
@@ -539,7 +573,8 @@ def _write_tombstones_for_targets(db: Session, operation_id: str) -> None:
         tomb_key_set.add(key)
 
     # ── event tombstone（source_event_id 与 visibility_service 查询方式对齐） ──
-    for eid in event_target_ids:
+    #  含显式 event 目标、被忘 Turn 下的子 Event、以及被忘 Memory 的来源 Event。
+    for eid in sorted(event_tombstone_ids):
         key = ("event", eid)
         if key in tomb_key_set:
             continue
@@ -677,6 +712,15 @@ def _discover_for_target(
                 db, operation_id, target.id, "evidence", ev.id, batch,
             )
             count += 1
+        # MemoryEvidence 可能已被上一次 Forget purge 删除；ContentProvenanceRef
+        # 持久，补齐来源 Event，保证后续 Operation 仍能发现受波及的 Summary。
+        for row in db.query(ContentProvenanceRef.source_id).filter(
+            ContentProvenanceRef.owner_type == "memory_record",
+            ContentProvenanceRef.source_type == "event",
+            ContentProvenanceRef.owner_id == target_id,
+        ).all():
+            if row[0] and row[0] not in src_event_ids:
+                src_event_ids.append(row[0])
     elif target_type == "event":
         src_event_ids = [target_id]
     elif target_type == "turn_record":
@@ -1269,29 +1313,33 @@ def _try_generate_summary(
     if not segment:
         return None
 
-    # 获取 segment 的 Event（过滤已被 tombstone block 的 event）
-    from aiive.db.forget_models import ForgetTombstone
-    blocked_ids = {
-        row[0] for row in db.query(ForgetTombstone.target_id).filter(
-            ForgetTombstone.forget_operation_id == operation_id,
-            ForgetTombstone.target_type == "event",
-            ForgetTombstone.block_visibility.is_(True),
-        ).all()
-    }
+    from aiive.forget.visibility_service import ForgetVisibilityService
 
+    logger.debug(
+        "summary rebuild for operation %s segment %s", operation_id, segment_id,
+    )
     # 经 TurnRecord.segment_id 关联取「该 segment」的事件（Event 无 segment_id），
     # 按 (turn_sequence, turn_event_index) 确定性排序（参考 raw_history_expander）。
+    # 统一走 ForgetVisibilityService：覆盖所有有效 Event Tombstone（不限当前
+    # Operation）、TurnRecord Tombstone 覆盖的子 Event、以及作为被遗忘
+    # MemoryRecord 来源的 Event。过滤必须先于最终 50 条上限，否则被屏蔽内容
+    # 会残留进 LLM 输入与新 Summary 的 source_* 字段。
     events = (
         db.query(Event, TurnRecord.turn_id)
         .join(TurnRecord, TurnRecord.turn_id == Event.turn_id)
         .filter(TurnRecord.segment_id == segment_id)
         .order_by(TurnRecord.turn_sequence.asc(), Event.turn_event_index.asc())
-        .limit(50)
         .all()
+    )
+    if not events:
+        return None
+
+    blocked_ids = ForgetVisibilityService.blocked_target_ids(
+        db, "event", [(e.id, e.created_at) for e, _ in events],
     )
     remaining: list[tuple[Event, str]] = [
         (e, tid) for e, tid in events if e.id not in blocked_ids
-    ]
+    ][:50]
     source_turns = [
         {"role": e.event_type, "content": str((e.payload or {}).get("content", ""))[:500]}
         for e, _ in remaining
@@ -1367,6 +1415,8 @@ def handle_forget_purge(claimed: ClaimedJob) -> HandlerResult:
 
     db = SessionLocal()
     try:
+        op = db.query(ForgetOperation).filter_by(id=operation_id).first()
+        mode = op.mode if op is not None else "everywhere"
         batch = _find_or_create_composite_batch(db, operation_id, "purge", "scrub")
         cursor = batch.cursor_start_json
 
@@ -1380,7 +1430,7 @@ def handle_forget_purge(claimed: ClaimedJob) -> HandlerResult:
 
         if targets:
             target_ids = [t.target_id for t in targets]
-            _scrub_batch(db, target_ids)
+            _scrub_batch(db, target_ids, mode=mode)
         else:
             # 额外清理旧 evidence / proposals
             target_ids = []
@@ -1473,11 +1523,16 @@ def _scrub_event_turn_targets(db: Session, operation_id: str) -> None:
     db.flush()
 
 
-def _scrub_batch(db: Session, memory_ids: list[str]) -> None:
+def _scrub_batch(db: Session, memory_ids: list[str], mode: str = "everywhere") -> None:
     """批量 scrub 内容——覆盖规格 §M 第 0 节清单所有内容承载位置。
 
     ids 使用 SQLAlchemy expanding 绑定参数，SQLite/PostgreSQL 均兼容
     （SQLite 渲染 IN (:1,:2,...)，PostgreSQL 渲染 = ANY(:ids)）。
+
+    memory_only：保留来源 Event 的原始 payload（含独占来源 Event），仅供显式
+    历史审计；其正常可见性屏蔽与防重抽由 Shield / Tombstone / Provenance
+    读取侧规则保证，不依赖清空正文。history_only / everywhere 继续执行不可逆
+    正文清理。
     """
     from sqlalchemy import bindparam, text as sa_text
     now = _utcnow()
@@ -1547,8 +1602,8 @@ def _scrub_batch(db: Session, memory_ids: list[str]) -> None:
         + "WHERE source_type = 'memory_record' AND source_id IN :ids"
     ).bindparams(ids_bind), {"ids": memory_ids})
 
-    # --- 来源 Event scrub ---
-    if exclusive_event_ids:
+    # --- 来源 Event scrub（memory_only 保留原始正文）---
+    if mode != "memory_only" and exclusive_event_ids:
         db.execute(sa_text(
             "UPDATE events SET payload = '{}' WHERE id IN :ids"
         ).bindparams(ids_bind), {"ids": exclusive_event_ids})
@@ -1580,15 +1635,19 @@ def _scrub_wide(db: Session, operation_id: str) -> None:
     tf = payload.get("time_from")
     tt = payload.get("time_to")
     all_user = payload.get("all_user_data", False)
+    # memory_only 保留 raw Event / Turn 正文供显式历史审计；宽选择器下同样
+    # 不得把原始历史不可逆清空，只屏蔽可见性（Shield / Tombstone / Provenance）。
+    preserve_raw_history = (op.mode == "memory_only")
 
     # thread 范围
     if thread_id:
-        db.execute(sa_text(
-            "UPDATE events SET payload = '{}' WHERE thread_id = :tid"
-        ), {"tid": thread_id})
-        db.execute(sa_text(
-            "UPDATE turn_records SET response_payload = NULL WHERE thread_id = :tid"
-        ), {"tid": thread_id})
+        if not preserve_raw_history:
+            db.execute(sa_text(
+                "UPDATE events SET payload = '{}' WHERE thread_id = :tid"
+            ), {"tid": thread_id})
+            db.execute(sa_text(
+                "UPDATE turn_records SET response_payload = NULL WHERE thread_id = :tid"
+            ), {"tid": thread_id})
         db.execute(sa_text(
             "UPDATE working_states SET current_objective=NULL, open_loops='[]', "
             + "active_constraints='[]', pending_approvals='[]', artifact_refs='[]', "
@@ -1639,9 +1698,10 @@ def _scrub_wide(db: Session, operation_id: str) -> None:
             conditions.append("created_at <= :tt")
             params["tt"] = tt
         where = " AND ".join(conditions)
-        db.execute(sa_text(
-            f"UPDATE events SET payload = '{{}}' WHERE {where}"
-        ), params)
+        if not preserve_raw_history:
+            db.execute(sa_text(
+                f"UPDATE events SET payload = '{{}}' WHERE {where}"
+            ), params)
         db.execute(sa_text(
             f"UPDATE llm_calls SET input_preview='', output_preview='' WHERE {where}"
         ), params)
@@ -1662,8 +1722,9 @@ def _scrub_wide(db: Session, operation_id: str) -> None:
 
     # all_user_data
     if all_user:
-        db.execute(sa_text("UPDATE events SET payload = '{}'"))
-        db.execute(sa_text("UPDATE turn_records SET response_payload = NULL"))
+        if not preserve_raw_history:
+            db.execute(sa_text("UPDATE events SET payload = '{}'"))
+            db.execute(sa_text("UPDATE turn_records SET response_payload = NULL"))
         db.execute(sa_text(
             "UPDATE working_states SET current_objective=NULL, open_loops='[]', "
             + "active_constraints='[]', pending_approvals='[]', artifact_refs='[]', "
@@ -1694,6 +1755,108 @@ def _scrub_wide(db: Session, operation_id: str) -> None:
 # ═══════════════════════════════════════════════════════════════════
 # forget_verify — Phase N: ForgetVerifier
 # ═══════════════════════════════════════════════════════════════════
+
+
+def _verify_source_event_integrity(
+    db: Session, operation_id: str, op: ForgetOperation, memory_ids: list[str],
+) -> list[str]:
+    """校验 Memory 来源 Event 隔离与 Summary 重建的隐私闭环完整性。
+
+    仅窄选择器调用（宽选择器最终为非严格的 verified_with_coarse_purge）。
+    无来源 Event / 无受影响 Summary 时真空通过；一旦存在来源却无法证明其已被
+    屏蔽、或 mode 内容语义不符、或新 Summary 仍引用被屏蔽 Event，即记为失败，
+    从而禁止标记为严格 verified。
+    """
+    from sqlalchemy import func as sa_func
+
+    from aiive.forget.visibility_service import ForgetVisibilityService
+
+    failures: list[str] = []
+    if not memory_ids:
+        return failures
+
+    # ── Memory → Event Provenance（持久，Evidence 删除后仍可反查）──
+    src_ids = [
+        r[0] for r in db.query(ContentProvenanceRef.source_id).filter(
+            ContentProvenanceRef.owner_type == "memory_record",
+            ContentProvenanceRef.source_type == "event",
+            ContentProvenanceRef.owner_id.in_(memory_ids),
+        ).distinct().all() if r[0]
+    ]
+    if src_ids:
+        # (1) 来源 Event 屏蔽覆盖：统一可见性规则（含所有有效 Tombstone、
+        #     TurnRecord 覆盖、Memory → Event Provenance）
+        blocked = ForgetVisibilityService.blocked_target_ids(
+            db, "event", [(eid, None) for eid in src_ids],
+        )
+        missed = [eid for eid in src_ids if eid not in blocked]
+        if missed:
+            failures.append(f"{len(missed)} memory source events not shielded")
+
+        # (2) mode 内容语义：memory_only 保留原文；history_only/everywhere 清理
+        ev_by_id = {
+            e.id: e for e in db.query(Event).filter(Event.id.in_(src_ids)).all()
+        }
+        for eid in src_ids:
+            ev = ev_by_id.get(eid)
+            if ev is None:
+                continue
+            empty = not ev.payload
+            if op.mode == "memory_only":
+                if empty:
+                    failures.append(
+                        f"memory_only source event {eid} payload wrongly cleared"
+                    )
+            elif op.mode in ("history_only", "everywhere"):
+                purged = db.query(ForgetTombstone.id).filter(
+                    ForgetTombstone.target_type == "event",
+                    ForgetTombstone.target_id == eid,
+                    ForgetTombstone.content_purged.is_(True),
+                ).first() is not None
+                if not empty and not purged:
+                    failures.append(
+                        f"{op.mode} source event {eid} payload not purged"
+                    )
+
+    # ── 受影响的新 Summary 不再引用被屏蔽 Event ──
+    affected_segments = [
+        r[0] for r in (
+            db.query(SegmentSummary.segment_id)
+            .join(ForgetDependency,
+                  ForgetDependency.dependency_id == SegmentSummary.id)
+            .filter(
+                ForgetDependency.forget_operation_id == operation_id,
+                ForgetDependency.dependency_type == "segment_summary",
+            )
+            .distinct().all()
+        ) if r[0]
+    ]
+    if affected_segments:
+        max_versions = dict(
+            db.query(
+                SegmentSummary.segment_id,
+                sa_func.max(SegmentSummary.summary_version),
+            ).filter(
+                SegmentSummary.segment_id.in_(affected_segments),
+            ).group_by(SegmentSummary.segment_id).all()
+        )
+        current = db.query(SegmentSummary).filter(
+            SegmentSummary.segment_id.in_(affected_segments),
+        ).all()
+        ref_ids: set[str] = set()
+        for s in current:
+            if max_versions.get(s.segment_id) == s.summary_version:
+                ref_ids.update(str(x) for x in (s.source_event_ids or []) if x)
+        if ref_ids:
+            blocked_refs = ForgetVisibilityService.blocked_target_ids(
+                db, "event", [(eid, None) for eid in ref_ids],
+            )
+            leaked = ref_ids & blocked_refs
+            if leaked:
+                failures.append(
+                    f"{len(leaked)} blocked events still referenced by rebuilt summaries"
+                )
+    return failures
 
 
 def handle_forget_verify(claimed: ClaimedJob) -> HandlerResult:
@@ -1773,6 +1936,14 @@ def handle_forget_verify(claimed: ClaimedJob) -> HandlerResult:
                 failures.append(
                     f"{len(typed_missing)} {ttype} targets missing tombstone"
                 )
+
+        # 3c. Memory 来源 Event 隔离 / Summary 重建完整性（仅窄选择器需证明
+        #     严格 verified；宽选择器最终为非严格 verified_with_coarse_purge）。
+        #     无法证明完整性时，下面的失败会阻止落入严格 verified。
+        if not is_wide:
+            failures.extend(
+                _verify_source_event_integrity(db, operation_id, op, memory_ids)
+            )
 
         # 4. 判定结果（三态，spec §N）
         if failures:

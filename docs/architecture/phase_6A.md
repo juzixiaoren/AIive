@@ -742,3 +742,16 @@ migration/models
 ```
 
 Phase 6B（Retention / vacuum / 长期混沌）见 `phase_6B.md`。
+
+## 实现补记：来源 Event 隔离与摘要重建隐私闭环
+
+本节为方案级规范追加的实现约束，不改变 `memory_only` / `history_only` / `everywhere` 的既定语义，不重写 Forget Saga。
+
+1. **来源关系持久化**：`MemoryEvidence.source_event_id` 在创建 Evidence 的同一事务写入 `ContentProvenanceRef(owner_type=memory_record, source_type=event)`（去重幂等）；Evidence 在 Purge 被删后仍存活。Alembic 数据迁移 `f1a2c3d4e5b6` 回填历史数据，幂等、兼容 PostgreSQL/SQLite、无 DDL。
+2. **Event 可见性**：`ForgetVisibilityService` 对 Event 除自身 Shield/Tombstone 外，还需检查所属 TurnRecord 被遗忘及作为被遗忘 MemoryRecord 的来源（沿 ProvenanceRef 反查 Memory 的实体/选择器 Shield 与 Tombstone）；保留 cutoff 语义，未知元数据 fail-closed。`is_tombstone_blocked_reingestion()` 沿同一 Provenance 拦截，不阻断无关新 Event，递归不进入无限循环。
+3. **屏蔽时序**：有界显式 `memory_ids` 在 Phase A 事务为来源 Event 立即写实体 Shield；宽选择器与超限 ID 不在 Phase A 无界枚举，靠选择器 Shield + 读取侧 Provenance 校验即时生效。Cascade 持久化来源 Event Tombstone，`allow_audit_read` 随 Mode 落库，保证 Shield 退休后长期屏蔽。
+4. **Summary 重建**：`_try_generate_summary()` 用统一可见性规则过滤所有有效 Event Tombstone、TurnRecord Tombstone 覆盖的子 Event、来源 MemoryRecord 已被遗忘的 Event；过滤在 50 条上限之前，LLM 只收允许来源，`source_event_ids` / `source_turn_ids` / `source_hash` 仅由允许来源生成。
+5. **mode 内容语义**：`memory_only` 保留来源 Event 原始 payload（含独占来源 Event），`history_only` / `everywhere` 维持不可逆清理；`can_audit_read()` 对多个冲突 Tombstone fail-closed，任何 `content_purged` 或不允许审计即拒绝。
+6. **Verifier**：校验 Memory 来源 Event 屏蔽覆盖、新 Summary 不引用被屏蔽 Event、`memory_only` 未误清原文、`history_only` / `everywhere` 清理完成；无法证明完整性不得标记严格 `verified`。
+
+验收补充：新增/修改集成测试覆盖上述链路（含真实 `_try_generate_summary()` 调用链）；全量 pytest、Ruff、basedpyright（0 errors / 0 warnings）、Alembic upgrade/check 无漂移；PostgreSQL 专项按环境可用性记录，不得冒充通过。

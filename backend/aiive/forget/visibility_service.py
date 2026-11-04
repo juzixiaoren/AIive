@@ -15,7 +15,7 @@ from typing import Any
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from aiive.db.forget_models import ForgetShield, ForgetTombstone
+from aiive.db.forget_models import ContentProvenanceRef, ForgetShield, ForgetTombstone
 
 
 class ForgetVisibilityService:
@@ -301,6 +301,22 @@ class ForgetVisibilityService:
                 session, target_type, ids
             )
         )
+
+        # 4/5) Event 扩展规则（仅 target_type == "event"）：
+        #   - 所属 TurnRecord 被 Shield/Tombstone 屏蔽的全部子 Event；
+        #   - 作为「已被遗忘 MemoryRecord」来源的 Event（Memory → Event Provenance）。
+        #   覆盖宽选择器 / 超限 ID：Phase A 不为屏蔽来源 Event 而枚举全部记录，
+        #   改由读取侧经 Provenance + 选择器 Shield 即时判定。
+        #   Provenance 侧复用 blocked_target_ids("memory_record", ...)，其内部
+        #   仅在 target_type == "event" 时做本扩展，故不会递归。
+        if target_type == "event":
+            blocked.update(
+                ForgetVisibilityService._turn_blocked_event_ids(session, ids)
+            )
+            blocked.update(
+                ForgetVisibilityService._source_memory_blocked_event_ids(session, ids)
+            )
+
         return blocked
 
     @staticmethod
@@ -360,6 +376,141 @@ class ForgetVisibilityService:
                 for r in rows
             ]
         return []
+
+    # ── Event 扩展屏蔽：TurnRecord 覆盖 + Memory → Event Provenance ──
+
+    @staticmethod
+    def _turn_tokens_by_event(
+        session: Session, event_ids: list[str],
+    ) -> dict[str, set[str]]:
+        """每个 Event 对应的「Turn 标识 token」集合。
+
+        token 含 Event.turn_id（逻辑 turn id），以及匹配到的 TurnRecord 的
+        id / turn_id。turn_record 的 Shield / Tombstone.target_id 可能是逻辑
+        turn_id，也可能是 TurnRecord.id（历史数据两种写法并存），故同时展开。
+        """
+        from aiive.db.models import Event, TurnRecord
+
+        result: dict[str, set[str]] = {}
+        if not event_ids:
+            return result
+        ev_rows = (
+            session.query(Event.id, Event.turn_id)
+            .filter(Event.id.in_(event_ids))
+            .all()
+        )
+        logical_by_event = {r[0]: r[1] for r in ev_rows}
+        logical_ids = {v for v in logical_by_event.values() if v}
+
+        tr_tokens: dict[str, set[str]] = {}
+        if logical_ids:
+            tr_rows = (
+                session.query(TurnRecord.id, TurnRecord.turn_id)
+                .filter(
+                    or_(
+                        TurnRecord.turn_id.in_(logical_ids),
+                        TurnRecord.id.in_(logical_ids),
+                    )
+                )
+                .all()
+            )
+            for tr_id, tr_turn_id in tr_rows:
+                toks = {x for x in (tr_id, tr_turn_id) if x}
+                for key in (tr_id, tr_turn_id):
+                    if key:
+                        tr_tokens.setdefault(key, set()).update(toks)
+
+        for eid, lid in logical_by_event.items():
+            toks: set[str] = set()
+            if lid:
+                toks.add(lid)
+                toks.update(tr_tokens.get(lid, set()))
+            result[eid] = toks
+        return result
+
+    @staticmethod
+    def _turn_blocked_event_ids(
+        session: Session, event_ids: list[str],
+    ) -> set[str]:
+        """返回所属 TurnRecord 被 Shield / Tombstone 屏蔽的 Event id 集合。
+
+        Turn 被遗忘后，其全部子 Event 在清理完成前即须不可见（含 TurnRecord
+        Tombstone 映射），而不依赖 Cascade 是否已完成内容清理。
+        """
+        tokens_by_event = ForgetVisibilityService._turn_tokens_by_event(
+            session, event_ids,
+        )
+        if not tokens_by_event:
+            return set()
+        all_tokens: set[str] = set()
+        for toks in tokens_by_event.values():
+            all_tokens.update(toks)
+        if not all_tokens:
+            return set()
+
+        shielded = {
+            r[0] for r in session.query(ForgetShield.target_id).filter(
+                ForgetShield.status == "active",
+                ForgetShield.target_type == "turn_record",
+                ForgetShield.target_id.in_(all_tokens),
+            ).all() if r[0]
+        }
+        tombstoned = {
+            r[0] for r in session.query(ForgetTombstone.target_id).filter(
+                ForgetTombstone.target_type == "turn_record",
+                ForgetTombstone.target_id.in_(all_tokens),
+                ForgetTombstone.block_visibility.is_(True),
+            ).all() if r[0]
+        }
+        blocked_tokens = shielded | tombstoned
+        if not blocked_tokens:
+            return set()
+        return {
+            eid for eid, toks in tokens_by_event.items()
+            if toks & blocked_tokens
+        }
+
+    @staticmethod
+    def _source_memory_blocked_event_ids(
+        session: Session, event_ids: list[str],
+    ) -> set[str]:
+        """返回「作为被屏蔽 MemoryRecord 来源」的 Event id 集合。
+
+        Memory → Event 关系取自 ContentProvenanceRef（持久，Evidence 被删除后
+        仍存活）。复用 blocked_target_ids("memory_record", ...) 应用全部实体级 /
+        选择器级 Shield（含 cutoff）与 Tombstone 规则，以覆盖宽选择器。
+        该调用以 target_type="memory_record" 进入，不会再次触发 Event 扩展，
+        因此无递归。
+        """
+        if not event_ids:
+            return set()
+        rows = (
+            session.query(
+                ContentProvenanceRef.source_id, ContentProvenanceRef.owner_id,
+            )
+            .filter(
+                ContentProvenanceRef.owner_type == "memory_record",
+                ContentProvenanceRef.source_type == "event",
+                ContentProvenanceRef.source_id.in_(event_ids),
+            )
+            .all()
+        )
+        if not rows:
+            return set()
+        memories_by_event: dict[str, list[str]] = {}
+        mem_ids: set[str] = set()
+        for src_id, owner_id in rows:
+            memories_by_event.setdefault(src_id, []).append(owner_id)
+            mem_ids.add(owner_id)
+        blocked_memories = ForgetVisibilityService.blocked_target_ids(
+            session, "memory_record", [(m, None) for m in mem_ids],
+        )
+        if not blocked_memories:
+            return set()
+        return {
+            eid for eid, mids in memories_by_event.items()
+            if any(m in blocked_memories for m in mids)
+        }
 
     @staticmethod
     def batch_is_tombstone_blocked(
@@ -427,6 +578,35 @@ class ForgetVisibilityService:
         conditions: list[Any] = []
         if source_event_id:
             conditions.append(ForgetTombstone.source_event_id == source_event_id)
+
+            # Memory → Event Provenance：被遗忘 MemoryRecord 的来源 Event 不得
+            # 被后台 Memory Extraction 重新抽取（MemoryRecord 是记忆真相源）。
+            mem_ids = [
+                r[0] for r in session.query(ContentProvenanceRef.owner_id).filter(
+                    ContentProvenanceRef.owner_type == "memory_record",
+                    ContentProvenanceRef.source_type == "event",
+                    ContentProvenanceRef.source_id == source_event_id,
+                ).all()
+            ]
+            if mem_ids:
+                conditions.append(
+                    (ForgetTombstone.target_type == "memory_record")
+                    & (ForgetTombstone.target_id.in_(mem_ids))
+                )
+
+            # 来源 Event 所属 Turn 的 turn_record Tombstone 也应拦截（Turn 被
+            # 遗忘时其子 Event 未必各自持有 event Tombstone）。
+            turn_tokens = ForgetVisibilityService._turn_tokens_by_event(
+                session, [source_event_id],
+            ).get(source_event_id, set())
+            if turn_tokens:
+                conditions.append(
+                    or_(
+                        ForgetTombstone.source_turn_record_id.in_(turn_tokens),
+                        (ForgetTombstone.target_type == "turn_record")
+                        & (ForgetTombstone.target_id.in_(turn_tokens)),
+                    )
+                )
         if source_turn_record_id:
             conditions.append(ForgetTombstone.source_turn_record_id == source_turn_record_id)
         if canonical_key and scope_type and scope_id:
@@ -450,9 +630,13 @@ class ForgetVisibilityService:
     ) -> bool:
         """检查目标是否允许经授权审计模式读取。
 
-        仅当 allow_audit_read=true 且 content_purged=false 时返回 True。
+        fail-closed：必须存在至少一条 tombstone，且**所有** tombstone 均
+        allow_audit_read=true 且 content_purged=false 才返回 True。同一对象存在
+        多个互相冲突的 tombstone（例如两次 Forget，其中一次已不可逆清理）时，
+        任何不允许审计或已清理的记录都优先拒绝，不能因 .first() 的返回顺序
+        造成权限绕过。
         """
-        row = (
+        rows = (
             session.query(
                 ForgetTombstone.allow_audit_read,
                 ForgetTombstone.content_purged,
@@ -461,11 +645,14 @@ class ForgetVisibilityService:
                 ForgetTombstone.target_type == target_type,
                 ForgetTombstone.target_id == target_id,
             )
-            .first()
+            .all()
         )
-        if row is None:
+        if not rows:
             return False  # 无 tombstone → 不在审计范围
-        return bool(row.allow_audit_read) and not bool(row.content_purged)
+        return all(
+            bool(row.allow_audit_read) and not bool(row.content_purged)
+            for row in rows
+        )
 
     # ── 批量过滤器（供 UnifiedRetriever / ContextAssembler 使用） ──
 

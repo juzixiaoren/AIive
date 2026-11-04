@@ -859,3 +859,15 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - 遗留风险：① 本机 .env 未改，需手动开启 BM25 并重建 postgres 镜像；
   ② 索引为普通 CREATE INDEX，大表需停机窗口；③ 单字中文查询不命中；
   ④ pg_search 版本与 PG 主版本强绑定。
+
+### Forget 来源 Event 隔离与摘要重建隐私闭环（2026-11-04）
+- 目标：修复 Forget 对 Memory 来源 Event 的隔离缺陷，确保被遗忘记忆不能经原始历史、记忆重新提取、SegmentSummary 重建重新进入正常上下文；严格遵循 phase_6A 的 memory_only / history_only / everywhere 语义，不重写整个 Saga。
+- 来源持久化：`MemoryWriteService._write_evidence_batch()` 同事务写 `ContentProvenanceRef(owner_type=memory_record, source_type=event)`（去重幂等，Evidence 删除后仍存活）；Alembic 数据迁移 `f1a2c3d4e5b6` 从 `memory_evidence.source_event_id` 回填历史数据（幂等、PostgreSQL/SQLite 兼容、无 DDL）。
+- 可见性：`ForgetVisibilityService` 对 Event 追加「所属 TurnRecord 被遗忘」「作为被遗忘 MemoryRecord 来源」屏蔽，`is_tombstone_blocked_reingestion()` 沿 Provenance 拦截再提取，`can_audit_read()` 多 Tombstone 冲突 fail-closed；保留 cutoff 与 fail-closed，不阻断无关新 Event、无递归死循环。
+- 屏蔽时序：有界显式 memory_ids 在 Phase A 事务立即写来源 Event 实体 Shield；宽选择器/超限 ID 不在 Phase A 无界枚举；Cascade 持久化来源 Event Tombstone（allow_audit_read 随 Mode），Shield 退休后仍长期屏蔽。
+- 摘要重建：`_try_generate_summary()` 用统一可见性规则在 50 条上限前过滤全部有效 Event/Turn Tombstone 与来源已遗忘 Event，LLM 只收允许来源，新 Summary 的 source_event_ids / source_turn_ids / source_hash 仅取允许来源；`_rebuild_summaries_batch()` 真实调用链有当前及后续 Operation 的回归测试。
+- mode 语义：`_scrub_batch()` / `_scrub_wide()` 对 memory_only 保留来源 Event 原文（含独占来源），history_only / everywhere 维持不可逆清理；正常可见性屏蔽与防重抽保留。
+- Verify：`_verify_source_event_integrity()` 校验来源 Event 屏蔽覆盖、新 Summary 不引用被屏蔽 Event、memory_only 未误清、everywhere/history_only 清理完成；无法证明完整性不落严格 verified。
+- 迁移链：HEAD 由 `b8d2e6f4a1c7` 推进到 `f1a2c3d4e5b6`（纯数据迁移，无 schema 变更）；CODE_MAP 已同步。
+- 验证：Forget 集成测试 65 passed；全量 pytest、Ruff、basedpyright、Alembic upgrade/check 见最终报告；PostgreSQL 专项按环境记录。
+- 遗留风险：宽范围 Scrub 的 JSON 数组匹配、scope/canonical_key 分支、mode 与 selector 契约、多用户边界、Task Runtime / Knowledge 对象与对象存储覆盖、Checkpoint/WorkingState/LLMCall preview 严格内容证明仍为既有审计缺口，不在本次范围。

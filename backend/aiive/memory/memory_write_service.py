@@ -32,6 +32,7 @@ from aiive.db.models import (
     MemoryProposal as MemoryProposalModel,
     MemoryRecord,
 )
+from aiive.db.forget_models import ContentProvenanceRef
 from aiive.forget.phase_a_shield import execute_phase_a_shield
 from aiive.forget.visibility_service import ForgetVisibilityService
 from aiive.memory.conflict_resolver import ConflictResolver, ResolutionResult
@@ -1139,7 +1140,32 @@ class MemoryWriteService:
     def _write_evidence_batch(
         self, memory_id: str, evidence: list[EvidenceItem]
     ) -> None:
-        """Write evidence items to memory_evidence table."""
+        """Write evidence items and durable Memory → Event provenance refs.
+
+        ContentProvenanceRef 持久化「MemoryRecord ← Event」来源关系。
+        MemoryEvidence 会在 Forget purge 阶段被物理删除，但 ProvenanceRef
+        必须存活，供读取侧可见性屏蔽、防重抽与 Summary 重建长期反查。
+        与 MemoryEvidence 同事务写入；按唯一约束去重，保证幂等。
+        """
+        src_event_ids = {
+            ev.source_event_id for ev in evidence if ev.source_event_id
+        }
+        if src_event_ids:
+            existing = {
+                row[0] for row in self._db.query(ContentProvenanceRef.source_id).filter(
+                    ContentProvenanceRef.owner_type == "memory_record",
+                    ContentProvenanceRef.owner_id == memory_id,
+                    ContentProvenanceRef.source_type == "event",
+                    ContentProvenanceRef.source_id.in_(src_event_ids),
+                ).all()
+            }
+            for eid in src_event_ids - existing:
+                self._db.add(ContentProvenanceRef(
+                    owner_type="memory_record",
+                    owner_id=memory_id,
+                    source_type="event",
+                    source_id=eid,
+                ))
         for ev in evidence:
             self._db.add(MemoryEvidence(
                 memory_id=memory_id,

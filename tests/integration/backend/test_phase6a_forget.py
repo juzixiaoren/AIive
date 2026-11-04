@@ -1465,3 +1465,762 @@ def test_write_rejects_tombstone_blocked_reingestion(db_session: Session):
 
     assert result.outcome == WriteOutcome.GATE_REJECTED
     assert "Reingestion blocked" in result.reason
+
+# ═══════════════════════════════════════════════════════════════════
+# Forget 来源 Event 隔离与摘要重建隐私闭环（目标新增测试）
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _fg_event(db, *, content="hello", turn_id=None, turn_event_index=None,
+              thread_id=None, created_at=None):
+    from aiive.db.models import Event
+    eid = _new_id()
+    db.add(Event(
+        id=eid, trace_id=_new_id(), thread_id=thread_id or _new_id(),
+        event_type="user_message", payload={"content": content},
+        turn_id=turn_id, turn_event_index=turn_event_index,
+        created_at=created_at or _utcnow(),
+    ))
+    return eid
+
+
+def _fg_memory(db, *, content="fact", lifecycle_state="active"):
+    from aiive.db.models import MemoryRecord
+    mid = _new_id()
+    db.add(MemoryRecord(
+        id=mid, memory_type="fact", canonical_key=f"k:{mid}",
+        content=content, lifecycle_state=lifecycle_state,
+        validity_state="valid", confidence=0.9, created_at=_utcnow(),
+    ))
+    return mid
+
+
+def _fg_provenance(db, memory_id, event_id):
+    from aiive.db.forget_models import ContentProvenanceRef
+    db.add(ContentProvenanceRef(
+        owner_type="memory_record", owner_id=memory_id,
+        source_type="event", source_id=event_id, created_at=_utcnow(),
+    ))
+
+
+def _fg_evidence(db, memory_id, event_id):
+    from aiive.db.models import MemoryEvidence
+    db.add(MemoryEvidence(
+        memory_id=memory_id, source_event_id=event_id,
+        source_type="user_message", trust_level="semi_trusted",
+        relation="supports", created_at=_utcnow(),
+    ))
+
+
+def _fg_tombstone(db, *, operation_id, target_type, target_id,
+                  block_visibility=True, block_reingestion=True,
+                  content_purged=False, allow_audit_read=False,
+                  source_event_id=None, source_turn_record_id=None):
+    from aiive.db.forget_models import ForgetTombstone
+    db.add(ForgetTombstone(
+        id=_new_id(), forget_operation_id=operation_id,
+        target_type=target_type, target_id=target_id,
+        block_visibility=block_visibility, block_reingestion=block_reingestion,
+        content_purged=content_purged, allow_audit_read=allow_audit_read,
+        source_event_id=source_event_id,
+        source_turn_record_id=source_turn_record_id,
+        reason_code="forget", created_at=_utcnow(),
+    ))
+
+
+def _fg_operation(db, op_id, *, mode="memory_only", selector_type="memory_ids",
+                  status="shielded"):
+    from aiive.db.forget_models import ForgetOperation
+    db.add(ForgetOperation(
+        id=op_id, operation_key=f"forget:{op_id}", mode=mode,
+        selector_type=selector_type, selector_hash="h", status=status,
+        requested_by="api", target_count=0, shielded_at=_utcnow(),
+    ))
+
+
+def test_write_evidence_batch_creates_provenance_ref(db_session: Session):
+    """MemoryEvidence 写入时同事务生成 Memory → Event ProvenanceRef（去重/幂等）。"""
+    from aiive.memory.memory_write_service import MemoryWriteService
+    from aiive.memory.memory_types import (
+        EvidenceItem, EvidenceSourceType, TrustLevel,
+    )
+    from aiive.db.forget_models import ContentProvenanceRef
+    from aiive.db.models import MemoryEvidence
+
+    mid = _fg_memory(db_session)
+    e1, e2 = _new_id(), _new_id()
+    evidence = [
+        EvidenceItem(source_event_id=e1,
+                     source_type=EvidenceSourceType.USER_ASSERTION.value,
+                     trust_level=TrustLevel.TRUSTED.value),
+        EvidenceItem(source_event_id=e2,
+                     source_type=EvidenceSourceType.USER_ASSERTION.value,
+                     trust_level=TrustLevel.TRUSTED.value),
+        EvidenceItem(source_event_id=e1,   # 重复来源
+                     source_type=EvidenceSourceType.USER_ASSERTION.value,
+                     trust_level=TrustLevel.TRUSTED.value),
+    ]
+    writer = MemoryWriteService(db_session)
+    writer._write_evidence_batch(mid, evidence)
+    db_session.commit()
+
+    refs = db_session.query(ContentProvenanceRef).filter_by(
+        owner_type="memory_record", owner_id=mid, source_type="event",
+    ).all()
+    assert {r.source_id for r in refs} == {e1, e2}
+    assert len(refs) == 2                        # 同批去重
+    assert db_session.query(MemoryEvidence).filter_by(memory_id=mid).count() == 3
+
+    writer._write_evidence_batch(mid, evidence)  # 幂等：不重复创建
+    db_session.commit()
+    assert db_session.query(ContentProvenanceRef).filter_by(
+        owner_type="memory_record", owner_id=mid, source_type="event",
+    ).count() == 2
+
+
+def test_memory_event_provenance_migration_backfill_and_idempotent():
+    """历史 MemoryEvidence 回填到 ContentProvenanceRef，且重复执行幂等。"""
+    import importlib.util
+    import os
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from aiive.db.models import Base
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    s = sessionmaker(bind=engine)()
+    m1, m2 = _fg_memory(s), _fg_memory(s)
+    e1, e2 = _new_id(), _new_id()
+    _fg_evidence(s, m1, e1)
+    _fg_evidence(s, m1, e1)          # 重复 evidence，回填须 DISTINCT
+    _fg_evidence(s, m2, e2)
+    _fg_provenance(s, m1, e1)        # 已存在组合，迁移须跳过
+    s.commit()
+    s.close()
+
+    path = os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "..", "..", "backend", "alembic",
+        "versions", "f1a2c3d4e5b6_memory_event_provenance_backfill.py",
+    ))
+    spec = importlib.util.spec_from_file_location("prov_backfill_migration", path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    query = sa_text(
+        "SELECT owner_id, source_id FROM content_provenance_refs "
+        "WHERE owner_type = 'memory_record' AND source_type = 'event'"
+    )
+    with engine.connect() as conn:
+        mod.op = Operations(MigrationContext.configure(conn))
+        mod.upgrade()
+        conn.commit()
+        pairs = {tuple(r) for r in conn.execute(query).all()}
+        assert (m1, e1) in pairs and (m2, e2) in pairs
+        assert len(pairs) == 2
+
+        mod.upgrade()                # 二次执行幂等
+        conn.commit()
+        pairs2 = {tuple(r) for r in conn.execute(query).all()}
+        assert pairs2 == pairs
+        assert len(pairs2) == 2
+    engine.dispose()
+
+
+def test_memory_only_source_event_hidden_from_normal_history(db_session: Session):
+    """memory_only 后来源 Event 不进入普通历史；无关 Event 仍可见。"""
+    from aiive.forget.fingerprint import configure_hmac_secret
+    from aiive.forget.phase_a_shield import execute_phase_a_shield
+    from aiive.forget.visibility_service import ForgetVisibilityService
+    configure_hmac_secret("test-secret", 1)
+
+    mid = _fg_memory(db_session)
+    src_eid = _fg_event(db_session, content="secret")
+    other_eid = _fg_event(db_session, content="public")
+    _fg_provenance(db_session, mid, src_eid)
+    _fg_evidence(db_session, mid, src_eid)
+    db_session.commit()
+
+    execute_phase_a_shield(
+        session=db_session, mode="memory_only", memory_ids=[mid], reason="t",
+    )
+    db_session.commit()
+
+    blocked = ForgetVisibilityService.blocked_target_ids(
+        db_session, "event", [(src_eid, None), (other_eid, None)],
+    )
+    assert src_eid in blocked
+    assert other_eid not in blocked
+    kept = ForgetVisibilityService.filter_events(
+        db_session, [{"id": src_eid}, {"id": other_eid}],
+    )
+    assert [e["id"] for e in kept] == [other_eid]
+
+
+def test_memory_only_scrub_batch_preserves_source_event_payload(db_session: Session):
+    """memory_only 保留来源 Event（含独占来源）的原始 payload。"""
+    from aiive.worker.handlers_forget import _scrub_batch
+    from aiive.db.models import Event, MemoryRecord
+
+    mid = _fg_memory(db_session)
+    eid = _fg_event(db_session, content="durable-secret")
+    _fg_provenance(db_session, mid, eid)
+    _fg_evidence(db_session, mid, eid)
+    db_session.commit()
+
+    _scrub_batch(db_session, [mid], mode="memory_only")
+    db_session.commit()
+
+    ev = db_session.query(Event).filter_by(id=eid).first()
+    assert ev.payload.get("content") == "durable-secret"
+    mem = db_session.query(MemoryRecord).filter_by(id=mid).first()
+    assert mem.content == "[forgotten]"          # memory 层仍按语义 scrub
+
+
+def test_everywhere_scrub_clears_source_event_payload(db_session: Session):
+    """everywhere 后来源 Event 正文不可恢复。"""
+    from aiive.worker.handlers_forget import _scrub_batch, _scrub_event_turn_targets
+    from aiive.db.models import Event
+
+    op_id = _new_id()
+    _fg_operation(db_session, op_id, mode="everywhere")
+    mid = _fg_memory(db_session, lifecycle_state="forgotten")
+    eid = _fg_event(db_session, content="purge-me")
+    _fg_provenance(db_session, mid, eid)
+    _fg_evidence(db_session, mid, eid)
+    _fg_tombstone(db_session, operation_id=op_id, target_type="memory_record",
+                  target_id=mid)
+    _fg_tombstone(db_session, operation_id=op_id, target_type="event",
+                  target_id=eid, source_event_id=eid)
+    db_session.commit()
+
+    _scrub_batch(db_session, [mid], mode="everywhere")
+    _scrub_event_turn_targets(db_session, op_id)
+    db_session.commit()
+
+    ev = db_session.query(Event).filter_by(id=eid).first()
+    assert not ev.payload
+
+
+def test_memory_only_source_event_cannot_be_reextracted(db_session: Session):
+    """memory_only 后来源 Event 不能重新提取为新记忆；无关新 Event 不被拦截。"""
+    from aiive.context.run_context import RunContext
+    from aiive.memory.memory_types import (
+        EvidenceItem, EvidenceSourceType, MemoryProposal, TrustLevel,
+    )
+    from aiive.memory.memory_write_service import MemoryWriteService, WriteOutcome
+    from aiive.forget.visibility_service import ForgetVisibilityService
+
+    op_id = _new_id()
+    _fg_operation(db_session, op_id, mode="memory_only", status="verified")
+    mid = _fg_memory(db_session, lifecycle_state="forgotten")
+    eid = _fg_event(db_session, content="secret")
+    _fg_provenance(db_session, mid, eid)
+    _fg_tombstone(db_session, operation_id=op_id, target_type="memory_record",
+                  target_id=mid, allow_audit_read=True)
+    new_eid = _new_id()
+    db_session.commit()
+
+    assert ForgetVisibilityService.is_tombstone_blocked_reingestion(
+        db_session, source_event_id=eid) is True
+    assert ForgetVisibilityService.is_tombstone_blocked_reingestion(
+        db_session, source_event_id=new_eid) is False
+
+    prop = MemoryProposal(
+        memory_type="knowledge", canonical_key="user.blocked",
+        scope_type="global", scope_id=None, content="重抽内容",
+        confidence=0.9, trust_level=TrustLevel.TRUSTED.value,
+        evidence=[EvidenceItem(
+            source_event_id=eid,
+            source_type=EvidenceSourceType.USER_ASSERTION.value,
+            trust_level=TrustLevel.TRUSTED.value,
+        )],
+    )
+    prop.compute_content_hash()
+    ctx = RunContext(thread_id="t", trace_id="tr")
+    result = MemoryWriteService(db_session).write(prop, ctx)
+    db_session.commit()
+    assert result.outcome == WriteOutcome.GATE_REJECTED
+    assert "Reingestion blocked" in result.reason
+
+
+def test_turn_record_tombstone_hides_all_child_events_before_purge(db_session: Session):
+    """一个 Turn 被遗忘后，其全部 Event 在清理完成前即不可见。"""
+    from aiive.db.models import Event, TurnRecord
+    from aiive.forget.visibility_service import ForgetVisibilityService
+
+    thread_id = _new_id()
+    logical_turn_id = _new_id()
+    op_id = _new_id()
+    db_session.add(TurnRecord(
+        id=_new_id(), thread_id=thread_id, turn_id=logical_turn_id,
+        turn_sequence=1, status="completed", request_fingerprint="",
+        created_at=_utcnow(),
+    ))
+    child1 = _fg_event(db_session, content="a", turn_id=logical_turn_id,
+                       turn_event_index=1, thread_id=thread_id)
+    child2 = _fg_event(db_session, content="b", turn_id=logical_turn_id,
+                       turn_event_index=2, thread_id=thread_id)
+    unrelated = _fg_event(db_session, content="c", turn_id=_new_id(),
+                          thread_id=thread_id)
+    _fg_tombstone(db_session, operation_id=op_id, target_type="turn_record",
+                  target_id=logical_turn_id, allow_audit_read=True)
+    db_session.commit()
+
+    blocked = ForgetVisibilityService.blocked_target_ids(
+        db_session, "event",
+        [(child1, None), (child2, None), (unrelated, None)],
+    )
+    assert child1 in blocked
+    assert child2 in blocked
+    assert unrelated not in blocked
+    assert db_session.query(Event).filter_by(id=child1).first().payload
+
+
+def test_can_audit_read_fails_closed_with_conflicting_tombstones(db_session: Session):
+    """同一对象多个冲突 Tombstone 时审计权限 fail-closed。"""
+    from aiive.forget.visibility_service import ForgetVisibilityService
+    from aiive.db.forget_models import ForgetTombstone
+
+    conflict_purged, conflict_denied = _new_id(), _new_id()
+    for target_id, purged, allow in (
+        (conflict_purged, False, True),
+        (conflict_purged, True, True),
+        (conflict_denied, False, True),
+        (conflict_denied, False, False),
+    ):
+        db_session.add(ForgetTombstone(
+            id=_new_id(), forget_operation_id=_new_id(),
+            target_type="memory_record", target_id=target_id,
+            block_visibility=True, block_reingestion=True,
+            content_purged=purged, allow_audit_read=allow, created_at=_utcnow(),
+        ))
+    db_session.commit()
+
+    assert ForgetVisibilityService.can_audit_read(
+        db_session, "memory_record", conflict_purged) is False
+    assert ForgetVisibilityService.can_audit_read(
+        db_session, "memory_record", conflict_denied) is False
+    assert ForgetVisibilityService.can_audit_read(
+        db_session, "memory_record", _new_id()) is False
+
+
+def test_wide_selector_phase_a_does_not_enumerate_targets(db_session: Session):
+    """宽选择器在 Phase A 不无界枚举（不写 Target / 不写来源 Event 实体 Shield）。"""
+    from aiive.forget.fingerprint import configure_hmac_secret
+    from aiive.forget.phase_a_shield import execute_phase_a_shield
+    from aiive.db.forget_models import ForgetShield, ForgetTarget
+    configure_hmac_secret("test-secret", 1)
+
+    for _ in range(5):
+        mid = _fg_memory(db_session)
+        eid = _fg_event(db_session, content="x")
+        _fg_provenance(db_session, mid, eid)
+        _fg_evidence(db_session, mid, eid)
+    db_session.commit()
+
+    result = execute_phase_a_shield(
+        session=db_session, mode="everywhere", thread_id=_new_id(), reason="wide",
+    )
+    db_session.commit()
+    op_id = result["operation_id"]
+
+    assert db_session.query(ForgetTarget).filter_by(
+        forget_operation_id=op_id).count() == 0
+    assert db_session.query(ForgetShield).filter(
+        ForgetShield.forget_operation_id == op_id,
+        ForgetShield.target_id.isnot(None),
+    ).count() == 0
+    assert db_session.query(ForgetShield).filter(
+        ForgetShield.forget_operation_id == op_id,
+        ForgetShield.selector_type == "thread",
+    ).count() == 1
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SegmentSummary 重建隐私闭环（真实 _try_generate_summary 调用链）
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _fg_install_fake_llm(monkeypatch):
+    """把 LLM 网络边界替换为可控桩并捕获发给 LLM 的 messages。
+
+    _try_generate_summary / ForgetVisibilityService / _build_summary_prompt /
+    _extract_json / merge_summary 全部保持真实实现，仅 LLM 客户端（对外网络调用）
+    被替换，因此这是真实调用链测试，而非孤立过滤函数测试。
+    """
+    import aiive.core.llm_client as llm_module
+
+    captured = {}
+
+    class _Resp:
+        content = (
+            '{"goal":"rebuilt goal","outcome":"rebuilt outcome",'
+            '"decisions":[],"entities":[]}'
+        )
+
+    class _FakeLLM:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def chat(self, messages, **kwargs):
+            captured["messages"] = messages
+            return _Resp()
+
+    monkeypatch.setattr(llm_module, "LLMClient", _FakeLLM)
+    return captured
+
+
+def _fg_setup_segment(db, event_contents):
+    """创建 Thread/Epoch/Segment + 每事件独占的 TurnRecord + Event。
+
+    event_contents: [(label, content), ...]；返回 (segment_id, handles)，
+    handles[label] = (event_id, turn_id, turn_record_id)。
+    """
+    from aiive.db.models import Thread, Epoch, Segment, TurnRecord
+
+    thread_id = _new_id()
+    epoch_id = _new_id()
+    segment_id = _new_id()
+    db.add(Thread(id=thread_id))
+    db.add(Epoch(id=epoch_id, thread_id=thread_id, epoch_no=1, status="active"))
+    db.add(Segment(
+        id=segment_id, epoch_id=epoch_id, thread_id=thread_id,
+        segment_no=1, status="sealed", start_turn_sequence=1,
+        summary_id=_new_id(),
+    ))
+    handles = {}
+    for idx, (label, content) in enumerate(event_contents):
+        turn_id = _new_id()
+        tr_id = _new_id()
+        db.add(TurnRecord(
+            id=tr_id, thread_id=thread_id, turn_id=turn_id,
+            segment_id=segment_id, turn_sequence=idx + 1,
+            status="completed", request_fingerprint="", created_at=_utcnow(),
+        ))
+        eid = _fg_event(db, content=content, turn_id=turn_id,
+                        turn_event_index=1, thread_id=thread_id)
+        handles[label] = (eid, turn_id, tr_id)
+    return segment_id, handles
+
+
+def test_summary_rebuild_current_op_excludes_forgotten_events(db_session, monkeypatch):
+    """真实 _try_generate_summary 调用链：当前 Operation 遗忘内容不进入 LLM 输入与新 Summary。"""
+    import hashlib
+    from aiive.runtime.compaction import event_content_hash
+    from aiive.worker.handlers_forget import _try_generate_summary
+    from aiive.db.models import Event
+
+    captured = _fg_install_fake_llm(monkeypatch)
+    op_id = _new_id()
+    _fg_operation(db_session, op_id, mode="everywhere")
+    segment_id, h = _fg_setup_segment(db_session, [
+        ("keep_a", "KEEP_ALPHA_TOKEN"),
+        ("keep_b", "KEEP_BETA_TOKEN"),
+        ("ev_drop", "DROP_EVENT_TOKEN"),
+        ("turn_drop", "DROP_TURN_TOKEN"),
+    ])
+    # 当前 Operation 的 Event Tombstone
+    _fg_tombstone(db_session, operation_id=op_id, target_type="event",
+                  target_id=h["ev_drop"][0])
+    # 当前 Operation 的 TurnRecord Tombstone（覆盖其全部子 Event）
+    _fg_tombstone(db_session, operation_id=op_id, target_type="turn_record",
+                  target_id=h["turn_drop"][1])
+    db_session.commit()
+
+    result = _try_generate_summary(db_session, segment_id, op_id)
+
+    assert result is not None, "仍有允许来源，应生成新 Summary 而非 redacted"
+    assert result["source_event_ids"] == [h["keep_a"][0], h["keep_b"][0]]
+    assert set(result["source_turn_ids"]) == {h["keep_a"][1], h["keep_b"][1]}
+
+    # source_hash 必须只由允许的来源按确定性顺序生成
+    ordered = [
+        db_session.query(Event).filter_by(id=h["keep_a"][0]).one(),
+        db_session.query(Event).filter_by(id=h["keep_b"][0]).one(),
+    ]
+    expected_hash = hashlib.sha256(
+        "|".join(f"{e.id}:{event_content_hash(e)}" for e in ordered).encode("utf-8")
+    ).hexdigest()
+    assert result["source_hash"] == expected_hash
+    assert len(result["source_hash"]) == 64
+
+    # LLM 只接收未被屏蔽的 Event
+    messages_str = str(captured.get("messages"))
+    assert "DROP_EVENT_TOKEN" not in messages_str
+    assert "DROP_TURN_TOKEN" not in messages_str
+    assert "KEEP_ALPHA_TOKEN" in messages_str
+    assert "KEEP_BETA_TOKEN" in messages_str
+    assert "DROP_" not in (result["goal"] or "") + (result["outcome"] or "")
+
+
+def test_summary_rebuild_later_op_keeps_earlier_memory_only_content_hidden(db_session, monkeypatch):
+    """后续另一个 Forget Operation 重建也不重新引入更早 memory_only 遗忘的来源 Event。"""
+    from aiive.worker.handlers_forget import _try_generate_summary
+
+    captured = _fg_install_fake_llm(monkeypatch)
+    op_a = _new_id()
+    _fg_operation(db_session, op_a, mode="memory_only")
+    mid = _fg_memory(db_session, lifecycle_state="forgotten")
+    segment_id, h = _fg_setup_segment(db_session, [
+        ("keep", "KEEP_LATER_TOKEN"),
+        ("mem_drop", "DROP_MEMORY_TOKEN"),
+    ])
+    _fg_provenance(db_session, mid, h["mem_drop"][0])
+    _fg_evidence(db_session, mid, h["mem_drop"][0])
+    # 早期 memory_only 遗忘：memory_record Tombstone（审计可读、内容未清除）
+    _fg_tombstone(db_session, operation_id=op_a, target_type="memory_record",
+                  target_id=mid, content_purged=False, allow_audit_read=True)
+    db_session.commit()
+
+    # 第一次（Operation A）重建：来源 Memory 已被遗忘 → 其来源 Event 被屏蔽
+    r_a = _try_generate_summary(db_session, segment_id, op_a)
+    assert r_a is not None
+    assert set(r_a["source_event_ids"]) == {h["keep"][0]}
+    assert "DROP_MEMORY_TOKEN" not in str(captured["messages"])
+    assert "KEEP_LATER_TOKEN" in str(captured["messages"])
+
+    # 后续另一个 Forget Operation 重建：过滤不依赖当前 operation_id，
+    # 统一读取全部有效 Tombstone / Provenance，早期遗忘内容仍被屏蔽。
+    op_b = _new_id()
+    _fg_operation(db_session, op_b, mode="memory_only")
+    db_session.commit()
+    captured["messages"] = None
+    r_b = _try_generate_summary(db_session, segment_id, op_b)
+    assert r_b is not None
+    assert set(r_b["source_event_ids"]) == {h["keep"][0]}
+    assert "DROP_MEMORY_TOKEN" not in str(captured["messages"])
+    assert "KEEP_LATER_TOKEN" in str(captured["messages"])
+
+
+def test_rebuild_summaries_batch_persists_summary_only_from_allowed_events(db_session, monkeypatch):
+    """真实调用方 _rebuild_summaries_batch → _try_generate_summary：落库新 Summary 来源字段只含允许 Event。"""
+    import hashlib
+    from aiive.runtime.compaction import event_content_hash
+    from aiive.worker.handlers_forget import _rebuild_summaries_batch
+    from aiive.db.models import Event, Segment, SegmentSummary
+    from aiive.db.forget_models import ForgetBatch, ForgetDependency
+
+    captured = _fg_install_fake_llm(monkeypatch)
+    op_id = _new_id()
+    _fg_operation(db_session, op_id, mode="everywhere")
+    segment_id, h = _fg_setup_segment(db_session, [
+        ("keep", "KEEP_PERSIST_TOKEN"),
+        ("drop", "DROP_PERSIST_TOKEN"),
+    ])
+    # 当前 Operation 遗忘 drop Event
+    _fg_tombstone(db_session, operation_id=op_id, target_type="event",
+                  target_id=h["drop"][0])
+    # 受影响旧 Summary（version 1）
+    old_sid = _new_id()
+    db_session.add(SegmentSummary(
+        id=old_sid, segment_id=segment_id, summary_version=1,
+        source_event_ids=[h["keep"][0], h["drop"][0]], goal="old",
+    ))
+    db_session.add(ForgetDependency(
+        id=_new_id(), forget_operation_id=op_id,
+        dependency_type="segment_summary", dependency_id=old_sid,
+        status="pending", discovered_at=_utcnow(),
+    ))
+    batch = ForgetBatch(
+        id=_new_id(), forget_operation_id=op_id, stage="rebuild",
+        dependency_type="segment_summary", batch_no=0,
+        cursor_start_json={}, status="pending",
+    )
+    db_session.add(batch)
+    db_session.commit()
+
+    _rebuild_summaries_batch(db_session, op_id, batch)
+    db_session.commit()
+
+    new_s = (
+        db_session.query(SegmentSummary)
+        .filter(SegmentSummary.segment_id == segment_id,
+                SegmentSummary.summary_version == 2)
+        .one()
+    )
+    assert list(new_s.source_event_ids or []) == [h["keep"][0]]
+    assert set(new_s.source_turn_ids or []) == {h["keep"][1]}
+    keep_ev = db_session.query(Event).filter_by(id=h["keep"][0]).one()
+    expected_hash = hashlib.sha256(
+        f"{keep_ev.id}:{event_content_hash(keep_ev)}".encode("utf-8")
+    ).hexdigest()
+    assert new_s.source_hash == expected_hash
+    assert "DROP_PERSIST_TOKEN" not in (new_s.goal or "") + (new_s.outcome or "")
+    seg = db_session.query(Segment).filter_by(id=segment_id).one()
+    assert seg.summary_id == new_s.id
+    # 真实 LLM 输入仍只含允许来源
+    assert "DROP_PERSIST_TOKEN" not in str(captured["messages"])
+    assert "KEEP_PERSIST_TOKEN" in str(captured["messages"])
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Forget Verify 完整性扩展
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _fg_verify_op(db, *, op_id, mid, mode, memory_block_visibility=True):
+    """窄选择器 Verify 基础数据：满足 memory forgotten / retrieval 不可搜 / tombstone 覆盖。"""
+    from aiive.db.models import MemoryRecord, RetrievalIndexEntry
+    from aiive.db.forget_models import ForgetTarget
+
+    _fg_operation(db, op_id, mode=mode)  # 默认 selector_type="memory_ids"（窄选择器）
+    db.add(ForgetTarget(
+        id=_new_id(), forget_operation_id=op_id,
+        target_type="memory_record", target_id=mid,
+        batch_no=0, frozen_at=_utcnow(),
+    ))
+    db.add(MemoryRecord(
+        id=mid, memory_type="fact", canonical_key=f"k:{mid}",
+        content="c", lifecycle_state="forgotten", validity_state="valid",
+        confidence=0.5, created_at=_utcnow(),
+    ))
+    db.add(RetrievalIndexEntry(
+        id=_new_id(), source_type="memory_record", source_id=mid,
+        source_version="1", index_version=1,
+        search_text="", snippet="", title="[forgotten]", is_searchable=False,
+    ))
+    _fg_tombstone(
+        db, operation_id=op_id, target_type="memory_record", target_id=mid,
+        block_visibility=memory_block_visibility,
+        content_purged=(mode != "memory_only"),
+        allow_audit_read=(mode == "memory_only"),
+    )
+
+
+def test_verify_accepts_full_source_event_integrity_memory_only(db_session):
+    """来源 Event 已屏蔽 + memory_only 原文保留 → 允许标记严格 verified。"""
+    from aiive.db.models import Event
+
+    op_id, mid, src_eid = _new_id(), _new_id(), _new_id()
+    _fg_verify_op(db_session, op_id=op_id, mid=mid, mode="memory_only")
+    db_session.add(Event(
+        id=src_eid, trace_id=_new_id(), thread_id=_new_id(),
+        event_type="user_message", payload={"content": "DURABLE_SECRET"},
+        created_at=_utcnow(),
+    ))
+    _fg_provenance(db_session, mid, src_eid)
+    db_session.commit()
+
+    _run_verify(db_session, op_id)
+    db_session.commit()
+
+    op = db_session.query(ForgetOperation).filter_by(id=op_id).first()
+    assert op.status == "verified"
+
+
+def test_verify_rejects_memory_only_wrongly_cleared_source_event(db_session):
+    """memory_only 误清空来源 Event 原文 → 完整性无法证明，不得严格 verified。"""
+    from aiive.db.models import Event
+
+    op_id, mid, src_eid = _new_id(), _new_id(), _new_id()
+    _fg_verify_op(db_session, op_id=op_id, mid=mid, mode="memory_only")
+    db_session.add(Event(
+        id=src_eid, trace_id=_new_id(), thread_id=_new_id(),
+        event_type="user_message", payload={},  # 被错误清空
+        created_at=_utcnow(),
+    ))
+    _fg_provenance(db_session, mid, src_eid)
+    db_session.commit()
+
+    _run_verify(db_session, op_id)
+    db_session.commit()
+
+    op = db_session.query(ForgetOperation).filter_by(id=op_id).first()
+    assert op.status == "failed_retryable"
+    assert "payload wrongly cleared" in (op.error_message or "")
+
+
+def test_verify_rejects_everywhere_unpurged_source_event(db_session):
+    """everywhere 来源 Event 正文未清理且无 content_purged Tombstone → 不得严格 verified。"""
+    from aiive.db.models import Event
+
+    op_id, mid, src_eid = _new_id(), _new_id(), _new_id()
+    _fg_verify_op(db_session, op_id=op_id, mid=mid, mode="everywhere")
+    db_session.add(Event(
+        id=src_eid, trace_id=_new_id(), thread_id=_new_id(),
+        event_type="user_message", payload={"content": "PURGE_ME"},
+        created_at=_utcnow(),
+    ))
+    _fg_provenance(db_session, mid, src_eid)
+    db_session.commit()
+
+    _run_verify(db_session, op_id)
+    db_session.commit()
+
+    op = db_session.query(ForgetOperation).filter_by(id=op_id).first()
+    assert op.status == "failed_retryable"
+    assert "payload not purged" in (op.error_message or "")
+
+
+def test_verify_rejects_unshielded_memory_source_event(db_session):
+    """来源 Event 存在但未被屏蔽 → 完整性无法证明，不得严格 verified。"""
+    from aiive.db.models import Event
+
+    op_id, mid, src_eid = _new_id(), _new_id(), _new_id()
+    # memory Tombstone 存在但不具备 block_visibility（模拟屏蔽缺口）
+    _fg_verify_op(db_session, op_id=op_id, mid=mid, mode="memory_only",
+                  memory_block_visibility=False)
+    db_session.add(Event(
+        id=src_eid, trace_id=_new_id(), thread_id=_new_id(),
+        event_type="user_message", payload={"content": "LEAK"},
+        created_at=_utcnow(),
+    ))
+    _fg_provenance(db_session, mid, src_eid)
+    db_session.commit()
+
+    _run_verify(db_session, op_id)
+    db_session.commit()
+
+    op = db_session.query(ForgetOperation).filter_by(id=op_id).first()
+    assert op.status == "failed_retryable"
+    assert "not shielded" in (op.error_message or "")
+
+
+def test_verify_rejects_rebuilt_summary_referencing_blocked_event(db_session):
+    """受影响的新 Summary 仍引用被屏蔽 Event → 不得严格 verified。"""
+    from aiive.db.models import Event, SegmentSummary
+    from aiive.db.forget_models import ForgetDependency
+
+    op_id, mid, src_eid = _new_id(), _new_id(), _new_id()
+    leaked_eid, segment_id, old_sid = _new_id(), _new_id(), _new_id()
+    _fg_verify_op(db_session, op_id=op_id, mid=mid, mode="memory_only")
+    # 来源 Event：已屏蔽 + 原文保留（前两项检查应通过）
+    db_session.add(Event(
+        id=src_eid, trace_id=_new_id(), thread_id=_new_id(),
+        event_type="user_message", payload={"content": "OK"},
+        created_at=_utcnow(),
+    ))
+    _fg_provenance(db_session, mid, src_eid)
+    # 被屏蔽的泄漏 Event
+    db_session.add(Event(
+        id=leaked_eid, trace_id=_new_id(), thread_id=_new_id(),
+        event_type="user_message", payload={"content": "LEAKED"},
+        created_at=_utcnow(),
+    ))
+    _fg_tombstone(db_session, operation_id=op_id, target_type="event",
+                  target_id=leaked_eid, block_visibility=True)
+    # 受影响旧 Summary + 重建后新 Summary（version 2）仍引用 leaked_eid
+    db_session.add(SegmentSummary(
+        id=old_sid, segment_id=segment_id, summary_version=1,
+        source_event_ids=[leaked_eid], goal="old",
+    ))
+    db_session.add(SegmentSummary(
+        id=_new_id(), segment_id=segment_id, summary_version=2,
+        source_event_ids=[leaked_eid], goal="rebuilt",
+    ))
+    db_session.add(ForgetDependency(
+        id=_new_id(), forget_operation_id=op_id,
+        dependency_type="segment_summary", dependency_id=old_sid,
+        status="pending", discovered_at=_utcnow(),
+    ))
+    db_session.commit()
+
+    _run_verify(db_session, op_id)
+    db_session.commit()
+
+    op = db_session.query(ForgetOperation).filter_by(id=op_id).first()
+    assert op.status == "failed_retryable"
+    assert "still referenced by rebuilt summaries" in (op.error_message or "")

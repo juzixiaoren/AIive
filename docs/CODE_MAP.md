@@ -276,7 +276,7 @@
 | `memory_types.py` | 全部枚举 + `MemoryProposal`/`EvidenceItem` 契约 |
 | `memory_key_registry.py` | 记忆 key 唯一真相源（cardinality/conflict_policy/core_memory_role） |
 | `memory_store.py` | 纯持久化 CRUD 仓库 `MemoryStore` |
-| `memory_write_service.py` | **写服务 Saga**：`MemoryWriteService` L114；`write_batch` L153、`write` L351、`forget` L534、`promote` L629、`execute_maintenance` L469；`_execute_supersede_or_revise` L785（旧记录 SUPERSEDED+superseded_by 双向链接+lineage+双投影入队）；`_execute_reinforce` L696、`_execute_merge` L874 |
+| `memory_write_service.py` | **写服务 Saga**：`MemoryWriteService` L114；`write_batch` L153、`write` L351、`forget` L534、`promote` L629、`execute_maintenance` L469；`_execute_supersede_or_revise` L785（旧记录 SUPERSEDED+superseded_by 双向链接+lineage+双投影入队）；`_execute_reinforce` L696、`_execute_merge` L874；`_write_evidence_batch` 同事务写 `MemoryEvidence` 与 `ContentProvenanceRef(owner_type=memory_record, source_type=event)`（Memory→Event 来源持久化，去重幂等，Evidence 在 Forget purge 被删后仍存活） |
 | `conflict_resolver.py` | `ConflictResolver.resolve` L41；`latest_value_wins`→supersede；`_is_minor_change` L160（长度相近+词重叠>60%→revise） |
 | `memory_gate.py` | 写入准入（authority/confirmation/candidate 降级） |
 | `memory_mutation.py` | `MemoryMutationExecutor` L64：锁/前置校验/lineage/事件/投影入队 |
@@ -300,6 +300,8 @@
 | `projection.py` / `vector_projection.py` / `vector_bootstrap.py` / `embedding_provider.py` | markdown/json 落盘投影（可丢失）；pgvector 投影+fail-closed 校验；provider 工厂与运行时校验；`embed_batch` 批量推理（`aiive_embedding_batch_size` 控制并发/内存，单条 `embed` 载荷保持字符串不变） |
 
 **其他记忆相关包**：`retrieval/`（lexical 检索索引代次：`retrieval_index_generations/_entries/_tokens/_runs` 表）；`forget/`（`fingerprint.py` 内容指纹、`phase_a_shield.py` 防再摄取盾牌、`selector_normalizer.py`、`visibility_service.py`、`reconcile_service.py`）；`retention/`（`engine.py` RetentionEngine、`config.py`、`maintenance_lease.py`、`safety_predicates.py`、`vacuum.py`）。
+
+**Forget 来源 Event 隔离（隐私闭环）**：`MemoryEvidence.source_event_id` 在 `_write_evidence_batch()` 写入时同步持久化到 `ContentProvenanceRef`（迁移 `f1a2c3d4e5b6` 回填历史数据、幂等、无 DDL）；`ForgetVisibilityService` 对 Event 追加「所属 TurnRecord 被遗忘」「作为被遗忘 MemoryRecord 来源」两类屏蔽，`is_tombstone_blocked_reingestion()` 沿 Provenance 拦截再提取，`can_audit_read()` 多 Tombstone 冲突 fail-closed；`phase_a_shield.py` 为有界显式 memory_ids 立即写来源 Event 实体 Shield（宽选择器不枚举、读取侧校验），Cascade 持久化来源 Event Tombstone；`handlers_forget.py::_try_generate_summary()` 用统一可见性规则在 50 条上限**之前**过滤，新 Summary 的 `source_event_ids`/`source_turn_ids`/`source_hash` 仅取自允许来源；`_scrub_batch()`/`_scrub_wide()` 对 `memory_only` 保留来源 Event 原文；`_verify_source_event_integrity()` 校验屏蔽覆盖/mode 内容语义/新 Summary 不引用被屏蔽 Event，无法证明则不落严格 `verified`。测试：`tests/integration/backend/test_phase6a_forget.py`。
 
 **记忆数据流**：
 - 写入：`tools/remember_or_update` / chat 收尾入队 `memory_extraction` → `worker/outbox_handlers.handle_memory_extraction` → `MemoryWriteService.write_batch` → conflict_resolver → memory_store + lineage + 投影入队（vector/markdown/core_memory refresh 均为独立 outbox job）
@@ -360,7 +362,7 @@
 | `handler_registry.py` | `HandlerRegistry` L10：job_type→handler + schema_version 白名单 |
 | `outbox_dto.py` | `HandlerOutcome` 枚举 L16（COMPLETED/RETRY_LATER/NON_RETRYABLE/RETRYABLE_ERROR/CLAIM_LOST/CONTINUE）；`ClaimedJob`/`HandlerResult`/`ActiveClaim`；`FencingViolationError` L102 |
 | `outbox_handlers.py`（100KB） | 装配 `register_all` L1398（27 类 job_type，schema_version=1；含 `memory_conflict_question` / `memory_conflict_reply` / `memory_conflict_cleanup` / `improvement_discovery` / `goal_trigger_decision`→`worker/handlers_goal_triggers.py` / `goal_event_dispatch`→`worker/handlers_goal_events.py`）；`handle_memory_extraction` L106、`handle_reminder_delivery` L350、`handle_core_memory_refresh` L617、`handle_memory_vector_refresh` L639、`handle_memory_markdown_project` L664、`handle_retrieval_index_refresh` L697、`handle_memory_maintenance` L1165、`handle_segment_sealing` L1622、`handle_epoch_rollover` L1961、`handle_epoch_checkpoint` L2055 |
-| `handlers_forget.py`（71KB） | 遗忘 Saga：`handle_forget_cascade` L133（目标物化 L239/墓碑 L435/依赖发现 L619）、`handle_forget_rebuild` L807、`handle_forget_purge` L1356（`_scrub_wide` L1535）、`handle_forget_verify` L1677、`handle_forget_reconcile` L1801；`BATCH_SIZE=200` |
+| `handlers_forget.py`（71KB） | 遗忘 Saga：`handle_forget_cascade` L133（目标物化 L239/墓碑 L435/依赖发现 L619）、`handle_forget_rebuild` L807、`handle_forget_purge` L1356（`_scrub_wide` L1535）、`handle_forget_verify` L1677、`handle_forget_reconcile` L1801；`_try_generate_summary`（统一可见性规则、先过滤后 50 上限）、`_verify_source_event_integrity`（来源 Event 屏蔽覆盖/mode 内容语义/新 Summary 引用校验）、`_scrub_batch`/`_scrub_wide`（memory_only 保留来源 Event 原文）；`BATCH_SIZE=200` |
 | `handlers_retention.py` / `handlers_agent_tasks.py` | `handle_retention_cleanup` L27 分批驱动 RetentionEngine；`handle_agent_task_run` L16 驱动 PersistentTaskRuntime |
 | `handlers_knowledge.py` | `handle_knowledge_maintenance` L29：扫描→分批清理→commit，无进展时 COMPLETED(partial) 而非空转；`MAX_MAINTENANCE_BATCHES=5` |
 | `handlers_improvement.py` | `handle_improvement_discovery`：改进候选发现的 Outbox 入口（`discovery` 参数仅供测试注入）；模型调用在事务外，`llm_failed` 返回 RETRYABLE_ERROR 且不推进水位，非法输出记 COMPLETED 不重试 |
@@ -452,7 +454,7 @@
 - `db/base.py`：`engine` L18、`SessionLocal` L27、`get_db()` L30（FastAPI 依赖）、`create_all()` L43
 - `db/models.py`（63 表，`Base` L17）、`db/forget_models.py`（10 表）、`db/retention_models.py`（2 表）—— 表清单见第 6 节
 - `alembic/env.py`：`target_metadata = Base.metadata` L29，**显式导入 forget/retention 模型** L12-13 防漏表；URL 取自 `settings.database_url`
-- 迁移链：baseline `69da20d1e47c`（全量 schema）→ … → HEAD `a7c4e9f1b8d2`（auth_owners，V49），现行链 22 个；`versions/_archive_migrations_20260717/` 为历史归档（已被 baseline squash）
+- 迁移链：baseline `69da20d1e47c`（全量 schema）→ … → `a7c4e9f1b8d2`（auth_owners）→ `f7a1c3d5e9b2` → `a9d3e5f7b1c4` → `c3f7b2a9d1e4` → `b8d2e6f4a1c7` → HEAD `f1a2c3d4e5b6`（Memory→Event ProvenanceRef 回填，纯数据迁移、无 DDL）；现行链以 `alembic history` 为准；`versions/_archive_migrations_20260717/` 为历史归档（已被 baseline squash）
 - **新增表流程**：`db/models.py` 加模型 → `alembic/env.py` 确认导入 → `alembic revision --autogenerate` → 检查生成的迁移（尤其索引/约束）→ 应用
 
 ---
@@ -509,7 +511,7 @@
 
 ## 6. 数据库表地图（75 表）
 
-> 模型定义：`db/models.py`（63）+ `db/forget_models.py`（10）+ `db/retention_models.py`（2）。迁移：baseline `69da20d1e47c`，HEAD `a7c4e9f1b8d2`。
+> 模型定义：`db/models.py`（63）+ `db/forget_models.py`（10）+ `db/retention_models.py`（2）。迁移：baseline `69da20d1e47c`，HEAD `f1a2c3d4e5b6`。
 
 | 域 | 表 | 说明 |
 |---|---|---|
@@ -525,7 +527,7 @@
 | 检索索引 | `retrieval_index_generations`、`_entries`、`_tokens`、`_runs` | 索引代次/条目/倒排 token/运行 |
 | 知识库 | `documents`、`chunks`、`retrieval_runs`、`retrieval_candidates` | 文档/分块/检索运行/候选 |
 | 知识分块向量 | `knowledge_chunk_vectors` | pgvector 512 维派生投影（主键 chunk_id，随分块级联删除；HNSW + vector_cosine_ops；可 TRUNCATE 后由维护任务回填） |
-| 遗忘 Saga | `forget_operations`、`forget_selector_manifests`、`forget_shields`、`forget_targets`、`forget_dependencies`、`forget_batches`、`forget_actions`、`forget_tombstones`、`forget_stage_runs`、`content_provenance_refs` | Phase 6A 遗忘全家桶 |
+| 遗忘 Saga | `forget_operations`、`forget_selector_manifests`、`forget_shields`、`forget_targets`、`forget_dependencies`、`forget_batches`、`forget_actions`、`forget_tombstones`、`forget_stage_runs`、`content_provenance_refs` | Phase 6A 遗忘全家桶；`content_provenance_refs` 复用承载 `owner_type=memory_record / source_type=event` 的 Memory→Event 来源关系（迁移 `f1a2c3d4e5b6` 回填历史数据） |
 | 保留治理 | `retention_cleanup_runs`、`retention_cleanup_batches` | Phase 6B |
 | 能力/MCP | `capabilities`、`capability_versions`（含 `source`/`state`/`sandbox_path`/`definition_snapshot` 生命周期列）、`mcp_install_records`、`capability_plans` | |
 | 自进化 | `selfdev_requests`、`patch_operations` | |

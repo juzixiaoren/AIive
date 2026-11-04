@@ -26,6 +26,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session
 
 from aiive.db.forget_models import (
+    ContentProvenanceRef,
     ForgetOperation,
     ForgetSelectorManifest,
     ForgetShield,
@@ -35,6 +36,7 @@ from aiive.db.forget_models import (
 )
 from aiive.db.models import (
     CoreMemoryBlock,
+    MemoryEvidence,
     MemoryRecord,
     MemoryVectorProjection,
     OutboxJob,
@@ -157,6 +159,13 @@ def execute_phase_a_shield(
     target_count = _write_tombstones_and_forget_memories(
         session, op_id, mode, memory_ids, turn_ids, event_ids, now,
     )
+
+    # 6b. 有界显式 memory_ids：Phase A 立即屏蔽其来源 Event。
+    #     宽选择器 / 超限 ID 不在此枚举（避免 Phase A 无界扫描），改由读取侧
+    #     经「选择器 Shield + Memory → Event Provenance」即时判定（见
+    #     ForgetVisibilityService._source_memory_blocked_event_ids）。
+    if memory_ids and len(memory_ids) <= MAX_INLINE_SHIELD_TARGETS:
+        _shield_source_events_for_memory_ids(session, op_id, memory_ids, now)
 
     # 7. 仅 bounded explicit Memory IDs 冻结 Target
     if memory_ids and len(memory_ids) <= MAX_INLINE_SHIELD_TARGETS:
@@ -498,6 +507,55 @@ def _write_tombstones_and_forget_memories(
             target_count += 1
 
     return target_count
+
+
+def _shield_source_events_for_memory_ids(
+    session: Session,
+    operation_id: str,
+    memory_ids: list[str],
+    now: datetime,
+) -> None:
+    """有界显式 memory_ids：Phase A 立即屏蔽其来源 Event。
+
+    来源关系取 ContentProvenanceRef（持久，Evidence 删除后仍存活），并兼容
+    MemoryEvidence（回填迁移前的存量数据）。仅写实体级 Shield 作为临时即时
+    屏蔽层；长期屏蔽由 Cascade 阶段持久化的 source Event Tombstone 承担，
+    Shield 在 verify 成功后 retire。
+
+    仅对 bounded explicit memory_ids 调用，不对宽选择器 / 超限 ID 在 Phase A
+    无界枚举全部记录。
+    """
+    src_event_ids: set[str] = set()
+    for row in session.query(ContentProvenanceRef.source_id).filter(
+        ContentProvenanceRef.owner_type == "memory_record",
+        ContentProvenanceRef.source_type == "event",
+        ContentProvenanceRef.owner_id.in_(memory_ids),
+    ).all():
+        if row[0]:
+            src_event_ids.add(row[0])
+    for row in session.query(MemoryEvidence.source_event_id).filter(
+        MemoryEvidence.memory_id.in_(memory_ids),
+        MemoryEvidence.source_event_id.isnot(None),
+    ).all():
+        eid = row[0]
+        if eid:
+            src_event_ids.add(eid)
+
+    for eid in sorted(src_event_ids):
+        session.add(ForgetShield(
+            id=_new_id(),
+            forget_operation_id=operation_id,
+            selector_type="memory_ids",
+            target_type="event",
+            target_id=eid,
+            cutoff_created_at=now,
+            status="active",
+            normalized_shield_key=compute_normalized_shield_key(
+                operation_id, "memory_ids",
+                target_type="event", target_id=eid,
+            ),
+            created_at=now,
+        ))
 
 
 def _freeze_initial_targets(

@@ -882,7 +882,7 @@ Forget 不是单条 `DELETE`，而是一个“先屏蔽、再发现依赖、重�
 | Knowledge 多用户 ACL | 未发现完整实现 | — | 搜索 SQL 未见 user/workspace ACL 过滤 |
 | Graph Projection / Expansion / Rebuild | 已实现 | 受配置与召回路径影响 | Graph 是 Memory 派生投影 |
 | Memory Extraction / Conflict Confirmation | 已实现 | Turn 后台 Outbox 提取；冲突时进入裁决/确认 | 本文已追踪主链；未逐一枚举所有 mutation 字段 |
-| Forget Saga | 已实现但有审计风险 | 用户请求触发 Phase A，后续 Outbox 推进 | 发现宽范围 Scrub、Summary 重建和 Verify 的缺口/疑点 |
+| Forget Saga | 已实现，来源 Event 隔离闭环已补齐 | 用户请求触发 Phase A，后续 Outbox 推进 | 来源 Event 可见性/防重抽/摘要重建/memory_only 保留/Verify 已按 13.11 补齐；宽范围 Scrub 与 Task/Knowledge 对象覆盖仍有审计缺口 |
 | Persistent Task Runtime | 已实现 | 用户委派或事件唤醒 | 已追踪 Run/Action/Evidence/Checkpoint 主链 |
 | Desktop Unknown Reconciliation | 已实现 | Node journal 回执/缺失报告触发 | 不代表普通 MCP/Shell 也具备同等对账能力 |
 | General External Action Exactly-once | 未能证明 | — | 必须按 capability 单独定义幂等/回执 |
@@ -1451,7 +1451,7 @@ cascade → rebuild_dependencies → purge → verify
 
 以下均为静态代码发现，建议作为独立测试/修复任务，不代表已在生产环境复现。
 
-### F-01：Summary 重建过滤条件可能让被遗忘 Event 重新进入新摘要 <badge color="danger">高风险</badge>
+### F-01：Summary 重建过滤条件可能让被遗忘 Event 重新进入新摘要 <badge color="success">已修复，见 13.11</badge>
 
 `_try_generate_summary()` 构造 `blocked_ids` 时，只查询当前 operation 的 `ForgetTombstone.target_type == 'event'`。但它读取 Segment 下的 Event 时，没有同时过滤：
 
@@ -1505,13 +1505,13 @@ Selector Normalizer 支持 `scope` 与 `canonical_key`，但 `_scrub_wide()` 只
 
 例如 `memory_only + thread_id` 仍会触发 thread 宽范围 Scrub；而 `history_only + memory_ids` 仍会把 memory target 置 forgotten。建议在 API/Tool 层强制只允许一类 Selector，并按 mode 拒绝不兼容的参数组合。
 
-### F-06：memory_only 不一定保留所有原始历史
+### F-06：memory_only 不一定保留所有原始历史 <badge color="success">已修复，见 13.11</badge>
 
 `_scrub_event_turn_targets()` 在 `memory_only` 时直接返回，但 `_scrub_batch()` 会计算目标 Memory 的 exclusive source_event_ids，并在任何 mode 下清空这些 Event payload。也就是说，Memory 专属来源 Event 可能被清空，而共享给其他未遗忘 Memory 的 Event 会保留。
 
 因此源码行为更准确的描述是：memory_only 不执行显式 Event/Turn target 的全量清理，但仍会删除目标 Memory 的专属来源 Event。它不是“所有聊天原文无条件完整保留”。需要产品定义决定这是预期的 provenance 清理，还是与 allow_audit_read 文案冲突。
 
-### F-07：Verify 对宽范围内容完整性的证明有限
+### F-07：Verify 对宽范围内容完整性的证明有限 <badge color="warning">部分补齐，见 13.11</badge>
 
 Verify 不检查 SegmentSummary/Checkpoint 正文、WorkingState、ContextSnapshot、LLMCall preview、Task/Artifact 内容是否仍含被遗忘数据；宽选择器只要 Memory/Tombstone/Index 检查通过就进入 `verified_with_coarse_purge`。建议：
 
@@ -1546,6 +1546,28 @@ Forget 的 `TARGET_TYPES` 不包含 `document`、`chunk` 或 `knowledge_chunk_ve
 ### F-12：Forget 的 operation_key 只有在调用端稳定复用时才具备请求级幂等
 
 `execute_phase_a_shield()` 在未提供 operation_key 时使用新 UUID 生成默认 key。相同 selector 的重复请求不会因此自动合并为同一个 Operation。需要检查公开 Tool/API 的调用端是否传入稳定 operation_key；若没有，应把 request idempotency key 纳入请求契约，并增加“同一请求重试不创建第二个 Saga”的集成测试。
+
+---
+
+## 13.11 实现补记：来源 Event 隔离与摘要重建隐私闭环
+
+本节记录针对 F-01 / F-06 / F-07 与 P0-1 的定向修复（不重写整个 Forget Saga）。目标：被遗忘的 Memory 不能通过原始历史、记忆重新提取或 SegmentSummary 重建重新进入正常上下文，同时严格保留 `memory_only` / `history_only` / `everywhere` 的既定语义。
+
+**持久化 Memory 到 Event 来源关系**：复用现有 `ContentProvenanceRef`，不新增模型。`MemoryWriteService._write_evidence_batch()` 在创建 `MemoryEvidence` 的同一事务写入 `(owner_type=memory_record, owner_id=MemoryRecord.id, source_type=event, source_id=Event.id)`，按唯一约束去重、幂等。Evidence 在 Purge 阶段会被物理删除，但 ProvenanceRef 长期存活，供读取侧屏蔽、防重抽与 Summary 重建反查。Alembic 数据迁移 `f1a2c3d4e5b6` 从历史 `memory_evidence.source_event_id` 回填，幂等、兼容 PostgreSQL/SQLite、无 DDL、不删 Evidence。
+
+**可见性与防重抽**：`ForgetVisibilityService.blocked_target_ids()` 对 Event 追加两类屏蔽：所属 TurnRecord 命中 Shield 或 `block_visibility` Tombstone 的全部子 Event；作为已被遗忘 MemoryRecord 来源的 Event（沿 ProvenanceRef 反查 Memory 的实体/选择器 Shield 与 Tombstone）。`is_tombstone_blocked_reingestion()` 同样沿 ProvenanceRef 拦截，防止后台提取从已遗忘来源重建事实；递归调用只在非 Event 目标上发生，不会无限循环，且不阻断无关新 Event。`can_audit_read()` 改为对同一对象的所有 Tombstone 取 `all(...)`，任何 `content_purged=True` 或 `allow_audit_read=False` 都 fail-closed 拒绝。
+
+**屏蔽时序与长期依据**：对有界显式 `memory_ids`（`MAX_INLINE_SHIELD_TARGETS=100` 以内），Phase A 事务为来源 Event 立即写实体 Shield；宽选择器与超限 ID 不在 Phase A 无界枚举，靠选择器 Shield + 读取侧 Provenance 校验即时生效。Cascade 阶段为来源 Event 持久化 `ForgetTombstone`（含被遗忘 Turn 的全部子 Event），使 Shield 退休后仍有长期屏蔽依据，`allow_audit_read` 随 Forget Mode 落库。
+
+**SegmentSummary 重建**：`_try_generate_summary()` 改用统一 `ForgetVisibilityService.blocked_target_ids()` 过滤所有有效 Event Tombstone、TurnRecord Tombstone 子 Event、以及来源 MemoryRecord 已被遗忘的 Event；过滤发生在最终 50 条上限之前，LLM 只接收未被屏蔽的 Event，新 Summary 的 `source_event_ids` / `source_turn_ids` / `source_hash` 仅由允许来源生成，不是删字符串。`_rebuild_summaries_batch()` 到 `_try_generate_summary()` 的真实调用链有集成测试覆盖（当前 Operation 与后续另一 Operation 均不重新引入已遗忘内容，且保留其他未遗忘 Event）。
+
+**mode 内容语义**：`_scrub_batch()` / `_scrub_wide()` 对 `memory_only` 保留来源 Event 原始 payload（含独占来源 Event），同时保留正常可见性屏蔽与防重抽；`history_only` / `everywhere` 维持不可逆正文清理。
+
+**Verify 完整性**：`_verify_source_event_integrity()` 校验 Memory 来源 Event 的屏蔽覆盖、新 Summary 不引用被屏蔽 Event、`memory_only` 未误清原文、`history_only` / `everywhere` 已完成应有清理；任一不满足或无法证明完整性即不落严格 `verified`。
+
+**测试**：`tests/integration/backend/test_phase6a_forget.py` 覆盖 ProvenanceRef 同事务写入、迁移回填与幂等、memory_only 来源 Event 普通历史隐藏与原文保留、防重抽、everywhere 正文不可恢复、Turn 遗忘先于清理屏蔽全部子 Event、当前与后续 Operation 的 Summary 重建、多 Tombstone 审计 fail-closed、宽选择器 Phase A 不枚举，以及真实 `_try_generate_summary()` 调用链。
+
+**仍未覆盖（既有审计结论）**：F-02（JSON 数组列标量 IN 比较）、F-03/F-04（宽 Scrub 覆盖与 scope 分支）、F-05（mode 与 selector 契约）、F-08~F-10（多用户边界、Task Runtime / Knowledge 对象与对象存储）、F-11/F-12（超大 ID 列表与 operation_key 幂等）、以及 F-07 中 Checkpoint/WorkingState/LLMCall preview 等其余正文承载面的严格内容证明。
 
 ---
 
@@ -2091,7 +2113,7 @@ RepairLoop 将一次自修复拆成有边界的阶段：
 
 ## P0：隐私与执行正确性
 
-1. **Forget Summary 重建过滤完整性**：Turn Tombstone、Memory Evidence 来源 Event 必须进入 blocked_event_ids；重建摘要不能重新包含被遗忘事实。
+1. **Forget Summary 重建过滤完整性**（已完成，见 13.11）：Turn Tombstone、Memory Evidence 来源 Event 进入统一 `blocked_ids`；重建摘要在 50 条上限前过滤，source 字段仅取允许来源。
 2. **Forget JSON 数组清理**：修复 `_scrub_wide()` 对 source_event_ids/source_segment_ids 的标量 `IN` 比较，使用真正 JSON containment 或 join。
 3. **Forget Verify 证明范围**：把“目标状态验证”与“所有内容承载表清理验证”区分；不能仅靠 Memory/Tombstone 检查就宣称所有内容都已证明清除。
 4. **Forget all_user_data 用户边界**：若支持多用户，所有宽范围更新必须按 owner/tenant 限定，不能无条件更新整张表。
