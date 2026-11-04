@@ -23,10 +23,14 @@
 
 来源定位
 --------
-切分过程中的每一段都携带它在 Block 原文中的字符区间（_Segment），Chunk 的行号由
-该区间换算得出，因此一个 Block 拆成多个 Chunk 后各自拥有准确范围。Overlap 前缀与
-重复的表格表头属于「上下文」，不计入 Chunk 的来源范围，只记录 context_tokens，
-不会伪装成当前 Chunk 的原始内容。
+切分过程中的每一段都携带它在 Block 原文中的字符区间（_Segment）与来源页码，
+Chunk 的行号由该区间换算得出、页码由各片段自带页码汇总，因此一个 Block 拆成多个
+Chunk 后各自拥有准确范围。Overlap 前缀与重复的表格表头属于「上下文」，不计入 Chunk
+的行号与页码范围，只记录 context_tokens，不会伪装成当前 Chunk 的原始内容。
+
+兜底拆分（_enforce_budget）沿用同一套来源片段：上下文片段不能独立成 Chunk，当它与
+紧随其后的正文放不进同一预算时优先舍弃上下文，正文不丢失、不重复；拆分后的每个
+Chunk 只标记自己实际覆盖的行号与页码。
 
 不变量
 ------
@@ -49,7 +53,7 @@ from aiive.knowledge.blocks import (
 )
 from aiive.knowledge.tokenization import count_tokens
 
-CHUNKER_VERSION = "structure_recursive_v3"
+CHUNKER_VERSION = "structure_recursive_v4"
 
 # 遗留字符窗口切分的默认宽度（仅 chunk_text 使用）。
 CHUNK_SIZE = 500
@@ -77,15 +81,21 @@ class ChunkConfig:
 
 @dataclass(frozen=True)
 class ChunkPart:
-    """Chunk 内的一个来源片段：正文 + 它在原始文档中的行范围。
+    """Chunk 内的一个来源片段：正文 + 它在原始文档中的行/页范围。
 
     `context=True` 表示该片段是 Overlap 前缀或重复表头，属于「上下文」而不是本 Chunk
-    的原始内容，因此不参与 `line_start / line_end` 汇总。
+    的原始内容，因此不参与 `line_start / line_end / page_start / page_end` 汇总。
+
+    `page_start / page_end` 逐片段携带来源页码（PDF 按页解析，每个 Block 自带页码）；
+    缺失时保持 None，不做推测。兜底拆分后各 Chunk 的页码只由自己保留的正文片段决定，
+    不会继承整个原 Chunk 的页码范围。
     """
 
     text: str
     line_start: int
     line_end: int
+    page_start: int | None = None
+    page_end: int | None = None
     context: bool = False
 
 
@@ -252,12 +262,18 @@ def _pack(pieces: list[_Piece], config: ChunkConfig) -> list[_Piece]:
         buffer_tokens = 0
 
     def overlap_piece(piece: _Piece, prefix: str) -> _Piece:
-        """Overlap 前缀：只作为上下文，来源范围仍指向本 Chunk 的真实内容。"""
+        """Overlap 前缀：只作为上下文，来源范围仍指向本 Chunk 的真实内容。
+
+        前缀文本来自上一个 Chunk，不是本片段的原始内容，因此行号退化为「当前片段
+        起点」、页码置 None（不把当前正文的页码伪造成前缀的页码）。
+        """
         return replace(
             piece,
             text=prefix,
             line_start=piece.line_start,
             line_end=piece.line_start,
+            page_start=None,
+            page_end=None,
             context=True,
             context_tokens=count_tokens(prefix),
             parts=(),
@@ -314,11 +330,16 @@ def _line_at(piece: _Piece, offset: int) -> int:
 
 
 def _assemble(parts: list[_Piece]) -> _Piece:
-    """把同一 Chunk 内的片段拼成一段正文，并汇总来源位置。"""
+    """把同一 Chunk 内的片段拼成一段正文，并汇总来源位置。
+
+    来源行号与页码只由正文片段决定：Overlap 前缀、重复表头属于上下文，既不能把
+    `line_start` 拉回上一块，也不能把自己的页码混进本 Chunk 的页码范围。
+    """
     texts = [part.text for part in parts if part.text.strip()]
     joined = _join_texts(texts)
-    source = [part for part in parts if part.text.strip() and not part.context] or parts
-    pages = [p for part in parts for p in (part.page_start, part.page_end) if p is not None]
+    body = [part for part in parts if part.text.strip() and not part.context]
+    source = body or parts
+    pages = [p for part in body for p in (part.page_start, part.page_end) if p is not None]
     context_tokens = sum(part.context_tokens for part in parts)
     if not context_tokens:
         context_tokens = sum(
@@ -342,10 +363,20 @@ def _assemble(parts: list[_Piece]) -> _Piece:
 
 
 def _piece_parts(piece: _Piece) -> tuple[ChunkPart, ...]:
-    """展开片段的来源片段：已汇总过的直接用其 parts，否则把自身视为一个来源片段。"""
+    """展开片段的来源片段：已汇总过的直接用其 parts，否则把自身视为一个来源片段。
+
+    页码随片段一起下传，兜底拆分才能按「真实正文片段」重新计算页码范围。
+    """
     if piece.parts:
         return piece.parts
-    return (ChunkPart(piece.text, piece.line_start, piece.line_end, piece.context),)
+    return (ChunkPart(
+        text=piece.text,
+        line_start=piece.line_start,
+        line_end=piece.line_end,
+        page_start=piece.page_start,
+        page_end=piece.page_end,
+        context=piece.context,
+    ),)
 
 
 def _join_texts(texts: list[str]) -> str:
@@ -420,8 +451,21 @@ def _enforce_budget(drafts: list[ChunkDraft], config: ChunkConfig) -> list[Chunk
 
 
 def _split_draft(draft: ChunkDraft, config: ChunkConfig) -> list[ChunkDraft]:
-    """按来源片段拆分超限 Chunk，保留行号、页码与上下文元数据。"""
-    parts = draft.parts or (ChunkPart(draft.content, draft.line_start, draft.line_end),)
+    """按来源片段拆分超限 Chunk，保留行号、页码与上下文元数据。
+
+    页码随片段一起传递：一个 Chunk 跨页合并后，拆分出的每个片段仍带着自己那一段
+    来源的页码，最终由 `_draft_from_parts` 按「本组真实正文」重新求页码范围，不再
+    把原 Chunk 的整段页码继承给每个子 Chunk。
+    """
+    parts = draft.parts or (
+        ChunkPart(
+            text=draft.content,
+            line_start=draft.line_start,
+            line_end=draft.line_end,
+            page_start=draft.page_start,
+            page_end=draft.page_end,
+        ),
+    )
     segments: list[ChunkPart] = []
     for part in parts:
         for segment in _split_text(part.text, config):
@@ -429,6 +473,8 @@ def _split_draft(draft: ChunkDraft, config: ChunkConfig) -> list[ChunkDraft]:
                 text=segment.text,
                 line_start=_line_in_part(part, segment.start),
                 line_end=_line_in_part(part, segment.end),
+                page_start=part.page_start,
+                page_end=part.page_end,
                 context=part.context,
             ))
     return [_draft_from_parts(draft, group) for group in _pack_parts(segments, config)]
@@ -443,31 +489,57 @@ def _line_in_part(part: ChunkPart, offset: int) -> int:
 
 
 def _pack_parts(parts: list[ChunkPart], config: ChunkConfig) -> list[list[ChunkPart]]:
-    """把来源片段重新装箱成不超过 max 的组（保持顺序，不丢上下文标记）。"""
+    """把来源片段重新装箱成不超过 max 的组（保持顺序，不丢正文）。
+
+    关键约束：**上下文片段不能独立成组**。Overlap 前缀与重复表头是上一块内容的复制，
+    单独成组会产出一个只有重复文本、没有任何真实正文的 Chunk。因此：
+
+    * 上下文只有在能与紧随其后的真实正文放进同一组时才保留；
+    * 放不下时优先舍弃上下文（正文完整性与预算优先级更高）；
+    * 一个只含上下文的组永不输出，全上下文的输入返回空列表（不产生空 Chunk）。
+    """
     groups: list[list[ChunkPart]] = []
     current: list[ChunkPart] = []
     for part in parts:
+        if not part.text.strip():
+            continue
         candidate = _join_texts([item.text for item in [*current, part]])
         if current and count_tokens(candidate) > config.max_chunk_tokens:
-            groups.append(current)
-            current = [part]
+            if any(not item.context for item in current):
+                groups.append(current)
+                current = [part]
+            elif part.context:
+                # 纯上下文组放不下下一段：舍弃上下文，等真实正文重新开组
+                current = []
+            else:
+                # 上下文挤不进正文所在组：舍弃上下文，只保留正文
+                current = [part]
             continue
         current.append(part)
-    if current:
+    if current and any(not item.context for item in current):
         groups.append(current)
     return groups
 
 
 def _draft_from_parts(draft: ChunkDraft, parts: list[ChunkPart]) -> ChunkDraft:
-    """由一组来源片段生成新 ChunkDraft（行号取正文片段，上下文长度单独累计）。"""
+    """由一组来源片段生成新 ChunkDraft。
+
+    行号、页码都只由**真实正文片段**汇总：上下文片段的页码不参与 min/max，缺失页码
+    时保持 None（不继承原 Chunk 的页码范围，也不做推测）。`context_tokens` 只累计
+    实际保留在组里的上下文。
+    """
     texts = [part.text for part in parts if part.text.strip()]
-    source = [part for part in parts if part.text.strip() and not part.context] or parts
+    body = [part for part in parts if part.text.strip() and not part.context]
+    source = body or parts
+    pages = [p for part in body for p in (part.page_start, part.page_end) if p is not None]
     content = _join_texts(texts)
     return replace(
         draft,
         content=content,
         line_start=min(part.line_start for part in source),
         line_end=max(part.line_end for part in source),
+        page_start=min(pages) if pages else None,
+        page_end=max(pages) if pages else None,
         token_count=count_tokens(content),
         context_tokens=sum(
             count_tokens(part.text) for part in parts if part.context and part.text.strip()

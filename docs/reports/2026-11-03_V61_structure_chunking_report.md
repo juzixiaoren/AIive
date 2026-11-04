@@ -317,4 +317,84 @@ V61.1 之后继续审计，发现三处只在边界条件下出现的缺陷：�
    （V61 既有行为），V61.2 只保证行号准确，不改变切分粒度。
 4. **token 仍是估算口径**：`count_tokens` 是启发式估算，模型侧真实 token 数可能不同。
 
+## 11. V61.3 兜底拆分正确性修复（2026-11-04 追加）
+
+V61.2 之后继续审计 `_enforce_budget` 兜底路径，发现两处边界缺陷：都不报错，但会静默
+产出错误 Chunk。本轮只修这两处，不做架构重构，不改正常 Chunk 切分、Section ID、
+Embedding、Vector Index 与历史重建逻辑。
+
+### 11.1 缺陷与修复
+
+| # | 缺陷 | 原实现的问题 | 修复 |
+|---|---|---|---|
+| 1 | 兜底拆分产生纯 Overlap Chunk | `_pack_parts` 按「累计超预算就 flush」装箱：Overlap 前缀（60 tokens）后面紧跟正文（700 tokens），两者放不进同一 700 预算时，先把只含上下文的组 flush 出去，得到一个没有任何真实正文、行号指向上一块的 60-token Chunk，正文另成一块 | `_pack_parts` 只输出含真实正文的组：放不下时优先舍弃上下文、正文单独开组；只含上下文的组直接丢弃，全上下文输入返回空组。`context_tokens` 由 `_draft_from_parts` 按实际保留的片段重算；正文不丢失、不重复，行号仍取自真实正文 |
+| 2 | 跨页 PDF 兜底拆分页码错误 | `ChunkPart` 只有 `text/line_start/line_end/context`，没有页码；`_draft_from_parts` 用 `replace(draft, ...)` 继承原 Chunk 的整段 `page_start/page_end`，跨页合并的 Chunk 拆开后每个子 Chunk 都标成 1..2 | `ChunkPart` 新增 `page_start/page_end`，`_piece_parts` / `_assemble` / `_split_draft` / `_draft_from_parts` 全链路携带；`_assemble` 的页码只取正文片段、Overlap 前缀页码置 `None`；`_draft_from_parts` 只按本组真实正文片段求 min/max，页码缺失保持 `None`，不推测、不继承 |
+
+### 11.2 修改文件
+
+| 文件 | 变更 |
+|---|---|
+| `backend/aiive/knowledge/chunker.py` | `ChunkPart` 增加 `page_start/page_end`；`_pack_parts` 拒绝纯上下文组；`_split_draft` / `_piece_parts` / `_assemble` / `_draft_from_parts` 传递并按正文片段汇总页码；`overlap_piece` 上下文页码置 `None`；`CHUNKER_VERSION = structure_recursive_v4`；模块文档补来源定位与兜底约束 |
+| `tests/unit/backend/test_chunker_fallback.py` | 新增 16 例独立回归（纯上下文与上下文舍弃语义 9 例 + 页码映射 7 例），其中 2 例由真实 `chunk_blocks` 产出 draft 后收紧预算再次进入兜底形成端到端验证，1 例确定性穷举片段形状校验「行号 / 页码 / context_tokens 三者同源」 |
+| `docs/architecture/knowledge_structure_chunking.md` | 版本升 v4、来源定位补页码链路与「上下文不能独立成 Chunk」、V61.3 存量数据影响、测试清单 |
+| `docs/CODE_MAP.md` | 图谱同步 `chunker.py` 版本号、`ChunkPart` 页码字段、新测试文件 |
+| `docs/reports/2026-11-03_V61_structure_chunking_report.md` | 本节 |
+
+未改动：`blocks.py`（`PARSER_VERSION` 仍为 `structure_v2`）、`ingestor.py`、
+`chunk_vectors.py`、`maintenance.py`、`db/models.py`、Alembic 迁移、检索侧代码。
+
+### 11.3 实测输出（真实运行）
+
+| 场景 | 输入 | 修复前 | 修复后 |
+|---|---|---|---|
+| Overlap + 正文恰好达到预算 | 上下文 60 tokens + 正文 700 tokens，`max=700` | 2 块：60（纯上下文，`context_tokens=60`，行号 0-0）/ 700（正文） | 1 块：700（正文，`context_tokens=0`，行号 1-10） |
+| 多个连续 context 片段 | 40 + 40 tokens 上下文 + 700 tokens 正文 | 1 块纯上下文 + 1 块正文 | 1 块：700（正文，上下文全部舍弃） |
+| 跨页 PDF 兜底拆分 | 2 页各 350 tokens，`max=400`，draft 标记 1..2 | 2 块均为 `page 1..2` | 2 块：`page 1..1` / `page 2..2`，各自只含本页正文 |
+| 单页 PDF 超长内容 | 1 页 800 tokens | 拆分后仍为 `page 1..1` | 拆分后仍为 `page 1..1` |
+| 上下文来自前一页 | 上下文 page 1 + 正文 page 2 | 页码被并入来源范围 | 页码 `2..2`，行号 5-8 / 9-11 |
+| 真实链路 + 收紧预算（Overlap） | `chunk_blocks` 产出「60 上下文 + 400 正文」draft，`max` 收紧到 400 后入兜底 | 2 块：60（纯上下文）/ 400（正文） | 1 块：400（正文，`context_tokens=0`，行号 4-4），正文 400 字不丢 |
+| 真实链路 + 收紧预算（跨页） | `chunk_blocks` 产出 400 tokens、`page 1..2` 的合并 Chunk，`max` 收紧到 250 后入兜底 | 2 块均为 `page 1..2` | 2 块：`page 1..1` / `page 2..2`，各 200 tokens |
+
+### 11.4 版本与存量数据影响
+
+`CHUNKER_VERSION` 由 `structure_recursive_v3` 升到 `structure_recursive_v4`
+（`PARSER_VERSION` 不变）。触发原因是兜底拆分的输出可能变化：不再产生纯 Overlap
+Chunk、跨页拆分后页码按真实正文片段重算。正常切分路径输出不变；存量文档仍按既有
+约定由 `_chunking_stale` 判为落后并按批重建，使存档页码与上下文口径和代码一致。
+数据库 schema 与 Alembic 迁移均无变化，不需要新迁移；重建期间检索仍可用。
+
+### 11.5 验证命令与结果
+
+| 命令 | 结果 |
+|---|---|
+| `pytest tests/unit/backend/test_chunker_fallback.py -q` | 16 passed |
+| `pytest tests/unit/backend/test_chunker_correctness.py tests/unit/backend/test_chunker_boundaries.py tests/unit/backend/test_chunker_fallback.py tests/unit/backend/test_structure_chunking.py tests/unit/backend/test_structure_chunking_migration.py -q` | 86 passed（V61.1 / V61.2 全部保持通过） |
+| `pytest tests/unit -q` | 1193 passed, 47 warnings（186.81s，EXIT=0） |
+| `pytest -q`（全量） | **1575 passed, 53 skipped, 52 warnings**（234.91s，EXIT=0；PG / 本地 Embedding 专项按默认跳过） |
+| `ruff check backend/aiive/knowledge/chunker.py tests/unit/backend/test_chunker_fallback.py` / `ruff check backend/aiive --select F,E9` | All checks passed |
+| `basedpyright backend/aiive/knowledge/chunker.py` / `basedpyright backend` | 0 errors, 0 warnings, 0 notes |
+| 变异验证（临时还原 HEAD 的 `chunker.py` 后运行新测试） | 11 failed / 5 passed；还原修复版后 16 passed。失败项正是纯上下文 Chunk 与跨页页码两类缺陷，含 2 例真实 `chunk_blocks` 端到端用例与 1 例不变量穷举 |
+
+**回归有效性**：修复前 `test_overlap_plus_body_at_budget_drops_context`、
+`test_multiple_context_parts_never_form_a_chunk`、`test_context_only_parts_produce_no_group`、
+`test_real_pipeline_overlap_draft_forced_into_fallback`、
+`test_real_pipeline_cross_page_draft_forced_into_fallback` 及 5 个页码用例全部失败，
+说明新测试确实覆盖缺陷，而非只跟着新实现走。后两个用例直接取 `chunk_blocks` 的真实
+产出（带 60-token Overlap 的 draft / 跨页 1..2 的 draft），收紧 `max_chunk_tokens`
+后再次送入 `_enforce_budget`，覆盖「真实摄取链路 → 兜底拆分」完整路径。
+
+### 11.6 剩余风险
+
+1. **兜底路径是防御网**：正常 `_pack` 已在加入 Overlap 前校验 `prefix + 正文 <= max`，
+   `_split_table` / `_split_code` 也保证输出 `<= max`，因此本次两处缺陷主要在
+   `_enforce_budget` 被显式喂入超限 draft（或未来新增切分分支）时显现；回归测试直接
+   驱动该路径，避免依赖不可达的组合条件。
+2. **上下文页码按设计置 `None`**：Overlap 文本来自上一 Chunk，当前片段不掌握其精确
+   页码，因此既不伪造也不计入来源范围；若将来需要「上下文页码」字段需单独引入。
+3. **片段缺页时不再继承 draft 页码**：`draft.parts` 存在但片段本身无页码时输出
+   `page_start/page_end = None`（不推测）。真实链路的片段均由 Block 携带页码，不受影响。
+4. **版本升级触发全量重建**：与 V61.1 / V61.2 一致，v4 会让存量文档分批重建；重建
+   完成前，旧 Chunk 的页码范围与上下文口径可能仍是旧规则产物。
+5. **token 仍是估算口径**：`count_tokens` 是启发式估算，模型侧真实 token 数可能不同。
+
 

@@ -99,7 +99,7 @@ NUL + occurrence)` 前 16 位，`occurrence` 是该标题路径在**本文档内
 * **Overlap**：只在同一 Section 的相邻文本 Chunk 之间、且只在句子边界取尾部；
   代码与表格前后不做 Overlap。
 
-`CHUNKER_VERSION = "structure_recursive_v3"` 随切分规则变化递增。
+`CHUNKER_VERSION = "structure_recursive_v4"` 随切分规则变化递增。
 
 ### 来源定位
 
@@ -113,15 +113,21 @@ Chunk 的行号由该区间换算得到，因此**一个 Block 被拆成多个 C
   `_split_code` 的函数边界分支统一 rebase 一次，禁止「内部加一次、返回时再加一次」
   （V61.2 修复的重复累加缺陷）；
 * 表格按行拆开时，数据行片段指向真实数据行，复制出来的表头不计入区间；
-* PDF 文本按页切块，拆分不改变 `page_start / page_end`；
+* PDF 文本按页切块，每个 Block 自带 `page_start / page_end`；`ChunkPart` 也逐片段
+  携带页码，跨页合并成的 Chunk 被兜底拆分后，各子 Chunk 只汇总**自己保留的真实正文
+  片段**的页码，不继承原 Chunk 的整段页码范围；页码缺失时保持 `None`，不推测；
 * 多个 Block 合并成一个 Chunk 时，取首个片段起点与末个片段终点，不把中间的间隔算进来；
 * **Overlap 前缀是上下文**：它由上一 Chunk 的尾部复制而来，标记为 `context=True`，
   只累加 `context_tokens`，不参与 `line_start / line_end` 汇总，因此不会把本 Chunk 的
   来源伪装成上一段的位置；重复的表格表头同理。
 * **兜底拆分沿用来源片段**：Chunk 落库前还会经过 `_enforce_budget` 统一校验上限。
-  它按 Chunk 自带的 `ChunkPart`（正文 / 行范围 / 是否上下文）重新拆分，而不是把最终
-  正文当成原文重新数换行——因此 Overlap 与重复表头不会被算成本 Chunk 的来源，
-  `context_tokens` 也不会被清零。
+  它按 Chunk 自带的 `ChunkPart`（正文 / 行范围 / 页码 / 是否上下文）重新拆分，而不是把
+  最终正文当成原文重新数换行——因此 Overlap 与重复表头不会被算成本 Chunk 的来源，
+  `context_tokens` 也不会被清零；
+* **上下文不能独立成 Chunk**：`_pack_parts` 只输出含真实正文的组。上下文与紧随其后
+  的正文放不进同一 `max_chunk_tokens` 预算时优先舍弃上下文（正文不丢失、不重复），
+  只含上下文的组直接丢弃，不产生空 Chunk 或纯 Overlap Chunk；`context_tokens` 只统计
+  实际保留下来的上下文。
 
 ### Token 口径
 
@@ -238,6 +244,19 @@ Chunk 的行号由该区间换算得到，因此**一个 Block 被拆成多个 C
 * 重建完成前，旧 Chunk 的内容仍是旧规则产物（表格可能缺空列、代码行号可能偏移），
   检索可用但结构定位不可全信，重建后收敛。
 
+**V61.3 的版本与存量数据影响**：`CHUNKER_VERSION` 由 `structure_recursive_v3` 升到
+`structure_recursive_v4`（`PARSER_VERSION` 不变，仍是 `structure_v2`）。触发原因是兜底
+拆分的输出可能变化：不再产生纯 Overlap Chunk、跨页拆分后的页码按真实正文片段重算。
+正常切分路径（Section 隔离、`section_id`、Overlap、Embedding 输入、Vector Index、历史
+重建逻辑）输出不变，但仍按既有约定触发 `_chunking_stale` 分批重建，使存量 Chunk 的
+页码与上下文口径与代码一致：
+
+* 数据库 schema 与 Alembic 迁移均无变化，不需要新迁移；
+* 重建期间检索仍可用，只有「曾进入兜底拆分」的旧 Chunk 可能存在多余纯上下文块或
+  页码范围偏大，重建完成后收敛；
+* `line_start / line_end`、`context_tokens` 与 `page_start / page_end` 三者同源，都由
+  该 Chunk 实际保留的来源片段计算，互不自相矛盾。
+
 ## 7. 检索
 
 保留现有架构（词法 + 向量 RRF 融合，k=60，各 0.5），只增强命中信息：
@@ -271,6 +290,10 @@ Chunk 的行号由该区间换算得到，因此**一个 Block 被拆成多个 C
 * `tests/unit/backend/test_chunker_boundaries.py`：V61.2 边界回归——后续函数中超长
   代码行的行号、兜底拆分保留 `ChunkPart` 来源与 `context_tokens`、空单元格在表格
   拆分中的保留与列结构完整性；
+* `tests/unit/backend/test_chunker_fallback.py`：V61.3 兜底正确性回归——不产生纯
+  Overlap Chunk、上下文被舍弃后正文与行号完整、单页/跨页 PDF 兜底拆分的页码定位、
+  上下文页码不混入来源范围、Token 上限与「每个 Chunk 都含真实正文」不变量；含 2 例
+  由真实 `chunk_blocks` 产出 draft 后收紧预算再次进入 `_enforce_budget` 的端到端用例；
 * `tests/unit/backend/test_structure_chunking_migration.py`：空库升级、存量库补列与
   降级回滚（数据不丢、默认值正确）；
 * `tests/integration/pg/test_pg_structure_chunking.py`：真实 PG + pgvector 上的
