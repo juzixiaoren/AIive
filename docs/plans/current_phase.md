@@ -871,3 +871,13 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - 迁移链：HEAD 由 `b8d2e6f4a1c7` 推进到 `f1a2c3d4e5b6`（纯数据迁移，无 schema 变更）；CODE_MAP 已同步。
 - 验证：Forget 集成测试 65 passed；全量 pytest、Ruff、basedpyright、Alembic upgrade/check 见最终报告；PostgreSQL 专项按环境记录。
 - 遗留风险：宽范围 Scrub 的 JSON 数组匹配、scope/canonical_key 分支、mode 与 selector 契约、多用户边界、Task Runtime / Knowledge 对象与对象存储覆盖、Checkpoint/WorkingState/LLMCall preview 严格内容证明仍为既有审计缺口，不在本次范围。
+
+### Forget 防重抽闭环 / Mode-Selector 契约 / Turn ID 一致性（2026-11-05）
+- 目标：修复 Phase A→Cascade 之间的防重抽漏洞、混合 Evidence 绕过、Mode/Selector 组合不一致、TurnRecord ID 清理不一致；不重写 Saga、不新增模型、不引入新 LLM。
+- 防重抽：`is_tombstone_blocked_reingestion()` 同时检查 active Shield（Event/Memory/Turn 实体 + thread/time_range/scope/canonical_key/all_user_data，应用 cutoff）与 `Tombstone.block_reingestion`；`blocked_target_ids(include_tombstones=False)` 将 Shield 与可见性 Tombstone 解耦，Phase A 后、Cascade 前旧来源即不可重抽，cutoff 后新 Event 不受阻。
+- 混合 Evidence：`write()` / `_write_single_in_transaction()` 改为任一来源被屏蔽即拒绝整个 Proposal；被拒绝 Evidence 不写 `MemoryEvidence` / `ContentProvenanceRef`，Reinforce/Merge/Supersede 无法绕过。
+- Mode/Selector：新增 `validate_selector_combination()`，API/Tool/Phase A 共用；只允许一种选择器；memory_only 仅 memory_ids/canonical_key/scope，history_only 仅 thread/turn_ids/event_ids/time_range；非法组合在创建 Operation 前拒绝。
+- Turn ID：`_normalize_turn_tokens()` 统一 TurnRecord.id/turn_id；依赖发现、子 Event Tombstone、`_scrub_event_turn_targets()` 全部走该入口；`content_purged` 仅在确认无剩余正文后置 True。
+- Verify：要求来源 Event 具备不依赖 active Shield 的持久化 Tombstone（block_visibility+block_reingestion）；event/turn 目标双标志校验；Turn 子 Event 长期 Tombstone 校验；仅活动 Shield 不得落严格 verified。
+- 验证：Forget 集成测试 95 passed；全量 pytest、Ruff（--select F,E9）、basedpyright 0/0、SQLite 专项、PostgreSQL 按环境记录；文档已同步。
+- 遗留风险：宽选择器 `_scrub_wide` 的 JSON 数组匹配与 scope/canonical_key 分支、Checkpoint/WorkingState/LLMCall preview 严格内容证明、Task/Knowledge 对象与对象存储覆盖仍为既有审计缺口。

@@ -21,7 +21,10 @@ from aiive.db.forget_models import (
     ForgetTarget,
 )
 from aiive.forget.phase_a_shield import execute_phase_a_shield
-from aiive.forget.selector_normalizer import MAX_INLINE_SHIELD_TARGETS
+from aiive.forget.selector_normalizer import (
+    MAX_INLINE_SHIELD_TARGETS,
+    validate_selector_combination,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,18 +84,23 @@ def handle_forget(
     # 优先使用 RunContext 的 trace_id；否则回退到 requested_by；再否则生成一次性标识
     effective_requested_by = (ctx.trace_id if ctx else None) or requested_by or f"forget:{_new_api_id()}"
 
-    # 参数校验
-    has_explicit = bool(memory_ids or turn_ids or event_ids)
-    has_wide = bool(
-        thread_id or canonical_key or (scope_type and scope_id)
-        or all_user_data or time_from or time_to
-    )
-
-    if not has_explicit and not has_wide:
-        return {"ok": False, "error": "至少需要指定目标: memory_ids / turn_ids / event_ids / thread_id / canonical_key / scope / all_user_data"}
-
-    if mode not in ("memory_only", "history_only", "everywhere"):
-        return {"ok": False, "error": f"mode 必须是 memory_only / history_only / everywhere，收到: {mode}"}
+    # 参数校验：与 API / Phase A 共用 Mode / Selector 兼容矩阵。
+    try:
+        validate_selector_combination(
+            mode,
+            memory_ids=memory_ids,
+            turn_ids=turn_ids,
+            event_ids=event_ids,
+            thread_id=thread_id or None,
+            canonical_key=canonical_key or None,
+            scope_type=scope_type or None,
+            scope_id=scope_id or None,
+            time_from=time_from,
+            time_to=time_to,
+            all_user_data=all_user_data,
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
 
     # 超限预警
     total_ids = len(memory_ids or []) + len(turn_ids or []) + len(event_ids or [])

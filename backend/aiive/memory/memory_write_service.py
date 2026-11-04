@@ -248,20 +248,27 @@ class MemoryWriteService:
             self._persist_proposal(proposal, gate_decision, final_op="reject")
             return WriteResult(outcome=WriteOutcome.GATE_REJECTED, reason=gate_decision.reason)
 
-        # 1.5. Phase 6A: 防重抽检查（tombstone.block_reingestion）
+        # 1.5. Phase 6A: 防重抽检查（active Shield + tombstone.block_reingestion）
         # write_batch 异步抽取路径同样必须拦截，避免被忘事实从被屏蔽旧源事件重建。
+        # fail-closed：只要 Proposal 含任一被屏蔽来源，即拒绝整个 Proposal；
+        # 被拒绝的 Evidence 不会写入 MemoryEvidence / ContentProvenanceRef，
+        # 也不会经 Reinforce / Merge / Supersede 等分支绕过。
         if proposal.evidence:
             blocked_events: set[str] = set()
             for ev in proposal.evidence:
                 if ev.source_event_id and ForgetVisibilityService.is_tombstone_blocked_reingestion(
-                    self._db, source_event_id=ev.source_event_id,
+                    self._db,
+                    source_event_id=ev.source_event_id,
+                    source_turn_record_id=proposal.source_turn_record_id or None,
                 ):
                     blocked_events.add(ev.source_event_id)
-            all_events = {ev.source_event_id for ev in proposal.evidence if ev.source_event_id}
-            if all_events and all_events == blocked_events:
+            if blocked_events:
                 return WriteResult(
                     outcome=WriteOutcome.GATE_REJECTED,
-                    reason="Reingestion blocked: all source events are tombstone-blocked",
+                    reason=(
+                        "Reingestion blocked: proposal contains shielded/"
+                        "tombstone-blocked source evidence"
+                    ),
                 )
 
         # 1.6. 语义冲突待确认：只建案例（含提案审计行 + 澄清问题任务），
@@ -411,21 +418,26 @@ class MemoryWriteService:
                 reason=f"Gate rejected: {gate_decision.reason}",
             )
 
-        # 1.5. Phase 6A: 防重抽检查（tombstone.block_reingestion）
+        # 1.5. Phase 6A: 防重抽检查（active Shield + tombstone.block_reingestion）
+        # fail-closed：只要 Proposal 含任一被屏蔽来源，即拒绝整个 Proposal；
+        # 被拒绝的 Evidence 不会写入 MemoryEvidence / ContentProvenanceRef，
+        # 也不会经 Reinforce / Merge / Supersede 等分支绕过。
         if proposal.evidence:
             blocked_events: set[str] = set()
             for ev in proposal.evidence:
-                if ev.source_event_id:
-                    if ForgetVisibilityService.is_tombstone_blocked_reingestion(
-                        self._db, source_event_id=ev.source_event_id,
-                    ):
-                        blocked_events.add(ev.source_event_id)
-            # 所有 evidence 都来自 blocked source → 拒绝
-            all_events = {ev.source_event_id for ev in proposal.evidence if ev.source_event_id}
-            if all_events and all_events == blocked_events:
+                if ev.source_event_id and ForgetVisibilityService.is_tombstone_blocked_reingestion(
+                    self._db,
+                    source_event_id=ev.source_event_id,
+                    source_turn_record_id=proposal.source_turn_record_id or None,
+                ):
+                    blocked_events.add(ev.source_event_id)
+            if blocked_events:
                 return WriteResult(
                     outcome=WriteOutcome.GATE_REJECTED,
-                    reason="Reingestion blocked: all source events are tombstone-blocked",
+                    reason=(
+                        "Reingestion blocked: proposal contains shielded/"
+                        "tombstone-blocked source evidence"
+                    ),
                 )
 
         # 2. Acquire advisory lock (hash of canonical_key + scope)

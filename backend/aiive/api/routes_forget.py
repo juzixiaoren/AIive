@@ -9,7 +9,10 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, model_validator
 
-from aiive.forget.selector_normalizer import MAX_INLINE_SHIELD_TARGETS
+from aiive.forget.selector_normalizer import (
+    MAX_INLINE_SHIELD_TARGETS,
+    validate_selector_combination,
+)
 from aiive.tools.forget_tool import handle_forget, handle_forget_status
 
 router = APIRouter(prefix="/api/forget", tags=["forget"])
@@ -33,24 +36,20 @@ class ForgetRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_selector(self) -> "ForgetRequest":
-        """校验选择器组合与时间范围。"""
-        if bool(self.scope_type) != bool(self.scope_id):
-            raise ValueError("scope_type 与 scope_id 必须同时提供")
-        if self.time_from and self.time_to and self.time_from > self.time_to:
-            raise ValueError("time_from 不能晚于 time_to")
-        has_selector = bool(
-            self.memory_ids
-            or self.turn_ids
-            or self.event_ids
-            or self.thread_id
-            or self.canonical_key
-            or (self.scope_type and self.scope_id)
-            or self.all_user_data
-            or self.time_from
-            or self.time_to
+        """校验 Mode / Selector 兼容矩阵与时间范围（与 Tool / Phase A 共用规则）。"""
+        validate_selector_combination(
+            self.mode,
+            memory_ids=self.memory_ids,
+            turn_ids=self.turn_ids,
+            event_ids=self.event_ids,
+            thread_id=self.thread_id or None,
+            canonical_key=self.canonical_key or None,
+            scope_type=self.scope_type or None,
+            scope_id=self.scope_id or None,
+            time_from=self.time_from,
+            time_to=self.time_to,
+            all_user_data=self.all_user_data,
         )
-        if not has_selector:
-            raise ValueError("至少需要提供一种遗忘选择器")
         return self
 
 

@@ -755,3 +755,17 @@ Phase 6B（Retention / vacuum / 长期混沌）见 `phase_6B.md`。
 6. **Verifier**：校验 Memory 来源 Event 屏蔽覆盖、新 Summary 不引用被屏蔽 Event、`memory_only` 未误清原文、`history_only` / `everywhere` 清理完成；无法证明完整性不得标记严格 `verified`。
 
 验收补充：新增/修改集成测试覆盖上述链路（含真实 `_try_generate_summary()` 调用链）；全量 pytest、Ruff、basedpyright（0 errors / 0 warnings）、Alembic upgrade/check 无漂移；PostgreSQL 专项按环境可用性记录，不得冒充通过。
+
+
+## 实现补记（二）：防重抽闭环、Mode/Selector 契约与 Turn ID 一致性
+
+本节记录 2026-11-05 的定向修复，不重写 Saga、不新增数据模型、不引入新 LLM 调用。
+
+1. **防重抽同时检查活动 Shield**：`ForgetVisibilityService.is_tombstone_blocked_reingestion()` 在原有 `Tombstone.block_reingestion` 之外，增加 active Shield 判定：来源 Event 实体 Shield、关联 MemoryRecord 实体 Shield（经 `ContentProvenanceRef`）、TurnRecord Shield（`id` / `turn_id` 双语义）、以及 thread / time_range / scope / canonical_key / all_user_data 选择器 Shield，并应用 `cutoff_created_at`。Shield 与 Tombstone 的 `block_visibility` / `block_reingestion` 语义保持独立：`blocked_target_ids(..., include_tombstones=False)` 只评估 Shield，不把可见性 Tombstone 当作防重抽依据。Phase A 生效后、Cascade 未运行前旧来源即不能重抽；cutoff 之后的新 Event 不受影响。
+2. **混合 Evidence fail-closed**：`MemoryWriteService.write()` 与 `_write_single_in_transaction()` 改为只要 Proposal 含任一被屏蔽来源就拒绝整个 Proposal；被拒绝的 Evidence 不写 `MemoryEvidence` / `ContentProvenanceRef`，Reinforce / Merge / Supersede / 强制决策等分支均在检查之后，无法绕过。
+3. **严格 Mode / Selector 矩阵**：`selector_normalizer.validate_selector_combination()` 成为 API、Tool、Phase A 共用的唯一校验入口。要求必须且只能提供一种独立选择器；`memory_only` 仅允许 memory_ids / canonical_key / scope，`history_only` 仅允许 thread / turn_ids / event_ids / time_range，`everywhere` 允许全部。非法组合在创建 ForgetOperation 之前拒绝，不再静默忽略多余参数。
+4. **TurnRecord ID 统一**：`handlers_forget._normalize_turn_tokens()` 把 `TurnRecord.id` 与 `turn_id` 任一输入展开为 token 集合；依赖发现、子 Event Tombstone 派生、`_scrub_event_turn_targets()` 的 Turn 行与子 Event 正文清理统一使用该入口。`content_purged` 仅在列查询确认 Turn / 子 Event 已无非空正文后才置 True，避免 ID 不匹配时误报清理完成。
+5. **Verify 加强**：除既有屏蔽覆盖与 Summary 引用检查外，新增（a）来源 Event 必须存在不依赖 active Shield 的持久化保护（event / turn_record / memory_record Tombstone 且同时 `block_visibility` 与 `block_reingestion`）；（b）event / turn 目标 Tombstone 必须同时具备两种标志；（c）Turn 目标下全部子 Event 必须获得长期 Event Tombstone。只有活动 Shield、没有持久化保护时不得落严格 `verified`。
+6. **测试**：新增覆盖宽选择器 Phase A 后旧 Event 重抽阻断、>100 memory_ids、canonical_key / scope / thread / time_range / all_user_data、cutoff 后新 Event、全量与部分 Evidence 屏蔽、被屏蔽 Evidence 不落库、Mode / Selector 合法与非法组合、多选择器拒绝、TurnRecord.id / turn_id 双输入清理、content_purged 真实性、Shield-only Verify 失败、Shield 退休后可见性与重抽仍被阻断。
+
+验收：Forget 集成测试 95 passed；全量 pytest、Ruff（CI 门禁 `--select F,E9`）、basedpyright 0 errors / 0 warnings 见最终报告；PostgreSQL 专项按环境记录，不冒充通过。

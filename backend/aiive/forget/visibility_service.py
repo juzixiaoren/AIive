@@ -128,6 +128,8 @@ class ForgetVisibilityService:
         session: Session,
         target_type: str,
         id_time_pairs: list[tuple[str, Any]],
+        *,
+        include_tombstones: bool = True,
     ) -> set[str]:
         """批量返回被 Shield（实体级/选择器级/all_user_data）或 Tombstone 屏蔽的 ID。
 
@@ -295,12 +297,15 @@ class ForgetVisibilityService:
                             blocked.add(m["id"])
                             break
 
-        # 3) Tombstone block_visibility
-        blocked.update(
-            ForgetVisibilityService.batch_is_tombstone_blocked(
-                session, target_type, ids
+        # 3) Tombstone block_visibility（防重抽判定时排除：Tombstone 的
+        #    block_visibility 与 block_reingestion 是独立语义，不能把可见性
+        #    屏蔽混作防重抽依据）
+        if include_tombstones:
+            blocked.update(
+                ForgetVisibilityService.batch_is_tombstone_blocked(
+                    session, target_type, ids
+                )
             )
-        )
 
         # 4/5) Event 扩展规则（仅 target_type == "event"）：
         #   - 所属 TurnRecord 被 Shield/Tombstone 屏蔽的全部子 Event；
@@ -311,10 +316,14 @@ class ForgetVisibilityService:
         #   仅在 target_type == "event" 时做本扩展，故不会递归。
         if target_type == "event":
             blocked.update(
-                ForgetVisibilityService._turn_blocked_event_ids(session, ids)
+                ForgetVisibilityService._turn_blocked_event_ids(
+                    session, ids, include_tombstones=include_tombstones,
+                )
             )
             blocked.update(
-                ForgetVisibilityService._source_memory_blocked_event_ids(session, ids)
+                ForgetVisibilityService._source_memory_blocked_event_ids(
+                    session, ids, include_tombstones=include_tombstones,
+                )
             )
 
         return blocked
@@ -429,8 +438,18 @@ class ForgetVisibilityService:
         return result
 
     @staticmethod
-    def _turn_blocked_event_ids(
+    def turn_tokens_by_event(
         session: Session, event_ids: list[str],
+    ) -> dict[str, set[str]]:
+        """公开入口：返回每个 Event 对应的 Turn 标识 token 集合。
+
+        供 Verify / 防重抽等跨模块判定使用，避免直接依赖私有实现。
+        """
+        return ForgetVisibilityService._turn_tokens_by_event(session, event_ids)
+
+    @staticmethod
+    def _turn_blocked_event_ids(
+        session: Session, event_ids: list[str], *, include_tombstones: bool = True,
     ) -> set[str]:
         """返回所属 TurnRecord 被 Shield / Tombstone 屏蔽的 Event id 集合。
 
@@ -455,13 +474,15 @@ class ForgetVisibilityService:
                 ForgetShield.target_id.in_(all_tokens),
             ).all() if r[0]
         }
-        tombstoned = {
-            r[0] for r in session.query(ForgetTombstone.target_id).filter(
-                ForgetTombstone.target_type == "turn_record",
-                ForgetTombstone.target_id.in_(all_tokens),
-                ForgetTombstone.block_visibility.is_(True),
-            ).all() if r[0]
-        }
+        tombstoned: set[str] = set()
+        if include_tombstones:
+            tombstoned = {
+                r[0] for r in session.query(ForgetTombstone.target_id).filter(
+                    ForgetTombstone.target_type == "turn_record",
+                    ForgetTombstone.target_id.in_(all_tokens),
+                    ForgetTombstone.block_visibility.is_(True),
+                ).all() if r[0]
+            }
         blocked_tokens = shielded | tombstoned
         if not blocked_tokens:
             return set()
@@ -472,7 +493,7 @@ class ForgetVisibilityService:
 
     @staticmethod
     def _source_memory_blocked_event_ids(
-        session: Session, event_ids: list[str],
+        session: Session, event_ids: list[str], *, include_tombstones: bool = True,
     ) -> set[str]:
         """返回「作为被屏蔽 MemoryRecord 来源」的 Event id 集合。
 
@@ -504,6 +525,7 @@ class ForgetVisibilityService:
             mem_ids.add(owner_id)
         blocked_memories = ForgetVisibilityService.blocked_target_ids(
             session, "memory_record", [(m, None) for m in mem_ids],
+            include_tombstones=include_tombstones,
         )
         if not blocked_memories:
             return set()
@@ -571,6 +593,52 @@ class ForgetVisibilityService:
             source_turn_record_id: 来源 Turn ID
             canonical_key: 内容 canonical_key
         """
+        # 1) 活动 Shield：Phase A 生效后、Cascade 尚未运行前即必须阻断重抽。
+        #    Shield 没有 block_visibility / block_reingestion 之分，active 即同时
+        #    承担可见性屏蔽与防重抽；Tombstone.block_reingestion 仍是独立的长期
+        #    依据（见下方查询），两者不得互相替代。
+        if source_event_id and ForgetVisibilityService.blocked_target_ids(
+            session,
+            "event",
+            [(source_event_id, None)],
+            include_tombstones=False,
+        ):
+            return True
+        if source_turn_record_id:
+            from aiive.db.models import Event, TurnRecord
+
+            tokens: set[str] = {source_turn_record_id}
+            tr_rows = session.query(TurnRecord.id, TurnRecord.turn_id).filter(
+                or_(
+                    TurnRecord.id == source_turn_record_id,
+                    TurnRecord.turn_id == source_turn_record_id,
+                )
+            ).all()
+            for tr_id, tr_turn_id in tr_rows:
+                if tr_id:
+                    tokens.add(tr_id)
+                if tr_turn_id:
+                    tokens.add(tr_turn_id)
+            entity_hit = session.query(ForgetShield.id).filter(
+                ForgetShield.status == "active",
+                ForgetShield.target_type == "turn_record",
+                ForgetShield.target_id.in_(tokens),
+            ).first()
+            if entity_hit is not None:
+                return True
+            turn_event_ids = [
+                r[0] for r in session.query(Event.id).filter(
+                    Event.turn_id.in_(tokens),
+                ).all()
+            ]
+            if turn_event_ids and ForgetVisibilityService.blocked_target_ids(
+                session,
+                "event",
+                [(eid, None) for eid in turn_event_ids],
+                include_tombstones=False,
+            ):
+                return True
+
         q = session.query(ForgetTombstone.id).filter(
             ForgetTombstone.block_reingestion.is_(True),
         )

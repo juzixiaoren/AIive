@@ -81,6 +81,32 @@ def _selector_target_type(selector_type: str) -> str:
     return _SELECTOR_TARGET_TYPE.get(selector_type, "memory_record")
 
 
+def _normalize_turn_tokens(db: Session, turn_ids: list[str]) -> set[str]:
+    """把 TurnRecord.id / turn_id 两种输入统一展开为可匹配的 token 集合。
+
+    Phase A 可能收到 TurnRecord 数据库主键（id）或业务逻辑 turn_id；Event.turn_id
+    只与后者同名关联。这里按任一 token 反查 TurnRecord，并同时返回 id 与 turn_id，
+    保证依赖发现、子 Event Tombstone 与正文清理都不依赖调用方使用哪一种 ID。
+    """
+    from sqlalchemy import or_
+
+    tokens = {tid for tid in turn_ids if tid}
+    if not tokens:
+        return tokens
+    rows = db.query(TurnRecord.id, TurnRecord.turn_id).filter(
+        or_(
+            TurnRecord.id.in_(tokens),
+            TurnRecord.turn_id.in_(tokens),
+        )
+    ).all()
+    for tr_id, tr_turn_id in rows:
+        if tr_id:
+            tokens.add(tr_id)
+        if tr_turn_id:
+            tokens.add(tr_turn_id)
+    return tokens
+
+
 def _summaries_containing_event(db: Session, ev_id: str) -> list[SegmentSummary]:
     """按 source_event_ids 包含关系查 SegmentSummary（方言兼容）。
 
@@ -471,8 +497,9 @@ def _write_tombstones_for_targets(db: Session, operation_id: str) -> None:
     # ── 由 event/turn 派生 memory_record 目标（cascade：派生记忆也要遗忘） ──
     derived_event_ids = list(event_target_ids)
     if turn_target_ids:
+        turn_tokens = _normalize_turn_tokens(db, turn_target_ids)
         turn_event_rows = db.query(Event.id).filter(
-            Event.turn_id.in_(turn_target_ids),
+            Event.turn_id.in_(turn_tokens),
         ).all()
         derived_event_ids.extend(r[0] for r in turn_event_rows)
     if derived_event_ids:
@@ -724,9 +751,10 @@ def _discover_for_target(
     elif target_type == "event":
         src_event_ids = [target_id]
     elif target_type == "turn_record":
+        turn_tokens = _normalize_turn_tokens(db, [target_id])
         src_event_ids = [
             r[0] for r in db.query(Event.id).filter(
-                Event.turn_id == target_id,
+                Event.turn_id.in_(turn_tokens),
             ).all()
         ]
 
@@ -1505,21 +1533,53 @@ def _scrub_event_turn_targets(db: Session, operation_id: str) -> None:
         db.execute(sa_text(
             "UPDATE events SET payload = '{}' WHERE id IN :ids"
         ).bindparams(ids_bind), {"ids": event_ids})
-    if turn_ids:
-        # turn 选择器的 ID 语义为 TurnRecord.turn_id（Event.turn_id 同名关联），
-        # 同时兼容直接传 turn_records.id 的旧数据。
+    turn_tokens = _normalize_turn_tokens(db, turn_ids) if turn_ids else set()
+    if turn_tokens:
+        token_list = sorted(turn_tokens)
+        # 同时兼容 TurnRecord.id 与逻辑 turn_id：Turn 行两种列都匹配。
         db.execute(sa_text(
             "UPDATE turn_records SET response_payload = NULL "
             + "WHERE turn_id IN :ids OR id IN :ids"
-        ).bindparams(ids_bind), {"ids": turn_ids})
-        # 该 turn 下的事件正文一并清除
+        ).bindparams(ids_bind), {"ids": token_list})
+        # 该 Turn 下全部子 Event 的正文一并清除（Event.turn_id 只匹配逻辑 id）。
         db.execute(sa_text(
             "UPDATE events SET payload = '{}' WHERE turn_id IN :ids"
-        ).bindparams(ids_bind), {"ids": turn_ids})
+        ).bindparams(ids_bind), {"ids": token_list})
+
+    # content_purged 必须以「实际完成内容清理」为依据：仅当 Tombstone 覆盖的
+    # Event / Turn 已不存在非空正文时才置 True，否则保持 False（fail-closed）。
+    def _turn_fully_cleared(tid: str) -> bool:
+        toks = _normalize_turn_tokens(db, [tid])
+        if not toks:
+            return True
+        tok_list = sorted(toks)
+        from sqlalchemy import or_ as _or
+        # 用列查询直接读库，避免 raw UPDATE 后 ORM identity map 返回旧值。
+        tr_payloads = [
+            r[0] for r in db.query(TurnRecord.response_payload).filter(
+                _or(TurnRecord.id.in_(tok_list), TurnRecord.turn_id.in_(tok_list))
+            ).all()
+        ]
+        if any((p or {}) for p in tr_payloads):
+            return False
+        ev_payloads = [
+            r[0] for r in db.query(Event.payload).filter(
+                Event.turn_id.in_(tok_list)
+            ).all()
+        ]
+        return all(not (p or {}) for p in ev_payloads)
 
     for t in tombs:
-        t.content_purged = True
-        t.purged_at = now
+        if t.target_type == "event":
+            eid = t.source_event_id or t.target_id
+            row = db.query(Event.payload).filter(Event.id == eid).first() if eid else None
+            done = row is None or not (row[0] or {})
+        else:
+            tid = t.source_turn_record_id or t.target_id
+            done = _turn_fully_cleared(tid) if tid else True
+        if done:
+            t.content_purged = True
+            t.purged_at = now
     db.flush()
 
 
@@ -1757,6 +1817,67 @@ def _scrub_wide(db: Session, operation_id: str) -> None:
 # ═══════════════════════════════════════════════════════════════════
 
 
+def _has_persistent_source_event_protection(db: Session, event_id: str) -> bool:
+    """来源 Event 是否具备不依赖 active Shield 的长期保护。
+
+    覆盖三种持久化 Tombstone：
+      - 直接 event Tombstone（target_id / source_event_id 命中）；
+      - 覆盖该 Event 的 turn_record Tombstone（TurnRecord.id / turn_id 任一语义）；
+      - 该 Event 作为来源的 memory_record Tombstone（经 ContentProvenanceRef）。
+    三者均须同时 block_visibility=True 与 block_reingestion=True。
+    """
+    from sqlalchemy import or_
+
+    from aiive.forget.visibility_service import ForgetVisibilityService
+
+    flags = (
+        ForgetTombstone.block_visibility.is_(True),
+        ForgetTombstone.block_reingestion.is_(True),
+    )
+    direct = db.query(ForgetTombstone.id).filter(
+        ForgetTombstone.target_type == "event",
+        or_(
+            ForgetTombstone.target_id == event_id,
+            ForgetTombstone.source_event_id == event_id,
+        ),
+        *flags,
+    ).first()
+    if direct is not None:
+        return True
+
+    turn_tokens = ForgetVisibilityService.turn_tokens_by_event(
+        db, [event_id]
+    ).get(event_id, set())
+    if turn_tokens:
+        turn_hit = db.query(ForgetTombstone.id).filter(
+            ForgetTombstone.target_type == "turn_record",
+            or_(
+                ForgetTombstone.target_id.in_(turn_tokens),
+                ForgetTombstone.source_turn_record_id.in_(turn_tokens),
+            ),
+            *flags,
+        ).first()
+        if turn_hit is not None:
+            return True
+
+    mem_ids = {
+        r[0] for r in db.query(ContentProvenanceRef.owner_id).filter(
+            ContentProvenanceRef.owner_type == "memory_record",
+            ContentProvenanceRef.source_type == "event",
+            ContentProvenanceRef.source_id == event_id,
+        ).all() if r[0]
+    }
+    if mem_ids:
+        mem_hit = db.query(ForgetTombstone.id).filter(
+            ForgetTombstone.target_type == "memory_record",
+            ForgetTombstone.target_id.in_(mem_ids),
+            *flags,
+        ).first()
+        if mem_hit is not None:
+            return True
+    return False
+
+
 def _verify_source_event_integrity(
     db: Session, operation_id: str, op: ForgetOperation, memory_ids: list[str],
 ) -> list[str]:
@@ -1792,6 +1913,18 @@ def _verify_source_event_integrity(
         missed = [eid for eid in src_ids if eid not in blocked]
         if missed:
             failures.append(f"{len(missed)} memory source events not shielded")
+
+        # (1b) 持久化保护：Verify 不能只依赖 active Shield。Shield 在成功后会
+        #      retire，因此必须证明每个来源 Event 仍有 Tombstone 同时承担
+        #      block_visibility（退休后不可见）与 block_reingestion（退休后不可重抽）。
+        persistent_missed = [
+            eid for eid in src_ids
+            if not _has_persistent_source_event_protection(db, eid)
+        ]
+        if persistent_missed:
+            failures.append(
+                f"{len(persistent_missed)} source events lack persistent tombstone protection"
+            )
 
         # (2) mode 内容语义：memory_only 保留原文；history_only/everywhere 清理
         ev_by_id = {
@@ -1927,15 +2060,58 @@ def handle_forget_verify(claimed: ClaimedJob) -> HandlerResult:
             typed_ids = [r[0] for r in typed_targets]
             if not typed_ids:
                 continue
-            typed_tombs = {row[0] for row in db.query(ForgetTombstone.target_id).filter(
+            typed_rows = db.query(
+                ForgetTombstone.target_id,
+                ForgetTombstone.block_visibility,
+                ForgetTombstone.block_reingestion,
+            ).filter(
                 ForgetTombstone.forget_operation_id == operation_id,
                 ForgetTombstone.target_type == ttype,
-            ).all()}
+                ForgetTombstone.target_id.in_(typed_ids),
+            ).all()
+            typed_tombs = {row[0] for row in typed_rows}
             typed_missing = [tid for tid in typed_ids if tid not in typed_tombs]
             if typed_missing:
                 failures.append(
                     f"{len(typed_missing)} {ttype} targets missing tombstone"
                 )
+            typed_bad_flags = [
+                row[0] for row in typed_rows if not (row[1] and row[2])
+            ]
+            if typed_bad_flags:
+                failures.append(
+                    f"{len(typed_bad_flags)} {ttype} targets lack persistent visibility/reingestion tombstone"
+                )
+
+        # 3d. Turn 目标下的全部子 Event 必须获得长期 Event Tombstone（Cascade 后），
+        #     否则 Shield 退休后子 Event 仍可能重新进入上下文或被重新抽取。
+        turn_targets = db.query(ForgetTarget.target_id).filter_by(
+            forget_operation_id=operation_id, target_type="turn_record",
+        ).all()
+        turn_target_ids = [r[0] for r in turn_targets]
+        if turn_target_ids:
+            turn_tokens = _normalize_turn_tokens(db, turn_target_ids)
+            child_ids = [
+                r[0] for r in db.query(Event.id).filter(
+                    Event.turn_id.in_(turn_tokens),
+                ).all()
+            ]
+            if child_ids:
+                child_protected = {
+                    r[0] for r in db.query(ForgetTombstone.target_id).filter(
+                        ForgetTombstone.target_type == "event",
+                        ForgetTombstone.target_id.in_(child_ids),
+                        ForgetTombstone.block_visibility.is_(True),
+                        ForgetTombstone.block_reingestion.is_(True),
+                    ).all()
+                }
+                child_missing = [
+                    eid for eid in child_ids if eid not in child_protected
+                ]
+                if child_missing:
+                    failures.append(
+                        f"{len(child_missing)} turn child events lack persistent tombstone"
+                    )
 
         # 3c. Memory 来源 Event 隔离 / Summary 重建完整性（仅窄选择器需证明
         #     严格 verified；宽选择器最终为非严格 verified_with_coarse_purge）。

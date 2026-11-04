@@ -882,7 +882,7 @@ Forget 不是单条 `DELETE`，而是一个“先屏蔽、再发现依赖、重�
 | Knowledge 多用户 ACL | 未发现完整实现 | — | 搜索 SQL 未见 user/workspace ACL 过滤 |
 | Graph Projection / Expansion / Rebuild | 已实现 | 受配置与召回路径影响 | Graph 是 Memory 派生投影 |
 | Memory Extraction / Conflict Confirmation | 已实现 | Turn 后台 Outbox 提取；冲突时进入裁决/确认 | 本文已追踪主链；未逐一枚举所有 mutation 字段 |
-| Forget Saga | 已实现，来源 Event 隔离闭环已补齐 | 用户请求触发 Phase A，后续 Outbox 推进 | 来源 Event 可见性/防重抽/摘要重建/memory_only 保留/Verify 已按 13.11 补齐；宽范围 Scrub 与 Task/Knowledge 对象覆盖仍有审计缺口 |
+| Forget Saga | 已实现，来源 Event 隔离闭环已补齐 | 用户请求触发 Phase A，后续 Outbox 推进 | 来源 Event 可见性/防重抽/摘要重建/memory_only 保留/Verify 已按 13.11 补齐；mode/selector 契约与 Turn ID 清理已按 13.12 补齐；宽范围 Scrub 与 Task/Knowledge 对象覆盖仍有审计缺口 |
 | Persistent Task Runtime | 已实现 | 用户委派或事件唤醒 | 已追踪 Run/Action/Evidence/Checkpoint 主链 |
 | Desktop Unknown Reconciliation | 已实现 | Node journal 回执/缺失报告触发 | 不代表普通 MCP/Shell 也具备同等对账能力 |
 | General External Action Exactly-once | 未能证明 | — | 必须按 capability 单独定义幂等/回执 |
@@ -1499,7 +1499,7 @@ WHERE source_event_ids IN (SELECT id FROM events WHERE thread_id=:tid)
 
 Selector Normalizer 支持 `scope` 与 `canonical_key`，但 `_scrub_wide()` 只按 thread/time/all_user_data 分支。目标级 Memory Scrub 仍会运行，但不能据此认为同一 Scope/Key 相关的全部 Event、Task、Artifact、WorkingState、Summary 等都已被宽范围清理。建议明确每个 Selector 的数据面定义，并增加 scope/canonical_key 的全链路隐私测试。
 
-### F-05：mode 与 selector 组合没有形成严格的服务端契约
+### F-05：mode 与 selector 组合没有形成严格的服务端契约 <badge color="success">已修复，见 13.12</badge>
 
 `mode` 有 `memory_only/history_only/everywhere`，Selector 又有 memory_ids/turn_ids/event_ids/thread/time/scope 等。当前 `normalize_selector()` 主要选择一个 selector_type，没有看到统一的 mode-selector 兼容矩阵校验。`_scrub_wide()` 只看 selector payload 中是否有 thread/time/all_user_data，不看 mode；因此混合传参时，可能出现 mode 文案与实际 Scrub 行为不一致。
 
@@ -1568,6 +1568,24 @@ Forget 的 `TARGET_TYPES` 不包含 `document`、`chunk` 或 `knowledge_chunk_ve
 **测试**：`tests/integration/backend/test_phase6a_forget.py` 覆盖 ProvenanceRef 同事务写入、迁移回填与幂等、memory_only 来源 Event 普通历史隐藏与原文保留、防重抽、everywhere 正文不可恢复、Turn 遗忘先于清理屏蔽全部子 Event、当前与后续 Operation 的 Summary 重建、多 Tombstone 审计 fail-closed、宽选择器 Phase A 不枚举，以及真实 `_try_generate_summary()` 调用链。
 
 **仍未覆盖（既有审计结论）**：F-02（JSON 数组列标量 IN 比较）、F-03/F-04（宽 Scrub 覆盖与 scope 分支）、F-05（mode 与 selector 契约）、F-08~F-10（多用户边界、Task Runtime / Knowledge 对象与对象存储）、F-11/F-12（超大 ID 列表与 operation_key 幂等）、以及 F-07 中 Checkpoint/WorkingState/LLMCall preview 等其余正文承载面的严格内容证明。
+
+---
+
+## 13.12 实现补记：防重抽闭环、Mode/Selector 契约与 Turn ID 一致性
+
+本节记录 2026-11-05 的定向修复，不重写 Saga、不新增模型、不引入新 LLM。
+
+**防重抽**：`ForgetVisibilityService.is_tombstone_blocked_reingestion()` 在 `Tombstone.block_reingestion` 之外增加 active Shield 检查：来源 Event 实体 Shield、关联 MemoryRecord 实体 Shield（沿 `ContentProvenanceRef`）、TurnRecord Shield（`id` / `turn_id` 双语义）、thread / time_range / scope / canonical_key / all_user_data 选择器 Shield，并应用 cutoff。`blocked_target_ids(..., include_tombstones=False)` 让 Shield 判定排除可见性 Tombstone，避免把 `block_visibility` 与 `block_reingestion` 混为一谈。Phase A 成功后、Cascade 运行前，旧来源 Event 已不可被重新抽取；cutoff 之后的新 Event 不受影响。
+
+**混合 Evidence**：`MemoryWriteService.write()` 与 `_write_single_in_transaction()` 改为 fail-closed：Proposal 含任一被屏蔽来源即拒绝整体，不再要求“全部来源被屏蔽”。被拒绝的 Evidence 不写 `MemoryEvidence` / `ContentProvenanceRef`；Reinforce / Merge / Supersede / 用户强制决策都在检查之后，不能绕过。
+
+**Mode/Selector 契约**：`selector_normalizer.validate_selector_combination()` 成为 API、Tool、Phase A 的唯一校验入口。必须且只能提供一种选择器；`memory_only` 仅允许 memory_ids / canonical_key / scope；`history_only` 仅允许 thread / turn_ids / event_ids / time_range；`everywhere` 允许全部。非法组合在创建 `ForgetOperation` 之前拒绝，杜绝“多选择器静默忽略”。
+
+**Turn ID 一致性**：`handlers_forget._normalize_turn_tokens()` 将 `TurnRecord.id` 与 `turn_id` 任一输入展开为 token 集合；`_discover_for_target()`、`_write_tombstones_for_targets()` 的子 Event 派生、`_scrub_event_turn_targets()` 的 Turn 行与子 Event 清理统一使用该入口。`content_purged` 改为以列查询确认“确实已无剩余正文”为依据，不再在 ID 不匹配、清理未命中时误置 True。
+
+**Verify**：`_verify_source_event_integrity()` 新增持久化保护检查：来源 Event 必须由 event / turn_record / memory_record 三类 Tombstone 之一覆盖，且同时 `block_visibility=True` 与 `block_reingestion=True`；`handle_forget_verify()` 还校验 event / turn 目标的双标志，以及 Turn 目标下全部子 Event 的长期 Event Tombstone。只有活动 Shield、没有持久化保护时保持 `failed_retryable`，不得落严格 `verified`。
+
+**测试**：新增覆盖宽选择器 Phase A 后旧 Event 重抽阻断、>100 memory_ids、canonical_key / scope / thread / time_range / all_user_data、cutoff 后新 Event、全量与部分 Evidence 屏蔽、被屏蔽 Evidence 不落库、Mode / Selector 合法与非法组合、多选择器拒绝、TurnRecord.id / turn_id 双输入清理、content_purged 真实性、Shield-only Verify 失败、Shield 退休后可见性与重抽仍被阻断。
 
 ---
 

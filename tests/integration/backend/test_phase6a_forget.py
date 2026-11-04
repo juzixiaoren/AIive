@@ -2061,7 +2061,8 @@ def test_rebuild_summaries_batch_persists_summary_only_from_allowed_events(db_se
 # ═══════════════════════════════════════════════════════════════════
 
 
-def _fg_verify_op(db, *, op_id, mid, mode, memory_block_visibility=True):
+def _fg_verify_op(db, *, op_id, mid, mode, memory_block_visibility=True,
+                  memory_block_reingestion=True):
     """窄选择器 Verify 基础数据：满足 memory forgotten / retrieval 不可搜 / tombstone 覆盖。"""
     from aiive.db.models import MemoryRecord, RetrievalIndexEntry
     from aiive.db.forget_models import ForgetTarget
@@ -2085,6 +2086,7 @@ def _fg_verify_op(db, *, op_id, mid, mode, memory_block_visibility=True):
     _fg_tombstone(
         db, operation_id=op_id, target_type="memory_record", target_id=mid,
         block_visibility=memory_block_visibility,
+        block_reingestion=memory_block_reingestion,
         content_purged=(mode != "memory_only"),
         allow_audit_read=(mode == "memory_only"),
     )
@@ -2224,3 +2226,458 @@ def test_verify_rejects_rebuilt_summary_referencing_blocked_event(db_session):
     op = db_session.query(ForgetOperation).filter_by(id=op_id).first()
     assert op.status == "failed_retryable"
     assert "still referenced by rebuilt summaries" in (op.error_message or "")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 防重抽闭环 / Mode-Selector 契约 / Turn ID 一致性（本次修复）
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _fg_memory_full(db, *, canonical_key=None, scope_type="global",
+                    scope_id=None, created_at=None):
+    from aiive.db.models import MemoryRecord
+
+    mid = _new_id()
+    db.add(MemoryRecord(
+        id=mid, memory_type="fact", canonical_key=canonical_key or f"k:{mid}",
+        scope_type=scope_type, scope_id=scope_id, content="fact",
+        lifecycle_state="active", validity_state="valid", confidence=0.9,
+        created_at=created_at or _utcnow(),
+    ))
+    return mid
+
+
+def _fg_write_proposal(db, *, event_ids, canonical_key="user.reingest"):
+    """经真实 MemoryWriteService.write 写入，返回 WriteResult。"""
+    from aiive.context.run_context import RunContext
+    from aiive.memory.memory_types import (
+        EvidenceItem, EvidenceSourceType, MemoryProposal, TrustLevel,
+    )
+    from aiive.memory.memory_write_service import MemoryWriteService
+
+    prop = MemoryProposal(
+        memory_type="knowledge", canonical_key=canonical_key,
+        scope_type="global", scope_id=None, content="重抽内容",
+        confidence=0.9, trust_level=TrustLevel.TRUSTED.value,
+        evidence=[
+            EvidenceItem(
+                source_event_id=eid,
+                source_type=EvidenceSourceType.USER_ASSERTION.value,
+                trust_level=TrustLevel.TRUSTED.value,
+            )
+            for eid in event_ids
+        ],
+    )
+    prop.compute_content_hash()
+    return MemoryWriteService(db).write(
+        prop, RunContext(thread_id=_new_id(), trace_id=_new_id())
+    )
+
+
+def test_phase_a_thread_shield_blocks_reingestion_before_cascade(db_session: Session):
+    """宽 thread 选择器：Phase A 后、Cascade 前旧 Event 不能重抽；cutoff 后新 Event 不受阻。"""
+    from datetime import timedelta
+
+    from aiive.db.models import MemoryEvidence
+    from aiive.forget.fingerprint import configure_hmac_secret
+    from aiive.forget.phase_a_shield import execute_phase_a_shield
+    from aiive.memory.memory_write_service import WriteOutcome
+
+    configure_hmac_secret("test-secret", 1)
+    thread_id = _new_id()
+    old_eid = _fg_event(
+        db_session, content="old-secret", thread_id=thread_id,
+        created_at=_utcnow() - timedelta(minutes=1),
+    )
+    mid = _fg_memory(db_session)
+    _fg_provenance(db_session, mid, old_eid)
+    db_session.commit()
+
+    execute_phase_a_shield(
+        session=db_session, mode="everywhere", thread_id=thread_id, reason="t",
+    )
+    db_session.commit()
+
+    result = _fg_write_proposal(db_session, event_ids=[old_eid])
+    assert result.outcome == WriteOutcome.GATE_REJECTED
+    assert "Reingestion blocked" in (result.reason or "")
+    assert db_session.query(MemoryEvidence).filter(
+        MemoryEvidence.source_event_id == old_eid,
+    ).count() == 0
+
+    new_eid = _fg_event(
+        db_session, content="new-ok", thread_id=thread_id,
+        created_at=_utcnow() + timedelta(minutes=5),
+    )
+    db_session.commit()
+    result2 = _fg_write_proposal(
+        db_session, event_ids=[new_eid], canonical_key="user.new-fact",
+    )
+    assert not (
+        result2.outcome == WriteOutcome.GATE_REJECTED
+        and "Reingestion blocked" in (result2.reason or "")
+    )
+
+
+@pytest.mark.parametrize("selector", ["canonical_key", "scope", "time_range", "all_user_data"])
+def test_wide_selector_phase_a_blocks_reingestion_before_cascade(
+    db_session: Session, selector,
+):
+    """canonical_key / scope / time_range / all_user_data 在 Phase A 后均阻断旧来源重抽。"""
+    from datetime import timedelta
+
+    from aiive.forget.fingerprint import configure_hmac_secret
+    from aiive.forget.phase_a_shield import execute_phase_a_shield
+    from aiive.memory.memory_write_service import WriteOutcome
+
+    configure_hmac_secret("test-secret", 1)
+    now = _utcnow()
+    old_time = now - timedelta(minutes=1)
+    kwargs = {}
+    if selector == "canonical_key":
+        mid = _fg_memory_full(db_session, canonical_key="user.ck", created_at=old_time)
+        kwargs["canonical_key"] = "user.ck"
+    elif selector == "scope":
+        scope_id = _new_id()
+        mid = _fg_memory_full(
+            db_session, scope_type="thread", scope_id=scope_id, created_at=old_time,
+        )
+        kwargs["scope_type"] = "thread"
+        kwargs["scope_id"] = scope_id
+    else:
+        mid = _fg_memory_full(db_session, created_at=old_time)
+        if selector == "time_range":
+            kwargs["time_from"] = now - timedelta(minutes=2)
+            kwargs["time_to"] = now
+        else:
+            kwargs["all_user_data"] = True
+
+    eid = _fg_event(db_session, content="old-secret", created_at=old_time)
+    _fg_provenance(db_session, mid, eid)
+    db_session.commit()
+
+    execute_phase_a_shield(
+        session=db_session, mode="everywhere", reason="t", **kwargs,
+    )
+    db_session.commit()
+
+    result = _fg_write_proposal(db_session, event_ids=[eid])
+    assert result.outcome == WriteOutcome.GATE_REJECTED
+    assert "Reingestion blocked" in (result.reason or "")
+
+
+def test_over_limit_memory_ids_blocks_reingestion_before_cascade(db_session: Session):
+    """> MAX_INLINE_SHIELD_TARGETS 的 memory_ids：Phase A 后仍不能从旧来源重抽。"""
+    from aiive.forget.fingerprint import configure_hmac_secret
+    from aiive.forget.phase_a_shield import execute_phase_a_shield
+    from aiive.forget.selector_normalizer import MAX_INLINE_SHIELD_TARGETS
+    from aiive.memory.memory_write_service import WriteOutcome
+
+    configure_hmac_secret("test-secret", 1)
+    mids = [_fg_memory(db_session) for _ in range(MAX_INLINE_SHIELD_TARGETS + 1)]
+    eid = _fg_event(db_session, content="old-secret")
+    _fg_provenance(db_session, mids[0], eid)
+    db_session.commit()
+
+    execute_phase_a_shield(
+        session=db_session, mode="memory_only", memory_ids=mids, reason="t",
+    )
+    db_session.commit()
+
+    result = _fg_write_proposal(db_session, event_ids=[eid])
+    assert result.outcome == WriteOutcome.GATE_REJECTED
+    assert "Reingestion blocked" in (result.reason or "")
+
+
+def test_mixed_evidence_fail_closed_and_not_persisted(db_session: Session):
+    """混合 Evidence（1 被屏蔽 + 1 正常）整体拒绝，且不写 Evidence/Provenance。"""
+    from aiive.db.forget_models import ContentProvenanceRef
+    from aiive.db.models import MemoryEvidence, MemoryRecord
+    from aiive.memory.memory_write_service import WriteOutcome
+
+    blocked_eid = _new_id()
+    normal_eid = _fg_event(db_session, content="normal")
+    _fg_tombstone(
+        db_session, operation_id=_new_id(), target_type="event",
+        target_id=blocked_eid, source_event_id=blocked_eid,
+        block_visibility=True, block_reingestion=True,
+    )
+    db_session.commit()
+
+    result = _fg_write_proposal(
+        db_session, event_ids=[blocked_eid, normal_eid],
+        canonical_key="user.mixed",
+    )
+    assert result.outcome == WriteOutcome.GATE_REJECTED
+    assert "Reingestion blocked" in (result.reason or "")
+
+    # 被拒绝的 Evidence 不得写入 MemoryEvidence / ContentProvenanceRef
+    assert db_session.query(MemoryEvidence).filter(
+        MemoryEvidence.source_event_id.in_([blocked_eid, normal_eid]),
+    ).count() == 0
+    assert db_session.query(ContentProvenanceRef).filter(
+        ContentProvenanceRef.source_id.in_([blocked_eid, normal_eid]),
+    ).count() == 0
+    assert db_session.query(MemoryRecord).filter_by(
+        canonical_key="user.mixed",
+    ).count() == 0
+
+
+def test_partial_shielded_evidence_via_phase_a_rejected(db_session: Session):
+    """Phase A 实体 Shield 命中其中一条 Evidence 时，整条 Proposal 拒绝。"""
+    from aiive.forget.fingerprint import configure_hmac_secret
+    from aiive.forget.phase_a_shield import execute_phase_a_shield
+    from aiive.memory.memory_write_service import WriteOutcome
+
+    configure_hmac_secret("test-secret", 1)
+    blocked_eid = _fg_event(db_session, content="blocked")
+    normal_eid = _fg_event(db_session, content="normal")
+    mid = _fg_memory(db_session)
+    _fg_provenance(db_session, mid, blocked_eid)
+    db_session.commit()
+
+    execute_phase_a_shield(
+        session=db_session, mode="memory_only", memory_ids=[mid], reason="t",
+    )
+    db_session.commit()
+
+    result = _fg_write_proposal(
+        db_session, event_ids=[blocked_eid, normal_eid],
+        canonical_key="user.partial",
+    )
+    assert result.outcome == WriteOutcome.GATE_REJECTED
+    assert "Reingestion blocked" in (result.reason or "")
+
+
+@pytest.mark.parametrize(
+    ("mode", "kwargs", "ok"),
+    [
+        ("memory_only", {"memory_ids": ["m1"]}, True),
+        ("memory_only", {"canonical_key": "k"}, True),
+        ("memory_only", {"scope_type": "thread", "scope_id": "t"}, True),
+        ("history_only", {"thread_id": "t"}, True),
+        ("history_only", {"turn_ids": ["t1"]}, True),
+        ("history_only", {"event_ids": ["e1"]}, True),
+        ("history_only", {"time_from": datetime(2026, 1, 1, tzinfo=timezone.utc)}, True),
+        ("everywhere", {"all_user_data": True}, True),
+        ("memory_only", {"thread_id": "t"}, False),
+        ("memory_only", {"all_user_data": True}, False),
+        ("memory_only", {"turn_ids": ["t1"]}, False),
+        ("history_only", {"memory_ids": ["m1"]}, False),
+        ("history_only", {"canonical_key": "k"}, False),
+        ("history_only", {"all_user_data": True}, False),
+    ],
+)
+def test_mode_selector_matrix(mode, kwargs, ok):
+    """memory_only / history_only / everywhere 与选择器的兼容矩阵。"""
+    from aiive.forget.selector_normalizer import normalize_selector
+
+    if ok:
+        payload = normalize_selector(mode, **kwargs)
+        assert payload["mode"] == mode
+    else:
+        with pytest.raises(ValueError):
+            normalize_selector(mode, **kwargs)
+
+
+def test_multiple_selectors_rejected_stably():
+    """多个独立 Selector 混合传入必须稳定拒绝，不能静默忽略。"""
+    from aiive.forget.selector_normalizer import normalize_selector
+
+    with pytest.raises(ValueError, match="只能提供一种选择器"):
+        normalize_selector("everywhere", memory_ids=["m"], thread_id="t")
+    with pytest.raises(ValueError, match="只能提供一种选择器"):
+        normalize_selector("everywhere", canonical_key="k", all_user_data=True)
+
+
+def test_api_and_tool_use_same_mode_selector_rules():
+    """API 与 Tool 与 selector_normalizer 使用一致的校验规则。"""
+    from pydantic import ValidationError
+
+    from aiive.api.routes_forget import ForgetRequest
+    from aiive.tools.forget_tool import handle_forget
+
+    with pytest.raises(ValidationError):
+        ForgetRequest(mode="memory_only", thread_id="t")
+    with pytest.raises(ValidationError):
+        ForgetRequest(mode="everywhere", memory_ids=["m"], thread_id="t")
+
+    out = handle_forget(mode="memory_only", thread_id="t")
+    assert out["ok"] is False
+    out2 = handle_forget(mode="history_only", memory_ids=["m"])
+    assert out2["ok"] is False
+
+
+def test_phase_a_rejects_incompatible_mode_selector_before_operation(db_session: Session):
+    """非法组合必须在创建 Operation 之前拒绝。"""
+    from aiive.forget.fingerprint import configure_hmac_secret
+    from aiive.forget.phase_a_shield import execute_phase_a_shield
+
+    configure_hmac_secret("test-secret", 1)
+    with pytest.raises(ValueError):
+        execute_phase_a_shield(
+            session=db_session, mode="memory_only", thread_id=_new_id(), reason="t",
+        )
+    assert db_session.query(ForgetOperation).count() == 0
+
+
+@pytest.mark.parametrize("use_record_id", [True, False])
+def test_turn_scrub_clears_all_child_events_for_both_id_forms(
+    db_session: Session, use_record_id,
+):
+    """TurnRecord.id 与 turn_id 两种输入均清理全部子 Event，并置 content_purged。"""
+    from aiive.db.models import Event, TurnRecord
+    from aiive.forget.fingerprint import configure_hmac_secret
+    from aiive.forget.phase_a_shield import execute_phase_a_shield
+    from aiive.worker.handlers_forget import _scrub_event_turn_targets
+
+    configure_hmac_secret("test-secret", 1)
+    thread_id = _new_id()
+    record_id = _new_id()
+    logical_id = _new_id()
+    db_session.add(TurnRecord(
+        id=record_id, thread_id=thread_id, turn_id=logical_id,
+        turn_sequence=1, status="completed", request_fingerprint="",
+        response_payload={"content": "resp"},
+    ))
+    eids = [
+        _fg_event(
+            db_session, content=f"c{i}", turn_id=logical_id,
+            turn_event_index=i, thread_id=thread_id,
+        )
+        for i in range(3)
+    ]
+    db_session.commit()
+
+    selector_id = record_id if use_record_id else logical_id
+    result = execute_phase_a_shield(
+        session=db_session, mode="everywhere", turn_ids=[selector_id], reason="t",
+    )
+    db_session.commit()
+    op_id = result["operation_id"]
+
+    _scrub_event_turn_targets(db_session, op_id)
+    db_session.commit()
+
+    for eid in eids:
+        assert db_session.query(Event).filter_by(id=eid).one().payload == {}
+    tr = db_session.query(TurnRecord).filter_by(id=record_id).one()
+    assert not tr.response_payload
+    tomb = db_session.query(ForgetTombstone).filter_by(
+        forget_operation_id=op_id, target_type="turn_record",
+    ).one()
+    assert tomb.content_purged is True
+    assert tomb.purged_at is not None
+
+
+def test_turn_scrub_content_purged_reflects_actual_cleanup(db_session: Session):
+    """未实际清理时 content_purged 保持 False；实际清理后才置 True。"""
+    from aiive.db.models import Event, TurnRecord
+    from aiive.worker.handlers_forget import _scrub_event_turn_targets
+
+    thread_id = _new_id()
+    logical_id = _new_id()
+    db_session.add(TurnRecord(
+        id=_new_id(), thread_id=thread_id, turn_id=logical_id,
+        turn_sequence=1, status="completed", request_fingerprint="",
+        response_payload={"content": "resp"},
+    ))
+    eid = _fg_event(
+        db_session, content="secret", turn_id=logical_id, thread_id=thread_id,
+    )
+    op_id = _new_id()
+    _fg_operation(db_session, op_id, mode="memory_only", selector_type="turn_ids")
+    _fg_tombstone(
+        db_session, operation_id=op_id, target_type="turn_record",
+        target_id=logical_id, source_turn_record_id=logical_id,
+        content_purged=False,
+    )
+    db_session.commit()
+
+    _scrub_event_turn_targets(db_session, op_id)  # memory_only 提前返回
+    db_session.commit()
+    tomb = db_session.query(ForgetTombstone).filter_by(
+        forget_operation_id=op_id, target_type="turn_record",
+    ).one()
+    assert tomb.content_purged is False
+    assert db_session.query(Event).filter_by(id=eid).one().payload == {
+        "content": "secret",
+    }
+
+    op = db_session.query(ForgetOperation).filter_by(id=op_id).one()
+    op.mode = "everywhere"
+    db_session.commit()
+    _scrub_event_turn_targets(db_session, op_id)
+    db_session.commit()
+
+    assert db_session.query(Event).filter_by(id=eid).one().payload == {}
+    assert db_session.query(ForgetTombstone).filter_by(
+        id=tomb.id,
+    ).one().content_purged is True
+
+
+def test_verify_rejects_shield_only_without_persistent_tombstone(db_session: Session):
+    """只有活动 Shield、没有持久化 Tombstone 时，Verify 不得严格 verified。"""
+    from aiive.db.models import Event
+
+    op_id, mid, src_eid = _new_id(), _new_id(), _new_id()
+    _fg_verify_op(
+        db_session, op_id=op_id, mid=mid, mode="memory_only",
+        memory_block_visibility=False, memory_block_reingestion=False,
+    )
+    db_session.add(Event(
+        id=src_eid, trace_id=_new_id(), thread_id=_new_id(),
+        event_type="user_message", payload={"content": "SEEN"},
+        created_at=_utcnow(),
+    ))
+    _fg_provenance(db_session, mid, src_eid)
+    db_session.add(ForgetShield(
+        id=_new_id(), forget_operation_id=op_id, selector_type="event_ids",
+        target_type="event", target_id=src_eid,
+        cutoff_created_at=_utcnow(), status="active",
+        normalized_shield_key=_new_id(),
+    ))
+    db_session.commit()
+
+    _run_verify(db_session, op_id)
+    db_session.commit()
+
+    op = db_session.query(ForgetOperation).filter_by(id=op_id).one()
+    assert op.status == "failed_retryable"
+    assert "persistent tombstone protection" in (op.error_message or "")
+
+
+def test_shield_retired_keeps_visibility_and_reingestion_blocked(db_session: Session):
+    """Shield 退休后，持久化 Tombstone 仍同时阻断可见性与重抽。"""
+    from aiive.db.models import Event
+    from aiive.forget.visibility_service import ForgetVisibilityService
+
+    op_id, eid = _new_id(), _new_id()
+    _fg_operation(db_session, op_id, mode="memory_only", status="verified")
+    db_session.add(Event(
+        id=eid, trace_id=_new_id(), thread_id=_new_id(),
+        event_type="user_message", payload={"content": "SECRET"},
+        created_at=_utcnow(),
+    ))
+    _fg_tombstone(
+        db_session, operation_id=op_id, target_type="event", target_id=eid,
+        source_event_id=eid, block_visibility=True, block_reingestion=True,
+        content_purged=False, allow_audit_read=True,
+    )
+    db_session.add(ForgetShield(
+        id=_new_id(), forget_operation_id=op_id, selector_type="event_ids",
+        target_type="event", target_id=eid,
+        cutoff_created_at=_utcnow(), status="retired",
+        normalized_shield_key=_new_id(),
+    ))
+    db_session.commit()
+
+    assert ForgetVisibilityService.blocked_target_ids(
+        db_session, "event", [(eid, None)],
+    ) == {eid}
+    assert ForgetVisibilityService.is_tombstone_blocked_reingestion(
+        db_session, source_event_id=eid,
+    ) is True
+    assert ForgetVisibilityService.filter_events(
+        db_session, [{"id": eid, "created_at": _utcnow()}],
+    ) == []

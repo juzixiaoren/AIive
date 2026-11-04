@@ -65,6 +65,20 @@ def _new_id() -> str:
     return str(uuid.uuid4())
 
 
+def _parse_dt(value: Any) -> datetime | None:
+    """把 selector_payload 中的 ISO 字符串还原为 datetime（DateTime 列需要）。"""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Phase A 主入口
 # ═══════════════════════════════════════════════════════════════════
@@ -282,8 +296,8 @@ def _materialize_selector_shields(
             id=_new_id(),
             forget_operation_id=operation_id,
             selector_type=selector_type,
-            time_from=selector_payload.get("time_from"),
-            time_to=selector_payload.get("time_to"),
+            time_from=_parse_dt(selector_payload.get("time_from")),
+            time_to=_parse_dt(selector_payload.get("time_to")),
             cutoff_created_at=cutoff,
             status="active",
             normalized_shield_key=compute_normalized_shield_key(
