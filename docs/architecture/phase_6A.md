@@ -943,7 +943,8 @@ error_message）。
 ### 5. Verify 字段一一对应
 
 `SCRUBBED_FIELDS` / `VERIFIED_FIELDS` 各 132 项固定清单；集成测试断言子集，并对每个
-非物理删除字段逐项注入残留、对删除行单独注入；Verify 补齐
+非物理删除字段逐项注入残留、对删除行单独注入；PostgreSQL 侧另覆盖 cutoff 新旧数据、
+派生清理、Task 子记录、冲突/辅助表、未知结构、真实 UnifiedRetriever 召回与跨表字段残留；Verify 补齐
 agent_runs.error_message、agent_actions.preconditions/effects/evidence_refs/error_message、
 agent_task_checkpoints.pending_action_refs/evidence_refs、task_evidence.inline_payload、
 task_artifacts.name、approval_requests 全部字段、tool_operations.effect_receipt/error_message、

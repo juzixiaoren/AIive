@@ -1001,6 +1001,7 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
   Tool/Compaction 字段；未知 JSON 引用只在本次范围统计并 fail-closed。
 - 测试：`test_forget_content_coverage.py` 25 用例（cutoff 新旧数据、派生清理、真实召回、
   Task 子记录、冲突/召回/检索/Outbox（含无 trace）、未知结构、字段子集、132 个 Scrub 字段
-  逐项注入残留）；PG 4 用例含 cutoff。
-- 验证：全量 pytest 1662 passed / 68 skipped；`tests/integration/pg` 55 passed / 13 skipped
+  逐项注入残留）；PG 10 用例（JSON 成员 + cutoff/派生清理 + Task 子记录 + 冲突/辅助表 +
+  未知结构 + 真实 UnifiedRetriever 召回 + 跨表字段残留注入）。
+- 验证：全量 pytest 1662 passed / 74 skipped；`tests/integration/pg` 61 passed / 13 skipped
   （skip 为本地 Embedding 不可用）；ruff `--select F,E9`、basedpyright 0/0 通过。

@@ -155,3 +155,7 @@ Verify 失败；物理删除行（Evidence/CoreBlock/Token/Chunk/Vector）单独
 - 任一残留 → `failed_retryable`，Shield 保持 active。
 - 全部通过 → 宽选择器仍以 `verified_with_coarse_purge` 结束，但该状态现在有逐表证明，
   不再是“粗粒度跳过”。
+- PostgreSQL 实测：`tests/integration/pg/test_pg_forget_scope_integrity.py` 覆盖 cutoff
+  新数据保留/派生清理、Task 子记录 time_range、Conflict/Recall/Retrieval/Outbox、
+  未知 JSON fail-closed、真实 UnifiedRetriever 前后召回、跨表字段残留注入；
+  SQLite 另有 132 字段逐项注入。
