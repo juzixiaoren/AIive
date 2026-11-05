@@ -42,6 +42,7 @@ from aiive.memory.memory_types import MemoryProposal
 from aiive.memory.memory_write_service import MemoryBatchWriteError, MemoryWriteService
 from aiive.prompts import get_prompt_registry
 from aiive.retrieval.index_rebuild import handle_retrieval_index_rebuild
+from aiive.worker.outbox_payload_contract import is_redacted_payload
 from aiive.worker.outbox_dto import (
     ClaimedJob,
     HandlerOutcome,
@@ -101,6 +102,70 @@ def _get_llm_client() -> LLMClient:
 # ============================================================================
 # memory_extraction (three-phase)
 # ============================================================================
+
+
+def _extraction_blocked_reason(
+    db: Session,
+    *,
+    source_event_ids: list[str],
+    source_turn_record_id: str,
+    source_turn_id: str,
+) -> str:
+    """Forget 后来源是否已被屏蔽：LLM 调用前与持久化前的双重 fail-closed。"""
+    from aiive.forget.visibility_service import ForgetVisibilityService
+
+    event_ids = [str(eid) for eid in (source_event_ids or []) if eid]
+    if event_ids and ForgetVisibilityService.blocked_target_ids(
+        db, "event", [(eid, None) for eid in event_ids],
+    ):
+        return "source_event_shielded"
+    for eid in event_ids:
+        if ForgetVisibilityService.is_tombstone_blocked_reingestion(
+            db, source_event_id=eid,
+        ):
+            return "source_event_tombstoned"
+    tokens = {t for t in (source_turn_record_id, source_turn_id) if t}
+    if tokens:
+        if ForgetVisibilityService.blocked_target_ids(
+            db, "turn_record", [(t, None) for t in sorted(tokens)],
+        ):
+            return "source_turn_shielded"
+        for token in tokens:
+            if ForgetVisibilityService.is_tombstone_blocked_reingestion(
+                db, source_turn_record_id=token,
+            ):
+                return "source_turn_tombstoned"
+    return ""
+
+
+def _mark_ingestion_succeeded_fencing(
+    run_id: str, execution_token: str, reason: str,
+) -> None:
+    """Forget 阻断时把 running IngestionRun 收敛为 succeeded，避免永久 running。"""
+    db_m = SessionLocal()
+    try:
+        affected = db_m.query(MemoryIngestionRun).filter(
+            MemoryIngestionRun.id == run_id,
+            MemoryIngestionRun.execution_token == execution_token,
+            MemoryIngestionRun.status == "running",
+        ).update({
+            MemoryIngestionRun.status: "succeeded",
+            MemoryIngestionRun.execution_token: None,
+            MemoryIngestionRun.proposal_count: 0,
+            MemoryIngestionRun.error_message: reason[:200],
+            MemoryIngestionRun.completed_at: datetime.now(timezone.utc),
+        }, synchronize_session=False)
+        db_m.commit()
+        if affected == 0:
+            logger.warning(
+                "_mark_ingestion_succeeded_fencing: no row matched run_id=%s",
+                run_id,
+            )
+    except Exception:
+        logger.exception("_mark_ingestion_succeeded_fencing failed")
+        db_m.rollback()
+    finally:
+        db_m.close()
 
 
 def handle_memory_extraction(claimed: ClaimedJob) -> HandlerResult:
@@ -167,6 +232,28 @@ def handle_memory_extraction(claimed: ClaimedJob) -> HandlerResult:
         return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, f"Phase A failed: {e}")
     finally:
         db_a.close()
+
+    # A3（LLM 调用前）：Forget 提交后来源已被屏蔽，或 payload 正文已被 Scrub，
+    # 直接收敛 IngestionRun 并终止本次提取，绝不把原文交给模型。
+    db_check = SessionLocal()
+    try:
+        blocked_reason = _extraction_blocked_reason(
+            db_check,
+            source_event_ids=source_event_ids,
+            source_turn_record_id=source_turn_record_id,
+            source_turn_id=source_turn_id,
+        )
+    finally:
+        db_check.close()
+    if is_redacted_payload(payload):
+        blocked_reason = blocked_reason or "payload_scrubbed_by_forget"
+    if blocked_reason:
+        _mark_ingestion_succeeded_fencing(run_id, execution_token, blocked_reason)
+        return HandlerResult(
+            HandlerOutcome.COMPLETED,
+            f"extraction_blocked_by_forget:{blocked_reason}",
+            ingestion_run_id=run_id,
+        )
 
     # ════════════════════════════════════════════════
     # Phase B: LLM 提取（事务外，无 DB Session）
@@ -260,6 +347,25 @@ def handle_memory_extraction(claimed: ClaimedJob) -> HandlerResult:
                                      terminal_reason="ingestion_run_deadletter")
             return HandlerResult(HandlerOutcome.CLAIM_LOST, f"run_not_running: {run_c.status}",
                                  ingestion_run_id=run_id)
+
+        # C1c（并发竞态）：Forget 可能在 Phase B 的 LLM 调用期间提交；已在途的
+        # 结果不得重新写入记忆。持 fencing 的事务内重新读取可见性。
+        blocked_reason_c = _extraction_blocked_reason(
+            db_c,
+            source_event_ids=source_event_ids,
+            source_turn_record_id=source_turn_record_id,
+            source_turn_id=source_turn_id,
+        )
+        if blocked_reason_c:
+            db_c.rollback()
+            _mark_ingestion_succeeded_fencing(
+                run_id, execution_token, blocked_reason_c,
+            )
+            return HandlerResult(
+                HandlerOutcome.COMPLETED,
+                f"extraction_blocked_by_forget:{blocked_reason_c}",
+                ingestion_run_id=run_id,
+            )
 
         # C2: 构建 RunContext — Phase 2: 注入真实 Event.id
         run_ctx = RunContext(
@@ -381,6 +487,8 @@ def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
     import uuid as _uuid
 
     payload = claimed.payload
+    if is_redacted_payload(payload):
+        return HandlerResult(HandlerOutcome.COMPLETED, "forget_content_redacted")
     task_id = str(payload.get("task_id", ""))
     thread_id = str(payload.get("thread_id", ""))
     title = str(payload.get("title", ""))

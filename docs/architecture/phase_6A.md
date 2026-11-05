@@ -949,3 +949,18 @@ agent_runs.error_message、agent_actions.preconditions/effects/evidence_refs/err
 agent_task_checkpoints.pending_action_refs/evidence_refs、task_evidence.inline_payload、
 task_artifacts.name、approval_requests 全部字段、tool_operations.effect_receipt/error_message、
 compaction_inputs.turn_manifest 等。未知引用结构只统计本次范围，fail-closed。
+
+## 实现补记（六）：Outbox 契约、Turn/Event 边界、Task 父子范围与未知结构发现（V62.4）
+
+- Outbox：新增 `worker/outbox_payload_contract.py`，按 job_type 定义正文/引用/幂等字段；
+  Scrub 与 Verify 共用同一契约；发现目标 Job 使用 trace_id、operation_id 与 payload 中的
+  结构化来源 ID（不按内容关键词）。
+- 异步闭环：`handle_memory_extraction` 在 LLM 调用前与写入前双重检查来源可见性，
+  命中 Shield/Tombstone 或已 Scrub 载荷即收敛 IngestionRun 为 succeeded，不调用模型、
+  不写回记忆；goal/reminder Handler 遇到 `forget_content_redacted` 直接完成。
+- Turn/Event：显式与间接 Turn 展开子 Event 均按 `created_at <= cutoff`；间接 Turn 在
+  time_range 下再逐个 Event 应用时间窗口；派生记录仍按 Provenance 清理。
+- Task Runtime：父 Task 与六类子记录各自独立按真实时间确定范围；Scrub/Verify 均按
+  子记录 ID 而非 `task_id` 批量清空；父任务未命中时只脱敏 task_state/task_brief 引用。
+- 未知 JSON：候选记录先由受影响集合、目标 ID 在引用数组文本中的出现、all_user_data
+  cutoff 确定，再校验数组元素必须为字符串；异常元素 fail-closed，无关 Thread 不阻断。

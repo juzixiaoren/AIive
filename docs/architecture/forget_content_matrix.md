@@ -147,7 +147,34 @@ Verify 失败；物理删除行（Evidence/CoreBlock/Token/Chunk/Vector）单独
 - `memory_vector_projection`：仅向量与版本；Memory 被遗忘时由 `_scratch_batch` 的
   `memory_vector_projection` 删除逻辑处理（Phase A 对显式 ID 已删除）。
 
-## 9. Verify 判定
+## 9. Outbox Payload 契约与异步阻断（V62.4）
+
+契约模块：`backend/aiive/worker/outbox_payload_contract.py`，Scrub / Verify / Worker 共用。
+
+| job_type | 正文/需清理字段 | 保留的引用/状态/幂等字段 |
+|---|---|---|
+| `memory_extraction` | user_message, reply | source_event_ids, source_turn_record_id, source_turn_id, thread_id, assistant_event_id, message_source, extraction_mode, operation_id |
+| `goal_event_dispatch` | event_payload | event_id, event_type, source, thread_id, occurred_at |
+| `goal_trigger_decision` | trigger_event_payload, reason, trigger_event_type | task_id, step_id, trigger_key, trigger_event_id, fired_at, trace_id, pending_event_dedupe_key |
+| `reminder_delivery` | title, content | task_id, thread_id, task_type, scheduled_at, operation_id, schema_version |
+| `agent_task_run` | goal, reason, failure_reason, task_title, summary, query | task_id, trigger, trace_id, schema_version |
+| `memory_conflict_question/reply/cleanup` | question, message, content, title, reason | conflict_case_id, thread_id, status |
+| `tool_operation` | name, params, result, error, tool_args, arguments | tool_call_id, idempotency_key, operation_id |
+| `improvement_discovery` | title, content, message, goal, content_preview | operation_id, schema_version |
+| `segment_sealing / epoch_checkpoint / epoch_rollover / memory_maintenance` | summary, content, goal, reason | segment_id, epoch_id, source_id, operation_id |
+
+- 发现：trace_id + operation_id + `payload` 文本中的目标 ID（结构化 ID 匹配，不做内容关键词匹配）。
+- 清理：按 job_type 递归替换正文键为 `[redacted]` / `{}` / `[]` / NULL，写入 `forget_content_redacted=True`；保留定位与幂等字段。
+- 异步阻断：`handle_memory_extraction` 在 LLM 调用前（Phase A 之后）与持久化写入前（Phase C）双重调用 `_extraction_blocked_reason()`；命中 Shield/Tombstone 或已 Scrub 载荷时收敛 IngestionRun 为 succeeded 并直接 COMPLETED，不调用模型、不写回记忆。`goal_event_dispatch` / `goal_trigger_decision` / `reminder_delivery` Handler 遇到 `forget_content_redacted` 直接完成。
+- 无关 Job 不被取消，payload 保持不变。
+
+## 10. 范围边界与发现（V62.4）
+
+- Turn→子 Event：显式 turn_ids 与间接 Turn 均按 `Event.created_at <= cutoff`；间接 Turn 在 time_range 下还须逐个 Event 落在时间窗口。`raw_event_ids` 只含实际命中原始 Event；派生 Summary/Memory 仍按 Provenance 清理。
+- Task Runtime：`ContentScope` 独立维护命中的 AgentTask 与六类子记录 ID 集合；每条子记录按自身 `created_at` + cutoff/time_range 判断。父 Task 命中只清父正文，子记录命中只清子记录；未命中父任务仅脱敏 `task_state/task_brief` 引用，引用变化时运行态任务才转 `cancelled`。
+- 未知 JSON：`unknown_reference_details()` 先按本次范围确定候选（受影响集合 + 「目标 ID 在引用数组文本中出现」+ all_user_data 按 cutoff），再检查数组结构；对象/嵌套数组/数字/布尔等元素 fail-closed。无关 Thread 且不含目标 ID 的异常数组不阻断本次 Forget。
+
+## 11. Verify 判定
 
 - 逐表重新查询残留（不信 rowcount）。
 - JSON 数组用成员查询（PG `jsonb_array_elements_text`；SQLite `json_each`），禁止 LIKE。

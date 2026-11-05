@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import bindparam, or_, text as sa_text
+from sqlalchemy import bindparam, cast, or_, text as sa_text, Text
 from sqlalchemy.orm import Session
 
 from aiive.db.forget_models import (
@@ -294,11 +294,21 @@ def build_scope(
     scope.raw_turn_tokens = set(tokens)
 
     # ── Event 范围 ──
+    # 显式 Turn Selector 与间接发现的 Turn 都要按 cutoff 冻结；间接 Turn 在
+    # time_range 下还须逐个 Event 满足时间窗口，不能因父 Turn 命中扩大范围。
+    explicit_turn_selector = selector_type == "turn_ids"
     events: set[str] = set(explicit_events)
     if tokens:
-        events |= _ids_from_query(
-            db, db.query(Event.id).filter(Event.turn_id.in_(tokens))
+        child_eq = db.query(Event.id).filter(
+            Event.turn_id.in_(tokens),
+            Event.created_at <= scope.cutoff,
         )
+        if not explicit_turn_selector and (scope.time_from or scope.time_to):
+            for cond in _time_filter(
+                Event.created_at, scope.time_from, scope.time_to,
+            ):
+                child_eq = child_eq.filter(cond)
+        events |= _ids_from_query(db, child_eq)
     if scope.thread_ids:
         events |= _ids_from_query(
             db, db.query(Event.id).filter(
@@ -440,25 +450,36 @@ def build_scope(
         )
     scope.agent_task_ids = tasks
 
-    # time_range：子记录按自身真实时间字段命中，再反向找父 Task；父 Task 只做
-    # 局部清理，避免把范围外的历史一并删除。
-    partial_task_ids: set[str] = set()
-    if scope.time_from is not None or scope.time_to is not None:
-        for model, attr in (
-            (AgentRun, "agent_run_ids"),
-            (AgentAction, "agent_action_ids"),
-            (AgentTaskEvent, "agent_task_event_ids"),
-            (AgentTaskCheckpoint, "agent_task_checkpoint_ids"),
-            (TaskEvidence, "task_evidence_ids"),
-            (TaskArtifact, "task_artifact_ids"),
-        ):
-            q = db.query(model.id, model.task_id).filter(model.created_at <= scope.cutoff)
-            for cond in _time_filter(model.created_at, scope.time_from, scope.time_to):
+    # 子记录集合独立维护：每条子记录按自身 created_at + cutoff/time_range 命中，
+    # 不因为父 Task 命中就扩大到全部子记录。父 Task 未命中但子记录命中时，
+    # 父 Task 只做局部状态脱敏，不整体清空。
+    time_selector = scope.time_from is not None or scope.time_to is not None
+    child_parent_ids: set[str] = set()
+    for model, attr in (
+        (AgentRun, "agent_run_ids"),
+        (AgentAction, "agent_action_ids"),
+        (AgentTaskEvent, "agent_task_event_ids"),
+        (AgentTaskCheckpoint, "agent_task_checkpoint_ids"),
+        (TaskEvidence, "task_evidence_ids"),
+        (TaskArtifact, "task_artifact_ids"),
+    ):
+        q = db.query(model.id, model.task_id).filter(
+            model.created_at <= scope.cutoff,
+        )
+        if time_selector:
+            for cond in _time_filter(
+                model.created_at, scope.time_from, scope.time_to,
+            ):
                 q = q.filter(cond)
-            rows = q.all()
-            setattr(scope, attr, {str(r[0]) for r in rows if r[0]})
-            partial_task_ids |= {str(r[1]) for r in rows if r[1]}
-    scope.partial_agent_task_ids = partial_task_ids - scope.agent_task_ids
+        elif tasks:
+            q = q.filter(model.task_id.in_(tasks))
+        else:
+            setattr(scope, attr, set())
+            continue
+        rows = q.all()
+        setattr(scope, attr, {str(row[0]) for row in rows if row[0]})
+        child_parent_ids |= {str(row[1]) for row in rows if row[1]}
+    scope.partial_agent_task_ids = child_parent_ids - scope.agent_task_ids
 
     # ── Knowledge（仅 all_user_data，或 everywhere + time_range）──
     documents: set[str] = set()
@@ -569,20 +590,32 @@ def build_scope(
         )
     scope.retrieval_run_ids = retrieval_runs
 
-    # ── Outbox：trace 归属 + operation_id 中引用的目标 id（结构性 ID 匹配）──
+    # ── Outbox：trace、operation_id、payload 内实际引用的目标 ID ──
+    # 不按内容关键词匹配；用结构化 ID 在 payload 文本中定位 Job。
     outbox_ids: set[str] = set()
     if scope.trace_ids:
         outbox_ids |= _ids_from_query(
             db, db.query(OutboxJob.id).filter(OutboxJob.trace_id.in_(scope.trace_ids))
         )
     linked_ids = (
-        scope.memory_ids | scope.event_ids | scope.turn_tokens | scope.segment_ids
-        | scope.epoch_ids | scope.agent_task_ids | scope.partial_agent_task_ids
+        scope.memory_ids | scope.raw_event_ids | scope.event_ids
+        | scope.turn_tokens | scope.segment_ids | scope.epoch_ids
+        | scope.agent_task_ids | scope.partial_agent_task_ids
+        | scope.thread_ids | scope.document_ids
     )
     for chunk in _chunked(sorted(linked_ids), 80):
         outbox_ids |= _ids_from_query(
             db, db.query(OutboxJob.id).filter(
                 or_(*[OutboxJob.operation_id.contains(item) for item in chunk])
+            )
+        )
+        payload_conds = [
+            cast(OutboxJob.payload, Text).like(f"%{item}%") for item in chunk
+        ]
+        outbox_ids |= _ids_from_query(
+            db, db.query(OutboxJob.id).filter(
+                ~OutboxJob.job_type.like("forget_%"),
+                or_(*payload_conds),
             )
         )
     scope.outbox_job_ids = outbox_ids

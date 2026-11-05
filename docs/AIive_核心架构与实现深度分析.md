@@ -1440,6 +1440,12 @@ MemoryRecord 本身保留为 forgotten sentinel，不是简单 `DELETE FROM memo
 - **Task Runtime time_range（V62.3）**：按 Run/Action/Event/Checkpoint/Evidence/Artifact
   自身时间命中并反向找父 Task，只清理命中子记录；父 task_state 引用替换为
   `[forgotten]`，无法安全恢复的运行中任务转 `cancelled`。
+- **Outbox 与范围一致性（V62.4）**：Outbox Job 按 `job_type` 建立 Payload 字段契约，
+  Scrub/Verify/Worker 共用；`memory_extraction` 在 LLM 调用前与写入前双重检查来源
+  Shield/Tombstone，命中即收敛 IngestionRun，不把已遗忘原文交给模型、不写回记忆。
+  Turn→子 Event 展开严格应用 cutoff/time_range；Task 父记录与六类子记录独立确定范围；
+  未知 JSON 引用结构先按候选范围发现再 fail-closed。
+
 - **完整承载审计（V62.3）**：补充 threads.title、agent_task_watches、desktop_action_receipts、
   MemoryConflictCase、Recall/RetrievalRun、Outbox（trace 或无 trace 的 operation_id 关联）。
   Scrub/Verify 字段各 132 项，测试逐字段注入残留；候选/运行元数据与认证表经审计确认

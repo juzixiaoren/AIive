@@ -1005,3 +1005,15 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
   未知结构 + 真实 UnifiedRetriever 召回 + 跨表字段残留注入）。
 - 验证：全量 pytest 1662 passed / 74 skipped；`tests/integration/pg` 61 passed / 13 skipped
   （skip 为本地 Embedding 不可用）；ruff `--select F,E9`、basedpyright 0/0 通过。
+
+### Forget Outbox、Turn/Event 与 Task 时间范围一致性（V62.4，2026-11-05）
+- 目标：修复 V62.3 审查发现的四类问题；不重写 Saga、不改锁协议/检索实现/Mode 语义。
+- Outbox：job_type 字段契约 + 递归正文清理 + 引用 ID 保留；异步提取在 LLM 前与写入前
+  双重 fail-closed；无关 Job 不取消。
+- Turn/Event：cutoff 与 time_range 严格应用于子 Event；新 Event 保留，旧来源派生清理。
+- Task：父子记录独立范围；父命中不扩大到全部子记录，子命中不整体清空父历史。
+- 未知 JSON：候选范围先行 + 异常元素 fail-closed，发现盲区消除。
+- 测试：SQLite 10 用例、PG 6 用例，覆盖真实 Outbox Handler、并发 LLM 竞态、
+  三类 Task 时间组合、Turn/Event 边界、未知结构与残留注入。
+- 验证：全量 pytest 1672 passed / 80 skipped；`tests/integration/pg` 67 passed / 13 skipped
+  （skip 为本地 Embedding 不可用；Windows 文件权限竞态用例复跑通过）；ruff、basedpyright 0/0。

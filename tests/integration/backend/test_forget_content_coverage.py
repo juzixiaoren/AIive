@@ -1072,9 +1072,9 @@ def test_time_range_scrubs_task_children_without_erasing_parent_history(
     db_session.commit()
     report = verify_scope(db_session, scope)
     assert not report.ok
-    assert report.residues.get("agent_runs_partial.error_message", 0) >= 1
-    assert report.residues.get("task_evidence_partial.inline_payload", 0) >= 1
-    assert report.residues.get("task_artifacts_partial.name", 0) >= 1
+    assert report.residues.get("agent_runs.error_message", 0) >= 1
+    assert report.residues.get("task_evidence.inline_payload", 0) >= 1
+    assert report.residues.get("task_artifacts.name", 0) >= 1
 
 
 def test_auxiliary_content_and_outbox_scrub(db_session: Session) -> None:

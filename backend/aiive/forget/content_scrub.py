@@ -31,6 +31,11 @@ from aiive.db.models import (
     TaskEvidence,
     Thread,
 )
+from aiive.worker.outbox_payload_contract import (
+    is_internal_job,
+    payload_has_content,
+    redact_job_payload,
+)
 from aiive.forget.content_scope import (
     ContentScope,
     count_json_array_members,
@@ -591,39 +596,132 @@ def _array_shape_unknown(value: Any) -> bool:
     return any(not isinstance(item, str) for item in value)
 
 
+def _array_text_candidate_ids(
+    db: Session, table: str, column: str, ids: set[str],
+) -> set[str]:
+    """引用 ID 在 JSON 文本中出现即视为候选（可发现嵌套对象/异常元素）。
+
+    只匹配结构化 ID，不做内容关键词匹配；用于异常结构发现，不用于内容清理。
+    """
+    if not ids:
+        return set()
+    result: set[str] = set()
+    for chunk in _chunks(ids):
+        clauses = [f"CAST({column} AS TEXT) LIKE :p{i}" for i in range(len(chunk))]
+        params = {f"p{i}": f"%{item}%" for i, item in enumerate(chunk)}
+        rows = db.execute(sa_text(
+            f"SELECT id FROM {table} WHERE " + " OR ".join(clauses)
+        ), params).all()
+        result |= {str(row[0]) for row in rows if row[0]}
+    return result
+
+
+def _all_user_candidate_ids(db: Session, table: str, cutoff: datetime) -> set[str]:
+    rows = db.execute(sa_text(
+        f"SELECT id FROM {table} WHERE created_at <= :cutoff"
+    ), {"cutoff": cutoff}).all()
+    return {str(row[0]) for row in rows if row[0]}
+
+
 def unknown_reference_details(
     db: Session, scope: ContentScope,
 ) -> list[tuple[str, str, Any]]:
-    """返回本次范围内无法识别的引用结构（表, 列, 值）。"""
+    """先按本次范围确定候选记录，再检查引用数组结构；异常元素 fail-closed。
+
+    普通字符串成员查询命不中嵌套对象，故额外用「ID 在 JSON 文本中出现」发现
+    候选；无关 Thread 且不含目标 ID 的异常数组不会被纳入。
+    """
     checks: list[tuple[str, str, str, set[str]]] = []
-    proposals = affected_proposal_ids(db, scope)
-    if proposals:
-        checks.append(("memory_proposals", "id", "source_event_ids", proposals))
-    summaries = affected_summary_ids(db, scope)
-    if summaries:
-        checks.append(("segment_summaries", "id", "source_event_ids", summaries))
-        checks.append(("segment_summaries", "id", "source_turn_ids", summaries))
-    checkpoints = affected_checkpoint_ids(db, scope)
-    if checkpoints:
-        checks.append(("epoch_checkpoints", "id", "source_segment_ids", checkpoints))
+
+    proposal_ids = set(affected_proposal_ids(db, scope))
+    proposal_ids |= _array_text_candidate_ids(
+        db, "memory_proposals", "source_event_ids", set(scope.event_ids),
+    )
     if scope.memory_ids:
-        actions = set(select_json_array_members(
+        proposal_ids |= _ids_from(
+            db,
+            "SELECT id FROM memory_proposals WHERE final_memory_id IN :ids",
+            scope.memory_ids,
+        )
+    if scope.turn_tokens:
+        proposal_ids |= _ids_from(
+            db,
+            "SELECT id FROM memory_proposals WHERE source_turn_id IN :ids "
+            "OR source_turn_record_id IN :ids",
+            scope.turn_tokens,
+        )
+    if scope.all_user:
+        proposal_ids |= _all_user_candidate_ids(
+            db, "memory_proposals", scope.cutoff,
+        )
+    if proposal_ids:
+        checks.append(("memory_proposals", "id", "source_event_ids", proposal_ids))
+
+    summary_ids = set(affected_summary_ids(db, scope))
+    summary_ids |= _array_text_candidate_ids(
+        db, "segment_summaries", "source_event_ids", set(scope.event_ids),
+    )
+    summary_ids |= _array_text_candidate_ids(
+        db, "segment_summaries", "source_turn_ids", set(scope.turn_tokens),
+    )
+    if scope.all_user:
+        summary_ids |= _all_user_candidate_ids(
+            db, "segment_summaries", scope.cutoff,
+        )
+    if summary_ids:
+        checks.append(("segment_summaries", "id", "source_event_ids", summary_ids))
+        checks.append(("segment_summaries", "id", "source_turn_ids", summary_ids))
+
+    checkpoint_ids = set(affected_checkpoint_ids(db, scope))
+    checkpoint_ids |= _array_text_candidate_ids(
+        db, "epoch_checkpoints", "source_segment_ids", set(scope.segment_ids),
+    )
+    if scope.all_user:
+        checkpoint_ids |= _all_user_candidate_ids(
+            db, "epoch_checkpoints", scope.cutoff,
+        )
+    if checkpoint_ids:
+        checks.append(("epoch_checkpoints", "id", "source_segment_ids", checkpoint_ids))
+
+    if scope.memory_ids:
+        action_ids = set(select_json_array_members(
             db, "memory_maintenance_actions", "id", "related_record_ids",
             sorted(scope.memory_ids),
         ))
-        actions |= _ids_from(
+        action_ids |= _array_text_candidate_ids(
+            db, "memory_maintenance_actions", "related_record_ids",
+            set(scope.memory_ids),
+        )
+        action_ids |= _ids_from(
             db,
-            "SELECT id FROM memory_maintenance_actions WHERE subject_memory_record_id IN :ids",
+            "SELECT id FROM memory_maintenance_actions "
+            "WHERE subject_memory_record_id IN :ids",
             scope.memory_ids,
         )
-        if actions:
-            checks.append(("memory_maintenance_actions", "id", "related_record_ids", actions))
-        blocks = set(select_json_array_members(
+        if scope.all_user:
+            action_ids |= _all_user_candidate_ids(
+                db, "memory_maintenance_actions", scope.cutoff,
+            )
+        if action_ids:
+            checks.append((
+                "memory_maintenance_actions", "id", "related_record_ids", action_ids,
+            ))
+        block_ids = set(select_json_array_members(
             db, "core_memory_blocks", "id", "source_memory_ids",
             sorted(scope.memory_ids),
         ))
-        if blocks:
-            checks.append(("core_memory_blocks", "id", "source_memory_ids", blocks))
+        block_ids |= _array_text_candidate_ids(
+            db, "core_memory_blocks", "source_memory_ids", set(scope.memory_ids),
+        )
+        if scope.all_user:
+            block_ids |= _all_user_candidate_ids(
+                db, "core_memory_blocks", scope.cutoff,
+            )
+        if block_ids:
+            checks.append((
+                "core_memory_blocks", "id", "source_memory_ids", block_ids,
+            ))
+
     details: list[tuple[str, str, Any]] = []
     for table, id_col, array_col, ids in checks:
         for _row_id, value in _scoped_array_rows(db, table, id_col, array_col, ids):
@@ -808,47 +906,6 @@ VERIFIED_FIELDS: frozenset[str] = frozenset({
     "outbox_jobs.payload", "outbox_jobs.error_message",
 })
 
-_SENSITIVE_PAYLOAD_KEYS = frozenset({
-    "content", "text", "query", "summary", "prompt", "result", "output",
-    "input", "message", "body", "preview", "raw_text", "raw_payload",
-    "arguments", "params", "tool_args", "input_snapshot", "output_summary",
-})
-
-
-def _redact_payload(value: Any) -> Any:
-    """只替换结构化 payload 中的用户正文键，保留任务恢复所需的标识字段。"""
-    if isinstance(value, dict):
-        redacted: dict[str, Any] = {}
-        for key, item in value.items():
-            if key in _SENSITIVE_PAYLOAD_KEYS:
-                if isinstance(item, dict):
-                    redacted[key] = {}
-                elif isinstance(item, list):
-                    redacted[key] = []
-                elif isinstance(item, str):
-                    redacted[key] = "[redacted]"
-                else:
-                    redacted[key] = None
-            else:
-                redacted[key] = _redact_payload(item)
-        return redacted
-    if isinstance(value, list):
-        return [_redact_payload(item) for item in value]
-    return value
-
-
-def _payload_has_content(value: Any) -> bool:
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if key in _SENSITIVE_PAYLOAD_KEYS and item not in (None, "", "[redacted]", [], {}):
-                return True
-            if _payload_has_content(item):
-                return True
-    elif isinstance(value, list):
-        return any(_payload_has_content(item) for item in value)
-    return False
-
-
 def scrub_auxiliary_tables(db: Session, scope: ContentScope) -> dict[str, int]:
     counts: dict[str, int] = {}
     cases = scope.conflict_case_ids
@@ -880,11 +937,12 @@ def scrub_auxiliary_tables(db: Session, scope: ContentScope) -> dict[str, int]:
     if scope.outbox_job_ids:
         changed = 0
         for job in db.query(OutboxJob).filter(OutboxJob.id.in_(scope.outbox_job_ids)).all():
-            payload = job.payload or {}
-            redacted = _redact_payload(payload)
-            if redacted != payload:
-                job.payload = redacted
-                changed += 1
+            if not is_internal_job(job.job_type):
+                payload = job.payload or {}
+                redacted = redact_job_payload(job.job_type, payload)
+                if redacted != payload:
+                    job.payload = redacted
+                    changed += 1
             if job.error_message:
                 job.error_message = ""
                 changed += 1
@@ -895,175 +953,134 @@ def scrub_auxiliary_tables(db: Session, scope: ContentScope) -> dict[str, int]:
 def scrub_task_runtime(
     db: Session, scope: ContentScope,
 ) -> tuple[dict[str, int], set[tuple[str, str]]]:
-    """清理 Agent Task Runtime，返回计数与待删除对象引用。"""
+    """按独立范围清理 Task Runtime 父任务与子记录，返回计数与对象引用。
+
+    父 Task 命中只清理父正文/语义状态；每条子记录按自身时间独立判断，绝不
+    因为父 Task 命中就清理其全部历史子记录。
+    """
     counts: dict[str, int] = {}
     refs: set[tuple[str, str]] = set()
     task_ids = scope.agent_task_ids
     partial_ids = scope.partial_agent_task_ids
-    if not task_ids and not partial_ids:
+    run_ids = scope.agent_run_ids
+    action_ids = scope.agent_action_ids
+    event_ids = scope.agent_task_event_ids
+    checkpoint_ids = scope.agent_task_checkpoint_ids
+    evidence_ids = scope.task_evidence_ids
+    artifact_ids = scope.task_artifact_ids
+    cleaned_ids = (
+        set(run_ids) | set(action_ids) | set(event_ids) | set(checkpoint_ids)
+        | set(evidence_ids) | set(artifact_ids)
+    )
+    if not task_ids and not cleaned_ids:
         return counts, refs
 
-    # 运行中的任务转为合法终态，避免恢复逻辑读取已脱敏的 task_state 后继续执行。
-    active_states = (
-        "'queued','dispatching','running','blocked_approval','blocked_user',"
-        "'blocked_node','reconciling','verifying'"
-    )
-    counts["agent_tasks"] = _execute_ids(
-        db,
-        "UPDATE agent_tasks SET title = '[redacted]', goal = '[redacted]', "
-        "task_brief = '{}', task_state = '{}', report = NULL, last_error = NULL, "
-        f"status = CASE WHEN status IN ({active_states}) THEN 'cancelled' ELSE status END, "
-        f"completed_at = CASE WHEN status IN ({active_states}) THEN :now ELSE completed_at END "
-        "WHERE id IN :ids",
-        task_ids,
-        {"now": datetime.now(timezone.utc)},
-    )
-    counts["agent_runs"] = _execute_ids(
-        db,
-        "UPDATE agent_runs SET input_snapshot = '{}', output_summary = NULL, "
-        "error_message = NULL WHERE task_id IN :ids",
-        task_ids,
-    )
-    counts["agent_actions"] = _execute_ids(
-        db,
-        "UPDATE agent_actions SET arguments = '{}', preconditions = '[]', effects = '[]', "
-        "result_summary = NULL, evidence_refs = '[]', error_message = NULL "
-        "WHERE task_id IN :ids",
-        task_ids,
-    )
-    counts["agent_task_events"] = _execute_ids(
-        db, "UPDATE agent_task_events SET payload = '{}' WHERE task_id IN :ids", task_ids,
-    )
-    counts["agent_task_checkpoints"] = _execute_ids(
-        db,
-        "UPDATE agent_task_checkpoints SET state = '{}', plan = '{}', "
-        "pending_action_refs = '[]', evidence_refs = '[]' WHERE task_id IN :ids",
-        task_ids,
-    )
+    # 1) 命中的父 Task：清理正文与语义状态；运行态转 cancelled。
+    if task_ids:
+        active_states = (
+            "'queued','dispatching','running','blocked_approval','blocked_user',"
+            "'blocked_node','reconciling','verifying'"
+        )
+        counts["agent_tasks"] = _execute_ids(
+            db,
+            "UPDATE agent_tasks SET title = '[redacted]', goal = '[redacted]', "
+            "task_brief = '{}', task_state = '{}', report = NULL, last_error = NULL, "
+            f"status = CASE WHEN status IN ({active_states}) THEN 'cancelled' ELSE status END, "
+            f"completed_at = CASE WHEN status IN ({active_states}) THEN :now ELSE completed_at END "
+            "WHERE id IN :ids",
+            task_ids,
+            {"now": datetime.now(timezone.utc)},
+        )
 
-    for bucket, key in db.query(TaskEvidence.object_bucket, TaskEvidence.object_key).filter(
-        TaskEvidence.task_id.in_(task_ids),
-        TaskEvidence.object_bucket.isnot(None),
-        TaskEvidence.object_key.isnot(None),
-    ).all():
-        if bucket and key:
-            refs.add((str(bucket), str(key)))
-    counts["task_evidence"] = _execute_ids(
-        db,
-        "UPDATE task_evidence SET summary = '[redacted]', inline_payload = NULL, "
-        "object_bucket = NULL, object_key = NULL WHERE task_id IN :ids",
-        task_ids,
-    )
+    # 2) 命中的子记录：逐条按 id 清理，不按 task_id 扩大。
+    if run_ids:
+        counts["agent_runs"] = _execute_ids(
+            db,
+            "UPDATE agent_runs SET input_snapshot = '{}', output_summary = NULL, "
+            "error_message = NULL WHERE id IN :ids",
+            run_ids,
+        )
+    if action_ids:
+        counts["agent_actions"] = _execute_ids(
+            db,
+            "UPDATE agent_actions SET arguments = '{}', preconditions = '[]', "
+            "effects = '[]', result_summary = NULL, evidence_refs = '[]', "
+            "error_message = NULL WHERE id IN :ids",
+            action_ids,
+        )
+    if event_ids:
+        counts["agent_task_events"] = _execute_ids(
+            db, "UPDATE agent_task_events SET payload = '{}' WHERE id IN :ids",
+            event_ids,
+        )
+    if checkpoint_ids:
+        counts["agent_task_checkpoints"] = _execute_ids(
+            db,
+            "UPDATE agent_task_checkpoints SET state = '{}', plan = '{}', "
+            "pending_action_refs = '[]', evidence_refs = '[]' WHERE id IN :ids",
+            checkpoint_ids,
+        )
+    if evidence_ids:
+        for bucket, key in db.query(
+            TaskEvidence.object_bucket, TaskEvidence.object_key,
+        ).filter(
+            TaskEvidence.id.in_(evidence_ids),
+            TaskEvidence.object_bucket.isnot(None),
+            TaskEvidence.object_key.isnot(None),
+        ).all():
+            if bucket and key:
+                refs.add((str(bucket), str(key)))
+        counts["task_evidence"] = _execute_ids(
+            db,
+            "UPDATE task_evidence SET summary = '[redacted]', inline_payload = NULL, "
+            "object_bucket = NULL, object_key = NULL WHERE id IN :ids",
+            evidence_ids,
+        )
+    if artifact_ids:
+        for bucket, key in db.query(
+            TaskArtifact.object_bucket, TaskArtifact.object_key,
+        ).filter(
+            TaskArtifact.id.in_(artifact_ids),
+            TaskArtifact.object_key != "",
+        ).all():
+            if bucket and key:
+                refs.add((str(bucket), str(key)))
+        counts["task_artifacts"] = _execute_ids(
+            db,
+            "UPDATE task_artifacts SET name = '[redacted]', summary = '[redacted]', "
+            "object_bucket = '', object_key = '' WHERE id IN :ids",
+            artifact_ids,
+        )
 
-    for bucket, key in db.query(TaskArtifact.object_bucket, TaskArtifact.object_key).filter(
-        TaskArtifact.task_id.in_(task_ids),
-        TaskArtifact.object_key != "",
-    ).all():
-        if bucket and key:
-            refs.add((str(bucket), str(key)))
-    counts["task_artifacts"] = _execute_ids(
-        db,
-        "UPDATE task_artifacts SET name = '[redacted]', summary = '[redacted]', "
-        "object_bucket = '', object_key = '' WHERE task_id IN :ids",
-        task_ids,
-    )
-
-    # Task 附属运行数据（watch / desktop receipt）
+    # 3) Task 附属运行数据（watch / desktop receipt）
     watch_task_ids = task_ids | partial_ids
     if watch_task_ids:
         watch_ids = _ids_from(
-            db, "SELECT id FROM agent_task_watches WHERE task_id IN :ids", watch_task_ids,
+            db, "SELECT id FROM agent_task_watches WHERE task_id IN :ids",
+            watch_task_ids,
         )
         if watch_ids:
             counts["agent_task_watches"] = _execute_ids(
                 db,
-                "UPDATE agent_task_watches SET config = '{}', cursor = '{}' WHERE id IN :ids",
+                "UPDATE agent_task_watches SET config = '{}', cursor = '{}' "
+                "WHERE id IN :ids",
                 watch_ids,
             )
-    receipt_action_ids = set(scope.agent_action_ids)
-    if task_ids:
-        receipt_action_ids |= _ids_from(
-            db, "SELECT id FROM agent_actions WHERE task_id IN :ids", task_ids,
-        )
+    receipt_action_ids = set(action_ids)
     if receipt_action_ids:
         counts["desktop_action_receipts"] = _execute_ids(
             db,
-            "UPDATE desktop_action_receipts SET result_payload = NULL, error_message = NULL "
-            "WHERE action_id IN :ids",
+            "UPDATE desktop_action_receipts SET result_payload = NULL, "
+            "error_message = NULL WHERE action_id IN :ids",
             receipt_action_ids,
         )
 
-    # ── time_range 子记录局部清理：只动命中的子行，不整体清空父 Task ──
-    if partial_ids:
-        cleaned_ids: set[str] = set()
-        if scope.agent_run_ids:
-            cleaned_ids |= set(scope.agent_run_ids)
-            counts["agent_runs_partial"] = _execute_ids(
-                db,
-                "UPDATE agent_runs SET input_snapshot = '{}', output_summary = NULL, "
-                "error_message = NULL WHERE id IN :ids",
-                scope.agent_run_ids,
-            )
-        if scope.agent_action_ids:
-            cleaned_ids |= set(scope.agent_action_ids)
-            counts["agent_actions_partial"] = _execute_ids(
-                db,
-                "UPDATE agent_actions SET arguments = '{}', preconditions = '[]', "
-                "effects = '[]', result_summary = NULL, evidence_refs = '[]', "
-                "error_message = NULL WHERE id IN :ids",
-                scope.agent_action_ids,
-            )
-        if scope.agent_task_event_ids:
-            cleaned_ids |= set(scope.agent_task_event_ids)
-            counts["agent_task_events_partial"] = _execute_ids(
-                db, "UPDATE agent_task_events SET payload = '{}' WHERE id IN :ids",
-                scope.agent_task_event_ids,
-            )
-        if scope.agent_task_checkpoint_ids:
-            cleaned_ids |= set(scope.agent_task_checkpoint_ids)
-            counts["agent_task_checkpoints_partial"] = _execute_ids(
-                db,
-                "UPDATE agent_task_checkpoints SET state = '{}', plan = '{}', "
-                "pending_action_refs = '[]', evidence_refs = '[]' WHERE id IN :ids",
-                scope.agent_task_checkpoint_ids,
-            )
-        if scope.task_evidence_ids:
-            cleaned_ids |= set(scope.task_evidence_ids)
-            for bucket, key in db.query(
-                TaskEvidence.object_bucket, TaskEvidence.object_key,
-            ).filter(
-                TaskEvidence.id.in_(scope.task_evidence_ids),
-                TaskEvidence.object_bucket.isnot(None),
-                TaskEvidence.object_key.isnot(None),
-            ).all():
-                if bucket and key:
-                    refs.add((str(bucket), str(key)))
-            counts["task_evidence_partial"] = _execute_ids(
-                db,
-                "UPDATE task_evidence SET summary = '[redacted]', inline_payload = NULL, "
-                "object_bucket = NULL, object_key = NULL WHERE id IN :ids",
-                scope.task_evidence_ids,
-            )
-        if scope.task_artifact_ids:
-            cleaned_ids |= set(scope.task_artifact_ids)
-            for bucket, key in db.query(
-                TaskArtifact.object_bucket, TaskArtifact.object_key,
-            ).filter(
-                TaskArtifact.id.in_(scope.task_artifact_ids),
-                TaskArtifact.object_key != "",
-            ).all():
-                if bucket and key:
-                    refs.add((str(bucket), str(key)))
-            counts["task_artifacts_partial"] = _execute_ids(
-                db,
-                "UPDATE task_artifacts SET name = '[redacted]', summary = '[redacted]', "
-                "object_bucket = '', object_key = '' WHERE id IN :ids",
-                scope.task_artifact_ids,
-            )
-        if cleaned_ids:
-            counts["agent_task_state_refs"] = _redact_task_state_refs(
-                db, partial_ids, cleaned_ids,
-            )
+    # 4) 父 Task 未自身命中但子记录命中：只脱敏 task_state/task_brief 中对
+    #    已清理子记录的引用；引用确实变化时运行态任务才转 cancelled。
+    if cleaned_ids and partial_ids:
+        counts["agent_task_state_refs"] = _redact_task_state_refs(
+            db, partial_ids, cleaned_ids,
+        )
     return counts, refs
 
 
@@ -1567,8 +1584,9 @@ def verify_scope(db: Session, scope: ContentScope) -> VerifyReport:
         report.add("approval_requests.error_message", _count_nonempty_text(
             db, "approval_requests", "error_message", approvals))
 
-    # Task Runtime（完整任务）
+    # Task Runtime：父字段按父 id、子记录字段按独立子记录 id 验证
     tasks = scope.agent_task_ids
+    partial = scope.partial_agent_task_ids
     if tasks:
         for label, sql in (
             ("agent_tasks.title", "SELECT COUNT(*) FROM agent_tasks WHERE id IN :ids AND title <> '[redacted]'"),
@@ -1580,97 +1598,78 @@ def verify_scope(db: Session, scope: ContentScope) -> VerifyReport:
         for column in ("task_brief", "task_state"):
             report.add(f"agent_tasks.{column}", _count_nonempty_json(
                 db, "agent_tasks", column, tasks))
-        for label, sql in (
-            ("agent_runs.input_snapshot", "SELECT COUNT(*) FROM agent_runs WHERE task_id IN :ids AND input_snapshot IS NOT NULL AND CAST(input_snapshot AS TEXT) NOT IN ('{}', 'null')"),
-            ("agent_runs.output_summary", "SELECT COUNT(*) FROM agent_runs WHERE task_id IN :ids AND output_summary IS NOT NULL"),
-            ("agent_runs.error_message", "SELECT COUNT(*) FROM agent_runs WHERE task_id IN :ids AND COALESCE(error_message, '') <> ''"),
-            ("agent_actions.arguments", "SELECT COUNT(*) FROM agent_actions WHERE task_id IN :ids AND arguments IS NOT NULL AND CAST(arguments AS TEXT) NOT IN ('{}', 'null')"),
-            ("agent_actions.preconditions", "SELECT COUNT(*) FROM agent_actions WHERE task_id IN :ids AND preconditions IS NOT NULL AND CAST(preconditions AS TEXT) NOT IN ('[]', 'null')"),
-            ("agent_actions.effects", "SELECT COUNT(*) FROM agent_actions WHERE task_id IN :ids AND effects IS NOT NULL AND CAST(effects AS TEXT) NOT IN ('[]', 'null')"),
-            ("agent_actions.result_summary", "SELECT COUNT(*) FROM agent_actions WHERE task_id IN :ids AND result_summary IS NOT NULL"),
-            ("agent_actions.evidence_refs", "SELECT COUNT(*) FROM agent_actions WHERE task_id IN :ids AND evidence_refs IS NOT NULL AND CAST(evidence_refs AS TEXT) NOT IN ('[]', 'null')"),
-            ("agent_actions.error_message", "SELECT COUNT(*) FROM agent_actions WHERE task_id IN :ids AND COALESCE(error_message, '') <> ''"),
-            ("agent_task_events.payload", "SELECT COUNT(*) FROM agent_task_events WHERE task_id IN :ids AND payload IS NOT NULL AND CAST(payload AS TEXT) NOT IN ('{}', 'null')"),
-            ("agent_task_checkpoints.state", "SELECT COUNT(*) FROM agent_task_checkpoints WHERE task_id IN :ids AND state IS NOT NULL AND CAST(state AS TEXT) NOT IN ('{}', 'null')"),
-            ("agent_task_checkpoints.plan", "SELECT COUNT(*) FROM agent_task_checkpoints WHERE task_id IN :ids AND plan IS NOT NULL AND CAST(plan AS TEXT) NOT IN ('{}', 'null')"),
-            ("agent_task_checkpoints.pending_action_refs", "SELECT COUNT(*) FROM agent_task_checkpoints WHERE task_id IN :ids AND pending_action_refs IS NOT NULL AND CAST(pending_action_refs AS TEXT) NOT IN ('[]', 'null')"),
-            ("agent_task_checkpoints.evidence_refs", "SELECT COUNT(*) FROM agent_task_checkpoints WHERE task_id IN :ids AND evidence_refs IS NOT NULL AND CAST(evidence_refs AS TEXT) NOT IN ('[]', 'null')"),
-            ("task_evidence.summary", "SELECT COUNT(*) FROM task_evidence WHERE task_id IN :ids AND summary <> '[redacted]'"),
-            ("task_evidence.inline_payload", "SELECT COUNT(*) FROM task_evidence WHERE task_id IN :ids AND inline_payload IS NOT NULL"),
-            ("task_evidence.object", "SELECT COUNT(*) FROM task_evidence WHERE task_id IN :ids AND (COALESCE(object_bucket, '') <> '' OR COALESCE(object_key, '') <> '')"),
-            ("task_artifacts.name", "SELECT COUNT(*) FROM task_artifacts WHERE task_id IN :ids AND name <> '[redacted]'"),
-            ("task_artifacts.summary", "SELECT COUNT(*) FROM task_artifacts WHERE task_id IN :ids AND summary <> '[redacted]'"),
-            ("task_artifacts.object", "SELECT COUNT(*) FROM task_artifacts WHERE task_id IN :ids AND (object_bucket <> '' OR object_key <> '')"),
-        ):
-            report.add(label, _sum_in(db, sql, tasks))
 
-    # Task Runtime（time_range 局部命中）
-    partial = scope.partial_agent_task_ids
-    if partial:
-        for label, table, column, ids in (
-            ("agent_runs_partial.input_snapshot", "agent_runs", "input_snapshot", scope.agent_run_ids),
-            ("agent_runs_partial.output_summary", "agent_runs", "output_summary", scope.agent_run_ids),
-            ("agent_runs_partial.error_message", "agent_runs", "error_message", scope.agent_run_ids),
-            ("agent_actions_partial.arguments", "agent_actions", "arguments", scope.agent_action_ids),
-            ("agent_actions_partial.preconditions", "agent_actions", "preconditions", scope.agent_action_ids),
-            ("agent_actions_partial.effects", "agent_actions", "effects", scope.agent_action_ids),
-            ("agent_actions_partial.result_summary", "agent_actions", "result_summary", scope.agent_action_ids),
-            ("agent_actions_partial.evidence_refs", "agent_actions", "evidence_refs", scope.agent_action_ids),
-            ("agent_actions_partial.error_message", "agent_actions", "error_message", scope.agent_action_ids),
-            ("agent_task_events_partial.payload", "agent_task_events", "payload", scope.agent_task_event_ids),
-            ("agent_task_checkpoints_partial.state", "agent_task_checkpoints", "state", scope.agent_task_checkpoint_ids),
-            ("agent_task_checkpoints_partial.plan", "agent_task_checkpoints", "plan", scope.agent_task_checkpoint_ids),
-            ("agent_task_checkpoints_partial.pending_action_refs", "agent_task_checkpoints", "pending_action_refs", scope.agent_task_checkpoint_ids),
-            ("agent_task_checkpoints_partial.evidence_refs", "agent_task_checkpoints", "evidence_refs", scope.agent_task_checkpoint_ids),
-            ("task_evidence_partial.summary", "task_evidence", "summary", scope.task_evidence_ids),
-            ("task_evidence_partial.inline_payload", "task_evidence", "inline_payload", scope.task_evidence_ids),
-            ("task_artifacts_partial.name", "task_artifacts", "name", scope.task_artifact_ids),
-            ("task_artifacts_partial.summary", "task_artifacts", "summary", scope.task_artifact_ids),
-        ):
-            if not ids:
-                continue
-            if column in ("input_snapshot", "arguments", "payload", "state", "plan"):
-                report.add(label, _sum_in(
-                    db,
-                    f"SELECT COUNT(*) FROM {table} WHERE id IN :ids AND {column} IS NOT NULL "
-                    f"AND CAST({column} AS TEXT) NOT IN ('{{}}', 'null')",
-                    ids,
-                ))
-            elif column in ("preconditions", "effects", "evidence_refs", "pending_action_refs"):
-                report.add(label, _sum_in(
-                    db,
-                    f"SELECT COUNT(*) FROM {table} WHERE id IN :ids AND {column} IS NOT NULL "
-                    f"AND CAST({column} AS TEXT) NOT IN ('[]', 'null')",
-                    ids,
-                ))
-            else:
-                report.add(label, _count_nonempty_text(db, table, column, set(ids)))
-        report.add("task_evidence_partial.object", _sum_in(
-            db,
-            "SELECT COUNT(*) FROM task_evidence WHERE id IN :ids AND "
-            "(COALESCE(object_bucket, '') <> '' OR COALESCE(object_key, '') <> '')",
-            scope.task_evidence_ids,
-        ))
-        report.add("task_artifacts_partial.object", _sum_in(
-            db,
-            "SELECT COUNT(*) FROM task_artifacts WHERE id IN :ids AND "
-            "(object_bucket <> '' OR object_key <> '')",
-            scope.task_artifact_ids,
-        ))
-        removed = (
-            scope.agent_run_ids | scope.agent_action_ids | scope.agent_task_event_ids
-            | scope.agent_task_checkpoint_ids | scope.task_evidence_ids
-            | scope.task_artifact_ids
-        )
-        if removed:
-            leftover = 0
-            from aiive.db.models import AgentTask as _AgentTask
-            for task in db.query(_AgentTask).filter(_AgentTask.id.in_(partial)).all():
-                if _json_has_ref(task.task_state, removed) or _json_has_ref(task.task_brief, removed):
-                    leftover += 1
-            report.add("agent_task_state_refs_partial", leftover)
+    child_checks = (
+        ("agent_runs.input_snapshot", "agent_runs", "input_snapshot", scope.agent_run_ids, "json_obj"),
+        ("agent_runs.output_summary", "agent_runs", "output_summary", scope.agent_run_ids, "json_null"),
+        ("agent_runs.error_message", "agent_runs", "error_message", scope.agent_run_ids, "text"),
+        ("agent_actions.arguments", "agent_actions", "arguments", scope.agent_action_ids, "json_obj"),
+        ("agent_actions.preconditions", "agent_actions", "preconditions", scope.agent_action_ids, "json_arr"),
+        ("agent_actions.effects", "agent_actions", "effects", scope.agent_action_ids, "json_arr"),
+        ("agent_actions.result_summary", "agent_actions", "result_summary", scope.agent_action_ids, "json_null"),
+        ("agent_actions.evidence_refs", "agent_actions", "evidence_refs", scope.agent_action_ids, "json_arr"),
+        ("agent_actions.error_message", "agent_actions", "error_message", scope.agent_action_ids, "text"),
+        ("agent_task_events.payload", "agent_task_events", "payload", scope.agent_task_event_ids, "json_obj"),
+        ("agent_task_checkpoints.state", "agent_task_checkpoints", "state", scope.agent_task_checkpoint_ids, "json_obj"),
+        ("agent_task_checkpoints.plan", "agent_task_checkpoints", "plan", scope.agent_task_checkpoint_ids, "json_obj"),
+        ("agent_task_checkpoints.pending_action_refs", "agent_task_checkpoints", "pending_action_refs", scope.agent_task_checkpoint_ids, "json_arr"),
+        ("agent_task_checkpoints.evidence_refs", "agent_task_checkpoints", "evidence_refs", scope.agent_task_checkpoint_ids, "json_arr"),
+        ("task_evidence.summary", "task_evidence", "summary", scope.task_evidence_ids, "text"),
+        ("task_evidence.inline_payload", "task_evidence", "inline_payload", scope.task_evidence_ids, "json_null"),
+        ("task_artifacts.name", "task_artifacts", "name", scope.task_artifact_ids, "text"),
+        ("task_artifacts.summary", "task_artifacts", "summary", scope.task_artifact_ids, "text"),
+    )
+    for label, table, column, ids, kind in child_checks:
+        if not ids:
+            continue
+        if kind == "json_obj":
+            report.add(label, _sum_in(
+                db,
+                f"SELECT COUNT(*) FROM {table} WHERE id IN :ids AND {column} IS NOT NULL "
+                "AND CAST(" + column + " AS TEXT) NOT IN ('{}', 'null')",
+                ids,
+            ))
+        elif kind == "json_arr":
+            report.add(label, _sum_in(
+                db,
+                f"SELECT COUNT(*) FROM {table} WHERE id IN :ids AND {column} IS NOT NULL "
+                "AND CAST(" + column + " AS TEXT) NOT IN ('[]', 'null')",
+                ids,
+            ))
+        elif kind == "json_null":
+            report.add(label, _sum_in(
+                db,
+                f"SELECT COUNT(*) FROM {table} WHERE id IN :ids AND {column} IS NOT NULL",
+                ids,
+            ))
+        else:
+            report.add(label, _count_nonempty_text(db, table, column, set(ids)))
+    report.add("task_evidence.object", _sum_in(
+        db,
+        "SELECT COUNT(*) FROM task_evidence WHERE id IN :ids AND "
+        "(COALESCE(object_bucket, '') <> '' OR COALESCE(object_key, '') <> '')",
+        scope.task_evidence_ids,
+    ))
+    report.add("task_artifacts.object", _sum_in(
+        db,
+        "SELECT COUNT(*) FROM task_artifacts WHERE id IN :ids AND "
+        "(object_bucket <> '' OR object_key <> '')",
+        scope.task_artifact_ids,
+    ))
+    removed = (
+        scope.agent_run_ids | scope.agent_action_ids | scope.agent_task_event_ids
+        | scope.agent_task_checkpoint_ids | scope.task_evidence_ids
+        | scope.task_artifact_ids
+    )
+    if removed and partial:
+        leftover = 0
+        from aiive.db.models import AgentTask as _AgentTask
+        for task in db.query(_AgentTask).filter(_AgentTask.id.in_(partial)).all():
+            if _json_has_ref(task.task_state, removed) or _json_has_ref(task.task_brief, removed):
+                leftover += 1
+        report.add("agent_task_state_refs_partial", leftover)
 
-    watch_task_ids = scope.agent_task_ids | scope.partial_agent_task_ids
+    watch_task_ids = tasks | partial
     if watch_task_ids:
         watch_ids = _ids_from(
             db, "SELECT id FROM agent_task_watches WHERE task_id IN :ids",
@@ -1680,24 +1679,18 @@ def verify_scope(db: Session, scope: ContentScope) -> VerifyReport:
             for column in ("config", "cursor"):
                 report.add(f"agent_task_watches.{column}", _count_nonempty_json(
                     db, "agent_task_watches", column, watch_ids))
-    receipt_action_ids = set(scope.agent_action_ids)
-    if scope.agent_task_ids:
-        receipt_action_ids |= _ids_from(
-            db, "SELECT id FROM agent_actions WHERE task_id IN :ids",
-            scope.agent_task_ids,
-        )
-    if receipt_action_ids:
+    if scope.agent_action_ids:
         report.add("desktop_action_receipts.result_payload", _sum_in(
             db,
             "SELECT COUNT(*) FROM desktop_action_receipts WHERE action_id IN :ids "
             "AND result_payload IS NOT NULL AND CAST(result_payload AS TEXT) NOT IN ('{}', 'null')",
-            receipt_action_ids,
+            scope.agent_action_ids,
         ))
         report.add("desktop_action_receipts.error_message", _sum_in(
             db,
             "SELECT COUNT(*) FROM desktop_action_receipts WHERE action_id IN :ids "
             "AND COALESCE(error_message, '') <> ''",
-            receipt_action_ids,
+            scope.agent_action_ids,
         ))
 
     # Auxiliary tables（冲突 / 召回 / 检索 / Outbox）
@@ -1732,7 +1725,9 @@ def verify_scope(db: Session, scope: ContentScope) -> VerifyReport:
     if scope.outbox_job_ids:
         residue = 0
         for job in db.query(OutboxJob).filter(OutboxJob.id.in_(scope.outbox_job_ids)).all():
-            if (job.error_message or "") or _payload_has_content(job.payload or {}):
+            if (job.error_message or "") or payload_has_content(
+                job.job_type, job.payload or {}
+            ):
                 residue += 1
         report.add("outbox_jobs", residue)
 

@@ -48,6 +48,7 @@ from aiive.task_runtime.goal_service import GoalService
 from aiive.task_runtime.repository import TaskRepository
 from aiive.task_runtime.schemas import TaskStatus
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome, HandlerResult
+from aiive.worker.outbox_payload_contract import is_redacted_payload
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +109,8 @@ def _active_turn_until(thread_id: str) -> datetime | None:
 
 
 def handle_goal_trigger_decision(claimed: ClaimedJob) -> HandlerResult:
+    if is_redacted_payload(claimed.payload):
+        return HandlerResult(HandlerOutcome.COMPLETED, "forget_content_redacted")
     payload = claimed.payload or {}
     task_id = str(payload.get("task_id") or "")
     step_id = str(payload.get("step_id") or "")
