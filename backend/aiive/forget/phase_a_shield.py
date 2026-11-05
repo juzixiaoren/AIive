@@ -43,6 +43,7 @@ from aiive.db.models import (
     RetrievalIndexEntry,
     RetrievalIndexToken,
 )
+from aiive.forget.concurrency import acquire_forget_exclusive_lock
 from aiive.forget.fingerprint import compute_value_fingerprint
 from aiive.forget.selector_normalizer import (
     MAX_INLINE_SHIELD_TARGETS,
@@ -106,10 +107,20 @@ def execute_phase_a_shield(
 
     必须在调用方的 session 事务边界内调用；不单独管理事务。
 
+    并发控制：本函数是 Phase A 唯一的排他锁入口。在计算 cutoff、创建
+    Operation / Shield / Tombstone 之前获取全局 Forget 排他事务锁，锁由当前
+    事务持有到 COMMIT / ROLLBACK。所有调用方（REST API → handle_forget、
+    Agent Forget Tool、MemoryWriteService.forget、内部直接调用）都经由此处，
+    不存在绕过锁协议的路径。
+
     Returns:
         { "operation_id": str, "operation_key": str, "status": "shielded",
           "shielded_at": str, "target_count": int }
     """
+
+    # 0. 统一排他锁入口：先与所有在途 MemoryWrite 互斥，再计算 cutoff。
+    #    等待锁期间提交的写入必然早于 cutoff，不会被本次遗忘遗漏。
+    acquire_forget_exclusive_lock(session)
 
     now = _utcnow()
     op_id = _new_id()

@@ -896,7 +896,7 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - 并发控制：写入路径取 `pg_advisory_xact_lock_shared(0x41495645, 1)`，`forget()` 取对应
   `pg_advisory_xact_lock` 排他锁；双 int4 命名空间与 canonical_key 的 bigint 锁（objsubid 1 vs 2）
   互不干扰；锁序「全局 → Memory Key」；锁由事务持有至 COMMIT/ROLLBACK；
-  `_ensure_read_committed()` 对非 READ COMMITTED fail-closed。
+  `concurrency.ensure_read_committed()` 对非 READ COMMITTED fail-closed。
 - 情况 A：Forget 等待在途写入提交后才获锁，`cutoff` 在获锁后计算，等待期间提交的记忆被本次
   Forget 的选择器 Shield 覆盖；情况 B：写入等共享锁，Forget 提交后读到 active Shield 并拒绝。
 - 纯 Turn 来源：`is_tombstone_blocked_reingestion(source_turn_record_id=...)` 统一展开
@@ -911,4 +911,44 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - 遗留风险：① 非 READ COMMITTED 部署会直接报错（刻意 fail-closed，需要改回默认隔离级别）；
   ② 同一事务内「先 forget 再 write」依赖同后端锁不自我冲突（PostgreSQL 允许），已在冲突确认流程覆盖；
   ③ time_range 宽范围 Scrub 与 JSON 数组清理仍留待 V62.2。
+
+### Forget Phase A 统一锁入口与 CI 失败状态修复（2026-11-05）
+- 目标：修复 Phase A 排他锁只覆盖 `MemoryWriteService.forget()`、未覆盖真实 API / Tool 入口的缺口；
+  同时修复 CI 单文件隔离测试失败被 `tee` 吞掉的问题。不重写 Saga、不改锁命名空间与
+  memory_only / history_only / everywhere 语义。
+- 锁模块：新增 `backend/aiive/forget/concurrency.py`，统一提供
+  `acquire_forget_shared_lock()`、`acquire_forget_exclusive_lock()` 与
+  `ensure_read_committed()`。锁仍为双 int4 命名空间 `(0x41495645, 1)`，事务级
+  advisory lock，持有到 COMMIT/ROLLBACK；PostgreSQL 非 READ COMMITTED fail-closed，SQLite no-op。
+- 统一排他入口：`execute_phase_a_shield()` 在计算 cutoff、创建 Operation / Shield /
+  Tombstone **之前**取排他锁。真实入口链：REST `routes_forget.py::forget_endpoint` →
+  `handle_forget()` → `execute_phase_a_shield()`；Agent Tool 经 `builtin_tools` 注册的同一
+  `handle_forget()`；`MemoryWriteService.forget()`（含 `routes_memories.py` 与
+  `MemoryConflictService` 的 `forget_old`）→ `execute_phase_a_shield()`。
+  `forget()` 内重复的排他锁调用已删除。顺带修复 Tool 入口无 `requested_by` 时生成
+  `forget:<uuid>`（43 字符）超过 `forget_operations.requested_by VARCHAR(36)`、在 PostgreSQL
+  上必然失败的问题（改为直接使用 36 位 UUID；SQLite 不校验长度所以此前未暴露）。
+- `forget_old` 同事务兼容：同一 Session 先 `forget()`（排他）再 `write()`（共享）；
+  PostgreSQL advisory lock 会话内可重入，不自我阻塞、不构成锁升级、不破坏原子性，
+  已用真实 PG 用例验证。
+- 测试：`tests/integration/pg/test_pg_forget_write_concurrency.py` 扩至 11 用例，新增
+  `handle_forget()` 等待在途写入、`handle_forget()` 排他锁阻塞写入并使其读 Shield 后拒绝、
+  REST 路由同锁保护、直接调用 `execute_phase_a_shield()` 无法绕过（lock_timeout 失败且零写入）、
+  `forget_old` 同事务先排他后共享；断言真实数据结果而不只看 `pg_locks`。
+- CI：`pytest` 与 `single-file` 两个 `| tee` 步骤都加 `set -o pipefail`，脚本失败不再被
+  `tee` 的 0 退出码覆盖；无其他 `| tee` 门禁步骤。
+- Supervisor 隔离测试根因：① `test_recover_after_interrupted_switch_rolls_back`：
+  `pid_alive()` 把已退出但未被父进程回收的僵尸进程（Linux `/proc/<pid>/stat` state=Z）
+  误判为存活，跨 Supervisor 停止接管进程时白等 15s + 5s 后失败；修复为识别僵尸进程。
+  ② `test_app_exit_during_monitor_rolls_back_to_previous`：`tick()` 开头的 `reap()` 与
+  `_watch()` 的存活判定之间存在窗口，进程恰在两者之间退出时漏记 `process_exited`；
+  修复为检测到退出后补一次 `reap()` 并记录事件。未删断言、未跳过、未延长超时。
+- 验证：全量 pytest 1637 passed / 64 skipped（新增 5 个 PG 用例默认 skip）；
+  Forget 集成 + 隐私 + 写入单测 123 passed；冲突确认 30 passed；Supervisor 单文件 19 passed；
+  PostgreSQL 并发 11 passed（全目录 51 passed / 13 skipped，skip 均为本地 Embedding 不可用）；
+  ruff `--select F,E9` 全仓通过；basedpyright 0 errors / 0 warnings。
+- 遗留风险：① 单事务内若先取共享锁再取排他锁，两个并发事务可能形成锁升级死锁；当前
+  生产路径只有 `forget_old` 的「先排他后共享」，无此顺序，新增调用方必须遵守
+  「排他 → 共享」或将其拆分为两个事务；② 僵尸识别仅覆盖 Linux（`/proc`），macOS 上仍是
+  保守的 `kill(pid, 0)` 语义。
 

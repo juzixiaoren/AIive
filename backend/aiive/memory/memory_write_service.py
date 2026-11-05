@@ -21,7 +21,6 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -34,6 +33,11 @@ from aiive.db.models import (
     MemoryRecord,
 )
 from aiive.db.forget_models import ContentProvenanceRef
+from aiive.forget.concurrency import (
+    FORGET_LOCK_KEY as FORGET_LOCK_KEY,
+    FORGET_LOCK_NAMESPACE as FORGET_LOCK_NAMESPACE,
+    acquire_forget_shared_lock,
+)
 from aiive.forget.phase_a_shield import execute_phase_a_shield
 from aiive.forget.visibility_service import ForgetVisibilityService
 from aiive.memory.conflict_resolver import ConflictResolver, ResolutionResult
@@ -59,31 +63,14 @@ logger = logging.getLogger(__name__)
 # Forget / MemoryWrite 并发控制锁协议
 # ============================================================================
 #
-# 目的：Phase A Shield 与 MemoryWrite 之间必须互斥，否则会出现
-#   「MemoryWrite 检查 Shield 未命中 → Forget 创建 Shield 并提交 →
-#     MemoryWrite 才提交」的窗口，导致遗忘目标遗漏一条已提交记忆。
-#
-# 协议（PostgreSQL transaction-level advisory lock，双 int4 命名空间）：
-#   - MemoryWrite.write() / write_batch()：pg_advisory_xact_lock_shared(ns, key)
-#     —— 共享锁，多个写入可并发；
-#   - Forget Phase A（MemoryWriteService.forget）：pg_advisory_xact_lock(ns, key)
-#     —— 排他锁，与所有在途写入互斥。
-#
-# 锁由数据库事务持有，随 COMMIT/ROLLBACK 自动释放；不能在执行完检查后立即
-# 释放（那等于没有互斥）。
-#
-# 命名空间：使用双 int4 形式（objsubid=2），与 canonical_key 的
-# pg_advisory_xact_lock(bigint)（objsubid=1）属于不同锁空间，不会互相干扰。
+# 锁协议与实现集中在 aiive.forget.concurrency：
+#   - 写入路径（write / write_batch）在读取任何 Shield 之前获取全局共享锁；
+#   - 排他锁由 execute_phase_a_shield 统一获取（API / Tool / 本服务 forget
+#     均经该入口），因此不存在绕过锁协议的调用路径。
 #
 # 锁顺序：全局 Forget 锁 → Memory Key 锁（两者都在本服务内获取），
 # forget 只取全局排他锁，因此不存在反向获取，不会死锁。
-#
-# 隔离级别：协议正确性依赖 READ COMMITTED（语句级快照）。获得锁之后的每一条
-# 查询都能看到前一个事务已提交的 Shield/Tombstone；若数据库被配置为
-# REPEATABLE READ / SERIALIZABLE，等待锁期间不会刷新快照，会静默丢失新提交
-# 的 Shield，故此处 fail-closed 直接报错。
-FORGET_LOCK_NAMESPACE = 0x41495645  # "AIVE"，独立命名空间
-FORGET_LOCK_KEY = 1
+# 隔离级别：PostgreSQL 下要求 READ COMMITTED，否则 fail-closed（见模块文档）。
 
 REINGESTION_BLOCKED_REASON = (
     "Reingestion blocked: proposal contains shielded/tombstone-blocked source"
@@ -174,8 +161,6 @@ class MemoryWriteService:
         self._lifecycle: MemoryLifecycleService = MemoryLifecycleService(
             db, executor=self._executor, registry=self._registry
         )
-        # 每个 Session 只需校验一次隔离级别（协议前提，见文件头锁协议说明）
-        self._isolation_checked: bool = False
 
     # ------------------------------------------------------------------
     # write_batch: atomic batch write
@@ -738,12 +723,10 @@ class MemoryWriteService:
             )
 
         try:
-            # Phase A 之前获取全局排他事务锁：
+            # 排他锁由 execute_phase_a_shield 统一获取（唯一入口）：
             #   - 与所有在途 MemoryWrite 互斥（等它们提交后才继续）；
-            #   - cutoff 在获得锁之后才计算（execute_phase_a_shield 内部取 now），
-            #     因此等待期间提交的写入一定落在 cutoff 之前，不会被遗漏；
+            #   - cutoff 在获得锁之后才计算，等待期间提交的写入不会被遗漏；
             #   - 锁持有到本次事务提交，提交后的写入必然读到 active Shield。
-            self._acquire_exclusive_forget_lock()
             result = execute_phase_a_shield(
                 session=self._db,
                 mode=mode,
@@ -1330,59 +1313,14 @@ class MemoryWriteService:
 
     # -- Forget 并发控制锁（共享/排他） --------------------------------
 
-    def _pg_dialect(self) -> str:
-        """返回当前 Session 绑定的方言名；探测失败按非 PG 处理（锁 no-op）。"""
-        try:
-            return self._db.get_bind().dialect.name
-        except Exception:
-            return ""
-
-    def _ensure_read_committed(self) -> None:
-        """校验协议前提：PostgreSQL 事务必须处于 READ COMMITTED。
-
-        排他/共享锁只保证互斥，不保证「等待锁期间提交的数据可见」。READ
-        COMMITTED 下每条语句取新快照，因此获得锁后的 Shield 查询必然能看到
-        前一个写入事务已提交的内容；REPEATABLE READ 会沿用旧快照，从而静默
-        放行已被遗忘来源的重抽。该前提不成立时 fail-closed 抛错。
-        """
-        if self._isolation_checked:
-            return
-        iso = self._db.execute(text("SHOW transaction_isolation")).scalar()
-        if str(iso or "").strip().lower() != "read committed":
-            raise RuntimeError(
-                f"Forget/MemoryWrite 并发协议要求 READ COMMITTED，当前为 {iso!r}，无法保证看到新提交的 Shield"
-            )
-        self._isolation_checked = True
-
     def _acquire_shared_write_lock(self) -> None:
-        """写入路径：获取全局 Forget 共享事务锁。
+        """写入路径：获取全局 Forget 共享事务锁（实现在 concurrency 模块）。
 
         必须在任何「读取 Shield / 写记忆」之前调用，并由当前事务一直持有到
         COMMIT/ROLLBACK。多个写入共享锁互不阻塞；Forget Phase A 的排他锁
         会与所有在途写入互斥。
         """
-        if self._pg_dialect() != "postgresql":
-            return
-        self._ensure_read_committed()
-        self._db.execute(
-            text("SELECT pg_advisory_xact_lock_shared(:ns, :key)"),
-            {"ns": FORGET_LOCK_NAMESPACE, "key": FORGET_LOCK_KEY},
-        )
-
-    def _acquire_exclusive_forget_lock(self) -> None:
-        """Forget Phase A：获取全局排他事务锁。
-
-        必须在计算 cutoff、创建 Shield 之前调用：等待期间所有在途写入已经
-        提交，因此 cutoff 取锁之后的时间可以覆盖它们；锁释放发生在 Phase A
-        提交之后，之后的写入必然能看到 active Shield。
-        """
-        if self._pg_dialect() != "postgresql":
-            return
-        self._ensure_read_committed()
-        self._db.execute(
-            text("SELECT pg_advisory_xact_lock(:ns, :key)"),
-            {"ns": FORGET_LOCK_NAMESPACE, "key": FORGET_LOCK_KEY},
-        )
+        acquire_forget_shared_lock(self._db)
 
     @staticmethod
     def _compute_lock_id(

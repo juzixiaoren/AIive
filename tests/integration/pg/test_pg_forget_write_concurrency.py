@@ -10,7 +10,10 @@ import uuid
 from datetime import datetime, timezone
 
 import pytest
+import aiive.forget.phase_a_shield as phase_a_module
+from aiive.api.routes_forget import ForgetRequest, forget_endpoint
 from aiive.context.run_context import RunContext
+from aiive.db.forget_models import ForgetOperation, ForgetShield
 from aiive.db.models import (
     Event,
     MemoryEvidence,
@@ -18,6 +21,7 @@ from aiive.db.models import (
     MemoryRecord,
     Thread,
 )
+from aiive.forget.phase_a_shield import execute_phase_a_shield
 from aiive.forget.visibility_service import ForgetVisibilityService
 from aiive.memory.memory_types import (
     EvidenceItem,
@@ -30,6 +34,8 @@ from aiive.memory.memory_write_service import (
     FORGET_LOCK_NAMESPACE,
     MemoryWriteService,
 )
+from aiive.tools import forget_tool
+from aiive.tools.forget_tool import handle_forget
 from sqlalchemy import text
 
 pytestmark = pytest.mark.pg
@@ -113,6 +119,16 @@ def _has_lock(pg_engine, mode: str, granted: bool) -> bool:
         and sub == 2 and m == mode and g is granted
         for cls, obj, sub, m, g in _advisory_locks(pg_engine)
     )
+
+
+def _wait_lock(pg_engine, mode: str, granted: bool, timeout: float = 5.0) -> bool:
+    """等待 advisory 锁进入目标状态（避免线程调度造成的瞬时误判）。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _has_lock(pg_engine, mode, granted):
+            return True
+        time.sleep(0.05)
+    return _has_lock(pg_engine, mode, granted)
 
 # ---------------------------------------------------------------------------
 # 情况 A：MemoryWrite 先获得共享锁
@@ -470,4 +486,338 @@ def _has_lock_any(pg_sessionmaker, mode: str, granted: bool) -> bool:
         and int(r[2]) == 2 and str(r[3]) == mode and bool(r[4]) is granted
         for r in rows
     )
+
+
+# ---------------------------------------------------------------------------
+# 真实生产入口：handle_forget / REST 路由 / 直接调用 execute_phase_a_shield
+# ---------------------------------------------------------------------------
+
+
+def test_handle_forget_waits_for_inflight_write_and_covers_it(
+    pg_session, pg_sessionmaker, pg_engine, monkeypatch,
+):
+    """MemoryWrite 持共享锁时 handle_forget 必须等待；提交后 Shield 覆盖该写入。"""
+    monkeypatch.setattr(forget_tool, "SessionLocal", pg_sessionmaker)
+    thread_id = _thread_row(pg_sessionmaker)
+    key = "pg.forget.tool.case-a"
+
+    written = threading.Event()
+    release_writer = threading.Event()
+    forget_done = threading.Event()
+    out: dict[str, object] = {}
+
+    def writer() -> None:
+        s = pg_sessionmaker()
+        try:
+            out["write"] = MemoryWriteService(s).write(
+                _proposal(key, "tool case-a secret"), _ctx(thread_id),
+            )
+            written.set()
+            release_writer.wait(20)
+            s.commit()
+        except Exception as exc:  # noqa: BLE001
+            out["write_err"] = exc
+            s.rollback()
+        finally:
+            s.close()
+
+    def forgetter() -> None:
+        try:
+            started = time.monotonic()
+            out["forget"] = handle_forget(
+                mode="memory_only", canonical_key=key, reason="tool-case-a",
+            )
+            out["forget_wait"] = time.monotonic() - started
+        except Exception as exc:  # noqa: BLE001
+            out["forget_err"] = exc
+        finally:
+            forget_done.set()
+
+    tw = threading.Thread(target=writer, daemon=True)
+    tw.start()
+    assert written.wait(20), "写入线程未完成前置写入"
+
+    tf = threading.Thread(target=forgetter, daemon=True)
+    tf.start()
+
+    assert not forget_done.wait(1.5), "handle_forget 未等待在途 MemoryWrite 就提交了 Shield"
+    assert _wait_lock(pg_engine, "ShareLock", True), "未观察到写入方持有的共享锁"
+    assert _wait_lock(pg_engine, "ExclusiveLock", False), "handle_forget 未等待排他锁"
+
+    release_writer.set()
+    tw.join(20)
+    tf.join(30)
+
+    assert "write_err" not in out, out.get("write_err")
+    assert "forget_err" not in out, out.get("forget_err")
+    forget_res = out["forget"]
+    assert isinstance(forget_res, dict) and forget_res.get("ok") is True, forget_res
+
+    write_res = out["write"]
+    assert getattr(write_res, "written", False)
+    memory_id = getattr(write_res, "memory_id", "")
+    assert memory_id
+
+    pg_session.expire_all()
+    blocked = ForgetVisibilityService.blocked_target_ids(
+        pg_session, "memory_record", [(memory_id, None)],
+    )
+    assert memory_id in blocked, "handle_forget 提交的 Shield 未覆盖等待期间写入的记忆"
+    assert pg_session.query(ForgetOperation).count() == 1
+    assert pg_session.query(ForgetShield).count() >= 1
+
+
+def test_handle_forget_exclusive_lock_blocks_writer_until_shield_commit(
+    pg_engine, pg_sessionmaker, monkeypatch,
+):
+    """handle_forget 持排他锁时写入必须等待；提交后写入读到 Shield 并拒绝旧来源。"""
+    monkeypatch.setattr(forget_tool, "SessionLocal", pg_sessionmaker)
+    thread_id = _thread_row(pg_sessionmaker)
+    event_id = _event_row(pg_sessionmaker, thread_id, "tool case-b secret")
+    key = "pg.forget.tool.case-b"
+
+    original = phase_a_module._materialize_selector_shields
+    locked = threading.Event()
+    release = threading.Event()
+
+    def gated(*args, **kwargs):  # noqa: ANN002, ANN003 - 透传原函数参数
+        locked.set()
+        assert release.wait(20), "测试未释放 handle_forget 的临界区"
+        return original(*args, **kwargs)
+
+    # 在取得排他锁之后、写 Shield 之前卡住，制造「Forget 在途」窗口。
+    monkeypatch.setattr(phase_a_module, "_materialize_selector_shields", gated)
+
+    write_done = threading.Event()
+    out: dict[str, object] = {}
+
+    def forgetter() -> None:
+        try:
+            out["forget"] = handle_forget(
+                mode="history_only", event_ids=[event_id], reason="tool-case-b",
+            )
+        except Exception as exc:  # noqa: BLE001
+            out["forget_err"] = exc
+
+    def writer() -> None:
+        s = pg_sessionmaker()
+        try:
+            s.execute(text("SET lock_timeout = '30s'"))
+            out["write"] = MemoryWriteService(s).write(
+                _proposal(key, "tool case-b secret", event_id=event_id), _ctx(thread_id),
+            )
+            s.commit()
+        except Exception as exc:  # noqa: BLE001
+            out["write_err"] = exc
+            s.rollback()
+        finally:
+            s.close()
+            write_done.set()
+
+    tf = threading.Thread(target=forgetter, daemon=True)
+    tf.start()
+    assert locked.wait(20), "handle_forget 未进入 Phase A"
+    assert _wait_lock(pg_engine, "ExclusiveLock", True), "handle_forget 未持有排他锁"
+
+    tw = threading.Thread(target=writer, daemon=True)
+    tw.start()
+    assert not write_done.wait(1.5), "写入未等待 handle_forget 的排他锁即继续"
+    assert _wait_lock(pg_engine, "ShareLock", False), "未观察到写入方等待共享锁"
+
+    release.set()
+    tf.join(30)
+    tw.join(30)
+
+    assert "forget_err" not in out, out.get("forget_err")
+    assert "write_err" not in out, out.get("write_err")
+    forget_res = out.get("forget")
+    assert isinstance(forget_res, dict) and forget_res.get("ok") is True
+    assert getattr(out["write"], "outcome") == WriteOutcome.GATE_REJECTED
+    assert "Reingestion blocked" in (getattr(out["write"], "reason", "") or "")
+
+    check = pg_sessionmaker()
+    try:
+        assert check.query(MemoryRecord).filter(MemoryRecord.canonical_key == key).count() == 0
+        assert check.query(MemoryEvidence).filter(
+            MemoryEvidence.source_event_id == event_id,
+        ).count() == 0
+        assert check.query(MemoryProposalModel).filter(
+            MemoryProposalModel.canonical_key == key,
+        ).count() == 0
+        assert check.query(ForgetShield).filter(
+            ForgetShield.target_type == "event", ForgetShield.target_id == event_id,
+        ).count() >= 1
+    finally:
+        check.close()
+
+
+def test_rest_route_forget_uses_same_exclusive_lock(
+    pg_session, pg_sessionmaker, pg_engine, monkeypatch,
+):
+    """REST 路由 forget_endpoint 走 handle_forget，同样受共享锁阻塞。"""
+    monkeypatch.setattr(forget_tool, "SessionLocal", pg_sessionmaker)
+    thread_id = _thread_row(pg_sessionmaker)
+    key = "pg.forget.rest.case-a"
+
+    written = threading.Event()
+    release_writer = threading.Event()
+    route_done = threading.Event()
+    out: dict[str, object] = {}
+
+    def writer() -> None:
+        s = pg_sessionmaker()
+        try:
+            out["write"] = MemoryWriteService(s).write(
+                _proposal(key, "rest case-a secret"), _ctx(thread_id),
+            )
+            written.set()
+            release_writer.wait(20)
+            s.commit()
+        except Exception as exc:  # noqa: BLE001
+            out["write_err"] = exc
+            s.rollback()
+        finally:
+            s.close()
+
+    def caller() -> None:
+        try:
+            out["route"] = forget_endpoint(
+                ForgetRequest(mode="memory_only", canonical_key=key, reason="rest-case-a")
+            )
+        except Exception as exc:  # noqa: BLE001
+            out["route_err"] = exc
+        finally:
+            route_done.set()
+
+    tw = threading.Thread(target=writer, daemon=True)
+    tw.start()
+    assert written.wait(20)
+
+    tr = threading.Thread(target=caller, daemon=True)
+    tr.start()
+    assert not route_done.wait(1.5), "REST forget 未等待在途 MemoryWrite 就提交了 Shield"
+    assert _wait_lock(pg_engine, "ShareLock", True)
+    assert _wait_lock(pg_engine, "ExclusiveLock", False)
+
+    release_writer.set()
+    tw.join(20)
+    tr.join(30)
+
+    assert "write_err" not in out, out.get("write_err")
+    assert "route_err" not in out, out.get("route_err")
+    route_res = out["route"]
+    assert isinstance(route_res, dict) and route_res.get("ok") is True, route_res
+
+    memory_id = getattr(out["write"], "memory_id", "")
+    assert memory_id
+    pg_session.expire_all()
+    blocked = ForgetVisibilityService.blocked_target_ids(
+        pg_session, "memory_record", [(memory_id, None)],
+    )
+    assert memory_id in blocked, "REST 路径创建的 Shield 未覆盖等待期间写入的记忆"
+
+
+def test_direct_phase_a_call_cannot_bypass_exclusive_lock(pg_sessionmaker):
+    """直接调用 execute_phase_a_shield 也必须拿排他锁，拿不到就失败且零写入。"""
+    _thread_row(pg_sessionmaker)  # 保证外键/线程上下文存在
+    key = "pg.forget.direct"
+
+    holder = pg_sessionmaker()
+    out: dict[str, object] = {}
+    done = threading.Event()
+
+    def direct() -> None:
+        s = pg_sessionmaker()
+        try:
+            s.execute(text("SET lock_timeout = '700ms'"))
+            out["result"] = execute_phase_a_shield(
+                session=s, mode="memory_only", canonical_key=key, reason="direct",
+            )
+            s.commit()
+        except Exception as exc:  # noqa: BLE001
+            out["error"] = exc
+            s.rollback()
+        finally:
+            s.close()
+            done.set()
+
+    try:
+        MemoryWriteService(holder)._acquire_shared_write_lock()
+        t = threading.Thread(target=direct, daemon=True)
+        t.start()
+        assert done.wait(10), "直接调用 execute_phase_a_shield 绕过了排他锁"
+        t.join(5)
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert "result" not in out, "排他锁被占用时直接调用不应成功"
+    error = out.get("error")
+    assert error is not None
+    assert "lock timeout" in str(error).lower() or "canceling statement" in str(error).lower()
+
+    check = pg_sessionmaker()
+    try:
+        assert check.query(ForgetOperation).count() == 0
+        assert check.query(ForgetShield).count() == 0
+    finally:
+        check.close()
+
+
+def test_forget_old_same_transaction_exclusive_then_shared(
+    pg_session, pg_sessionmaker,
+):
+    """forget_old 同事务「先排他后共享」不自我阻塞、不死锁，且事务原子提交。"""
+    thread_id = _thread_row(pg_sessionmaker)
+    old_key = "pg.forget.forget-old.old"
+    new_key = "pg.forget.forget-old.new"
+
+    seed = pg_sessionmaker()
+    try:
+        old_res = MemoryWriteService(seed).write(
+            _proposal(old_key, "old content"), _ctx(thread_id),
+        )
+        seed.commit()
+    finally:
+        seed.close()
+    assert old_res.written
+    old_id = old_res.memory_id
+
+    out: dict[str, object] = {}
+    done = threading.Event()
+
+    def flow() -> None:
+        s = pg_sessionmaker()
+        try:
+            s.execute(text("SET lock_timeout = '20s'"))
+            writer = MemoryWriteService(s)
+            out["forget"] = writer.forget(memory_id=old_id, reason="forget_old")
+            out["write"] = writer.write(_proposal(new_key, "new content"), _ctx(thread_id))
+            s.commit()
+        except Exception as exc:  # noqa: BLE001
+            out["error"] = exc
+            s.rollback()
+        finally:
+            s.close()
+            done.set()
+
+    t = threading.Thread(target=flow, daemon=True)
+    t.start()
+    assert done.wait(30), "同事务先排他后共享发生自我阻塞或死锁"
+    t.join(5)
+
+    assert "error" not in out, out.get("error")
+    assert getattr(out.get("forget"), "written", False)
+    assert getattr(out.get("write"), "written", False)
+
+    pg_session.expire_all()
+    old = pg_session.get(MemoryRecord, old_id)
+    assert old is not None
+    assert (old.lifecycle_state or "") == "forgotten"
+    new = pg_session.query(MemoryRecord).filter(
+        MemoryRecord.canonical_key == new_key,
+    ).one()
+    assert (new.lifecycle_state or "") in {"active", "candidate"}
+    assert pg_session.query(ForgetOperation).count() == 1
+
 

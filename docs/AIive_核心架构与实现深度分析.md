@@ -1146,7 +1146,7 @@ pending/asking --TTL 到期--> expired
 4. 对需要修改旧记录的决策，若旧记录已变化或不再 active，则标记 stale，不执行基于旧快照的计划；
 5. clarify 会递增轮次并入队下一轮问题；超过最大澄清轮数则 expired，保留旧记忆且不写新提案；
 6. accept_new/revise/merge/keep_both 会转成 MemoryWriteService 的强制 decision；
-7. forget_old 先调用 `MemoryWriteService.forget()`（进入 Forget Saga），再将新提案按 create 语义写入；
+7. forget_old 先调用 `MemoryWriteService.forget()`（进入 Forget Saga，同事务持排他锁），再将新提案按 create 语义写入（同会话再取共享锁，advisory lock 可重入，不阻塞）；
 8. 用户回复作为 trusted Evidence 加入新 Proposal，confidence 至少提高到 0.95，execution_mode=user_required；
 9. 成功后更新 Case、同步 Proposal 记录、关闭通知并提交。
 
@@ -1167,6 +1167,17 @@ pending/asking --TTL 到期--> expired
 9. 外层 `handle_memory_extraction` 在同一 Phase C 事务里将 IngestionRun 标记 succeeded，最后一次性 commit。
 
 Advisory Lock 使用 `pg_advisory_xact_lock`，事务结束自动释放。`_release_lock()` 是保留的空操作，不是依赖 Python finally 手工解锁。
+
+除 Memory Key 锁之外，`MemoryWriteService` 必须在事务开头取全局 Forget 共享锁
+（`forget/concurrency.py::acquire_forget_shared_lock`，双 int4 命名空间
+`(0x41495645, 1)`，与 bigint Key 锁空间隔离），并在任何 Shield 查询之前持有到
+COMMIT/ROLLBACK。Forget Phase A 的排他锁（`acquire_forget_exclusive_lock`）唯一入口是
+`execute_phase_a_shield()`：它在计算 cutoff、创建 Operation / Shield / Tombstone 之前取锁，
+因此 REST（`routes_forget` → `handle_forget`）、Agent Forget Tool、
+`MemoryWriteService.forget` 与内部直接调用全部自动受保护，不存在绕过路径。
+PostgreSQL 非 READ COMMITTED 时 fail-closed（避免等待锁期间沿用旧快照）；SQLite 为 no-op，
+只用于逻辑测试。冲突确认的 `forget_old` 在同一事务先 forget（排他）再 write（共享）：
+PostgreSQL advisory lock 在会话内可重入，不会自我阻塞，也不构成锁升级。
 
 ## 12.9 Memory Gate 的准确含义
 

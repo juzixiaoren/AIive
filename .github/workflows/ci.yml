@@ -29,7 +29,10 @@ jobs:
           pip install -e ".[dev]"
       - name: 运行单元与关键流程测试
         # tee 保留完整输出，失败时由下一步转成 ::error:: 注解（job 日志需仓库权限）。
-        run: pytest tests/unit tests/flow -v 2>&1 | tee /tmp/pytest.log
+        # 必须显式开启 pipefail：否则 tee 的退出码会覆盖 pytest 的失败，job 假绿。
+        run: |
+          set -o pipefail
+          pytest tests/unit tests/flow -v 2>&1 | tee /tmp/pytest.log
       - name: 失败摘要（pytest）
         if: failure()
         run: |
@@ -57,7 +60,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
       - name: 逐文件单独运行
-        run: bash scripts/check_single_file_tests.sh 2>&1 | tee /tmp/single_file.log
+        # 同上：脚本以非零码报告失败文件，pipefail 缺失会被 tee 吞成成功。
+        run: |
+          set -o pipefail
+          bash scripts/check_single_file_tests.sh 2>&1 | tee /tmp/single_file.log
       - name: 失败摘要（单文件）
         if: failure()
         run: |

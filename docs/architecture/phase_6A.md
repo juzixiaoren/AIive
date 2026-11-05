@@ -795,12 +795,17 @@ Phase 6B（Retention / vacuum / 长期混沌）见 `phase_6B.md`。
 | 路径 | 锁 | 说明 |
 |---|---|---|
 | `write()` / `write_batch()` | `pg_advisory_xact_lock_shared(FORGET_LOCK_NAMESPACE, FORGET_LOCK_KEY)` | 共享锁，多个写入可并发 |
-| `forget()`（Phase A） | `pg_advisory_xact_lock(FORGET_LOCK_NAMESPACE, FORGET_LOCK_KEY)` | 排他锁，与所有在途写入互斥 |
+| `execute_phase_a_shield()`（Phase A 唯一入口） | `pg_advisory_xact_lock(FORGET_LOCK_NAMESPACE, FORGET_LOCK_KEY)` | 排他锁，与所有在途写入互斥；API / Agent Tool / `forget()` / 内部调用全覆盖 |
 
 - **锁空间独立**：双 int4 形式在 `pg_locks` 中 `objsubid=2`，而 canonical_key 锁走单 bigint 形式
   （`objsubid=1`），两套键不会互相命中。
-- **锁顺序**：全局 Forget 锁 → Memory Key 锁。`forget()` 只取全局排他锁，不取 Key 锁，
+- **锁顺序**：全局 Forget 锁 → Memory Key 锁。Phase A 只取全局排他锁，不取 Key 锁，
   因此不存在反向顺序，不会死锁。
+- **统一入口**：锁协议实现在 `backend/aiive/forget/concurrency.py`
+  （`acquire_forget_shared_lock` / `acquire_forget_exclusive_lock` / `ensure_read_committed`）。
+  `execute_phase_a_shield()` 在计算 cutoff、创建 Operation / Shield / Tombstone **之前**取排他锁，
+  因此 REST API（`routes_forget.py` → `handle_forget()`）、Agent Forget Tool、
+  `MemoryWriteService.forget()` 及任何内部直接调用都自动受保护；`forget()` 内不再重复取锁。
 - **事务边界**：锁由数据库事务持有到 COMMIT/ROLLBACK；`write()` / `write_batch()` 不在内部
   提交，`forget()` 也不提交（由调用方提交），因此锁的持有期与屏蔽生效期严格对齐。
 - **情况 A（写入先持共享锁）**：Forget 的排他锁等待；写入提交后 Forget 才获得锁，`cutoff` 在
@@ -810,7 +815,10 @@ Phase 6B（Retention / vacuum / 长期混沌）见 `phase_6B.md`。
   下后续语句取新快照，读到 active Shield 并拒绝旧来源，不写 MemoryRecord / MemoryEvidence /
   ContentProvenanceRef / MemoryProposal。
 - **隔离级别**：协议正确性依赖 READ COMMITTED（语句级快照）。非 READ COMMITTED 时
-  `_ensure_read_committed()` fail-closed 抛错，避免等待锁期间沿用旧快照而静默放行。
+  `concurrency.ensure_read_committed()` fail-closed 抛错，避免等待锁期间沿用旧快照而静默放行。
+- **`forget_old` 同事务兼容**：`MemoryConflictService._execute_decision()` 在同一 Session 先
+  `writer.forget()`（排他锁）再 `writer.write()`（共享锁）。PostgreSQL advisory lock 按会话
+  可重入，同会话重复获取不阻塞，因此不会自我死锁、也不构成锁升级；事务原子性不变。
 - **SQLite**：无 advisory lock 语义，锁为 no-op；SQLite 测试只验证拒绝逻辑，并发语义由
   `tests/integration/pg/test_pg_forget_write_concurrency.py` 在真实 PG 上验证。
 
@@ -830,8 +838,16 @@ Phase 6B（Retention / vacuum / 长期混沌）见 `phase_6B.md`。
 - `tests/integration/backend/test_forget_write_privacy.py`：15 用例（Gate Reject 隐私、普通拒绝审计、
   `write` / `write_batch` 真实调用链、混合 Evidence、纯 Turn、cutoff 后新 Turn、强制决策 / Reinforce /
   Merge / Supersede 不可绕过、RunContext 来源）。
-- `tests/integration/pg/test_pg_forget_write_concurrency.py`：6 用例（情况 A/B、共享锁并发性、
-  回滚与异常释放锁、多写入 + Forget 无死锁），断言 `pg_locks` 中 `ShareLock` / `ExclusiveLock` 的授予状态。
+- `tests/integration/pg/test_pg_forget_write_concurrency.py`：11 用例。除原有情况 A/B、共享锁并发性、
+  回滚与异常释放锁、多写入 + Forget 无死锁外，新增真实生产入口用例：`handle_forget()` 等待在途写入、
+  `handle_forget()` 排他锁阻塞写入并使其读取 Shield 后拒绝、REST `forget_endpoint` 走同一锁、
+  直接调用 `execute_phase_a_shield()` 无法绕过（lock_timeout 失败且零写入）、`forget_old`
+  同事务「先排他后共享」正常完成。断言同时覆盖 `pg_locks` 授予状态与真实数据结果
+  （MemoryRecord / MemoryEvidence / MemoryProposal / ForgetShield）。
+  实测：该文件 11 passed；`tests/integration/pg` 全目录 51 passed / 13 skipped（skip 为本地
+  Embedding 服务不可用）。真实入口用例还暴露并修复了 `handle_forget()` 在无 `requested_by`
+  时生成 `forget:<uuid>`（43 字符）超过 `forget_operations.requested_by VARCHAR(36)` 的缺陷
+  （SQLite 不校验长度，此前未暴露）。
 - CI：该文件位于 `tests/integration/pg/`，由既有 `postgres-contract` Job（`pytest tests/integration/pg -v`，
   `AIIVE_PG_TESTS=1`）自动纳入，无需新增 Job。
 

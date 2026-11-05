@@ -509,6 +509,11 @@ class Supervisor:
         previous = str(state.get("previous_slot") or "")
 
         if not self.controller.alive(record):
+            # tick() 开头的 reap 与本处存活判定之间存在窗口：进程可能在两次
+            # 调用之间退出。检测到退出后补一次 reap，确保 process_exited 事件
+            # 一定被记录（事件应绑定「检测到退出」，而不是上一次 poll 的时机）。
+            for item in self.controller.reap():
+                self._event("process_exited", pid=item["pid"], exit_code=item["exit_code"])
             self._event("app_exited_unexpectedly", slot=record.slot, pid=record.pid, in_monitor=in_monitor)
             self._write_state(process=None)
             if in_monitor and previous in _SLOTS and previous != record.slot:

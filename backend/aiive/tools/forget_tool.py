@@ -82,7 +82,9 @@ def handle_forget(
     调用无 RunContext，通过 requested_by 标识来源（如 "api"）。
     """
     # 优先使用 RunContext 的 trace_id；否则回退到 requested_by；再否则生成一次性标识
-    effective_requested_by = (ctx.trace_id if ctx else None) or requested_by or f"forget:{_new_api_id()}"
+    # requested_by 列长度 36：无 RunContext 时必须直接使用 36 位 UUID，
+    # 不能再拼接 "forget:" 前缀（43 字符会被 PostgreSQL 拒绝）。
+    effective_requested_by = (ctx.trace_id if ctx else None) or requested_by or _new_api_id()
 
     # 参数校验：与 API / Phase A 共用 Mode / Selector 兼容矩阵。
     try:

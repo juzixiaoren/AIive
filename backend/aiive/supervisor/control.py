@@ -40,6 +40,27 @@ def iso_now() -> str:
     return utc_now().isoformat()
 
 
+def _is_zombie(pid: int) -> bool:
+    """POSIX：进程已退出但尚未被父进程回收（state=Z）。
+
+    僵尸进程不再执行代码、不占用监听端口，但 os.kill(pid, 0) 仍然成功。
+    若不识别，跨 Supervisor 停止接管进程时会误判为「仍在运行」，白等
+    stop_timeout，并让恢复流程误以为清理失败。
+    """
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_bytes()
+    except OSError:
+        return False
+    try:
+        # comm 字段可能包含空格/括号，state 是最后一个 ')' 之后的第一个字段。
+        tail = raw[raw.rindex(b")") + 2:]
+    except ValueError:
+        return False
+    return tail[:1] == b"Z"
+
+
 def pid_alive(pid: int | None) -> bool:
     """判断 pid 是否仍存活。
 
@@ -72,7 +93,7 @@ def pid_alive(pid: int | None) -> bool:
         return True
     except OSError:
         return False
-    return True
+    return not _is_zombie(int(pid))
 
 
 @dataclass(frozen=True)
