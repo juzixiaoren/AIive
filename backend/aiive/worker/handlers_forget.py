@@ -36,6 +36,7 @@ from aiive.db.models import (
     EpochCheckpoint,
     Event,
     MemoryEvidence,
+    MemoryProposal as MemoryProposalModel,
     MemoryRecord,
     MemoryVectorProjection,
     OutboxJob,
@@ -1481,10 +1482,26 @@ def handle_forget_purge(claimed: ClaimedJob) -> HandlerResult:
         # 时按 tombstone 的 source_event_id / source_turn_record_id 清除原文）
         _scrub_event_turn_targets(db, operation_id)
 
-        # 宽选择器全量 scrub
-        _scrub_wide(db, operation_id)
+        # 范围化 scrub（含 Task Runtime / Knowledge / 对象引用登记）。
+        scrub_counts = _scrub_wide(db, operation_id)
+        _record_scrub_content_action(db, operation_id, scrub_counts)
+        # 先提交数据库清理与 pending delete_object 动作：对象删除必须在提交之后，
+        # 否则回滚会留下「数据库有引用但对象已删除」的不可逆状态。
+        db.commit()
 
-        # 全部完成 → enqueue verify（必须在 commit 之前，同事务）
+        # 提交后执行对象删除；失败保留 failed 动作并由本 Job 重试。
+        from aiive.forget.content_scrub import process_object_deletions
+        object_result = process_object_deletions(db, operation_id)
+        if object_result["failed"]:
+            logger.warning(
+                "forget_purge 对象删除未完成，等待重试：%s", object_result["failed"][:5],
+            )
+            return HandlerResult(
+                HandlerOutcome.RETRYABLE_ERROR,
+                f"object deletion failed: {len(object_result['failed'])}",
+            )
+
+        # 全部完成 → enqueue verify（同事务）
         batch.status = "done"
         _enqueue_next_stage(db, operation_id, "forget_verify")
         db.commit()
@@ -1643,13 +1660,69 @@ def _scrub_batch(db: Session, memory_ids: list[str], mode: str = "everywhere") -
         ), {"eid": entity_id}).first()
         if still_used is None:
             db.execute(sa_text("DELETE FROM graph_entities WHERE id = :eid"), {"eid": entity_id})
-    db.execute(sa_text(
-        "UPDATE memory_proposals SET raw_payload = NULL, normalized_payload = NULL "
-        + "WHERE final_memory_id IN :ids"
-    ).bindparams(ids_bind), {"ids": memory_ids})
+    # --- 提案：不能只依赖 final_memory_id；按来源 Event / Turn 反查 ---
+    from aiive.forget.content_scope import (
+        normalize_turn_tokens,
+        select_json_array_members,
+    )
+    proposal_ids: set[str] = {
+        row[0] for row in db.query(MemoryProposalModel.id).filter(
+            MemoryProposalModel.final_memory_id.in_(memory_ids),
+        ).all()
+    }
+    if event_ids:
+        proposal_ids |= set(select_json_array_members(
+            db, "memory_proposals", "id", "source_event_ids", event_ids,
+        ))
+    if event_ids:
+        turn_tokens = normalize_turn_tokens(db, [
+            str(row[0]) for row in db.query(Event.turn_id).filter(
+                Event.id.in_(event_ids), Event.turn_id.isnot(None),
+            ).distinct().all() if row[0] is not None
+        ])
+        if turn_tokens:
+            proposal_ids |= {
+                row[0] for row in db.query(MemoryProposalModel.id).filter(
+                    (MemoryProposalModel.source_turn_id.in_(turn_tokens))
+                    | (MemoryProposalModel.source_turn_record_id.in_(turn_tokens))
+                ).all()
+            }
+    if proposal_ids:
+        db.execute(sa_text(
+            "UPDATE memory_proposals SET content = NULL, structured_value = NULL, "
+            + "evidence = '[]', raw_payload = NULL, normalized_payload = NULL "
+            + "WHERE id IN :ids"
+        ).bindparams(ids_bind), {"ids": sorted(proposal_ids)})
     db.execute(sa_text(
         "DELETE FROM memory_evidence WHERE memory_id IN :ids"
     ).bindparams(ids_bind), {"ids": memory_ids})
+    # 其他仍然有效的 memory 若以被清理 Event 为证据：清除 span，保留行供重算。
+    if event_ids:
+        db.execute(sa_text(
+            "UPDATE memory_evidence SET content_span = '' "
+            + "WHERE source_event_id IN :ids AND content_span IS NOT NULL"
+        ).bindparams(ids_bind), {"ids": event_ids})
+    db.execute(sa_text(
+        "UPDATE memory_maintenance_actions SET details = NULL, preconditions = NULL "
+        + "WHERE subject_memory_record_id IN :ids"
+    ).bindparams(ids_bind), {"ids": memory_ids})
+    related_action_ids: set[str] = set()
+    if memory_ids:
+        related_action_ids = set(select_json_array_members(
+            db, "memory_maintenance_actions", "id", "related_record_ids", memory_ids,
+        ))
+        if related_action_ids:
+            db.execute(sa_text(
+                "UPDATE memory_maintenance_actions SET details = NULL, preconditions = NULL "
+                + "WHERE id IN :ids"
+            ).bindparams(ids_bind), {"ids": sorted(related_action_ids)})
+        block_ids = set(select_json_array_members(
+            db, "core_memory_blocks", "id", "source_memory_ids", memory_ids,
+        ))
+        if block_ids:
+            db.execute(sa_text(
+                "DELETE FROM core_memory_blocks WHERE id IN :ids"
+            ).bindparams(ids_bind), {"ids": sorted(block_ids)})
     db.execute(sa_text(
         "UPDATE memory_maintenance_inputs SET snapshot_json = NULL "
         + "WHERE memory_record_id IN :ids"
@@ -1658,7 +1731,7 @@ def _scrub_batch(db: Session, memory_ids: list[str], mode: str = "everywhere") -
     # --- retrieval index ---
     db.execute(sa_text(
         "UPDATE retrieval_index_entries SET search_text = '', snippet = '', "
-        + "title = '[forgotten]', is_searchable = false "
+        + "title = '[forgotten]', metadata = '{}', is_searchable = false "
         + "WHERE source_type = 'memory_record' AND source_id IN :ids"
     ).bindparams(ids_bind), {"ids": memory_ids})
 
@@ -1669,147 +1742,56 @@ def _scrub_batch(db: Session, memory_ids: list[str], mode: str = "everywhere") -
         ).bindparams(ids_bind), {"ids": exclusive_event_ids})
 
 
-def _scrub_wide(db: Session, operation_id: str) -> None:
-    """宽选择器全量 scrub：覆盖规格 §M 清单所有内容承载位置。
+def _scrub_wide(db: Session, operation_id: str) -> dict[str, int]:
+    """宽 / 窄选择器的统一内容清理入口。
 
-    按选择器范围（thread / time_range / all_user_data）对 events / turn_records /
-    working_states / context_snapshots / llm_calls / tasks / artifacts /
-    compaction_inputs / epoch_compaction_inputs / segment_summaries /
-    epoch_checkpoints 做 redact。
+    范围由 SelectorManifest 解析为 ContentScope（表/字段/关联均来自真实模型），
+    逐表 redact；对象引用解除后登记 pending delete_object 动作，提交后删除。
+    memory_only 保留 Event/Turn 原始正文；memory_ids / canonical_key / scope 的
+    历史正文只由 _scrub_batch 按「独占来源 Event」处理，不在此扩大范围。
     """
-    from sqlalchemy import text as sa_text
+    from aiive.forget.content_scope import load_scope
+    from aiive.forget.content_scrub import scrub_all
 
     op = db.query(ForgetOperation).filter_by(id=operation_id).first()
-    if not op:
-        return
+    if op is None:
+        return {}
+    scope = load_scope(db, operation_id, op.mode)
+    if scope is None:
+        return {}
 
-    selector = (
-        db.query(ForgetSelectorManifest)
-        .filter_by(forget_operation_id=operation_id).first()
-    )
-    if not selector:
-        return
+    # 目标 memory 的窄层清理（记录/证据/提案/维护/图谱/检索）。幂等：Purge 已按
+    # 批次处理过，这里保证直接调用 _scrub_wide（canonical_key/scope 等）也完整。
+    for start in range(0, len(scope.memory_ids), BATCH_SIZE):
+        chunk = sorted(scope.memory_ids)[start:start + BATCH_SIZE]
+        if chunk:
+            _scrub_batch(db, chunk, mode=op.mode)
 
-    payload = selector.selector_payload
-    thread_id = payload.get("thread_id")
-    tf = payload.get("time_from")
-    tt = payload.get("time_to")
-    all_user = payload.get("all_user_data", False)
-    # memory_only 保留 raw Event / Turn 正文供显式历史审计；宽选择器下同样
-    # 不得把原始历史不可逆清空，只屏蔽可见性（Shield / Tombstone / Provenance）。
-    preserve_raw_history = (op.mode == "memory_only")
+    # 沿 Provenance / Evidence 把「被清理历史」派生的 memory 一并纳入窄层清理。
+    if scope.selector_type not in ("memory_ids", "canonical_key", "scope") and scope.event_ids:
+        from sqlalchemy import bindparam, text as sa_text
+        ids = sorted(scope.event_ids)
+        bind = bindparam("ids", expanding=True)
+        derived: set[str] = set()
+        for start in range(0, len(ids), BATCH_SIZE):
+            chunk = ids[start:start + BATCH_SIZE]
+            derived |= {r[0] for r in db.execute(sa_text(
+                "SELECT DISTINCT owner_id FROM content_provenance_refs WHERE owner_type = 'memory_record' AND source_type = 'event' AND source_id IN :ids"
+            ).bindparams(bind), {"ids": chunk}).all() if r[0]}
+            derived |= {r[0] for r in db.execute(sa_text(
+                "SELECT DISTINCT memory_id FROM memory_evidence WHERE source_event_id IN :ids"
+            ).bindparams(bind), {"ids": chunk}).all() if r[0]}
+            derived |= {r[0] for r in db.execute(sa_text(
+                "SELECT id FROM memory_records WHERE source_event_id IN :ids"
+            ).bindparams(bind), {"ids": chunk}).all() if r[0]}
+        extra = sorted(derived - scope.memory_ids)
+        for start in range(0, len(extra), BATCH_SIZE):
+            _scrub_batch(db, extra[start:start + BATCH_SIZE], mode=op.mode)
+        scope.memory_ids |= set(extra)
 
-    # thread 范围
-    if thread_id:
-        if not preserve_raw_history:
-            db.execute(sa_text(
-                "UPDATE events SET payload = '{}' WHERE thread_id = :tid"
-            ), {"tid": thread_id})
-            db.execute(sa_text(
-                "UPDATE turn_records SET response_payload = NULL WHERE thread_id = :tid"
-            ), {"tid": thread_id})
-        db.execute(sa_text(
-            "UPDATE working_states SET current_objective=NULL, open_loops='[]', "
-            + "active_constraints='[]', pending_approvals='[]', artifact_refs='[]', "
-            + "verified_tool_states='[]', uncommitted_side_effects='[]', "
-            + "running_tool_state='[]' WHERE thread_id = :tid"
-        ), {"tid": thread_id})
-        db.execute(sa_text(
-            "UPDATE context_snapshots SET context_items='[]' WHERE thread_id = :tid"
-        ), {"tid": thread_id})
-        db.execute(sa_text(
-            "UPDATE llm_calls SET input_preview='', output_preview='' WHERE thread_id = :tid"
-        ), {"tid": thread_id})
-        db.execute(sa_text(
-            "UPDATE tasks SET description='', title='[redacted]' WHERE thread_id = :tid"
-        ), {"tid": thread_id})
-        db.execute(sa_text(
-            "UPDATE artifacts SET content='[redacted]' WHERE thread_id = :tid"
-        ), {"tid": thread_id})
-        db.execute(sa_text(
-            "UPDATE compaction_inputs SET working_state_snapshot='{}' "
-            + "WHERE segment_id IN (SELECT id FROM segments WHERE thread_id=:tid)"
-        ), {"tid": thread_id})
-        db.execute(sa_text(
-            "UPDATE epoch_compaction_inputs SET current_objective=NULL, open_loops='[]', "
-            + "active_constraints='[]', artifact_refs='[]', verified_tool_states='[]', "
-            + "source_segment_ids='[]', source_hashes='[]' "
-            + "WHERE epoch_id IN (SELECT id FROM epochs WHERE thread_id=:tid)"
-        ), {"tid": thread_id})
-        db.execute(sa_text(
-            "UPDATE segment_summaries SET goal='[redacted]',outcome='[redacted]',"
-            + "decisions='[]',open_loops='[]',entities='[]' WHERE source_event_ids "
-            + "IN (SELECT id FROM events WHERE thread_id=:tid)"
-        ), {"tid": thread_id})
-        db.execute(sa_text(
-            "UPDATE epoch_checkpoints SET current_goal='[redacted]',open_loops='[]',"
-            + "active_constraints='[]' WHERE source_segment_ids IN "
-            + "(SELECT id FROM segments WHERE thread_id=:tid)"
-        ), {"tid": thread_id})
-
-    # time range
-    if tf or tt:
-        conditions = []
-        params: dict[str, Any] = {}
-        if tf:
-            conditions.append("created_at >= :tf")
-            params["tf"] = tf
-        if tt:
-            conditions.append("created_at <= :tt")
-            params["tt"] = tt
-        where = " AND ".join(conditions)
-        if not preserve_raw_history:
-            db.execute(sa_text(
-                f"UPDATE events SET payload = '{{}}' WHERE {where}"
-            ), params)
-        db.execute(sa_text(
-            f"UPDATE llm_calls SET input_preview='', output_preview='' WHERE {where}"
-        ), params)
-        db.execute(sa_text(
-            f"UPDATE context_snapshots SET context_items='[]' WHERE {where}"
-        ), params)
-        db.execute(sa_text(
-            f"UPDATE tasks SET description='', title='[redacted]' WHERE {where}"
-        ), params)
-        db.execute(sa_text(
-            f"UPDATE compaction_inputs SET working_state_snapshot='{{}}' WHERE {where}"
-        ), params)
-        db.execute(sa_text(
-            "UPDATE epoch_compaction_inputs SET current_objective=NULL, open_loops='[]', "
-            + "active_constraints='[]', artifact_refs='[]', verified_tool_states='[]', "
-            + f"source_segment_ids='[]', source_hashes='[]' WHERE {where}"
-        ), params)
-
-    # all_user_data
-    if all_user:
-        if not preserve_raw_history:
-            db.execute(sa_text("UPDATE events SET payload = '{}'"))
-            db.execute(sa_text("UPDATE turn_records SET response_payload = NULL"))
-        db.execute(sa_text(
-            "UPDATE working_states SET current_objective=NULL, open_loops='[]', "
-            + "active_constraints='[]', pending_approvals='[]', artifact_refs='[]', "
-            + "verified_tool_states='[]', uncommitted_side_effects='[]', "
-            + "running_tool_state='[]'"
-        ))
-        db.execute(sa_text("UPDATE context_snapshots SET context_items='[]'"))
-        db.execute(sa_text("UPDATE llm_calls SET input_preview='', output_preview=''"))
-        db.execute(sa_text("UPDATE tasks SET description='', title='[redacted]'"))
-        db.execute(sa_text("UPDATE artifacts SET content='[redacted]'"))
-        db.execute(sa_text("UPDATE compaction_inputs SET working_state_snapshot='{}'"))
-        db.execute(sa_text(
-            "UPDATE epoch_compaction_inputs SET current_objective=NULL, open_loops='[]', "
-            + "active_constraints='[]', artifact_refs='[]', verified_tool_states='[]', "
-            + "source_segment_ids='[]', source_hashes='[]'"
-        ))
-        db.execute(sa_text(
-            "UPDATE segment_summaries SET goal='[redacted]',outcome='[redacted]',"
-            + "decisions='[]',open_loops='[]',entities='[]'"
-        ))
-        db.execute(sa_text(
-            "UPDATE epoch_checkpoints SET current_goal='[redacted]',open_loops='[]',"
-            + "active_constraints='[]'"
-        ))
+    counts = scrub_all(db, scope)
     db.flush()
+    return counts
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2121,12 +2103,34 @@ def handle_forget_verify(claimed: ClaimedJob) -> HandlerResult:
                 _verify_source_event_integrity(db, operation_id, op, memory_ids)
             )
 
+        # 3e. 逐表内容完整性证明：重新读取数据库与对象存储，不信任 Scrub rowcount。
+        #     每个纳入矩阵的字段都有残留计数；任何残留都进入 failed_retryable，
+        #     Shield 保持 active。缺少 manifest 的历史操作无法证明范围，保持旧行为。
+        from aiive.forget.content_scope import load_scope
+        from aiive.forget.content_scrub import verify_scope
+        content_report = None
+        scope = load_scope(db, operation_id, op.mode)
+        if scope is not None:
+            content_report = verify_scope(db, scope)
+            # 补入 Scrub 阶段的逐表执行计数，形成「目标/执行/残留/对象」完整证明。
+            scrub_action = db.query(ForgetAction).filter_by(
+                idempotency_key=f"fa:{operation_id}:scrub_content:global:b0",
+            ).first()
+            if scrub_action is not None and isinstance(scrub_action.details, dict):
+                counts = scrub_action.details.get("counts")
+                if isinstance(counts, dict):
+                    content_report.scrubbed.update({
+                        str(k): int(v) for k, v in counts.items()
+                    })
+            failures.extend(content_report.failures)
+
         # 4. 判定结果（三态，spec §N）
         if failures:
             op.status = "failed_retryable"
             op.error_message = "; ".join(failures[:3])
         elif is_wide:
-            # 宽选择器：粗粒度 purge 已施加（_scrub_wide）→ verified_with_coarse_purge
+            # 宽选择器：逐表 Scrub 与 Verify 均通过 → verified_with_coarse_purge
+            # （状态名沿用兼容；语义已由 verify_scope 的逐表证明支撑）。
             op.status = "verified_with_coarse_purge"
             op.verified_at = _utcnow()
             op.purged_at = _utcnow()
@@ -2153,8 +2157,14 @@ def handle_forget_verify(claimed: ClaimedJob) -> HandlerResult:
             ).update({ForgetShield.status: "retired"}, synchronize_session=False)
 
         op.updated_at = _utcnow()
-        _record_action(db, operation_id, "verify",
-                       details={"result": op.status, "failures": len(failures)})
+        verify_details: dict[str, Any] = {
+            "result": op.status,
+            "failures": len(failures),
+            "failure_messages": failures[:20],
+        }
+        if content_report is not None:
+            verify_details["content"] = content_report.to_dict()
+        _record_verify_action(db, operation_id, verify_details)
         db.commit()
 
         result_msg = "verified" if not failures else f"failed: {failures[0]}"
@@ -2238,6 +2248,56 @@ def _record_action(
         completed_at=now,
     )
     db.add(action)
+
+
+def _record_scrub_content_action(
+    db: Session, operation_id: str, counts: dict[str, int],
+) -> None:
+    """持久化逐表执行计数（Purge 每次重试刷新）。"""
+    ikey = f"fa:{operation_id}:scrub_content:global:b0"
+    now = _utcnow()
+    action = db.query(ForgetAction).filter_by(idempotency_key=ikey).first()
+    if action is None:
+        db.add(ForgetAction(
+            id=_generate_id(),
+            forget_operation_id=operation_id,
+            action_type="scrub_content",
+            batch_no=0,
+            status="done",
+            idempotency_key=ikey,
+            details={"counts": counts},
+            started_at=now,
+            completed_at=now,
+        ))
+        return
+    action.details = {"counts": counts}
+    action.status = "done"
+    action.completed_at = now
+
+
+def _record_verify_action(
+    db: Session, operation_id: str, details: dict[str, Any],
+) -> None:
+    """Verify 动作每次都刷新 details/状态（_record_action 是幂等插入，不适合）。"""
+    ikey = f"fa:{operation_id}:verify:global:b0"
+    now = _utcnow()
+    action = db.query(ForgetAction).filter_by(idempotency_key=ikey).first()
+    if action is None:
+        db.add(ForgetAction(
+            id=_generate_id(),
+            forget_operation_id=operation_id,
+            action_type="verify",
+            batch_no=0,
+            status="done",
+            idempotency_key=ikey,
+            details=details,
+            started_at=now,
+            completed_at=now,
+        ))
+        return
+    action.details = details
+    action.status = "done"
+    action.completed_at = now
 
 
 def _generate_id() -> str:

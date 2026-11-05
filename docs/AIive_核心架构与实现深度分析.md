@@ -828,7 +828,7 @@ Forget 不是单条 `DELETE`，而是一个“先屏蔽、再发现依赖、重�
 - **Shield** 是临时的即时可见性屏蔽层；**Tombstone** 是长期保留的可见性/重摄取阻断记录。
 - Phase A 的立即屏蔽不代表物理删除已经完成；真正 Scrub 由后台 Outbox 阶段推进。
 - `memory_only` 不等于“所有聊天原文一定完整保留”：目标 Memory 的独占来源 Event 可能在 `_scrub_batch()` 中被清空。
-- `verified` / `verified_with_coarse_purge` 的验证范围有限，不能解释为所有内容承载表均已逐项扫描并证明无残留。
+- V62.2 起 Verify 会逐表重新读取内容残留、对象存储动作与未知 JSON 结构；宽选择器的 `verified_with_coarse_purge` 以完整 Scope 证明为前提。
 - `all_user_data` 当前宽清理 SQL 未按用户 ID 过滤；如果部署为多用户/多租户系统，这会构成跨用户数据影响风险。
 - 还需注意：Task Runtime 的 Evidence/Artifact 等对象是否纳入 Forget 需要单独核实，不能只根据“all user data”名称推断已经清理。
 
@@ -882,7 +882,7 @@ Forget 不是单条 `DELETE`，而是一个“先屏蔽、再发现依赖、重�
 | Knowledge 多用户 ACL | 未发现完整实现 | — | 搜索 SQL 未见 user/workspace ACL 过滤 |
 | Graph Projection / Expansion / Rebuild | 已实现 | 受配置与召回路径影响 | Graph 是 Memory 派生投影 |
 | Memory Extraction / Conflict Confirmation | 已实现 | Turn 后台 Outbox 提取；冲突时进入裁决/确认 | 本文已追踪主链；未逐一枚举所有 mutation 字段 |
-| Forget Saga | 已实现，来源 Event 隔离闭环已补齐 | 用户请求触发 Phase A，后续 Outbox 推进 | 来源 Event 可见性/防重抽/摘要重建/memory_only 保留/Verify 已按 13.11 补齐；mode/selector 契约与 Turn ID 清理已按 13.12 补齐；宽范围 Scrub 与 Task/Knowledge 对象覆盖仍有审计缺口 |
+| Forget Saga | 已实现，来源 Event 隔离闭环已补齐 | 用户请求触发 Phase A，后续 Outbox 推进 | 来源 Event 可见性/防重抽/摘要重建/memory_only 保留/Verify 已按 13.11 补齐；mode/selector 契约与 Turn ID 清理已按 13.12 补齐；宽范围 Scrub、Task Runtime/Knowledge/对象存储与逐表 Verify 已按 V62.2 补齐 |
 | Persistent Task Runtime | 已实现 | 用户委派或事件唤醒 | 已追踪 Run/Action/Evidence/Checkpoint 主链 |
 | Desktop Unknown Reconciliation | 已实现 | Node journal 回执/缺失报告触发 | 不代表普通 MCP/Shell 也具备同等对账能力 |
 | General External Action Exactly-once | 未能证明 | — | 必须按 capability 单独定义幂等/回执 |
@@ -1408,37 +1408,48 @@ Event / TurnRecord 目标也会沿 turn 关联、Segment 归属、Summary source
 
 MemoryRecord 本身保留为 forgotten sentinel，不是简单 `DELETE FROM memory_records`。这样保留生命周期审计与 ID 稳定性，同时删除正文和结构化事实。
 
-### 宽范围 Scrub
+### 宽范围 Scrub（V62.2）
 
-`_scrub_wide()` 当前显式读取的选择器字段只有：
+`_scrub_wide()` 改为基于 `forget/content_scope.py::ContentScope` 的统一范围模型，
+完整字段矩阵见 `docs/architecture/forget_content_matrix.md`。
 
-- `thread_id`；
-- `time_from/time_to`；
-- `all_user_data`。
+- 范围：thread / time_range / all_user_data / canonical_key / scope / turn_ids /
+  event_ids / memory_ids；memory_only 保留 Event/Turn 原始正文，history_only /
+  everywhere 清理原始与派生副本；canonical_key/scope 只覆盖目标 Memory 与可证明
+  派生，不扩大到无关用户数据。
+- JSON 数组：Summary.source_event_ids/source_turn_ids、Checkpoint.source_segment_ids、
+  CoreMemoryBlock.source_memory_ids、MaintenanceAction.related_record_ids 使用
+  PostgreSQL `jsonb_array_elements_text` / SQLite `json_each` 的成员查询（批量分片），
+  不再使用标量 IN 或 LIKE。
+- 表覆盖：Events/TurnRecords/TurnEventInbox、MemoryRecord、Proposal 五字段、Evidence
+  span、Maintenance inputs/actions、CoreMemoryBlock、Retrieval 四字段、Summary 10 字段、
+  Checkpoint 8 字段、Compaction/EpochCompaction、WorkingState 全部语义 JSON、
+  ContextSnapshot、LLMCall、Tasks、Artifacts、AttentionState、Task Runtime 全部表、
+  Knowledge Document/Chunk/Vector。
+- time_range 使用各表真实时间列（WorkingState.updated_at、其余 created_at）并沿
+  Segment/Epoch 关系清理派生副本，不套用统一 created_at。
+- 对象存储：DB 事务内只解除引用并登记 `forget_actions(action_type='delete_object')`；
+  COMMIT 后才删除。共享对象复查后跳过，失败保留 failed 动作供 Purge 重试；
+  `documents.source_path` 指向的用户原始文件永不删除。
 
-对应会更新/清空的内容承载表包括 Events、TurnRecords、WorkingStates、ContextSnapshots、LLMCalls、Tasks、Artifacts、CompactionInputs、EpochCompactionInputs，以及部分 SegmentSummary/EpochCheckpoint 字段。
+## 13.8 Phase E：Verify 实际检查了什么（V62.2）
 
-但当前代码没有针对 `scope` 和 `canonical_key` 编写与 thread/time/all_user_data 等价的全量宽表 Scrub 分支。它们仍会通过 Memory Target / Dependency 做目标级清理，但不能据此声称“Scope 下所有非 Memory 内容都被全量物理清理”。
+`handle_forget_verify()` 在原有 Memory/Tombstone/Retrieval 检查之外，调用
+`forget/content_scrub.py::verify_scope()` 重新读取数据库与对象存储：
 
-## 13.8 Phase E：Verify 实际检查了什么
-
-`handle_forget_verify()` 当前实际检查：
-
-1. 本次 Forget 的 MemoryRecord 是否都已 `lifecycle_state='forgotten'`；
-2. 对应 RetrievalIndexEntry 是否仍 `is_searchable=true`；
-3. 每个 memory_record target 是否有对应 Tombstone；
-4. event / turn_record target 是否按正确 target_type 有 Tombstone。
+1. 逐表统计目标范围内的非空内容残留（含 JSON 数组的成员查询）；
+2. 统计无法按数组解析的引用字段（unknown JSON shapes）；
+3. 统计 delete_object 动作的 pending/failed/already-present 数量，并实际检查对象是否存在；
+4. 目标数、逐表残留、对象动作写入 Verify 动作 `details.content`。
 
 结果：
 
 - 无失败且窄选择器：`verified`；
-- 无失败且宽选择器：`verified_with_coarse_purge`；
+- 无失败且宽选择器：`verified_with_coarse_purge`（现在有逐表证明，不再是粗粒度声明）；
 - 从旧 forget_requests 迁移且 provenance 不完整：`legacy_unverifiable`；
-- 有失败：`failed_retryable`。
+- 任一残留、未完成对象删除、未知 JSON 结构：`failed_retryable`。
 
-成功后将本次 active Shield 改为 retired，永久拦截由 Tombstone 承担。失败时 Shield 保持 active，继续 fail-closed。
-
-**重要边界：Verify 并没有逐条重新读取所有内容承载表，也没有对新生成 Summary 的语义内容做隐私扫描。** 它主要验证 Memory 状态、Retrieval 可搜索性和 Tombstone 覆盖。`verified_with_coarse_purge` 不等于“所有内容列均已被逐项证明不存在”。
+成功后将本次 active Shield 改为 retired；失败时 Shield 保持 active（fail-closed）。
 
 ## 13.9 Forget 自动恢复
 

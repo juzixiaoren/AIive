@@ -955,3 +955,31 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
   「排他 → 共享」或将其拆分为两个事务；② 僵尸识别仅覆盖 Linux（`/proc`），macOS 上仍是
   保守的 `kill(pid, 0)` 语义。
 
+
+### Forget 宽范围 Scrub、Task/Knowledge 覆盖与完整性证明（V62.2，2026-11-05）
+- 目标：修复宽范围 Scrub 覆盖面不足、JSON 数组误用标量 IN、Task Runtime/Knowledge/对象存储
+  未纳入、宽选择器 Verify 只做粗粒度声明的问题；不重写 Saga、不改并发锁协议与 Mode 语义。
+- 矩阵：`docs/architecture/forget_content_matrix.md` 列出每张表/字段、来源关系、Selector、
+  Mode 处理、Scrub 操作与 Verify 方法；明确 tasks≠agent_tasks、artifacts≠task_artifacts。
+- 范围：新增 `forget/content_scope.py`，从真实 ORM 列/JSON 引用解析 thread / time_range /
+  all_user_data / canonical_key / scope / turn_ids / event_ids / memory_ids 的清理范围；
+  memory_only 保留 Event/Turn 正文，其余模式按矩阵清理；canonical_key/scope 只处理目标
+  Memory 与可证明派生，不扩大到无关用户数据。
+- JSON：`select_json_array_members` / `count_json_array_members` 在 PG 用
+  `jsonb_array_elements_text`、SQLite 用 `json_each`，批量分片；Summary/Checkpoint 的
+  source ids 不再使用标量 IN 或 LIKE。
+- 清理：新增 `forget/content_scrub.py`，覆盖 Memory/Proposal 五字段/Evidence span/
+  Maintenance/CoreBlock/Retrieval、Summary 10 字段、Checkpoint 8 字段、Compaction、
+  WorkingState/Context/LLMCall/Task/Artifact/Attention/Inbox、Task Runtime 全部内容副本、
+  Knowledge Document/Chunk/Vector。
+- 对象：DB 事务内解除引用并登记 pending `delete_object` 动作，COMMIT 后才删除；
+  共享对象复查后跳过；失败保留 failed 并让 Purge 可重试；Verify 检查动作与对象实际存在。
+- Verify：逐表重新读库统计残留 + 未知 JSON 结构 + 对象动作；残留 → `failed_retryable`，
+  Shield 保持 active；全部通过才进入 `verified_with_coarse_purge`（宽）或 `verified`（窄），
+  报告写入 Verify 动作 details。
+- 测试：新增 `tests/integration/backend/test_forget_content_coverage.py`（17 用例，
+  SQLite 真实 _scrub_wide/Purge/Verify 链路、对象删除与重试、共享对象、Knowledge、
+  memory_only/history_only/everywhere、canonical_key/scope、time_range）；
+  `tests/integration/pg/test_pg_forget_json_membership.py`（3 用例，PG JSON 成员与宽清理）。
+- 验证：全量 pytest 1654 passed / 67 skipped；`tests/integration/pg` 54 passed / 13 skipped
+  （skip 为本地 Embedding 不可用）；ruff `--select F,E9` 通过；basedpyright 0/0。

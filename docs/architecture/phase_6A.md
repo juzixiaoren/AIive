@@ -851,3 +851,59 @@ Phase 6B（Retention / vacuum / 长期混沌）见 `phase_6B.md`。
 - CI：该文件位于 `tests/integration/pg/`，由既有 `postgres-contract` Job（`pytest tests/integration/pg -v`，
   `AIIVE_PG_TESTS=1`）自动纳入，无需新增 Job。
 
+
+## 实现补记（四）：宽范围内容矩阵、Task/Knowledge 与逐表 Verify（V62.2）
+
+完整字段清单与 Selector × Mode 矩阵见 `docs/architecture/forget_content_matrix.md`。
+
+### 1. 范围解析与 JSON 数组成员
+
+- 新增 `forget/content_scope.py::ContentScope`：只从 ORM 真实列/JSON 引用推导范围，
+  区分「原始历史」（Event/Turn/Inbox）与「派生副本」（Proposal/Summary/Checkpoint/
+  Context/WorkingState/Task Runtime/Knowledge）。
+- `select_json_array_members` / `count_json_array_members`：PostgreSQL 使用
+  `jsonb_array_elements_text` + `IN`，SQLite 使用 `json_each` + `IN`；批量按 400 分片，
+  空数组/None/重复/嵌套 JSON 均有明确语义，禁止 LIKE。
+- `SegmentSummary.source_event_ids`/`source_turn_ids` 与
+  `EpochCheckpoint.source_segment_ids` 全部改用成员查询；宽范围按事件/时间写入的
+  Summary/Checkpoint 不会再漏清理。
+
+### 2. 清理覆盖
+
+- `forget/content_scrub.py::scrub_all` 按 ContentScope 逐表处理：
+  - 原始：events.payload、turn_records.response_payload、turn_event_inbox.payload
+    （memory_only 保留）；
+  - Memory：memory_records、五字段 Proposal、memory_evidence.content_span、
+    maintenance inputs/actions、core_memory_blocks、retrieval（title/search/snippet/metadata）；
+  - 摘要：SegmentSummary 10 个内容字段、EpochCheckpoint 8 个内容字段、compaction/epoch
+    compaction；保留 source ids/hash/version 供 Verify 追溯；
+  - 运行态：working_states 全部语义 JSON、context_snapshots.context_items/meta、
+    llm_calls preview、tasks(title/description/condition)、artifacts.content、
+    attention_states、turn_event_inbox；
+  - Task Runtime：agent_tasks/agent_runs/agent_actions/agent_task_events/
+    agent_task_checkpoints/task_evidence/task_artifacts；
+  - Knowledge：documents/chunks/knowledge_chunk_vectors（all_user_data，或
+    everywhere + time_range），不删除 source_path 原始文件。
+- Selector：thread/time_range/all_user_data 全覆盖；canonical_key/scope 只清理目标
+  Memory 与可证明派生（独占来源 Event 由 `_scrub_batch` 处理），不扩大范围。
+- time_range 按各表真实时间列（working_states.updated_at、其余 created_at）与
+  Segment/Epoch 关系取范围，不套用同一个 created_at。
+
+### 3. 对象存储
+
+- 数据库事务内只解除 object_bucket/object_key 并登记
+  `forget_actions(action_type='delete_object', status='pending')`；COMMIT 后才调用
+  `object_store.delete`。
+- 删除前复查 task_evidence/task_artifacts/documents 是否仍有引用；共享对象不删除
+  （动作标记 skipped_shared）。
+- 失败保留 failed 动作，Purge 返回 RETRYABLE_ERROR 并在下次重试；Verify 检查
+  pending/failed 与对象是否真实存在。
+- 测试覆盖：提交前对象仍存在、失败重试、两个目标共享对象只登记一次、目标与非目标
+  共享对象不误删、source_path 文件不动。
+
+### 4. Verify 逐表证明
+
+- `verify_scope` 重新查询数据库与对象存储：目标数、逐表残留、对象动作统计、
+  未知 JSON 结构数；任一残留/未完成对象/未知结构 → `failed_retryable`。
+- 仅当全部通过时才以 `verified_with_coarse_purge` 结束（宽选择器）；Shield 在成功
+  终态才 retire，失败保持 active。Verify 动作的 `details.content` 持久化完整报告。
