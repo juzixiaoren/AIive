@@ -769,3 +769,69 @@ Phase 6B（Retention / vacuum / 长期混沌）见 `phase_6B.md`。
 6. **测试**：新增覆盖宽选择器 Phase A 后旧 Event 重抽阻断、>100 memory_ids、canonical_key / scope / thread / time_range / all_user_data、cutoff 后新 Event、全量与部分 Evidence 屏蔽、被屏蔽 Evidence 不落库、Mode / Selector 合法与非法组合、多选择器拒绝、TurnRecord.id / turn_id 双输入清理、content_purged 真实性、Shield-only Verify 失败、Shield 退休后可见性与重抽仍被阻断。
 
 验收：Forget 集成测试 95 passed；全量 pytest、Ruff（CI 门禁 `--select F,E9`）、basedpyright 0 errors / 0 warnings 见最终报告；PostgreSQL 专项按环境记录，不冒充通过。
+
+## 实现补记（三）：Forget × MemoryWrite 并发安全与拒绝路径隐私闭环（2026-11-05）
+
+本节记录第二轮定向修复：不重写 Saga、不新增 Provenance 模型、不改 Schema、不引入 LLM 调用。
+
+### 1. 拒绝路径隐私（Gate Reject 内容泄漏）
+
+- 原顺序为 `Gate.decide → Gate Reject 时 _persist_proposal → 防重抽检查`，被遗忘来源的
+  `content` / `structured_value` / `evidence` / `raw_payload` / `normalized_payload` 会经
+  `memory_proposals` 重新落库。
+- 现顺序：`_is_reingestion_blocked()` → Gate → Resolve → Execute → Persist。`write()` 与
+  `_write_single_in_transaction()`（`write_batch` 路径）共用同一入口，两条入口行为一致。
+- 命中即返回 `GATE_REJECTED`（reason = `REINGESTION_BLOCKED_REASON`），**不写任何表**，也不做
+  「最小审计」：拒绝路径不保留原文，避免旁路重新持久化。普通 Gate Reject（未命中 Forget）仍
+  写原有 `memory_proposals` 审计行（`final_operation="reject"`）。
+- 检查范围：`proposal.evidence[*].source_event_id`、`proposal.source_event_ids`、
+  `proposal.source_turn_record_id`、`proposal.source_turn_id`、`RunContext.turn_record_id` /
+  `RunContext.turn_id` / `RunContext.source_event_ids`。
+
+### 2. Phase A 与 MemoryWrite 的并发控制
+
+锁协议（PostgreSQL transaction-level advisory lock，双 int4 命名空间）：
+
+| 路径 | 锁 | 说明 |
+|---|---|---|
+| `write()` / `write_batch()` | `pg_advisory_xact_lock_shared(FORGET_LOCK_NAMESPACE, FORGET_LOCK_KEY)` | 共享锁，多个写入可并发 |
+| `forget()`（Phase A） | `pg_advisory_xact_lock(FORGET_LOCK_NAMESPACE, FORGET_LOCK_KEY)` | 排他锁，与所有在途写入互斥 |
+
+- **锁空间独立**：双 int4 形式在 `pg_locks` 中 `objsubid=2`，而 canonical_key 锁走单 bigint 形式
+  （`objsubid=1`），两套键不会互相命中。
+- **锁顺序**：全局 Forget 锁 → Memory Key 锁。`forget()` 只取全局排他锁，不取 Key 锁，
+  因此不存在反向顺序，不会死锁。
+- **事务边界**：锁由数据库事务持有到 COMMIT/ROLLBACK；`write()` / `write_batch()` 不在内部
+  提交，`forget()` 也不提交（由调用方提交），因此锁的持有期与屏蔽生效期严格对齐。
+- **情况 A（写入先持共享锁）**：Forget 的排他锁等待；写入提交后 Forget 才获得锁，`cutoff` 在
+  **获得锁之后**由 `execute_phase_a_shield()` 计算，因此等待期间提交的写入必然 `created_at <= cutoff`，
+  会被选择器 Shield 覆盖（读取侧经 `blocked_target_ids` fail-closed 过滤）。
+- **情况 B（Forget 先持排他锁）**：写入等共享锁；Forget 提交后写入获得锁，READ COMMITTED
+  下后续语句取新快照，读到 active Shield 并拒绝旧来源，不写 MemoryRecord / MemoryEvidence /
+  ContentProvenanceRef / MemoryProposal。
+- **隔离级别**：协议正确性依赖 READ COMMITTED（语句级快照）。非 READ COMMITTED 时
+  `_ensure_read_committed()` fail-closed 抛错，避免等待锁期间沿用旧快照而静默放行。
+- **SQLite**：无 advisory lock 语义，锁为 no-op；SQLite 测试只验证拒绝逻辑，并发语义由
+  `tests/integration/pg/test_pg_forget_write_concurrency.py` 在真实 PG 上验证。
+
+### 3. 纯 Turn 来源防重抽
+
+- `is_tombstone_blocked_reingestion(source_turn_record_id=...)` 先把 `TurnRecord.id` 与逻辑
+  `turn_id` 统一展开为 token 集合：实体级 turn Shield 直接匹配两种写法；选择器级 Shield
+  （thread / all_user_data / time_range）经 `blocked_target_ids("turn_record", ...)` 以
+  `TurnRecord.created_at` 应用 cutoff，因此 Forget 之后产生的新 Turn 不被阻断。
+- Turn 的子 Event 继续按 Event 规则检查（实体 / 选择器 / Tombstone），覆盖「只忘事件、没忘 Turn」
+  与「只忘 Turn、事件未单独 tombstone」两种历史数据形态。
+- 持久化 `block_reingestion` Tombstone 同时按 `source_turn_record_id`、`target_type=turn_record + target_id`
+  与子 Event 的 `source_event_id` 匹配。
+
+### 4. 测试与验收
+
+- `tests/integration/backend/test_forget_write_privacy.py`：15 用例（Gate Reject 隐私、普通拒绝审计、
+  `write` / `write_batch` 真实调用链、混合 Evidence、纯 Turn、cutoff 后新 Turn、强制决策 / Reinforce /
+  Merge / Supersede 不可绕过、RunContext 来源）。
+- `tests/integration/pg/test_pg_forget_write_concurrency.py`：6 用例（情况 A/B、共享锁并发性、
+  回滚与异常释放锁、多写入 + Forget 无死锁），断言 `pg_locks` 中 `ShareLock` / `ExclusiveLock` 的授予状态。
+- CI：该文件位于 `tests/integration/pg/`，由既有 `postgres-contract` Job（`pytest tests/integration/pg -v`，
+  `AIIVE_PG_TESTS=1`）自动纳入，无需新增 Job。
+

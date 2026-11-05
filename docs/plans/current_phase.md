@@ -881,3 +881,34 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - Verify：要求来源 Event 具备不依赖 active Shield 的持久化 Tombstone（block_visibility+block_reingestion）；event/turn 目标双标志校验；Turn 子 Event 长期 Tombstone 校验；仅活动 Shield 不得落严格 verified。
 - 验证：Forget 集成测试 95 passed；全量 pytest、Ruff（--select F,E9）、basedpyright 0/0、SQLite 专项、PostgreSQL 按环境记录；文档已同步。
 - 遗留风险：宽选择器 `_scrub_wide` 的 JSON 数组匹配与 scope/canonical_key 分支、Checkpoint/WorkingState/LLMCall preview 严格内容证明、Task/Knowledge 对象与对象存储覆盖仍为既有审计缺口。
+
+### Forget × MemoryWrite 并发安全与拒绝路径隐私闭环（2026-11-05）
+- 目标：修复两个 P0 —— ① `Gate Reject` 分支在防重抽检查之前持久化 Proposal 原文；
+  ② Phase A Shield 与 MemoryWrite 之间缺少共同并发控制（检查通过后、Shield 提交前后交错写入）。
+  不重写 Saga、不新增数据模型、不改 Schema、不引入 LLM 调用。
+- 拒绝路径隐私：`write()` / `_write_single_in_transaction()` 的检查顺序改为
+  `_is_reingestion_blocked()` → Gate → Resolve → Execute → Persist；命中即整条 Proposal 拒绝，
+  **不写** `memory_records` / `memory_evidence` / `content_provenance_refs` / `memory_proposals`，
+  也不保留最小审计（避免旁路重新持久化）。普通 Gate Reject 仍写原有审计行。
+- 检查范围统一：`evidence[*].source_event_id`、`source_event_ids`、`source_turn_record_id`、
+  `source_turn_id`、`RunContext.turn_record_id` / `turn_id` / `source_event_ids`；`write_batch`
+  内按来源 id 做单事务 memo，避免同批次重复查询。
+- 并发控制：写入路径取 `pg_advisory_xact_lock_shared(0x41495645, 1)`，`forget()` 取对应
+  `pg_advisory_xact_lock` 排他锁；双 int4 命名空间与 canonical_key 的 bigint 锁（objsubid 1 vs 2）
+  互不干扰；锁序「全局 → Memory Key」；锁由事务持有至 COMMIT/ROLLBACK；
+  `_ensure_read_committed()` 对非 READ COMMITTED fail-closed。
+- 情况 A：Forget 等待在途写入提交后才获锁，`cutoff` 在获锁后计算，等待期间提交的记忆被本次
+  Forget 的选择器 Shield 覆盖；情况 B：写入等共享锁，Forget 提交后读到 active Shield 并拒绝。
+- 纯 Turn 来源：`is_tombstone_blocked_reingestion(source_turn_record_id=...)` 统一展开
+  `TurnRecord.id` / `turn_id`，实体 Shield 双写法匹配，选择器 Shield 经
+  `blocked_target_ids("turn_record")` 以 `TurnRecord.created_at` 应用 cutoff（Forget 之后的新 Turn 不阻断），
+  Tombstone 同时匹配 `source_turn_record_id`、`target_type=turn_record + target_id` 与子 Event。
+- 测试：`tests/integration/backend/test_forget_write_privacy.py` 15 passed；
+  `tests/integration/pg/test_pg_forget_write_concurrency.py` 6 用例（两个独立 PG 连接 + 真实事务，
+  断言 `pg_locks` 中 ShareLock/ExclusiveLock 的授予状态），位于既有 `postgres-contract` Job 的采集目录。
+- 验证：全量 pytest 1637 passed / 59 skipped；Forget 集成 + 隐私用例 + 写入单测 123 passed；
+  ruff `--select F,E9` 全仓通过；basedpyright 改动文件 0 errors / 0 warnings。
+- 遗留风险：① 非 READ COMMITTED 部署会直接报错（刻意 fail-closed，需要改回默认隔离级别）；
+  ② 同一事务内「先 forget 再 write」依赖同后端锁不自我冲突（PostgreSQL 允许），已在冲突确认流程覆盖；
+  ③ time_range 宽范围 Scrub 与 JSON 数组清理仍留待 V62.2。
+

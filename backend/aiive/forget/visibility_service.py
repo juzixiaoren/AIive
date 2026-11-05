@@ -338,8 +338,19 @@ class ForgetVisibilityService:
         """
         from aiive.db.models import (
             MemoryRecord, Event, SegmentSummary, EpochCheckpoint,
-            Segment, Epoch,
+            Segment, Epoch, TurnRecord,
         )
+        if target_type == "turn_record":
+            # 纯 Turn 来源防重抽：用 TurnRecord.created_at 应用选择器 Shield 的
+            # cutoff（Forget 之后产生的新 Turn 不应被旧 Shield 阻断）。
+            rows = session.query(
+                TurnRecord.id, TurnRecord.thread_id, TurnRecord.created_at,
+            ).filter(TurnRecord.id.in_(ids)).all()
+            return [
+                {"id": r[0], "thread_id": r[1], "scope_type": None,
+                 "scope_id": None, "canonical_key": None, "created_at": r[2]}
+                for r in rows
+            ]
         if target_type == "memory_record":
             # MemoryRecord 不带 thread_id（按 scope 归属），故 thread 选择器对
             # memory_record 不直接生效，仅 scope/canonical_key/time_range 生效。
@@ -604,10 +615,13 @@ class ForgetVisibilityService:
             include_tombstones=False,
         ):
             return True
+        turn_source_tokens: set[str] = set()
+        turn_source_event_ids: list[str] = []
         if source_turn_record_id:
             from aiive.db.models import Event, TurnRecord
 
             tokens: set[str] = {source_turn_record_id}
+            resolved_ids: set[str] = set()
             tr_rows = session.query(TurnRecord.id, TurnRecord.turn_id).filter(
                 or_(
                     TurnRecord.id == source_turn_record_id,
@@ -617,20 +631,36 @@ class ForgetVisibilityService:
             for tr_id, tr_turn_id in tr_rows:
                 if tr_id:
                     tokens.add(tr_id)
+                    resolved_ids.add(tr_id)
                 if tr_turn_id:
                     tokens.add(tr_turn_id)
-            entity_hit = session.query(ForgetShield.id).filter(
+
+            # 实体级 turn Shield：TurnRecord.id 与逻辑 turn_id 两种历史写法都匹配。
+            # 纯 Turn 来源（无任何 Event ID）只能靠这里拦截。
+            if session.query(ForgetShield.id).filter(
                 ForgetShield.status == "active",
                 ForgetShield.target_type == "turn_record",
                 ForgetShield.target_id.in_(tokens),
-            ).first()
-            if entity_hit is not None:
+            ).first() is not None:
                 return True
+
+            # 选择器级 Shield（thread / all_user_data / time_range）：用
+            # TurnRecord.created_at 应用 cutoff —— Forget 之后产生的新 Turn
+            # 创建时间晚于 cutoff，不会被旧 Shield 阻断。
+            if resolved_ids and ForgetVisibilityService.blocked_target_ids(
+                session,
+                "turn_record",
+                [(tid, None) for tid in sorted(resolved_ids)],
+                include_tombstones=False,
+            ):
+                return True
+            turn_source_tokens = set(tokens)
             turn_event_ids = [
                 r[0] for r in session.query(Event.id).filter(
                     Event.turn_id.in_(tokens),
                 ).all()
             ]
+            turn_source_event_ids = list(turn_event_ids)
             if turn_event_ids and ForgetVisibilityService.blocked_target_ids(
                 session,
                 "event",
@@ -676,7 +706,20 @@ class ForgetVisibilityService:
                     )
                 )
         if source_turn_record_id:
-            conditions.append(ForgetTombstone.source_turn_record_id == source_turn_record_id)
+            # 同时匹配 TurnRecord.id 与逻辑 turn_id 两种历史写法（Phase A 的
+            # turn Tombstone 两种都可能出现），并覆盖该 Turn 子 Event 的
+            # event Tombstone（history_only 遗忘时只有事件级 tombstone）。
+            conditions.append(
+                or_(
+                    ForgetTombstone.source_turn_record_id.in_(turn_source_tokens),
+                    (ForgetTombstone.target_type == "turn_record")
+                    & (ForgetTombstone.target_id.in_(turn_source_tokens)),
+                )
+            )
+            if turn_source_event_ids:
+                conditions.append(
+                    ForgetTombstone.source_event_id.in_(turn_source_event_ids)
+                )
         if canonical_key and scope_type and scope_id:
             conditions.append(
                 (ForgetTombstone.canonical_key == canonical_key)

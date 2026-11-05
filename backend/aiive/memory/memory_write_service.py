@@ -21,6 +21,7 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -53,6 +54,40 @@ from aiive.memory.memory_types import (
 from aiive.runtime.event_logger import EventLogger
 
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# Forget / MemoryWrite 并发控制锁协议
+# ============================================================================
+#
+# 目的：Phase A Shield 与 MemoryWrite 之间必须互斥，否则会出现
+#   「MemoryWrite 检查 Shield 未命中 → Forget 创建 Shield 并提交 →
+#     MemoryWrite 才提交」的窗口，导致遗忘目标遗漏一条已提交记忆。
+#
+# 协议（PostgreSQL transaction-level advisory lock，双 int4 命名空间）：
+#   - MemoryWrite.write() / write_batch()：pg_advisory_xact_lock_shared(ns, key)
+#     —— 共享锁，多个写入可并发；
+#   - Forget Phase A（MemoryWriteService.forget）：pg_advisory_xact_lock(ns, key)
+#     —— 排他锁，与所有在途写入互斥。
+#
+# 锁由数据库事务持有，随 COMMIT/ROLLBACK 自动释放；不能在执行完检查后立即
+# 释放（那等于没有互斥）。
+#
+# 命名空间：使用双 int4 形式（objsubid=2），与 canonical_key 的
+# pg_advisory_xact_lock(bigint)（objsubid=1）属于不同锁空间，不会互相干扰。
+#
+# 锁顺序：全局 Forget 锁 → Memory Key 锁（两者都在本服务内获取），
+# forget 只取全局排他锁，因此不存在反向获取，不会死锁。
+#
+# 隔离级别：协议正确性依赖 READ COMMITTED（语句级快照）。获得锁之后的每一条
+# 查询都能看到前一个事务已提交的 Shield/Tombstone；若数据库被配置为
+# REPEATABLE READ / SERIALIZABLE，等待锁期间不会刷新快照，会静默丢失新提交
+# 的 Shield，故此处 fail-closed 直接报错。
+FORGET_LOCK_NAMESPACE = 0x41495645  # "AIVE"，独立命名空间
+FORGET_LOCK_KEY = 1
+
+REINGESTION_BLOCKED_REASON = (
+    "Reingestion blocked: proposal contains shielded/tombstone-blocked source"
+)
 
 
 # ============================================================================
@@ -139,6 +174,8 @@ class MemoryWriteService:
         self._lifecycle: MemoryLifecycleService = MemoryLifecycleService(
             db, executor=self._executor, registry=self._registry
         )
+        # 每个 Session 只需校验一次隔离级别（协议前提，见文件头锁协议说明）
+        self._isolation_checked: bool = False
 
     # ------------------------------------------------------------------
     # write_batch: atomic batch write
@@ -170,6 +207,10 @@ class MemoryWriteService:
             计划为 defer 的提案只建待确认案例（不写记忆、不写图谱关系），
             由用户回复后再走本服务的正式写入路径。为空时行为与历史完全一致。
         """
+        # Step -1: 全局 Forget 共享锁（锁顺序：全局 → Memory Key，避免死锁）
+        # 必须在任何 Shield 读取之前获取，并由本事务持有到提交。
+        self._acquire_shared_write_lock()
+
         # Step 0: 收集并排序所有 lock_id
         lock_ids: list[int] = []
         seen: set[int] = set()
@@ -185,6 +226,8 @@ class MemoryWriteService:
             self._acquire_lock(lid)
 
         # Step 2: 逐 Proposal 写入
+        # forget_memo：同批次内共享同一批来源的 Shield 判定，避免重复查询。
+        forget_memo: dict[tuple[str, str], bool] = {}
         results: list[WriteResult] = []
         for i, p in enumerate(proposals):
             p.ingestion_run_id = ingestion_run.id
@@ -194,7 +237,7 @@ class MemoryWriteService:
             p.execution_mode = run_context.execution_mode
 
             result = self._write_single_in_transaction(
-                p, run_context, conflict_plan=conflict_plan,
+                p, run_context, conflict_plan=conflict_plan, forget_memo=forget_memo,
             )
             results.append(result)
 
@@ -235,41 +278,102 @@ class MemoryWriteService:
             )
         return existing
 
+    # ------------------------------------------------------------------
+    # Forget 防重抽：write / write_batch 共用的唯一检查入口
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _collect_forget_sources(
+        proposal: MemoryProposal, run_context: RunContext | None,
+    ) -> tuple[set[str], set[str]]:
+        """收集 Proposal 携带的全部遗忘来源（Event ID 与 Turn 标识）。
+
+        纯 Turn 来源（没有任何 Event ID）同样必须被识别：被遗忘 Turn 的重抽
+        若只检查 Evidence.source_event_id 会整体绕过。Turn 标识同时包含
+        TurnRecord.id 与逻辑 turn_id 两种历史写法。
+        """
+        event_ids: set[str] = set()
+        turn_ids: set[str] = set()
+
+        for ev in proposal.evidence:
+            if ev.source_event_id:
+                event_ids.add(ev.source_event_id)
+        for eid in proposal.source_event_ids or []:
+            if eid:
+                event_ids.add(eid)
+        for tid in (proposal.source_turn_record_id, proposal.source_turn_id):
+            if tid:
+                turn_ids.add(tid)
+        if run_context is not None:
+            for tid in (run_context.turn_record_id, run_context.turn_id):
+                if tid:
+                    turn_ids.add(tid)
+            for eid in run_context.source_event_ids or []:
+                if eid:
+                    event_ids.add(eid)
+        return event_ids, turn_ids
+
+    def _is_reingestion_blocked(
+        self, proposal: MemoryProposal, run_context: RunContext | None,
+        memo: dict[tuple[str, str], bool] | None = None,
+    ) -> bool:
+        """任一来源命中 active Shield 或 block_reingestion Tombstone → 拒绝整个 Proposal。
+
+        fail-closed：混合 Evidence 不做部分写入；被拒绝的 Proposal 不得进入
+        MemoryRecord / MemoryEvidence / ContentProvenanceRef / MemoryProposal
+        （不落 content / structured_value / evidence / raw_payload）。
+
+        memo: 同一批次内的判定缓存（key = ("event"|"turn", id)）。抽取批次里
+        多个 Proposal 共享同一批 source_event_ids，逐条重复查 Shield 会放大成
+        数百次查询；缓存只在单个事务的 write_batch 内复用，不跨事务。
+        """
+        event_ids, turn_ids = self._collect_forget_sources(proposal, run_context)
+        cache = memo if memo is not None else {}
+
+        def _blocked(kind: str, value: str) -> bool:
+            key = (kind, value)
+            if key not in cache:
+                if kind == "event":
+                    cache[key] = ForgetVisibilityService.is_tombstone_blocked_reingestion(
+                        self._db, source_event_id=value,
+                    )
+                else:
+                    cache[key] = ForgetVisibilityService.is_tombstone_blocked_reingestion(
+                        self._db, source_turn_record_id=value,
+                    )
+            return cache[key]
+
+        for eid in sorted(event_ids):
+            if _blocked("event", eid):
+                return True
+        for tid in sorted(turn_ids):
+            if _blocked("turn", tid):
+                return True
+        return False
+
     def _write_single_in_transaction(
         self, proposal: MemoryProposal, run_context: RunContext,
         conflict_plan: dict[str, Any] | None = None,
+        forget_memo: dict[tuple[str, str], bool] | None = None,
     ) -> WriteResult:
-        """单个 Proposal 的 Gate → Resolve → Execute → Persist 流程。
+        """单个 Proposal 的 Forget 防重抽 → Gate → Resolve → Execute → Persist 流程。
 
         不再获取/释放 advisory lock（由 write_batch 统一管理）。
         """
+        # 0. Phase 6A 防重抽检查必须早于任何可能持久化 Proposal 内容的分支
+        #    （含 Gate Reject 的 _persist_proposal、Reinforce / Merge / Supersede
+        #    与强制决策）：否则被遗忘来源的原文会经 memory_proposals 重新落库。
+        if self._is_reingestion_blocked(proposal, run_context, memo=forget_memo):
+            return WriteResult(
+                outcome=WriteOutcome.GATE_REJECTED,
+                reason=REINGESTION_BLOCKED_REASON,
+            )
+
+        # 1. Gate admission
         gate_decision = self._gate.decide(proposal)
         if gate_decision.decision == "reject":
             self._persist_proposal(proposal, gate_decision, final_op="reject")
             return WriteResult(outcome=WriteOutcome.GATE_REJECTED, reason=gate_decision.reason)
-
-        # 1.5. Phase 6A: 防重抽检查（active Shield + tombstone.block_reingestion）
-        # write_batch 异步抽取路径同样必须拦截，避免被忘事实从被屏蔽旧源事件重建。
-        # fail-closed：只要 Proposal 含任一被屏蔽来源，即拒绝整个 Proposal；
-        # 被拒绝的 Evidence 不会写入 MemoryEvidence / ContentProvenanceRef，
-        # 也不会经 Reinforce / Merge / Supersede 等分支绕过。
-        if proposal.evidence:
-            blocked_events: set[str] = set()
-            for ev in proposal.evidence:
-                if ev.source_event_id and ForgetVisibilityService.is_tombstone_blocked_reingestion(
-                    self._db,
-                    source_event_id=ev.source_event_id,
-                    source_turn_record_id=proposal.source_turn_record_id or None,
-                ):
-                    blocked_events.add(ev.source_event_id)
-            if blocked_events:
-                return WriteResult(
-                    outcome=WriteOutcome.GATE_REJECTED,
-                    reason=(
-                        "Reingestion blocked: proposal contains shielded/"
-                        "tombstone-blocked source evidence"
-                    ),
-                )
 
         # 1.6. 语义冲突待确认：只建案例（含提案审计行 + 澄清问题任务），
         # 不写 memory_records、不写图谱关系，现有记忆与有效关系保持原样。
@@ -409,6 +513,18 @@ class MemoryWriteService:
             raise RuntimeError("MemoryWriteService.write() requires valid RunContext")
         tid: str = run_context.thread_id
 
+        # 0. Forget 并发控制共享锁：必须先于任何 Shield 读取与记忆写入，
+        #    由当前事务持有到 COMMIT/ROLLBACK（见文件头锁协议）。
+        self._acquire_shared_write_lock()
+
+        # 0.5 Phase 6A 防重抽检查必须早于 Gate Reject 持久化 / 强制决策 /
+        #     Reinforce / Merge / Supersede，避免被遗忘来源的原文重新落库。
+        if self._is_reingestion_blocked(proposal, run_context):
+            return WriteResult(
+                outcome=WriteOutcome.GATE_REJECTED,
+                reason=REINGESTION_BLOCKED_REASON,
+            )
+
         # 1. Gate admission
         gate_decision: GateDecision = self._gate.decide(proposal)
         if gate_decision.decision == "reject":
@@ -417,28 +533,6 @@ class MemoryWriteService:
                 outcome=WriteOutcome.GATE_REJECTED,
                 reason=f"Gate rejected: {gate_decision.reason}",
             )
-
-        # 1.5. Phase 6A: 防重抽检查（active Shield + tombstone.block_reingestion）
-        # fail-closed：只要 Proposal 含任一被屏蔽来源，即拒绝整个 Proposal；
-        # 被拒绝的 Evidence 不会写入 MemoryEvidence / ContentProvenanceRef，
-        # 也不会经 Reinforce / Merge / Supersede 等分支绕过。
-        if proposal.evidence:
-            blocked_events: set[str] = set()
-            for ev in proposal.evidence:
-                if ev.source_event_id and ForgetVisibilityService.is_tombstone_blocked_reingestion(
-                    self._db,
-                    source_event_id=ev.source_event_id,
-                    source_turn_record_id=proposal.source_turn_record_id or None,
-                ):
-                    blocked_events.add(ev.source_event_id)
-            if blocked_events:
-                return WriteResult(
-                    outcome=WriteOutcome.GATE_REJECTED,
-                    reason=(
-                        "Reingestion blocked: proposal contains shielded/"
-                        "tombstone-blocked source evidence"
-                    ),
-                )
 
         # 2. Acquire advisory lock (hash of canonical_key + scope)
         lock_id: int = self._compute_lock_id(
@@ -644,6 +738,12 @@ class MemoryWriteService:
             )
 
         try:
+            # Phase A 之前获取全局排他事务锁：
+            #   - 与所有在途 MemoryWrite 互斥（等它们提交后才继续）；
+            #   - cutoff 在获得锁之后才计算（execute_phase_a_shield 内部取 now），
+            #     因此等待期间提交的写入一定落在 cutoff 之前，不会被遗漏；
+            #   - 锁持有到本次事务提交，提交后的写入必然读到 active Shield。
+            self._acquire_exclusive_forget_lock()
             result = execute_phase_a_shield(
                 session=self._db,
                 mode=mode,
@@ -1227,6 +1327,62 @@ class MemoryWriteService:
     # ------------------------------------------------------------------
     # Advisory lock helpers
     # ------------------------------------------------------------------
+
+    # -- Forget 并发控制锁（共享/排他） --------------------------------
+
+    def _pg_dialect(self) -> str:
+        """返回当前 Session 绑定的方言名；探测失败按非 PG 处理（锁 no-op）。"""
+        try:
+            return self._db.get_bind().dialect.name
+        except Exception:
+            return ""
+
+    def _ensure_read_committed(self) -> None:
+        """校验协议前提：PostgreSQL 事务必须处于 READ COMMITTED。
+
+        排他/共享锁只保证互斥，不保证「等待锁期间提交的数据可见」。READ
+        COMMITTED 下每条语句取新快照，因此获得锁后的 Shield 查询必然能看到
+        前一个写入事务已提交的内容；REPEATABLE READ 会沿用旧快照，从而静默
+        放行已被遗忘来源的重抽。该前提不成立时 fail-closed 抛错。
+        """
+        if self._isolation_checked:
+            return
+        iso = self._db.execute(text("SHOW transaction_isolation")).scalar()
+        if str(iso or "").strip().lower() != "read committed":
+            raise RuntimeError(
+                f"Forget/MemoryWrite 并发协议要求 READ COMMITTED，当前为 {iso!r}，无法保证看到新提交的 Shield"
+            )
+        self._isolation_checked = True
+
+    def _acquire_shared_write_lock(self) -> None:
+        """写入路径：获取全局 Forget 共享事务锁。
+
+        必须在任何「读取 Shield / 写记忆」之前调用，并由当前事务一直持有到
+        COMMIT/ROLLBACK。多个写入共享锁互不阻塞；Forget Phase A 的排他锁
+        会与所有在途写入互斥。
+        """
+        if self._pg_dialect() != "postgresql":
+            return
+        self._ensure_read_committed()
+        self._db.execute(
+            text("SELECT pg_advisory_xact_lock_shared(:ns, :key)"),
+            {"ns": FORGET_LOCK_NAMESPACE, "key": FORGET_LOCK_KEY},
+        )
+
+    def _acquire_exclusive_forget_lock(self) -> None:
+        """Forget Phase A：获取全局排他事务锁。
+
+        必须在计算 cutoff、创建 Shield 之前调用：等待期间所有在途写入已经
+        提交，因此 cutoff 取锁之后的时间可以覆盖它们；锁释放发生在 Phase A
+        提交之后，之后的写入必然能看到 active Shield。
+        """
+        if self._pg_dialect() != "postgresql":
+            return
+        self._ensure_read_committed()
+        self._db.execute(
+            text("SELECT pg_advisory_xact_lock(:ns, :key)"),
+            {"ns": FORGET_LOCK_NAMESPACE, "key": FORGET_LOCK_KEY},
+        )
 
     @staticmethod
     def _compute_lock_id(
