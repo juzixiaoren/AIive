@@ -170,13 +170,19 @@ jobs:
           pip install -e ".[dev]"
       - name: 运行本地集成测试
         # 集成测试位于 tests/integration（SQLite 离线）。
-        # 用 collect-only 探测，避免空集合导致 pytest 以 exit code 5 失败。
+        # 旧探针用 `--collect-only -q | grep -q "::"`，但 pytest 9 的 collect-only
+        # 输出改为树形（<Module>/<Function>），不含 "::"，会整段误判为空集合并
+        # 静默跳过全部集成测试。改为直接运行，仅把 exit code 5（未收集到用例）
+        # 视为跳过。
         run: |
-          if pytest tests/integration --collect-only -q | grep -q "::"; then
-            pytest tests/integration -v
-          else
+          set +e
+          pytest tests/integration -v
+          code=$?
+          if [ "$code" -eq 5 ]; then
             echo "tests/integration 暂无可收集测试，跳过"
+            exit 0
           fi
+          exit "$code"
 
   postgres-contract:
     name: PostgreSQL 核心契约测试（事务/锁/幂等/并发）
