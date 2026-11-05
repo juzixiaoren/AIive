@@ -12,6 +12,7 @@ import signal
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -105,8 +106,16 @@ def _promote(
 def _kill(pid: int) -> None:
     if sys.platform.startswith("win"):
         subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, check=False)
-        return
-    os.kill(pid, signal.SIGKILL)
+    else:
+        os.kill(pid, signal.SIGKILL)
+    # SIGKILL/taskkill 的生效是异步的：必须等进程真正退出（Linux 僵尸也视为已退出），
+    # 否则紧接着的 tick() 可能先观察到「仍存活 → 健康检查失败」，把退出误判为健康故障。
+    # 这是同步等待而非放宽断言：进程未退出时照常失败。
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return
+        time.sleep(0.02)
 
 
 def test_process_controller_starts_and_stops_real_process(make_supervisor, tmp_path) -> None:

@@ -509,22 +509,18 @@ class Supervisor:
         previous = str(state.get("previous_slot") or "")
 
         if not self.controller.alive(record):
-            # tick() 开头的 reap 与本处存活判定之间存在窗口：进程可能在两次
-            # 调用之间退出。检测到退出后补一次 reap，确保 process_exited 事件
-            # 一定被记录（事件应绑定「检测到退出」，而不是上一次 poll 的时机）。
-            for item in self.controller.reap():
-                self._event("process_exited", pid=item["pid"], exit_code=item["exit_code"])
-            self._event("app_exited_unexpectedly", slot=record.slot, pid=record.pid, in_monitor=in_monitor)
-            self._write_state(process=None)
-            if in_monitor and previous in _SLOTS and previous != record.slot:
-                restore = self._restore_previous(previous, reason="app_exited_during_monitor")
-                self._event("auto_rollback", reason="app_exited", ok=restore.get("ok"), detail=restore)
-                return {"ok": bool(restore.get("ok")), "action": "auto_rollback", "rollback": restore}
-            return self._restart_after_exit(record.slot, previous)
+            return self._handle_unexpected_exit(record, in_monitor=in_monitor, previous=previous)
 
         if in_monitor:
             health = self._probe(self.config.host, self.config.port, self.config.health_path, timeout=2.0)
             if not getattr(health, "ok", False):
+                # 健康检查失败可能只是进程刚被杀死（端口先关闭、SIGKILL 的
+                # wait 状态稍后才可见）。探针之后再次确认存活：进程确已退出时
+                # 按「异常退出」归因并记录 process_exited，而不是误报健康失败。
+                if not self.controller.alive(record):
+                    return self._handle_unexpected_exit(
+                        record, in_monitor=in_monitor, previous=previous,
+                    )
                 self._event("monitor_health_failed", slot=record.slot, detail=health.as_dict()
                             if hasattr(health, "as_dict") else str(health))
                 restore = self._restore_previous(previous or ("B" if record.slot == "A" else "A"),
@@ -542,6 +538,28 @@ class Supervisor:
             self._event("monitoring_completed", slot=active)
             return {"ok": True, "action": "monitoring_completed"}
         return {"ok": True, "action": "healthy"}
+
+    def _handle_unexpected_exit(
+        self, record: Any, *, in_monitor: bool, previous: str,
+    ) -> dict[str, Any]:
+        """进程意外退出：补记 exit 事件、清空状态，并按观察窗决定回滚或重启。
+
+        tick() 开头的 reap() 与本方法之前的存活判定之间存在窗口；进入本方法
+        时进程已确认退出，再补一次 reap() 保证 process_exited 事件一定被记录
+        （事件应绑定「检测到退出」，而不是上一次 poll 的时机）。
+        """
+        for item in self.controller.reap():
+            self._event("process_exited", pid=item["pid"], exit_code=item["exit_code"])
+        self._event(
+            "app_exited_unexpectedly", slot=record.slot, pid=record.pid,
+            in_monitor=in_monitor,
+        )
+        self._write_state(process=None)
+        if in_monitor and previous in _SLOTS and previous != record.slot:
+            restore = self._restore_previous(previous, reason="app_exited_during_monitor")
+            self._event("auto_rollback", reason="app_exited", ok=restore.get("ok"), detail=restore)
+            return {"ok": bool(restore.get("ok")), "action": "auto_rollback", "rollback": restore}
+        return self._restart_after_exit(record.slot, previous)
 
     def _restart_after_exit(self, slot: str, previous: str) -> dict[str, Any]:
         now = time.monotonic()

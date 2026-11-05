@@ -940,9 +940,12 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - Supervisor 隔离测试根因：① `test_recover_after_interrupted_switch_rolls_back`：
   `pid_alive()` 把已退出但未被父进程回收的僵尸进程（Linux `/proc/<pid>/stat` state=Z）
   误判为存活，跨 Supervisor 停止接管进程时白等 15s + 5s 后失败；修复为识别僵尸进程。
-  ② `test_app_exit_during_monitor_rolls_back_to_previous`：`tick()` 开头的 `reap()` 与
-  `_watch()` 的存活判定之间存在窗口，进程恰在两者之间退出时漏记 `process_exited`；
-  修复为检测到退出后补一次 `reap()` 并记录事件。未删断言、未跳过、未延长超时。
+  ② `test_app_exit_during_monitor_rolls_back_to_previous`：SIGKILL 生效是异步的，
+  `tick()` 可能在进程尚未被回收时先判定「存活」、随后健康探针失败，把退出误报为
+  `monitor_health_failed`，且漏记 `process_exited`。修复三处：检测到退出后补一次
+  `reap()` 并记录事件；健康探针失败后再次确认存活，已退出则转入退出路径归因；
+  测试的 `_kill` 以有界轮询等待进程真正退出（同步竞态，而非放宽断言）。
+  未删断言、未跳过、未延长产品超时。
 - 验证：全量 pytest 1637 passed / 64 skipped（新增 5 个 PG 用例默认 skip）；
   Forget 集成 + 隐私 + 写入单测 123 passed；冲突确认 30 passed；Supervisor 单文件 19 passed；
   PostgreSQL 并发 11 passed（全目录 51 passed / 13 skipped，skip 均为本地 Embedding 不可用）；
