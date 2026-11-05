@@ -983,3 +983,23 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
   `tests/integration/pg/test_pg_forget_json_membership.py`（3 用例，PG JSON 成员与宽清理）。
 - 验证：全量 pytest 1654 passed / 67 skipped；`tests/integration/pg` 54 passed / 13 skipped
   （skip 为本地 Embedding 不可用）；ruff `--select F,E9` 通过；basedpyright 0/0。
+
+### Forget 范围冻结、检索一致性与全内容承载完整性（V62.3，2026-11-05）
+- 目标：修复 thread/all_user 未完整应用 Phase A cutoff、Retrieval Index 残留、Task Runtime
+  time_range 父子遗漏、冲突/召回/Outbox 等辅助表未覆盖、Verify 字段缺口。
+- Cutoff：直接记录统一按真实时间列 <= `manifest.cutoff_created_at`；派生记录按
+  Provenance/JSON 成员清理（即使创建于 cutoff 之后）；cutoff 后独立新数据保留。
+- 检索：Entry 发现纳入 segment/epoch/Summary/Checkpoint；Scrub 删除 Token、置
+  is_searchable/is_current=false；`fetch_entries_by_ids` 过滤 is_searchable；真实
+  UnifiedRetriever 验证 exact/lexical 前后召回差异。
+- Task Runtime：time_range 按子表时间命中并反向找父 Task，只清命中子记录；父 task_state
+  引用替换为 [forgotten]；无法恢复的运行中任务转 cancelled。
+- 辅助表：MemoryConflictCase（pending/asking→stale）、MemoryRecallRun、RetrievalRun、
+  TurnEventInbox（turn/event）、tasks.source_event_id、approval task/action、llm trace、
+  outbox 正文键与 error_message。
+- Verify：新增 SCRUBBED_FIELDS ⊆ VERIFIED_FIELDS 自动化约束；补齐 Agent/Task/Approval/
+  Tool/Compaction 字段；未知 JSON 引用只在本次范围统计并 fail-closed。
+- 测试：`test_forget_content_coverage.py` 23 用例（cutoff 新旧数据、派生清理、真实召回、
+  Task 子记录、冲突/召回/检索/Outbox、未知结构、字段子集）；PG 4 用例含 cutoff。
+- 验证：全量 pytest 1660 passed / 68 skipped；`tests/integration/pg` 55 passed / 13 skipped
+  （skip 为本地 Embedding 不可用）；ruff `--select F,E9`、basedpyright 0/0 通过。

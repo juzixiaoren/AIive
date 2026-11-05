@@ -907,3 +907,43 @@ Phase 6B（Retention / vacuum / 长期混沌）见 `phase_6B.md`。
   未知 JSON 结构数；任一残留/未完成对象/未知结构 → `failed_retryable`。
 - 仅当全部通过时才以 `verified_with_coarse_purge` 结束（宽选择器）；Shield 在成功
   终态才 retire，失败保持 active。Verify 动作的 `details.content` 持久化完整报告。
+
+## 实现补记（五）：范围冻结、检索一致性、Task 子记录与全字段 Verify（V62.3）
+
+### 1. Phase A cutoff 范围冻结
+
+`content_scope.build_scope()` 对 Event/Turn/Memory/Segment/Epoch/AgentTask(父)/Task/Document、
+WorkingState、Context/LLMCall/Inbox/ToolOperation/Approval 等直接记录统一应用
+`created_at/updated_at <= cutoff`（各表真实时间列）。派生记录（Summary/Checkpoint/Proposal/
+Retrieval/派生 Memory）按 Provenance / JSON 成员命中，不受自身创建时间限制。
+`all_user_data` 的 Memory 兜底同样受 cutoff 限制。
+
+### 2. Retrieval Index 完整清理
+
+`retrieval_entry_ids()` 新增 segment_id / epoch_id / Summary / Checkpoint 来源；Scrub 删除
+`retrieval_index_tokens` 并设置 `is_searchable=false`、`is_current=false`；
+`RetrievalIndexManager.fetch_entries_by_ids()` 增加 `is_searchable=True` 过滤。
+Verify 检查正文/metadata/Token/is_searchable/is_current。真实 `UnifiedRetriever` 测试验证
+遗忘前 exact + lexical 可召回、遗忘后均不可召回。
+
+### 3. Task Runtime 时间范围父子关联
+
+`ContentScope` 新增 agent_run/action/event/checkpoint/task_evidence/task_artifact 子记录集；
+time_range 按各子表 `created_at` 命中并反向找父 Task，只清理命中子记录，不整体清空父历史；
+`task_state/task_brief` 中已清理 id 替换为 `[forgotten]`，运行中任务无法安全恢复时转
+`cancelled`。
+
+### 4. 辅助内容承载表
+
+新增清理：`memory_conflict_cases`（pending/asking → stale）、`memory_recall_runs`、
+`retrieval_runs`、`turn_event_inbox`（turn/event 关联）、`tasks.source_event_id`、
+`approval_requests.task_id/action_id`、`llm_calls.trace_id`、`outbox_jobs`（仅正文键与
+error_message）。
+
+### 5. Verify 字段一一对应
+
+`SCRUBBED_FIELDS` / `VERIFIED_FIELDS` 固定清单 + 集成测试断言子集；Verify 补齐
+agent_runs.error_message、agent_actions.preconditions/effects/evidence_refs/error_message、
+agent_task_checkpoints.pending_action_refs/evidence_refs、task_evidence.inline_payload、
+task_artifacts.name、approval_requests 全部字段、tool_operations.effect_receipt/error_message、
+compaction_inputs.turn_manifest 等。未知引用结构只统计本次范围，fail-closed。

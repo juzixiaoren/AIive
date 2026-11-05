@@ -33,6 +33,50 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def test_pg_cutoff_freezes_thread_scope(pg_sessionmaker) -> None:
+    from datetime import timedelta
+
+    s: Session = pg_sessionmaker()
+    try:
+        thread_id = _id()
+        s.add(Thread(id=thread_id))
+        s.flush()
+        old_id, new_id = _id(), _id()
+        now = _now()
+        s.add(Event(
+            id=old_id, trace_id=_id(), thread_id=thread_id,
+            event_type="user_message", payload={"text": "old"},
+            created_at=now - timedelta(seconds=60),
+        ))
+        s.add(Event(
+            id=new_id, trace_id=_id(), thread_id=thread_id,
+            event_type="user_message", payload={"text": "new"},
+            created_at=now + timedelta(seconds=60),
+        ))
+        op_id = _id()
+        s.add(ForgetOperation(
+            id=op_id, operation_key=f"forget:{op_id}", mode="everywhere",
+            selector_type="thread", selector_hash="h", status="shielded",
+            requested_by="test", target_count=0, shielded_at=now,
+        ))
+        s.add(ForgetSelectorManifest(
+            id=_id(), forget_operation_id=op_id, selector_type="thread",
+            selector_payload={"selector_type": "thread", "thread_id": thread_id},
+            selector_payload_hash="h", cutoff_created_at=now,
+        ))
+        s.commit()
+
+        from aiive.worker.handlers_forget import _scrub_wide
+        _scrub_wide(s, op_id)
+        s.commit()
+        s.expire_all()
+
+        assert s.query(Event).filter_by(id=old_id).first().payload == {}
+        assert s.query(Event).filter_by(id=new_id).first().payload == {"text": "new"}
+    finally:
+        s.close()
+
+
 def test_pg_json_array_membership_segment_summaries(pg_sessionmaker) -> None:
     s: Session = pg_sessionmaker()
     try:

@@ -1040,6 +1040,8 @@ def test_scrub_wide_covers_runtime_tables(db_session: Session):
     db_session.add(ContextSnapshot(
         id=_new_id(), trace_id=_new_id(), thread_id=thread,
         stable_prefix_hash="h", context_items=[{"x": 1}]))
+    # 先落库既有内容，确保其 created_at 早于 Phase A 冻结的 cutoff。
+    db_session.flush()
     op_id = _new_id()
     db_session.add(ForgetOperation(
         id=op_id, operation_key=f"forget:{op_id}", mode="everywhere",

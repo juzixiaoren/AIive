@@ -328,6 +328,7 @@ class RetrievalIndexManager:
             .filter(
                 RetrievalIndexEntry.index_version == index_version,
                 RetrievalIndexEntry.is_current == True,  # noqa: E712
+                RetrievalIndexEntry.is_searchable == True,  # noqa: E712
                 RetrievalIndexEntry.id.in_(entry_ids),
             )
             .all()

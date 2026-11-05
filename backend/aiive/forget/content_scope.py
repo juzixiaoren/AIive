@@ -21,14 +21,26 @@ from aiive.db.forget_models import (
     ForgetTarget,
 )
 from aiive.db.models import (
+    AgentAction,
+    AgentRun,
     AgentTask,
+    AgentTaskCheckpoint,
+    AgentTaskEvent,
     Chunk,
     Document,
     Epoch,
     Event,
+    MemoryConflictCase as ConflictCase,
     MemoryEvidence,
+    MemoryProposal,
+    MemoryRecallCandidate,
+    MemoryRecallRun,
     MemoryRecord,
+    OutboxJob,
+    RetrievalRun,
     Segment,
+    TaskArtifact,
+    TaskEvidence,
     TurnRecord,
 )
 from aiive.db.forget_models import ContentProvenanceRef
@@ -61,6 +73,19 @@ class ContentScope:
     segment_ids: set[str] = field(default_factory=set)
     epoch_ids: set[str] = field(default_factory=set)
     agent_task_ids: set[str] = field(default_factory=set)
+    # time_range 下只命中部分子记录时的父 Task（不整体清空父历史）。
+    partial_agent_task_ids: set[str] = field(default_factory=set)
+    agent_run_ids: set[str] = field(default_factory=set)
+    agent_action_ids: set[str] = field(default_factory=set)
+    agent_task_event_ids: set[str] = field(default_factory=set)
+    agent_task_checkpoint_ids: set[str] = field(default_factory=set)
+    task_evidence_ids: set[str] = field(default_factory=set)
+    task_artifact_ids: set[str] = field(default_factory=set)
+    trace_ids: set[str] = field(default_factory=set)
+    conflict_case_ids: set[str] = field(default_factory=set)
+    recall_run_ids: set[str] = field(default_factory=set)
+    retrieval_run_ids: set[str] = field(default_factory=set)
+    outbox_job_ids: set[str] = field(default_factory=set)
     document_ids: set[str] = field(default_factory=set)
 
     @property
@@ -214,8 +239,13 @@ def build_scope(
         )
     )
     if scope.all_user:
-        # all_user_data 的兜底：即使 Cascade 物化中断，也不漏任何 memory。
-        scope.memory_ids |= _ids_from_query(db, db.query(MemoryRecord.id))
+        # all_user_data 的兜底：只纳入 Phase A cutoff 之前已存在的 memory；
+        # 请求之后新产生的记忆必须保留。
+        scope.memory_ids |= _ids_from_query(
+            db, db.query(MemoryRecord.id).filter(
+                MemoryRecord.created_at <= scope.cutoff,
+            )
+        )
     explicit_events = _ids_from_query(
         db, db.query(ForgetTarget.target_id).filter_by(
             forget_operation_id=operation_id, target_type="event",
@@ -243,14 +273,19 @@ def build_scope(
     if scope.thread_ids:
         _add_turn_rows(db.query(TurnRecord.id, TurnRecord.turn_id).filter(
             TurnRecord.thread_id.in_(scope.thread_ids),
+            TurnRecord.created_at <= scope.cutoff,
         ).all())
     if scope.time_from or scope.time_to:
-        tq = db.query(TurnRecord.id, TurnRecord.turn_id)
+        tq = db.query(TurnRecord.id, TurnRecord.turn_id).filter(
+            TurnRecord.created_at <= scope.cutoff,
+        )
         for cond in _time_filter(TurnRecord.created_at, scope.time_from, scope.time_to):
             tq = tq.filter(cond)
         _add_turn_rows(tq.all())
     if scope.all_user:
-        _add_turn_rows(db.query(TurnRecord.id, TurnRecord.turn_id).all())
+        _add_turn_rows(db.query(TurnRecord.id, TurnRecord.turn_id).filter(
+            TurnRecord.created_at <= scope.cutoff,
+        ).all())
     scope.turn_tokens = tokens
     scope.raw_turn_tokens = set(tokens)
 
@@ -262,15 +297,20 @@ def build_scope(
         )
     if scope.thread_ids:
         events |= _ids_from_query(
-            db, db.query(Event.id).filter(Event.thread_id.in_(scope.thread_ids))
+            db, db.query(Event.id).filter(
+                Event.thread_id.in_(scope.thread_ids),
+                Event.created_at <= scope.cutoff,
+            )
         )
     if scope.time_from or scope.time_to:
-        eq = db.query(Event.id)
+        eq = db.query(Event.id).filter(Event.created_at <= scope.cutoff)
         for cond in _time_filter(Event.created_at, scope.time_from, scope.time_to):
             eq = eq.filter(cond)
         events |= _ids_from_query(db, eq)
     if scope.all_user:
-        events |= _ids_from_query(db, db.query(Event.id))
+        events |= _ids_from_query(
+            db, db.query(Event.id).filter(Event.created_at <= scope.cutoff)
+        )
     scope.raw_event_ids = set(events)
     if scope.memory_ids:
         events |= _ids_from_query(
@@ -301,20 +341,28 @@ def build_scope(
                 Event.id.in_(events), Event.turn_id.isnot(None),
             )
         )
+        scope.trace_ids = _ids_from_query(
+            db, db.query(Event.trace_id).filter(Event.id.in_(events))
+        )
 
     # ── Segment / Epoch ──
     segments: set[str] = set()
     if scope.thread_ids:
         segments |= _ids_from_query(
-            db, db.query(Segment.id).filter(Segment.thread_id.in_(scope.thread_ids))
+            db, db.query(Segment.id).filter(
+                Segment.thread_id.in_(scope.thread_ids),
+                Segment.created_at <= scope.cutoff,
+            )
         )
     if scope.time_from or scope.time_to:
-        sq = db.query(Segment.id)
+        sq = db.query(Segment.id).filter(Segment.created_at <= scope.cutoff)
         for cond in _time_filter(Segment.created_at, scope.time_from, scope.time_to):
             sq = sq.filter(cond)
         segments |= _ids_from_query(db, sq)
     if scope.all_user:
-        segments |= _ids_from_query(db, db.query(Segment.id))
+        segments |= _ids_from_query(
+            db, db.query(Segment.id).filter(Segment.created_at <= scope.cutoff)
+        )
     if scope.turn_tokens:
         segments |= _ids_from_query(
             db, db.query(TurnRecord.segment_id).filter(
@@ -346,30 +394,40 @@ def build_scope(
         )
     if scope.thread_ids:
         epochs |= _ids_from_query(
-            db, db.query(Epoch.id).filter(Epoch.thread_id.in_(scope.thread_ids))
+            db, db.query(Epoch.id).filter(
+                Epoch.thread_id.in_(scope.thread_ids),
+                Epoch.created_at <= scope.cutoff,
+            )
         )
     if scope.time_from or scope.time_to:
-        epq = db.query(Epoch.id)
+        epq = db.query(Epoch.id).filter(Epoch.created_at <= scope.cutoff)
         for cond in _time_filter(Epoch.created_at, scope.time_from, scope.time_to):
             epq = epq.filter(cond)
         epochs |= _ids_from_query(db, epq)
     if scope.all_user:
-        epochs |= _ids_from_query(db, db.query(Epoch.id))
+        epochs |= _ids_from_query(
+            db, db.query(Epoch.id).filter(Epoch.created_at <= scope.cutoff)
+        )
     scope.epoch_ids = epochs
 
     # ── Task Runtime ──
     tasks: set[str] = set()
     if scope.thread_ids:
         tasks |= _ids_from_query(
-            db, db.query(AgentTask.id).filter(AgentTask.thread_id.in_(scope.thread_ids))
+            db, db.query(AgentTask.id).filter(
+                AgentTask.thread_id.in_(scope.thread_ids),
+                AgentTask.created_at <= scope.cutoff,
+            )
         )
     if scope.time_from or scope.time_to:
-        tq = db.query(AgentTask.id)
+        tq = db.query(AgentTask.id).filter(AgentTask.created_at <= scope.cutoff)
         for cond in _time_filter(AgentTask.created_at, scope.time_from, scope.time_to):
             tq = tq.filter(cond)
         tasks |= _ids_from_query(db, tq)
     if scope.all_user:
-        tasks |= _ids_from_query(db, db.query(AgentTask.id))
+        tasks |= _ids_from_query(
+            db, db.query(AgentTask.id).filter(AgentTask.created_at <= scope.cutoff)
+        )
     if scope.turn_tokens:
         tasks |= _ids_from_query(
             db, db.query(AgentTask.id).filter(
@@ -378,19 +436,143 @@ def build_scope(
         )
     scope.agent_task_ids = tasks
 
+    # time_range：子记录按自身真实时间字段命中，再反向找父 Task；父 Task 只做
+    # 局部清理，避免把范围外的历史一并删除。
+    partial_task_ids: set[str] = set()
+    if scope.time_from is not None or scope.time_to is not None:
+        for model, attr in (
+            (AgentRun, "agent_run_ids"),
+            (AgentAction, "agent_action_ids"),
+            (AgentTaskEvent, "agent_task_event_ids"),
+            (AgentTaskCheckpoint, "agent_task_checkpoint_ids"),
+            (TaskEvidence, "task_evidence_ids"),
+            (TaskArtifact, "task_artifact_ids"),
+        ):
+            q = db.query(model.id, model.task_id).filter(model.created_at <= scope.cutoff)
+            for cond in _time_filter(model.created_at, scope.time_from, scope.time_to):
+                q = q.filter(cond)
+            rows = q.all()
+            setattr(scope, attr, {str(r[0]) for r in rows if r[0]})
+            partial_task_ids |= {str(r[1]) for r in rows if r[1]}
+    scope.partial_agent_task_ids = partial_task_ids - scope.agent_task_ids
+
     # ── Knowledge（仅 all_user_data，或 everywhere + time_range）──
     documents: set[str] = set()
     if scope.all_user:
-        documents |= _ids_from_query(db, db.query(Document.id))
+        documents |= _ids_from_query(
+            db, db.query(Document.id).filter(Document.created_at <= scope.cutoff)
+        )
     elif scope.time_from or scope.time_to:
         if mode == "everywhere":
-            dq = db.query(Document.id)
+            dq = db.query(Document.id).filter(Document.created_at <= scope.cutoff)
             for cond in _time_filter(Document.created_at, scope.time_from, scope.time_to):
                 dq = dq.filter(cond)
             documents |= _ids_from_query(db, dq)
     scope.document_ids = documents
 
+    # ── MemoryConflictCase ──
+    cases: set[str] = set()
+    if scope.memory_ids:
+        cases |= _ids_from_query(
+            db, db.query(ConflictCase.id).filter(
+                (ConflictCase.old_memory_id.in_(scope.memory_ids))
+                | (ConflictCase.resolved_memory_id.in_(scope.memory_ids))
+            )
+        )
+    if events:
+        cases |= _ids_from_query(
+            db, db.query(ConflictCase.id).filter(
+                ConflictCase.question_event_id.in_(events)
+            )
+        )
+    if scope.thread_ids:
+        cases |= _ids_from_query(
+            db, db.query(ConflictCase.id).filter(
+                ConflictCase.thread_id.in_(scope.thread_ids),
+                ConflictCase.created_at <= scope.cutoff,
+            )
+        )
+    if scope.time_from or scope.time_to:
+        cq = db.query(ConflictCase.id).filter(ConflictCase.created_at <= scope.cutoff)
+        for cond in _time_filter(ConflictCase.created_at, scope.time_from, scope.time_to):
+            cq = cq.filter(cond)
+        cases |= _ids_from_query(db, cq)
+    if scope.all_user:
+        cases |= _ids_from_query(
+            db, db.query(ConflictCase.id).filter(ConflictCase.created_at <= scope.cutoff)
+        )
+    if events or scope.turn_tokens:
+        proposal_ids: set[str] = set()
+        if events:
+            proposal_ids |= set(select_json_array_members(
+                db, "memory_proposals", "id", "source_event_ids", sorted(events),
+            ))
+        if scope.turn_tokens:
+            proposal_ids |= _ids_from_query(
+                db, db.query(MemoryProposal.id).filter(
+                    (MemoryProposal.source_turn_id.in_(scope.turn_tokens))
+                    | (MemoryProposal.source_turn_record_id.in_(scope.turn_tokens))
+                )
+            )
+        if proposal_ids:
+            cases |= _ids_from_query(
+                db, db.query(ConflictCase.id).filter(
+                    ConflictCase.proposal_id.in_(proposal_ids)
+                )
+            )
+    scope.conflict_case_ids = cases
+
+    # ── MemoryRecallRun / RetrievalRun ──
+    recall_runs: set[str] = set()
+    if scope.trace_ids:
+        recall_runs |= _ids_from_query(
+            db, db.query(MemoryRecallRun.id).filter(
+                MemoryRecallRun.trace_id.in_(scope.trace_ids)
+            )
+        )
+    if scope.memory_ids:
+        recall_runs |= _ids_from_query(
+            db, db.query(MemoryRecallCandidate.run_id).filter(
+                MemoryRecallCandidate.memory_id.in_(scope.memory_ids)
+            )
+        )
+    if scope.time_from or scope.time_to:
+        rq = db.query(MemoryRecallRun.id).filter(MemoryRecallRun.created_at <= scope.cutoff)
+        for cond in _time_filter(MemoryRecallRun.created_at, scope.time_from, scope.time_to):
+            rq = rq.filter(cond)
+        recall_runs |= _ids_from_query(db, rq)
+    if scope.all_user:
+        recall_runs |= _ids_from_query(
+            db, db.query(MemoryRecallRun.id).filter(
+                MemoryRecallRun.created_at <= scope.cutoff,
+            )
+        )
+    scope.recall_run_ids = recall_runs
+
+    retrieval_runs: set[str] = set()
+    if scope.trace_ids:
+        retrieval_runs |= _ids_from_query(
+            db, db.query(RetrievalRun.id).filter(RetrievalRun.trace_id.in_(scope.trace_ids))
+        )
+    if scope.time_from or scope.time_to:
+        rrq = db.query(RetrievalRun.id).filter(RetrievalRun.created_at <= scope.cutoff)
+        for cond in _time_filter(RetrievalRun.created_at, scope.time_from, scope.time_to):
+            rrq = rrq.filter(cond)
+        retrieval_runs |= _ids_from_query(db, rrq)
+    if scope.all_user:
+        retrieval_runs |= _ids_from_query(
+            db, db.query(RetrievalRun.id).filter(RetrievalRun.created_at <= scope.cutoff)
+        )
+    scope.retrieval_run_ids = retrieval_runs
+
+    # ── Outbox：仅按 trace 归属（不按 operation_id 猜测内容）──
+    if scope.trace_ids:
+        scope.outbox_job_ids = _ids_from_query(
+            db, db.query(OutboxJob.id).filter(OutboxJob.trace_id.in_(scope.trace_ids))
+        )
+
     # 目标文档的分块（用于 Verify 计数）
+
     scope.segment_ids = {s for s in scope.segment_ids if s}
     return scope
 

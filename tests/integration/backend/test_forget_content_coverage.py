@@ -33,8 +33,14 @@ from aiive.db.models import (
     Event,
     KnowledgeChunkVector,
     LLMCall,
+    RetrievalIndexEntry,
+    RetrievalIndexToken,
+    MemoryConflictCase,
     MemoryEvidence,
     MemoryProposal,
+    MemoryRecallRun,
+    OutboxJob,
+    RetrievalRun,
     MemoryRecord,
     Segment,
     SegmentSummary,
@@ -75,6 +81,9 @@ def _thread(db: Session) -> str:
 def _op(
     db: Session, *, mode: str, selector_type: str, payload: dict,
 ) -> str:
+    # 先 flush 让既有内容拿到真实 created_at，再冻结 Phase A cutoff（模拟
+    # "数据先存在、Forget 请求后到达" 的真实时序）。
+    db.flush()
     op_id = _id()
     db.add(ForgetOperation(
         id=op_id, operation_key=f"forget:{op_id}", mode=mode,
@@ -493,6 +502,75 @@ def _at(delta_seconds: int) -> datetime:
     return datetime.now(timezone.utc) + timedelta(seconds=delta_seconds)
 
 
+def test_cutoff_keeps_post_request_data_but_cleans_old_derived(
+    db_session: Session,
+) -> None:
+    thread_id = _thread(db_session)
+    old_ev = _event(db_session, thread_id, "old secret")
+    old_memory = MemoryRecord(
+        id=_id(), memory_type="fact", canonical_key="k:old", scope_type="thread",
+        scope_id=thread_id, content="old memory", lifecycle_state="active",
+        validity_state="valid", confidence=0.9, created_at=_now(),
+        source_event_id=old_ev,
+    )
+    db_session.add(old_memory)
+    op_id = _op(db_session, mode="everywhere", selector_type="thread",
+                payload={"thread_id": thread_id})
+    from aiive.db.forget_models import ForgetTarget
+    db_session.add(ForgetTarget(
+        id=_id(), forget_operation_id=op_id, target_type="memory_record",
+        target_id=old_memory.id, batch_no=0, frozen_at=_now(),
+    ))
+
+    # Phase A 之后：同 Thread 的新 Event / Memory / Task / Summary。
+    new_ev = _event(db_session, thread_id, "new secret")
+    new_memory = MemoryRecord(
+        id=_id(), memory_type="fact", canonical_key="k:new", scope_type="thread",
+        scope_id=thread_id, content="new memory", lifecycle_state="active",
+        validity_state="valid", confidence=0.9, created_at=_at(60),
+        source_event_id=new_ev,
+    )
+    new_task = AgentTask(
+        id=_id(), thread_id=thread_id, task_type="research", title="new task",
+        goal="new goal", status="queued", executor_type="llm", priority=0,
+        task_brief={"x": 1}, task_state={"y": 1}, created_at=_at(60),
+    )
+    db_session.add_all([new_memory, new_task])
+    # 派生记录：cutoff 之后创建，但来源是旧 Event → 必须清理。
+    seg_old = Segment(
+        id=_id(), epoch_id=_id(), thread_id=thread_id, segment_no=1, status="open",
+        start_turn_sequence=1, end_turn_sequence=1, created_at=_at(60),
+    )
+    db_session.add(seg_old)
+    db_session.add(Epoch(
+        id=seg_old.epoch_id, thread_id=thread_id, epoch_no=1, status="open",
+        created_at=_at(60),
+    ))
+    db_session.add(SegmentSummary(
+        id=_id(), segment_id=seg_old.id, goal="old-derived", outcome="o",
+        source_event_ids=[old_ev], summary_version=1, token_count=1,
+        created_at=_at(60),
+    ))
+    db_session.add(SegmentSummary(
+        id=_id(), segment_id=_id(), goal="new-derived", outcome="o",
+        source_event_ids=[new_ev], summary_version=1, token_count=1,
+        created_at=_at(60),
+    ))
+    db_session.commit()
+
+    _scrub_wide(db_session, op_id)
+    db_session.commit()
+    db_session.expire_all()
+
+    assert db_session.query(Event).filter_by(id=old_ev).first().payload == {}
+    assert db_session.query(Event).filter_by(id=new_ev).first().payload == {"text": "new secret"}
+    assert db_session.query(MemoryRecord).filter_by(id=old_memory.id).first().content == "[forgotten]"
+    assert db_session.query(MemoryRecord).filter_by(id=new_memory.id).first().content == "new memory"
+    assert db_session.query(AgentTask).filter_by(id=new_task.id).first().title == "new task"
+    goals = {r.goal for r in db_session.query(SegmentSummary).all()}
+    assert "[redacted]" in goals and "new-derived" in goals
+
+
 def test_time_range_uses_each_table_real_time_column(db_session: Session) -> None:
     inside = _thread(db_session)
     outside = _thread(db_session)
@@ -897,6 +975,302 @@ def test_cleanup_preserves_other_thread_queries_and_knowledge_search(
     assert summary["title"] == "keep-title"
     hits = search_chunks(db_session, "keep-token", 5)
     assert any(hit.get("chunk_id") for hit in hits)
+
+
+def test_time_range_scrubs_task_children_without_erasing_parent_history(
+    db_session: Session,
+) -> None:
+    thread_id = _thread(db_session)
+    task = AgentTask(
+        id=_id(), thread_id=thread_id, task_type="research", title="long task",
+        goal="goal", status="running", executor_type="llm", priority=0,
+        task_brief={"initial_input": "keep brief"},
+        task_state={"current_action": "keep", "evidence_id": "pending"},
+        created_at=_at(-3600),
+    )
+    db_session.add(task)
+    run_old = AgentRun(
+        id=_id(), task_id=task.id, run_index=0, trigger="user", status="completed",
+        input_snapshot={"old": 1}, created_at=_at(-3600),
+    )
+    run_new = AgentRun(
+        id=_id(), task_id=task.id, run_index=1, trigger="user", status="running",
+        input_snapshot={"new": 1}, output_summary={"o": 1}, error_message="new err",
+        created_at=_at(-60),
+    )
+    ev_old = TaskEvidence(
+        id=_id(), task_id=task.id, kind="file", summary="old evidence",
+        inline_payload={"old": 1}, content_hash="h", mime_type="text/plain",
+        content_size=1, created_at=_at(-3600),
+    )
+    ev_new = TaskEvidence(
+        id=_id(), task_id=task.id, kind="file", summary="new evidence",
+        inline_payload={"new": 1}, content_hash="h", mime_type="text/plain",
+        content_size=1, created_at=_at(-60),
+    )
+    art_old = TaskArtifact(
+        id=_id(), task_id=task.id, name="old artifact", artifact_type="file",
+        summary="old", object_bucket="b", object_key="old-key",
+        content_hash="h", mime_type="text/plain", content_size=1, created_at=_at(-3600),
+    )
+    art_new = TaskArtifact(
+        id=_id(), task_id=task.id, name="new artifact", artifact_type="file",
+        summary="new", object_bucket="b", object_key="new-key",
+        content_hash="h", mime_type="text/plain", content_size=1, created_at=_at(-60),
+    )
+    db_session.add_all([run_old, run_new, ev_old, ev_new, art_old, art_new])
+    task.task_state = {"current_action": "keep", "evidence_id": ev_new.id}
+    op_id = _op(
+        db_session, mode="everywhere", selector_type="time_range",
+        payload={
+            "time_from": _at(-120).isoformat(),
+            "time_to": _at(0).isoformat(),
+        },
+    )
+    db_session.commit()
+
+    _scrub_wide(db_session, op_id)
+    db_session.commit()
+    db_session.expire_all()
+
+    task = db_session.query(AgentTask).filter_by(id=task.id).first()
+    assert task.title == "long task" and task.goal == "goal"
+    assert task.task_brief == {"initial_input": "keep brief"}
+    assert task.status == "cancelled"  # 引用了被清理 evidence → 不可安全恢复
+    assert task.task_state["evidence_id"] == "[forgotten]"
+    assert task.task_state["current_action"] == "keep"
+
+    old_run = db_session.query(AgentRun).filter_by(id=run_old.id).first()
+    new_run = db_session.query(AgentRun).filter_by(id=run_new.id).first()
+    assert old_run.input_snapshot == {"old": 1}
+    assert new_run.input_snapshot == {} and new_run.output_summary is None
+    assert new_run.error_message is None
+
+    assert db_session.query(TaskEvidence).filter_by(id=ev_old.id).first().summary == "old evidence"
+    new_ev = db_session.query(TaskEvidence).filter_by(id=ev_new.id).first()
+    assert new_ev.summary == "[redacted]" and new_ev.inline_payload is None
+    assert db_session.query(TaskArtifact).filter_by(id=art_old.id).first().name == "old artifact"
+    assert db_session.query(TaskArtifact).filter_by(id=art_new.id).first().name == "[redacted]"
+
+    process_object_deletions(db_session, op_id)
+    scope = load_scope(db_session, op_id, "everywhere")
+    assert scope is not None
+    report = verify_scope(db_session, scope)
+    assert report.ok
+
+    # 人为注入 Task 子记录残留 → Verify 必须发现。
+    new_run.error_message = "leak"
+    new_ev.inline_payload = {"leak": 1}
+    art_new.name = "leak"
+    db_session.commit()
+    report = verify_scope(db_session, scope)
+    assert not report.ok
+    assert report.residues.get("agent_runs_partial.error_message", 0) >= 1
+    assert report.residues.get("task_evidence_partial.inline_payload", 0) >= 1
+    assert report.residues.get("task_artifacts_partial.name", 0) >= 1
+
+
+def test_auxiliary_content_and_outbox_scrub(db_session: Session) -> None:
+    thread_id = _thread(db_session)
+    ev = _event(db_session, thread_id, "aux secret")
+    memory = MemoryRecord(
+        id=_id(), memory_type="fact", canonical_key="k:aux", scope_type="thread",
+        scope_id=thread_id, content="aux memory", lifecycle_state="active",
+        validity_state="valid", confidence=0.9, created_at=_now(),
+    )
+    db_session.add(memory)
+    reminder = Task(
+        id=_id(), task_type="reminder", status="pending", title="reminder",
+        description="reminder desc", condition="when", thread_id=None,
+        source_event_id=ev, created_at=_now(),
+    )
+    case = MemoryConflictCase(
+        id=_id(), status="pending", thread_id=thread_id, scope_type="thread",
+        scope_id=thread_id, canonical_key="k:aux", memory_type="fact",
+        sensitivity="normal", old_memory_id=memory.id, old_record_version=1,
+        old_content="old case", new_content="new case", proposal_id="p1",
+        proposal_payload={"content": "proposal"}, verdict="conflict",
+        verdict_reason="reason", evidence=[{"span": "e"}],
+        graph_evidence={"g": 1}, question="which?", decision_source="user",
+        decision_span="span", resolution_reason="resolution",
+        idempotency_key="case-1", created_at=_now(),
+    )
+    ev_trace = db_session.query(Event.trace_id).filter_by(id=ev).scalar()
+    recall = MemoryRecallRun(
+        id=_id(), trace_id=ev_trace,
+        request_query="recall query", scope_context={"scope": 1},
+        routes_executed=[{"route": "lexical"}], created_at=_now(),
+    )
+    retrieval = RetrievalRun(
+        id=_id(), trace_id=ev_trace, query="retrieval query",
+        strategy="hybrid", created_at=_now(),
+    )
+    outbox = OutboxJob(
+        id=_id(), operation_id="op-1", job_type="memory_extract", status="completed",
+        payload={"content": "outbox content", "memory_id": memory.id},
+        trace_id=ev_trace, error_message="outbox error", created_at=_now(),
+    )
+    db_session.add_all([reminder, case, recall, retrieval, outbox])
+    op_id = _op(db_session, mode="everywhere", selector_type="thread",
+                payload={"thread_id": thread_id})
+    from aiive.db.forget_models import ForgetTarget
+    db_session.add(ForgetTarget(
+        id=_id(), forget_operation_id=op_id, target_type="memory_record",
+        target_id=memory.id, batch_no=0, frozen_at=_now(),
+    ))
+    db_session.commit()
+
+    _scrub_wide(db_session, op_id)
+    db_session.commit()
+    db_session.expire_all()
+
+    case = db_session.query(MemoryConflictCase).first()
+    assert case.status == "stale"
+    assert case.old_content == "[redacted]" and case.new_content == "[redacted]"
+    assert case.proposal_payload == {} and case.evidence == [] and case.graph_evidence == []
+    assert case.question == "[redacted]" and case.verdict_reason == ""
+    assert case.decision_span == "" and case.resolution_reason == ""
+    assert db_session.query(MemoryRecallRun).first().request_query == "[redacted]"
+    assert db_session.query(RetrievalRun).first().query == "[redacted]"
+    outbox = db_session.query(OutboxJob).first()
+    assert outbox.payload["content"] == "[redacted]"
+    assert outbox.payload["memory_id"] == memory.id
+    assert outbox.error_message == ""
+    assert db_session.query(Task).filter_by(id=reminder.id).first().title == "[redacted]"
+
+    # 人为注入残留 → Verify 必须发现。
+    case.old_content = "leak"
+    outbox.payload = {"content": "leak"}
+    db_session.commit()
+    scope = load_scope(db_session, op_id, "everywhere")
+    assert scope is not None
+    report = verify_scope(db_session, scope)
+    assert not report.ok
+    assert report.residues.get("memory_conflict_cases.old_content", 0) >= 1
+    assert report.residues.get("outbox_jobs", 0) >= 1
+
+
+def test_unknown_json_element_fails_closed_only_in_scope(db_session: Session) -> None:
+    target_thread = _thread(db_session)
+    other_thread = _thread(db_session)
+    ev = _event(db_session, target_thread, "target")
+    other_ev = _event(db_session, other_thread, "other")
+    seg = Segment(
+        id=_id(), epoch_id=_id(), thread_id=target_thread, segment_no=1,
+        status="open", start_turn_sequence=1, end_turn_sequence=1, created_at=_now(),
+    )
+    other_seg = Segment(
+        id=_id(), epoch_id=_id(), thread_id=other_thread, segment_no=1,
+        status="open", start_turn_sequence=1, end_turn_sequence=1, created_at=_now(),
+    )
+    db_session.add_all([seg, other_seg])
+    db_session.add(SegmentSummary(
+        id=_id(), segment_id=seg.id, goal="target",
+        source_event_ids=[{"id": ev}], summary_version=1,
+        token_count=1, created_at=_now(),
+    ))
+    db_session.add(SegmentSummary(
+        id=_id(), segment_id=other_seg.id, goal="other",
+        source_event_ids=[{"id": other_ev}], summary_version=1,
+        token_count=1, created_at=_now(),
+    ))
+    op_id = _op(db_session, mode="everywhere", selector_type="thread",
+                payload={"thread_id": target_thread})
+    db_session.commit()
+
+    _scrub_wide(db_session, op_id)
+    db_session.commit()
+    scope = load_scope(db_session, op_id, "everywhere")
+    assert scope is not None
+    report = verify_scope(db_session, scope)
+    # 只有目标 Thread 的未知结构计入；其他 Thread 的同类数据不阻断。
+    assert report.unknown == 1
+    assert not report.ok
+
+
+def test_scrub_fields_subset_of_verify_fields() -> None:
+    from aiive.forget.content_scrub import SCRUBBED_FIELDS, VERIFIED_FIELDS
+
+    assert SCRUBBED_FIELDS <= VERIFIED_FIELDS
+    assert "agent_runs.error_message" in VERIFIED_FIELDS
+    assert "tool_operations.effect_receipt" in VERIFIED_FIELDS
+    assert "memory_conflict_cases.old_content" in VERIFIED_FIELDS
+
+
+def test_unified_retriever_cannot_recall_after_forget(db_session: Session) -> None:
+    from aiive.retrieval.indexing_service import refresh_source
+    from aiive.retrieval.retrieval_index import RetrievalIndexManager
+    from aiive.retrieval.retrieval_types import RetrievalMode, RetrievalRequest
+    from aiive.retrieval.unified_retriever import UnifiedRetriever
+
+    gen = RetrievalIndexManager().create_generation(db_session, 1, status="active")
+    assert gen.index_version == 1
+    thread_id = _thread(db_session)
+    ev = _event(db_session, thread_id, "Python 编程偏好")
+    seg = Segment(
+        id=_id(), epoch_id=_id(), thread_id=thread_id, segment_no=1, status="open",
+        start_turn_sequence=1, end_turn_sequence=1, created_at=_now(),
+    )
+    db_session.add(seg)
+    db_session.add(Epoch(
+        id=seg.epoch_id, thread_id=thread_id, epoch_no=1, status="open",
+        created_at=_now(),
+    ))
+    summary = SegmentSummary(
+        id=_id(), segment_id=seg.id, goal="Python 编程偏好",
+        outcome="用户明确选择 Python", source_event_ids=[ev],
+        summary_version=1, token_count=1, source_hash="h", created_at=_now(),
+    )
+    memory = MemoryRecord(
+        id=_id(), memory_type="fact", canonical_key="user.pref.lang",
+        scope_type="thread", scope_id=thread_id, content="用户偏好 Python",
+        lifecycle_state="active", validity_state="valid", confidence=0.9,
+        created_at=_now(),
+    )
+    db_session.add_all([summary, memory])
+    db_session.flush()
+    refresh_source(db_session, "segment_summary", summary.id, "memory.created")
+    refresh_source(db_session, "memory_record", memory.id, "memory.created")
+    db_session.commit()
+
+    ur = UnifiedRetriever(db_session)
+    exact = ur.retrieve(RetrievalRequest(
+        query="user.pref.lang", mode=RetrievalMode.SEARCH,
+        source_types=["memory_record"], scope_context={},
+    ))
+    lexical = ur.retrieve(RetrievalRequest(
+        query="Python", mode=RetrievalMode.SEARCH,
+        source_types=["segment_summary"],
+    ))
+    assert any(h.source_id == memory.id for h in exact.hits)
+    assert any(h.source_id == summary.id for h in lexical.hits)
+
+    from aiive.db.forget_models import ForgetTarget
+    op_id = _op(db_session, mode="everywhere", selector_type="thread",
+                payload={"thread_id": thread_id})
+    db_session.add(ForgetTarget(
+        id=_id(), forget_operation_id=op_id, target_type="memory_record",
+        target_id=memory.id, batch_no=0, frozen_at=_now(),
+    ))
+    db_session.commit()
+
+    _scrub_wide(db_session, op_id)
+    db_session.commit()
+    db_session.expire_all()
+
+    exact_after = ur.retrieve(RetrievalRequest(
+        query="user.pref.lang", mode=RetrievalMode.SEARCH,
+        source_types=["memory_record"], scope_context={},
+    ))
+    lexical_after = ur.retrieve(RetrievalRequest(
+        query="Python", mode=RetrievalMode.SEARCH,
+        source_types=["segment_summary"],
+    ))
+    assert exact_after.hits == []
+    assert lexical_after.hits == []
+    assert db_session.query(RetrievalIndexToken).count() == 0
+    entries = db_session.query(RetrievalIndexEntry).all()
+    assert entries and all(not e.is_current and not e.is_searchable for e in entries)
 
 
 def _run_job(handler, op_id: str, db_session: Session, monkeypatch):

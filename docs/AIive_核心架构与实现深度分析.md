@@ -1431,6 +1431,15 @@ MemoryRecord 本身保留为 forgotten sentinel，不是简单 `DELETE FROM memo
 - 对象存储：DB 事务内只解除引用并登记 `forget_actions(action_type='delete_object')`；
   COMMIT 后才删除。共享对象复查后跳过，失败保留 failed 动作供 Purge 重试；
   `documents.source_path` 指向的用户原始文件永不删除。
+- **范围冻结（V62.3）**：直接记录按各自真实时间列（created_at / updated_at /
+  created_source_at）过滤 `<= manifest.cutoff_created_at`；派生记录按 Provenance /
+  JSON 成员命中，即使创建于 cutoff 之后也清理；cutoff 后独立新数据保留。
+- **检索一致性（V62.3）**：Entry 发现覆盖 memory/segment/epoch/Summary/Checkpoint/
+  thread/time/all；删除 RetrievalIndexToken，置 `is_searchable=false`、
+  `is_current=false`；`fetch_entries_by_ids` 过滤不可搜索条目。
+- **Task Runtime time_range（V62.3）**：按 Run/Action/Event/Checkpoint/Evidence/Artifact
+  自身时间命中并反向找父 Task，只清理命中子记录；父 task_state 引用替换为
+  `[forgotten]`，无法安全恢复的运行中任务转 `cancelled`。
 
 ## 13.8 Phase E：Verify 实际检查了什么（V62.2）
 
