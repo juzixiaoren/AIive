@@ -21,11 +21,15 @@ from aiive.db.models import (
     AgentTask,
     AgentTaskCheckpoint,
     AgentTaskEvent,
+    AgentTaskWatch,
     Artifact,
     AttentionState,
+    ApprovalRequest,
     Chunk,
     CompactionInput,
     ContextSnapshot,
+    CoreMemoryBlock,
+    DesktopActionReceipt,
     Document,
     Epoch,
     EpochCheckpoint,
@@ -37,6 +41,8 @@ from aiive.db.models import (
     RetrievalIndexToken,
     MemoryConflictCase,
     MemoryEvidence,
+    MemoryMaintenanceAction,
+    MemoryMaintenanceInput,
     MemoryProposal,
     MemoryRecallRun,
     OutboxJob,
@@ -46,6 +52,7 @@ from aiive.db.models import (
     SegmentSummary,
     Task,
     TaskArtifact,
+    ToolOperation,
     TaskEvidence,
     Thread,
     TurnEventInbox,
@@ -1186,6 +1193,414 @@ def test_unknown_json_element_fails_closed_only_in_scope(db_session: Session) ->
     # 只有目标 Thread 的未知结构计入；其他 Thread 的同类数据不阻断。
     assert report.unknown == 1
     assert not report.ok
+
+
+def test_every_scrubbed_field_residue_detected(db_session: Session) -> None:
+    from sqlalchemy import select, update
+
+    from aiive.db.models import Base
+    from aiive.forget.content_scrub import SCRUBBED_FIELDS
+
+    thread_id = _thread(db_session)
+    ev = _event(db_session, thread_id, "all fields secret")
+    trace = db_session.query(Event.trace_id).filter_by(id=ev).scalar()
+    turn = _turn(db_session, thread_id)
+    epoch_id, seg_id = _id(), _id()
+    db_session.add(Epoch(id=epoch_id, thread_id=thread_id, epoch_no=1, status="open",
+                         created_at=_now()))
+    db_session.add(Segment(id=seg_id, epoch_id=epoch_id, thread_id=thread_id,
+                           segment_no=1, status="open", start_turn_sequence=1,
+                           end_turn_sequence=1, created_at=_now()))
+    summary = SegmentSummary(
+        id=_id(), segment_id=seg_id, goal="goal", outcome="outcome",
+        decisions=["d"], source_event_ids=[ev], summary_version=1,
+        token_count=1, created_at=_now(),
+    )
+    checkpoint = EpochCheckpoint(
+        id=_id(), epoch_id=epoch_id, current_goal="goal",
+        completed_milestones=["m"], source_segment_ids=[seg_id],
+        source_hashes=["h"], version=1, token_count=1, created_at=_now(),
+    )
+    memory = MemoryRecord(
+        id=_id(), memory_type="fact", canonical_key="k:all", scope_type="thread",
+        scope_id=thread_id, content="memory", lifecycle_state="active",
+        validity_state="valid", confidence=0.9, created_at=_now(),
+        source_event_id=ev,
+    )
+    proposal = MemoryProposal(
+        id=_id(), proposal_id="p-all", source_event_ids=[ev],
+        canonical_key="k:all", content="proposal", structured_value={"v": 1},
+        evidence=[{"span": "e"}], raw_payload={"r": 1}, normalized_payload={"n": 1},
+        execution_mode="sync", retention_policy="standard", durable=True,
+        created_at=_now(),
+    )
+    maint_in = MemoryMaintenanceInput(
+        id=_id(), run_id=_id(), batch_id=_id(), input_sequence=1,
+        memory_record_id=memory.id, input_role="primary", record_version=1,
+        snapshot_json={"content": "snapshot"}, created_at=_now(),
+    )
+    maint_act = MemoryMaintenanceAction(
+        id=_id(), run_id=_id(), batch_id=_id(), action_sequence=1,
+        subject_memory_record_id=memory.id, related_record_ids=[memory.id],
+        action_type="merge", status="done", details={"content": "d"},
+        preconditions={"p": 1}, created_at=_now(),
+    )
+    block = CoreMemoryBlock(
+        id=_id(), block_name=f"block-{_id()}", content="block content",
+        source_memory_ids=[memory.id], projection_version=1, record_versions={},
+        token_count=1, checksum="h", created_at=_now(), updated_at=_now(),
+    )
+    entry = RetrievalIndexEntry(
+        id=_id(), source_type="memory_record", source_id=memory.id,
+        source_version="1", index_version=1, thread_id=thread_id,
+        memory_record_id=memory.id, scope_type="thread", scope_id=thread_id,
+        canonical_key="k:all", lifecycle_state="active", validity_state="valid",
+        retrieval_tier="warm", title="title", search_text="text", snippet="snip",
+        metadata={"m": 1}, created_source_at=_now(), indexed_at=_now(),
+        is_current=True, is_searchable=True,
+    )
+    compaction = CompactionInput(
+        id=_id(), segment_id=seg_id, start_turn_sequence=1, end_turn_sequence=1,
+        turn_manifest=[{"t": 1}], event_manifest=[{"e": 1}],
+        working_state_version=1, working_state_snapshot={"x": 1},
+        source_hash="h", summary_version=1, created_at=_now(),
+    )
+    epoch_compaction = EpochCompactionInput(
+        id=_id(), epoch_id=epoch_id, boundary_turn_sequence=1,
+        working_state_version=1, current_objective="obj",
+        open_loops=["o"], active_constraints=["c"], artifact_refs=["a"],
+        verified_tool_states=["v"], source_segment_ids=[seg_id],
+        source_hashes=["h"], snapshot_hash="h", checkpoint_version=1,
+        created_at=_now(),
+    )
+    db_session.add_all([summary, checkpoint, memory, proposal, maint_in, maint_act,
+                        block, entry, compaction, epoch_compaction])
+    db_session.flush()
+    token = RetrievalIndexToken(
+        id=_id(), entry_id=entry.id, index_version=1, token="leak",
+        token_kind="word", term_frequency=1,
+    )
+    db_session.add(token)
+    db_session.add(WorkingState(
+        id=_id(), thread_id=thread_id, current_objective="obj",
+        open_loops=["o"], active_constraints=["c"], pending_approvals=["p"],
+        artifact_refs=["a"], verified_tool_states=["v"],
+        uncommitted_side_effects=["u"], running_tool_state=["r"],
+        applied_idempotency_keys=["k"],
+    ))
+    db_session.add(ContextSnapshot(
+        id=_id(), trace_id=_id(), thread_id=thread_id, stable_prefix_hash="h",
+        context_items=[{"x": 1}], meta={"m": 1}, token_total=1, created_at=_now(),
+    ))
+    db_session.add(LLMCall(
+        id=_id(), trace_id=trace, thread_id=thread_id, model="m", latency_ms=1.0,
+        input_preview="in", output_preview="out", created_at=_now(),
+    ))
+    reminder = Task(
+        id=_id(), task_type="reminder", status="pending", title="title",
+        description="desc", condition="cond", thread_id=thread_id,
+        source_event_id=ev, created_at=_now(),
+    )
+    db_session.add(reminder)
+    artifact = Artifact(
+        id=_id(), thread_id=thread_id, kind="text", ref="r", content="content",
+        content_hash="h", token_count=1, turn_record_id=turn.id, created_at=_now(),
+    )
+    db_session.add(artifact)
+    db_session.add(AttentionState(
+        id=_id(), thread_id=thread_id, focus_topic="topic",
+        recent_topics=["a"], decision="none", created_at=_now(),
+    ))
+    db_session.add(TurnEventInbox(
+        id=_id(), thread_id=thread_id, dedupe_key="d", event_type="e",
+        source="s", priority=1, payload={"text": "inbox"}, status="pending",
+        turn_record_id=turn.id, turn_id=turn.turn_id, created_at=_now(),
+    ))
+    outbox = OutboxJob(
+        id=_id(), operation_id=f"memory_extraction:{turn.id}:x",
+        job_type="memory_extraction", status="completed",
+        payload={"content": "outbox", "memory_id": memory.id},
+        trace_id=trace, error_message="err", created_at=_now(),
+    )
+    db_session.add(outbox)
+    db_session.flush()
+    tool = ToolOperation(
+        id=_id(), idempotency_key="tool-1", thread_id=thread_id,
+        turn_record_id=turn.id, turn_id=turn.turn_id, tool_call_id="call-1",
+        capability_id="cap", params={"content": "params"}, params_hash="h",
+        descriptor_hash="h", status="committed", effect_mode="db_transactional",
+        outbox_job_id=outbox.id, result_payload={"content": "result"},
+        effect_receipt={"content": "receipt"}, error_message="err",
+        trace_id=trace, created_at=_now(),
+    )
+    task_rt = AgentTask(
+        id=_id(), thread_id=thread_id, task_type="research", title="task",
+        goal="goal", status="running", executor_type="llm", priority=0,
+        task_brief={"initial_input": "brief"}, task_state={"current_action": "a"},
+        report={"r": 1}, last_error="err", created_at=_now(),
+    )
+    db_session.add(task_rt)
+    db_session.flush()
+    run = AgentRun(
+        id=_id(), task_id=task_rt.id, run_index=0, trigger="user",
+        status="completed", input_snapshot={"i": 1}, output_summary={"o": 1},
+        error_message="err", created_at=_now(),
+    )
+    action = AgentAction(
+        id=_id(), task_id=task_rt.id, run_id=run.id, sequence=1,
+        capability_id="cap", arguments={"a": 1}, arguments_hash="h",
+        descriptor_hash="h", idempotency_key="act-1", status="succeeded",
+        risk_level="low", requires_approval=False, preconditions=[{"p": 1}],
+        effects=[{"e": 1}], result_summary={"r": 1}, evidence_refs=[{"x": 1}],
+        error_message="err", created_at=_now(),
+    )
+    task_event = AgentTaskEvent(
+        id=_id(), task_id=task_rt.id, sequence=1, event_type="e",
+        visibility="conversation", payload={"text": "event"}, created_at=_now(),
+    )
+    checkpoint_rt = AgentTaskCheckpoint(
+        id=_id(), task_id=task_rt.id, version=1, event_sequence=1,
+        state={"s": 1}, plan={"p": 1}, pending_action_refs=[{"a": 1}],
+        evidence_refs=[{"e": 1}], reason="r", snapshot_hash="h", created_at=_now(),
+    )
+    evidence = TaskEvidence(
+        id=_id(), task_id=task_rt.id, kind="file", summary="summary",
+        inline_payload={"i": 1}, content_hash="h", mime_type="text/plain",
+        content_size=1, created_at=_now(),
+    )
+    task_artifact = TaskArtifact(
+        id=_id(), task_id=task_rt.id, name="name", artifact_type="file",
+        summary="summary", object_bucket="", object_key="",
+        content_hash="h", mime_type="text/plain", content_size=1, created_at=_now(),
+    )
+    approval = ApprovalRequest(
+        id=_id(), thread_id=thread_id, task_id=task_rt.id, action_id=action.id,
+        tool_name="tool", tool_args={"content": "args"}, tool_args_hash="h",
+        descriptor_hash="h", risk_snapshot={"r": 1}, preconditions={"p": 1},
+        effects={"e": 1}, approval_hash="h", status="pending",
+        execution_result={"content": "result"}, error_message="err",
+        created_at=_now(),
+    )
+    watch = AgentTaskWatch(
+        id=_id(), task_id=task_rt.id, watch_type="condition",
+        config={"query": "watch"}, cursor={"cursor": 1}, status="active",
+        created_at=_now(),
+    )
+    receipt = DesktopActionReceipt(
+        action_id=action.id, node_id="node-1", idempotency_key="receipt-1",
+        arguments_hash="h", status="committed",
+        result_payload={"content": "receipt"}, error_message="err",
+        updated_at=_now(),
+    )
+    db_session.add_all([tool, run, action, task_event, checkpoint_rt, evidence,
+                        task_artifact, approval, watch, receipt])
+    db_session.flush()
+    case = MemoryConflictCase(
+        id=_id(), status="pending", thread_id=thread_id, scope_type="thread",
+        scope_id=thread_id, canonical_key="k:all", memory_type="fact",
+        sensitivity="normal", old_memory_id=memory.id, old_record_version=1,
+        old_content="old", new_content="new", proposal_id=proposal.id,
+        proposal_payload={"content": "p"}, verdict="conflict",
+        verdict_reason="reason", evidence=[{"e": 1}], graph_evidence={"g": 1},
+        question="q", decision_source="user", decision_span="span",
+        resolution_reason="res", idempotency_key="case-all", created_at=_now(),
+    )
+    recall = MemoryRecallRun(
+        id=_id(), trace_id=trace, request_query="query",
+        scope_context={"s": 1}, routes_executed=[{"r": 1}], created_at=_now(),
+    )
+    retrieval_run = RetrievalRun(
+        id=_id(), trace_id=trace, query="retrieval", strategy="hybrid",
+        created_at=_now(),
+    )
+    db_session.add_all([case, recall, retrieval_run])
+    doc = Document(
+        id=_id(), source_path="external/all.txt", content_hash="h",
+        mime_type="text/plain", title="doc", doc_type="text", status="indexed",
+        parser_version="p", chunker_version="c", created_at=_now(),
+    )
+    db_session.add(doc)
+    db_session.flush()
+    chunk = Chunk(
+        id=_id(), document_id=doc.id, content="chunk", line_start=0, line_end=1,
+        chunk_index=0, token_estimate=1, heading_path="", section_id="",
+        block_type="text", source_type="text", parser_version="p",
+        chunker_version="c", embedding_input_hash="h", created_at=_now(),
+    )
+    db_session.add(chunk)
+    db_session.flush()
+    db_session.add(KnowledgeChunkVector(
+        chunk_id=chunk.id, content_hash="h", embedding_model="m",
+        input_version="1", embedding=[0.0] * 512, created_at=_now(),
+    ))
+    op_id = _op(
+        db_session, mode="everywhere", selector_type="time_range",
+        payload={"time_from": _at(-120).isoformat(), "time_to": _at(120).isoformat()},
+    )
+    db_session.commit()
+
+    _scrub_wide(db_session, op_id)
+    db_session.commit()
+    db_session.expire_all()
+    scope = load_scope(db_session, op_id, "everywhere")
+    assert scope is not None
+    from aiive.forget.content_scrub import unknown_reference_details
+    report = verify_scope(db_session, scope)
+    assert report.ok, unknown_reference_details(db_session, scope)
+
+    rows = {
+        "events": ev, "turn_records": turn.id, "turn_event_inbox": db_session.query(TurnEventInbox).first().id,
+        "memory_records": memory.id, "memory_proposals": proposal.id,
+        "memory_maintenance_inputs": maint_in.id, "memory_maintenance_actions": maint_act.id,
+        "retrieval_index_entries": entry.id,
+        "segment_summaries": summary.id, "epoch_checkpoints": checkpoint.id,
+        "working_states": db_session.query(WorkingState).first().id,
+        "context_snapshots": db_session.query(ContextSnapshot).first().id,
+        "llm_calls": db_session.query(LLMCall).first().id,
+        "tasks": reminder.id, "artifacts": artifact.id,
+        "attention_states": db_session.query(AttentionState).first().id,
+        "tool_operations": tool.id, "approval_requests": approval.id,
+        "agent_tasks": task_rt.id, "agent_runs": run.id, "agent_actions": action.id,
+        "agent_task_events": task_event.id, "agent_task_checkpoints": checkpoint_rt.id,
+        "task_evidence": evidence.id, "task_artifacts": task_artifact.id,
+        "documents": doc.id, "memory_conflict_cases": case.id,
+        "memory_recall_runs": recall.id, "retrieval_runs": retrieval_run.id,
+        "outbox_jobs": outbox.id,
+        "compaction_inputs": compaction.id,
+        "epoch_compaction_inputs": epoch_compaction.id,
+        "threads": thread_id,
+        "agent_task_watches": watch.id,
+        "desktop_action_receipts": action.id,
+    }
+
+    special = {
+        "memory_evidence", "core_memory_blocks", "retrieval_index_tokens",
+        "chunks", "knowledge_chunk_vectors",
+    }
+    json_columns = {
+        "structured_value", "graph_facts", "evidence", "raw_payload",
+        "normalized_payload", "proposal_payload", "graph_evidence",
+        "snapshot_json", "details", "preconditions", "effects", "risk_snapshot",
+        "execution_result", "tool_args", "params", "result_payload",
+        "effect_receipt", "input_snapshot", "output_summary", "arguments",
+        "result_summary", "evidence_refs", "pending_action_refs", "inline_payload",
+        "payload", "task_brief", "task_state", "state", "plan", "context_items",
+        "meta", "scope_context", "routes_executed", "metadata",
+        "working_state_snapshot", "turn_manifest", "event_manifest",
+        "open_loops", "active_constraints", "artifact_refs",
+        "verified_tool_states", "pending_approvals", "uncommitted_side_effects",
+        "running_tool_state", "applied_idempotency_keys", "recent_topics",
+    }
+
+    def _inject(label: str) -> None:
+        table_name, column = label.split(".")
+        if table_name in special:
+            return
+        table = Base.metadata.tables[table_name]
+        column_obj = table.c[column]
+        row_id = rows[table_name]
+        pk = "action_id" if table_name == "desktop_action_receipts" else "id"
+        stmt = select(column_obj).where(table.c[pk] == row_id)
+        original = db_session.execute(stmt).scalar()
+        if column == "is_searchable" or column == "is_current":
+            value: Any = True
+        elif column == "status":
+            value = "indexed"
+        elif column in json_columns:
+            value = {"leak": 1}
+        else:
+            value = "leak"
+        db_session.execute(
+            update(table).where(table.c[pk] == row_id).values({column: value})
+        )
+        db_session.commit()
+        report = verify_scope(db_session, scope)
+        assert not report.ok, f"residue not detected: {label}"
+        db_session.execute(
+            update(table).where(table.c[pk] == row_id).values({column: original})
+        )
+        db_session.commit()
+
+    for label in sorted(SCRUBBED_FIELDS):
+        _inject(label)
+
+    # 被物理删除的行：重新插入残留后 Verify 必须发现。
+    db_session.add(MemoryEvidence(
+        id=_id(), memory_id=memory.id, source_event_id=ev,
+        source_type="user_assertion", trust_level="trusted", relation="support",
+        content_span="leak", created_at=_now(),
+    ))
+    db_session.commit()
+    assert not verify_scope(db_session, scope).ok
+    db_session.query(MemoryEvidence).delete()
+    db_session.commit()
+
+    db_session.add(CoreMemoryBlock(
+        id=_id(), block_name=f"leak-{_id()}", content="leak",
+        source_memory_ids=[memory.id], projection_version=1, record_versions={},
+        token_count=1, checksum="h", created_at=_now(), updated_at=_now(),
+    ))
+    db_session.commit()
+    assert not verify_scope(db_session, scope).ok
+    db_session.query(CoreMemoryBlock).filter(CoreMemoryBlock.content == "leak").delete()
+    db_session.commit()
+
+    db_session.add(RetrievalIndexToken(
+        id=_id(), entry_id=entry.id, index_version=1, token="leak2",
+        token_kind="word", term_frequency=1,
+    ))
+    db_session.commit()
+    assert not verify_scope(db_session, scope).ok
+    db_session.query(RetrievalIndexToken).delete()
+    db_session.commit()
+
+    db_session.add(Chunk(
+        id=_id(), document_id=doc.id, content="leak", line_start=0, line_end=1,
+        chunk_index=0, token_estimate=1, heading_path="", section_id="",
+        block_type="text", source_type="text", parser_version="p",
+        chunker_version="c", embedding_input_hash="h", created_at=_now(),
+    ))
+    db_session.commit()
+    assert not verify_scope(db_session, scope).ok
+    db_session.query(Chunk).delete()
+    db_session.commit()
+
+    chunk_action = db_session.query(ForgetAction).filter_by(
+        idempotency_key=f"fo:{op_id}:knowledge_chunks",
+    ).first()
+    stored = (chunk_action.details or {}).get("chunk_ids") if chunk_action else []
+    assert stored
+    db_session.add(KnowledgeChunkVector(
+        chunk_id=stored[0], content_hash="h", embedding_model="m",
+        input_version="1", embedding=[0.0] * 512, created_at=_now(),
+    ))
+    db_session.commit()
+    assert not verify_scope(db_session, scope).ok
+    db_session.query(KnowledgeChunkVector).delete()
+    db_session.commit()
+
+
+def test_outbox_without_trace_is_linked_by_operation_ids(db_session: Session) -> None:
+    thread_id = _thread(db_session)
+    turn = _turn(db_session, thread_id)
+    outbox = OutboxJob(
+        id=_id(), operation_id=f"memory_extraction:{turn.id}:abc",
+        job_type="memory_extraction", status="completed",
+        payload={"content": "no-trace content"}, trace_id=None,
+        error_message="no-trace error", created_at=_now(),
+    )
+    db_session.add(outbox)
+    op_id = _op(db_session, mode="everywhere", selector_type="thread",
+                payload={"thread_id": thread_id})
+    db_session.commit()
+
+    _scrub_wide(db_session, op_id)
+    db_session.commit()
+    db_session.expire_all()
+
+    outbox = db_session.query(OutboxJob).filter_by(id=outbox.id).first()
+    assert outbox.payload["content"] == "[redacted]"
+    assert outbox.error_message == ""
 
 
 def test_scrub_fields_subset_of_verify_fields() -> None:

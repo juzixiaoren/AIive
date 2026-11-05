@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import bindparam, text as sa_text
+from sqlalchemy import bindparam, or_, text as sa_text
 from sqlalchemy.orm import Session
 
 from aiive.db.forget_models import (
@@ -202,6 +202,10 @@ def count_json_array_members(
             continue
         total += int(db.execute(sql, {"ids": chunk}).scalar() or 0)
     return total
+
+
+def _chunked(items: list[str], size: int) -> list[list[str]]:
+    return [items[i:i + size] for i in range(0, len(items), size)]
 
 
 def _ids_from_query(_db: Session, query: Any) -> set[str]:
@@ -565,11 +569,23 @@ def build_scope(
         )
     scope.retrieval_run_ids = retrieval_runs
 
-    # ── Outbox：仅按 trace 归属（不按 operation_id 猜测内容）──
+    # ── Outbox：trace 归属 + operation_id 中引用的目标 id（结构性 ID 匹配）──
+    outbox_ids: set[str] = set()
     if scope.trace_ids:
-        scope.outbox_job_ids = _ids_from_query(
+        outbox_ids |= _ids_from_query(
             db, db.query(OutboxJob.id).filter(OutboxJob.trace_id.in_(scope.trace_ids))
         )
+    linked_ids = (
+        scope.memory_ids | scope.event_ids | scope.turn_tokens | scope.segment_ids
+        | scope.epoch_ids | scope.agent_task_ids | scope.partial_agent_task_ids
+    )
+    for chunk in _chunked(sorted(linked_ids), 80):
+        outbox_ids |= _ids_from_query(
+            db, db.query(OutboxJob.id).filter(
+                or_(*[OutboxJob.operation_id.contains(item) for item in chunk])
+            )
+        )
+    scope.outbox_job_ids = outbox_ids
 
     # 目标文档的分块（用于 Verify 计数）
 

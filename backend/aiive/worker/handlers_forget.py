@@ -1641,6 +1641,9 @@ def _scrub_batch(db: Session, memory_ids: list[str], mode: str = "everywhere") -
         "UPDATE memory_records SET content = '[forgotten]', structured_value = NULL, "
         + "graph_facts = NULL, updated_at = :now WHERE id IN :ids"
     ).bindparams(ids_bind), {"now": now, "ids": memory_ids})
+    db.execute(sa_text(
+        "DELETE FROM memory_vector_projections WHERE memory_id IN :ids"
+    ).bindparams(ids_bind), {"ids": memory_ids})
     # --- 时序知识图谱：关系行必须物理删除（隐私承诺），实体锚点随后清理 ---
     graph_entity_ids = [
         row[0] for row in db.execute(sa_text(

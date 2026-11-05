@@ -1440,6 +1440,10 @@ MemoryRecord 本身保留为 forgotten sentinel，不是简单 `DELETE FROM memo
 - **Task Runtime time_range（V62.3）**：按 Run/Action/Event/Checkpoint/Evidence/Artifact
   自身时间命中并反向找父 Task，只清理命中子记录；父 task_state 引用替换为
   `[forgotten]`，无法安全恢复的运行中任务转 `cancelled`。
+- **完整承载审计（V62.3）**：补充 threads.title、agent_task_watches、desktop_action_receipts、
+  MemoryConflictCase、Recall/RetrievalRun、Outbox（trace 或无 trace 的 operation_id 关联）。
+  Scrub/Verify 字段各 132 项，测试逐字段注入残留；候选/运行元数据与认证表经审计确认
+  不含用户正文，不纳入清理。
 
 ## 13.8 Phase E：Verify 实际检查了什么（V62.2）
 

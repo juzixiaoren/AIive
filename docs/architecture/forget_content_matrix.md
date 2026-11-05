@@ -35,6 +35,9 @@
 | `tasks`（提醒） | `title`, `description`, `condition` | `thread_id` / `created_at` | thread/time/all | 全部脱敏 | `'[redacted]'` / `''` | 非空正文=0 |
 | `artifacts`（普通） | `content` | `thread_id` / `created_at` / `turn_record_id` | thread/time/all/turn | 全部脱敏 | `'[redacted]'` | 非空正文=0 |
 | `attention_states` | `focus_topic`, `recent_topics` | `thread_id` / `created_at` | thread/time/all | 全部清空 | NULL / `'[]'` | 非空=0 |
+| `threads` | `title` | `id` / `created_at` | thread/time/all | 脱敏 | title='[redacted]' | 非空=0 |
+| `agent_task_watches` | `config`, `cursor` | `task_id`（目标 Task） | 随 Task | '{}' | 非空=0 |
+| `desktop_action_receipts` | `result_payload`, `error_message` | `action_id`（目标 Action） | 随 Task | NULL | 非空=0 |
 | `tool_operations` | `params`, `result_payload`, `effect_receipt`, `error_message` | `thread_id` / `turn_record_id` / `created_at` | thread/time/all/turn | `'{}'` / NULL | 非空=0 |
 | `approval_requests` | `tool_args`, `preconditions`, `effects`, `execution_result`, `risk_snapshot`, `error_message` | `thread_id` / `turn_record_id` / `created_at` | thread/time/all/turn | `'{}'` / `'[]'` / NULL | 非空=0 |
 
@@ -108,9 +111,11 @@
 
 ## 7. Scrub ↔ Verify 字段对应
 
-`forget/content_scrub.py` 的 `SCRUBBED_FIELDS` 与 `VERIFIED_FIELDS` 是一一对应的字段清单；
-集成测试断言 `SCRUBBED_FIELDS <= VERIFIED_FIELDS`。新增清理字段必须同时加入两集合，
-并在 `verify_scope()` 中增加真实残留查询。
+`forget/content_scrub.py` 的 `SCRUBBED_FIELDS` 与 `VERIFIED_FIELDS` 是一一对应的字段清单
+（当前各 132 项）；集成测试断言 `SCRUBBED_FIELDS <= VERIFIED_FIELDS`。新增清理字段必须
+同时加入两集合，并在 `verify_scope()` 中增加真实残留查询。测试
+`test_every_scrubbed_field_residue_detected` 对每一个非物理删除字段逐项注入残留并断言
+Verify 失败；物理删除行（Evidence/CoreBlock/Token/Chunk/Vector）单独注入验证。
 
 未知引用结构（非数组、数组元素为对象/嵌套数组/数字等）只在本次影响范围内统计
 （`count_unknown_references`），fail-closed；无关历史数据不会阻断 Forget。
@@ -129,6 +134,18 @@
 **Cutoff 列（适用于所有行）**：直接记录只命中 `created_at/updated_at <= cutoff` 的行；
 派生记录（Summary/Checkpoint/Proposal/Retrieval/派生 Memory）按 Provenance 命中，
 不受自身创建时间限制。all_user_data 同样冻结在 Phase A cutoff。
+
+## 8. 非内容表审计结论
+
+以下表已审计但不属于用户正文承载位置，不纳入 Scrub（不标记为“已清理内容”）：
+
+- `memory_recall_candidates` / `retrieval_candidates`：仅 id/分数/路由/排除原因。
+- `retrieval_index_generations` / `retrieval_index_runs` / `compaction_runs` /
+  `checkpoint_runs`：状态、游标、计数、错误摘要；不含用户正文。
+- `auth_owner`、`desktop_nodes`、`capabilities`、`selfdev_*`、`thread_execution_lease`、
+  `turn_recall_*` 等运行/配置表：无用户内容字段。
+- `memory_vector_projection`：仅向量与版本；Memory 被遗忘时由 `_scratch_batch` 的
+  `memory_vector_projection` 删除逻辑处理（Phase A 对显式 ID 已删除）。
 
 ## 9. Verify 判定
 

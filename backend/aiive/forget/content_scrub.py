@@ -11,6 +11,7 @@ Scrub 与 Verify 共用 `ContentScope`；所有 JSON 数组成员判断走
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -22,7 +23,14 @@ from sqlalchemy import bindparam, text as sa_text
 from sqlalchemy.orm import Session
 
 from aiive.db.forget_models import ForgetAction
-from aiive.db.models import AgentTask, Document, OutboxJob, TaskArtifact, TaskEvidence
+from aiive.db.models import (
+    AgentTask,
+    Document,
+    OutboxJob,
+    TaskArtifact,
+    TaskEvidence,
+    Thread,
+)
 from aiive.forget.content_scope import (
     ContentScope,
     count_json_array_members,
@@ -519,6 +527,18 @@ def scrub_runtime_tables(db: Session, scope: ContentScope) -> dict[str, int]:
             "risk_snapshot = '{}' WHERE id IN :ids",
             approvals,
         )
+    title_ids = set(scope.thread_ids)
+    if scope.all_user or scope.time_from is not None or scope.time_to is not None:
+        tq = db.query(Thread.id).filter(Thread.created_at <= scope.cutoff)
+        if scope.time_from is not None:
+            tq = tq.filter(Thread.created_at >= scope.time_from)
+        if scope.time_to is not None:
+            tq = tq.filter(Thread.created_at <= scope.time_to)
+        title_ids |= {str(r[0]) for r in tq.all() if r[0]}
+    if title_ids:
+        counts["threads"] = _execute_ids(
+            db, "UPDATE threads SET title = '[redacted]' WHERE id IN :ids", title_ids,
+        )
     return counts
 
 
@@ -561,13 +581,20 @@ def _array_shape_unknown(value: Any) -> bool:
     """引用数组只接受字符串元素；对象/嵌套数组/数字等一律 fail-closed。"""
     if value is None:
         return False
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return True
     if not isinstance(value, list):
         return True
     return any(not isinstance(item, str) for item in value)
 
 
-def count_unknown_references(db: Session, scope: ContentScope) -> int:
-    """只统计本次影响范围内的未知引用结构，无关历史数据不阻断 Forget。"""
+def unknown_reference_details(
+    db: Session, scope: ContentScope,
+) -> list[tuple[str, str, Any]]:
+    """返回本次范围内无法识别的引用结构（表, 列, 值）。"""
     checks: list[tuple[str, str, str, set[str]]] = []
     proposals = affected_proposal_ids(db, scope)
     if proposals:
@@ -597,12 +624,16 @@ def count_unknown_references(db: Session, scope: ContentScope) -> int:
         ))
         if blocks:
             checks.append(("core_memory_blocks", "id", "source_memory_ids", blocks))
-    unknown = 0
+    details: list[tuple[str, str, Any]] = []
     for table, id_col, array_col, ids in checks:
         for _row_id, value in _scoped_array_rows(db, table, id_col, array_col, ids):
             if _array_shape_unknown(value):
-                unknown += 1
-    return unknown
+                details.append((table, array_col, value))
+    return details
+
+
+def count_unknown_references(db: Session, scope: ContentScope) -> int:
+    return len(unknown_reference_details(db, scope))
 
 
 def _redact_task_state_refs(
@@ -645,6 +676,7 @@ SCRUBBED_FIELDS: frozenset[str] = frozenset({
     "memory_evidence.content_span",
     "memory_maintenance_inputs.snapshot_json",
     "memory_maintenance_actions.details", "memory_maintenance_actions.preconditions",
+    "core_memory_blocks.content",
     "retrieval_index_entries.title", "retrieval_index_entries.search_text",
     "retrieval_index_entries.snippet", "retrieval_index_entries.metadata",
     "retrieval_index_entries.is_searchable", "retrieval_index_entries.is_current",
@@ -672,6 +704,9 @@ SCRUBBED_FIELDS: frozenset[str] = frozenset({
     "tasks.title", "tasks.description", "tasks.condition",
     "artifacts.content",
     "attention_states.focus_topic", "attention_states.recent_topics",
+    "threads.title",
+    "agent_task_watches.config", "agent_task_watches.cursor",
+    "desktop_action_receipts.result_payload", "desktop_action_receipts.error_message",
     "tool_operations.params", "tool_operations.result_payload",
     "tool_operations.effect_receipt", "tool_operations.error_message",
     "approval_requests.tool_args", "approval_requests.preconditions",
@@ -711,6 +746,7 @@ VERIFIED_FIELDS: frozenset[str] = frozenset({
     "memory_evidence.content_span",
     "memory_maintenance_inputs.snapshot_json",
     "memory_maintenance_actions.details", "memory_maintenance_actions.preconditions",
+    "core_memory_blocks.content",
     "retrieval_index_entries.title", "retrieval_index_entries.search_text",
     "retrieval_index_entries.snippet", "retrieval_index_entries.metadata",
     "retrieval_index_entries.is_searchable", "retrieval_index_entries.is_current",
@@ -738,6 +774,9 @@ VERIFIED_FIELDS: frozenset[str] = frozenset({
     "tasks.title", "tasks.description", "tasks.condition",
     "artifacts.content",
     "attention_states.focus_topic", "attention_states.recent_topics",
+    "threads.title",
+    "agent_task_watches.config", "agent_task_watches.cursor",
+    "desktop_action_receipts.result_payload", "desktop_action_receipts.error_message",
     "tool_operations.params", "tool_operations.result_payload",
     "tool_operations.effect_receipt", "tool_operations.error_message",
     "approval_requests.tool_args", "approval_requests.preconditions",
@@ -929,6 +968,31 @@ def scrub_task_runtime(
         task_ids,
     )
 
+    # Task 附属运行数据（watch / desktop receipt）
+    watch_task_ids = task_ids | partial_ids
+    if watch_task_ids:
+        watch_ids = _ids_from(
+            db, "SELECT id FROM agent_task_watches WHERE task_id IN :ids", watch_task_ids,
+        )
+        if watch_ids:
+            counts["agent_task_watches"] = _execute_ids(
+                db,
+                "UPDATE agent_task_watches SET config = '{}', cursor = '{}' WHERE id IN :ids",
+                watch_ids,
+            )
+    receipt_action_ids = set(scope.agent_action_ids)
+    if task_ids:
+        receipt_action_ids |= _ids_from(
+            db, "SELECT id FROM agent_actions WHERE task_id IN :ids", task_ids,
+        )
+    if receipt_action_ids:
+        counts["desktop_action_receipts"] = _execute_ids(
+            db,
+            "UPDATE desktop_action_receipts SET result_payload = NULL, error_message = NULL "
+            "WHERE action_id IN :ids",
+            receipt_action_ids,
+        )
+
     # ── time_range 子记录局部清理：只动命中的子行，不整体清空父 Task ──
     if partial_ids:
         cleaned_ids: set[str] = set()
@@ -1003,6 +1067,29 @@ def scrub_task_runtime(
     return counts, refs
 
 
+def _record_knowledge_chunk_ids(
+    db: Session, operation_id: str, chunk_ids: list[str],
+) -> None:
+    ikey = f"fo:{operation_id}:knowledge_chunks"
+    action = db.query(ForgetAction).filter_by(idempotency_key=ikey).first()
+    if action is None:
+        db.add(ForgetAction(
+            id=str(uuid.uuid4()),
+            forget_operation_id=operation_id,
+            action_type="scrub_knowledge_chunks",
+            batch_no=0,
+            status="done",
+            idempotency_key=ikey,
+            details={"chunk_ids": sorted(chunk_ids)},
+            started_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(timezone.utc),
+        ))
+        db.flush()
+        return
+    action.details = {"chunk_ids": sorted(chunk_ids)}
+    db.flush()
+
+
 def scrub_knowledge(
     db: Session, scope: ContentScope,
 ) -> tuple[dict[str, int], set[tuple[str, str]]]:
@@ -1013,6 +1100,9 @@ def scrub_knowledge(
         return counts, refs
     chunk_ids = document_chunk_ids(db, docs)
     if chunk_ids:
+        # 分块删除后无法再由 document_id 反查向量；持久化本次目标 chunk_ids，
+        # 供 Verify 重新统计向量残留。
+        _record_knowledge_chunk_ids(db, scope.operation_id, chunk_ids)
         counts["knowledge_chunk_vectors"] = _execute_ids(
             db, "DELETE FROM knowledge_chunk_vectors WHERE chunk_id IN :ids", chunk_ids,
         )
@@ -1293,6 +1383,13 @@ def verify_scope(db: Session, scope: ContentScope) -> VerifyReport:
             db, "core_memory_blocks", "source_memory_ids", sorted(scope.memory_ids),
         )
         report.add("core_memory_blocks", block_residue)
+        block_ids = set(select_json_array_members(
+            db, "core_memory_blocks", "id", "source_memory_ids",
+            sorted(scope.memory_ids),
+        ))
+        if block_ids:
+            report.add("core_memory_blocks.content", _count_nonempty_text(
+                db, "core_memory_blocks", "content", block_ids))
         report.add("memory_maintenance_actions", _sum_in(
             db,
             "SELECT COUNT(*) FROM memory_maintenance_actions WHERE subject_memory_record_id IN :ids "
@@ -1441,6 +1538,18 @@ def verify_scope(db: Session, scope: ContentScope) -> VerifyReport:
             db, "attention_states", "focus_topic", attention))
         report.add("attention_states.recent_topics", _count_nonempty_json(
             db, "attention_states", "recent_topics", attention))
+    title_ids = set(scope.thread_ids)
+    if scope.all_user or scope.time_from is not None or scope.time_to is not None:
+        tq = db.query(Thread.id).filter(Thread.created_at <= scope.cutoff)
+        if scope.time_from is not None:
+            tq = tq.filter(Thread.created_at >= scope.time_from)
+        if scope.time_to is not None:
+            tq = tq.filter(Thread.created_at <= scope.time_to)
+        title_ids |= {str(r[0]) for r in tq.all() if r[0]}
+    if title_ids:
+        report.add("threads.title", _count_nonempty_text(
+            db, "threads", "title", title_ids))
+
     tool_ops = tool_operation_ids(db, scope)
     if tool_ops:
         for column in ("params", "result_payload", "effect_receipt"):
@@ -1561,6 +1670,36 @@ def verify_scope(db: Session, scope: ContentScope) -> VerifyReport:
                     leftover += 1
             report.add("agent_task_state_refs_partial", leftover)
 
+    watch_task_ids = scope.agent_task_ids | scope.partial_agent_task_ids
+    if watch_task_ids:
+        watch_ids = _ids_from(
+            db, "SELECT id FROM agent_task_watches WHERE task_id IN :ids",
+            watch_task_ids,
+        )
+        if watch_ids:
+            for column in ("config", "cursor"):
+                report.add(f"agent_task_watches.{column}", _count_nonempty_json(
+                    db, "agent_task_watches", column, watch_ids))
+    receipt_action_ids = set(scope.agent_action_ids)
+    if scope.agent_task_ids:
+        receipt_action_ids |= _ids_from(
+            db, "SELECT id FROM agent_actions WHERE task_id IN :ids",
+            scope.agent_task_ids,
+        )
+    if receipt_action_ids:
+        report.add("desktop_action_receipts.result_payload", _sum_in(
+            db,
+            "SELECT COUNT(*) FROM desktop_action_receipts WHERE action_id IN :ids "
+            "AND result_payload IS NOT NULL AND CAST(result_payload AS TEXT) NOT IN ('{}', 'null')",
+            receipt_action_ids,
+        ))
+        report.add("desktop_action_receipts.error_message", _sum_in(
+            db,
+            "SELECT COUNT(*) FROM desktop_action_receipts WHERE action_id IN :ids "
+            "AND COALESCE(error_message, '') <> ''",
+            receipt_action_ids,
+        ))
+
     # Auxiliary tables（冲突 / 召回 / 检索 / Outbox）
     cases = scope.conflict_case_ids
     if cases:
@@ -1610,14 +1749,22 @@ def verify_scope(db: Session, scope: ContentScope) -> VerifyReport:
             "(object_bucket IS NOT NULL OR object_key IS NOT NULL)",
             docs,
         ))
-        chunk_ids = document_chunk_ids(db, docs)
         report.add("chunks", _sum_in(
             db, "SELECT COUNT(*) FROM chunks WHERE document_id IN :ids", docs,
         ))
-        if chunk_ids:
+        chunk_action = db.query(ForgetAction).filter_by(
+            idempotency_key=f"fo:{scope.operation_id}:knowledge_chunks",
+        ).first()
+        stored_chunks: list[str] = []
+        if chunk_action is not None and isinstance(chunk_action.details, dict):
+            raw_chunk_ids = chunk_action.details.get("chunk_ids")
+            if isinstance(raw_chunk_ids, list):
+                stored_chunks = [str(item) for item in raw_chunk_ids]
+        if stored_chunks:
             report.add("knowledge_chunk_vectors", _sum_in(
-                db, "SELECT COUNT(*) FROM knowledge_chunk_vectors WHERE chunk_id IN :ids",
-                chunk_ids,
+                db,
+                "SELECT COUNT(*) FROM knowledge_chunk_vectors WHERE chunk_id IN :ids",
+                set(stored_chunks),
             ))
 
     # Objects

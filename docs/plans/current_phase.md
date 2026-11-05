@@ -999,7 +999,8 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
   outbox 正文键与 error_message。
 - Verify：新增 SCRUBBED_FIELDS ⊆ VERIFIED_FIELDS 自动化约束；补齐 Agent/Task/Approval/
   Tool/Compaction 字段；未知 JSON 引用只在本次范围统计并 fail-closed。
-- 测试：`test_forget_content_coverage.py` 23 用例（cutoff 新旧数据、派生清理、真实召回、
-  Task 子记录、冲突/召回/检索/Outbox、未知结构、字段子集）；PG 4 用例含 cutoff。
-- 验证：全量 pytest 1660 passed / 68 skipped；`tests/integration/pg` 55 passed / 13 skipped
+- 测试：`test_forget_content_coverage.py` 25 用例（cutoff 新旧数据、派生清理、真实召回、
+  Task 子记录、冲突/召回/检索/Outbox（含无 trace）、未知结构、字段子集、132 个 Scrub 字段
+  逐项注入残留）；PG 4 用例含 cutoff。
+- 验证：全量 pytest 1662 passed / 68 skipped；`tests/integration/pg` 55 passed / 13 skipped
   （skip 为本地 Embedding 不可用）；ruff `--select F,E9`、basedpyright 0/0 通过。
