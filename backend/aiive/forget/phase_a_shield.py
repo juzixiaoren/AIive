@@ -118,7 +118,16 @@ def execute_phase_a_shield(
           "shielded_at": str, "target_count": int }
     """
 
-    # 0. 统一排他锁入口：先与所有在途 MemoryWrite 互斥，再计算 cutoff。
+    # 0. 执行授权交接：同线程若仍持有 Outbox 共享执行授权，必须先释放，
+    #    否则「持共享锁再排队等排他锁」会永久自锁（Agent Task / ConflictReply /
+    #    Forget Tool 都可能在执行授权内嵌套调用本函数）。
+    #    释放只影响锁，不影响本 session 的事务；Phase A 提交后由调用方
+    #    resume_execution_authorization() 重新获取。
+    from aiive.worker.outbox_execution_auth import release_execution_authorization
+
+    release_execution_authorization()
+
+    # 1. 统一排他锁入口：先与所有在途 MemoryWrite 互斥，再计算 cutoff。
     #    等待锁期间提交的写入必然早于 cutoff，不会被本次遗忘遗漏。
     acquire_forget_exclusive_lock(session)
 

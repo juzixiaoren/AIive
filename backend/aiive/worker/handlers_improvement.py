@@ -10,13 +10,17 @@ import json
 import logging
 from typing import Any
 
+from aiive.db.base import SessionLocal
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome, HandlerResult
+from aiive.worker.job_source_guard import guard_job_sources_visible
+from aiive.worker.outbox_execution_auth import with_execution_authorization
 
 logger = logging.getLogger(__name__)
 
 JOB_IMPROVEMENT_DISCOVERY = "improvement_discovery"
 
 
+@with_execution_authorization
 def handle_improvement_discovery(
     claimed: ClaimedJob, *, discovery: Any = None
 ) -> HandlerResult:
@@ -31,6 +35,11 @@ def handle_improvement_discovery(
         ImprovementDiscovery,
     )
 
+    fresh, blocked = guard_job_sources_visible(claimed, SessionLocal)
+    if blocked is not None:
+        return blocked
+    assert fresh is not None
+    claimed = fresh
     if discovery is None:
         discovery = ImprovementDiscovery(default_llm_client())
     try:

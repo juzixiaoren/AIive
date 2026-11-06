@@ -297,6 +297,27 @@ class EvidenceCollector:
         return batch
 
     # ── 各来源 ──────────────────────────────────────────────────────
+    @staticmethod
+    def _thread_blocked(
+        db: Session, thread_id: str | None, observed_at: datetime | None,
+    ) -> bool:
+        """证据来源是否已被 Forget Shield/Tombstone 覆盖。
+
+        EvidenceCollector 的摘要会进入模型提示词，因此被遗忘 Thread 的
+        Task / Action / Job 证据必须在采集阶段剔除，不能靠下游过滤。
+        """
+        if not thread_id:
+            return False
+        from aiive.forget.visibility_service import ForgetVisibilityService
+
+        try:
+            return ForgetVisibilityService.is_shielded(
+                db, thread_id=thread_id, target_time=observed_at,
+            )
+        except Exception:  # 可见性查询失败 → fail-closed 丢弃该条证据
+            logger.exception("证据可见性检查失败，按已遗忘处理")
+            return True
+
     def _task_items(
         self, db: Session, since: datetime, scanned: dict[str, int]
     ) -> list[EvidenceItem]:
@@ -314,6 +335,9 @@ class EvidenceCollector:
         scanned["agent_task"] = len(rows)
         items: list[EvidenceItem] = []
         for task in rows:
+            if self._thread_blocked(db, task.thread_id, task.updated_at or task.created_at):
+                scanned["agent_task_blocked"] = scanned.get("agent_task_blocked", 0) + 1
+                continue
             report = task.report if isinstance(task.report, dict) else {}
             unresolved = report.get("unresolved")
             detail = _text(task.last_error) or _text(report.get("summary")) or _text(unresolved)
@@ -351,6 +375,13 @@ class EvidenceCollector:
         scanned["agent_action"] = len(rows)
         items: list[EvidenceItem] = []
         for action in rows:
+            owner = db.get(AgentTask, action.task_id) if action.task_id else None
+            if self._thread_blocked(
+                db, getattr(owner, "thread_id", None),
+                action.updated_at or action.created_at,
+            ):
+                scanned["agent_action_blocked"] = scanned.get("agent_action_blocked", 0) + 1
+                continue
             detail = _text(action.error_message) or _text(action.result_summary) or action.status
             signature = normalize_signature(detail)
             capability = _text(action.capability_id, 128) or "unknown"
@@ -384,6 +415,13 @@ class EvidenceCollector:
         scanned["outbox_job"] = len(rows)
         items: list[EvidenceItem] = []
         for job in rows:
+            payload = job.payload if isinstance(job.payload, dict) else {}
+            if self._thread_blocked(
+                db, str(payload.get("thread_id") or ""),
+                job.updated_at or job.created_at,
+            ):
+                scanned["outbox_job_blocked"] = scanned.get("outbox_job_blocked", 0) + 1
+                continue
             detail = _text(job.error_message) or _text(job.terminal_reason) or job.status
             signature = normalize_signature(detail)
             job_type = _text(job.job_type, 64) or "unknown"

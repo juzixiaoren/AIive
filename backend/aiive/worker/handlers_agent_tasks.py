@@ -9,11 +9,22 @@ from aiive.task_runtime.repository import TaskRepository
 from aiive.task_runtime.runtime import PersistentTaskRuntime
 from aiive.task_runtime.schemas import RunStatus, TaskStatus
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome, HandlerResult
+from aiive.worker.job_source_guard import guard_job_sources_visible
+from aiive.worker.outbox_execution_auth import (
+    resume_execution_authorization,
+    with_execution_authorization,
+)
 
 logger = logging.getLogger(__name__)
 
 
+@with_execution_authorization
 def handle_agent_task_run(claimed: ClaimedJob) -> HandlerResult:
+    fresh, blocked = guard_job_sources_visible(claimed, SessionLocal)
+    if blocked is not None:
+        return blocked
+    assert fresh is not None
+    claimed = fresh
     task_id = str((claimed.payload or {}).get("task_id") or "")
     trigger = str((claimed.payload or {}).get("trigger") or "dispatch")
     if not task_id:
@@ -39,6 +50,8 @@ def handle_agent_task_run(claimed: ClaimedJob) -> HandlerResult:
         }:
             return HandlerResult(HandlerOutcome.COMPLETED, reason=f"task_{task.status}")
         PersistentTaskRuntime(db).run(task_id, trigger=trigger)
+        # 本次运行可能嵌套 Forget：提交后重新获取共享执行授权
+        resume_execution_authorization()
         return HandlerResult(HandlerOutcome.COMPLETED, reason="task_run_advanced")
     except ValueError as error:
         if str(error) in {"task_terminal", "task_not_found"}:

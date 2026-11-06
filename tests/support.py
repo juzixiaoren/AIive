@@ -39,7 +39,118 @@ def install_session_dispatcher() -> None:
                 mod.SessionLocal = _dispatching_session_local
 
 
+def current_test_session() -> Session | None:
+    """返回当前用例注册的测试会话（未注册时为 None）。"""
+    return _current_test_session
+
+
 def set_current_test_session(session: Session | None) -> None:
     """注册/注销当前测试会话（仅单元与流程测试使用）。"""
     global _current_test_session
     _current_test_session = session
+
+
+def persist_running_job(
+    db: Session,
+    *,
+    job_type: str,
+    payload: dict,
+    trace_id: str | None = None,
+    job_id: str | None = None,
+    worker_id: str = "test",
+    operation_id: str | None = None,
+    max_retries: int = 3,
+    lease_seconds: int = 300,
+):
+    """以 running 状态持久化一条 OutboxJob 并返回对应的 ClaimedJob。
+
+    生产 Worker 的 claim fencing 要求 Job 行存在、status=running、claim_token /
+    locked_by 严格匹配且 lease 有效，因此直接调用 Handler 的用例必须落一条真
+    实 Job，不能只构造内存 ClaimedJob。
+    """
+    import uuid as _uuid
+    from datetime import datetime, timedelta, timezone
+
+    from aiive.db.models import OutboxJob
+    from aiive.worker.outbox_dto import ClaimedJob
+
+    job = OutboxJob(
+        id=job_id or str(_uuid.uuid4()),
+        operation_id=operation_id or f"test:{_uuid.uuid4()}",
+        job_type=job_type,
+        status="running",
+        payload=dict(payload),
+        trace_id=trace_id,
+        claim_token=str(_uuid.uuid4()),
+        locked_by=worker_id,
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=lease_seconds),
+        max_retries=max_retries,
+    )
+    db.add(job)
+    db.commit()
+    return ClaimedJob(
+        id=job.id,
+        job_type=job_type,
+        payload=dict(payload),
+        trace_id=trace_id,
+        retry_count=0,
+        max_retries=max_retries,
+        claim_token=job.claim_token,
+        schema_version=1,
+        worker_id=worker_id,
+    )
+
+
+def claim_existing_job(
+    db: Session, job_id: str, *, worker_id: str = "test", lease_seconds: int = 300,
+) -> tuple[str, str]:
+    """把已存在的 OutboxJob 置为 running 并返回 (claim_token, worker_id)。"""
+    import uuid as _uuid
+    from datetime import datetime, timedelta, timezone
+
+    from aiive.db.models import OutboxJob
+
+    job = db.query(OutboxJob).filter(OutboxJob.id == job_id).first()
+    assert job is not None, f"OutboxJob 不存在: {job_id}"
+    job.status = "running"
+    job.claim_token = job.claim_token or str(_uuid.uuid4())
+    job.locked_by = worker_id
+    job.lease_expires_at = datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
+    db.commit()
+    return job.claim_token, worker_id
+
+
+def ensure_running_claim(
+    claimed: "ClaimedJob", *, lease_seconds: int = 300, db: Session | None = None,
+):
+    """在测试库把该 ClaimedJob 对应的 OutboxJob 置为 running（claim fencing 前置）。
+
+    直接调用 Handler 的用例必须满足生产 claim 契约：行存在、status=running、
+    claim_token / locked_by 严格匹配、lease 未过期。
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from aiive.db.models import OutboxJob
+
+    session = db or _current_test_session
+    if session is None:
+        return claimed
+    db = session
+    row = db.query(OutboxJob).filter(OutboxJob.id == claimed.id).first()
+    if row is None:
+        row = OutboxJob(
+            id=claimed.id,
+            operation_id=f"test:{claimed.id}",
+            job_type=claimed.job_type,
+            status="running",
+            payload=dict(claimed.payload or {}),
+            trace_id=claimed.trace_id,
+            max_retries=claimed.max_retries,
+        )
+        db.add(row)
+    row.status = "running"
+    row.claim_token = claimed.claim_token or "test-claim"
+    row.locked_by = claimed.worker_id or "test"
+    row.lease_expires_at = datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
+    db.commit()
+    return claimed

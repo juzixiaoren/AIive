@@ -216,6 +216,66 @@ Verify 失败；物理删除行（Evidence/CoreBlock/Token/Chunk/Vector）单独
 - 释放：成功 / 失败 / 异常 / 超时全部走 `finally` 显式 `pg_advisory_unlock_shared`；SQLite 为 no-op（仅逻辑测试），
   并发正确性只以 PostgreSQL 双连接真实并发用例为准。
 
+### 9.3 Job 来源可见性守卫（V62.6）
+
+`worker/job_source_guard.py::guard_job_sources_visible()` 是外部调用前的统一入口，
+顺序固定：**共享执行授权 → 严格重读 OutboxJob 并校验 claim → 解析类型化来源 →
+检查 active Shield / Tombstone → 放行**。`forget_content_redacted` 只在 Purge 时写入，
+不能作为唯一判据，因此守卫直接查 Shield/Tombstone。
+
+| Job 类型 | 来源解析 |
+|---|---|
+| `goal_event_dispatch` | `event_id` / `thread_id` / payload 内 Event |
+| `goal_trigger_decision` | `trigger_event_id` / `task_id`（agent_task）/ `trigger_event_payload` 内 Event/Turn |
+| `reminder_delivery` | `task_id`（`tasks` 提醒表，不是 agent_tasks）/ `source_event_id` / `thread_id` |
+| `segment_sealing` | `compaction_input_id` → `CompactionInput.event_manifest` / `turn_manifest` |
+| `epoch_checkpoint` | `epoch_compaction_input_id` → `EpochCompactionInput.source_segment_ids` → `SegmentSummary.source_event_ids` |
+| `memory_conflict_question/reply` | `conflict_case_id` → `old_memory_id` / `resolved_memory_id` / proposal 来源 Event/Turn |
+| `memory_vector_refresh` / `core_memory_refresh` / `memory_graph_refresh` / `memory_markdown_project` | `memory_id` |
+| `retrieval_index_refresh` | `source_type` + `source_id`（`memory_record` / `segment_summary` / `epoch_checkpoint` …） |
+| `agent_task_run` | `task_id` → thread / `source_event_id` |
+| `tool_operation` | `tool_operation_id` → `turn_record_id` / `turn_id` / `thread_id` |
+| `retrieval_index_rebuild` / `improvement_discovery` | 无单一来源：只做 claim fencing，逐条/逐证据过滤 |
+| `forget_*` / `retention_cleanup` / `knowledge_maintenance` / `memory_conflict_cleanup` | 无用户正文，跳过来源检查 |
+
+- 来源无法解析（如 `compaction_input` 缺失、未知 `source_type`、payload 无来源 ID）→ **fail-closed**：
+  终止并写 `forget_source_blocked:<reason>`，不读正文、不调模型、不产生派生内容。
+- 检查使用的目标类型限于 `ForgetVisibilityService` 支持元数据重载的
+  `event` / `turn_record` / `memory_record` / `segment_summary` / `epoch_checkpoint`；
+  Segment/Epoch 的屏蔽通过其 Summary/Checkpoint 与 Thread 选择器传递。
+- 新 Job / 新 Event：Shield 的 cutoff 只覆盖旧数据，`is_shielded(target_time=…)` 对新数据不命中。
+
+### 9.4 执行授权覆盖矩阵（V62.6）
+
+`@with_execution_authorization` 覆盖「重读 Job → 来源守卫 → 内容读取 → 外部调用 → 结果提交」。
+
+| Handler | 授权 | 来源守卫 | 嵌套 Forget 交接 |
+|---|---|---|---|
+| `handle_memory_extraction` | ✅ | ✅（A3 前，拦截时收敛 IngestionRun） | — |
+| `handle_goal_event_dispatch` | ✅ | ✅ | — |
+| `handle_goal_trigger_decision` | ✅ | ✅ | — |
+| `handle_reminder_delivery` | ✅ | ✅ | Turn 内工具不嵌套 Forget |
+| `handle_memory_conflict_question` | ✅ | ✅ | — |
+| `handle_memory_conflict_reply` | ✅ | ✅ | ✅ 提交后 `resume_execution_authorization()` |
+| `handle_agent_task_run` | ✅ | ✅ | ✅ 运行结束后 resume |
+| `handle_tool_operation` | ✅ | ✅ | — |
+| `handle_segment_sealing` | ✅ | ✅ | — |
+| `handle_epoch_checkpoint` | ✅ | ✅ | — |
+| `handle_epoch_rollover` | ✅ | ✅（thread 级） | — |
+| `handle_memory_maintenance` | ✅ | ✅（快照驱动，允许空来源） | — |
+| `handle_memory_vector_refresh` | ✅ | ✅ | — |
+| `handle_core_memory_refresh` | ✅ | ✅ | — |
+| `handle_memory_graph_refresh` | ✅ | ✅ | — |
+| `handle_memory_markdown_project` | ✅ | ✅ | — |
+| `handle_retrieval_index_refresh` | ✅ | ✅ | — |
+| `handle_retrieval_index_rebuild` | ✅ | claim-only + 逐条可见性过滤 | — |
+| `handle_improvement_discovery` | ✅ | claim-only + EvidenceCollector 过滤 | — |
+
+**嵌套 Forget 的显式交接**：`execute_phase_a_shield()` 在取排他锁之前调用
+`release_execution_authorization()`（同线程先持共享锁再排队等排他锁会永久自锁）；
+Phase A 提交后由调用方 `resume_execution_authorization()` 重新获取（带 `lock_timeout`，
+拿不到就保持未授权，绝不阻塞在自身事务上）。ConflictReply / Agent Task / Forget Tool
+三条路径都经过该交接，`forget_old` 的原子性不变（仍在同一事务内取排他锁并提交）。
 ## 10. 范围边界与发现（V62.4）
 
 - Turn→子 Event：显式 turn_ids 与间接 Turn 均按 `Event.created_at <= cutoff`；间接 Turn 在 time_range 下还须逐个 Event 落在时间窗口。`raw_event_ids` 只含实际命中原始 Event；派生 Summary/Memory 仍按 Provenance 清理。

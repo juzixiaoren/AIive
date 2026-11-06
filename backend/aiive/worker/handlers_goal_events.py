@@ -14,17 +14,15 @@ from aiive.task_runtime.goal_events import event_from_job_payload
 from aiive.task_runtime.goal_trigger_service import GoalTriggerService
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome, HandlerResult
 from aiive.worker.outbox_payload_contract import is_redacted_payload
-from aiive.worker.outbox_execution_auth import (
-    guard_handler_payload,
-    with_execution_authorization,
-)
+from aiive.worker.job_source_guard import guard_job_sources_visible
+from aiive.worker.outbox_execution_auth import with_execution_authorization
 
 logger = logging.getLogger(__name__)
 
 
 @with_execution_authorization
 def handle_goal_event_dispatch(claimed: ClaimedJob) -> HandlerResult:
-    fresh_claimed, guard = guard_handler_payload(claimed, SessionLocal, require_persisted=False)
+    fresh_claimed, guard = guard_job_sources_visible(claimed, SessionLocal)
     if guard is not None:
         return guard
     assert fresh_claimed is not None

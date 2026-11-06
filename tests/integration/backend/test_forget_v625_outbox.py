@@ -27,6 +27,7 @@ from tests.integration.backend.test_forget_v624_scope import (
     _thread,
     _turn,
 )
+from tests.support import ensure_running_claim
 
 
 def _trace(db: Session, event_id: str) -> str:
@@ -236,6 +237,7 @@ def test_new_memory_extraction_job_still_executes(db_session: Session, monkeypat
         trace_id=job.trace_id, retry_count=0, max_retries=3,
         claim_token="ct", schema_version=1, worker_id="w",
     )
+    ensure_running_claim(claimed, db=db_session)
     result = outbox_handlers.handle_memory_extraction(claimed)
     assert "forget_content_redacted" not in result.reason
     assert captured.get("user_message") == "new secret"
@@ -306,6 +308,7 @@ def test_goal_reminder_handlers_use_fresh_db_payload(
         trace_id=job.trace_id, retry_count=0, max_retries=3,
         claim_token="c", schema_version=1, worker_id="w",
     )
+    ensure_running_claim(stale, db=db_session)
     seen: list[dict] = []
 
     def _capture(payload: dict):  # noqa: ANN001
@@ -327,6 +330,7 @@ def test_goal_reminder_handlers_use_fresh_db_payload(
         trace_id=job.trace_id, retry_count=0, max_retries=3,
         claim_token="c", schema_version=1, worker_id="w",
     )
+    ensure_running_claim(stale2, db=db_session)
     result2 = handlers_goal_events.handle_goal_event_dispatch(stale2)
     assert result2.reason == "forget_content_redacted"
 

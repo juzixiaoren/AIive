@@ -137,8 +137,13 @@ def _fill_and_overflow(db: Session, thread: Thread, *, keys: list[str]) -> str:
 
 
 def _job(task: AgentTask, step_id: str, trigger_key: str, pending_key: str) -> ClaimedJob:
-    return ClaimedJob(
-        id=str(uuid.uuid4()),
+    """持久化一条 running 的 OutboxJob：Handler 的 claim fencing 要求真实 Job 行。"""
+    from tests.support import current_test_session, persist_running_job
+
+    db = current_test_session()
+    assert db is not None, "决策 Job 需要真实测试库"
+    return persist_running_job(
+        db,
         job_type="goal_trigger_decision",
         payload={
             "task_id": task.id,
@@ -149,10 +154,6 @@ def _job(task: AgentTask, step_id: str, trigger_key: str, pending_key: str) -> C
             "pending_event_dedupe_key": pending_key,
         },
         trace_id="trace-overflow",
-        retry_count=0,
-        max_retries=3,
-        claim_token=str(uuid.uuid4()),
-        schema_version=1,
         worker_id="test",
     )
 

@@ -9,6 +9,7 @@ from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome
 from aiive.worker.outbox_handlers import handle_reminder_delivery, register_all
 from aiive.worker.outbox_worker import OutboxWorker
 from aiive.worker.task_worker import enqueue_due_tasks
+from tests.support import ensure_running_claim
 
 
 def _create_due_reminder(db, title: str = "hi") -> Task:
@@ -43,7 +44,7 @@ def _claim(db, job: OutboxJob) -> ClaimedJob:
     job.claim_token = "test-claim"
     job.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
     db.commit()
-    return ClaimedJob(
+    claimed = ClaimedJob(
         id=job.id,
         job_type=job.job_type,
         payload=dict(job.payload or {}),
@@ -54,6 +55,7 @@ def _claim(db, job: OutboxJob) -> ClaimedJob:
         schema_version=1,
         worker_id="test-worker",
     )
+    return ensure_running_claim(claimed)
 
 
 def test_worker_only_enqueues_due_reminder(db_session):

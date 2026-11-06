@@ -33,6 +33,7 @@ from aiive.worker.outbox_payload_contract import (
     is_redacted_payload,
     payload_has_content,
 )
+from tests.support import ensure_running_claim
 
 
 def _id() -> str:
@@ -232,6 +233,7 @@ def test_pending_memory_extraction_does_not_call_llm_after_forget(
         trace_id=job.trace_id, retry_count=0, max_retries=3,
         claim_token="ct", schema_version=1, worker_id="w",
     )
+    ensure_running_claim(claimed, db=db_session)
     result = outbox_handlers.handle_memory_extraction(claimed)
     assert result.outcome.value == "completed"
     assert result.reason in ("forget_content_redacted",) or (
@@ -282,9 +284,15 @@ def test_active_shield_blocks_extraction_before_llm(
         trace_id=job.trace_id, retry_count=0, max_retries=3,
         claim_token="ct", schema_version=1, worker_id="w",
     )
+    ensure_running_claim(claimed, db=db_session)
     result = outbox_handlers.handle_memory_extraction(claimed)
     assert result.outcome.value == "completed"
-    assert "extraction_blocked_by_forget" in result.reason
+    # 来源守卫在 LLM 之前拦截（forget_source_blocked），A3 兜底为
+    # extraction_blocked_by_forget；两者都证明未把原文交给模型。
+    assert (
+        "extraction_blocked_by_forget" in result.reason
+        or result.reason.startswith("forget_source_blocked")
+    )
     run = db_session.execute(sa_text(
         "SELECT status FROM memory_ingestion_runs WHERE source_turn_record_id = :tid"
     ), {"tid": turn.id}).scalar()
@@ -351,9 +359,15 @@ def test_concurrent_forget_during_llm_blocks_write(db_session: Session, monkeypa
         trace_id=job.trace_id, retry_count=0, max_retries=3,
         claim_token="ct", schema_version=1, worker_id="w",
     )
+    ensure_running_claim(claimed, db=db_session)
     result = outbox_handlers.handle_memory_extraction(claimed)
     assert result.outcome.value == "completed"
-    assert "extraction_blocked_by_forget" in result.reason
+    # 来源守卫在 LLM 之前拦截（forget_source_blocked），A3 兜底为
+    # extraction_blocked_by_forget；两者都证明未把原文交给模型。
+    assert (
+        "extraction_blocked_by_forget" in result.reason
+        or result.reason.startswith("forget_source_blocked")
+    )
     assert db_session.execute(sa_text(
         "SELECT COUNT(*) FROM memory_records"
     )).scalar() == 0
@@ -364,12 +378,19 @@ def test_goal_handlers_skip_redacted_payload(monkeypatch) -> None:
     from aiive.worker.handlers_goal_triggers import handle_goal_trigger_decision
     from aiive.worker.outbox_dto import ClaimedJob
 
+    from aiive.db.base import SessionLocal
+
     def claimed(job_type: str) -> ClaimedJob:
-        return ClaimedJob(
+        c = ClaimedJob(
             id=_id(), job_type=job_type, payload={"forget_content_redacted": True},
             trace_id="t", retry_count=0, max_retries=3, claim_token="c",
             schema_version=1, worker_id="w",
         )
+        db = SessionLocal()
+        try:
+            return ensure_running_claim(c, db=db)
+        finally:
+            db.close()
 
     assert handle_goal_event_dispatch(claimed("goal_event_dispatch")).outcome.value == "completed"
     assert handle_goal_trigger_decision(claimed("goal_trigger_decision")).outcome.value == "completed"
@@ -379,6 +400,11 @@ def test_goal_handlers_skip_redacted_payload(monkeypatch) -> None:
         trace_id="t", retry_count=0, max_retries=3, claim_token="c",
         schema_version=1, worker_id="w",
     )
+    db = SessionLocal()
+    try:
+        ensure_running_claim(normal, db=db)
+    finally:
+        db.close()
     assert "forget_content_redacted" not in handle_goal_event_dispatch(normal).reason
 
 

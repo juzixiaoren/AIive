@@ -1,7 +1,8 @@
 # Current Phase
 
 ## 版本索引
-- 主干最新：**V62.5 Outbox 精确关联 + 执行授权 fencing + 递归 JSON Scrub**（2026-11-06）→ 见文末「### V62.5 …」；上一版为 V62.4 Outbox 契约与 Turn/Event/Task 范围一致性。
+- 主干最新：**V62.6 Job 来源守卫 + 执行授权全覆盖 + 精确关联补齐**（2026-11-06）→ 见文末「### V62.6 …」；上一版为 V62.5 Outbox 精确关联与执行授权。
+- 历史版本：V62.4 / V62.5 依次见文末。
 - 历史阶段：V34 → V54 按时间顺序记录在下方各节；下方 `## Phase` / `## Status` 是 V34 阶段的原始记录，不再代表当前主干。
 
 ## Phase
@@ -1039,3 +1040,16 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - 验证：全量 pytest 1680 passed / 85 skipped；`tests/integration/pg` 72 passed / 13 skipped；
   ruff `--select F,E9` 通过；basedpyright 0 errors / 0 warnings；alembic `upgrade head` + `check`
   在 PostgreSQL 上「No new upgrade operations detected」。
+
+### Job 来源守卫、执行授权全覆盖与精确关联补齐（V62.6，2026-11-06）
+- 目标：Phase A 提交后、Purge 之前的旧 Job 不得再调用 LLM/Embedding/副作用；补齐授权覆盖与精确关联。
+- 来源守卫：`worker/job_source_guard.py` 统一「严格 claim → 类型化来源 → Shield/Tombstone」，
+  失败即 `forget_source_blocked`（fail-closed），覆盖 12 类 Job 的来源映射。
+- 授权：13 个 Handler 接入 `@with_execution_authorization`；Phase A 与共享授权显式交接
+  （执行 Forget 前释放、提交后 resume），三条嵌套路径不死锁。
+- claim：`running` + 非空 token + 严格 owner + 未过期 lease，其余一律 CLAIM_LOST。
+- 精确关联：`conflict_case_ids` / 新增 `tool_operation_ids` 纳入 Outbox 匹配；
+  `retrieval_index_refresh` 按 `source_type` 解析；异常引用结构 fail-closed。
+- 元数据：`COMMON_CONTENT_FIELDS` 移除 `trigger`，`state/plan/progress/details` 按 job_type 归类。
+- 证据：`EvidenceCollector` 过滤被 Shield 覆盖的 Task/Action/Job 证据。
+- 测试：SQLite 12 用例、PG 3 用例（真实 Phase A 拦截、嵌套 Forget 不死锁、Forget 等待在途执行）。

@@ -27,6 +27,7 @@ from aiive.worker.handlers_improvement import (
 from aiive.worker.job_types import ENABLED_OUTBOX_JOB_TYPES
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome
 from aiive.worker.outbox_handlers import register_all
+from tests.support import ensure_running_claim
 
 
 class ScriptedLLM:
@@ -40,7 +41,7 @@ class ScriptedLLM:
 
 
 def _claimed(trace_id: str = "trace-improve") -> ClaimedJob:
-    return ClaimedJob(
+    claimed = ClaimedJob(
         id=str(uuid.uuid4()),
         job_type=JOB_IMPROVEMENT_DISCOVERY,
         payload={"schema_version": 1},
@@ -51,6 +52,14 @@ def _claimed(trace_id: str = "trace-improve") -> ClaimedJob:
         schema_version=1,
         worker_id="test-worker",
     )
+    # 集成测试不注册测试会话：用真实 SessionLocal 落库后再领取
+    from aiive.db.base import SessionLocal
+
+    db = SessionLocal()
+    try:
+        return ensure_running_claim(claimed, db=db)
+    finally:
+        db.close()
 
 
 def _seed_failed_tasks(db, count: int = 2) -> list[str]:

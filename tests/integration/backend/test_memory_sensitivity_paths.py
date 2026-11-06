@@ -16,6 +16,7 @@ from aiive.memory.memory_mutation import MemoryMutationExecutor
 from aiive.worker.handler_registry import HandlerRegistry
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome
 from aiive.worker.outbox_handlers import handle_memory_markdown_project, register_all
+from tests.support import ensure_running_claim
 
 
 def _memory(db, *, record_id: str, key: str, content: str, sensitivity: str) -> MemoryRecord:
@@ -117,6 +118,7 @@ def test_file_projection_writes_consistent_atomic_snapshot(db, tmp_path, monkeyp
         schema_version=1,
         worker_id="test-worker",
     )
+    ensure_running_claim(claimed, db=db)
     result = handle_memory_markdown_project(claimed)
 
     assert result.outcome == HandlerOutcome.COMPLETED

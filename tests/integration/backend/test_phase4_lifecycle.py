@@ -34,6 +34,7 @@ from aiive.memory.memory_key_registry import MemoryKeySpec
 from aiive.memory.recall_config import MaintenanceConfig
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome
 from aiive.worker.outbox_handlers import handle_memory_maintenance
+from tests.support import ensure_running_claim
 
 
 def _now():
@@ -347,6 +348,7 @@ def _claim_and_run(db, job_id, op_id) -> HandlerOutcome:
             trace_id="t", retry_count=0, max_retries=3,
             claim_token=token, schema_version=1, worker_id="test-worker",
         )
+        ensure_running_claim(claimed)
         result = handle_memory_maintenance(claimed)
         outcome = result.outcome
         if outcome in (HandlerOutcome.COMPLETED, HandlerOutcome.NON_RETRYABLE, HandlerOutcome.CLAIM_LOST):

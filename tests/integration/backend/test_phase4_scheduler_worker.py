@@ -41,6 +41,7 @@ from aiive.worker.scheduler_daemon import (
     _maintenance_scanner_job,
     enqueue_maintenance_job,
 )
+from tests.support import ensure_running_claim
 
 
 def _now():
@@ -113,7 +114,7 @@ def _make_running_job(db, token, op_id=None, retry_count=0):
 
 
 def _claimed(job, token) -> ClaimedJob:
-    return ClaimedJob(
+    claimed = ClaimedJob(
         id=job.id,
         job_type="memory_maintenance",
         payload={"schema_version": 1, "operation_id": job.operation_id},
@@ -124,6 +125,7 @@ def _claimed(job, token) -> ClaimedJob:
         schema_version=1,
         worker_id="w1",
     )
+    return ensure_running_claim(claimed)
 
 
 # ───────────────────────── Scheduler / 工具入口 ─────────────────────────

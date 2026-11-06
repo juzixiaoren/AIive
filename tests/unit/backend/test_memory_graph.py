@@ -16,6 +16,7 @@ from aiive.memory.memory_mutation import MemoryMutationExecutor
 from aiive.memory.memory_store import MemoryStore
 from aiive.memory.memory_types import EvidenceItem, MemoryProposal, TrustLevel
 from aiive.memory.proposal_normalizer import ProposalNormalizer
+from tests.support import ensure_running_claim
 
 
 def _fact(
@@ -651,7 +652,7 @@ def test_recorded_at_differs_from_fact_time(db_session):
 def _claimed(payload: dict) -> object:
     from aiive.worker.outbox_dto import ClaimedJob
 
-    return ClaimedJob(
+    claimed = ClaimedJob(
         id="job-1",
         job_type="memory_graph_refresh",
         payload=payload,
@@ -662,6 +663,7 @@ def _claimed(payload: dict) -> object:
         schema_version=1,
         worker_id="worker-1",
     )
+    return ensure_running_claim(claimed)
 
 
 def test_outbox_handler_projects_graph(db_session, monkeypatch):

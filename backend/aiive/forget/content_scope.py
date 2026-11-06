@@ -90,6 +90,7 @@ class ContentScope:
     task_artifact_ids: set[str] = field(default_factory=set)
     trace_ids: set[str] = field(default_factory=set)
     conflict_case_ids: set[str] = field(default_factory=set)
+    tool_operation_ids: set[str] = field(default_factory=set)
     recall_run_ids: set[str] = field(default_factory=set)
     retrieval_run_ids: set[str] = field(default_factory=set)
     outbox_job_ids: set[str] = field(default_factory=set)
@@ -260,10 +261,25 @@ def _discover_outbox_jobs(
         | scope.agent_task_checkpoint_ids | scope.task_evidence_ids
         | scope.task_artifact_ids | scope.segment_ids | scope.epoch_ids
         | scope.summary_ids | scope.checkpoint_ids | scope.document_ids
+        | scope.conflict_case_ids | scope.tool_operation_ids
     )
     target_full_tasks = set(scope.agent_task_ids)
     target_threads = set(scope.thread_ids)
     target_traces = set(scope.trace_ids)
+    # retrieval_index_refresh 的 source_id 必须结合 source_type 判定实体类型。
+    source_sets: dict[str, set[str]] = {
+        "memory": target_memories,
+        "memory_record": target_memories,
+        "segment": set(scope.segment_ids),
+        "epoch": set(scope.epoch_ids),
+        "summary": set(scope.summary_ids),
+        "segment_summary": set(scope.summary_ids),
+        "checkpoint": set(scope.checkpoint_ids),
+        "epoch_checkpoint": set(scope.checkpoint_ids),
+        "document": set(scope.document_ids),
+        "task": target_full_tasks,
+        "tool_operation": set(scope.tool_operation_ids),
+    }
     cutoff = _as_utc(scope.cutoff)
     tf = _as_utc(scope.time_from)
     tt = _as_utc(scope.time_to)
@@ -312,6 +328,13 @@ def _discover_outbox_jobs(
                     )
                 )
             )
+            if not strong and job_type == "retrieval_index_refresh" and isinstance(
+                payload, dict,
+            ):
+                bucket = source_sets.get(str(payload.get("source_type") or ""))
+                source_id = str(payload.get("source_id") or "")
+                if bucket is not None and source_id and source_id in bucket:
+                    strong = True
             if strong:
                 matched.add(job_id)
                 if refs.unparseable:
@@ -708,6 +731,11 @@ def build_scope(
                 )
             )
     scope.conflict_case_ids = cases
+
+    # ── ToolOperation：按真实 Thread/Turn 关联发现（与 content_scrub 同一判定）──
+    from aiive.forget.content_scrub import tool_operation_ids as _tool_ops
+
+    scope.tool_operation_ids = _tool_ops(db, scope)
 
     # ── MemoryRecallRun / RetrievalRun ──
     recall_runs: set[str] = set()

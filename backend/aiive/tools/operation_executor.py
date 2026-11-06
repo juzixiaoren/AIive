@@ -16,6 +16,8 @@ from aiive.context.run_context import RunContext, RUN_CTX_OUTBOX_WORKER
 from aiive.db.base import SessionLocal
 from aiive.db.models import Event, OutboxJob, ToolOperation
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome, HandlerResult
+from aiive.worker.job_source_guard import guard_job_sources_visible
+from aiive.worker.outbox_execution_auth import with_execution_authorization
 
 logger = logging.getLogger(__name__)
 TOOL_OPERATION_JOB_TYPE = "tool_operation"
@@ -216,8 +218,14 @@ def operation_response(operation: ToolOperation) -> dict[str, Any]:
     }
 
 
+@with_execution_authorization
 def handle_tool_operation(claimed: ClaimedJob) -> HandlerResult:
     """Outbox handler：领取持久化 operation 并执行一次真实副作用。"""
+    fresh, blocked = guard_job_sources_visible(claimed, SessionLocal)
+    if blocked is not None:
+        return blocked
+    assert fresh is not None
+    claimed = fresh
     operation_id = str(claimed.payload.get("tool_operation_id", "") or "")
     if not operation_id:
         return HandlerResult(HandlerOutcome.NON_RETRYABLE, "缺少 tool_operation_id", terminal_reason="invalid_payload")

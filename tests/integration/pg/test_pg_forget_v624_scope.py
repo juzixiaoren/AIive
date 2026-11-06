@@ -34,6 +34,7 @@ from aiive.worker.outbox_payload_contract import (
     is_redacted_payload,
     payload_has_content,
 )
+from tests.support import ensure_running_claim
 
 pytestmark = pytest.mark.pg
 
@@ -214,6 +215,7 @@ def test_pg_pending_memory_extraction_no_llm(pg_sessionmaker, monkeypatch) -> No
             trace_id=job.trace_id, retry_count=0, max_retries=3,
             claim_token="ct", schema_version=1, worker_id="w",
         )
+        ensure_running_claim(claimed, db=s)
         result = outbox_handlers.handle_memory_extraction(claimed)
         assert result.outcome.value == "completed"
         assert result.reason in ("forget_content_redacted",) or (
@@ -264,9 +266,13 @@ def test_pg_active_shield_blocks_extraction_before_llm(
             trace_id=job.trace_id, retry_count=0, max_retries=3,
             claim_token="ct", schema_version=1, worker_id="w",
         )
+        ensure_running_claim(claimed, db=s)
         result = outbox_handlers.handle_memory_extraction(claimed)
         assert result.outcome.value == "completed"
-        assert "extraction_blocked_by_forget" in result.reason
+        assert (
+            "extraction_blocked_by_forget" in result.reason
+            or result.reason.startswith("forget_source_blocked")
+        )
     finally:
         s.close()
 
@@ -437,9 +443,13 @@ def test_pg_concurrent_forget_during_llm_blocks_write(pg_sessionmaker, monkeypat
             trace_id=job.trace_id, retry_count=0, max_retries=3,
             claim_token="ct", schema_version=1, worker_id="w",
         )
+        ensure_running_claim(claimed, db=s)
         result = outbox_handlers.handle_memory_extraction(claimed)
         assert result.outcome.value == "completed"
-        assert "extraction_blocked_by_forget" in result.reason
+        assert (
+            "extraction_blocked_by_forget" in result.reason
+            or result.reason.startswith("forget_source_blocked")
+        )
         s.expire_all()
         from aiive.db.models import MemoryRecord
         assert s.query(MemoryRecord).count() == 0

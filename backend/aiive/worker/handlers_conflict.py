@@ -21,6 +21,11 @@ from aiive.memory.conflict_adjudication import (
 )
 from aiive.memory.conflict_confirmation import MemoryConflictService
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome, HandlerResult
+from aiive.worker.job_source_guard import guard_job_sources_visible
+from aiive.worker.outbox_execution_auth import (
+    resume_execution_authorization,
+    with_execution_authorization,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +51,14 @@ def _snapshot_question_input(case_id: str) -> tuple[bool, dict[str, str], str]:
         db.close()
 
 
+@with_execution_authorization
 def handle_memory_conflict_question(claimed: ClaimedJob) -> HandlerResult:
     """为待确认案例生成澄清问题并通过通知机制提问（幂等）。"""
+    fresh, blocked = guard_job_sources_visible(claimed, SessionLocal)
+    if blocked is not None:
+        return blocked
+    assert fresh is not None
+    claimed = fresh
     case_id = str(claimed.payload.get("conflict_case_id", ""))
     if not case_id:
         return HandlerResult(
@@ -112,8 +123,14 @@ def _snapshot_reply_input(case_id: str) -> tuple[bool, dict[str, str], str]:
         db.close()
 
 
+@with_execution_authorization
 def handle_memory_conflict_reply(claimed: ClaimedJob) -> HandlerResult:
     """解析用户自然语言回复并执行决策（写入仍走 MemoryWriteService）。"""
+    fresh, blocked = guard_job_sources_visible(claimed, SessionLocal)
+    if blocked is not None:
+        return blocked
+    assert fresh is not None
+    claimed = fresh
     payload = claimed.payload
     case_id = str(payload.get("conflict_case_id", ""))
     thread_id = str(payload.get("thread_id", ""))
@@ -163,6 +180,8 @@ def handle_memory_conflict_reply(claimed: ClaimedJob) -> HandlerResult:
             source="user_reply",
         )
         db.commit()
+        # 嵌套 Forget 可能已释放共享授权：提交后重新获取并复查来源
+        resume_execution_authorization()
         logger.info(
             "冲突回复处理完成: case=%s decision=%s status=%s memory=%s",
             case_id, decision.decision, outcome.status, outcome.memory_id,

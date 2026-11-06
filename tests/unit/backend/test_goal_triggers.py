@@ -44,6 +44,7 @@ from aiive.task_runtime.repository import TaskRepository, utcnow
 from aiive.task_runtime.schemas import TaskStatus
 from aiive.worker.handlers_goal_triggers import handle_goal_trigger_decision
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome
+from tests.support import ensure_running_claim
 
 JOB_TYPE = "goal_trigger_decision"
 
@@ -131,11 +132,12 @@ def _jobs(db, task_id: str) -> list[OutboxJob]:
 
 
 def _claimed(job: OutboxJob) -> ClaimedJob:
-    return ClaimedJob(
+    claimed = ClaimedJob(
         id=job.id, job_type=job.job_type, payload=dict(job.payload or {}),
         trace_id=job.trace_id, retry_count=0, max_retries=job.max_retries,
         claim_token="claim-test", schema_version=1, worker_id="worker-test",
     )
+    return ensure_running_claim(claimed)
 
 
 def _event(db, thread_id: str, event_type: str, payload: dict | None = None) -> Event:

@@ -23,6 +23,7 @@ from aiive.task_runtime.repository import TaskRepository, utcnow
 from aiive.task_runtime.runtime import PersistentTaskRuntime
 from aiive.task_runtime.schemas import ActionProposal, TaskStatus
 from aiive.task_runtime.watchers import WatcherService
+from tests.support import ensure_running_claim
 
 
 class SequenceAgent:
@@ -644,11 +645,13 @@ def test_outbox_handler_drives_goal_step(db_session, monkeypatch) -> None:
         ),
     )
     job = jobs[0]
-    result = handle_agent_task_run(ClaimedJob(
+    claimed = ClaimedJob(
         id=job.id, job_type=job.job_type, payload=job.payload, trace_id=job.trace_id,
         retry_count=0, max_retries=job.max_retries, claim_token="claim-test",
         schema_version=1, worker_id="worker-test",
-    ))
+    )
+    ensure_running_claim(claimed)
+    result = handle_agent_task_run(claimed)
     assert result.outcome == HandlerOutcome.COMPLETED
 
     stored = _fresh(db_session, task)

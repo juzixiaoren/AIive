@@ -1191,6 +1191,19 @@ Worker 先取共享锁 → Forget 等待，Purge 覆盖该次执行产生的记�
 Worker 获得授权后判定来源已遗忘，不调用 LLM、不写 Memory。命名空间、锁顺序与 MemoryWrite
 共享锁语义均未改变。
 
+**Job 来源守卫（V62.6）**：执行授权只解决「锁被谁持有」，还必须在外部调用前证明
+「来源仍然可见」。`worker/job_source_guard.py::guard_job_sources_visible()` 把顺序固定为
+「严格重读 OutboxJob 并校验 claim → 按 job_type 解析类型化来源（Event / Turn / Memory /
+Summary / Checkpoint / Thread）→ 查 active Shield / Tombstone」，任一不满足即以
+`forget_source_blocked:<reason>` 终止。不能只依赖 `forget_content_redacted`：该标记在
+Purge 阶段才写入，而 Phase A 提交后 Shield 已经生效。`segment_sealing` 经
+CompactionInput 的 event/turn manifest 解析来源，`epoch_checkpoint` 经
+EpochCompactionInput → SegmentSummary 回溯，`memory_conflict_*` 经案例的
+old/resolved Memory 与 proposal 来源，`tool_operation` 经 ToolOperation 的 Turn/Thread，
+未知来源一律 fail-closed。`retrieval_index_rebuild` 与 `improvement_discovery` 没有单一
+来源，改为 claim fencing + 逐条/逐证据可见性过滤（EvidenceCollector 在采集阶段剔除被
+Shield 覆盖的 Task/Action/Job 证据）。
+
 ## 12.9 Memory Gate 的准确含义
 
 Gate 是写入准入规则，不是 LLM 自己的置信度投票：

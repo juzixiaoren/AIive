@@ -51,6 +51,7 @@ from aiive.task_runtime.goal_trigger_service import GoalTriggerService
 from aiive.task_runtime.repository import TaskRepository, utcnow
 from aiive.worker.handlers_goal_triggers import handle_goal_trigger_decision
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome
+from tests.support import ensure_running_claim
 JOB_TYPE = "goal_trigger_decision"
 
 
@@ -134,11 +135,12 @@ def _claimed(db: Session, task_id: str) -> ClaimedJob:
         OutboxJob.job_type == JOB_TYPE,
         OutboxJob.operation_id.like(f"goal_trigger:{task_id}:%"),
     ).one()
-    return ClaimedJob(
+    claimed = ClaimedJob(
         id=row.id, job_type=row.job_type, payload=dict(row.payload or {}),
         trace_id=row.trace_id, retry_count=0, max_retries=row.max_retries,
         claim_token="claim-v57", schema_version=1, worker_id="worker-v57",
     )
+    return ensure_running_claim(claimed)
 
 
 def _plan_of(db: Session, task_id: str):

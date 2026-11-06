@@ -1008,3 +1008,58 @@ compaction_inputs.turn_manifest 等。未知引用结构只统计本次范围，
   子串碰撞不命中、新 memory_extraction / Goal Event Job 保留并执行）。
 - PostgreSQL：`test_pg_forget_exec_auth.py` 4 用例（共享/排他锁互斥、Case A Worker 先执行、
   Case B Forget 先提交、精确关联 + 嵌套 List），全部双连接真实并发，无 Mock Shield。
+
+## 实现补记（八）：Job 来源守卫、执行授权全覆盖与精确关联补齐（V62.6，2026-11-06）
+
+### 1. 问题
+
+Phase A 提交后 Shield 立即生效，但尚未 Purge 的旧 Outbox Job 仍持有内存 payload，
+仍可能调用 LLM / Embedding 或执行外部副作用；`forget_content_redacted` 只在 Purge 写入，
+不能作为外部调用前的唯一判据。
+
+### 2. 统一来源守卫
+
+- 新增 `worker/job_source_guard.py`：`guard_job_sources_visible()` = 严格 claim 校验 +
+  按 job_type 解析类型化来源（Event / Turn / Memory / Summary / Checkpoint / Thread）
+  + `ForgetVisibilityService` 屏蔽检查，任一失败即 `forget_source_blocked:<reason>`。
+- memory_extraction 的守卫放在 Phase A 之后、A3 之前：拦截时先收敛 IngestionRun，
+  再返回 `extraction_blocked_by_forget:forget_source_blocked:…`，不调用模型。
+
+### 3. 执行授权覆盖
+
+- 13 个内容/派生 Handler 全部接入 `@with_execution_authorization`（清单见矩阵 §9.4）。
+- `execute_phase_a_shield()` 在取排他锁前释放共享授权，Phase A 提交后由调用方
+  `resume_execution_authorization()` 重新获取：ConflictReply / Agent Task / Forget Tool
+  三条嵌套路径不再自锁，`forget_old` 原子性保持不变。
+- `_release_shared()` 检查 `pg_advisory_unlock_shared` 返回值；返回 false 或抛异常时
+  `invalidate()` 物理连接，禁止带锁归还连接池。
+
+### 4. 严格 claim fencing
+
+- `refresh_claimed_job()` 要求：行存在、`status == running`、`claim_token` 非空且严格相等、
+  `locked_by` 严格等于领取者、lease 存在且未过期。pending / 空 token / 空 owner / 过期 lease
+  一律 CLAIM_LOST。
+- 单元测试改用真实持久化 Job（`tests/support.py::persist_running_job` / `ensure_running_claim`）。
+
+### 5. 精确关联补齐
+
+- `target_children` 纳入 `conflict_case_ids` 与新增的 `tool_operation_ids`；
+  `ContentScope` 新增 `tool_operation_ids`（复用 `content_scrub.tool_operation_ids` 判定）。
+- `retrieval_index_refresh` 的 `source_id` 结合 `source_type` 映射到对应目标集合。
+- `_add_ids()` 遇到非字符串 / 嵌套数组 / 对象时标记 `unparseable`（fail-closed），不再静默丢弃。
+- `COMMON_CONTENT_FIELDS` 移除执行控制字段 `trigger`；`state` / `plan` / `progress` / `details`
+  改为按 job_type 归类，避免破坏状态机与执行元数据。
+
+### 6. 证据侧过滤
+
+- `selfdev/improvement_evidence.py::EvidenceCollector` 在采集 AgentTask / AgentAction /
+  OutboxJob 证据时用 `ForgetVisibilityService.is_shielded(thread_id, target_time)` 过滤，
+  被遗忘来源的证据不进入模型提示词；可见性查询异常按 fail-closed 丢弃。
+
+### 7. 测试与验收
+
+- SQLite：`test_forget_v626_guard.py` 12 用例（Goal/Trigger/Conflict/投影/ToolOperation 屏蔽、
+  claim fencing、conflict_case/tool_operation 精确发现、unparseable fail-closed、
+  unlock 失败 invalidate、新 Job 不误拦）。
+- PostgreSQL：`test_pg_forget_v626_guard.py` 3 用例（真实 Phase A 后 Goal 被拦、
+  嵌套 Forget 交接不死锁、Forget 等待在途共享授权）。

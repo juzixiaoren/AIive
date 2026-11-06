@@ -49,10 +49,8 @@ from aiive.task_runtime.repository import TaskRepository
 from aiive.task_runtime.schemas import TaskStatus
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome, HandlerResult
 from aiive.worker.outbox_payload_contract import is_redacted_payload
-from aiive.worker.outbox_execution_auth import (
-    guard_handler_payload,
-    with_execution_authorization,
-)
+from aiive.worker.job_source_guard import guard_job_sources_visible
+from aiive.worker.outbox_execution_auth import with_execution_authorization
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +112,7 @@ def _active_turn_until(thread_id: str) -> datetime | None:
 
 @with_execution_authorization
 def handle_goal_trigger_decision(claimed: ClaimedJob) -> HandlerResult:
-    fresh_claimed, guard = guard_handler_payload(claimed, SessionLocal, require_persisted=False)
+    fresh_claimed, guard = guard_job_sources_visible(claimed, SessionLocal)
     if guard is not None:
         return guard
     assert fresh_claimed is not None

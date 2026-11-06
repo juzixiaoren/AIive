@@ -21,20 +21,24 @@ COMMON_CONTENT_FIELDS: frozenset[str] = frozenset({
     "input_snapshot", "output_summary", "inline_payload", "content_preview",
     "content_span", "error", "error_message", "notes", "decision_span",
     "verdict_reason", "resolution_reason", "old_content", "new_content",
-    "event_payload", "trigger_event_payload", "plan", "state", "condition",
-    "progress", "details", "trigger",
+    "event_payload", "trigger_event_payload", "condition",
 })
+# 明确不属于正文的执行控制字段（绝不能脱敏，否则状态机断链）：
+#   trigger —— agent_task_run 的派发原因（dispatch / reminder / goal），
+#   step_id / task_type / status 等见 REFERENCE_FIELDS。
 
 # job_type → 该类型实际携带正文的字段（生产结构）。
 CONTENT_FIELDS_BY_JOB_TYPE: dict[str, frozenset[str]] = {
     "memory_extraction": frozenset({"user_message", "reply"}),
     "goal_event_dispatch": frozenset({"event_payload"}),
     "goal_trigger_decision": frozenset({
-        "trigger_event_payload", "reason", "trigger_event_type",
+        "trigger_event_payload", "reason", "trigger_event_type", "plan",
     }),
     "reminder_delivery": frozenset({"title", "content"}),
     "agent_task_run": frozenset({
         "goal", "reason", "failure_reason", "task_title", "summary", "query",
+        # working-state 快照属于正文；trigger 是执行控制字段，保留。
+        "state", "plan", "progress",
     }),
     "memory_conflict_question": frozenset({
         "title", "content", "message", "question",
@@ -47,10 +51,14 @@ CONTENT_FIELDS_BY_JOB_TYPE: dict[str, frozenset[str]] = {
     "tool_operation": frozenset({
         "name", "params", "result", "error", "tool_args", "arguments",
     }),
-    "segment_sealing": frozenset({"summary", "content", "goal", "reason"}),
+    "segment_sealing": frozenset({
+        "summary", "content", "goal", "reason", "state", "details",
+    }),
     "epoch_checkpoint": frozenset({"summary", "content", "goal", "reason"}),
-    "epoch_rollover": frozenset({"reason", "summary"}),
-    "memory_maintenance": frozenset({"content", "reason", "summary"}),
+    "epoch_rollover": frozenset({"reason", "summary", "state", "details"}),
+    "memory_maintenance": frozenset({
+        "content", "reason", "summary", "progress", "details", "state",
+    }),
 }
 
 # 定位与幂等字段：任何情况下保留。
@@ -242,11 +250,28 @@ class JobReferences:
         )
 
 
-def _add_ids(value: Any, out: set[str]) -> None:
+def _add_ids(value: Any, out: set[str]) -> bool:
+    """收集引用字段里的字符串 ID；返回是否全部可解析。
+
+    已知引用字段出现嵌套数组 / 对象 / 数字等异常结构时必须标记 unparseable
+    （fail-closed），不能静默丢弃——否则该 Job 可能因解析不完整而漏检。
+    """
+    if value is None:
+        return True
     if isinstance(value, str):
-        out.add(value)
-    elif isinstance(value, (list, tuple, set)):
-        out.update(str(item) for item in value if isinstance(item, str))
+        if value:
+            out.add(value)
+        return True
+    if isinstance(value, (list, tuple, set)):
+        ok = True
+        for item in value:
+            if isinstance(item, str):
+                if item:
+                    out.add(item)
+            else:
+                ok = False
+        return ok
+    return False
 
 
 def _schema_for(job_type: str) -> dict[str, frozenset[str]]:
@@ -282,8 +307,8 @@ def job_reference_ids(job_type: str, payload: Any) -> JobReferences:
             if out is None:
                 continue
             for key in keys:
-                if key in node:
-                    _add_ids(node[key], out)
+                if key in node and not _add_ids(node[key], out):
+                    unparseable = True
         # 非契约字段中的嵌套结构继续递归；正文键与已知引用键不再深入。
         for key, value in node.items():
             if key in known_keys or key in content_keys:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import replace
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -137,10 +138,16 @@ def _dispatch_job(db) -> dict:
 
 
 def _claimed(job: dict, *, retry_count: int = 0) -> ClaimedJob:
+    """把真实 OutboxJob 置为 running 并领取，满足 Handler 的严格 claim fencing。"""
+    from tests.support import claim_existing_job, current_test_session
+
+    db = current_test_session()
+    assert db is not None, "领取 Job 需要真实测试库"
+    token, worker_id = claim_existing_job(db, job["id"], worker_id="worker-test")
     return ClaimedJob(
         id=job["id"], job_type=job["job_type"], payload=dict(job["payload"]),
         trace_id=job["trace_id"], retry_count=retry_count, max_retries=job["max_retries"],
-        claim_token="claim-test", schema_version=1, worker_id="worker-test",
+        claim_token=token, schema_version=1, worker_id=worker_id,
     )
 
 
@@ -477,11 +484,13 @@ def test_knowledge_maintenance_failure_publishes_on_last_attempt(db_session, mon
     }
 
     # 非最后一次尝试：不发布失败事件（Outbox 还会重试）。
-    first = handle_knowledge_maintenance(_claimed(claimed_job, retry_count=0))
+    # 只领取一次：Handler 失败会 rollback，重复领取需要 Job 行仍在库中。
+    first_claim = _claimed(claimed_job, retry_count=0)
+    first = handle_knowledge_maintenance(first_claim)
     assert first.outcome == HandlerOutcome.RETRYABLE_ERROR
     assert published == []
 
-    last = handle_knowledge_maintenance(_claimed(claimed_job, retry_count=2))
+    last = handle_knowledge_maintenance(replace(first_claim, retry_count=2))
     assert last.outcome == HandlerOutcome.RETRYABLE_ERROR
     assert [item["status"] for item in published] == ["failed"]
 

@@ -43,9 +43,9 @@ from aiive.memory.memory_write_service import MemoryBatchWriteError, MemoryWrite
 from aiive.prompts import get_prompt_registry
 from aiive.retrieval.index_rebuild import handle_retrieval_index_rebuild
 from aiive.worker.outbox_payload_contract import is_redacted_payload
+from aiive.worker.job_source_guard import guard_job_sources_visible
 from aiive.worker.outbox_execution_auth import (
     authorized_session_factory,
-    guard_handler_payload,
     with_execution_authorization,
 )
 from aiive.worker.outbox_dto import (
@@ -176,13 +176,7 @@ def _mark_ingestion_succeeded_fencing(
 @with_execution_authorization
 def handle_memory_extraction(claimed: ClaimedJob) -> HandlerResult:
     """三阶段异步记忆提取 Handler（持共享执行授权覆盖 LLM 与写入提交）。"""
-    # 授权已获取：重新读取最新 Job 状态与 Payload，不信任领取时的旧副本。
     auth_sessions = authorized_session_factory(SessionLocal)
-    fresh_claimed, guard = guard_handler_payload(claimed, auth_sessions)
-    if guard is not None:
-        return guard
-    assert fresh_claimed is not None
-    claimed = fresh_claimed
     payload = claimed.payload
     user_message: str = payload.get("user_message", "")
     message_source = payload.get("message_source")
@@ -245,6 +239,22 @@ def handle_memory_extraction(claimed: ClaimedJob) -> HandlerResult:
         return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, f"Phase A failed: {e}")
     finally:
         db_a.close()
+
+    # 来源守卫：严格校验 claim + Shield/Tombstone，未通过绝不进入 LLM。
+    # 放在 Phase A 之后：Phase A 只做 IngestionRun 幂等收敛，不读正文、不调模型。
+    fresh_claimed, guard = guard_job_sources_visible(claimed, auth_sessions)
+    if guard is not None:
+        if guard.outcome == HandlerOutcome.CLAIM_LOST:
+            return guard
+        # 来源被 Shield/Tombstone 覆盖：收敛 IngestionRun 后终止，绝不调用模型。
+        _mark_ingestion_succeeded_fencing(run_id, execution_token, guard.reason)
+        return HandlerResult(
+            HandlerOutcome.COMPLETED,
+            f"extraction_blocked_by_forget:{guard.reason}",
+            ingestion_run_id=run_id,
+        )
+    assert fresh_claimed is not None
+    claimed = fresh_claimed
 
     # A3（LLM 调用前）：Forget 提交后来源已被屏蔽，或 payload 正文已被 Scrub，
     # 直接收敛 IngestionRun 并终止本次提取，绝不把原文交给模型。
@@ -501,7 +511,7 @@ def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
     import uuid as _uuid
 
     auth_sessions = authorized_session_factory(SessionLocal)
-    fresh_claimed, guard = guard_handler_payload(claimed, auth_sessions, require_persisted=False)
+    fresh_claimed, guard = guard_job_sources_visible(claimed, auth_sessions)
     if guard is not None:
         return guard
     assert fresh_claimed is not None
@@ -771,8 +781,14 @@ def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
 # ============================================================================
 
 
+@with_execution_authorization
 def handle_core_memory_refresh(claimed: ClaimedJob) -> HandlerResult:
     """core_memory_refresh 使用统一 Handler 接口。"""
+    fresh, blocked = guard_job_sources_visible(claimed, SessionLocal)
+    if blocked is not None:
+        return blocked
+    assert fresh is not None
+    claimed = fresh
     payload = claimed.payload
     memory_id: str = payload.get("memory_id", "")
     record_version: int = payload.get("record_version", 0)
@@ -793,8 +809,14 @@ def handle_core_memory_refresh(claimed: ClaimedJob) -> HandlerResult:
         db.close()
 
 
+@with_execution_authorization
 def handle_memory_vector_refresh(claimed: ClaimedJob) -> HandlerResult:
     """按 MemoryRecord 真相源状态刷新或删除 pgvector 投影。"""
+    fresh, blocked = guard_job_sources_visible(claimed, SessionLocal)
+    if blocked is not None:
+        return blocked
+    assert fresh is not None
+    claimed = fresh
     memory_id = str(claimed.payload.get("memory_id", ""))
     record_version = int(claimed.payload.get("record_version", 0))
     if not memory_id or record_version <= 0:
@@ -818,12 +840,18 @@ def handle_memory_vector_refresh(claimed: ClaimedJob) -> HandlerResult:
         db.close()
 
 
+@with_execution_authorization
 def handle_memory_graph_refresh(claimed: ClaimedJob) -> HandlerResult:
     """按 canonical 记忆记录刷新时序知识图谱投影。
 
     幂等：同一 (memory_id, record_version) 重复执行只更新同一批关系行；
     旧版本任务迟到时直接跳过（新版本任务负责正确内容）。
     """
+    fresh, blocked = guard_job_sources_visible(claimed, SessionLocal)
+    if blocked is not None:
+        return blocked
+    assert fresh is not None
+    claimed = fresh
     if not settings.aiive_memory_graph_enabled:
         return HandlerResult(HandlerOutcome.COMPLETED, "知识图谱已关闭")
     memory_id = str(claimed.payload.get("memory_id", ""))
@@ -849,8 +877,14 @@ def handle_memory_graph_refresh(claimed: ClaimedJob) -> HandlerResult:
         db.close()
 
 
+@with_execution_authorization
 def handle_memory_markdown_project(claimed: ClaimedJob) -> HandlerResult:
     """从当前 PostgreSQL 真相源重建 Markdown 和 JSON 文件投影。"""
+    fresh, blocked = guard_job_sources_visible(claimed, SessionLocal)
+    if blocked is not None:
+        return blocked
+    assert fresh is not None
+    claimed = fresh
     if not settings.aiive_memory_file_projection_enabled:
         return HandlerResult(HandlerOutcome.COMPLETED, "记忆文件投影已关闭")
     if not claimed.payload.get("memory_id") and not claimed.payload.get("forget_operation_id"):
@@ -882,12 +916,18 @@ def handle_memory_markdown_project(claimed: ClaimedJob) -> HandlerResult:
         db.close()
 
 
+@with_execution_authorization
 def handle_retrieval_index_refresh(claimed: ClaimedJob) -> HandlerResult:
     """retrieval_index_refresh Handler：对 active + building generation 刷新单个 source。
 
     幂等：operation_id 以 source 为粒度（retrieval_refresh:{type}:{id}），
     多次变更合并为一次刷新；upsert_entry 内部按 source_version fencing 防旧覆盖新。
     """
+    fresh, blocked = guard_job_sources_visible(claimed, SessionLocal)
+    if blocked is not None:
+        return blocked
+    assert fresh is not None
+    claimed = fresh
     payload = claimed.payload
     source_type: str = payload.get("source_type", "")
     source_id: str = payload.get("source_id", "")
@@ -1350,6 +1390,7 @@ def _resolve_maintenance_run(
     return ("acquired" if not was_running else "takeover"), run.id
 
 
+@with_execution_authorization
 def handle_memory_maintenance(claimed: ClaimedJob) -> HandlerResult:
     """Phase 4 长期记忆生命周期维护 Handler（三阶段 + CONTINUE 分页）。
 
@@ -1360,6 +1401,11 @@ def handle_memory_maintenance(claimed: ClaimedJob) -> HandlerResult:
       若本 lane 仍有未处理 seed 或存在其他 lane 剩余候选 → CONTINUE，
       全部 lane 穷尽 → Run succeeded → COMPLETED（OutboxJob 由 Worker finalize）。
     """
+    fresh, blocked = guard_job_sources_visible(claimed, SessionLocal)
+    if blocked is not None:
+        return blocked
+    assert fresh is not None
+    claimed = fresh
     from aiive.memory.memory_maintenance_planner import plan_batch
     from aiive.memory.memory_store import MemoryStore
     from aiive.memory.recall_config import MaintenanceConfig
@@ -1838,6 +1884,7 @@ def _build_extract_fallback_summary(source_turns: list[dict[str, Any]]) -> dict[
     }
 
 
+@with_execution_authorization
 def handle_segment_sealing(claimed: ClaimedJob) -> HandlerResult:
     """三阶段 Segment 摘要 Handler（Phase 3）。
 
@@ -1846,6 +1893,11 @@ def handle_segment_sealing(claimed: ClaimedJob) -> HandlerResult:
     Phase C：双重 fencing + 覆盖校验 + 写 Summary/Segment + 事务性 enqueue rollover/checkpoint
     Handler 不 finalize OutboxJob（由 OutboxWorker 负责）。
     """
+    fresh, blocked = guard_job_sources_visible(claimed, SessionLocal)
+    if blocked is not None:
+        return blocked
+    assert fresh is not None
+    claimed = fresh
     from aiive.memory.recall_config import RecallConfig
     from aiive.runtime.compaction import (
         build_item_ref_map,
@@ -2177,10 +2229,16 @@ def _mark_phase3_run_failed(run_cls: Any, run_id: str, execution_token: str, err
         db_m.close()
 
 
+@with_execution_authorization
 def handle_epoch_rollover(claimed: ClaimedJob) -> HandlerResult:
     """Epoch rollover Handler（Item 5）：短事务调用 begin_epoch_sealing，幂等。"""
     from aiive.runtime.epoch_manager import EpochManager
 
+    fresh, blocked = guard_job_sources_visible(claimed, SessionLocal)
+    if blocked is not None:
+        return blocked
+    assert fresh is not None
+    claimed = fresh
     payload = claimed.payload
     thread_id: str = payload.get("thread_id", "")
 
@@ -2271,8 +2329,14 @@ def _build_epoch_checkpoint_payload(
     }
 
 
+@with_execution_authorization
 def handle_epoch_checkpoint(claimed: ClaimedJob) -> HandlerResult:
     """EpochCheckpoint Handler：从 EpochCompactionInput + SegmentSummary 聚合生成 Checkpoint。"""
+    fresh, blocked = guard_job_sources_visible(claimed, SessionLocal)
+    if blocked is not None:
+        return blocked
+    assert fresh is not None
+    claimed = fresh
     payload = claimed.payload
     epoch_id: str = payload.get("epoch_id", "")
     epoch_compaction_input_id: str = payload.get("epoch_compaction_input_id", "")

@@ -1,35 +1,49 @@
 """Outbox 执行授权：与 Forget Phase A 排他锁互斥的 session-level 共享锁。
 
 - PostgreSQL：独立连接上 `pg_advisory_lock_shared(FORGET_LOCK_NAMESPACE, FORGET_LOCK_KEY)`；
-  与 `execute_phase_a_shield()` 的事务级 `pg_advisory_xact_lock` 排他锁互斥
-  （同一 advisory lock 空间，已用真实 PG 验证）。
-- 锁覆盖 LLM 调用与后续持久化提交；所有路径显式 unlock。
+  与 `execute_phase_a_shield()` 的事务级 `pg_advisory_xact_lock` 排他锁互斥。
+- 授权覆盖「重读 Job → 来源可见性检查 → 外部调用/副作用 → 结果提交」整段。
+- 嵌套 Forget（ConflictReply / Agent Task / Forget Tool）走显式交接：
+  `execute_phase_a_shield()` 进入前释放共享授权（`release_execution_authorization`），
+  Phase A 提交后由调用方 `resume_execution_authorization()` 重新获取，避免同线程死锁。
+- 释放失败时必须 invalidate 物理连接，绝不把仍持锁的连接归还连接池。
 - SQLite：no-op，仅用于逻辑测试；并发正确性以 PostgreSQL 为准。
 """
 from __future__ import annotations
 
 import functools
 import logging
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from collections.abc import Callable, Generator
 from typing import Any
 
 from sqlalchemy import text as sa_text
 
 from aiive.forget.concurrency import FORGET_LOCK_KEY, FORGET_LOCK_NAMESPACE
-from aiive.worker.outbox_dto import (
-    ClaimedJob,
-    HandlerOutcome,
-    HandlerResult,
-)
+from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome, HandlerResult
 from aiive.worker.outbox_payload_contract import is_redacted_payload
 
 logger = logging.getLogger(__name__)
-_ACTIVE_CONNECTION: ContextVar[Any | None] = ContextVar(
-    "aiive_outbox_authorization_connection", default=None,
+
+_LOCK_PARAMS = {"ns": FORGET_LOCK_NAMESPACE, "key": FORGET_LOCK_KEY}
+# 嵌套 Forget 交接后重新取锁的最长等待：拿不到就保持「未授权」状态，
+# 由调用方在事务提交后重试，绝不在持排他锁的事务里无限等待。
+RESUME_LOCK_TIMEOUT_MS = 2000
+
+
+@dataclass
+class _AuthorizationState:
+    """单个 Context 内共享授权连接的状态（支持嵌套 Forget 交接）。"""
+
+    connection: Any | None
+    suspended_for_forget: bool = False
+
+
+_STATE: ContextVar[_AuthorizationState | None] = ContextVar(
+    "aiive_outbox_authorization_state", default=None,
 )
 
 
@@ -37,6 +51,132 @@ def get_engine() -> Any:
     from aiive.db.base import engine
 
     return engine
+
+
+def _is_postgres() -> bool:
+    return getattr(get_engine().dialect, "name", "") == "postgresql"
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _acquire_shared(timeout_ms: int | None = None) -> Any:
+    """在新连接上取 session-level 共享锁并返回该连接。"""
+    connection = get_engine().connect()
+    try:
+        if timeout_ms is not None:
+            connection.execute(sa_text(f"SET lock_timeout = {int(timeout_ms)}"))
+        connection.execute(
+            sa_text("SELECT pg_advisory_lock_shared(:ns, :key)"), _LOCK_PARAMS,
+        )
+        # session-level 锁独立于事务，commit 只为结束该只读事务
+        connection.commit()
+        return connection
+    except Exception:
+        connection.invalidate()
+        raise
+
+
+def _release_shared(state: _AuthorizationState) -> None:
+    """释放共享锁；任何失败都 invalidate 连接，禁止带锁归还连接池。"""
+    connection = state.connection
+    state.connection = None
+    if connection is None:
+        return
+    try:
+        granted = connection.execute(
+            sa_text("SELECT pg_advisory_unlock_shared(:ns, :key)"), _LOCK_PARAMS,
+        ).scalar()
+        connection.commit()
+        if granted is not True:
+            logger.error("pg_advisory_unlock_shared 返回 %r，强制 invalidate 连接", granted)
+            connection.invalidate()
+    except Exception:
+        logger.exception("释放共享执行授权失败，强制 invalidate 连接")
+        connection.invalidate()
+    finally:
+        try:
+            connection.close()
+        except Exception:  # pragma: no cover - 关闭失败无补救手段
+            logger.exception("关闭授权连接失败")
+
+
+@contextmanager
+def shared_execution_authorization() -> Generator[None, None, None]:
+    """持共享执行授权直到外部调用与写入提交结束（可重入）。"""
+    if not _is_postgres():
+        yield
+        return
+    existing = _STATE.get()
+    if existing is not None:
+        # 嵌套调用：外层已持有授权；若因 Forget 交接被释放，这里不擅自重取
+        yield
+        return
+    state = _AuthorizationState(connection=_acquire_shared())
+    token = _STATE.set(state)
+    try:
+        yield
+    finally:
+        _release_shared(state)
+        _STATE.reset(token)
+
+
+def release_execution_authorization() -> None:
+    """为嵌套 Forget 让路：释放共享授权并标记交接。
+
+    由 `execute_phase_a_shield()` 在获取排他锁之前调用：同一个线程先持共享锁
+    再排队等排他锁会永久自锁，必须先放掉共享授权。
+    """
+    state = _STATE.get()
+    if state is None or state.connection is None:
+        return
+    logger.debug("释放共享执行授权以进入 Forget Phase A 排他锁")
+    _release_shared(state)
+    state.suspended_for_forget = True
+
+
+def resume_execution_authorization(*, timeout_ms: int | None = None) -> bool:
+    """Phase A 事务提交后重新获取共享授权。返回是否已持有。
+
+    拿不到（例如调用方事务仍未提交）时保持未授权并返回 False，由调用方在
+    真正需要保护的外部调用前重试；绝不阻塞等待以免与自身事务互锁。
+    """
+    state = _STATE.get()
+    if state is None or not _is_postgres():
+        return True
+    if state.connection is not None:
+        return True
+    budget = RESUME_LOCK_TIMEOUT_MS if timeout_ms is None else timeout_ms
+    try:
+        state.connection = _acquire_shared(timeout_ms=budget)
+        state.suspended_for_forget = False
+        return True
+    except Exception:
+        logger.warning("重新获取共享执行授权失败（保持未授权，稍后重试）", exc_info=True)
+        return False
+
+
+def has_execution_authorization() -> bool:
+    if not _is_postgres():
+        return True
+    state = _STATE.get()
+    return state is not None and state.connection is not None
+
+
+def get_session_factory() -> Callable[[], Any]:
+    state = _STATE.get()
+    if state is not None and state.connection is not None:
+        from sqlalchemy.orm import Session
+
+        return _mark_owns_session(lambda: Session(bind=state.connection, expire_on_commit=False))
+    from aiive.db.base import SessionLocal
+
+    return SessionLocal
 
 
 # 标记「该工厂每次都新建 Session」：只有自建 Session 才能 close，
@@ -49,7 +189,8 @@ def _mark_owns_session(factory: Callable[[], Any]) -> Callable[[], Any]:
     return factory
 
 
-def _owns_session(factory: Callable[[], Any]) -> bool:
+def owns_session_factory(factory: Callable[[], Any]) -> bool:
+    """该工厂是否每次新建 Session（只有自建 Session 才能 close）。"""
     flag = getattr(factory, _OWNS_SESSION_ATTR, None)
     if flag is not None:
         return bool(flag)
@@ -58,117 +199,59 @@ def _owns_session(factory: Callable[[], Any]) -> bool:
     return isinstance(factory, sessionmaker)
 
 
-def get_session_factory() -> Callable[[], Any]:
-    active = _ACTIVE_CONNECTION.get()
-    if active is not None:
-        from sqlalchemy.orm import Session
-        return _mark_owns_session(
-            lambda: Session(bind=active, expire_on_commit=False)
-        )
-    from aiive.db.base import SessionLocal
-    return SessionLocal
-
-
-def _as_utc(value: datetime | None) -> datetime | None:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value
-
-
-@contextmanager
-def shared_execution_authorization() -> Generator[None, None, None]:
-    """持共享执行授权直到 LLM 调用与写入提交结束。"""
-    engine = get_engine()
-    if getattr(engine.dialect, "name", "") != "postgresql":
-        yield
-        return
-    connection = engine.connect()
-    params = {"ns": FORGET_LOCK_NAMESPACE, "key": FORGET_LOCK_KEY}
-    token = _ACTIVE_CONNECTION.set(connection)
-    try:
-        connection.execute(
-            sa_text("SELECT pg_advisory_lock_shared(:ns, :key)"), params,
-        )
-        connection.commit()  # session-level lock 不随事务结束释放
-        try:
-            yield
-        finally:
-            try:
-                connection.execute(
-                    sa_text("SELECT pg_advisory_unlock_shared(:ns, :key)"), params,
-                )
-                connection.commit()
-            except Exception:
-                logger.exception("释放共享执行授权失败")
-                connection.rollback()
-    finally:
-        _ACTIVE_CONNECTION.reset(token)
-        connection.close()
-
-
 def authorized_session_factory(fallback: Callable[[], Any]) -> Callable[[], Any]:
     """有活跃授权连接时，返回绑定该连接的 Session 工厂；否则回退调用方工厂。"""
-    active = _ACTIVE_CONNECTION.get()
-    if active is None:
+    state = _STATE.get()
+    if state is None or state.connection is None:
         return fallback
     from sqlalchemy.orm import Session
-    return _mark_owns_session(
-        lambda: Session(bind=active, expire_on_commit=False)
-    )
+
+    return _mark_owns_session(lambda: Session(bind=state.connection, expire_on_commit=False))
+
+
+def verify_claim(db: Any, claimed: ClaimedJob) -> tuple[ClaimedJob | None, str]:
+    """在给定 Session 上严格校验 claim，返回 (最新 Job, 失败原因)。"""
+    from aiive.db.models import OutboxJob
+
+    job = db.query(OutboxJob).filter(OutboxJob.id == claimed.id).first()
+    if job is None:
+        return None, "outbox_job_not_found"
+    if job.status != "running":
+        return None, f"outbox_job_not_running:{job.status}"
+    if not claimed.claim_token or job.claim_token != claimed.claim_token:
+        return None, "claim_token_mismatch"
+    if not claimed.worker_id or job.locked_by != claimed.worker_id:
+        return None, "claim_owner_mismatch"
+    lease = _as_utc(job.lease_expires_at)
+    if lease is None:
+        return None, "claim_lease_missing"
+    if lease <= datetime.now(timezone.utc):
+        return None, "claim_lease_expired"
+    if is_redacted_payload(job.payload):
+        return None, "forget_content_redacted"
+    return replace(
+        claimed,
+        payload=job.payload or {},
+        schema_version=int(job.schema_version or claimed.schema_version),
+        trace_id=job.trace_id or claimed.trace_id,
+    ), ""
 
 
 def refresh_claimed_job(
     claimed: ClaimedJob,
     session_factory: Callable[[], Any] | None = None,
-    *,
-    require_persisted: bool = True,
 ) -> tuple[ClaimedJob | None, str]:
-    """重新读取 OutboxJob，拒绝继续使用领取时的旧 payload 副本。
+    """严格重读 OutboxJob 并校验 claim，拒绝任何旧副本。
 
-    require_persisted=True（内容会进入 LLM 的路径）要求 Job 行必须存在：行缺失
-    说明已被清理，必须终止。其余 Handler 的 Job 行缺失只意味着「非持久化直接
-    调用」，此时仍执行脱敏校验后继续，避免把单元级调用误判为 claim 丢失。
+    生产 Worker 路径必须满足：行存在、status=running、claim_token 严格相等、
+    locked_by 严格等于领取者、lease 存在且未过期。任何一项不满足即终止，
+    绝不继续使用领取时的 payload 副本。
     """
-    # 不能信任领取时的旧 payload 副本：先重新读取 DB，再判断 Forget 标记。
     factory = session_factory or get_session_factory()
     db = factory()
-    owns_session = _owns_session(factory)
+    owns_session = owns_session_factory(factory)
     try:
-        from aiive.db.models import OutboxJob
-
-        job = db.query(OutboxJob).filter(OutboxJob.id == claimed.id).first()
-        if job is None:
-            if is_redacted_payload(claimed.payload):
-                return None, "forget_content_redacted"
-            if require_persisted:
-                return None, "outbox_job_not_found"
-            logger.warning(
-                "OutboxJob %s 不在库中，使用调用方提供的 claim 副本继续（非 Worker 领取路径）",
-                claimed.id,
-            )
-            return claimed, ""
-        if job.status in ("completed", "deadletter", "failed", "cancelled"):
-            return None, f"outbox_job_terminal:{job.status}"
-        if job.status not in ("pending", "running"):
-            return None, f"outbox_job_invalid_status:{job.status}"
-        if job.claim_token and job.claim_token != claimed.claim_token:
-            return None, "claim_lost"
-        if job.locked_by and job.locked_by != claimed.worker_id:
-            return None, "claim_lost"
-        lease = _as_utc(job.lease_expires_at)
-        if lease is not None and lease <= datetime.now(timezone.utc):
-            return None, "lease_expired"
-        if is_redacted_payload(job.payload):
-            return None, "forget_content_redacted"
-        fresh = replace(
-            claimed,
-            payload=job.payload or {},
-            schema_version=int(job.schema_version or claimed.schema_version),
-            trace_id=job.trace_id or claimed.trace_id,
-        )
-        return fresh, ""
+        return verify_claim(db, claimed)
     finally:
         if owns_session:
             db.close()
@@ -176,23 +259,21 @@ def refresh_claimed_job(
 
 def with_execution_authorization(fn: Callable[..., HandlerResult]) -> Callable[..., HandlerResult]:
     """Handler 装饰器：整个外部调用/写入链持共享执行授权。"""
+
     @functools.wraps(fn)
     def wrapper(claimed: ClaimedJob, *args: Any, **kwargs: Any) -> HandlerResult:
         with shared_execution_authorization():
             return fn(claimed, *args, **kwargs)
+
     return wrapper
 
 
 def guard_handler_payload(
     claimed: ClaimedJob,
     session_factory: Callable[[], Any] | None = None,
-    *,
-    require_persisted: bool = True,
 ) -> tuple[ClaimedJob | None, HandlerResult | None]:
-    """LLM / 外部副作用前的统一 fencing：返回 (最新 claimed, 终止结果)。"""
-    fresh, reason = refresh_claimed_job(
-        claimed, session_factory, require_persisted=require_persisted,
-    )
+    """外部副作用前的统一 fencing：返回 (最新 claimed, 终止结果)。"""
+    fresh, reason = refresh_claimed_job(claimed, session_factory)
     if fresh is not None:
         return fresh, None
     if reason == "forget_content_redacted":

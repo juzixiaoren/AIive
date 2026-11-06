@@ -27,6 +27,11 @@ from aiive.db.models import (
 from aiive.memory.recall_config import RetrievalConfig
 from aiive.retrieval.retrieval_index import RetrievalIndexManager
 from aiive.retrieval.retrieval_store import build_entry_fields
+from aiive.forget.visibility_service import ForgetVisibilityService
+from aiive.worker.outbox_execution_auth import (
+    guard_handler_payload,
+    with_execution_authorization,
+)
 from aiive.worker.outbox_dto import (
     ClaimedJob,
     HandlerOutcome,
@@ -87,8 +92,15 @@ def _insert_conflict_do_nothing(
 
 # ── 主入口 ──
 
+@with_execution_authorization
 def handle_retrieval_index_rebuild(claimed: ClaimedJob) -> HandlerResult:
     """retrieval_index_rebuild 三阶段 Handler（有界分批 + CONTINUE）。"""
+    # 全量重建没有单一来源：只校验 claim，逐条按可见性过滤被屏蔽源
+    fresh, blocked = guard_handler_payload(claimed, SessionLocal)
+    if blocked is not None:
+        return blocked
+    assert fresh is not None
+    claimed = fresh
     payload = claimed.payload
     operation_id: str = payload.get("operation_id", "")
 
@@ -275,7 +287,15 @@ def _process_one_batch(
                 and (fields.get("validity_state") or "valid")
                 in ("superseded", "contradicted", "expired")
             )
-            if fields is None or fields.get("is_forgotten") or is_invalid_memory:
+            blocked_source = (
+                bool(ForgetVisibilityService.blocked_target_ids(
+                    db, fields["source_type"],
+                    [(fields["source_id"], fields.get("created_source_at"))],
+                ))
+                if fields is not None else False
+            )
+            if (fields is None or fields.get("is_forgotten") or is_invalid_memory
+                    or blocked_source):
                 # forgotten / validity 非 valid 源：在该 generation 内清理其
                 # Entry（清空文本/不检索），而非保留旧 active 的 current Entry。
                 mgr.tombstone_by_source(
