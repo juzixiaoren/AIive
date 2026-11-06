@@ -210,6 +210,9 @@ Verify 失败；物理删除行（Evidence/CoreBlock/Token/Chunk/Vector）单独
   返回才 unlock；不把 ORM 事务挂在网络调用期间（锁在独立连接上，ORM 事务各自短提交）。
 - 拿到授权后必须重新读 `outbox_jobs`：校验存在性、终态、`claim_token` / `locked_by`、`lease_expires_at`、
   最新 payload 与 `forget_content_redacted`；任何一项不满足即终止，绝不继续使用领取时的旧 payload 副本。
+- 会话归属（`session_is_ours`）：守卫/claim 校验打开的 Session 若由本模块新建（会话与其绑定连接
+  都无外部事务）必须 `close()`，否则会把打开的事务连同连接留在池里，阻塞后续用例或 Worker 的
+  `TRUNCATE`；调用方（单元测试共享会话）已有外层事务时绝不 close。
 - 两种时序：Worker 先取共享授权 → Forget 在 Phase A 排他锁上等待，Purge 必定覆盖该次执行产生的记忆；
   Forget 先取排他锁并 COMMIT → Worker 获得授权后重新读到 Shield/Tombstone 或已脱敏 Job，直接终止，
   不调用 LLM、不写 Memory。

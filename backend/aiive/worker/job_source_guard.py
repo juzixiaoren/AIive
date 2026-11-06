@@ -214,6 +214,10 @@ def _resolve_task(db: Session, claimed: ClaimedJob, sources: JobSources) -> None
     source_event_id = getattr(task, "source_event_id", None)
     if isinstance(source_event_id, str) and source_event_id:
         sources.events.setdefault(source_event_id, None)
+    # AgentTask 的 Turn 来源（Task Runtime 在 run/action 中沿用该 Turn 内容）
+    source_turn = getattr(task, "source_turn_record_id", None)
+    if isinstance(source_turn, str) and source_turn:
+        sources.turns.setdefault(source_turn, None)
 
 
 def _resolve_reminder_task(db: Session, claimed: ClaimedJob, sources: JobSources) -> None:
@@ -384,13 +388,13 @@ def guard_job_sources_visible(
     from aiive.db.models import OutboxJob
     from aiive.worker.outbox_execution_auth import (
         get_session_factory,
-        owns_session_factory,
+        session_is_ours,
         verify_claim,
     )
 
     factory = session_factory or get_session_factory()
     db = factory()
-    owns = owns_session_factory(factory)
+    owns = session_is_ours(db)
     try:
         fresh, reason = verify_claim(db, claimed)
         if fresh is None:

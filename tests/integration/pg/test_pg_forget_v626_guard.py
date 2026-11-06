@@ -220,3 +220,442 @@ def test_pg_forget_waits_for_worker_shared_lock(pg_sessionmaker, pg_engine) -> N
     finally:
         release.set()
         outbox_execution_auth.get_engine = original_engine
+
+
+def _add_shield(s: Session, *, target_type: str, target_id: str, thread_id: str | None = None):
+    """走真实 Phase A：同时建立 Shield 与 Tombstone（PG 有 forget_operations 外键）。"""
+    kwargs: dict[str, list[str]] = {"event_ids": [], "memory_ids": [], "turn_ids": []}
+    key = {
+        "event": "event_ids",
+        "memory_record": "memory_ids",
+        "turn_record": "turn_ids",
+    }[target_type]
+    kwargs[key] = [target_id]
+    execute_phase_a_shield(
+        s, mode="everywhere", requested_by="v626-test", **kwargs,
+    )
+    s.commit()
+
+
+def _retire(s: Session, target_type: str, target_id: str) -> None:
+    from aiive.db.forget_models import ForgetTombstone
+
+    s.query(ForgetShield).filter(
+        ForgetShield.target_type == target_type,
+        ForgetShield.target_id == target_id,
+    ).update({ForgetShield.status: "retired"})
+    s.query(ForgetTombstone).filter(
+        ForgetTombstone.target_type == target_type,
+        ForgetTombstone.target_id == target_id,
+    ).update({ForgetTombstone.block_visibility: False})
+    s.commit()
+
+
+def test_pg_segment_sealing_blocked_before_llm(pg_sessionmaker, monkeypatch) -> None:
+    """Segment Sealing：来源 Event 被 Shield 后不得调用摘要模型。"""
+    from aiive.db.models import CompactionInput, Epoch, Segment
+    from aiive.worker import outbox_handlers
+
+    s: Session = pg_sessionmaker()
+    try:
+        thread_id = _thread(s)
+        turn = _turn(s, thread_id)
+        ev = _event(s, thread_id, "secret", turn.turn_id)
+        epoch = Epoch(id=_id(), thread_id=thread_id, epoch_no=1, status="active")
+        s.add(epoch)
+        s.flush()
+        segment = Segment(
+            id=_id(), epoch_id=epoch.id, thread_id=thread_id, segment_no=1,
+            status="sealing", start_turn_sequence=1, end_turn_sequence=1,
+            source_hash="h1",
+        )
+        s.add(segment)
+        s.flush()
+        ci = CompactionInput(
+            id=_id(), segment_id=segment.id, start_turn_sequence=1,
+            end_turn_sequence=1, turn_manifest=[{"turn_record_id": turn.id}],
+            event_manifest=[{"event_id": ev.id}], working_state_version=1,
+            working_state_snapshot={}, source_hash="h1",
+        )
+        s.add(ci)
+        s.commit()
+        _add_shield(s, target_type="event", target_id=ev.id, thread_id=thread_id)
+        job = _running_job(s, job_type="segment_sealing", payload={
+            "segment_id": segment.id, "compaction_input_id": ci.id,
+            "source_hash": "h1", "summary_version": 1,
+        })
+    finally:
+        s.close()
+
+    monkeypatch.setattr(outbox_handlers, "SessionLocal", pg_sessionmaker)
+    monkeypatch.setattr(
+        outbox_handlers, "_get_llm_client",
+        lambda: (_ for _ in ()).throw(AssertionError("摘要模型不得被调用")),
+    )
+    result = outbox_handlers.handle_segment_sealing(job)
+    assert result.outcome == HandlerOutcome.COMPLETED
+    assert str(result.reason).startswith(BLOCKED_REASON)
+
+
+def test_pg_epoch_checkpoint_blocked_before_llm(pg_sessionmaker, monkeypatch) -> None:
+    """Epoch Checkpoint：Summary 来源 Event 被 Shield 后不得重新生成。"""
+    from aiive.db.models import (
+        Epoch, EpochCompactionInput, Segment, SegmentSummary,
+    )
+    from aiive.worker import outbox_handlers
+
+    s: Session = pg_sessionmaker()
+    try:
+        thread_id = _thread(s)
+        turn = _turn(s, thread_id)
+        ev = _event(s, thread_id, "secret", turn.turn_id)
+        epoch = Epoch(id=_id(), thread_id=thread_id, epoch_no=1, status="sealing")
+        s.add(epoch)
+        s.flush()
+        segment = Segment(
+            id=_id(), epoch_id=epoch.id, thread_id=thread_id, segment_no=1,
+            status="sealing", start_turn_sequence=1, end_turn_sequence=1,
+            source_hash="h1",
+        )
+        s.add(segment)
+        s.flush()
+        summary = SegmentSummary(
+            id=_id(), segment_id=segment.id, source_event_ids=[ev.id],
+            source_turn_ids=[turn.turn_id], summary_version=1,
+        )
+        s.add(summary)
+        s.flush()
+        # sealed 段必须挂 summary（ck_segment_sealed_requires_summary）
+        segment.summary_id = summary.id
+        segment.status = "sealed"
+        eci = EpochCompactionInput(
+            id=_id(), epoch_id=epoch.id, boundary_turn_sequence=1,
+            working_state_version=1, source_segment_ids=[segment.id],
+            source_hashes=["h1"], snapshot_hash="sh1",
+        )
+        s.add(eci)
+        s.commit()
+        _add_shield(s, target_type="event", target_id=ev.id, thread_id=thread_id)
+        job = _running_job(s, job_type="epoch_checkpoint", payload={
+            "epoch_id": epoch.id, "epoch_compaction_input_id": eci.id,
+            "boundary_hash": "bh", "checkpoint_version": 1,
+        })
+    finally:
+        s.close()
+
+    monkeypatch.setattr(outbox_handlers, "SessionLocal", pg_sessionmaker)
+    monkeypatch.setattr(
+        outbox_handlers, "_get_llm_client",
+        lambda: (_ for _ in ()).throw(AssertionError("模型不得被调用")),
+    )
+    result = outbox_handlers.handle_epoch_checkpoint(job)
+    assert result.outcome == HandlerOutcome.COMPLETED
+    assert str(result.reason).startswith(BLOCKED_REASON)
+
+
+def test_pg_conflict_question_blocked_before_llm(pg_sessionmaker, monkeypatch) -> None:
+    """Conflict Question：案例旧 Memory 被 Shield 后不得生成问题。"""
+    from aiive.db.models import MemoryConflictCase, MemoryRecord
+    from aiive.worker import handlers_conflict
+
+    s: Session = pg_sessionmaker()
+    try:
+        thread_id = _thread(s)
+        memory = MemoryRecord(
+            id=_id(), memory_type="fact", canonical_key="k:v626pg",
+            scope_type="thread", scope_id=thread_id, content="old",
+            lifecycle_state="active", validity_state="valid", confidence=0.9,
+            created_at=_now(),
+        )
+        s.add(memory)
+        s.flush()
+        case = MemoryConflictCase(
+            id=_id(), status="pending", thread_id=thread_id, scope_type="thread",
+            scope_id=thread_id, canonical_key="k:v626pg", memory_type="fact",
+            sensitivity="normal", old_memory_id=memory.id, old_record_version=1,
+            old_content="old", new_content="new", proposal_id="p-pg",
+            proposal_payload={"content": "p"}, verdict="conflict",
+            verdict_reason="reason", decision_source="user",
+            resolution_reason="res", idempotency_key="case-v626pg",
+            created_at=_now(),
+        )
+        s.add(case)
+        s.commit()
+        _add_shield(s, target_type="memory_record", target_id=memory.id)
+        job = _running_job(s, job_type="memory_conflict_question", payload={
+            "conflict_case_id": case.id, "thread_id": thread_id,
+        })
+    finally:
+        s.close()
+
+    monkeypatch.setattr(handlers_conflict, "SessionLocal", pg_sessionmaker)
+    monkeypatch.setattr(
+        handlers_conflict, "ConflictQuestionGenerator",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("模型不得被调用")),
+    )
+    result = handlers_conflict.handle_memory_conflict_question(job)
+    assert result.outcome == HandlerOutcome.COMPLETED
+    assert str(result.reason).startswith(BLOCKED_REASON)
+
+
+def test_pg_memory_projection_jobs_blocked(pg_sessionmaker) -> None:
+    """Core / Graph / Vector 投影：Memory 被 Shield 后不得重建。"""
+    from aiive.db.models import MemoryRecord
+    from aiive.worker import outbox_handlers
+
+    s: Session = pg_sessionmaker()
+    try:
+        thread_id = _thread(s)
+        memory = MemoryRecord(
+            id=_id(), memory_type="fact", canonical_key="k:v626pj",
+            scope_type="thread", scope_id=thread_id, content="old",
+            lifecycle_state="active", validity_state="valid", confidence=0.9,
+            created_at=_now(),
+        )
+        s.add(memory)
+        s.commit()
+        _add_shield(s, target_type="memory_record", target_id=memory.id)
+        jobs = {
+            "memory_vector_refresh": _running_job(
+                s, job_type="memory_vector_refresh",
+                payload={"memory_id": memory.id, "record_version": 1},
+            ),
+            "core_memory_refresh": _running_job(
+                s, job_type="core_memory_refresh",
+                payload={"memory_id": memory.id, "record_version": 1},
+            ),
+            "memory_graph_refresh": _running_job(
+                s, job_type="memory_graph_refresh",
+                payload={"memory_id": memory.id, "record_version": 1},
+            ),
+        }
+    finally:
+        s.close()
+
+    handlers = {
+        "memory_vector_refresh": outbox_handlers.handle_memory_vector_refresh,
+        "core_memory_refresh": outbox_handlers.handle_core_memory_refresh,
+        "memory_graph_refresh": outbox_handlers.handle_memory_graph_refresh,
+    }
+    for name, job in jobs.items():
+        result = handlers[name](job)
+        assert result.outcome == HandlerOutcome.COMPLETED, name
+        assert str(result.reason).startswith(BLOCKED_REASON), name
+
+
+def test_pg_tool_operation_blocked_after_forget(pg_sessionmaker) -> None:
+    """ToolOperation：Turn 被 Shield 后不得执行旧内容副作用。"""
+    from aiive.db.models import ToolOperation
+    from aiive.tools import operation_executor
+
+    s: Session = pg_sessionmaker()
+    try:
+        thread_id = _thread(s)
+        turn = _turn(s, thread_id)
+        job = _running_job(s, job_type="tool_operation",
+                           payload={"tool_operation_id": "op-v626pg"})
+        s.add(ToolOperation(
+            id="op-v626pg", idempotency_key="idem-v626pg", thread_id=thread_id,
+            turn_record_id=turn.id, turn_id=turn.turn_id, tool_call_id="call-pg",
+            capability_id="cap", params={}, params_hash="h", descriptor_hash="d",
+            status="queued", effect_mode="db_transactional",
+            outbox_job_id=job.id, trace_id="t-v626pg",
+        ))
+        s.commit()
+        _add_shield(s, target_type="turn_record", target_id=turn.id,
+                    thread_id=thread_id)
+    finally:
+        s.close()
+
+    result = operation_executor.handle_tool_operation(job)
+    assert result.outcome == HandlerOutcome.COMPLETED
+    assert str(result.reason).startswith(BLOCKED_REASON)
+
+
+def test_pg_claim_fencing_rejections(pg_sessionmaker) -> None:
+    """旧 claim、pending、空 token、过期 lease 全部拒绝。"""
+    from aiive.worker.outbox_execution_auth import refresh_claimed_job
+
+    s: Session = pg_sessionmaker()
+    try:
+        job = _running_job(s, job_type="goal_event_dispatch",
+                           payload={"event_id": _id()})
+        fresh, reason = refresh_claimed_job(job, pg_sessionmaker)
+        assert fresh is not None and reason == ""
+
+        def _mutate(**changes):
+            s.query(OutboxJob).filter(OutboxJob.id == job.id).update(changes)
+            s.commit()
+
+        _mutate(status="pending")
+        assert refresh_claimed_job(job, pg_sessionmaker)[0] is None
+
+        _mutate(status="running", claim_token="")
+        assert refresh_claimed_job(job, pg_sessionmaker)[0] is None
+
+        _mutate(claim_token=job.claim_token, locked_by="other-worker")
+        assert refresh_claimed_job(job, pg_sessionmaker)[0] is None
+
+        _mutate(locked_by=job.worker_id,
+                lease_expires_at=_now() - timedelta(seconds=5))
+        assert refresh_claimed_job(job, pg_sessionmaker)[0] is None
+
+        _mutate(lease_expires_at=_now() + timedelta(minutes=5))
+        assert refresh_claimed_job(job, pg_sessionmaker)[0] is not None
+    finally:
+        s.close()
+
+
+def test_pg_unlock_failure_invalidates_connection() -> None:
+    """unlock 返回 false 或抛异常时必须 invalidate，禁止带锁归还连接池。"""
+    from aiive.worker.outbox_execution_auth import (
+        _AuthorizationState,
+        _release_shared,
+    )
+
+    class _Conn:
+        def __init__(self, granted, raise_on_unlock=False):
+            self._granted = granted
+            self._raise = raise_on_unlock
+            self.invalidated = False
+            self.closed = False
+
+        def execute(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            if self._raise:
+                raise RuntimeError("unlock boom")
+            outer = self
+
+            class _R:
+                def scalar(self):
+                    return outer._granted
+
+            return _R()
+
+        def commit(self) -> None:
+            return None
+
+        def invalidate(self) -> None:
+            self.invalidated = True
+
+        def close(self) -> None:
+            self.closed = True
+
+    for granted, raise_on_unlock in ((False, False), (True, True)):
+        conn = _Conn(granted, raise_on_unlock)
+        state = _AuthorizationState(connection=conn)
+        _release_shared(state)
+        assert state.connection is None
+        assert conn.invalidated is True
+        assert conn.closed is True
+
+
+def test_pg_new_job_not_blocked(pg_sessionmaker) -> None:
+    """Shield 之后产生的新 Event / 新 Job 不被误拦截。"""
+    from aiive.worker.job_source_guard import blocked_source_reason, resolve_job_sources
+
+    s: Session = pg_sessionmaker()
+    try:
+        thread_id = _thread(s)
+        turn = _turn(s, thread_id)
+        old_ev = _event(s, thread_id, "old", turn.turn_id)
+        _add_shield(s, target_type="event", target_id=old_ev.id, thread_id=thread_id)
+        new_ev = _event(s, thread_id, "new", turn.turn_id)
+        job = _running_job(s, job_type="goal_event_dispatch",
+                           payload={"event_id": new_ev.id})
+        sources = resolve_job_sources(s, job)
+        assert blocked_source_reason(s, job, sources) == ""
+    finally:
+        s.close()
+
+
+def test_pg_reminder_blocked_then_allowed(pg_sessionmaker, monkeypatch) -> None:
+    """Reminder：来源 Event 被 Shield 时拦截；来源恢复后放行到 Turn 执行。"""
+    from aiive.db.models import Task
+    from aiive.worker import outbox_handlers
+
+    s: Session = pg_sessionmaker()
+    try:
+        thread_id = _thread(s)
+        turn = _turn(s, thread_id)
+        ev = _event(s, thread_id, "secret", turn.turn_id)
+        task = Task(
+            id=_id(), task_type="reminder", status="dispatching",
+            title="喝水", source_event_id=ev.id, thread_id=thread_id,
+        )
+        s.add(task)
+        s.commit()
+        _add_shield(s, target_type="event", target_id=ev.id, thread_id=thread_id)
+        job = _running_job(s, job_type="reminder_delivery", payload={
+            "task_id": task.id, "thread_id": thread_id, "event_id": ev.id,
+            "title": "喝水", "content": "该喝水了",
+        })
+    finally:
+        s.close()
+
+    def _boom(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("Agent Turn 不得启动")
+
+    monkeypatch.setattr(outbox_handlers, "SessionLocal", pg_sessionmaker)
+    monkeypatch.setattr(
+        "aiive.runtime.turn_execution.TurnExecutionService.execute_turn", _boom,
+    )
+    blocked = outbox_handlers.handle_reminder_delivery(job)
+    assert blocked.outcome == HandlerOutcome.COMPLETED
+    assert str(blocked.reason).startswith(BLOCKED_REASON)
+
+    s2: Session = pg_sessionmaker()
+    try:
+        _retire(s2, "event", ev.id)
+    finally:
+        s2.close()
+
+    allowed = outbox_handlers.handle_reminder_delivery(job)
+    assert not str(allowed.reason).startswith(BLOCKED_REASON)
+
+
+def test_pg_agent_task_blocked_then_allowed(pg_sessionmaker, monkeypatch) -> None:
+    """Agent Task：来源 Turn 被 Shield 时拦截；恢复后进入运行时。"""
+    from aiive.db.models import AgentTask
+    from aiive.worker import handlers_agent_tasks
+
+    s: Session = pg_sessionmaker()
+    try:
+        thread_id = _thread(s)
+        turn = _turn(s, thread_id)
+        ev = _event(s, thread_id, "secret", turn.turn_id)
+        task = AgentTask(
+            id=_id(), thread_id=thread_id, source_turn_record_id=turn.id,
+            task_type="research", title="t", goal="g", status="queued",
+            executor_type="llm", priority=0, task_brief={}, task_state={},
+            created_at=_now(),
+        )
+        s.add(task)
+        s.commit()
+        _add_shield(s, target_type="turn_record", target_id=turn.id,
+                    thread_id=thread_id)
+        job = _running_job(s, job_type="agent_task_run",
+                           payload={"task_id": task.id})
+        assert ev is not None
+    finally:
+        s.close()
+
+    calls: list[str] = []
+
+    def _run(self, task_id, *, trigger="dispatch"):  # noqa: ANN001, ANN003
+        calls.append(task_id)
+        raise RuntimeError("runtime reached")
+
+    monkeypatch.setattr(handlers_agent_tasks, "SessionLocal", pg_sessionmaker)
+    monkeypatch.setattr(handlers_agent_tasks.PersistentTaskRuntime, "run", _run)
+    blocked = handlers_agent_tasks.handle_agent_task_run(job)
+    assert str(blocked.reason).startswith(BLOCKED_REASON)
+    assert calls == []
+
+    s2: Session = pg_sessionmaker()
+    try:
+        _retire(s2, "turn_record", turn.id)
+    finally:
+        s2.close()
+
+    handlers_agent_tasks.handle_agent_task_run(job)
+    assert calls == [task.id]

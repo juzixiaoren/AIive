@@ -199,6 +199,25 @@ def owns_session_factory(factory: Callable[[], Any]) -> bool:
     return isinstance(factory, sessionmaker)
 
 
+def session_is_ours(db: Any) -> bool:
+    """判断 Session 是否由本模块新建（可安全 close）。
+
+    判据是「会话本身尚未开启事务、且其绑定的连接也没有外部事务」：
+      - 自己新建的 Session(bind=engine/connection) → 两者都无事务 → 归本模块；
+      - 单元测试的共享会话绑在调用方的外层事务上 → 不归本模块，绝不能 close。
+    """  # noqa: D401
+    try:
+        if db.get_transaction() is not None:
+            return False
+        bind = db.get_bind()
+        in_tx = getattr(bind, "in_transaction", None)
+        if in_tx is None:
+            return True
+        return not bool(in_tx())
+    except Exception:  # pragma: no cover - 探测失败按「非自建」处理更安全
+        return False
+
+
 def authorized_session_factory(fallback: Callable[[], Any]) -> Callable[[], Any]:
     """有活跃授权连接时，返回绑定该连接的 Session 工厂；否则回退调用方工厂。"""
     state = _STATE.get()
@@ -249,7 +268,9 @@ def refresh_claimed_job(
     """
     factory = session_factory or get_session_factory()
     db = factory()
-    owns_session = owns_session_factory(factory)
+    # 归属判定看事务状态：调用方（如单元测试的共享会话）已开事务时不 close，
+    # 自己新建的会话必须在本函数内关闭，避免把连接连同打开的事务留在池里。
+    owns_session = session_is_ours(db)
     try:
         return verify_claim(db, claimed)
     finally:

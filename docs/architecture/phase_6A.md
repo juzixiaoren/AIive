@@ -1061,5 +1061,12 @@ Phase A 提交后 Shield 立即生效，但尚未 Purge 的旧 Outbox Job 仍持
 - SQLite：`test_forget_v626_guard.py` 12 用例（Goal/Trigger/Conflict/投影/ToolOperation 屏蔽、
   claim fencing、conflict_case/tool_operation 精确发现、unparseable fail-closed、
   unlock 失败 invalidate、新 Job 不误拦）。
-- PostgreSQL：`test_pg_forget_v626_guard.py` 3 用例（真实 Phase A 后 Goal 被拦、
-  嵌套 Forget 交接不死锁、Forget 等待在途共享授权）。
+- PostgreSQL：`test_pg_forget_v626_guard.py` 13 用例：
+  Goal Event（真实 Phase A 后拦截）、嵌套 Forget 交接不死锁、Forget 等待在途共享授权、
+  Segment Sealing / Epoch Checkpoint / Conflict Question / Core·Graph·Vector 投影 /
+  ToolOperation 的 Shield 拦截（均断言模型零调用）、claim fencing 四种拒绝、
+  unlock 失败 invalidate、新 Job 不误拦、Reminder 与 Agent Task 的来源 Turn/Event
+  拦截 → 解除后放行对比。
+- 会话归属：`session_is_ours()` 按「会话与绑定连接是否已有外部事务」判断，避免把
+  调用方的共享会话 close 掉，同时确保自建会话不把打开的事务留在连接池（否则会阻塞
+  下一个用例的 TRUNCATE）。
