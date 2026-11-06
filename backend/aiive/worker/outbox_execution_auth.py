@@ -108,12 +108,8 @@ def shared_execution_authorization() -> Generator[None, None, None]:
         connection.close()
 
 
-def current_authorization_connection() -> Any | None:
-    return _ACTIVE_CONNECTION.get()
-
-
 def authorized_session_factory(fallback: Callable[[], Any]) -> Callable[[], Any]:
-    """Return Sessions bound to the authorization connection when one is active."""
+    """有活跃授权连接时，返回绑定该连接的 Session 工厂；否则回退调用方工厂。"""
     active = _ACTIVE_CONNECTION.get()
     if active is None:
         return fallback
