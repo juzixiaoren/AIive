@@ -415,7 +415,8 @@ class EvidenceCollector:
         scanned["outbox_job"] = len(rows)
         items: list[EvidenceItem] = []
         for job in rows:
-            payload = job.payload if isinstance(job.payload, dict) else {}
+            raw_payload: Any = job.payload
+            payload = raw_payload if isinstance(raw_payload, dict) else {}
             if self._thread_blocked(
                 db, str(payload.get("thread_id") or ""),
                 job.updated_at or job.created_at,
