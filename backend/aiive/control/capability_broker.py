@@ -187,6 +187,12 @@ class CapabilityBroker:
         return issues
 
     def dispatch(self, task: AgentTask, run: AgentRun, action: AgentAction) -> dict[str, Any]:
+        from aiive.worker.outbox_execution_auth import require_execution_authorization
+        from aiive.worker.job_source_guard import task_sources_visible
+
+        require_execution_authorization()
+        if not task_sources_visible(self.db, task.id):
+            return {"ok": False, "error": "forget_source_blocked", "error_type": "source_blocked"}
         scope = TaskScope.from_brief(task.task_brief or {})
         registry = self.registry_for(task)
         registration = registry.get(action.capability_id)

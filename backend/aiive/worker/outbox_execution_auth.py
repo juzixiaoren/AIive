@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import functools
 import logging
+import concurrent.futures
+import threading
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -40,6 +42,13 @@ class _AuthorizationState:
 
     connection: Any | None
     suspended_for_forget: bool = False
+    gate: Any = None
+    claimed: ClaimedJob | None = None
+    owner_thread_id: int = field(default_factory=threading.get_ident)
+
+    def assert_owner(self) -> None:
+        if self.owner_thread_id != threading.get_ident():
+            raise RuntimeError("execution_authorization_wrong_thread")
 
 
 _STATE: ContextVar[_AuthorizationState | None] = ContextVar(
@@ -70,7 +79,7 @@ def _acquire_shared(timeout_ms: int | None = None) -> Any:
     connection = get_engine().connect()
     try:
         if timeout_ms is not None:
-            connection.execute(sa_text(f"SET lock_timeout = {int(timeout_ms)}"))
+            connection.execute(sa_text(f"SET LOCAL lock_timeout = {int(timeout_ms)}"))
         connection.execute(
             sa_text("SELECT pg_advisory_lock_shared(:ns, :key)"), _LOCK_PARAMS,
         )
@@ -84,6 +93,7 @@ def _acquire_shared(timeout_ms: int | None = None) -> Any:
 
 def _release_shared(state: _AuthorizationState) -> None:
     """释放共享锁；任何失败都 invalidate 连接，禁止带锁归还连接池。"""
+    state.assert_owner()
     connection = state.connection
     state.connection = None
     if connection is None:
@@ -109,15 +119,12 @@ def _release_shared(state: _AuthorizationState) -> None:
 @contextmanager
 def shared_execution_authorization() -> Generator[None, None, None]:
     """持共享执行授权直到外部调用与写入提交结束（可重入）。"""
-    if not _is_postgres():
-        yield
-        return
     existing = _STATE.get()
     if existing is not None:
-        # 嵌套调用：外层已持有授权；若因 Forget 交接被释放，这里不擅自重取
+        require_execution_authorization()
         yield
         return
-    state = _AuthorizationState(connection=_acquire_shared())
+    state = _AuthorizationState(connection=_acquire_shared() if _is_postgres() else None)
     token = _STATE.set(state)
     try:
         yield
@@ -133,6 +140,12 @@ def release_execution_authorization() -> None:
     再排队等排他锁会永久自锁，必须先放掉共享授权。
     """
     state = _STATE.get()
+    if state is not None and state.gate is not None:
+        # The gate contains only thread-safe control state, never a DB connection.
+        with state.gate.lock:
+            if state.gate.cancelled:
+                raise RuntimeError("forget_cancelled_before_phase_a")
+            state.gate.forget_started = True
     if state is None or state.connection is None:
         return
     logger.debug("释放共享执行授权以进入 Forget Phase A 排他锁")
@@ -149,6 +162,7 @@ def resume_execution_authorization(*, timeout_ms: int | None = None) -> bool:
     state = _STATE.get()
     if state is None or not _is_postgres():
         return True
+    state.assert_owner()
     if state.connection is not None:
         return True
     budget = RESUME_LOCK_TIMEOUT_MS if timeout_ms is None else timeout_ms
@@ -168,9 +182,76 @@ def has_execution_authorization() -> bool:
     return state is not None and state.connection is not None
 
 
+def require_execution_authorization() -> None:
+    """A suspended worker must stop before another model call or side effect."""
+    state = _STATE.get()
+    if state is not None and not resume_execution_authorization():
+        raise RuntimeError("execution_authorization_restore_failed")
+
+
+class _ToolGate:
+    def __init__(self) -> None:
+        self.lock: Any = threading.Lock()
+        self.cancelled: bool = False
+        self.forget_started: bool = False
+
+
+def execute_in_tool_thread(executor: Any, invoke: Callable[[], Any], timeout: float) -> Any:
+    """Transfer execution, never Connection ownership, to a pool worker.
+
+    The parent releases its own connection before submission. The child acquires
+    and closes its own connection, rechecks the claim/sources, and can therefore
+    enter Phase A without a parent/child lock cycle. No Context is copied.
+    Timeout revokes permission to *start* Forget under the same gate lock. Once
+    Phase A starts, await its definitive commit/rollback rather than report a
+    failure while a destructive operation is still executing in the background.
+    """
+    parent = _STATE.get()
+    claimed = parent.claimed if parent else None
+    gate = _ToolGate()
+    if parent is not None:
+        _release_shared(parent)
+        parent.suspended_for_forget = True
+
+    def child() -> Any:
+        with shared_execution_authorization():
+            state = _STATE.get()
+            if state is not None:
+                state.gate = gate
+                state.claimed = claimed
+            with gate.lock:
+                if gate.cancelled:
+                    raise concurrent.futures.CancelledError()
+            if claimed is not None:
+                from aiive.worker.job_source_guard import guard_job_sources_visible
+
+                _, blocked = guard_job_sources_visible(claimed)
+                if blocked is not None:
+                    raise RuntimeError(blocked.reason)
+            return invoke()
+
+    try:
+        future = executor.submit(child)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            with gate.lock:
+                started = gate.forget_started
+                if not started:
+                    gate.cancelled = True
+            if started:
+                return future.result()
+            future.cancel()
+            raise
+    finally:
+        # Runs on the parent thread even if the child timed out or raised.
+        require_execution_authorization()
+
+
 def get_session_factory() -> Callable[[], Any]:
     state = _STATE.get()
     if state is not None and state.connection is not None:
+        state.assert_owner()
         from sqlalchemy.orm import Session
 
         return _mark_owns_session(lambda: Session(bind=state.connection, expire_on_commit=False))
@@ -223,6 +304,7 @@ def authorized_session_factory(fallback: Callable[[], Any]) -> Callable[[], Any]
     state = _STATE.get()
     if state is None or state.connection is None:
         return fallback
+    state.assert_owner()
     from sqlalchemy.orm import Session
 
     return _mark_owns_session(lambda: Session(bind=state.connection, expire_on_commit=False))
@@ -284,6 +366,9 @@ def with_execution_authorization(fn: Callable[..., HandlerResult]) -> Callable[.
     @functools.wraps(fn)
     def wrapper(claimed: ClaimedJob, *args: Any, **kwargs: Any) -> HandlerResult:
         with shared_execution_authorization():
+            state = _STATE.get()
+            if state is not None:
+                state.claimed = claimed
             return fn(claimed, *args, **kwargs)
 
     return wrapper

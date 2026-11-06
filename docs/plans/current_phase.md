@@ -1,7 +1,7 @@
 # Current Phase
 
 ## 版本索引
-- 主干最新：**V62.6 Job 来源守卫 + 执行授权全覆盖 + 精确关联补齐**（2026-11-06）→ 见文末「### V62.6 …」；上一版为 V62.5 Outbox 精确关联与执行授权。
+- 当前工作版本：**V62.6.1 Forget 来源闭包与跨线程执行授权修复**（2026-11-06）→ 见文末「### V62.6 …」；上一版为 V62.5 Outbox 精确关联与执行授权。
 - 历史版本：V62.4 / V62.5 依次见文末。
 - 历史阶段：V34 → V54 按时间顺序记录在下方各节；下方 `## Phase` / `## Status` 是 V34 阶段的原始记录，不再代表当前主干。
 
@@ -1053,3 +1053,15 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - 元数据：`COMMON_CONTENT_FIELDS` 移除 `trigger`，`state/plan/progress/details` 按 job_type 归类。
 - 证据：`EvidenceCollector` 过滤被 Shield 覆盖的 Task/Action/Job 证据。
 - 测试：SQLite 12 用例、PG 3 用例（真实 Phase A 拦截、嵌套 Forget 不死锁、Forget 等待在途执行）。
+
+
+### V62.6.1 Forget 来源闭包与跨线程执行授权修复（2026-11-06）
+
+- 基线：`f966dae48c22eceb7bf191be27bf57a212c9b112`；fetch 后 origin/main 与 HEAD 一致，开始时工作区干净。
+- 状态：completed。代码、功能与资源清理验收完成；用户授权的两份历史测试库已清理，新测试库自动清理验证通过。全量 1716 passed / 118 skipped；真实 PostgreSQL 105 passed / 13 skipped；Ruff、basedpyright、前端构建、隔离 PG Alembic upgrade/check 均通过。完整证据见 `docs/audit/v6261_acceptance.md`。
+- 实现：三个 P0 与四个 P1 的代码路径、来源缺失规则 1、真实 PostgreSQL 线程池调用链回归；无新 API、表或 Alembic 迁移。
+- 可观察行为：Event Shield 立即阻止其 Memory 进入 Embedding/投影/维护；正常新数据和已证明的独立人工记忆仍可执行；旧 Task 无法用新 Job 时间绕过 Shield；被遗忘证据不进入 LLM；混合 WorkingState 按条目过滤。
+- 限制：来源不明的历史 Memory/WorkingState 采用隔离/阻止新快照，未自动推测来源；Phase A 已开始时等待确定事务结果，可超过通用工具超时。真实外部 Embedding smoke 不属于离线验收。
+- 清理：SQLite rollback / tmp_path；PG 测试使用一次性容器，fixture teardown 删除；Alembic 使用独立一次性容器并在 finally 清理，保留原有用户容器。
+
+- V62.6.1 清理补验：根 conftest 先关闭 Session/连接池再删除本进程测试库，失败写报告并返回非零码；真实子进程回归 3 passed，最终全量 1716 passed、PG 105 passed，清理报告 verified。

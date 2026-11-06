@@ -2349,3 +2349,22 @@ RepairLoop 将一次自修复拆成有边界的阶段：
 - [Embedding Input Builder](https://github.com/juzixiaoren/AIive/blob/main/backend/aiive/knowledge/embedding_input.py)
 - [Knowledge Maintenance](https://github.com/juzixiaoren/AIive/blob/main/backend/aiive/knowledge/maintenance.py)
 - [Knowledge Fallback Regression Tests](https://github.com/juzixiaoren/AIive/blob/main/tests/unit/backend/test_chunker_fallback.py)
+
+## V62.6.1：来源闭包和线程之间的执行边界
+
+Memory 不仅是 Shield 的目标，也携带上游 Event 的隐私约束。读取时先检查自身，
+再检查全部 Event 的真实元数据与 Turn 关系。反向“Memory 遗忘 → 来源历史隔离”与正向
+“历史遗忘 → Memory 禁用”采用不同的检查方向，避免递归及 memory_only 的范围反射。
+无来源的人工记忆必须由持久化提案证明为独立手动创建；来源不明的普通记忆会被隔离。
+
+ThreadPool 的 ContextVar 默认不传播，而 SQLAlchemy Connection 又不能并行跨线程使用。
+修复后共享连接从不交给子线程：父线程在等待工具前释放；子线程用自己的连接持授权并
+重新检查来源；嵌套 Forget 在子线程中正常释放共享锁、用业务 Session 取排他锁提交；
+父线程恢复授权后才返回。恢复失败会中止 Runtime，下一次推理/副作用还须重查 Task 来源。
+超时前没有启动的 Forget 会被撤销；已启动的 Phase A 必须返回真实事务结果。
+
+Maintenance 在读取候选、冻结正文与执行旧计划三个时点检查闭包；跳过记录不复制正文，
+仍形成终态统计和游标进展。Epoch 不再用 WorkingState.updated_at 证明整个混合快照安全：
+每项须有可追溯来源，已遗忘项剔除，新项保留，未知来源阻止新快照。
+使用既有 Provenance/Manifest/授权模块，无新表、新迁移或独立 Forget 机制。
+详见 [验收报告](audit/v6261_acceptance.md)。

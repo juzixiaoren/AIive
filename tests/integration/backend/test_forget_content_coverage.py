@@ -1644,6 +1644,8 @@ def test_unified_retriever_cannot_recall_after_forget(db_session: Session) -> No
     )
     db_session.add_all([summary, memory])
     db_session.flush()
+    from tests.support import attach_memory_event_source
+    attach_memory_event_source(db_session, memory)
     refresh_source(db_session, "segment_summary", summary.id, "memory.created")
     refresh_source(db_session, "memory_record", memory.id, "memory.created")
     db_session.commit()

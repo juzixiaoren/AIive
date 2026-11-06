@@ -32,6 +32,8 @@ def _record(db_session) -> MemoryRecord:
     )
     db_session.add(record)
     db_session.flush()
+    from tests.support import attach_memory_event_source
+    attach_memory_event_source(db_session, record)
     return record
 
 

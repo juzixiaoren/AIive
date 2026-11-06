@@ -181,7 +181,8 @@ def handle_memory_conflict_reply(claimed: ClaimedJob) -> HandlerResult:
         )
         db.commit()
         # 嵌套 Forget 可能已释放共享授权：提交后重新获取并复查来源
-        resume_execution_authorization()
+        if not resume_execution_authorization():
+            raise RuntimeError("execution_authorization_restore_failed")
         logger.info(
             "冲突回复处理完成: case=%s decision=%s status=%s memory=%s",
             case_id, decision.decision, outcome.status, outcome.memory_id,

@@ -214,6 +214,8 @@ def _mk(
     )
     db.add(record)
     db.flush()
+    from tests.support import attach_memory_event_source
+    attach_memory_event_source(db, record)
     return record
 
 

@@ -19,7 +19,10 @@ def _make_and_store(store, key, content, mem_type="user_profile"):
         evidence=[EvidenceItem(source_type="user_message", trust_level=TrustLevel.TRUSTED.value)],
     )
     p.compute_request_idempotency()
-    return store.create_record(p, lifecycle_state=LifecycleState.ACTIVE.value)
+    record = store.create_record(p, lifecycle_state=LifecycleState.ACTIVE.value)
+    from tests.support import attach_memory_event_source
+    attach_memory_event_source(store._db, record)
+    return record
 
 
 class TestMemoryReadModel:

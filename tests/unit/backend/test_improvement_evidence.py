@@ -52,11 +52,19 @@ def _task(
 
 
 def _job(db, *, job_type: str = "memory_extraction", error: str = "bad payload") -> OutboxJob:
+    from aiive.db.models import Event
+    tid = str(uuid.uuid4())
+    db.add(Thread(id=tid, title="job evidence"))
+    db.flush()
+    event = Event(id=str(uuid.uuid4()), trace_id=str(uuid.uuid4()), thread_id=tid,
+                  event_type="user_message", payload={"text": "evidence"})
+    db.add(event)
+    db.flush()
     row = OutboxJob(
         operation_id=f"op-{uuid.uuid4().hex}",
         job_type=job_type,
         status="deadletter",
-        payload={},
+        payload={"source_event_ids": [event.id]},
         error_message=error,
         created_at=_now(),
         updated_at=_now(),

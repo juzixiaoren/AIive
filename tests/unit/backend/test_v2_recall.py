@@ -31,6 +31,8 @@ def _mk(db, canonical_key, content, memory_type="knowledge", scope_type="global"
     )
     db.add(rec)
     db.flush()
+    from tests.support import attach_memory_event_source
+    attach_memory_event_source(db, rec)
     return rec
 
 

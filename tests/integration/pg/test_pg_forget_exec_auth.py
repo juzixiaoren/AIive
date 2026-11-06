@@ -98,6 +98,8 @@ def _advisory_locks(pg_engine) -> list[tuple[str, bool]]:
 
 def _make_extraction_job(s: Session, thread_id: str, turn: TurnRecord, ev: str,
                          *, created_at: datetime, operation_id: str) -> OutboxJob:
+    assistant_id = _event(s, thread_id, "case reply", created_at, turn.turn_id)
+    s.get(Event, assistant_id).event_type = "llm_response"
     job = OutboxJob(
         id=_id(), operation_id=operation_id, job_type="memory_extraction",
         status="running",
@@ -105,7 +107,7 @@ def _make_extraction_job(s: Session, thread_id: str, turn: TurnRecord, ev: str,
             "user_message": "case secret", "reply": "case reply",
             "thread_id": thread_id, "source_event_ids": [ev],
             "source_turn_record_id": turn.id, "source_turn_id": turn.turn_id,
-            "assistant_event_id": _id(), "message_source": "user",
+            "assistant_event_id": assistant_id, "message_source": "user",
             "extraction_mode": "async",
         },
         trace_id="case-trace", max_retries=3, created_at=created_at,

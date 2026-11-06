@@ -83,6 +83,9 @@ class MemoryVectorProjectionService:
             delete_result = self.delete(memory_id, expected_version)
             return "inactive_deleted" if delete_result == "deleted" else delete_result
 
+        if memory_id not in ForgetVisibilityService.filter_memory_ids(self._db, [memory_id]):
+            self.delete(memory_id, expected_version)
+            return "forget_source_blocked"
         provider = self._provider_factory()
         vector = provider.embed(self._embedding_text(record), input_type="document")
         projection = self._db.get(MemoryVectorProjection, memory_id)

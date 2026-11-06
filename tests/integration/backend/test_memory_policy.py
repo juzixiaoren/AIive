@@ -50,6 +50,8 @@ def _record(db, *, record_id: str, content: str, sensitivity: str | None) -> Mem
     )
     db.add(record)
     db.flush()
+    from tests.support import attach_memory_event_source
+    attach_memory_event_source(db, record)
     return record
 
 

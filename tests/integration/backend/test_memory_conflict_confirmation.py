@@ -150,6 +150,8 @@ def _seed_record(db, proposal: MemoryProposal) -> MemoryRecord:
         validity_state=ValidityState.VALID.value,
     )
     db.flush()
+    from tests.support import attach_memory_event_source
+    attach_memory_event_source(db, record)
     GraphProjectionService(db).refresh(record.id, record.record_version)
     db.flush()
     return record
@@ -178,6 +180,12 @@ def _defer_plan(proposal: MemoryProposal, old: MemoryRecord, verdict: str = VERD
 
 def _park_case(db, *, thread_id: str, proposal: MemoryProposal, old: MemoryRecord,
                verdict: str = VERDICT_UNCERTAIN) -> MemoryConflictCase:
+    from tests.support import create_memory_source_event
+    if not proposal.source_event_ids:
+        event = create_memory_source_event(db, thread_id, proposal.content)
+        proposal.source_event_ids = [event.id]
+        proposal.evidence[0].source_event_id = event.id
+        proposal.compute_request_idempotency()
     case_id = MemoryConflictService.park(
         db, proposal=proposal, plan=_defer_plan(proposal, old, verdict),
         run_context=_ctx(thread_id),
@@ -610,9 +618,16 @@ class TestReplyEntryPoint:
         new = _proposal("user.lives_in", "用户现在住在上海")
         case = _park_case(db, thread_id=thread_id, proposal=new, old=old)
 
+        from aiive.db.models import TurnRecord, Event
+        turn = TurnRecord(id="turn-1", turn_id="turn-1", thread_id=thread_id, status="completed")
+        db.add(turn)
+        db.flush()
+        db.add(Event(id="evt-1", trace_id="trace-reply", thread_id=thread_id,
+                     turn_id=turn.turn_id, event_type="user_message", payload={"text": "以新的为准"}))
+        db.flush()
         MemoryConflictService.enqueue_reply_jobs(
             db, thread_id=thread_id, user_message="以新的为准",
-            turn_id="turn-1", source_event_ids=["evt-1"],
+            turn_id=turn.turn_id, source_event_ids=["evt-1"],
         )
         db.commit()
         job = db.query(OutboxJob).filter(OutboxJob.job_type == JOB_CONFLICT_REPLY).one()

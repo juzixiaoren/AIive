@@ -313,6 +313,7 @@ class MemoryWriteService:
         数百次查询；缓存只在单个事务的 write_batch 内复用，不跨事务。
         """
         event_ids, turn_ids = self._collect_forget_sources(proposal, run_context)
+        proposal.source_event_ids = sorted(event_ids)
         cache = memo if memo is not None else {}
 
         def _blocked(kind: str, value: str) -> bool:
@@ -410,7 +411,7 @@ class MemoryWriteService:
                 proposal=proposal, lifecycle_state=target_state,
                 validity_state=ValidityState.VALID.value,
             )
-            self._write_evidence_batch(record.id, proposal.evidence)
+            self._write_evidence_batch(record.id, proposal.evidence, proposal.source_event_ids)
             self._persist_proposal(proposal, gate_decision, final_op="create", final_memory_id=record.id)
             self._log_event(tid, proposal, "memory.created", record.id)
             self._enqueue_projection(record, "memory.created")
@@ -464,7 +465,7 @@ class MemoryWriteService:
         existing.updated_at = datetime.now(timezone.utc)
 
         self._merge_reinforce_keywords(proposal, existing)
-        self._write_evidence_batch(existing.id, proposal.evidence)
+        self._write_evidence_batch(existing.id, proposal.evidence, proposal.source_event_ids)
         self._persist_proposal(proposal, gate_decision, final_op="reinforce", final_memory_id=existing.id)
         self._log_event(thread_id, proposal, "memory.reinforced", existing.id)
         self._enqueue_projection(existing, "memory.reinforced")
@@ -595,7 +596,7 @@ class MemoryWriteService:
                     lifecycle_state=target_state,
                     validity_state=ValidityState.VALID.value,
                 )
-                self._write_evidence_batch(record.id, proposal.evidence)
+                self._write_evidence_batch(record.id, proposal.evidence, proposal.source_event_ids)
                 self._persist_proposal(
                     proposal, gate_decision,
                     final_op="create", final_memory_id=record.id,
@@ -840,7 +841,7 @@ class MemoryWriteService:
                 lifecycle_state=target_state,
                 validity_state=ValidityState.VALID.value,
             )
-            self._write_evidence_batch(record.id, proposal.evidence)
+            self._write_evidence_batch(record.id, proposal.evidence, proposal.source_event_ids)
             self._persist_proposal(
                 proposal, gate_decision, final_op="create", final_memory_id=record.id,
             )
@@ -905,7 +906,7 @@ class MemoryWriteService:
         candidate.record_version += 1
         candidate.updated_at = datetime.now(timezone.utc)
 
-        self._write_evidence_batch(candidate.id, proposal.evidence)
+        self._write_evidence_batch(candidate.id, proposal.evidence, proposal.source_event_ids)
         self._persist_proposal(
             proposal, gate_decision,
             final_op="promote", final_memory_id=candidate.id,
@@ -976,7 +977,7 @@ class MemoryWriteService:
         existing.updated_at = datetime.now(timezone.utc)
 
         self._merge_reinforce_keywords(proposal, existing)
-        self._write_evidence_batch(existing.id, proposal.evidence)
+        self._write_evidence_batch(existing.id, proposal.evidence, proposal.source_event_ids)
         self._persist_proposal(
             proposal, gate_decision,
             final_op="reinforce", final_memory_id=existing.id,
@@ -1035,7 +1036,7 @@ class MemoryWriteService:
                 lifecycle_state=LifecycleState.CANDIDATE.value,
                 validity_state=ValidityState.VALID.value,
             )
-            self._write_evidence_batch(record.id, proposal.evidence)
+            self._write_evidence_batch(record.id, proposal.evidence, proposal.source_event_ids)
             self._persist_proposal(
                 proposal, gate_decision,
                 final_op="create", final_memory_id=record.id,
@@ -1079,7 +1080,7 @@ class MemoryWriteService:
             reason=resolution.reason,
         ))
 
-        self._write_evidence_batch(new_record.id, proposal.evidence)
+        self._write_evidence_batch(new_record.id, proposal.evidence, proposal.source_event_ids)
         self._persist_proposal(
             proposal, gate_decision,
             final_op=resolution.operation, final_memory_id=new_record.id,
@@ -1107,6 +1108,14 @@ class MemoryWriteService:
     ) -> WriteResult:
         """Merge multiple existing records into one new record."""
         old_ids: list[str] = [r.id for r in resolution.existing_records]
+        inherited = {
+            ref.source_id for ref in self._db.query(ContentProvenanceRef).filter(
+                ContentProvenanceRef.owner_type == "memory_record",
+                ContentProvenanceRef.owner_id.in_(old_ids),
+                ContentProvenanceRef.source_type == "event",
+            ).all()
+        }
+        proposal.source_event_ids = sorted(set(proposal.source_event_ids) | inherited)
 
         for old in resolution.existing_records:
             old.validity_state = ValidityState.SUPERSEDED.value
@@ -1129,7 +1138,7 @@ class MemoryWriteService:
                 reason=resolution.reason,
             ))
 
-        self._write_evidence_batch(new_record.id, proposal.evidence)
+        self._write_evidence_batch(new_record.id, proposal.evidence, proposal.source_event_ids)
         self._persist_proposal(
             proposal, gate_decision,
             final_op="merge", final_memory_id=new_record.id,
@@ -1233,7 +1242,8 @@ class MemoryWriteService:
             raise
 
     def _write_evidence_batch(
-        self, memory_id: str, evidence: list[EvidenceItem]
+        self, memory_id: str, evidence: list[EvidenceItem],
+        source_event_ids: list[str] | None = None,
     ) -> None:
         """Write evidence items and durable Memory → Event provenance refs.
 
@@ -1242,7 +1252,7 @@ class MemoryWriteService:
         必须存活，供读取侧可见性屏蔽、防重抽与 Summary 重建长期反查。
         与 MemoryEvidence 同事务写入；按唯一约束去重，保证幂等。
         """
-        src_event_ids = {
+        src_event_ids = set(source_event_ids or []) | {
             ev.source_event_id for ev in evidence if ev.source_event_id
         }
         if src_event_ids:

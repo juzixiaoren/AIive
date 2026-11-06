@@ -499,6 +499,13 @@ def test_blocked_target_ids_all_user_data_global(db_session: Session):
     db_session.commit()
 
     id_old, id_old2, id_new, id_unknown = _new_id(), _new_id(), _new_id(), _new_id()
+    from aiive.db.models import MemoryRecord
+    from tests.support import attach_memory_event_source
+    for mid, stamp in [(id_old, before), (id_old2, before), (id_new, after)]:
+        record = MemoryRecord(id=mid, memory_type="fact", content="cutoff fixture",
+                              scope_type="global", lifecycle_state="active", created_at=stamp)
+        db_session.add(record)
+        attach_memory_event_source(db_session, record)
     blocked = ForgetVisibilityService.blocked_target_ids(
         db_session, "memory_record",
         [(id_old, before), (id_old2, before), (id_new, after), (id_unknown, None)],
@@ -745,6 +752,10 @@ def test_blocked_target_ids_selector_scope(db_session: Session):
         created_at=earlier))
     db_session.commit()
 
+    from tests.support import attach_memory_event_source
+    from aiive.db.models import MemoryRecord
+    for record in db_session.query(MemoryRecord).all():
+        attach_memory_event_source(db_session, record)
     blocked = ForgetVisibilityService.blocked_target_ids(
         db_session, "memory_record", [(m_match, earlier), (m_other, earlier)])
     assert m_match in blocked
@@ -826,6 +837,10 @@ def test_blocked_target_ids_selector_canonical_key(db_session: Session):
         created_at=earlier))
     db_session.commit()
 
+    from tests.support import attach_memory_event_source
+    from aiive.db.models import MemoryRecord
+    for record in db_session.query(MemoryRecord).all():
+        attach_memory_event_source(db_session, record)
     blocked = ForgetVisibilityService.blocked_target_ids(
         db_session, "memory_record", [(m_match, earlier), (m_other, earlier)])
     assert m_match in blocked
@@ -866,6 +881,10 @@ def test_blocked_target_ids_selector_time_range(db_session: Session):
         created_at=now - timedelta(days=100)))
     db_session.commit()
 
+    from tests.support import attach_memory_event_source
+    from aiive.db.models import MemoryRecord
+    for record in db_session.query(MemoryRecord).all():
+        attach_memory_event_source(db_session, record)
     blocked = ForgetVisibilityService.blocked_target_ids(
         db_session, "memory_record", [(m_in, now), (m_out, now - timedelta(days=100))])
     assert m_in in blocked

@@ -56,6 +56,8 @@ def _mk_record(db, **kwargs) -> MemoryRecord:
     rec = MemoryRecord(**defaults)
     db.add(rec)
     db.flush()
+    from tests.support import attach_memory_event_source
+    attach_memory_event_source(db, rec)
     return rec
 
 

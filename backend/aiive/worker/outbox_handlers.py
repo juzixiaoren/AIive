@@ -1034,17 +1034,22 @@ def _maintenance_lane_has_more(
         cursor_time=ct,
         cursor_id=cid,
         limit=1,
+        scan_limit=1,
         now=now,
         ttl_days=cfg.candidate_ttl_days,
         cooling_days=cfg.sleep_cooling_days,
     )
-    return len(seeds) > 0
+    return bool(seeds or store.maintenance_scan)
 
 
 def _freeze_input(_db: Session, batch_id: str, run_id: str, record: Any, input_role: str, seq: int, _now: Any, _cfg: Any, store: Any) -> MemoryMaintenanceInput:
     """冻结单条记忆快照为 MemoryMaintenanceInput。"""
     from aiive.memory.memory_mutation import hashes_for_record
 
+    from aiive.forget.visibility_service import ForgetVisibilityService
+
+    if record.id not in ForgetVisibilityService.filter_memory_ids(_db, [record.id]):
+        raise ValueError("forget_source_blocked_before_freeze")
     state_hash, decision_hash = hashes_for_record(record)
     protected, source_ids = store.is_user_required_protected(record.id)
     snapshot = {
@@ -1143,11 +1148,13 @@ def _create_batch_and_freeze(db: Session, run: MemoryMaintenanceRun, lane: str, 
         cursor_time=ct,
         cursor_id=cid,
         limit=cfg.max_maintenance_batch,
+        scan_limit=cfg.max_maintenance_batch,
         now=now,
         ttl_days=cfg.candidate_ttl_days,
         cooling_days=cfg.sleep_cooling_days,
     )
-    if not seeds:
+    scanned = store.maintenance_scan
+    if not scanned:
         return None
 
     max_no = db.query(MemoryMaintenanceBatch.batch_no).filter(
@@ -1188,10 +1195,21 @@ def _create_batch_and_freeze(db: Session, run: MemoryMaintenanceRun, lane: str, 
 
     for inp in inputs:
         db.add(inp)
-    batch.candidate_count = len(inputs)
+    rejected = {record.id: record for record in [*scanned, *store.maintenance_rejected_neighbors]
+                if record.id not in seen}
+    for sequence, record in enumerate(rejected.values(), 1):
+        # Negative sequences are reserved for metadata-only visibility skips;
+        # planner sequences remain unchanged and stable across recovery.
+        db.add(MemoryMaintenanceAction(
+            run_id=run.id, batch_id=batch.id, action_sequence=-sequence,
+            subject_memory_record_id=record.id, source_input_ids=[], related_record_ids=[],
+            action_type="no_op", reason_code="forget_source_blocked", status="skipped_stale",
+            idempotency_key=f"{batch.id}:forget_skip:{record.id}", applied_at=now,
+        ))
+    batch.candidate_count = len(inputs) + len(rejected)
 
     # 续跑游标：本批最后一条 seed 的 (lane_time, id)
-    last_seed = seeds[-1]
+    last_seed = scanned[-1]
     batch.cursor_end_time = _seed_lane_time(last_seed, lane)
     batch.cursor_end_id = last_seed.id
     db.flush()
@@ -1234,7 +1252,10 @@ def _persist_actions(db: Session, batch: MemoryMaintenanceBatch, actions: Any, i
     """B2：持久化确定性 Action（幂等），Batch frozen → planned。"""
     batch.input_hash = input_hash
     batch.plan_hash = plan_hash
-    batch.action_count = len(actions)
+    batch.action_count = len(actions) + db.query(MemoryMaintenanceAction).filter(
+        MemoryMaintenanceAction.batch_id == batch.id,
+        MemoryMaintenanceAction.action_sequence < 0,
+    ).count()
     batch.status = "planned"
     batch.planned_at = now
     for a in actions:
@@ -1287,7 +1308,19 @@ def _execute_batch(db: Session, batch: MemoryMaintenanceBatch, run: MemoryMainte
             else:
                 skipped += 1
             continue
+        from aiive.forget.visibility_service import ForgetVisibilityService
+
+        source_inputs = db.query(MemoryMaintenanceInput).filter(
+            MemoryMaintenanceInput.id.in_(act.source_input_ids or []),
+        ).all()
+        missing = len({row.id for row in source_inputs}) != len(set(act.source_input_ids or []))
+        blocked_inputs = ForgetVisibilityService.blocked_target_ids(
+            db, "memory_record", [(row.memory_record_id, None) for row in source_inputs],
+        )
         grp = act.operation_group_id or ""
+        if missing or blocked_inputs:
+            act.reason_code = "forget_source_blocked"
+            stale_groups.add(grp)
         if grp in stale_groups:
             act.status = "skipped_stale"
             act.applied_at = now

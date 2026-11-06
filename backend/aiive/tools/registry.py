@@ -453,15 +453,18 @@ class ToolRegistry:
     ) -> dict[str, Any]:
         """在线程池执行本地或 Desktop WebSocket 代理 handler。"""
         has_ctx = "ctx" in inspect.signature(reg.handler).parameters
-        future = _tool_executor.submit(_invoke_handler, reg.handler, has_ctx, run_context, params)
+        from aiive.worker.outbox_execution_auth import execute_in_tool_thread
+
         try:
-            result = future.result(timeout=timeout)
+            result = execute_in_tool_thread(
+                _tool_executor,
+                lambda: _invoke_handler(reg.handler, has_ctx, run_context, params),
+                timeout,
+            )
             logger.info("[TRACE:registry] SUCCESS tool=%s result_type=%s", capability_id, type(result).__name__)
             return {"ok": True, "result": result}
         except concurrent.futures.TimeoutError:
-            # 关键：超时后不 cancel + wait，直接返回错误。
-            # 子线程会继续运行直到自行结束（DB I/O 完成后自然退出）。
-            # 如果 cancel 并 wait，会因为 DB 阻塞 I/O 无法中断而死锁。
+            # Forget 尚未进入 Phase A 时撤销其启动许可；已进入则等待确定终态。
             logger.error(
                 "[TRACE:registry] TIMEOUT tool=%s after %.0fs params=%s",
                 capability_id, timeout, params,
@@ -479,6 +482,9 @@ class ToolRegistry:
                 "timeout_seconds": timeout,
             }
         except Exception as e:
+            from aiive.worker.outbox_execution_auth import require_execution_authorization
+
+            require_execution_authorization()
             logger.exception("[TRACE:registry] FAILED tool=%s error=%s", capability_id, e)
             if reg.executor_kind == "desktop_node" and str(e) in {
                 "desktop_node_disconnected",

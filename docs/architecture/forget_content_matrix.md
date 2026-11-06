@@ -302,3 +302,17 @@ Phase A 提交后由调用方 `resume_execution_authorization()` 重新获取（
   新数据保留/派生清理、Task 子记录 time_range、Conflict/Recall/Retrieval/Outbox、
   未知 JSON fail-closed、真实 UnifiedRetriever 前后召回、跨表字段残留注入；
   SQLite 另有 132 字段逐项注入。
+
+
+## V62.6.1 Forget 来源闭包与跨线程授权（2026-11-06）
+
+- Memory 可见性现在沿 `ContentProvenanceRef(memory_record → event)` 检查全部真实 Event/Turn 元数据；任一来源被 Shield/Tombstone 屏蔽即关闭。`filter_memory_ids`、Worker、Core/Graph/Vector/Markdown、单条索引与全量重建共用该入口。
+- 用户确认的规则 1：无 Event 来源仅允许持久化 `manual_memory_api + user_required + create` 提案证明为独立人工创建的记忆；未知来源、悬空引用、非法数组、查询异常全部 fail-closed。Memory-only 的来源历史隔离不会反射扩大到共享 Event 的其他 Memory。
+- Maintenance 在 Seed/Neighbor 筛选、冻结前、历史 Action 执行前复查。被屏蔽候选只生成不含正文的 `skipped_stale / forget_source_blocked` 终态 Action（负序号保留给可见性跳过），纳入 Batch/Run 计数并推进实际扫描游标；原 planner 的非负序号、版本检查、hash、claim fencing 不变。
+- 授权连接严格归创建线程：父线程释放自己的连接，线程池子线程新建授权连接、重读 claim/来源并执行工具，父线程返回前重取共享授权。`_ToolGate` 仅同步取消/启动状态，不携带 Connection，不复制 Context。恢复失败停止任务；Runtime 每轮和 Broker 派发前再次检查授权与来源。
+- 超时与 Phase A 的开始由同一 gate 锁串行决定：尚未开始时撤销 Forget 启动许可；已经开始时等待真实提交/回滚后返回确定结果，避免“报告失败后后台成功”。该路径可超过通用工具等待时长，不提供强杀数据库事务的硬截止承诺。`forget_old` 仍由同一个业务 Session 原子提交。
+- AgentTask/Reminder 使用自身 `created_at`；多来源同 Thread 使用最早真实时间。Turn 同时检查子 Event。Goal 的领域事件 ID 不是聊天 Event ID，按真实 Task/原始 Job/Request 追溯。
+- Improvement Evidence 的 Task/Action/Job 使用同一引用契约和来源解析器；来源未知时不进入 LLM。Epoch rollover 遍历 active Epoch、Segment、CI manifests、Summary 来源，并逐项过滤 WorkingState；无来源证明的非空状态拒绝生成快照。新的语义项与 objective 记录 Turn 来源，复用现有 Provenance 表，无 Schema 变更。
+- 测试、调用时序、具体函数清单与验收限制见 [V62.6.1 验收报告](../audit/v6261_acceptance.md)。旧版本补记是当时实现记录，以本节为准。
+
+验收结果：默认全量 1716 passed / 118 skipped；PG 全目录 105 passed / 13 skipped（均为既有 live Embedding 用例）；Ruff、basedpyright、前端构建、Alembic upgrade/check 通过。Merge 与维护复制继承真实 Event 来源；来源被遗忘后新派生记录即时关闭。

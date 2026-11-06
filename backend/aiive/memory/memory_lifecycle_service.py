@@ -51,6 +51,19 @@ class MemoryLifecycleService:
         返回：`applied` / `skip_stale` / `no_op`。
         调用方（Outbox handler）负责把 `skip_stale` 传播到同一 operation_group 的全部动作。
         """
+        from aiive.forget.visibility_service import ForgetVisibilityService
+        from aiive.forget.concurrency import acquire_forget_shared_lock
+
+        acquire_forget_shared_lock(self._db)
+        participants = [action.subject_memory_record_id, *(action.related_record_ids or [])]
+        if not all(isinstance(pid, str) and pid.strip() for pid in participants):
+            action.reason_code = "forget_source_unresolved"
+            return "skip_stale"
+        if ForgetVisibilityService.blocked_target_ids(
+            self._db, "memory_record", [(pid, None) for pid in participants if isinstance(pid, str)],
+        ):
+            action.reason_code = "forget_source_blocked"
+            return "skip_stale"
         action_type = action.action_type
         if action_type == "no_op":
             return "no_op"
@@ -188,6 +201,15 @@ class MemoryLifecycleService:
             )
             self._db.add(new_record)
             self._db.flush()
+            from aiive.db.forget_models import ContentProvenanceRef
+
+            for ref in self._db.query(ContentProvenanceRef).filter_by(
+                owner_type="memory_record", owner_id=winner_src.id,
+            ).all():
+                self._db.add(ContentProvenanceRef(
+                    owner_type="memory_record", owner_id=new_record.id,
+                    source_type=ref.source_type, source_id=ref.source_id,
+                ))
             for old in locked.values():
                 old.lifecycle_state = LifecycleState.ARCHIVED.value
                 old.validity_state = ValidityState.SUPERSEDED.value

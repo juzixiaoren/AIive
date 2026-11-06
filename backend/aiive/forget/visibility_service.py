@@ -12,10 +12,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import or_
+from sqlalchemy import or_, true
 from sqlalchemy.orm import Session
 
-from aiive.db.forget_models import ContentProvenanceRef, ForgetShield, ForgetTombstone
+from aiive.db.forget_models import ContentProvenanceRef, ForgetOperation, ForgetShield, ForgetTombstone
 
 
 class ForgetVisibilityService:
@@ -130,6 +130,32 @@ class ForgetVisibilityService:
         id_time_pairs: list[tuple[str, Any]],
         *,
         include_tombstones: bool = True,
+        _expand_provenance: bool = True,
+        _ignore_memory_only: bool = False,
+    ) -> set[str]:
+        """统一读取边界；查询失败时整批关闭，禁止部分解析成功后放行。"""
+        try:
+            return ForgetVisibilityService._blocked_target_ids(
+                session, target_type, id_time_pairs,
+                include_tombstones=include_tombstones,
+                _expand_provenance=_expand_provenance,
+                _ignore_memory_only=_ignore_memory_only,
+            )
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception("Forget visibility lookup failed")
+            return {pair[0] for pair in id_time_pairs}
+
+    @staticmethod
+    def _blocked_target_ids(
+        session: Session,
+        target_type: str,
+        id_time_pairs: list[tuple[str, Any]],
+        *,
+        include_tombstones: bool = True,
+        _expand_provenance: bool = True,
+        _ignore_memory_only: bool = False,
     ) -> set[str]:
         """批量返回被 Shield（实体级/选择器级/all_user_data）或 Tombstone 屏蔽的 ID。
 
@@ -150,7 +176,7 @@ class ForgetVisibilityService:
         provided_time: dict[str, Any] = {p[0]: p[1] for p in id_time_pairs}
 
         # 重载各目标元数据（thread_id / scope / canonical_key / created_at）
-        meta = ForgetVisibilityService._load_target_meta(session, target_type, ids)
+        meta = ForgetVisibilityService.load_target_meta(session, target_type, ids)
         meta_by_id = {m["id"]: m for m in meta}
         _as_utc = ForgetVisibilityService._as_utc
 
@@ -160,12 +186,20 @@ class ForgetVisibilityService:
                 return _as_utc(m["created_at"])
             return _as_utc(provided_time.get(tid))
 
+        def query(*entities: Any) -> Any:
+            q = session.query(*entities)
+            if _ignore_memory_only:
+                q = q.filter(~ForgetShield.forget_operation_id.in_(
+                    session.query(ForgetOperation.id).filter(ForgetOperation.mode == "memory_only"),
+                ))
+            return q
+
         blocked: set[str] = set()
 
         # 0) 全局 all_user_data shield：屏蔽 cutoff 之前创建的数据；
         #    创建时间未知 → fail-closed 屏蔽。
         global_cutoffs = [
-            _as_utc(r[0]) for r in session.query(
+            _as_utc(r[0]) for r in query(
                 ForgetShield.cutoff_created_at,
             ).filter(
                 ForgetShield.status == "active",
@@ -180,7 +214,7 @@ class ForgetVisibilityService:
 
         # 1) 实体级 Shield（target_type/target_id 直接命中，无 cutoff 语义）
         shield_rows = (
-            session.query(ForgetShield.target_id)
+            query(ForgetShield.target_id)
             .filter(
                 ForgetShield.status == "active",
                 ForgetShield.target_type == target_type,
@@ -208,7 +242,7 @@ class ForgetVisibilityService:
 
             thread_ids = {m["thread_id"] for m in meta if m["thread_id"]}
             if thread_ids:
-                trows = session.query(
+                trows = query(
                     ForgetShield.thread_id, ForgetShield.cutoff_created_at,
                 ).filter(
                     ForgetShield.status == "active",
@@ -233,7 +267,7 @@ class ForgetVisibilityService:
                 for m in meta if m["scope_type"] and m["scope_id"]
             }
             if scope_pairs:
-                srows = session.query(
+                srows = query(
                     ForgetShield.scope_type, ForgetShield.scope_id,
                     ForgetShield.cutoff_created_at,
                 ).filter(
@@ -253,7 +287,7 @@ class ForgetVisibilityService:
 
             cks = {m["canonical_key"] for m in meta if m["canonical_key"]}
             if cks:
-                krows = session.query(
+                krows = query(
                     ForgetShield.canonical_key, ForgetShield.cutoff_created_at,
                 ).filter(
                     ForgetShield.status == "active",
@@ -273,7 +307,7 @@ class ForgetVisibilityService:
                     if any(_within_cutoff(ct, c) for c in cuts):
                         blocked.add(m["id"])
 
-            time_shields = session.query(
+            time_shields = query(
                 ForgetShield.time_from, ForgetShield.time_to,
                 ForgetShield.cutoff_created_at,
             ).filter(
@@ -303,7 +337,7 @@ class ForgetVisibilityService:
         if include_tombstones:
             blocked.update(
                 ForgetVisibilityService.batch_is_tombstone_blocked(
-                    session, target_type, ids
+                    session, target_type, ids, ignore_memory_only=_ignore_memory_only
                 )
             )
 
@@ -314,22 +348,96 @@ class ForgetVisibilityService:
         #   改由读取侧经 Provenance + 选择器 Shield 即时判定。
         #   Provenance 侧复用 blocked_target_ids("memory_record", ...)，其内部
         #   仅在 target_type == "event" 时做本扩展，故不会递归。
+        if target_type == "memory_record" and _expand_provenance:
+            blocked.update(ForgetVisibilityService._source_event_blocked_memory_ids(
+                session, ids, include_tombstones=include_tombstones,
+            ))
         if target_type == "event":
             blocked.update(
                 ForgetVisibilityService._turn_blocked_event_ids(
                     session, ids, include_tombstones=include_tombstones,
+                    ignore_memory_only=_ignore_memory_only,
                 )
             )
-            blocked.update(
-                ForgetVisibilityService._source_memory_blocked_event_ids(
-                    session, ids, include_tombstones=include_tombstones,
+            if _expand_provenance:
+                blocked.update(
+                    ForgetVisibilityService._source_memory_blocked_event_ids(
+                        session, ids, include_tombstones=include_tombstones,
+                    )
                 )
-            )
 
         return blocked
 
     @staticmethod
-    def _load_target_meta(
+    def _source_event_blocked_memory_ids(
+        session: Session, memory_ids: list[str], *, include_tombstones: bool,
+    ) -> set[str]:
+        """Memory → 全部 Event 来源闭包；不把 Memory 屏蔽再反射到兄弟 Memory。
+
+        无来源仅允许持久化提案证明为 manual_memory_api 独立 create 的记录。
+        后续混入无来源提案不继承该豁免；空引用、未知类型和悬空来源关闭。
+        """
+        from aiive.db.models import Event, MemoryProposal, MemoryRecord
+
+        records = session.query(MemoryRecord).filter(MemoryRecord.id.in_(memory_ids)).all()
+        refs = session.query(ContentProvenanceRef).filter(
+            ContentProvenanceRef.owner_type == "memory_record",
+            ContentProvenanceRef.owner_id.in_(memory_ids),
+        ).all()
+        by_memory: dict[str, set[str]] = {r.id: set() for r in records}
+        blocked = set(memory_ids) - set(by_memory)
+        for ref in refs:
+            if ref.source_type != "event" or not ref.source_id.strip():
+                blocked.add(ref.owner_id)
+            else:
+                by_memory[ref.owner_id].add(ref.source_id)
+        proposals = session.query(MemoryProposal).filter(
+            MemoryProposal.final_memory_id.in_(memory_ids),
+        ).all()
+        proposals_by_memory: dict[str, list[Any]] = {}
+        for proposal in proposals:
+            proposals_by_memory.setdefault(proposal.final_memory_id or "", []).append(proposal)
+        for record in records:
+            sources = by_memory[record.id]
+            if record.source_event_id and record.source_event_id not in sources:
+                blocked.add(record.id)
+            proofs = proposals_by_memory.get(record.id, [])
+            for proof in proofs:
+                declared = proof.source_event_ids
+                evidence = proof.evidence
+                if declared is not None:
+                    if not isinstance(declared, list) or any(not isinstance(e, str) or not e.strip() for e in declared):
+                        blocked.add(record.id)
+                    elif set(declared) - sources:
+                        blocked.add(record.id)
+                if evidence is not None:
+                    if not isinstance(evidence, list) or any(not isinstance(e, dict) for e in evidence):
+                        blocked.add(record.id)
+                    elif any(e.get("source_event_id") and e["source_event_id"] not in sources for e in evidence):
+                        blocked.add(record.id)
+            if not sources:
+                if not proofs or not any(p.final_operation == "create" for p in proofs) or not all(
+                    p.extractor_name == "manual_memory_api"
+                    and p.execution_mode == "user_required"
+                    and p.source_event_ids == [] and p.evidence == []
+                    and not p.source_turn_id and not p.source_turn_record_id
+                    and p.final_operation in {"create", "reinforce", "merge"}
+                    for p in proofs
+                ):
+                    blocked.add(record.id)
+        event_ids = set().union(*by_memory.values()) if by_memory else set()
+        events = session.query(Event.id, Event.created_at).filter(Event.id.in_(event_ids)).all() if event_ids else []
+        unsafe = event_ids - {row[0] for row in events if ForgetVisibilityService._as_utc(row[1]) is not None}
+        unsafe.update(ForgetVisibilityService.blocked_target_ids(
+            session, "event", [(row[0], row[1]) for row in events],
+            include_tombstones=include_tombstones, _expand_provenance=False,
+            _ignore_memory_only=True,
+        ))
+        blocked.update(mid for mid, sources in by_memory.items() if sources & unsafe)
+        return blocked
+
+    @staticmethod
+    def load_target_meta(
         session: Session, target_type: str, ids: list[str],
     ) -> list[dict[str, Any]]:
         """重载目标元数据（thread_id / scope / canonical_key / created_at）。
@@ -344,12 +452,12 @@ class ForgetVisibilityService:
             # 纯 Turn 来源防重抽：用 TurnRecord.created_at 应用选择器 Shield 的
             # cutoff（Forget 之后产生的新 Turn 不应被旧 Shield 阻断）。
             rows = session.query(
-                TurnRecord.id, TurnRecord.thread_id, TurnRecord.created_at,
-            ).filter(TurnRecord.id.in_(ids)).all()
+                TurnRecord.id, TurnRecord.thread_id, TurnRecord.created_at, TurnRecord.turn_id,
+            ).filter(or_(TurnRecord.id.in_(ids), TurnRecord.turn_id.in_(ids))).all()
             return [
-                {"id": r[0], "thread_id": r[1], "scope_type": None,
+                {"id": token, "thread_id": r[1], "scope_type": None,
                  "scope_id": None, "canonical_key": None, "created_at": r[2]}
-                for r in rows
+                for r in rows for token in {r[0], r[3]} if token in ids
             ]
         if target_type == "memory_record":
             # MemoryRecord 不带 thread_id（按 scope 归属），故 thread 选择器对
@@ -461,6 +569,7 @@ class ForgetVisibilityService:
     @staticmethod
     def _turn_blocked_event_ids(
         session: Session, event_ids: list[str], *, include_tombstones: bool = True,
+        ignore_memory_only: bool = False,
     ) -> set[str]:
         """返回所属 TurnRecord 被 Shield / Tombstone 屏蔽的 Event id 集合。
 
@@ -483,6 +592,9 @@ class ForgetVisibilityService:
                 ForgetShield.status == "active",
                 ForgetShield.target_type == "turn_record",
                 ForgetShield.target_id.in_(all_tokens),
+                ~ForgetShield.forget_operation_id.in_(session.query(ForgetOperation.id).filter(
+                    ForgetOperation.mode == "memory_only",
+                )) if ignore_memory_only else true(),
             ).all() if r[0]
         }
         tombstoned: set[str] = set()
@@ -491,6 +603,9 @@ class ForgetVisibilityService:
                 r[0] for r in session.query(ForgetTombstone.target_id).filter(
                     ForgetTombstone.target_type == "turn_record",
                     ForgetTombstone.target_id.in_(all_tokens),
+                    ~ForgetTombstone.forget_operation_id.in_(session.query(ForgetOperation.id).filter(
+                        ForgetOperation.mode == "memory_only",
+                    )) if ignore_memory_only else true(),
                     ForgetTombstone.block_visibility.is_(True),
                 ).all() if r[0]
             }
@@ -537,6 +652,7 @@ class ForgetVisibilityService:
         blocked_memories = ForgetVisibilityService.blocked_target_ids(
             session, "memory_record", [(m, None) for m in mem_ids],
             include_tombstones=include_tombstones,
+            _expand_provenance=False,
         )
         if not blocked_memories:
             return set()
@@ -550,6 +666,7 @@ class ForgetVisibilityService:
         session: Session,
         target_type: str,
         target_ids: list[str],
+        *, ignore_memory_only: bool = False,
     ) -> set[str]:
         """批量检查目标是否被 tombstone.block_visibility 屏蔽。
 
@@ -563,6 +680,9 @@ class ForgetVisibilityService:
             .filter(
                 ForgetTombstone.target_type == target_type,
                 ForgetTombstone.target_id.in_(target_ids),
+                ~ForgetTombstone.forget_operation_id.in_(session.query(ForgetOperation.id).filter(
+                    ForgetOperation.mode == "memory_only",
+                )) if ignore_memory_only else true(),
                 ForgetTombstone.block_visibility.is_(True),
             )
             .all()

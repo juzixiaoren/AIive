@@ -74,6 +74,11 @@ def test_11_freeze_captures_ws_snapshot_immutably(db):
     seg = new_segment(db, epoch.id, thread.id)
     add_turn(db, thread.id, seg.id, 1)
     ws = new_ws(db, thread.id, current_objective="old")
+    from aiive.db.forget_models import ContentProvenanceRef
+    from aiive.db.models import TurnRecord
+    source_turn = db.query(TurnRecord).filter_by(segment_id=seg.id).one()
+    db.add(ContentProvenanceRef(owner_type="working_state_objective", owner_id=ws.id,
+                                source_type="turn_record", source_id=source_turn.id))
     db.commit()
 
     ci, _ = _freeze(db, seg, thread, epoch, ws)

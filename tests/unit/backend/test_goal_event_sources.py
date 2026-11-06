@@ -270,18 +270,19 @@ def test_event_without_subscribers_is_dropped(db_session) -> None:
 # ----------------------------------------------------------------------
 def test_duplicate_event_and_redelivery_are_idempotent(db_session) -> None:
     thread_id = _thread(db_session)
+    source_task = TaskRepository(db_session).create_task(thread_id=thread_id, goal="event source", enqueue=False)
     _confirmed(db_session, thread_id, _plan([
         {"id": "wake", "title": "事件唤醒", "kind": "autonomous",
          "trigger": {"kind": "event_condition", "event_types": [TASK_COMPLETED]}},
     ]))
     assert publish_goal_event(
         db_session, event_type=TASK_COMPLETED, event_id="dup-1", source="task",
-        thread_id=thread_id, payload={"task_id": "t1", "status": "succeeded"},
+        thread_id=thread_id, payload={"task_id": source_task.id, "status": "succeeded"},
     ) is not None
     # 同一 source + event_id 的第二次发布被唯一键挡掉。
     assert publish_goal_event(
         db_session, event_type=TASK_COMPLETED, event_id="dup-1", source="task",
-        thread_id=thread_id, payload={"task_id": "t1", "status": "succeeded"},
+        thread_id=thread_id, payload={"task_id": source_task.id, "status": "succeeded"},
     ) is None
     db_session.commit()
     dispatch = _dispatch_job(db_session)
@@ -297,13 +298,14 @@ def test_duplicate_event_and_redelivery_are_idempotent(db_session) -> None:
 # ----------------------------------------------------------------------
 def test_dispatch_failure_is_retried_by_outbox(db_session, monkeypatch) -> None:
     thread_id = _thread(db_session)
+    source_task = TaskRepository(db_session).create_task(thread_id=thread_id, goal="event source", enqueue=False)
     _confirmed(db_session, thread_id, _plan([
         {"id": "wake", "title": "事件唤醒", "kind": "autonomous",
          "trigger": {"kind": "event_condition", "event_types": [TASK_COMPLETED]}},
     ]))
     publish_goal_event(
         db_session, event_type=TASK_COMPLETED, event_id="retry-1", source="task",
-        thread_id=thread_id, payload={"status": "succeeded"},
+        thread_id=thread_id, payload={"task_id": source_task.id, "status": "succeeded"},
     )
     db_session.commit()
     dispatch = _dispatch_job(db_session)
@@ -328,13 +330,14 @@ def test_dispatch_failure_is_retried_by_outbox(db_session, monkeypatch) -> None:
 # ----------------------------------------------------------------------
 def test_pending_dispatch_survives_restart(db_session) -> None:
     thread_id = _thread(db_session)
+    source_task = TaskRepository(db_session).create_task(thread_id=thread_id, goal="event source", enqueue=False)
     _confirmed(db_session, thread_id, _plan([
         {"id": "wake", "title": "事件唤醒", "kind": "autonomous",
          "trigger": {"kind": "event_condition", "event_types": [TASK_COMPLETED]}},
     ]))
     publish_goal_event(
         db_session, event_type=TASK_COMPLETED, event_id="restart-1", source="task",
-        thread_id=thread_id, payload={"status": "succeeded"},
+        thread_id=thread_id, payload={"task_id": source_task.id, "status": "succeeded"},
     )
     db_session.commit()
     dispatch = _dispatch_job(db_session)
@@ -355,13 +358,14 @@ def test_pending_dispatch_survives_restart(db_session) -> None:
 # ----------------------------------------------------------------------
 def test_cancelled_goal_is_not_woken(db_session, monkeypatch) -> None:
     thread_id = _thread(db_session)
+    source_task = TaskRepository(db_session).create_task(thread_id=thread_id, goal="event source", enqueue=False)
     task_id = _confirmed(db_session, thread_id, _plan([
         {"id": "wake", "title": "事件唤醒", "kind": "autonomous",
          "trigger": {"kind": "event_condition", "event_types": [TASK_COMPLETED]}},
     ]))
     publish_goal_event(
         db_session, event_type=TASK_COMPLETED, event_id="cancel-1", source="task",
-        thread_id=thread_id, payload={"status": "succeeded"},
+        thread_id=thread_id, payload={"task_id": source_task.id, "status": "succeeded"},
     )
     db_session.commit()
     dispatch = _dispatch_job(db_session)

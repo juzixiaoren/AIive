@@ -206,6 +206,7 @@ class WorkingStateService:
     ) -> None:
         ws = self.get_or_create(db, thread_id)
         current = list(getattr(ws, field, None) or [])
+        payload = {**payload, "source_turn_id": _source_turn_id}
         if operation == "add":
             current.append(payload)
             if len(current) > MAX_LIST_ITEMS:
@@ -224,6 +225,75 @@ class WorkingStateService:
         ws.updated_at = datetime.now(timezone.utc)
         serialized = _json.dumps(current, ensure_ascii=False)
         ws.token_count = len(serialized.encode("utf-8")) // 2
+
+    @staticmethod
+    def safe_boundary_snapshot(db: Session, ws: WorkingState) -> dict[str, Any]:
+        """Copy only individually proven sources into a new compaction snapshot.
+
+        Legacy semantic items without provenance cannot be reconstructed from
+        updated_at. Refuse the snapshot rather than guess their source time.
+        Hidden items are omitted independently, retaining unrelated new items.
+        """
+        from aiive.db.forget_models import ContentProvenanceRef
+        from aiive.db.models import Artifact, Event, ToolOperation, ApprovalRequest
+        from aiive.runtime.compaction import build_working_state_snapshot
+        from aiive.worker.job_source_guard import JobSources, blocked_source_reason
+        from aiive.worker.outbox_dto import ClaimedJob
+
+        claimed = ClaimedJob("boundary", "epoch_rollover", {}, None, 0, 1, "", 1, "")
+
+        def visible(item: Any) -> bool:
+            if not isinstance(item, dict):
+                raise ValueError("working_state_source_unresolved")
+            sources = JobSources()
+            for key in ("source_turn_id", "turn_record_id", "source_turn_record_id"):
+                value = item.get(key)
+                if value is not None:
+                    if not isinstance(value, str) or not value.strip():
+                        raise ValueError("working_state_source_unresolved")
+                    sources.turns[value] = None
+            approval_id = item.get("id")
+            if isinstance(approval_id, str):
+                approval = db.get(ApprovalRequest, approval_id)
+                if approval is not None and approval.turn_record_id:
+                    sources.turns[approval.turn_record_id] = None
+            ref = item.get("ref")
+            if isinstance(ref, str):
+                artifact = db.query(Artifact).filter(Artifact.ref == ref).first()
+                if artifact is not None and artifact.turn_record_id:
+                    sources.turns[artifact.turn_record_id] = None
+            tool_call_id = item.get("tool_call_id") or ref
+            if isinstance(tool_call_id, str):
+                executions = db.query(ToolOperation).filter(ToolOperation.tool_call_id == tool_call_id, ToolOperation.thread_id == ws.thread_id).all()
+                for execution in executions:
+                    if execution.turn_record_id:
+                        sources.turns[execution.turn_record_id] = None
+                events = db.query(Event).filter(
+                    Event.thread_id == ws.thread_id,
+                    Event.payload["tool_call_id"].as_string() == tool_call_id,
+                ).all()
+                for event in events:
+                    sources.events[event.id] = event.created_at
+            if sources.empty:
+                raise ValueError("working_state_source_unresolved")
+            return not blocked_source_reason(db, claimed, sources)
+
+        snapshot = build_working_state_snapshot(ws)
+        if snapshot.get("current_objective"):
+            refs = db.query(ContentProvenanceRef).filter_by(
+                owner_type="working_state_objective", owner_id=ws.id,
+            ).all()
+            if not refs or any(r.source_type != "turn_record" for r in refs):
+                raise ValueError("working_state_objective_source_unresolved")
+            if not all(visible({"source_turn_record_id": r.source_id}) for r in refs):
+                snapshot["current_objective"] = None
+        for field in ("open_loops", "active_constraints", "artifact_refs", "verified_tool_states",
+                      "pending_approvals", "uncommitted_side_effects", "running_tool_state"):
+            items = snapshot.get(field, [])
+            if not isinstance(items, list):
+                raise ValueError("working_state_field_not_array")
+            snapshot[field] = [item for item in items if visible(item)]
+        return snapshot
 
     # ── 渲染为上下文字段 ──
 

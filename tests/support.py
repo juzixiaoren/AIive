@@ -154,3 +154,44 @@ def ensure_running_claim(
     row.lease_expires_at = datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
     db.commit()
     return claimed
+
+def attach_memory_event_source(db, record):
+    """Explicit valid provenance for legacy memory fixtures (never autouse).
+
+    Orphan/quarantine tests deliberately do not call this helper. The Event is
+    a real ORM row with the memory's original time, so cutoff tests stay real.
+    """
+    import uuid
+    from aiive.db.models import Thread, Event
+    from aiive.db.forget_models import ContentProvenanceRef
+
+    db.flush()
+    event_id = record.source_event_id or str(uuid.uuid4())
+    event = db.get(Event, event_id)
+    if event is None:
+        thread = Thread(id=str(uuid.uuid4()), title="memory fixture source")
+        db.add(thread)
+        db.flush()
+        event = Event(id=event_id, trace_id=str(uuid.uuid4()), thread_id=thread.id,
+                      event_type="user_message", payload={"text": record.content},
+                      created_at=record.created_at)
+        db.add(event)
+    db.add(ContentProvenanceRef(owner_type="memory_record", owner_id=record.id,
+                               source_type="event", source_id=event_id))
+    db.flush()
+    return event
+
+
+def create_memory_source_event(db, thread_id=None, text="source fixture"):
+    import uuid
+    from aiive.db.models import Thread, Event
+
+    thread_id = thread_id or str(uuid.uuid4())
+    if db.get(Thread, thread_id) is None:
+        db.add(Thread(id=thread_id, title="source fixture"))
+        db.flush()
+    event = Event(id=str(uuid.uuid4()), trace_id=str(uuid.uuid4()), thread_id=thread_id,
+                  event_type="user_message", payload={"text": text})
+    db.add(event)
+    db.flush()
+    return event

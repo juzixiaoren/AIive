@@ -123,6 +123,8 @@ def _seed_record(db, proposal: MemoryProposal) -> MemoryRecord:
         validity_state=ValidityState.VALID.value,
     )
     db.flush()
+    from tests.support import attach_memory_event_source
+    attach_memory_event_source(db, record)
     GraphProjectionService(db).refresh(record.id, record.record_version)
     db.flush()
     return record
@@ -166,6 +168,11 @@ def _binding_response(name: str, decision: str, entity_id: str = "", verdict: st
 
 
 def _write_and_project(db, proposal: MemoryProposal, thread_id: str) -> MemoryRecord:
+    from tests.support import create_memory_source_event
+    event = create_memory_source_event(db, thread_id, proposal.content)
+    proposal.source_event_ids = [event.id]
+    proposal.evidence[0].source_event_id = event.id
+    proposal.compute_request_idempotency()
     result = MemoryWriteService(db).write(proposal, _ctx(thread_id))
     db.commit()
     assert result.written is True, result
@@ -450,6 +457,12 @@ class TestPendingIsolation:
         before_relations = db.query(GraphRelation).count()
         before_entities = db.query(GraphEntity).count()
 
+        from tests.support import create_memory_source_event
+        event = create_memory_source_event(db, thread_id, new.content)
+        event.turn_id = turn.turn_id
+        new.source_event_ids = [event.id]
+        new.evidence[0].source_event_id = event.id
+        new.compute_request_idempotency()
         results = MemoryWriteService(db).write_batch(
             proposals=[new], ingestion_run=run, run_context=_ctx(thread_id),
             conflict_plan={new.proposal_id: self._defer_plan(new, old)},

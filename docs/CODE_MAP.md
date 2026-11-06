@@ -118,6 +118,8 @@
 | 向量召回（pgvector 投影） | `memory/vector_projection.py`、`memory/vector_bootstrap.py` | `memory/embedding_provider.py`、`db/models.py::memory_vector_projections` | `test_vector*.py` |
 | 检索索引代次（lexical 索引） | `retrieval/` | `worker/outbox_handlers.py::handle_retrieval_index_refresh` | `test_retrieval*.py` |
 | Core Memory Block | `memory/core_memory_projection.py` | `worker/outbox_handlers.py::handle_core_memory_refresh` | `test_core_memory*.py` |
+| Forget 来源闭包 / 跨线程授权 / 安全边界快照（V62.6.1） | `forget/visibility_service.py`、`worker/outbox_execution_auth.py`、`worker/job_source_guard.py` | `runtime/working_state.py::safe_boundary_snapshot`、`runtime/epoch_manager.py` | `test_forget_v6261.py`、`test_pg_forget_v6261.py`；`docs/audit/v6261_acceptance.md` |
+
 
 ### 2.4 能力扩展（MCP / Skills / 自进化）
 
@@ -1063,3 +1065,21 @@ POST /api/auth/login（失败统一 invalid_credentials；同 (client, username)
 模型侧在 `MemoryVectorProjection.__table_args__` 同步声明（`postgresql_using="hnsw"` +
 `postgresql_ops={"embedding": "vector_cosine_ops"}`，`.ddl_if(dialect="postgresql")` 抑制 SQLite），
 因此 `create_all` 与迁移建库的索引定义一致。
+
+
+## V62.6.1 当前执行链补记
+
+`handle_agent_task_run → PersistentTaskRuntime.run → _dispatch_ready → CapabilityBroker.dispatch
+→ ToolRegistry.execute_brokered → _execute_direct → execute_in_tool_thread → ThreadPoolExecutor
+→ handle_forget → execute_phase_a_shield` 是 PostgreSQL 验收使用的实际调用链。
+
+父、子线程各自持有和释放自己的授权连接；ThreadPool 启动前父线程释放，子线程新连接检查来源，
+Phase A 使用原业务事务，父线程恢复后才继续。Runtime 每轮与 Broker 派发都会重新验证。
+WorkingState 的语义项保存 source_turn_id；objective 的来源复用 ContentProvenanceRef，
+`safe_boundary_snapshot` 将 Event/Turn/Artifact/ToolOperation/Approval 追溯后逐项过滤，
+由 EpochManager 与 compaction 冻结路径使用。具体函数变更见验收报告的 AST 清单。
+新增测试：`tests/integration/backend/test_forget_v6261.py`、
+`tests/integration/pg/test_pg_forget_v6261.py`；已有正常记忆夹具通过
+`tests/support.py::attach_memory_event_source` 显式创建真实 Event 来源，孤儿测试不使用此助手。
+
+V62.6.1 测试清理：根 `conftest.py::_cleanup_test_db` / `pytest_sessionfinish` 在 fixture teardown 后关闭本进程 Session 和 engine，校验并移除本进程测试库，失败写 `tests/artifacts/validation/cleanup/<pid>/cleanup_report.json` 并置非零退出码；跨进程回归在 `tests/unit/backend/test_process_database_cleanup.py`。

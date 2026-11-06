@@ -183,7 +183,9 @@ def freeze_compaction_input(
     turn_ids = [m["turn_id"] for m in turn_manifest]
     event_manifest = build_event_manifest(db, turn_ids)
 
-    ws_snapshot = build_working_state_snapshot(boundary_working_state) if boundary_working_state is not None else {}
+    from aiive.runtime.working_state import WorkingStateService
+
+    ws_snapshot = WorkingStateService.safe_boundary_snapshot(db, boundary_working_state) if boundary_working_state is not None else {}
     ws_snap_hash = working_state_snapshot_hash(ws_snapshot)
 
     source_hash = compute_source_hash(

@@ -96,6 +96,8 @@ def _seed_memory(db, *, subject="用户", object_="AIive") -> str:
     )
     record = MemoryStore(db).create_record(proposal, lifecycle_state="active")
     db.flush()
+    from tests.support import attach_memory_event_source
+    attach_memory_event_source(db, record)
     GraphProjectionService(db).refresh(record.id, record.record_version)
     db.flush()
     return record.id

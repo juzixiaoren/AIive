@@ -50,6 +50,8 @@ class MemoryStore:
 
     def __init__(self, db: Session) -> None:
         self._db: Session = db
+        self.maintenance_scan: list[MemoryRecord] = []
+        self.maintenance_rejected_neighbors: list[MemoryRecord] = []
 
     # ------------------------------------------------------------------
     # Write operations (internal — called only by MemoryWriteService)
@@ -253,6 +255,7 @@ class MemoryStore:
         now: datetime,
         ttl_days: int = 30,
         cooling_days: int | None = None,
+        scan_limit: int | None = None,
     ) -> list[MemoryRecord]:
         """选取某 lane 的 seed 记忆（升序，最多 `limit` 条）。
 
@@ -353,7 +356,30 @@ class MemoryStore:
                 )
             q = q.order_by(eff.asc(), MR.id.asc())
 
-        return q.limit(limit).all()
+        # Filter before applying the caller's visible limit: a blocked first page
+        # must not hide later valid seeds or stall the lane cursor.
+        visible: list[MemoryRecord] = []
+        self.maintenance_scan = []
+        offset = 0
+        while len(visible) < limit and (scan_limit is None or len(self.maintenance_scan) < scan_limit):
+            page = q.offset(offset).limit(max(limit, 100)).all()
+            if not page:
+                break
+            allowed = {record.id for record in self._maintenance_visible(page)}
+            for record in page:
+                self.maintenance_scan.append(record)
+                if record.id in allowed:
+                    visible.append(record)
+                if len(visible) == limit or (scan_limit is not None and len(self.maintenance_scan) == scan_limit):
+                    break
+            offset += len(page)
+        return visible[:limit]
+
+    def _maintenance_visible(self, records: list[MemoryRecord]) -> list[MemoryRecord]:
+        from aiive.forget.visibility_service import ForgetVisibilityService
+
+        allowed = set(ForgetVisibilityService.filter_memory_ids(self._db, [r.id for r in records]))
+        return [r for r in records if r.id in allowed]
 
     def expand_maintenance_neighbors(self, seed: MemoryRecord) -> list[MemoryRecord]:
         """扩展 seed 的同 (canonical_key, scope_type, scope_id) 邻域（第 4 点）。"""
@@ -371,12 +397,11 @@ class MemoryStore:
             conditions.append(MR.scope_id.is_(None))
         else:
             conditions.append(MR.scope_id == seed.scope_id)
-        return (
-            self._db.query(MR)
-            .filter(*conditions)
-            .order_by(MR.id.asc())
-            .all()
-        )
+        records = self._db.query(MR).filter(*conditions).order_by(MR.id.asc()).all()
+        visible = self._maintenance_visible(records)
+        allowed = {record.id for record in visible}
+        self.maintenance_rejected_neighbors.extend(record for record in records if record.id not in allowed)
+        return visible
 
     def count_independent_evidence(self, memory_id: str) -> int:
         """独立 evidence 计数：COUNT(DISTINCT source_event_id) 且 source_event 属真实 user_message Event。

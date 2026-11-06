@@ -51,7 +51,8 @@ def handle_agent_task_run(claimed: ClaimedJob) -> HandlerResult:
             return HandlerResult(HandlerOutcome.COMPLETED, reason=f"task_{task.status}")
         PersistentTaskRuntime(db).run(task_id, trigger=trigger)
         # 本次运行可能嵌套 Forget：提交后重新获取共享执行授权
-        resume_execution_authorization()
+        if not resume_execution_authorization():
+            raise RuntimeError("execution_authorization_restore_failed")
         return HandlerResult(HandlerOutcome.COMPLETED, reason="task_run_advanced")
     except ValueError as error:
         if str(error) in {"task_terminal", "task_not_found"}:

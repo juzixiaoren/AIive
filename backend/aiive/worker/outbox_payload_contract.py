@@ -96,6 +96,7 @@ _DEFAULT_REFERENCE_SCHEMA: dict[str, frozenset[str]] = {
     "child": frozenset({
         "run_id", "step_id", "action_id", "evidence_id", "artifact_id",
         "checkpoint_id", "approval_id", "conflict_case_id", "case_id",
+        "segment_id", "epoch_id", "compaction_input_id", "epoch_compaction_input_id",
         "tool_operation_id", "source_id",
     }),
     "thread": frozenset({"thread_id"}),
@@ -250,7 +251,7 @@ class JobReferences:
         )
 
 
-def _add_ids(value: Any, out: set[str]) -> bool:
+def parse_reference_ids(value: Any, out: set[str]) -> bool:
     """收集引用字段里的字符串 ID；返回是否全部可解析。
 
     已知引用字段出现嵌套数组 / 对象 / 数字等异常结构时必须标记 unparseable
@@ -259,15 +260,19 @@ def _add_ids(value: Any, out: set[str]) -> bool:
     if value is None:
         return True
     if isinstance(value, str):
-        if value:
-            out.add(value)
+        # Producers use an empty optional scalar for absent Turn/Memory ids.
+        # Empty array *elements* remain malformed below.
+        if value == "":
+            return True
+        if not value.strip():
+            return False
+        out.add(value)
         return True
     if isinstance(value, (list, tuple, set)):
         ok = True
         for item in value:
-            if isinstance(item, str):
-                if item:
-                    out.add(item)
+            if isinstance(item, str) and item.strip():
+                out.add(item)
             else:
                 ok = False
         return ok
@@ -307,7 +312,7 @@ def job_reference_ids(job_type: str, payload: Any) -> JobReferences:
             if out is None:
                 continue
             for key in keys:
-                if key in node and not _add_ids(node[key], out):
+                if key in node and not parse_reference_ids(node[key], out):
                     unparseable = True
         # 非契约字段中的嵌套结构继续递归；正文键与已知引用键不再深入。
         for key, value in node.items():

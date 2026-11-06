@@ -29,7 +29,6 @@ from aiive.db.models import (
     WorkingState,
 )
 from aiive.runtime.compaction import (
-    build_working_state_snapshot,
     freeze_compaction_input,
     working_state_snapshot_hash,
 )
@@ -488,6 +487,19 @@ class EpochManager:
             .first()
         )
 
+        from aiive.runtime.working_state import WorkingStateService
+        from aiive.worker.job_source_guard import epoch_rollover_sources
+
+        # Validate every source before *any* freeze or status mutation, including
+        # direct API callers that do not enter through an Outbox handler.
+        reason = epoch_rollover_sources(db, thread_id).unresolved
+        if reason:
+            return EpochSealingResult(old_epoch_id=active_epoch.id, stale=True, reason=reason)
+        try:
+            snapshot = WorkingStateService.safe_boundary_snapshot(db, ws) if ws else {}
+        except ValueError as error:
+            return EpochSealingResult(old_epoch_id=active_epoch.id, stale=True, reason=str(error))
+
         # 冻结旧 Epoch 当前 open Segment（rollover 不复用 successor）
         if open_seg is not None:
             turn_record_count = (
@@ -505,7 +517,6 @@ class EpochManager:
                 )
 
         # Epoch boundary WorkingState 快照
-        snapshot = build_working_state_snapshot(ws) if ws else {}
         snapshot_hash = working_state_snapshot_hash(snapshot)
         boundary_turn_sequence = peek_next_turn_sequence(db, thread_id) - 1
 

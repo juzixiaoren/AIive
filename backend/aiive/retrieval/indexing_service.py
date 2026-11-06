@@ -65,8 +65,14 @@ def refresh_source(
             fields.get("source_type") == "memory_record"
             and (fields.get("validity_state") or "valid") in _INVALID_VALIDITY_STATES
         )
+        from aiive.forget.visibility_service import ForgetVisibilityService
+
+        blocked = ForgetVisibilityService.blocked_target_ids(
+            db, fields["source_type"], [(fields["source_id"], fields.get("created_source_at"))],
+        )
         if (
-            fields.get("is_forgotten")
+            blocked
+            or fields.get("is_forgotten")
             or is_invalid_memory
             or event_type in _TOMBSTONE_EVENTS
         ):

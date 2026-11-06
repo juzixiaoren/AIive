@@ -534,6 +534,8 @@ def test_pg_unified_retriever_recall_after_forget(pg_sessionmaker) -> None:
         )
         s.add_all([summary, memory])
         s.flush()
+        from tests.support import attach_memory_event_source
+        attach_memory_event_source(s, memory)
         refresh_source(s, "segment_summary", summary.id, "memory.created")
         refresh_source(s, "memory_record", memory.id, "memory.created")
         s.commit()

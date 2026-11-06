@@ -148,6 +148,9 @@ def handle_forget(
         return {"ok": False, "error": f"Forget Phase A 失败: {exc}"}
     finally:
         db.close()
+        from aiive.worker.outbox_execution_auth import require_execution_authorization
+
+        require_execution_authorization()
 
 
 # ── forget_status 工具 ──

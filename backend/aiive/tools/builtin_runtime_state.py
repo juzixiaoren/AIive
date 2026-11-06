@@ -50,6 +50,16 @@ def handle_update_working_state(
         return {"ok": True, "applied": False, "reason": "idempotent_skip", "field": field}
 
     if field == "current_objective":
+        from aiive.db.forget_models import ContentProvenanceRef
+
+        db.query(ContentProvenanceRef).filter_by(
+            owner_type="working_state_objective", owner_id=ws.id,
+        ).delete(synchronize_session=False)
+        if ctx.turn_record_id or ctx.turn_id:
+            db.add(ContentProvenanceRef(
+                owner_type="working_state_objective", owner_id=ws.id,
+                source_type="turn_record", source_id=ctx.turn_record_id or ctx.turn_id,
+            ))
         ws.current_objective = payload.get("value", "")
         # 统一版本簿记：current_objective 分支也 bump version/updated_at
         ws.version = (ws.version or 0) + 1
@@ -58,7 +68,7 @@ def handle_update_working_state(
         # update_semantic_field 内部已 bump version/updated_at，此处不再重复
         ws_service.update_semantic_field(
             db, ctx.thread_id, field, operation, payload,
-            ctx.turn_id or "", idempotency_key or "",
+            ctx.turn_record_id or ctx.turn_id or "", idempotency_key or "",
         )
     else:
         return {"ok": False, "error": f"unsupported field: {field}"}

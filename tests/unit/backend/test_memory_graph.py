@@ -67,6 +67,8 @@ def _record(
         proposal, lifecycle_state=lifecycle, validity_state=validity,
     )
     db.flush()
+    from tests.support import attach_memory_event_source
+    attach_memory_event_source(db, record)
     return record
 
 
@@ -681,12 +683,16 @@ def test_outbox_handler_projects_graph(db_session, monkeypatch):
         calls.append((memory_id, record_version))
         return {"status": "projected"}
 
+    record = _record(db_session, facts=[_fact()])
+    record.record_version = 3
+    db_session.flush()
+    record_id = record.id
     monkeypatch.setattr(GraphProjectionService, "refresh", _refresh)
     result = handle_memory_graph_refresh(
-        _claimed({"memory_id": "mem-1", "record_version": 3}),
+        _claimed({"memory_id": record_id, "record_version": 3}),
     )
     assert result.outcome == HandlerOutcome.COMPLETED
-    assert calls == [("mem-1", 3)]
+    assert calls == [(record_id, 3)]
 
 
 def test_outbox_handler_rejects_invalid_payload(db_session):
@@ -734,6 +740,10 @@ def test_write_service_persists_facts_and_enqueues_graph_job(db_session):
         )],
         confidence=0.95,
     )
+    from tests.support import create_memory_source_event
+    event = create_memory_source_event(db_session, "thread-1", proposal.content)
+    proposal.source_event_ids = [event.id]
+    proposal.evidence[0].source_event_id = event.id
     proposal.compute_request_idempotency()
 
     result = MemoryWriteService(db_session).write(

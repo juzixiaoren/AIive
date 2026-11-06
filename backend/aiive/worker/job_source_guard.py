@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -52,36 +52,49 @@ class JobSources:
     segments: dict[str, datetime | None] = field(default_factory=dict)
     epochs: dict[str, datetime | None] = field(default_factory=dict)
     thread_ids: set[str] = field(default_factory=set)
+    thread_times: dict[str, datetime | None] = field(default_factory=dict)
     #: 非空表示来源无法可靠解析 → fail-closed。
+    source_times: list[datetime] = field(default_factory=list)
     unresolved: str = ""
 
     @property
     def empty(self) -> bool:
         return not any((self.events, self.turns, self.memories, self.summaries,
                         self.checkpoints, self.segments, self.epochs,
-                        self.thread_ids))
+                        self.thread_ids, self.source_times))
 
 
 def _add(payload: Any, key: str, out: dict[str, datetime | None]) -> None:
-    value = payload.get(key) if isinstance(payload, dict) else None
-    if isinstance(value, str) and value:
+    from aiive.worker.outbox_payload_contract import parse_reference_ids
+
+    if not isinstance(payload, dict) or key not in payload:
+        return
+    ids: set[str] = set()
+    if not parse_reference_ids(payload[key], ids):
+        raise ValueError(f"invalid_reference:{key}")
+    for value in ids:
         out.setdefault(value, None)
-    elif isinstance(value, list):
-        for item in value:
-            if isinstance(item, str) and item:
-                out.setdefault(item, None)
 
 
 def _collect_manifest_ids(manifest: Any, key: str) -> list[str]:
-    ids: list[str] = []
     if not isinstance(manifest, list):
-        return ids
+        raise ValueError("manifest_not_array")
+    ids: list[str] = []
     for item in manifest:
-        if isinstance(item, dict):
-            value = item.get(key)
-            if isinstance(value, str) and value:
-                ids.append(value)
+        if not isinstance(item, dict):
+            raise ValueError("manifest_entry_not_mapping")
+        if any(isinstance(value, (dict, list)) for value in item.values()):
+            raise ValueError("manifest_nested_reference")
+        value = item.get(key)
+        if value is None and key in {"turn_id", "turn_record_id"}:
+            other = item.get("turn_record_id" if key == "turn_id" else "turn_id")
+            if isinstance(other, str) and other.strip():
+                continue
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"invalid_manifest_reference:{key}")
+        ids.append(value)
     return ids
+
 
 def _resolve_from_payload(claimed: ClaimedJob, sources: JobSources) -> None:
     """先收集 payload 自带的精确引用（不依赖 DB 补充）。"""
@@ -148,7 +161,9 @@ def _resolve_epoch_checkpoint(db: Session, claimed: ClaimedJob, sources: JobSour
     if eci is None:
         sources.unresolved = "epoch_compaction_input_missing"
         return
-    segment_ids = [s for s in (eci.source_segment_ids or []) if isinstance(s, str)]
+    segment_refs: dict[str, datetime | None] = {}
+    _add({"ids": eci.source_segment_ids}, "ids", segment_refs)
+    segment_ids = list(segment_refs)
     for segment_id in segment_ids:
         sources.segments.setdefault(segment_id, None)
     if not segment_ids:
@@ -157,14 +172,14 @@ def _resolve_epoch_checkpoint(db: Session, claimed: ClaimedJob, sources: JobSour
     rows = db.query(SegmentSummary).filter(
         SegmentSummary.segment_id.in_(segment_ids),
     ).all()
+    if set(segment_ids) - {row.segment_id for row in rows}:
+        sources.unresolved = "epoch_checkpoint_summary_missing"
     for row in rows:
+        if not row.source_event_ids and not row.source_turn_ids:
+            sources.unresolved = "epoch_summary_source_missing"
         sources.summaries.setdefault(row.id, row.created_at)
-        for event_id in (row.source_event_ids or []):
-            if isinstance(event_id, str):
-                sources.events.setdefault(event_id, None)
-        for turn_id in (row.source_turn_ids or []):
-            if isinstance(turn_id, str):
-                sources.turns.setdefault(turn_id, None)
+        _add({"ids": row.source_event_ids}, "ids", sources.events)
+        _add({"ids": row.source_turn_ids}, "ids", sources.turns)
     if not sources.summaries and not sources.events and not sources.turns:
         sources.unresolved = "epoch_checkpoint_no_summary_sources"
 
@@ -186,15 +201,29 @@ def _resolve_conflict_case(db: Session, claimed: ClaimedJob, sources: JobSources
     for memory_id in (case.old_memory_id, case.resolved_memory_id):
         if isinstance(memory_id, str) and memory_id:
             sources.memories.setdefault(memory_id, None)
-    if case.proposal_id:
-        proposal = db.get(MemoryProposal, case.proposal_id)
-        if proposal is not None:
-            for raw_event_id in (proposal.source_event_ids or []):
-                sources.events.setdefault(str(raw_event_id), None)
-            if proposal.source_turn_id:
-                sources.turns.setdefault(proposal.source_turn_id, None)
-            if proposal.source_turn_record_id:
-                sources.turns.setdefault(proposal.source_turn_record_id, None)
+    from aiive.memory.memory_types import MemoryProposal as ProposalSchema
+
+    # The durable case snapshot is authoritative even when park() is used before
+    # the separate proposal audit row is persisted. Validate the full schema,
+    # then inspect every source rather than silently ignoring a missing row.
+    snapshot = ProposalSchema.model_validate(case.proposal_payload)
+    if snapshot.proposal_id != case.proposal_id:
+        sources.unresolved = "conflict_proposal_identity_mismatch"
+        return
+    candidates: list[Any] = [snapshot]
+    proposal = db.query(MemoryProposal).filter(MemoryProposal.proposal_id == case.proposal_id).first()
+    if proposal is not None:
+        candidates.append(proposal)
+    for candidate in candidates:
+        _add({"ids": candidate.source_event_ids}, "ids", sources.events)
+        for token in (candidate.source_turn_id, candidate.source_turn_record_id):
+            if token:
+                _add({"turn": token}, "turn", sources.turns)
+    for evidence in snapshot.evidence:
+        if evidence.source_event_id:
+            sources.events[evidence.source_event_id] = None
+    if not snapshot.source_event_ids and not snapshot.source_turn_id and not snapshot.source_turn_record_id and not any(e.source_event_id for e in snapshot.evidence):
+        sources.unresolved = "conflict_proposal_source_missing"
 
 
 def _resolve_task(db: Session, claimed: ClaimedJob, sources: JobSources) -> None:
@@ -211,6 +240,11 @@ def _resolve_task(db: Session, claimed: ClaimedJob, sources: JobSources) -> None
         return
     if task.thread_id:
         sources.thread_ids.add(task.thread_id)
+        stamp = task.created_at
+        prior = sources.thread_times.get(task.thread_id)
+        normalized = stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None else stamp
+        if prior is None or normalized < (prior.replace(tzinfo=timezone.utc) if prior.tzinfo is None else prior):
+            sources.thread_times[task.thread_id] = stamp
     source_event_id = getattr(task, "source_event_id", None)
     if isinstance(source_event_id, str) and source_event_id:
         sources.events.setdefault(source_event_id, None)
@@ -235,6 +269,11 @@ def _resolve_reminder_task(db: Session, claimed: ClaimedJob, sources: JobSources
         return
     if task.thread_id:
         sources.thread_ids.add(task.thread_id)
+        stamp = task.created_at
+        prior = sources.thread_times.get(task.thread_id)
+        normalized = stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None else stamp
+        if prior is None or normalized < (prior.replace(tzinfo=timezone.utc) if prior.tzinfo is None else prior):
+            sources.thread_times[task.thread_id] = stamp
     source_event_id = getattr(task, "source_event_id", None)
     if isinstance(source_event_id, str) and source_event_id:
         sources.events.setdefault(source_event_id, None)
@@ -285,9 +324,104 @@ def _resolve_retrieval_refresh(_db: Session, claimed: ClaimedJob, sources: JobSo
     bucket.setdefault(source_id, None)
 
 
+def epoch_rollover_sources(db: Session, thread_id: str) -> JobSources:
+    from aiive.db.models import Epoch, Segment, TurnRecord, Event, CompactionInput, WorkingState, SegmentSummary
+    from aiive.runtime.working_state import WorkingStateService
+
+    sources = JobSources()
+    epoch = db.query(Epoch).filter_by(thread_id=thread_id, status="active").first()
+    if epoch is None:
+        return sources
+    segments = db.query(Segment).filter_by(epoch_id=epoch.id).all()
+    ids = [segment.id for segment in segments]
+    turns = db.query(TurnRecord).filter(TurnRecord.segment_id.in_(ids)).all()
+    for turn in turns:
+        sources.turns[turn.id] = turn.created_at
+    tokens = {turn.turn_id for turn in turns}
+    for event in db.query(Event).filter(Event.thread_id == thread_id, Event.turn_id.in_(tokens)).all():
+        sources.events[event.id] = event.created_at
+    for ci in db.query(CompactionInput).filter(CompactionInput.segment_id.in_(ids)).all():
+        for eid in _collect_manifest_ids(ci.event_manifest, "event_id"):
+            sources.events[eid] = None
+        for tid in _collect_manifest_ids(ci.turn_manifest, "turn_record_id"):
+            sources.turns[tid] = None
+    for summary in db.query(SegmentSummary).filter(SegmentSummary.segment_id.in_(ids)).all():
+        if not summary.source_event_ids and not summary.source_turn_ids:
+            sources.unresolved = "epoch_summary_source_missing"
+        sources.summaries[summary.id] = summary.created_at
+        _add({"ids": summary.source_event_ids}, "ids", sources.events)
+        _add({"ids": summary.source_turn_ids}, "ids", sources.turns)
+    # Raw manifests cannot be selectively copied into an immutable sealed
+    # segment. Stop before creating an input if any manifest source is hidden.
+    for kind, refs in (("event", sources.events), ("turn_record", sources.turns), ("segment_summary", sources.summaries)):
+        if _blocked_ids(db, kind, refs):
+            sources.unresolved = f"forget_source_blocked:{kind}"
+            return sources
+    ws = db.query(WorkingState).filter_by(thread_id=thread_id).first()
+    if ws is not None:
+        try:
+            WorkingStateService.safe_boundary_snapshot(db, ws)
+        except ValueError as error:
+            sources.unresolved = str(error)
+    return sources
+
+
+def _resolve_domain_event(db: Session, claimed: ClaimedJob, sources: JobSources) -> None:
+    from dataclasses import replace
+    from aiive.task_runtime.goal_events import SUPPORTED_EVENT_TYPES
+    from aiive.db.models import OutboxJob, SelfDevRequest
+
+    payload = claimed.payload
+    event_type = payload.get("event_type") if claimed.job_type == "goal_event_dispatch" else payload.get("trigger_event_type")
+    if not isinstance(event_type, str) or event_type not in SUPPORTED_EVENT_TYPES:
+        return
+    # These event ids identify durable domain events, not rows in `events`.
+    key = "event_id" if claimed.job_type == "goal_event_dispatch" else "trigger_event_id"
+    domain_id = payload.get(key)
+    if not isinstance(domain_id, str) or not domain_id.strip():
+        sources.unresolved = "domain_event_id_missing"
+        return
+    sources.events.pop(domain_id, None)
+    data = payload.get("event_payload" if claimed.job_type == "goal_event_dispatch" else "trigger_event_payload")
+    if not isinstance(data, dict):
+        sources.unresolved = "domain_event_missing_source"
+        return
+    if event_type in {"task_completed", "task_cancelled"}:
+        _resolve_task(db, replace(claimed, payload=data), sources)
+    elif event_type.startswith("knowledge_maintenance_"):
+        op = data.get("operation_id")
+        row = db.query(OutboxJob).filter(
+            OutboxJob.job_type == "knowledge_maintenance",
+            (OutboxJob.operation_id == op) | (OutboxJob.operation_id == f"knowledge_maintenance:{op}"),
+        ).first() if isinstance(op, str) else None
+        if row is None:
+            sources.unresolved = "domain_event_source_job_missing"
+        else:
+            sources.source_times.append(row.created_at)
+    else:
+        rid = data.get("request_id")
+        row = db.get(SelfDevRequest, rid) if isinstance(rid, str) else None
+        if row is None:
+            sources.unresolved = "domain_event_request_missing"
+        else:
+            sources.source_times.append(row.created_at)
+
+
+def _resolve_epoch_rollover(db: Session, claimed: ClaimedJob, sources: JobSources) -> None:
+    thread_id = claimed.payload.get("thread_id")
+    if not isinstance(thread_id, str) or not thread_id.strip():
+        sources.unresolved = "epoch_rollover_missing_thread"
+        return
+    resolved = epoch_rollover_sources(db, thread_id)
+    sources.unresolved = resolved.unresolved
+    sources.events.update(resolved.events)
+    sources.turns.update(resolved.turns)
+
+
 _RESOLVERS = {
     "segment_sealing": _resolve_segment_sealing,
     "epoch_checkpoint": _resolve_epoch_checkpoint,
+    "epoch_rollover": _resolve_epoch_rollover,
     "memory_conflict_question": _resolve_conflict_case,
     "memory_conflict_reply": _resolve_conflict_case,
     "agent_task_run": _resolve_task,
@@ -319,9 +453,15 @@ _ALLOW_EMPTY_SOURCE_JOB_TYPES: frozenset[str] = frozenset({
 })
 
 
-def resolve_job_sources(db: Session, claimed: ClaimedJob) -> JobSources:
+def _resolve_job_sources(db: Session, claimed: ClaimedJob) -> JobSources:
     """解析 Job 的类型化来源引用（payload + DB 补充）。"""
     sources = JobSources()
+    from aiive.worker.outbox_payload_contract import job_reference_ids
+
+    refs = job_reference_ids(claimed.job_type, claimed.payload)
+    if refs.unparseable:
+        sources.unresolved = "payload_references_unparseable"
+        return sources
     _resolve_from_payload(claimed, sources)
     raw_payload: Any = claimed.payload
     payload = raw_payload if isinstance(raw_payload, dict) else {}
@@ -329,13 +469,22 @@ def resolve_job_sources(db: Session, claimed: ClaimedJob) -> JobSources:
     if isinstance(trigger_payload, dict):
         # 触发事件正文里可能带自己的来源 Event / Turn
         for key in ("event_id", "turn_id", "turn_record_id", "source_turn_record_id"):
-            value = trigger_payload.get(key)
-            if isinstance(value, str) and value:
-                (sources.events if "event" in key else sources.turns).setdefault(value, None)
+            _add(trigger_payload, key, sources.events if "event" in key else sources.turns)
+    elif trigger_payload is not None:
+        sources.unresolved = "trigger_payload_not_mapping"
+    _resolve_domain_event(db, claimed, sources)
     resolver = _RESOLVERS.get(claimed.job_type)
     if resolver is not None:
         resolver(db, claimed, sources)
     return sources
+
+
+def resolve_job_sources(db: Session, claimed: ClaimedJob) -> JobSources:
+    try:
+        return _resolve_job_sources(db, claimed)
+    except Exception:
+        logger.exception("Job source resolution failed")
+        return JobSources(unresolved="source_resolution_failed")
 
 
 def _blocked_ids(
@@ -343,7 +492,9 @@ def _blocked_ids(
 ) -> set[str]:
     if not ids:
         return set()
-    return ForgetVisibilityService.blocked_target_ids(
+    meta = ForgetVisibilityService.load_target_meta(db, target_type, list(ids))
+    missing = set(ids) - {row["id"] for row in meta if row["created_at"] is not None}
+    return missing | ForgetVisibilityService.blocked_target_ids(
         db, target_type, list(ids.items()),
     )
 
@@ -355,6 +506,17 @@ def blocked_source_reason(
     """返回屏蔽原因；空串表示来源可见。"""
     if sources.unresolved:
         return sources.unresolved
+    if sources.turns:
+        from sqlalchemy import or_
+        from aiive.db.models import Event, TurnRecord
+
+        turns = db.query(TurnRecord).filter(or_(
+            TurnRecord.id.in_(sources.turns), TurnRecord.turn_id.in_(sources.turns),
+        )).all()
+        tokens = set(sources.turns) | {turn.turn_id for turn in turns}
+        events: dict[str, datetime | None] = {row.id: row.created_at for row in db.query(Event).filter(Event.turn_id.in_(tokens)).all()}
+        if _blocked_ids(db, "event", events):
+            return "blocked:turn_source_event"
     # 只使用 ForgetVisibilityService 支持元数据重载的目标类型；segment / epoch
     # 的屏蔽通过其 Summary / Checkpoint 与 Thread 选择器传递，不在本层重复判定
     # （未知 created_at 会被 all_user_data 分支 fail-closed 过度拦截）。
@@ -368,9 +530,15 @@ def blocked_source_reason(
     for target_type, ids in groups:
         if _blocked_ids(db, target_type, ids):
             return f"blocked:{target_type}"
+    for stamp in sources.source_times:
+        if ForgetVisibilityService.is_shielded(db, target_time=stamp):
+            return "blocked:source_time"
     for thread_id in sorted(sources.thread_ids):
+        source_time = sources.thread_times.get(thread_id, job_created_at)
+        if source_time is None:
+            return "source_time_missing"
         if ForgetVisibilityService.is_shielded(
-            db, thread_id=thread_id, target_time=job_created_at,
+            db, thread_id=thread_id, target_time=source_time,
         ):
             return "blocked:thread"
     return ""
@@ -428,3 +596,12 @@ def guard_job_sources_visible(
     finally:
         if owns:
             db.close()
+
+def task_sources_visible(db: Session, task_id: str) -> bool:
+    """Revalidate before every runtime iteration and broker dispatch after handoff."""
+    try:
+        claimed = ClaimedJob("runtime", "agent_task_run", {"task_id": task_id}, None, 0, 1, "", 1, "")
+        sources = resolve_job_sources(db, claimed)
+        return not sources.empty and not blocked_source_reason(db, claimed, sources)
+    except Exception:
+        return False

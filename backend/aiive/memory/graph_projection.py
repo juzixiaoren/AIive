@@ -118,6 +118,10 @@ class GraphProjectionService:
             )
             return {"status": "record_invalid_closed", "closed": closed}
 
+        from aiive.forget.visibility_service import ForgetVisibilityService
+
+        if memory_id not in ForgetVisibilityService.filter_memory_ids(self._db, [memory_id]):
+            return {"status": "forget_source_blocked", "purged": self.purge_for_memory(memory_id)}
         facts = self._load_facts(record)
         if not facts:
             closed = self._close_own_relations(

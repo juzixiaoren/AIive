@@ -55,6 +55,10 @@ def build_blocks(db: Session, config: RecallConfig | None = None) -> list[CoreMe
             .order_by(MemoryRecord.updated_at.desc())
             .all()
         )
+        from aiive.forget.visibility_service import ForgetVisibilityService
+
+        allowed = set(ForgetVisibilityService.filter_memory_ids(db, [r.id for r in recs]))
+        recs = [r for r in recs if r.id in allowed]
         if recs:
             buckets.setdefault(role, []).extend(recs)
 
@@ -112,6 +116,12 @@ def load_core_memory(db: Session, config: RecallConfig | None = None) -> list[Co
     """Read path: load persisted blocks; fall back to live rebuild if empty."""
     rows = db.query(CoreMemoryBlockRow).all()
     if rows:
+        from aiive.forget.visibility_service import ForgetVisibilityService
+
+        ids = [mid for row in rows for mid in (row.source_memory_ids or [])]
+        visible = set(ForgetVisibilityService.filter_memory_ids(db, ids))
+        if any(not row.source_memory_ids or any(mid not in visible for mid in row.source_memory_ids) for row in rows):
+            return build_blocks(db, config)
         blocks = [
             CoreMemoryBlock(
                 block_name=r.block_name,

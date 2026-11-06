@@ -80,6 +80,15 @@ class PersistentTaskRuntime:
         last_model: str | None = None
         run_tokens: dict[str, int] = {}
         while completed_this_run < budget.max_actions_per_run:
+            from aiive.worker.outbox_execution_auth import require_execution_authorization
+            from aiive.worker.job_source_guard import task_sources_visible
+
+            require_execution_authorization()
+            if not task_sources_visible(self.db, task.id):
+                return self._complete(
+                    task, run, status="partial", summary="任务来源已被遗忘，停止执行。",
+                    unresolved=["forget_source_blocked"],
+                )
             self.db.refresh(task)
             if goals is not None and goals.is_paused(task):
                 # 暂停是用户显式意图：停止本轮推理，保留已完成步骤与证据。

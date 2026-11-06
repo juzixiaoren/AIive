@@ -15,7 +15,9 @@
 from __future__ import annotations
 
 import atexit
+import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -51,14 +53,56 @@ _load_dotenv()
 # 文件名带 PID：同一进程内多会话共享同一物理库（backend/tests 的既有设计），
 # 而并行的多个 pytest 进程互不干扰（固定文件名会导致并发 drop_all 假失败）。
 _TEST_DB = os.path.join(tempfile.gettempdir(), f"aiive_test_{os.getpid()}.db")
+_CLEANUP_SUCCEEDED = False
 
 
 @atexit.register
 def _cleanup_test_db() -> None:
+    """先释放本进程的 Session/连接池，再删除唯一的进程测试库。"""
+    global _CLEANUP_SUCCEEDED
+    if _CLEANUP_SUCCEEDED:
+        return
+    target = Path(_TEST_DB)
+    resolved = target.resolve()
+    if (resolved.parent != Path(tempfile.gettempdir()).resolve()
+            or resolved.name != f"aiive_test_{os.getpid()}.db"):
+        raise RuntimeError(f"Unexpected process test database: {target}")
+    # 不导入尚未加载的应用模块，防止纯收集/配置失败时初始化其他数据库。
+    database = sys.modules.get("aiive.db.base")
+    if database is not None:
+        from sqlalchemy.orm import close_all_sessions
+
+        close_all_sessions()
+        database.engine.dispose()
+    target.unlink(missing_ok=True)
+    _CLEANUP_SUCCEEDED = True
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session, exitstatus) -> None:
+    """fixture teardown 后验证清理；失败必须使 pytest 非零退出并留下报告。"""
+    report = {
+        "pid": os.getpid(), "process_database": _TEST_DB,
+        "test_exitstatus": int(exitstatus), "status": "failed",
+    }
     try:
-        os.remove(_TEST_DB)
-    except OSError:
-        pass
+        _cleanup_test_db()
+        report["exists_after_cleanup"] = Path(_TEST_DB).exists()
+        if report["exists_after_cleanup"]:
+            raise RuntimeError("Process test database still exists after cleanup")
+        report["status"] = "cleaned"
+    except Exception as error:
+        report["error"] = f"{type(error).__name__}: {error}"
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+    destination = ROOT / "tests/artifacts/validation/cleanup" / str(os.getpid()) / "cleanup_report.json"
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except OSError as error:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        print(f"ERROR: Cannot write cleanup report: {error}", file=sys.stderr)
+    if report["status"] != "cleaned":
+        print(f"ERROR: Process database cleanup failed: {report.get('error')}; report={destination}", file=sys.stderr)
 
 
 os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DB}"
