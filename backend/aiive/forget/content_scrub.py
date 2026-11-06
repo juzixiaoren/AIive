@@ -1239,6 +1239,7 @@ class VerifyReport:
     object_actions: dict[str, int] = field(default_factory=dict)
     unknown: int = 0
     failures: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -1253,12 +1254,18 @@ class VerifyReport:
             "object_actions": self.object_actions,
             "unknown": self.unknown,
             "failures": self.failures,
+            "warnings": self.warnings,
         }
 
     def add(self, label: str, count: int) -> None:
         if count:
             self.residues[label] = count
             self.failures.append(f"{label}: {count} residue rows")
+
+    def warn(self, label: str, count: int) -> None:
+        '''显式记录但不判定失败：仅表明该维度无法证明（不静默丢弃）。'''
+        if count:
+            self.warnings.append(f"{label}: {count}")
 
 
 def _count_unknown_json_shapes(
@@ -1730,6 +1737,10 @@ def verify_scope(db: Session, scope: ContentScope) -> VerifyReport:
             ):
                 residue += 1
         report.add("outbox_jobs", residue)
+        if scope.outbox_unparseable_ids:
+            # 无法完整解析引用的 Job：已纳入范围并执行 Scrub，但引用提取不完整，
+            # 必须显式记录（不阻塞终态，也不静默忽略）。
+            report.warn("outbox_jobs.unparseable_refs", len(scope.outbox_unparseable_ids))
 
     docs = scope.document_ids
     if docs:

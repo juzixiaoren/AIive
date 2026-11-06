@@ -14,11 +14,21 @@ from aiive.task_runtime.goal_events import event_from_job_payload
 from aiive.task_runtime.goal_trigger_service import GoalTriggerService
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome, HandlerResult
 from aiive.worker.outbox_payload_contract import is_redacted_payload
+from aiive.worker.outbox_execution_auth import (
+    guard_handler_payload,
+    with_execution_authorization,
+)
 
 logger = logging.getLogger(__name__)
 
 
+@with_execution_authorization
 def handle_goal_event_dispatch(claimed: ClaimedJob) -> HandlerResult:
+    fresh_claimed, guard = guard_handler_payload(claimed, SessionLocal, require_persisted=False)
+    if guard is not None:
+        return guard
+    assert fresh_claimed is not None
+    claimed = fresh_claimed
     if is_redacted_payload(claimed.payload):
         return HandlerResult(HandlerOutcome.COMPLETED, "forget_content_redacted")
     event = event_from_job_payload(dict(claimed.payload or {}))

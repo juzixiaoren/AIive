@@ -216,6 +216,56 @@ def test_pg_pending_memory_extraction_no_llm(pg_sessionmaker, monkeypatch) -> No
         )
         result = outbox_handlers.handle_memory_extraction(claimed)
         assert result.outcome.value == "completed"
+        assert result.reason in ("forget_content_redacted",) or (
+            "extraction_blocked_by_forget" in result.reason
+        )
+    finally:
+        s.close()
+
+
+def test_pg_active_shield_blocks_extraction_before_llm(
+    pg_sessionmaker, monkeypatch,
+) -> None:
+    from aiive.worker import outbox_handlers
+    from aiive.worker.outbox_dto import ClaimedJob
+
+    s: Session = pg_sessionmaker()
+    try:
+        thread_id = _thread(s)
+        turn = _turn(s, thread_id, _now())
+        ev = _event(s, thread_id, "secret", _now(), turn.turn_id)
+        op_id = _op(s, selector="event_ids", payload={"event_ids": [ev]})
+        s.add(ForgetShield(
+            id=_id(), forget_operation_id=op_id, selector_type="event",
+            target_type="event", target_id=ev, cutoff_created_at=_now(),
+            status="active", normalized_shield_key=f"pga3:{ev}", created_at=_now(),
+        ))
+        job = OutboxJob(
+            id=_id(), operation_id="pg_extract:a3", job_type="memory_extraction",
+            status="pending",
+            payload={
+                "user_message": "secret", "reply": "reply", "thread_id": thread_id,
+                "source_turn_record_id": turn.id, "source_turn_id": turn.turn_id,
+                "source_event_ids": [ev], "assistant_event_id": _id(),
+                "message_source": "user", "extraction_mode": "async",
+            },
+            trace_id=_id(), max_retries=3, created_at=_now(),
+        )
+        s.add(job)
+        s.commit()
+
+        def _boom():
+            raise AssertionError("LLM must not be called")
+
+        monkeypatch.setattr(outbox_handlers, "_get_llm_client", _boom)
+        monkeypatch.setattr(outbox_handlers, "SessionLocal", pg_sessionmaker)
+        claimed = ClaimedJob(
+            id=job.id, job_type="memory_extraction", payload=job.payload,
+            trace_id=job.trace_id, retry_count=0, max_retries=3,
+            claim_token="ct", schema_version=1, worker_id="w",
+        )
+        result = outbox_handlers.handle_memory_extraction(claimed)
+        assert result.outcome.value == "completed"
         assert "extraction_blocked_by_forget" in result.reason
     finally:
         s.close()

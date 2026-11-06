@@ -147,7 +147,7 @@ Verify 失败；物理删除行（Evidence/CoreBlock/Token/Chunk/Vector）单独
 - `memory_vector_projection`：仅向量与版本；Memory 被遗忘时由 `_scratch_batch` 的
   `memory_vector_projection` 删除逻辑处理（Phase A 对显式 ID 已删除）。
 
-## 9. Outbox Payload 契约与异步阻断（V62.4）
+## 9. Outbox Payload 契约与异步阻断（V62.4 / V62.5）
 
 契约模块：`backend/aiive/worker/outbox_payload_contract.py`，Scrub / Verify / Worker 共用。
 
@@ -163,21 +163,74 @@ Verify 失败；物理删除行（Evidence/CoreBlock/Token/Chunk/Vector）单独
 | `improvement_discovery` | title, content, message, goal, content_preview | operation_id, schema_version |
 | `segment_sealing / epoch_checkpoint / epoch_rollover / memory_maintenance` | summary, content, goal, reason | segment_id, epoch_id, source_id, operation_id |
 
-- 发现：trace_id + operation_id + `payload` 文本中的目标 ID（结构化 ID 匹配，不做内容关键词匹配）。
-- 清理：按 job_type 递归替换正文键为 `[redacted]` / `{}` / `[]` / NULL，写入 `forget_content_redacted=True`；保留定位与幂等字段。
-- 异步阻断：`handle_memory_extraction` 在 LLM 调用前（Phase A 之后）与持久化写入前（Phase C）双重调用 `_extraction_blocked_reason()`；命中 Shield/Tombstone 或已 Scrub 载荷时收敛 IngestionRun 为 succeeded 并直接 COMPLETED，不调用模型、不写回记忆。`goal_event_dispatch` / `goal_trigger_decision` / `reminder_delivery` Handler 遇到 `forget_content_redacted` 直接完成。
+- 清理：`redact_job_payload()` 递归支持 dict / list / 嵌套 list / scalar（顶层为 List 时同样清理）；
+  正文键替换为 `[redacted]` / `{}` / `[]` / NULL，写入 `forget_content_redacted=True`；保留定位、引用、状态与幂等字段。
+  `payload_has_content()` 使用同一递归结构判定，Scrub 与 Verify 不会出现「清得掉但检不出 / 检得出却清不掉」。
+- 异步阻断：`handle_memory_extraction` 在 LLM 调用前（Phase A 之后）与持久化写入前（Phase C）双重调用
+  `_extraction_blocked_reason()`；命中 Shield/Tombstone 或已 Scrub 载荷时收敛 IngestionRun 为 succeeded 并直接
+  COMPLETED，不调用模型、不写回记忆。`goal_event_dispatch` / `goal_trigger_decision` / `reminder_delivery`
+  Handler 遇到 `forget_content_redacted` 直接完成。
 - 无关 Job 不被取消，payload 保持不变。
+
+### 9.1 发现规则（V62.5：精确关联，禁用 LIKE / 子串包含）
+
+- **有界分批**：按 `id` keyset 每次读 500 行（`SELECT id, job_type, payload, trace_id, operation_id, created_at`），
+  不把整表 Outbox 一次性载入内存；`job_type` 属于 `forget_*` / `retention_cleanup` 的内部 Saga Job 直接跳过。
+- **结构化提取**：`outbox_payload_contract.job_reference_ids(job_type, payload)` 按 job_type 的真实 Payload Schema
+  把引用拆成 event / turn / memory / task / child / thread / trace / operation 八类，只做精确集合交集。
+  禁止 `CAST(payload AS Text) LIKE '%id%'` 与 `operation_id.contains()`：子串碰撞与 Thread/父 Task 过度关联一律不成立。
+- **强关联（不受 cutoff 约束，命中即清理）**：
+  `event_id` / `trigger_event_id` / `assistant_event_id` / `request_event_id` / `message_event_id` / `source_event_ids`
+  与目标 Event 相交；`turn_id` / `source_turn_record_id` / `source_turn_id` 与目标 Turn 相交；
+  `memory_id` / `old_memory_id` / `resolved_memory_id` 与目标 Memory 相交；
+  `run_id` / `step_id` / `action_id` / `evidence_id` / `artifact_id` / `checkpoint_id` / `approval_id` /
+  `conflict_case_id` / `case_id` / `tool_operation_id` 与目标子记录相交；`trace_id`（列或 payload 字段）与目标 trace 相交。
+  明确引用旧 Event/Turn/Memory/子记录的派生 Job 即使在 cutoff 之后创建，仍然必须清理。
+- **弱关联（必须同时满足 cutoff）**：仅引用 `thread_id` 的 Job 只在 thread 选择器且 `created_at <= cutoff` 时清理；
+  仅引用父 `task_id` 的 Job 只在整 Task 命中且 cutoff 内时清理；`time_range` 选择器按 `created_at` 落在窗口内；
+  `all_user_data` 覆盖 cutoff 内全部用户数据。cutoff 之后独立创建、只引用 Thread/父 Task 的新 Job 一律保留。
+- **Task 父子**：`task_id` 永不作为强关联；部分命中（partial）只能靠子记录 ID 命中，
+  因此范围外的新 Run/Action Job 不会因为引用了父 Task ID 被误清理。
+- **operation_id**：`operation_id_tokens()` 按冒号拆成业务键 token，剔除业务前缀（`memory_extraction`、
+  `agent_task_run`、`retrieval_refresh`、`core`、`memory_*` 等）与版本/批次 token（`v3`、`b0`），
+  其余 token 与目标 ID 集合做**整段精确相等**交集。`<turn_id>EXTRA` 这类前缀相同但实际不同的
+  token 不会命中；绝不用整串 `contains()` 或子串包含代替来源判断。
+- **语义分级**：Event / Turn / Memory / 子记录 / trace 命中为强关联；`thread_id` 与父 `task_id` 只在
+  cutoff + 选择器范围内作为弱关联。
+- **不可解析 Job**：出现未登记语义的 `*_id` 键时标记 unparseable；已命中者仍执行 Scrub，
+  并在 Verify 中以 `outbox_jobs.unparseable_refs` 显式记录（不静默丢弃，也不误判为失败）。
+
+### 9.2 共享执行授权（V62.5：Forget COMMIT × Worker 外部调用的确定先后）
+
+- 锁：沿用 `forget/concurrency.py` 的全局命名空间与 key（`FORGET_LOCK_NAMESPACE` / `FORGET_LOCK_KEY`）。
+  Worker 侧在独立连接上取 session-level `pg_advisory_lock_shared`，Phase A 仍取 transaction-level
+  `pg_advisory_xact_lock`（排他）；两者同属一个 advisory lock 空间，必然互斥。命名空间、锁顺序、
+  MemoryWrite 共享锁均未改变。
+- 覆盖范围：授权覆盖「重新读库 → 检查 Shield/Tombstone → LLM 调用 → 结果持久化提交」整段，直到 Handler
+  返回才 unlock；不把 ORM 事务挂在网络调用期间（锁在独立连接上，ORM 事务各自短提交）。
+- 拿到授权后必须重新读 `outbox_jobs`：校验存在性、终态、`claim_token` / `locked_by`、`lease_expires_at`、
+  最新 payload 与 `forget_content_redacted`；任何一项不满足即终止，绝不继续使用领取时的旧 payload 副本。
+- 两种时序：Worker 先取共享授权 → Forget 在 Phase A 排他锁上等待，Purge 必定覆盖该次执行产生的记忆；
+  Forget 先取排他锁并 COMMIT → Worker 获得授权后重新读到 Shield/Tombstone 或已脱敏 Job，直接终止，
+  不调用 LLM、不写 Memory。
+- 释放：成功 / 失败 / 异常 / 超时全部走 `finally` 显式 `pg_advisory_unlock_shared`；SQLite 为 no-op（仅逻辑测试），
+  并发正确性只以 PostgreSQL 双连接真实并发用例为准。
 
 ## 10. 范围边界与发现（V62.4）
 
 - Turn→子 Event：显式 turn_ids 与间接 Turn 均按 `Event.created_at <= cutoff`；间接 Turn 在 time_range 下还须逐个 Event 落在时间窗口。`raw_event_ids` 只含实际命中原始 Event；派生 Summary/Memory 仍按 Provenance 清理。
 - Task Runtime：`ContentScope` 独立维护命中的 AgentTask 与六类子记录 ID 集合；每条子记录按自身 `created_at` + cutoff/time_range 判断。父 Task 命中只清父正文，子记录命中只清子记录；未命中父任务仅脱敏 `task_state/task_brief` 引用，引用变化时运行态任务才转 `cancelled`。
+- Outbox Job：发现按 §9.1 的强/弱关联分级；强关联不受 cutoff 约束，弱关联必须落在 cutoff 内。
+  `time_range` 用 Job 自身 `created_at` 判窗口，`thread` / `all_user_data` 用 cutoff，
+  `task` 只在整 Task 命中时才允许父 `task_id` 参与弱关联。
 - 未知 JSON：`unknown_reference_details()` 先按本次范围确定候选（受影响集合 + 「目标 ID 在引用数组文本中出现」+ all_user_data 按 cutoff），再检查数组结构；对象/嵌套数组/数字/布尔等元素 fail-closed。无关 Thread 且不含目标 ID 的异常数组不阻断本次 Forget。
 
 ## 11. Verify 判定
 
 - 逐表重新查询残留（不信 rowcount）。
 - JSON 数组用成员查询（PG `jsonb_array_elements_text`；SQLite `json_each`），禁止 LIKE。
+- Outbox：`payload_has_content()` 与 Scrub 使用同一递归判定；引用无法完整解析的 Job 记入
+  `warnings`（`outbox_jobs.unparseable_refs`），属于「无法证明完整性」的显式记录，不阻塞终态。
 - 对象：pending/failed 动作必须为 0，且对象不存在。
 - 任一残留 → `failed_retryable`，Shield 保持 active。
 - 全部通过 → 宽选择器仍以 `verified_with_coarse_purge` 结束，但该状态现在有逐表证明，

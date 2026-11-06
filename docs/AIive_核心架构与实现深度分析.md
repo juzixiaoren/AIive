@@ -1179,6 +1179,18 @@ PostgreSQL 非 READ COMMITTED 时 fail-closed（避免等待锁期间沿用旧�
 只用于逻辑测试。冲突确认的 `forget_old` 在同一事务先 forget（排他）再 write（共享）：
 PostgreSQL advisory lock 在会话内可重入，不会自我阻塞，也不构成锁升级。
 
+**Outbox 执行侧的第三把锁（V62.5）**：事务级共享锁只保护「Memory 写入」这一段，无法阻止
+「Worker 检查完 Shield → Forget 提交 → Worker 用旧 payload 调 LLM」。因此新增
+`worker/outbox_execution_auth.py`，在**独立连接**上取同一命名空间的 session-level
+`pg_advisory_lock_shared`，与 Phase A 的 `pg_advisory_xact_lock` 排他锁互斥（同为双 int4 锁空间）。
+授权覆盖「重读 OutboxJob → 复查 Shield/Tombstone → LLM 调用 → 结果持久化提交」整段，
+`finally` 显式 `pg_advisory_unlock_shared` 释放，不把 ORM 事务挂在网络调用期间。
+拿到授权后必须重新读库校验 status / claim_token / locked_by / lease / 最新 payload /
+`forget_content_redacted`，不得继续使用领取时的 payload 副本。两种时序都成立：
+Worker 先取共享锁 → Forget 等待，Purge 覆盖该次执行产生的记忆；Forget 先取排他锁并 COMMIT →
+Worker 获得授权后判定来源已遗忘，不调用 LLM、不写 Memory。命名空间、锁顺序与 MemoryWrite
+共享锁语义均未改变。
+
 ## 12.9 Memory Gate 的准确含义
 
 Gate 是写入准入规则，不是 LLM 自己的置信度投票：

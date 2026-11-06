@@ -43,6 +43,11 @@ from aiive.memory.memory_write_service import MemoryBatchWriteError, MemoryWrite
 from aiive.prompts import get_prompt_registry
 from aiive.retrieval.index_rebuild import handle_retrieval_index_rebuild
 from aiive.worker.outbox_payload_contract import is_redacted_payload
+from aiive.worker.outbox_execution_auth import (
+    authorized_session_factory,
+    guard_handler_payload,
+    with_execution_authorization,
+)
 from aiive.worker.outbox_dto import (
     ClaimedJob,
     HandlerOutcome,
@@ -168,8 +173,16 @@ def _mark_ingestion_succeeded_fencing(
         db_m.close()
 
 
+@with_execution_authorization
 def handle_memory_extraction(claimed: ClaimedJob) -> HandlerResult:
-    """三阶段异步记忆提取 Handler。"""
+    """三阶段异步记忆提取 Handler（持共享执行授权覆盖 LLM 与写入提交）。"""
+    # 授权已获取：重新读取最新 Job 状态与 Payload，不信任领取时的旧副本。
+    auth_sessions = authorized_session_factory(SessionLocal)
+    fresh_claimed, guard = guard_handler_payload(claimed, auth_sessions)
+    if guard is not None:
+        return guard
+    assert fresh_claimed is not None
+    claimed = fresh_claimed
     payload = claimed.payload
     user_message: str = payload.get("user_message", "")
     message_source = payload.get("message_source")
@@ -186,7 +199,7 @@ def handle_memory_extraction(claimed: ClaimedJob) -> HandlerResult:
     # ════════════════════════════════════════════════
     # Phase A: 短事务 —— 幂等预检查 + source Turn 验证
     # ════════════════════════════════════════════════
-    db_a = SessionLocal()
+    db_a = auth_sessions()
     try:
         # A1: 验证 source Turn + schema_version
         validated_source = _validate_source_turn(
@@ -235,7 +248,7 @@ def handle_memory_extraction(claimed: ClaimedJob) -> HandlerResult:
 
     # A3（LLM 调用前）：Forget 提交后来源已被屏蔽，或 payload 正文已被 Scrub，
     # 直接收敛 IngestionRun 并终止本次提取，绝不把原文交给模型。
-    db_check = SessionLocal()
+    db_check = auth_sessions()
     try:
         blocked_reason = _extraction_blocked_reason(
             db_check,
@@ -283,7 +296,7 @@ def handle_memory_extraction(claimed: ClaimedJob) -> HandlerResult:
             from aiive.memory.conflict_confirmation import MemoryConflictService
             from aiive.memory.scope_resolver import build_scope_context
 
-            db_b = SessionLocal()
+            db_b = auth_sessions()
             try:
                 scope_ctx = build_scope_context(db_b, None, thread_id)
                 discoveries = MemoryConflictService.collect_candidates(
@@ -301,7 +314,7 @@ def handle_memory_extraction(claimed: ClaimedJob) -> HandlerResult:
     # ════════════════════════════════════════════════
     # Phase C: 短事务 —— 双重 fencing + 写入 + 标记成功
     # ════════════════════════════════════════════════
-    db_c = SessionLocal()
+    db_c = auth_sessions()
     try:
         # C1a: 双重 fencing — 先验证 OutboxJob
         outbox_c = db_c.query(OutboxJob).filter(
@@ -482,10 +495,17 @@ def _remind_alert_succeeded(db: Session, turn_id: str, expected_reminder_id: str
     return False
 
 
+@with_execution_authorization
 def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
     """投递到期提醒：使用确定性 Turn 唤醒 Agent，成功后完成 Task。"""
     import uuid as _uuid
 
+    auth_sessions = authorized_session_factory(SessionLocal)
+    fresh_claimed, guard = guard_handler_payload(claimed, auth_sessions, require_persisted=False)
+    if guard is not None:
+        return guard
+    assert fresh_claimed is not None
+    claimed = fresh_claimed
     payload = claimed.payload
     if is_redacted_payload(payload):
         return HandlerResult(HandlerOutcome.COMPLETED, "forget_content_redacted")

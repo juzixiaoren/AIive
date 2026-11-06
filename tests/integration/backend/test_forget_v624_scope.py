@@ -234,6 +234,56 @@ def test_pending_memory_extraction_does_not_call_llm_after_forget(
     )
     result = outbox_handlers.handle_memory_extraction(claimed)
     assert result.outcome.value == "completed"
+    assert result.reason in ("forget_content_redacted",) or (
+        "extraction_blocked_by_forget" in result.reason
+    )
+
+
+def test_active_shield_blocks_extraction_before_llm(
+    db_session: Session, monkeypatch,
+) -> None:
+    from aiive.worker import outbox_handlers
+    from aiive.worker.outbox_dto import ClaimedJob
+
+    thread_id = _thread(db_session)
+    turn = _turn(db_session, thread_id, _now())
+    ev = _event(db_session, thread_id, "secret", _now(), turn.turn_id)
+    op_id = _op(db_session, mode="everywhere", selector="event_ids",
+                payload={"event_ids": [ev]})
+    db_session.add(ForgetShield(
+        id=_id(), forget_operation_id=op_id, selector_type="event",
+        target_type="event", target_id=ev, cutoff_created_at=_now(),
+        status="active", normalized_shield_key=f"a3:{ev}", created_at=_now(),
+    ))
+    job = OutboxJob(
+        id=_id(), operation_id="memory_extraction:a3", job_type="memory_extraction",
+        status="pending",
+        payload={
+            "user_message": "secret", "reply": "reply", "thread_id": thread_id,
+            "source_turn_record_id": turn.id, "source_turn_id": turn.turn_id,
+            "source_event_ids": [ev], "assistant_event_id": _id(),
+            "message_source": "user", "extraction_mode": "async",
+        },
+        trace_id=_id(), max_retries=3, created_at=_now(),
+    )
+    db_session.add(job)
+    db_session.commit()
+
+    def _boom():
+        raise AssertionError("LLM must not be called for shielded source")
+
+    monkeypatch.setattr(outbox_handlers, "_get_llm_client", _boom)
+    monkeypatch.setattr(
+        outbox_handlers, "SessionLocal",
+        sessionmaker(bind=db_session.get_bind()),
+    )
+    claimed = ClaimedJob(
+        id=job.id, job_type="memory_extraction", payload=job.payload,
+        trace_id=job.trace_id, retry_count=0, max_retries=3,
+        claim_token="ct", schema_version=1, worker_id="w",
+    )
+    result = outbox_handlers.handle_memory_extraction(claimed)
+    assert result.outcome.value == "completed"
     assert "extraction_blocked_by_forget" in result.reason
     run = db_session.execute(sa_text(
         "SELECT status FROM memory_ingestion_runs WHERE source_turn_record_id = :tid"

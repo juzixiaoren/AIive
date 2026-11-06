@@ -1,7 +1,7 @@
 # Current Phase
 
 ## 版本索引
-- 主干最新：**V60 记忆检索架构升级（pg_search BM25 + 统一排序）**（2026-11-03）→ 见文末「### V60 …」；上一版为 V59 待回答问题的状态一致性。
+- 主干最新：**V62.5 Outbox 精确关联 + 执行授权 fencing + 递归 JSON Scrub**（2026-11-06）→ 见文末「### V62.5 …」；上一版为 V62.4 Outbox 契约与 Turn/Event/Task 范围一致性。
 - 历史阶段：V34 → V54 按时间顺序记录在下方各节；下方 `## Phase` / `## Status` 是 V34 阶段的原始记录，不再代表当前主干。
 
 ## Phase
@@ -1017,3 +1017,25 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
   三类 Task 时间组合、Turn/Event 边界、未知结构与残留注入。
 - 验证：全量 pytest 1672 passed / 80 skipped；`tests/integration/pg` 67 passed / 13 skipped
   （skip 为本地 Embedding 不可用；Windows 文件权限竞态用例复跑通过）；ruff、basedpyright 0/0。
+
+### Outbox 精确关联、执行授权与递归 Scrub（V62.5，2026-11-06）
+- 目标：修复 V62.4 审查发现的三类问题（Outbox 误清理 cutoff 后新任务、Forget×LLM 检查后竞态、
+  嵌套 List 清理不完整）；不重写 Saga、不改锁命名空间与 Mode/Selector 语义。
+- Outbox 发现：`_discover_outbox_jobs` 按 `id` keyset 每批 500 行扫描，用
+  `job_reference_ids()` 的结构化引用做精确集合交集；Event/Turn/Memory/子记录/trace 为强关联
+  （不受 cutoff 约束），仅 Thread/父 Task 的弱关联必须同时满足 cutoff 与选择器范围；
+  彻底移除 `operation_id.contains()` 与 `CAST(payload AS Text).like()`。
+- operation_id：`operation_id_tokens()` 按冒号拆 token、剔除业务前缀与版本/批次 token 后整段精确相等；
+  `<turn_id>EXTRA` 类前缀相同串不命中。
+- 执行授权：新增 `worker/outbox_execution_auth.py`，独立连接 session-level `pg_advisory_lock_shared`
+  与 Phase A 排他锁互斥，覆盖「重读 Job → 检查 Shield/Tombstone → LLM → 写入提交」；
+  `refresh_claimed_job()` 重新校验 status/claim_token/locked_by/lease/最新 payload/redacted 标记。
+- Handler：`handle_memory_extraction`（Job 行必须存在）、`handle_goal_event_dispatch`、
+  `handle_goal_trigger_decision`、`handle_reminder_delivery` 全部接入，不再使用领取时的旧 payload。
+- Scrub/Verify：`redact_job_payload()` 与 `payload_has_content()` 递归支持 dict/list/嵌套 list/scalar，
+  顶层 List 同样清理；引用无法完整解析的 Job 写入 Verify `warnings`（显式记录、不阻塞终态）。
+- 测试：SQLite `test_forget_v625_outbox.py` 7 用例；PostgreSQL `test_pg_forget_exec_auth.py` 4 用例
+  （锁互斥 + Case A/B 双连接真实时序 + 精确关联/嵌套 List）。
+- 验证：全量 pytest 1680 passed / 85 skipped；`tests/integration/pg` 72 passed / 13 skipped；
+  ruff `--select F,E9` 通过；basedpyright 0 errors / 0 warnings；alembic `upgrade head` + `check`
+  在 PostgreSQL 上「No new upgrade operations detected」。

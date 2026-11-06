@@ -964,3 +964,47 @@ compaction_inputs.turn_manifest 等。未知引用结构只统计本次范围，
   子记录 ID 而非 `task_id` 批量清空；父任务未命中时只脱敏 task_state/task_brief 引用。
 - 未知 JSON：候选记录先由受影响集合、目标 ID 在引用数组文本中的出现、all_user_data
   cutoff 确定，再校验数组元素必须为字符串；异常元素 fail-closed，无关 Thread 不阻断。
+
+## 实现补记（七）：Outbox 精确关联、执行授权 fencing 与递归 JSON Scrub（V62.5，2026-11-06）
+
+### 1. Outbox 目标发现改为精确关联
+
+- `content_scope.py::_discover_outbox_jobs` 取代旧的 `operation_id.contains()` +
+  `CAST(payload AS Text).like('%id%')`：按 `id` keyset 每批 500 行扫描，结构化解析后做集合交集。
+- `outbox_payload_contract.py::job_reference_ids(job_type, payload)` 升级为按 job_type 真实 Schema
+  分类返回 `JobReferences`（event / turn / memory / task / child / thread / trace / operation），
+  递归支持 dict / list / 嵌套 list；未知 `*_id` 键标记 `unparseable`。
+- 强关联（不受 cutoff 约束）：Event / Turn / Memory / 子记录 / trace 精确命中即清理，
+  派生 Job 即使创建于 cutoff 之后也必须清理。
+- 弱关联（必须满足 cutoff）：仅 `thread_id` 只在 thread 选择器下、仅父 `task_id` 只在整 Task
+  命中时参与；`time_range` 按 Job 自身 `created_at` 判窗口；`all_user_data` 覆盖 cutoff 内的数据。
+  因此 cutoff 后独立创建的新 Job 不会被误清理。
+- `operation_id` 改为 `operation_id_tokens()`：按冒号拆 token、剔除业务前缀与版本/批次 token，
+  与目标 ID 集合做整段精确相等比较；`<turn_id>EXTRA` 这类前缀相同的串不命中。
+
+### 2. 共享执行授权（Forget COMMIT × Worker 外部调用）
+
+- 新增 `worker/outbox_execution_auth.py`：独立连接上取 session-level `pg_advisory_lock_shared`，
+  与 Phase A 的 transaction-level `pg_advisory_xact_lock` 互斥；命名空间/顺序不变。
+- 授权覆盖「重读 Job → 检查 Shield/Tombstone → LLM → 写入提交」，`finally` 显式 unlock。
+- 取得授权后 `refresh_claimed_job()` 重读 `outbox_jobs`，校验状态、`claim_token`/`locked_by`、
+  租约、最新 payload 与 `forget_content_redacted`，不再信任领取时的旧副本。
+- `handle_memory_extraction` / `handle_goal_event_dispatch` / `handle_goal_trigger_decision` /
+  `handle_reminder_delivery` 全部接入；memory_extraction 额外要求 Job 行必须存在。
+- SQLite 为 no-op；并发正确性由 `tests/integration/pg/test_pg_forget_exec_auth.py` 的双连接
+  真实时序用例证明（含 `pg_locks` granted/未 granted 断言语义）。
+
+### 3. 递归 JSON Scrub / Verify
+
+- `redact_job_payload()` 支持 dict / list / 嵌套 list / scalar，顶层为 List 时同样清理；
+  引用 ID、状态与幂等元数据保留，`forget_content_redacted` 仅写在 dict 顶层。
+- `payload_has_content()` 复用同一递归规则，Scrub 与 Verify 语义一致。
+- 引用无法完整解析的 Job 记入 Verify `warnings`（`outbox_jobs.unparseable_refs`），显式可见且不阻塞终态。
+
+### 4. 测试与验收
+
+- SQLite：`test_forget_v625_outbox.py` 7 用例（Dict→List→Dict、Dict→List→List→Dict、多层嵌套、
+  正常 ID/状态保留、Scrub 后注入深层残留 Verify 失败、cutoff 新旧 Job 边界、部分命中 Task 保留、
+  子串碰撞不命中、新 memory_extraction / Goal Event Job 保留并执行）。
+- PostgreSQL：`test_pg_forget_exec_auth.py` 4 用例（共享/排他锁互斥、Case A Worker 先执行、
+  Case B Forget 先提交、精确关联 + 嵌套 List），全部双连接真实并发，无 Mock Shield。

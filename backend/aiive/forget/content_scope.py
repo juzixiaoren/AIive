@@ -9,13 +9,19 @@
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import bindparam, cast, or_, text as sa_text, Text
+from sqlalchemy import bindparam, text as sa_text
 from sqlalchemy.orm import Session
 
+from aiive.worker.outbox_payload_contract import (
+    is_internal_job,
+    job_reference_ids,
+    operation_id_tokens,
+)
 from aiive.db.forget_models import (
     ForgetSelectorManifest,
     ForgetTarget,
@@ -29,6 +35,7 @@ from aiive.db.models import (
     Chunk,
     Document,
     Epoch,
+    EpochCheckpoint,
     Event,
     MemoryConflictCase as ConflictCase,
     MemoryEvidence,
@@ -36,9 +43,9 @@ from aiive.db.models import (
     MemoryRecallCandidate,
     MemoryRecallRun,
     MemoryRecord,
-    OutboxJob,
     RetrievalRun,
     Segment,
+    SegmentSummary,
     TaskArtifact,
     TaskEvidence,
     TurnRecord,
@@ -86,6 +93,9 @@ class ContentScope:
     recall_run_ids: set[str] = field(default_factory=set)
     retrieval_run_ids: set[str] = field(default_factory=set)
     outbox_job_ids: set[str] = field(default_factory=set)
+    outbox_unparseable_ids: set[str] = field(default_factory=set)
+    summary_ids: set[str] = field(default_factory=set)
+    checkpoint_ids: set[str] = field(default_factory=set)
     document_ids: set[str] = field(default_factory=set)
 
     @property
@@ -204,10 +214,6 @@ def count_json_array_members(
     return total
 
 
-def _chunked(items: list[str], size: int) -> list[list[str]]:
-    return [items[i:i + size] for i in range(0, len(items), size)]
-
-
 def _ids_from_query(_db: Session, query: Any) -> set[str]:
     return {str(row[0]) for row in query.all() if row and row[0]}
 
@@ -219,6 +225,130 @@ def _time_filter(column: Any, scope_from: datetime | None, scope_to: datetime | 
     if scope_to is not None:
         filters.append(column <= scope_to)
     return filters
+
+
+def _as_utc(value: Any) -> datetime | None:
+    """SQLite raw SQL 可能返回 ISO 字符串，PostgreSQL 返回 datetime。"""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _discover_outbox_jobs(
+    db: Session, scope: "ContentScope",
+) -> tuple[set[str], set[str]]:
+    """精确、有界地发现目标 Outbox Job。
+
+    按 id keyset 分批读取（每批 500 行，不一次性加载全表）；用
+    outbox_payload_contract 的结构化引用 ID 做精确集合匹配，禁用 JSON 全文
+    LIKE / 子串包含。返回 (命中 Job ID, 无法可靠解析的 Job ID)。
+    """
+    target_events = set(scope.event_ids) | set(scope.raw_event_ids)
+    target_turns = set(scope.turn_tokens)
+    target_memories = set(scope.memory_ids)
+    target_children = (
+        scope.agent_run_ids | scope.agent_action_ids | scope.agent_task_event_ids
+        | scope.agent_task_checkpoint_ids | scope.task_evidence_ids
+        | scope.task_artifact_ids | scope.segment_ids | scope.epoch_ids
+        | scope.summary_ids | scope.checkpoint_ids | scope.document_ids
+    )
+    target_full_tasks = set(scope.agent_task_ids)
+    target_threads = set(scope.thread_ids)
+    target_traces = set(scope.trace_ids)
+    cutoff = _as_utc(scope.cutoff)
+    tf = _as_utc(scope.time_from)
+    tt = _as_utc(scope.time_to)
+    matched: set[str] = set()
+    unparseable: set[str] = set()
+    last_id = ""
+    batch_size = 500
+    while True:
+        rows = db.execute(sa_text(
+            "SELECT id, job_type, payload, trace_id, operation_id, created_at "
+            "FROM outbox_jobs WHERE id > :last ORDER BY id LIMIT :limit"
+        ), {"last": last_id, "limit": batch_size}).all()
+        if not rows:
+            break
+        last_id = str(rows[-1][0])
+        for job_id, job_type, payload, trace_id, operation_id, created_at in rows:
+            job_id = str(job_id)
+            if is_internal_job(str(job_type or "")):
+                continue
+            # SQLite raw SQL 返回 JSON 文本；解析为结构化对象后再精确匹配。
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except (TypeError, ValueError):
+                    payload = None
+            refs = job_reference_ids(str(job_type or ""), payload)
+            op_tokens = operation_id_tokens(str(job_type or ""), str(operation_id or ""))
+            job_trace = str(trace_id) if trace_id else ""
+            created = _as_utc(created_at)
+            in_cutoff = created is not None and cutoff is not None and created <= cutoff
+
+            # 1) 强关联：精确来源引用 → 即使 Job 在 cutoff 后创建也必须清理。
+            #    operation_id 只做「整段 token 精确相等」，不做子串包含。
+            strong = bool(
+                (refs.event_ids & target_events)
+                or (refs.turn_ids & target_turns)
+                or (refs.memory_ids & target_memories)
+                or (refs.child_ids & target_children)
+                or (refs.trace_ids & target_traces)
+                or (job_trace and job_trace in target_traces)
+                or (
+                    op_tokens
+                    & (
+                        target_events | target_turns | target_memories
+                        | target_children | target_traces
+                    )
+                )
+            )
+            if strong:
+                matched.add(job_id)
+                if refs.unparseable:
+                    unparseable.add(job_id)
+                continue
+
+            # 2) cutoff 之后独立创建、且只引用 Thread/父 Task 的新 Job 保留。
+            if not in_cutoff:
+                continue
+
+            # 3) cutoff 之前的弱关联：按 Selector 范围 + Job 创建时间判定。
+            weak = False
+            if scope.all_user:
+                weak = True
+            elif scope.selector_type == "thread" and (refs.thread_ids & target_threads):
+                weak = True
+            elif scope.selector_type == "time_range":
+                if tf is not None and created is not None and created < tf:
+                    weak = False
+                elif tt is not None and created is not None and created > tt:
+                    weak = False
+                else:
+                    weak = True
+            elif refs.task_ids & target_full_tasks:
+                weak = True
+            elif op_tokens & target_full_tasks:
+                weak = True
+            elif (
+                scope.selector_type == "thread"
+                and (op_tokens & target_threads)
+            ):
+                weak = True
+            if weak:
+                matched.add(job_id)
+                if refs.unparseable:
+                    unparseable.add(job_id)
+    return matched, unparseable
 
 
 def build_scope(
@@ -424,6 +554,38 @@ def build_scope(
         )
     scope.epoch_ids = epochs
 
+    # ── 派生摘要 / 检查点 ID（供 Outbox operation_id 精确关联）──
+    summary_ids: set[str] = set()
+    if segments:
+        summary_ids |= _ids_from_query(
+            db, db.query(SegmentSummary.id).filter(
+                SegmentSummary.segment_id.in_(segments)
+            )
+        )
+    if events:
+        summary_ids |= set(select_json_array_members(
+            db, "segment_summaries", "id", "source_event_ids", sorted(events),
+        ))
+    if scope.turn_tokens:
+        summary_ids |= set(select_json_array_members(
+            db, "segment_summaries", "id", "source_turn_ids",
+            sorted(scope.turn_tokens),
+        ))
+    scope.summary_ids = summary_ids
+
+    checkpoint_ids: set[str] = set()
+    if epochs:
+        checkpoint_ids |= _ids_from_query(
+            db, db.query(EpochCheckpoint.id).filter(
+                EpochCheckpoint.epoch_id.in_(epochs)
+            )
+        )
+    if segments:
+        checkpoint_ids |= set(select_json_array_members(
+            db, "epoch_checkpoints", "id", "source_segment_ids", sorted(segments),
+        ))
+    scope.checkpoint_ids = checkpoint_ids
+
     # ── Task Runtime ──
     tasks: set[str] = set()
     if scope.thread_ids:
@@ -590,35 +752,10 @@ def build_scope(
         )
     scope.retrieval_run_ids = retrieval_runs
 
-    # ── Outbox：trace、operation_id、payload 内实际引用的目标 ID ──
-    # 不按内容关键词匹配；用结构化 ID 在 payload 文本中定位 Job。
-    outbox_ids: set[str] = set()
-    if scope.trace_ids:
-        outbox_ids |= _ids_from_query(
-            db, db.query(OutboxJob.id).filter(OutboxJob.trace_id.in_(scope.trace_ids))
-        )
-    linked_ids = (
-        scope.memory_ids | scope.raw_event_ids | scope.event_ids
-        | scope.turn_tokens | scope.segment_ids | scope.epoch_ids
-        | scope.agent_task_ids | scope.partial_agent_task_ids
-        | scope.thread_ids | scope.document_ids
+    # ── Outbox：精确结构化引用 + 有界分批发现 ──
+    scope.outbox_job_ids, scope.outbox_unparseable_ids = _discover_outbox_jobs(
+        db, scope,
     )
-    for chunk in _chunked(sorted(linked_ids), 80):
-        outbox_ids |= _ids_from_query(
-            db, db.query(OutboxJob.id).filter(
-                or_(*[OutboxJob.operation_id.contains(item) for item in chunk])
-            )
-        )
-        payload_conds = [
-            cast(OutboxJob.payload, Text).like(f"%{item}%") for item in chunk
-        ]
-        outbox_ids |= _ids_from_query(
-            db, db.query(OutboxJob.id).filter(
-                ~OutboxJob.job_type.like("forget_%"),
-                or_(*payload_conds),
-            )
-        )
-    scope.outbox_job_ids = outbox_ids
 
     # 目标文档的分块（用于 Verify 计数）
 
