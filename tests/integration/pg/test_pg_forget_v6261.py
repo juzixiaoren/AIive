@@ -94,12 +94,20 @@ def test_pg_agent_task_real_pool_forget(pg_sessionmaker, pg_engine, monkeypatch,
         second = handlers_agent_tasks.handle_agent_task_run(job)
         assert second.reason.startswith("forget_source_blocked")
     else:
-        assert result.reason == "task_run_advanced"
+        from aiive.worker.outbox_dto import HandlerOutcome
+        assert result.outcome == HandlerOutcome.COMPLETED
+        assert result.reason == "forget_source_blocked:task_content_unavailable"
+        second = handlers_agent_tasks.handle_agent_task_run(job)
+        assert second.outcome == HandlerOutcome.COMPLETED
+        assert second.reason.startswith("forget_source_blocked")
     assert spy.call_count == 1
     assert len(worker_threads) == 1 and worker_threads[0] != model_threads[0]
     assert worker_threads[0] != parent
     with pg_sessionmaker() as db:
+        from aiive.db.models import TaskEvidence, AgentTaskEvent
         assert db.query(ForgetOperation).count() == 1
+        assert db.query(TaskEvidence).filter_by(task_id=task.id).count() == 0
+        assert db.query(AgentTaskEvent).filter_by(task_id=task.id, event_type="run_failed").count() == 0
 
 
 def test_pg_timeout_revokes_late_forget(pg_sessionmaker, pg_engine, monkeypatch):

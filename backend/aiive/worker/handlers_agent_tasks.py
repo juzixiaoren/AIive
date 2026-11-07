@@ -6,10 +6,11 @@ import logging
 from aiive.db.base import SessionLocal
 from aiive.db.models import AgentRun
 from aiive.task_runtime.repository import TaskRepository
+from aiive.task_runtime.read_repository import TaskContentUnavailable
 from aiive.task_runtime.runtime import PersistentTaskRuntime
 from aiive.task_runtime.schemas import RunStatus, TaskStatus
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome, HandlerResult
-from aiive.worker.job_source_guard import guard_job_sources_visible
+from aiive.worker.job_source_guard import BLOCKED_REASON, guard_job_sources_visible
 from aiive.worker.outbox_execution_auth import (
     resume_execution_authorization,
     with_execution_authorization,
@@ -54,6 +55,15 @@ def handle_agent_task_run(claimed: ClaimedJob) -> HandlerResult:
         if not resume_execution_authorization():
             raise RuntimeError("execution_authorization_restore_failed")
         return HandlerResult(HandlerOutcome.COMPLETED, reason="task_run_advanced")
+    except TaskContentUnavailable:
+        # A tool can commit Forget, or a model snapshot can expire mid-run.
+        # Discard pending copies and finish this job without replaying its input.
+        # The Forget cascade owns cleanup; recovery must not read the hidden Task.
+        db.rollback()
+        return HandlerResult(
+            HandlerOutcome.COMPLETED,
+            reason=f"{BLOCKED_REASON}:task_content_unavailable",
+        )
     except ValueError as error:
         if str(error) in {"task_terminal", "task_not_found"}:
             return HandlerResult(HandlerOutcome.COMPLETED, reason=str(error))

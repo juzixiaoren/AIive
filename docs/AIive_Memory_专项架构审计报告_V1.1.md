@@ -3027,3 +3027,18 @@ Task 模型调用同样记录 Forget revision，在组装后发送前复核，�
 本地日志位于忽略目录 `.pytest_cache/audit_followup_*.log`、类型检查 JSON；核心结果已记录于本文，不依赖缓存文件保存唯一证据。新回归文件为 `tests/integration/backend/test_memory_audit_followup.py`，覆盖独立 E2 被屏蔽而 E1 仍保留、inline/object 零读取、Task 副本、Goal 修改证明、Identity UNSET/重新设置、Scope 排序、Core 缓存命中/失效、Graph peer 授权与生命周期零副作用。
 
 本轮不执行生产存量审计/回填，不为旧内容补造来源。PG 的既有远程 80 passed/39 skipped 仅证明 fcd8948 的对应运行，不是本轮新增代码的并发验收。新增实现仍需推送后 CI 的 PG 运行证据；本机 Docker 环境限制保持如实记录。
+
+
+## 24.7 PostgreSQL CI 失败修复（2026-11-07）
+
+提交 `40aeccf` 的 [CI Run 42373408655](https://github.com/juzixiaoren/AIive/actions/runs/42373408655) 仅 PostgreSQL Job 失败；单元/流程、本地集成、逐文件隔离、Ruff、basedpyright、迁移、前端和 Docker 冒烟均成功。[PG Job 128405998211](https://github.com/juzixiaoren/AIive/actions/runs/42373408655/job/128405998211) 的实际结果为 **79 passed / 1 failed / 39 skipped，40.24 秒**，不是 PG 未执行，也不能标为通过。
+
+唯一失败是 `test_pg_agent_task_real_pool_forget[False]`。真实工具线程提交 history_only Forget 后，Task 来源立即失效；EvidenceStore 的新守卫按设计抛出 TaskContentUnavailable。Worker 原来将它落入通用异常分支，返回 RETRYABLE_ERROR/task_unavailable；旧测试仍期望 task_run_advanced。问题是 Worker 未区分正常的来源拦截和可重试故障，不能通过放宽 Evidence 读取修复。
+
+现已为 TaskContentUnavailable 增加独立终止分支：回滚未提交副本，返回 COMPLETED/forget_source_blocked:task_content_unavailable，不再进入失败回收、检查点生成或任务重试。隐藏 Task 的清理由 Forget Cascade 负责；执行授权恢复失败仍沿用原有错误处理，不被此分支吞掉。
+
+PG 回归更新为精确断言正常终止、重投在来源守卫处收敛、仅一次模型/工具执行、ForgetOperation 保留且无 TaskEvidence/run_failed 副本。另增默认 CI 可执行的 `tests/integration/backend/test_task_source_loss.py`，通过真实 Worker→Task Runtime→Forget 调用链覆盖模型阶段失效和工具结果阶段失效。
+
+集中验证：**95 passed / 20 skipped / 2 warnings，39.98 秒**，包含上述新增用例、Memory 审计、Forget 守卫、Persistent Task Runtime、工具结果回填与架构边界；20 项跳过是本次选择的 PG 专项。新文件单独启动 pytest 进程：**2 passed**。Ruff 0.17.1 通过；basedpyright 1.40.2 检查 289 文件，**0 errors / 0 warnings**；git diff --check 通过。未修改 CI 配置、关闭门禁或移除授权检查，未重复运行耗时全量。
+
+本机 Docker CLI 能启动，但 Linux engine pipe 不存在，也没有本地 PostgreSQL；因此本次未取得修复后真实 PG 并发运行结果，仍须由推送后的 CI 复验，不能把 SQLite 回归或 PG 跳过当作并发通过。
