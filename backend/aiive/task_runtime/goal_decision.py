@@ -24,7 +24,8 @@ from sqlalchemy.orm import Session
 from aiive.forget.visibility_service import ForgetVisibilityService
 from aiive.forget.durable_sources import sources_visible, references_visible
 from aiive.memory.memory_policy import MemoryPolicyEngine, MemoryReadChannel
-from aiive.worker.job_source_guard import task_sources_visible
+from aiive.worker.job_source_guard import JobSources, task_sources_visible
+from aiive.worker.outbox_dto import ClaimedJob
 from aiive.core.llm_client import LLMClient, default_llm_client
 from aiive.memory.memory_types import LifecycleState, ValidityState
 from aiive.runtime.event_logger import EventLogger
@@ -116,6 +117,12 @@ class GoalDecisionEngine:
         self.repo: TaskRepository = TaskRepository(db)
         self.goals: GoalService = GoalService(db)
         self._source_ids: dict[str, set[str]] = {}
+        self._source_revision: int | None = None
+        self._context_blocked: bool = False
+        self._source_task_id: str = ""
+        self._evidence_ids: list[str] = []
+        self._trigger_claimed: ClaimedJob | None = None
+        self._trigger_sources: JobSources = JobSources()
 
     # ------------------------------------------------------------------
     # 上下文
@@ -132,14 +139,13 @@ class GoalDecisionEngine:
         self._context_blocked = True
         self._source_task_id = task.id
         self._evidence_ids = []
-        self._source_ids: dict[str, set[str]] = {}
+        self._source_ids = {}
         if not task_sources_visible(self.db, task.id):
             return {"source_blocked": True}
         from aiive.forget.durable_sources import collect_sources
         from aiive.worker.job_source_guard import resolve_job_sources, blocked_source_reason
-        from aiive.worker.outbox_dto import ClaimedJob
         from aiive.task_runtime.goal_events import SUPPORTED_EVENT_TYPES
-        source_payload = {"task_id": task.id}
+        source_payload: dict[str, Any] = {"task_id": task.id}
         if trigger.get("event_id"):
             source_payload.update(trigger_event_id=trigger["event_id"],
                                   trigger_event_type=trigger.get("event_type"),
@@ -299,7 +305,7 @@ class GoalDecisionEngine:
     ) -> tuple[GoalDecision, dict[str, Any]]:
         from aiive.forget.concurrency import forget_revision
         from aiive.worker.job_source_guard import blocked_source_reason
-        if getattr(self, "_trigger_claimed", None) is not None and blocked_source_reason(
+        if self._trigger_claimed is not None and blocked_source_reason(
             self.db, self._trigger_claimed, self._trigger_sources):
             self._context_blocked = True
         if getattr(self, "_context_blocked", False) or (getattr(self, "_source_revision", None) is not None

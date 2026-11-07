@@ -321,7 +321,6 @@ class MemoryLifecycleService:
         （防止经 sleep → wake 复活），archived 也不允许直接转 sleeping。
         """
         from aiive.forget.concurrency import acquire_forget_shared_lock
-        from aiive.forget.visibility_service import ForgetVisibilityService
         acquire_forget_shared_lock(self._db)
         locked = self._executor.lock_records([memory_id])
         record = locked.get(memory_id)
@@ -352,7 +351,6 @@ class MemoryLifecycleService:
         一律拒绝（终态，不得被任何生命周期动作触碰）。
         """
         from aiive.forget.concurrency import acquire_forget_shared_lock
-        from aiive.forget.visibility_service import ForgetVisibilityService
         acquire_forget_shared_lock(self._db)
         locked = self._executor.lock_records([memory_id])
         record = locked.get(memory_id)

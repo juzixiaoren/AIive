@@ -61,7 +61,7 @@ class MemoryReadModel:
     """
 
     def __init__(self, store: MemoryStore, scope_chain: Sequence[tuple[str, str | None]] | None = None) -> None:
-        self._scope_chain = scope_chain
+        self._scope_chain: Sequence[tuple[str, str | None]] | None = scope_chain
         self._store: MemoryStore = store
         self._policy: MemoryPolicyEngine = MemoryPolicyEngine()
 
@@ -82,7 +82,7 @@ class MemoryReadModel:
 
         seen: set[str] = set()
         for rec in records:
-            if rec.canonical_key in seen:
+            if rec.canonical_key is None or rec.canonical_key in seen:
                 continue
             content = self._policy.render_content(
                 rec.content, rec.sensitivity, MemoryReadChannel.LLM_CONTEXT,

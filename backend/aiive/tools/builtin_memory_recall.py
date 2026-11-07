@@ -260,7 +260,7 @@ def handle_memory_timeline(
                     "source_type": e.source_type,
                     "trust_level": e.trust_level,
                     "relation": e.relation,
-                    "content_span": policy.render_content(e.content_span, r.sensitivity, MemoryReadChannel.TOOL),
+                    "content_span": policy.render_content(e.content_span or "", r.sensitivity, MemoryReadChannel.TOOL),
                 }
                 for e in evs if e.source_event_id in allowed_events
             ]

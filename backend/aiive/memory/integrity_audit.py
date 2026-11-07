@@ -1,10 +1,12 @@
 """Read-only consistency summary. Reports IDs/reasons, never forgotten content."""
+from sqlalchemy.orm import Session
+
 from aiive.db.models import MemoryRecord, GraphRelation
 from aiive.db.forget_models import ContentProvenanceRef
 from aiive.forget.visibility_service import ForgetVisibilityService
 
 
-def audit_memory_integrity(db, *, batch_size=200):
+def audit_memory_integrity(db: Session, *, batch_size: int = 200) -> dict[str, int | list[dict[str, str]]]:
     findings = []
     last_id = ""
     scanned = 0

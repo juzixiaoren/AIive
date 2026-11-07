@@ -1,7 +1,9 @@
 """Durable dependency proofs for task-derived text; no content is stored here."""
+from collections.abc import Collection, Mapping
+
 from sqlalchemy.orm import Session
+from aiive.db.models import SegmentSummary
 from aiive.db.forget_models import ContentProvenanceRef
-from aiive.forget.visibility_service import ForgetVisibilityService
 from aiive.worker.outbox_payload_contract import parse_reference_ids
 
 REFERENCE_KEYS = {
@@ -13,7 +15,7 @@ REFERENCE_KEYS = {
 }
 
 
-def collect_sources(value, refs):
+def collect_sources(value: object, refs: set[tuple[str, str]]) -> None:
     if isinstance(value, dict):
         for key, item in value.items():
             if key in REFERENCE_KEYS and item is not None:
@@ -28,7 +30,7 @@ def collect_sources(value, refs):
             collect_sources(item, refs)
 
 
-def persist_sources(db: Session, owner_type: str, owner_id: str, *payloads):
+def persist_sources(db: Session, owner_type: str, owner_id: str, *payloads: object) -> None:
     refs = set()
     try:
         for payload in payloads:
@@ -41,7 +43,7 @@ def persist_sources(db: Session, owner_type: str, owner_id: str, *payloads):
         db.add(ContentProvenanceRef(owner_type=owner_type, owner_id=owner_id, source_type=kind, source_id=token))
 
 
-def references_visible(db: Session, grouped) -> bool:
+def references_visible(db: Session, grouped: Mapping[str, Collection[str]]) -> bool:
     if any(kind not in {"event", "memory_record", "turn_record"} for kind in grouped):
         return False
     # Reuse the worker contract, including Turn -> child Event closure and missing metadata.
@@ -64,7 +66,7 @@ def sources_visible(db: Session, owner_type: str, owner_id: str) -> bool:
     return references_visible(db, grouped)
 
 
-def summary_sources_visible(db: Session, summary) -> bool:
+def summary_sources_visible(db: Session, summary: SegmentSummary) -> bool:
     """A sealing snapshot must prove all its declared and durable dependencies."""
     dependencies = set()
     try:

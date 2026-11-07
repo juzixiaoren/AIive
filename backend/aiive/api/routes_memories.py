@@ -150,9 +150,13 @@ def get_memory_relations(memory_id: str, db: Session = Depends(get_db)):
         .limit(200)
         .all()
     )
-    from aiive.memory.graph_types import canonical_relation_fact, normalize_entity_name
-    facts = {r.id: canonical_relation_fact(record.graph_facts, record.id, r.relation_key) for r in relations}
-    relations = [r for r in relations if facts[r.id] is not None]
+    from aiive.memory.graph_types import GraphFact, canonical_relation_fact, normalize_entity_name
+    facts: dict[str, GraphFact] = {}
+    for relation in relations:
+        fact = canonical_relation_fact(record.graph_facts, record.id, relation.relation_key)
+        if fact is not None:
+            facts[relation.id] = fact
+    relations = [r for r in relations if r.id in facts]
     # 单值谓词出现多个有效客体 = 冲突：如实返回标记，不隐藏、也不替记忆层裁决。
     # 冲突对方可能属于别的记忆，因此按同主体做一次有界批查询再判定。
     single_subjects = {

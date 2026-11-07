@@ -2971,3 +2971,18 @@ $env:PATH = 'E:\git\Git\bin;' + $env:PATH
 测试详细输出保留在本地忽略目录 `.pytest_cache/memory_audit_20261107_implementation/`；核心结果与限制已写入本文，不依赖缓存文件作为唯一证据。
 
 **代码实现与离线相关回归已完成。PostgreSQL 并发专项仍未运行，不能标记为完整并发验收通过；真实存量数据审计/回填未执行。** Schema 迁移：无。Git 提交：未创建。
+
+
+## 24.5 推送后 CI 修复记录（2026-11-07）
+
+CI Run：[42351233448](https://github.com/juzixiaoren/AIive/actions/runs/42351233448)，对应提交 `fcd8948995f907e79dfa3c13d1fa6f5003c71ece`。失败项仅 Ruff 与 basedpyright；单元/流程、本地集成、逐文件隔离、PostgreSQL、迁移、前端与 Docker 冒烟均成功。此前本地没有执行这两个静态门禁，属于验证遗漏。
+
+修正内容：删除 3 处未使用导入；GraphFact 字典先排除 None 再供序列化使用；Identity 跳过空 Key；Goal 决策来源状态在 __init__ 中显式初始化并标注类型；触发载荷使用异构字典类型；Optional ClaimedJob 使用明确的非空分支；Evidence span 将空值归一化为空字符串；为来源、分页和只读审计工具补充参数类型。未关闭规则，未增加 type ignore，未修改 CI 配置。
+
+验证（与 CI 固定版本一致）：
+
+- `ruff==0.17.1`，`ruff check backend/aiive --select F,E9`：通过。
+- `basedpyright==1.40.2`，检查 285 个文件：0 errors、0 warnings，退出码 0。使用 `--pythonpath .venv/Scripts/python.exe` 指定本地已安装项目依赖的解释器。
+- Memory ReadModel、Graph、Goal 事件/决策序列化、Memory 审计回归、生命周期与访问边界：112 passed，29.21 秒。未重新运行耗时全量；最后补充类型注解后另做运行时导入检查。
+
+远程 PostgreSQL 证据补充：上述提交的 [PG 契约 Job](https://github.com/juzixiaoren/AIive/actions/runs/42351233448/job/128339613249) 为 **80 passed、39 skipped，41.03 秒**。这补充了前文“本地 PG 未运行”的限制，但不能将 39 项跳过记成通过，也不等于本次修复提交的新 CI 已运行。
