@@ -21,6 +21,10 @@ from json_repair import repair_json
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
+from aiive.forget.visibility_service import ForgetVisibilityService
+from aiive.forget.durable_sources import sources_visible, references_visible
+from aiive.memory.memory_policy import MemoryPolicyEngine, MemoryReadChannel
+from aiive.worker.job_source_guard import task_sources_visible
 from aiive.core.llm_client import LLMClient, default_llm_client
 from aiive.memory.memory_types import LifecycleState, ValidityState
 from aiive.runtime.event_logger import EventLogger
@@ -111,6 +115,7 @@ class GoalDecisionEngine:
         self.llm: LLMClient = llm or default_llm_client()
         self.repo: TaskRepository = TaskRepository(db)
         self.goals: GoalService = GoalService(db)
+        self._source_ids: dict[str, set[str]] = {}
 
     # ------------------------------------------------------------------
     # 上下文
@@ -122,6 +127,43 @@ class GoalDecisionEngine:
         step: GoalStep,
         trigger: dict[str, Any],
     ) -> dict[str, Any]:
+        from aiive.forget.concurrency import forget_revision
+        self._source_revision = forget_revision(self.db)
+        self._context_blocked = True
+        self._source_task_id = task.id
+        self._evidence_ids = []
+        self._source_ids: dict[str, set[str]] = {}
+        if not task_sources_visible(self.db, task.id):
+            return {"source_blocked": True}
+        from aiive.forget.durable_sources import collect_sources
+        from aiive.worker.job_source_guard import resolve_job_sources, blocked_source_reason
+        from aiive.worker.outbox_dto import ClaimedJob
+        from aiive.task_runtime.goal_events import SUPPORTED_EVENT_TYPES
+        source_payload = {"task_id": task.id}
+        if trigger.get("event_id"):
+            source_payload.update(trigger_event_id=trigger["event_id"],
+                                  trigger_event_type=trigger.get("event_type"),
+                                  trigger_event_payload=trigger.get("event_payload"))
+        self._trigger_claimed = ClaimedJob("context", "goal_trigger_decision", source_payload, None, 0, 1, "", 1, "")
+        self._trigger_sources = resolve_job_sources(self.db, self._trigger_claimed)
+        if blocked_source_reason(self.db, self._trigger_claimed, self._trigger_sources):
+            return {"source_blocked": True}
+        refs: set[tuple[str, str]] = set()
+        domain = trigger.get("event_type") in SUPPORTED_EVENT_TYPES
+        try:
+            collect_sources(trigger.get("event_payload") if domain else trigger, refs)
+        except ValueError:
+            return {"source_blocked": True}
+        if trigger.get("event_payload") and not refs and not domain:
+            return {"source_blocked": True}
+        for kind, token in refs:
+            self._source_ids.setdefault(kind, set()).add(token)
+        if not references_visible(self.db, self._source_ids):
+            return {"source_blocked": True}
+        for item in plan.steps:
+            if any(not sources_visible(self.db, "task_evidence", eid) for eid in item.evidence_refs):
+                return {"source_blocked": True}
+        self._context_blocked = False
         rule = trigger_of(step)
         return {
             "goal": {
@@ -178,18 +220,25 @@ class GoalDecisionEngine:
         rows = self.db.query(TaskEvidence).filter(
             TaskEvidence.task_id == task_id,
         ).order_by(TaskEvidence.created_at.desc()).limit(8).all()
+        from aiive.forget.durable_sources import sources_visible
+        rows = [r for r in rows if sources_visible(self.db, "task_evidence", r.id)]
+        self._evidence_ids = [r.id for r in rows]
         return [
             {"id": row.id, "kind": row.kind, "summary": _bounded(row.summary or "", 400)}
             for row in reversed(rows)
         ]
 
     def _memories(self, task: AgentTask) -> list[dict[str, Any]]:
-        rows = self.db.query(MemoryRecord).filter(
+        from aiive.memory.read_access import visible_memory_page
+        rows = visible_memory_page(self.db, self.db.query(MemoryRecord).filter(
             MemoryRecord.lifecycle_state == LifecycleState.ACTIVE.value,
             MemoryRecord.validity_state == ValidityState.VALID.value,
             (MemoryRecord.scope_type == "global")
             | ((MemoryRecord.scope_type == "thread") & (MemoryRecord.scope_id == task.thread_id)),
-        ).order_by(MemoryRecord.observed_at.desc()).limit(8).all()
+        ).order_by(MemoryRecord.observed_at.desc()), 8)
+        allowed = set(ForgetVisibilityService.filter_memory_ids(self.db, [r.id for r in rows]))
+        rows = [r for r in rows if r.id in allowed and MemoryPolicyEngine().decide_read(r.sensitivity, MemoryReadChannel.LLM_CONTEXT).allowed]
+        self._source_ids.setdefault("memory_record", set()).update(r.id for r in rows)
         return [
             {"id": row.id, "type": row.memory_type, "content": _bounded(row.content or "", 300)}
             for row in rows
@@ -200,6 +249,8 @@ class GoalDecisionEngine:
             TurnRecord.thread_id == thread_id,
             TurnRecord.status == "completed",
         ).order_by(TurnRecord.turn_sequence.desc()).limit(limit).all()
+        allowed_turns = set(ForgetVisibilityService.filter_blocked_ids(self.db, "turn_record", [t.id for t in turns]))
+        turns = [t for t in turns if t.id in allowed_turns]
         if not turns:
             return []
         turn_ids = [turn.turn_id for turn in turns]
@@ -209,7 +260,11 @@ class GoalDecisionEngine:
             Event.event_type.in_(["user_message", "llm_response"]),
         ).order_by(Event.turn_event_index.asc(), Event.created_at.asc()).all()
         by_turn: dict[str, list[Event]] = {}
+        allowed_events = set(ForgetVisibilityService.filter_blocked_ids(self.db, "event", [e.id for e in events]))
+        self._source_ids.setdefault("event", set()).update(allowed_events)
         for event in events:
+            if event.id not in allowed_events:
+                continue
             by_turn.setdefault(str(event.turn_id), []).append(event)
         messages: list[dict[str, str]] = []
         for turn in reversed(turns):
@@ -242,6 +297,21 @@ class GoalDecisionEngine:
     def decide(
         self, messages: list[dict[str, str]], *, trace_id: str,
     ) -> tuple[GoalDecision, dict[str, Any]]:
+        from aiive.forget.concurrency import forget_revision
+        from aiive.worker.job_source_guard import blocked_source_reason
+        if getattr(self, "_trigger_claimed", None) is not None and blocked_source_reason(
+            self.db, self._trigger_claimed, self._trigger_sources):
+            self._context_blocked = True
+        if getattr(self, "_context_blocked", False) or (getattr(self, "_source_revision", None) is not None
+                and forget_revision(self.db) != self._source_revision):
+            return GoalDecision(action="no_action", reason="forget_source_blocked"), {"model": "", "latency_ms": 0, "raw": "", "usage": {}}
+        if getattr(self, "_source_task_id", None) and (
+            not task_sources_visible(self.db, self._source_task_id)
+            or any(not sources_visible(
+                self.db, "task_evidence", eid) for eid in getattr(self, "_evidence_ids", []))
+            or not references_visible(self.db, self._source_ids)
+        ):
+            return GoalDecision(action="no_action", reason="forget_source_blocked"), {"model": "", "latency_ms": 0, "raw": "", "usage": {}}
         response = self.llm.chat(
             messages, temperature=0.1, trace_id=trace_id, json_mode=True,
         )

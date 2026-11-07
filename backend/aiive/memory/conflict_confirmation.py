@@ -585,6 +585,9 @@ class MemoryConflictService:
             db.commit()
             return ReplyOutcome(case_id=case.id, status=STATUS_EXPIRED, reason="案例已过期")
 
+        from aiive.worker.job_source_guard import conflict_case_sources_visible
+        if not conflict_case_sources_visible(db, case.id):
+            return ReplyOutcome(case_id=case.id, status=STATUS_STALE, reason="forget_source_blocked")
         parser = ConflictReplyParser(llm_client)
         decision = parser.parse(
             question=case.question,
@@ -628,6 +631,11 @@ class MemoryConflictService:
                 reason="unrelated_message",
             )
 
+        from aiive.worker.job_source_guard import conflict_case_sources_visible
+        from aiive.forget.concurrency import acquire_forget_shared_lock
+        acquire_forget_shared_lock(db)
+        if not conflict_case_sources_visible(db, case.id):
+            return ReplyOutcome(case_id=case.id, status=STATUS_STALE, reason="forget_source_blocked")
         old_record = cls._load_old_record(db, case)
         if decision.decision not in (DECISION_CLARIFY, DECISION_KEEP_OLD, DECISION_REJECT_NEW):
             if old_record is None:
@@ -1064,11 +1072,13 @@ class MemoryConflictService:
         status: str = "",
         limit: int = 50,
     ) -> list[MemoryConflictCase]:
+        from aiive.worker.job_source_guard import conflict_case_sources_visible
         query = db.query(MemoryConflictCase)
         if thread_id:
             query = query.filter(MemoryConflictCase.thread_id == thread_id)
         if status:
             query = query.filter(MemoryConflictCase.status == status)
         return (
-            query.order_by(MemoryConflictCase.created_at.desc()).limit(max(1, limit)).all()
+            [case for case in query.order_by(MemoryConflictCase.created_at.desc()).limit(max(1, limit) * 10).all()
+             if conflict_case_sources_visible(db, case.id)][:max(1, limit)]
         )

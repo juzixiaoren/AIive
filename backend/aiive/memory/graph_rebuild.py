@@ -133,6 +133,9 @@ class GraphRebuildService:
                 else:
                     report["kept_unresolved"] += 1
                 continue
+            from aiive.forget.visibility_service import ForgetVisibilityService
+            if not ForgetVisibilityService.filter_memory_ids(self._db, [record.id]):
+                continue
             fact = self._matching_fact(record, relation)
             if fact is None:
                 report["skipped_fact_removed"] += 1

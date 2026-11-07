@@ -58,6 +58,21 @@ class EvidenceStore:
         result: Any,
         kind: str = "tool_result",
     ) -> TaskEvidence:
+        from aiive.db.models import AgentTask
+        from aiive.forget.concurrency import acquire_forget_shared_lock
+        from aiive.forget.durable_sources import collect_sources, references_visible
+        acquire_forget_shared_lock(db)
+        task = db.get(AgentTask, task_id)
+        origin = {"source_event_id": getattr(task, "source_event_id", None),
+                  "source_turn_record_id": getattr(task, "source_turn_record_id", None)} if task else {}
+        dependencies = set()
+        for payload in (origin, action.arguments, result):
+            collect_sources(payload, dependencies)
+        grouped = {}
+        for source_type, source_id in dependencies:
+            grouped.setdefault(source_type, set()).add(source_id)
+        if not references_visible(db, grouped):
+            raise ValueError("forget_source_blocked")
         data = _json_bytes(result)
         digest = hashlib.sha256(data).hexdigest()
         inline: dict[str, Any] | None
@@ -93,6 +108,8 @@ class EvidenceStore:
         )
         db.add(evidence)
         db.flush()
+        from aiive.forget.durable_sources import persist_sources
+        persist_sources(db, "task_evidence", evidence.id, origin, action.arguments, result)
         refs = list(action.evidence_refs or [])
         refs.append({"evidence_id": evidence.id, "kind": kind, "content_hash": digest})
         action.evidence_refs = refs

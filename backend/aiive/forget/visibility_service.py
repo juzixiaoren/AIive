@@ -366,6 +366,27 @@ class ForgetVisibilityService:
                     )
                 )
 
+        if _expand_provenance and target_type in {"segment_summary", "epoch_checkpoint"}:
+            from aiive.db.models import SegmentSummary, EpochCheckpoint
+            from aiive.forget.durable_sources import summary_sources_visible
+            if target_type == "segment_summary":
+                rows = session.query(SegmentSummary).filter(SegmentSummary.id.in_(ids)).all()
+                blocked.update(set(ids) - {r.id for r in rows})
+                blocked.update(r.id for r in rows if not summary_sources_visible(session, r))
+            else:
+                rows = session.query(EpochCheckpoint).filter(EpochCheckpoint.id.in_(ids)).all()
+                blocked.update(set(ids) - {r.id for r in rows})
+                for checkpoint in rows:
+                    segments = checkpoint.source_segment_ids
+                    if not isinstance(segments, list) or not segments or any(not isinstance(i, str) or not i for i in segments):
+                        blocked.add(checkpoint.id)
+                        continue
+                    summaries = session.query(SegmentSummary).filter(SegmentSummary.segment_id.in_(segments)).all()
+                    if set(segments) - {r.segment_id for r in summaries} or ForgetVisibilityService.blocked_target_ids(
+                        session, "segment_summary", [(r.id, r.created_at) for r in summaries],
+                    ):
+                        blocked.add(checkpoint.id)
+
         return blocked
 
     @staticmethod

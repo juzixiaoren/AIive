@@ -133,6 +133,7 @@ def handle_goal_trigger_decision(claimed: ClaimedJob) -> HandlerResult:
 
     raw_event_payload = payload.get("trigger_event_payload")
     trigger: dict[str, Any] = {
+        "event_id": payload.get("trigger_event_id"),
         "trigger_key": trigger_key,
         "reason": str(payload.get("reason") or ""),
         "fired_at": str(payload.get("fired_at") or ""),

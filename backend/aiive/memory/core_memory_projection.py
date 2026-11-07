@@ -49,6 +49,8 @@ def build_blocks(db: Session, config: RecallConfig | None = None) -> list[CoreMe
             db.query(MemoryRecord)
             .filter(
                 MemoryRecord.canonical_key == key,
+                MemoryRecord.scope_type == "global",
+                MemoryRecord.scope_id.is_(None),
                 MemoryRecord.lifecycle_state == LifecycleState.ACTIVE.value,
                 MemoryRecord.validity_state == ValidityState.VALID.value,
             )
@@ -133,6 +135,10 @@ def load_core_memory(db: Session, config: RecallConfig | None = None) -> list[Co
             for r in rows
         ]
         blocks.sort(key=lambda b: _ROLE_PRIORITY.get(b.block_name, 9))
+        # Compare authoritative content too: lifecycle/sensitivity changes can precede refresh.
+        current = build_blocks(db, config)
+        if [b.model_dump() for b in current] != [b.model_dump() for b in blocks]:
+            return current
         return blocks
     # Lost projection → reconstruct from memory_records (requirement #30).
     return build_blocks(db, config)

@@ -21,11 +21,13 @@ def _make_ctx(thread_id: str = "thread-1", trace_id: str = "trace-1") -> RunCont
     return RunContext(thread_id=thread_id, trace_id=trace_id, source="test")
 
 
-def _make_proposal(key: str, content: str, mem_type: str = "user_profile") -> MemoryProposal:
+def _make_proposal(db_session, key: str, content: str, mem_type: str = "user_profile") -> MemoryProposal:
     idx = next(_proposal_counter)
+    from tests.support import create_memory_source_event
+    event = create_memory_source_event(db_session)
     p = MemoryProposal(
         memory_type=mem_type, canonical_key=key, content=content, confidence=0.95,
-        source_event_ids=[f"evt-{idx}"],
+        source_event_ids=[event.id],
         evidence=[EvidenceItem(source_type="user_message", trust_level=TrustLevel.TRUSTED.value)],
         extractor_name="test", extractor_version="1.0",
     )
@@ -46,7 +48,7 @@ class TestWriteResult:
 class TestMemoryWriteService:
     def test_create_active_record(self, db_session):
         writer = MemoryWriteService(db_session)
-        proposal = _make_proposal("user.preference.coffee", "Loves coffee")
+        proposal = _make_proposal(db_session, "user.preference.coffee", "Loves coffee")
         result = writer.write(proposal, run_context=_make_ctx())
 
         assert result.written
@@ -61,13 +63,13 @@ class TestMemoryWriteService:
 
     def test_reinforce_same_content(self, db_session):
         writer = MemoryWriteService(db_session)
-        p1 = _make_proposal("user.preference.coffee", "Loves coffee")
+        p1 = _make_proposal(db_session, "user.preference.coffee", "Loves coffee")
         result1 = writer.write(p1, run_context=_make_ctx())
         assert result1.operation == "create"
 
         db_session.flush()
 
-        p2 = _make_proposal("user.preference.coffee", "Loves coffee")
+        p2 = _make_proposal(db_session, "user.preference.coffee", "Loves coffee")
         result2 = writer.write(p2, run_context=_make_ctx("thread-2", "trace-2"))
 
         assert result2.operation == "reinforce"
@@ -76,7 +78,7 @@ class TestMemoryWriteService:
     def test_ignore_resolution_is_not_reported_as_written(self, db_session, monkeypatch):
         """ConflictResolver ignore 必须返回 IGNORED，而不是 WRITTEN。"""
         writer = MemoryWriteService(db_session)
-        proposal = _make_proposal("user.preference.ignore", "忽略内容")
+        proposal = _make_proposal(db_session, "user.preference.ignore", "忽略内容")
         monkeypatch.setattr(
             writer._resolver,
             "resolve",
@@ -96,12 +98,12 @@ class TestMemoryWriteService:
     def test_duplicate_source_event_returns_reinforce_skipped(self, db_session):
         """同一 source_event 重放不能被报告为成功强化。"""
         writer = MemoryWriteService(db_session)
-        proposal = _make_proposal("user.preference.replay", "相同内容")
+        proposal = _make_proposal(db_session, "user.preference.replay", "相同内容")
         proposal.evidence[0].source_event_id = proposal.source_event_ids[0]
         created = writer.write(proposal, run_context=_make_ctx())
         db_session.flush()
 
-        replay = _make_proposal("user.preference.replay", "相同内容")
+        replay = _make_proposal(db_session, "user.preference.replay", "相同内容")
         replay.source_event_ids = list(proposal.source_event_ids)
         replay.evidence[0].source_event_id = proposal.source_event_ids[0]
         result = writer.write(replay, run_context=_make_ctx("thread-2", "trace-2"))
@@ -114,12 +116,12 @@ class TestMemoryWriteService:
 
     def test_supersede_single_key(self, db_session):
         writer = MemoryWriteService(db_session)
-        p1 = _make_proposal("user.display_name", "Alice")
+        p1 = _make_proposal(db_session, "user.display_name", "Alice")
         result1 = writer.write(p1, run_context=_make_ctx())
         assert result1.operation == "create"
         db_session.flush()
 
-        p2 = _make_proposal("user.display_name", "Bob")
+        p2 = _make_proposal(db_session, "user.display_name", "Bob")
         result2 = writer.write(p2, run_context=_make_ctx("thread-2", "trace-2"))
 
         assert result2.operation in ("supersede", "revise")
@@ -134,12 +136,12 @@ class TestMemoryWriteService:
 
     def test_multi_key_allows_multiple(self, db_session):
         writer = MemoryWriteService(db_session)
-        p1 = _make_proposal("user.preference.color", "Blue")
+        p1 = _make_proposal(db_session, "user.preference.color", "Blue")
         result1 = writer.write(p1, run_context=_make_ctx())
         assert result1.written
         db_session.flush()
 
-        p2 = _make_proposal("user.preference.color", "Green")
+        p2 = _make_proposal(db_session, "user.preference.color", "Green")
         result2 = writer.write(p2, run_context=_make_ctx("thread-2", "trace-2"))
         assert result2.written
         # Different content → create new multi record
@@ -148,18 +150,18 @@ class TestMemoryWriteService:
 
     def test_multi_key_dedup_same_value(self, db_session):
         writer = MemoryWriteService(db_session)
-        p1 = _make_proposal("user.preference.color", "Blue")
+        p1 = _make_proposal(db_session, "user.preference.color", "Blue")
         result1 = writer.write(p1, run_context=_make_ctx())
         db_session.flush()
 
-        p2 = _make_proposal("user.preference.color", "Blue")
+        p2 = _make_proposal(db_session, "user.preference.color", "Blue")
         result2 = writer.write(p2, run_context=_make_ctx("thread-2", "trace-2"))
         # Same content → reinforce
         assert result2.operation == "reinforce"
 
     def test_forget(self, db_session):
         writer = MemoryWriteService(db_session)
-        p1 = _make_proposal("user.preference.temp", "Temp memory")
+        p1 = _make_proposal(db_session, "user.preference.temp", "Temp memory")
         result1 = writer.write(p1, run_context=_make_ctx())
         db_session.flush()
 
@@ -178,7 +180,7 @@ class TestMemoryWriteService:
         db_session.flush()
 
         writer = MemoryWriteService(db_session)
-        proposal = _make_proposal("user.preference.drink", "Tea")
+        proposal = _make_proposal(db_session, "user.preference.drink", "Tea")
         result = writer.write(proposal, run_context=_make_ctx())
 
         assert result.written
@@ -211,7 +213,7 @@ class TestMemoryWriteService:
         db_session.flush()
 
         result = MemoryWriteService(db_session).write(
-            _make_proposal("user.preference.vector", "Semantic memory"),
+            _make_proposal(db_session, "user.preference.vector", "Semantic memory"),
             run_context=_make_ctx(),
         )
         jobs = db_session.query(OutboxJob).filter(
@@ -225,7 +227,7 @@ class TestMemoryWriteService:
 
     def test_evidence_table_written(self, db_session):
         writer = MemoryWriteService(db_session)
-        proposal = _make_proposal("user.preference.sport", "Running")
+        proposal = _make_proposal(db_session, "user.preference.sport", "Running")
         result = writer.write(proposal, run_context=_make_ctx())
 
         evidence = (
@@ -238,7 +240,7 @@ class TestMemoryWriteService:
 
     def test_proposal_persisted(self, db_session):
         writer = MemoryWriteService(db_session)
-        proposal = _make_proposal("user.preference.food", "Sushi")
+        proposal = _make_proposal(db_session, "user.preference.food", "Sushi")
         result = writer.write(proposal, run_context=_make_ctx())
 
         proposals = (

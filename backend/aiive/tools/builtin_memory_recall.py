@@ -219,6 +219,12 @@ def handle_memory_timeline(
 
     ctx = require_ctx(ctx, "memory_timeline")
 
+    from aiive.forget.visibility_service import ForgetVisibilityService
+    from aiive.memory.scope_resolver import build_scope_context
+    chain = build_scope_context(db, ctx, ctx.thread_id).chain()
+    def visible(r: MemoryRecord) -> bool:
+        return (r.scope_type, r.scope_id) in chain and r.lifecycle_state != "forgotten" and bool(
+            ForgetVisibilityService.filter_memory_ids(db, [r.id]))
     policy = MemoryPolicyEngine()
 
     # 辅助：从 MemoryRecord 提取详情
@@ -247,21 +253,23 @@ def handle_memory_timeline(
                 .order_by(MemoryEvidence.created_at.asc())
                 .all()
             )
+            allowed_events = set(ForgetVisibilityService.filter_blocked_ids(
+                db, "event", [e.source_event_id for e in evs if e.source_event_id]))
             d["evidence"] = [
                 {
                     "source_type": e.source_type,
                     "trust_level": e.trust_level,
                     "relation": e.relation,
-                    "content_span": e.content_span,
+                    "content_span": policy.render_content(e.content_span, r.sensitivity, MemoryReadChannel.TOOL),
                 }
-                for e in evs
+                for e in evs if e.source_event_id in allowed_events
             ]
         return d
 
     # 路径一：按 memory_id 精确获取（单条）
     if memory_id:
         rec = db.query(MemoryRecord).filter(MemoryRecord.id == memory_id).first()
-        if rec is None:
+        if rec is None or not visible(rec):
             return {"ok": False, "error": "not_found", "memory_id": memory_id}
         return {"ok": True, "current": _record_detail(rec), "revisions": [], "total_versions": 1}
 
@@ -275,6 +283,7 @@ def handle_memory_timeline(
             .order_by(MemoryRecord.record_version.desc())
             .all()
         )
+        recs = [r for r in recs if visible(r)]
         if not recs:
             return {"ok": False, "error": "not_found", "canonical_key": canonical_key}
         current = next((r for r in recs if r.validity_state == ValidityState.VALID.value
@@ -320,7 +329,8 @@ def handle_memory_event_log(db: Session, ctx: RunContext | None, query: str = ""
     seen: set[str] = set()
     matched: list[MemoryRecord] = []
     for scope_type, scope_id in chain:
-        recs = (
+        from aiive.memory.read_access import visible_memory_page
+        recs = visible_memory_page(db, (
             db.query(MemoryRecord).filter(
                 MemoryRecord.lifecycle_state == LifecycleState.ACTIVE.value,
                 MemoryRecord.validity_state == ValidityState.VALID.value,
@@ -331,10 +341,12 @@ def handle_memory_event_log(db: Session, ctx: RunContext | None, query: str = ""
                 MemoryRecord.content.ilike(f"%{q}%"),
             )
             .order_by(MemoryRecord.observed_at.desc())
-            .limit(20)
-            .all()
-        )
+        ), 20)
+        from aiive.forget.visibility_service import ForgetVisibilityService
+        allowed = set(ForgetVisibilityService.filter_memory_ids(db, [r.id for r in recs]))
         for r in recs:
+            if r.id not in allowed:
+                continue
             if r.id not in seen:
                 seen.add(r.id)
                 matched.append(r)

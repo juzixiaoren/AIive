@@ -134,6 +134,10 @@ def get_memory_relations(memory_id: str, db: Session = Depends(get_db)):
 
     blocked = ForgetVisibilityService.filter_memory_ids(db, [memory_id])
     visible = memory_id in blocked
+    if not visible or record.lifecycle_state == "forgotten":
+        raise HTTPException(status_code=404, detail="记忆不存在")
+    if not MemoryPolicyEngine().decide_read(record.sensitivity, MemoryReadChannel.LLM_CONTEXT).allowed:
+        raise HTTPException(status_code=404, detail="记忆不存在")
     policy = MemoryPolicyEngine()
     relations = (
         db.query(GraphRelation)
@@ -146,6 +150,9 @@ def get_memory_relations(memory_id: str, db: Session = Depends(get_db)):
         .limit(200)
         .all()
     )
+    from aiive.memory.graph_types import canonical_relation_fact, normalize_entity_name
+    facts = {r.id: canonical_relation_fact(record.graph_facts, record.id, r.relation_key) for r in relations}
+    relations = [r for r in relations if facts[r.id] is not None]
     # 单值谓词出现多个有效客体 = 冲突：如实返回标记，不隐藏、也不替记忆层裁决。
     # 冲突对方可能属于别的记忆，因此按同主体做一次有界批查询再判定。
     single_subjects = {
@@ -162,6 +169,9 @@ def get_memory_relations(memory_id: str, db: Session = Depends(get_db)):
         .limit(1000)
         .all()
     ) if single_subjects else []
+    peer_allowed = set(ForgetVisibilityService.filter_memory_ids(db, [r.source_memory_id for r in peers]))
+    peers = [r for r in peers if r.source_memory_id in peer_allowed
+             and r.scope_type == record.scope_type and r.scope_id == record.scope_id]
     conflict_keys = conflicted_group_keys([
         (
             r.subject_entity_id, r.predicate, r.object_entity_id,
@@ -175,6 +185,11 @@ def get_memory_relations(memory_id: str, db: Session = Depends(get_db)):
         for entity in db.query(GraphEntity).filter(GraphEntity.id.in_(entity_ids)).all()
     } if entity_ids else {}
 
+    names = {}
+    for relation in relations:
+        fact = facts[relation.id]
+        names[relation.subject_entity_id] = fact.subject
+        names[relation.object_entity_id] = fact.object
     return {
         "memory_id": memory_id,
         "memory_type": record.memory_type,
@@ -185,9 +200,9 @@ def get_memory_relations(memory_id: str, db: Session = Depends(get_db)):
         "entities": [
             {
                 "id": entity.id,
-                "display_name": entity.display_name,
-                "normalized_name": entity.normalized_name,
-                "aliases": entity.aliases or [],
+                "display_name": names.get(entity.id, ""),
+                "normalized_name": normalize_entity_name(names.get(entity.id, "")),
+                "aliases": [],
                 "scope_type": entity.scope_type,
                 "scope_id": entity.scope_id,
             }
@@ -196,9 +211,9 @@ def get_memory_relations(memory_id: str, db: Session = Depends(get_db)):
         "relations": [
             {
                 "id": relation.id,
-                "subject": getattr(entities.get(relation.subject_entity_id), "display_name", ""),
+                "subject": facts[relation.id].subject,
                 "predicate": relation.predicate,
-                "object": getattr(entities.get(relation.object_entity_id), "display_name", ""),
+                "object": facts[relation.id].object,
                 "status": relation.status,
                 "confidence": relation.confidence,
                 "scope_type": relation.scope_type,
@@ -208,7 +223,7 @@ def get_memory_relations(memory_id: str, db: Session = Depends(get_db)):
                 "recorded_at": relation.recorded_at.isoformat() if relation.recorded_at else None,
                 "source_record_version": relation.source_record_version,
                 "source_span": policy.render_content(
-                    relation.source_span or "", record.sensitivity, MemoryReadChannel.API,
+                    facts[relation.id].source_span or "", record.sensitivity, MemoryReadChannel.API,
                 ),
                 "closed_reason": relation.closed_reason,
                 "superseded_by_id": relation.superseded_by_id,
@@ -256,7 +271,7 @@ def list_memory_conflicts(
                 case.new_content, case.sensitivity, MemoryReadChannel.API,
             ),
             "verdict": case.verdict,
-            "question": case.question,
+            "question": policy.render_content(case.question, case.sensitivity, MemoryReadChannel.API),
             "clarify_rounds": case.clarify_rounds,
             "decision": case.decision,
             "resolved_memory_id": case.resolved_memory_id,
@@ -310,7 +325,7 @@ def create_memory(request: CreateMemoryRequest,
                     ok=False,
                     outcome=WriteOutcome.IGNORED,
                     operation="ignore",
-                    content=existing.content or request.content,
+                    content="",
                     memory_type=existing.memory_type or request.memory_type,
                     canonical_key=existing.canonical_key or "",
                     reason=existing.gate_reason or "该请求未产生记忆变更",
@@ -323,6 +338,9 @@ def create_memory(request: CreateMemoryRequest,
                     detail="幂等请求没有可重放的记忆写入结果",
                 )
 
+            from aiive.forget.visibility_service import ForgetVisibilityService
+            if not ForgetVisibilityService.filter_memory_ids(db, [existing.final_memory_id]):
+                raise HTTPException(status_code=409, detail="幂等结果已不可用")
             record = db.get(MemoryRecord, existing.final_memory_id)
             if record is None:
                 raise HTTPException(
@@ -339,7 +357,7 @@ def create_memory(request: CreateMemoryRequest,
                 outcome=replay_outcome,
                 operation=final_operation,
                 id=record.id,
-                content=record.content,
+                content=MemoryPolicyEngine().render_content(record.content, record.sensitivity, MemoryReadChannel.API) or "",
                 lifecycle_state=record.lifecycle_state,
                 memory_type=record.memory_type,
                 canonical_key=record.canonical_key or "",

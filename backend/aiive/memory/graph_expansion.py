@@ -132,7 +132,7 @@ class GraphExpansionService:
         if not views:
             return result
         views = views[: self._config.max_relations_per_expansion]
-        result.relations = self._attach_history(views)
+        result.relations = self._attach_history(views, scope_chain)
         self._mark_conflicts(result.relations)
         result.conflicted = sum(1 for item in result.relations if item.is_conflicted)
         return result
@@ -267,9 +267,15 @@ class GraphExpansionService:
                 continue
             if (record.validity_state or ValidityState.VALID.value) != ValidityState.VALID.value:
                 continue
+            from aiive.memory.memory_policy import MemoryPolicyEngine, MemoryReadChannel
+            if not MemoryPolicyEngine().decide_read(record.sensitivity, MemoryReadChannel.LLM_CONTEXT).allowed:
+                continue
             if relation.confidence < self._config.min_confidence:
                 continue
             if not (relation.source_span or "").strip():
+                continue
+            from aiive.memory.graph_types import canonical_relation_fact
+            if canonical_relation_fact(record.graph_facts, record.id, relation.relation_key) is None:
                 continue
             view = self._to_view(relation, record, hop)
             views.append(view)
@@ -338,10 +344,10 @@ class GraphExpansionService:
     def _to_view(
         self, relation: GraphRelation, record: MemoryRecord, hop: int,
     ) -> GraphRelationView:
-        subject = self._db.get(GraphEntity, relation.subject_entity_id)
-        object_entity = self._db.get(GraphEntity, relation.object_entity_id)
-        subject_name = subject.display_name if subject else ""
-        object_name = object_entity.display_name if object_entity else ""
+        from aiive.memory.graph_types import canonical_relation_fact
+        fact = canonical_relation_fact(record.graph_facts, record.id, relation.relation_key)
+        subject_name = fact.subject if fact else ""
+        object_name = fact.object if fact else ""
         confidence = float(relation.confidence or 0.0)
         scope_score = 1.0 if (record.scope_type or "global") != "global" else 0.6
         score = (
@@ -375,7 +381,7 @@ class GraphExpansionService:
             cardinality=cardinality(relation.predicate),
         )
 
-    def _attach_history(self, views: list[GraphRelationView]) -> list[GraphRelationView]:
+    def _attach_history(self, views: list[GraphRelationView], scope_chain: list[tuple[str, str | None]] | None = None) -> list[GraphRelationView]:
         """为每条当前关系补充被它取代的历史关系（时间变化），标记为非当前。"""
         if not views:
             return views
@@ -404,20 +410,29 @@ class GraphExpansionService:
                 record = self._db.get(MemoryRecord, relation.source_memory_id)
                 if record is None or (record.lifecycle_state or "") == LifecycleState.FORGOTTEN.value:
                     continue
-                subject = self._db.get(GraphEntity, relation.subject_entity_id)
-                object_entity = self._db.get(GraphEntity, relation.object_entity_id)
+                from aiive.memory.memory_policy import MemoryPolicyEngine, MemoryReadChannel
+                if relation.source_memory_id in self._blocked_memory_ids([relation.source_memory_id]):
+                    continue
+                if scope_chain is not None and (record.scope_type, record.scope_id) not in scope_chain:
+                    continue
+                if not MemoryPolicyEngine().decide_read(record.sensitivity, MemoryReadChannel.LLM_CONTEXT).allowed:
+                    continue
+                from aiive.memory.graph_types import canonical_relation_fact
+                fact = canonical_relation_fact(record.graph_facts, record.id, relation.relation_key)
+                if fact is None:
+                    continue
                 line = _render_line(
-                    subject.display_name if subject else "",
+                    fact.subject,
                     relation.predicate,
-                    object_entity.display_name if object_entity else "",
+                    fact.object,
                     relation,
                     float(relation.confidence or 0.0),
                 )
                 history.append(GraphRelationView(
                     relation_id=relation.id,
-                    subject=subject.display_name if subject else "",
+                    subject=fact.subject,
                     predicate=relation.predicate,
-                    object=object_entity.display_name if object_entity else "",
+                    object=fact.object,
                     subject_entity_id=relation.subject_entity_id,
                     object_entity_id=relation.object_entity_id,
                     confidence=float(relation.confidence or 0.0),

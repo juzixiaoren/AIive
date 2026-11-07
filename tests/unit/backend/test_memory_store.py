@@ -39,7 +39,9 @@ class TestMemoryStore:
     def test_get_by_context_roles(self, db_session):
         store = MemoryStore(db_session)
         p = _make_proposal("agent.display_name", "Helper", "agent_self")
-        store.create_record(p, lifecycle_state=LifecycleState.ACTIVE.value)
+        record = store.create_record(p, lifecycle_state=LifecycleState.ACTIVE.value)
+        from tests.support import attach_memory_event_source
+        attach_memory_event_source(db_session, record)
         db_session.flush()
 
         records = store.get_by_context_roles(["runtime_identity"])

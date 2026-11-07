@@ -150,6 +150,7 @@ class MemoryStore:
         query = self._db.query(MemoryRecord).filter(
             MemoryRecord.canonical_key == canonical_key,
             MemoryRecord.scope_type == scope_type,
+            MemoryRecord.validity_state == ValidityState.VALID.value,
             MemoryRecord.lifecycle_state.in_([
                 LifecycleState.ACTIVE.value,
                 LifecycleState.CANDIDATE.value,
@@ -164,17 +165,9 @@ class MemoryStore:
             (MemoryRecord.lifecycle_state == LifecycleState.ACTIVE.value, 0),
             else_=1,
         )
-        try:
-            return query.order_by(
-                state_order.asc(),  # active before candidate
-                MemoryRecord.updated_at.desc(),
-            ).with_for_update().all()
-        except Exception:
-            logger.warning("记忆查询加锁失败，回退非锁定查询（并发风险）", exc_info=True)
-            return query.order_by(
-                state_order.asc(),
-                MemoryRecord.updated_at.desc(),
-            ).all()
+        return self._maintenance_visible(list(query.order_by(
+            state_order.asc(), MemoryRecord.updated_at.desc(), MemoryRecord.id.asc(),
+        ).with_for_update().all()))
 
     def get_sleeping_by_key_scope_locked(
         self, canonical_key: str, scope_type: str, scope_id: str | None
@@ -187,20 +180,19 @@ class MemoryStore:
         query = self._db.query(MemoryRecord).filter(
             MemoryRecord.canonical_key == canonical_key,
             MemoryRecord.scope_type == scope_type,
+            MemoryRecord.validity_state == ValidityState.VALID.value,
             MemoryRecord.lifecycle_state == LifecycleState.SLEEPING.value,
         )
         if scope_id is not None:
             query = query.filter(MemoryRecord.scope_id == scope_id)
         else:
             query = query.filter(MemoryRecord.scope_id.is_(None))
-        try:
-            return query.order_by(MemoryRecord.updated_at.desc()).with_for_update().all()
-        except Exception:
-            logger.warning("睡眠记忆查询加锁失败，回退非锁定查询（并发风险）", exc_info=True)
-            return query.order_by(MemoryRecord.updated_at.desc()).all()
+        return self._maintenance_visible(list(query.order_by(
+            MemoryRecord.updated_at.desc(), MemoryRecord.id.asc(),
+        ).with_for_update().all()))
 
     def get_by_context_roles(
-        self, roles: Sequence[str]
+        self, roles: Sequence[str], *, scope_chain: Sequence[tuple[str, str | None]] | None = None,
     ) -> Sequence[MemoryRecord]:
         """Get active+valid records by context role keys (exact + pattern prefixes).
 
@@ -224,21 +216,24 @@ class MemoryStore:
             conditions.append(MemoryRecord.canonical_key.in_(list(exact_keys)))
         for pfx in prefixes:
             conditions.append(MemoryRecord.canonical_key.like(f"{pfx}%"))
-        return (
+        scopes = scope_chain if scope_chain is not None else [("global", None)]
+        if not scopes:
+            return []
+        scope_filter = or_(*(and_(MemoryRecord.scope_type == kind, MemoryRecord.scope_id == token
+                                 if token is not None else MemoryRecord.scope_id.is_(None))
+                             for kind, token in scopes))
+        return self._maintenance_visible(list(
             self._db.query(MemoryRecord)
-            .filter(or_(*conditions), *self._ACTIVE_VALID)
-            .order_by(MemoryRecord.updated_at.desc())
+            .filter(or_(*conditions), *self._ACTIVE_VALID, scope_filter)
+            .order_by(MemoryRecord.updated_at.desc(), MemoryRecord.id.asc())
             .all()
-        )
+        ))
 
     def list_all(self, limit: int = 100) -> Sequence[MemoryRecord]:
-        """List all records (for inspection)."""
-        return (
-            self._db.query(MemoryRecord)
-            .order_by(MemoryRecord.updated_at.desc())
-            .limit(limit)
-            .all()
-        )
+        """Visible inspection page, including legitimate historical states."""
+        from aiive.memory.read_access import visible_memory_page
+        return visible_memory_page(self._db, self._db.query(MemoryRecord).order_by(
+            MemoryRecord.updated_at.desc()), limit)
 
     # ------------------------------------------------------------------
     # Phase 4: 维护 dirty-set lane 查询与 Batch 选择

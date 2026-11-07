@@ -111,3 +111,15 @@ def acquire_forget_exclusive_lock(session: Session) -> None:
         text("SELECT pg_advisory_xact_lock(:ns, :key)"),
         {"ns": FORGET_LOCK_NAMESPACE, "key": FORGET_LOCK_KEY},
     )
+
+
+def forget_revision(session: Session) -> int:
+    """Committed Forget operation watermark for short-lived context snapshots.
+
+    Operations are append-only; a changed watermark invalidates the whole snapshot,
+    conservatively including unrelated Forget. No lock spans an external model call.
+    """
+    from sqlalchemy import func
+    from aiive.db.forget_models import ForgetOperation
+    ensure_read_committed(session)
+    return int(session.query(func.count(ForgetOperation.id)).scalar() or 0)

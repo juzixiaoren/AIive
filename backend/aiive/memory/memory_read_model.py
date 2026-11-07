@@ -60,7 +60,8 @@ class MemoryReadModel:
         policies = model.resolve_policies()
     """
 
-    def __init__(self, store: MemoryStore) -> None:
+    def __init__(self, store: MemoryStore, scope_chain: Sequence[tuple[str, str | None]] | None = None) -> None:
+        self._scope_chain = scope_chain
         self._store: MemoryStore = store
         self._policy: MemoryPolicyEngine = MemoryPolicyEngine()
 
@@ -76,30 +77,35 @@ class MemoryReadModel:
         """
         identity = RuntimeIdentity(agent_runtime_id=agent_runtime_id)
         records: Sequence[MemoryRecord] = self._store.get_by_context_roles(
-            ["runtime_identity"]
+            ["runtime_identity"], scope_chain=self._scope_chain,
         )
 
+        seen: set[str] = set()
         for rec in records:
+            if rec.canonical_key in seen:
+                continue
             content = self._policy.render_content(
                 rec.content, rec.sensitivity, MemoryReadChannel.LLM_CONTEXT,
             )
             if content is None:
                 continue
+            seen.add(rec.canonical_key)
             if rec.canonical_key == "agent.display_name":
                 identity.agent_display_name = content
             elif rec.canonical_key == "user.display_name":
                 identity.user_display_name = content
             elif rec.canonical_key == "user.name":
                 identity.user_name = content
-                if not identity.user_display_name:
-                    identity.user_display_name = content
             elif rec.canonical_key == "agent.persona.relationship":
                 identity.relationship_style = content
             elif rec.canonical_key == "agent.persona.tone":
-                identity.response_style = content
+                if "user.preference.response_style" not in seen:
+                    identity.response_style = content
             elif rec.canonical_key == "user.preference.response_style":
                 identity.response_style = content
 
+        if not identity.user_display_name:
+            identity.user_display_name = identity.user_name
         return identity
 
     # ------------------------------------------------------------------
@@ -108,7 +114,7 @@ class MemoryReadModel:
 
     def resolve_policies(self) -> list[dict[str, Any]]:
         """Resolve policy records via exact 'policy' context role keys."""
-        policy_records = self._store.get_by_context_roles(["policy"])
+        policy_records = self._store.get_by_context_roles(["policy"], scope_chain=self._scope_chain)
         result: list[dict[str, Any]] = []
         for record in policy_records:
             content = self._policy.render_content(

@@ -164,6 +164,7 @@ class AssembledContext:
     # ContextAssembler 与 AgentGraph 必须共享同一不可变工具视图，避免 Desktop
     # Node 在两阶段之间上下线时出现“schema 可见但执行注册表不同”的竞态。
     tool_registry: Any = None
+    forget_revision: int | None = None
 
 
 class ContextBudgetExceededError(Exception):
@@ -216,6 +217,8 @@ class ContextAssembler:
 
         无法装入窗口时抛出 ContextBudgetExceededError。
         """
+        from aiive.forget.concurrency import forget_revision
+        source_revision = forget_revision(db)
         requested_output = requested_output_tokens or self._profile.max_output_tokens
         ws_service = WorkingStateService()
         epoch_mgr = EpochManager()
@@ -442,6 +445,7 @@ class ContextAssembler:
                     ),
                     total_token_count=total_count,
                     is_safe=True,
+                    forget_revision=source_revision,
                     working_state_text=working_state_text,
                     snapshot=snapshot,
                     agent_ctx=agent_ctx,
@@ -524,7 +528,8 @@ class ContextAssembler:
         """加载 Stable Contract + Core Memory + Automatic Recall。"""
         config = RecallConfig()
         memory_store = MemoryStore(db)
-        read_model = MemoryReadModel(memory_store)
+        scope = build_scope_context(db, None, thread_id)
+        read_model = MemoryReadModel(memory_store, scope.chain())
         identity = read_model.resolve_identity()
         policies = read_model.resolve_policies()
 
@@ -1043,11 +1048,15 @@ class ContextAssembler:
         if seg is None:
             return ""
 
+        from aiive.forget.visibility_service import ForgetVisibilityService
+
         if seg.summary_id:
             summary = db.query(SegmentSummary).filter(
                 SegmentSummary.id == seg.summary_id,
             ).first()
-            if summary is not None:
+            if summary is not None and not ForgetVisibilityService.blocked_target_ids(
+                db, "segment_summary", [(summary.id, summary.created_at)],
+            ):
                 parts = ["## 密封中 Segment 摘要（桥接）"]
                 if summary.goal:
                     parts.append(f"- 目标: {summary.goal}")
@@ -1063,7 +1072,7 @@ class ContextAssembler:
             return ""
         # event_manifest 已按 (turn_sequence, turn_event_index) 时间序冻结
         # （见 compaction.build_event_manifest），尾部切片即时间尾部。
-        event_ids = [m.get("event_id") for m in (ci.event_manifest or [])]
+        event_ids = [m.get("event_id") for m in (ci.event_manifest or []) if isinstance(m, dict)]
         if not event_ids:
             return ""
         from aiive.db.models import Event, TurnRecord
@@ -1079,7 +1088,10 @@ class ContextAssembler:
             .all()
         )
         lines = ["## 密封中 Segment 原始尾部（桥接，bounded）"]
+        allowed = set(ForgetVisibilityService.filter_blocked_ids(db, "event", [e.id for e in events]))
         for e in events:
+            if e.id not in allowed:
+                continue
             pl = e.payload or {}
             if e.event_type in ("user_message", "llm_response"):
                 content = str(pl.get("content", ""))[:400]

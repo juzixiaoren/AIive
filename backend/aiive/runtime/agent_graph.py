@@ -619,6 +619,7 @@ class AgentGraph:
         turn_record_id: str = "",
         execution_id: str = "",
         turn_id: str = "",
+        context_forget_revision: int | None = None,
     ) -> tuple[Any, list[dict[str, Any]], list[dict[str, Any]]]:
         """构建并返回编译后的 StateGraph、工具记录引用列表和待审批列表。
 
@@ -724,6 +725,9 @@ class AgentGraph:
             if _tool_calls_paired(msgs):
                 injection_text, injected = _load_event_injection()
             call_messages = [*msgs, SystemMessage(content=injection_text)] if injection_text else msgs
+            from aiive.forget.concurrency import forget_revision
+            if context_forget_revision is not None and forget_revision(self._db) != context_forget_revision:
+                return {"messages": [AIMessage(content="上下文因遗忘操作失效，本轮已停止。请重新发送消息。")]}
             resp = llm_with_tools.invoke(call_messages)
             tc_count = len(getattr(resp, "tool_calls", None) or [])
             content_len = len(str(resp.content or ""))
@@ -1209,6 +1213,7 @@ class AgentGraph:
             normalizer=normalizer, ws_service=ws_service,
             thread_id=thread.id, turn_record_id=exec_ctx.turn_record_id,
             execution_id=exec_ctx.execution_id, turn_id=exec_ctx.turn_id,
+            context_forget_revision=getattr(assembled_ctx, "forget_revision", None),
         )
         return {
             "trace": trace,

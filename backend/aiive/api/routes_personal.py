@@ -31,23 +31,25 @@ def list_personal_signals(db: Session = Depends(get_db)):
         个人信号列表，按更新时间降序排列，最多50条
     """
     try:
-        records = (
+        from aiive.memory.read_access import visible_memory_page
+        records = visible_memory_page(db, (
             db.query(MemoryRecord)
             .filter(MemoryRecord.memory_type.in_(_PERSONAL_SIGNAL_TYPES))
             .order_by(MemoryRecord.updated_at.desc())
-            .limit(50)
-            .all()
-        )
+        ), 50)
+        from aiive.forget.visibility_service import ForgetVisibilityService
+        from aiive.memory.memory_policy import MemoryPolicyEngine, MemoryReadChannel
+        allowed = set(ForgetVisibilityService.filter_memory_ids(db, [r.id for r in records]))
         return [
             {
                 "id": r.id,
                 "memory_type": r.memory_type,
-                "content": r.content,
+                "content": MemoryPolicyEngine().render_content(r.content, r.sensitivity, MemoryReadChannel.API),
                 "lifecycle_state": r.lifecycle_state,
                 "confidence": r.confidence,
                 "created_at": r.created_at.isoformat(),
             }
-            for r in records
+            for r in records if r.id in allowed and r.lifecycle_state != "forgotten"
         ]
     except Exception:
         logger.exception("获取个人信号列表失败")

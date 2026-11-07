@@ -312,3 +312,17 @@ class GraphExpansionResult:
             "relation_count": len(self.relations),
             "relations": [item.to_dict() for item in self.relations],
         }
+
+
+def canonical_relation_fact(graph_facts: Any, memory_id: str, relation_key: str) -> GraphFact | None:
+    """Render only a fact proved by this source; shared entity aliases have other owners."""
+    if not isinstance(graph_facts, list):
+        return None
+    for payload in graph_facts:
+        try:
+            fact = GraphFact.model_validate(payload)
+        except (ValidationError, TypeError):
+            continue
+        if fact.normalized_key(memory_id) == relation_key:
+            return fact
+    return None

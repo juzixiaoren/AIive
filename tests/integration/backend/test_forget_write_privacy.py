@@ -423,6 +423,10 @@ def test_pure_turn_new_turn_after_forget_is_not_blocked(db_session: Session):
     )
     db_session.commit()
 
+    from tests.support import create_memory_source_event
+    event = create_memory_source_event(db_session, thread_id)
+    event.turn_id = new_turn.turn_id
+    db_session.flush()
     content = "用户主动重新提供的新事实"
     prop = _proposal(
         content=content, canonical_key="user.new-fact",

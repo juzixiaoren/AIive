@@ -239,9 +239,14 @@ class MemoryLifecycleService:
         wake 是生命周期动作：bump `record_version`、更新 `updated_at`、
         写 lineage/event、刷新投影。与普通 touch（不 bump）区分。
         """
+        from aiive.forget.concurrency import acquire_forget_shared_lock
+        from aiive.forget.visibility_service import ForgetVisibilityService
+        acquire_forget_shared_lock(self._db)
         locked = self._executor.lock_records([memory_id])
         record = locked.get(memory_id)
         if record is None:
+            return False
+        if record.validity_state != "valid" or not ForgetVisibilityService.filter_memory_ids(self._db, [memory_id]):
             return False
         if record.lifecycle_state != LifecycleState.SLEEPING.value:
             return False
@@ -270,10 +275,15 @@ class MemoryLifecycleService:
         走共享 executor：加锁 → bump `record_version` → 写 lineage/event →
         即时刷新投影（J.5）。返回 (是否执行, reason)。
         """
+        from aiive.forget.concurrency import acquire_forget_shared_lock
+        from aiive.forget.visibility_service import ForgetVisibilityService
+        acquire_forget_shared_lock(self._db)
         locked = self._executor.lock_records([memory_id])
         record = locked.get(memory_id)
         if record is None:
             return False, "Memory not found"
+        if record.validity_state != "valid" or not ForgetVisibilityService.filter_memory_ids(self._db, [memory_id]):
+            return False, "forget_source_blocked"
         if record.lifecycle_state != LifecycleState.CANDIDATE.value:
             return False, f"Cannot promote: current state is {record.lifecycle_state}"
         now = datetime.now(timezone.utc)
@@ -310,6 +320,9 @@ class MemoryLifecycleService:
         仅允许 active / sleeping 进入 sleeping；forgotten 记忆一律拒绝
         （防止经 sleep → wake 复活），archived 也不允许直接转 sleeping。
         """
+        from aiive.forget.concurrency import acquire_forget_shared_lock
+        from aiive.forget.visibility_service import ForgetVisibilityService
+        acquire_forget_shared_lock(self._db)
         locked = self._executor.lock_records([memory_id])
         record = locked.get(memory_id)
         if record is None:
@@ -338,6 +351,9 @@ class MemoryLifecycleService:
         仅允许 active / sleeping / candidate 进入 archived；forgotten 记忆
         一律拒绝（终态，不得被任何生命周期动作触碰）。
         """
+        from aiive.forget.concurrency import acquire_forget_shared_lock
+        from aiive.forget.visibility_service import ForgetVisibilityService
+        acquire_forget_shared_lock(self._db)
         locked = self._executor.lock_records([memory_id])
         record = locked.get(memory_id)
         if record is None:

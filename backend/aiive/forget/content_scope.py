@@ -664,6 +664,24 @@ def build_scope(
         rows = q.all()
         setattr(scope, attr, {str(row[0]) for row in rows if row[0]})
         child_parent_ids |= {str(row[1]) for row in rows if row[1]}
+    # Evidence can depend on a Memory/Event outside its owning Task's origin.
+    # Keep raw provenance IDs after scrub so future copies remain attributable.
+    from sqlalchemy import or_, and_
+    dependency_conditions = []
+    for kind, ids in (
+        ("event", scope.raw_event_ids if mode == "memory_only" else scope.event_ids),
+        ("memory_record", scope.memory_ids), ("turn_record", scope.turn_tokens),
+    ):
+        if ids:
+            dependency_conditions.append(and_(ContentProvenanceRef.source_type == kind,
+                                               ContentProvenanceRef.source_id.in_(ids)))
+    if dependency_conditions:
+        evidence_ids = db.query(ContentProvenanceRef.owner_id).filter(
+            ContentProvenanceRef.owner_type == "task_evidence", or_(*dependency_conditions))
+        dependent = db.query(TaskEvidence.id, TaskEvidence.task_id).filter(
+            TaskEvidence.id.in_(evidence_ids), TaskEvidence.created_at <= scope.cutoff).all()
+        scope.task_evidence_ids |= {r[0] for r in dependent}
+        child_parent_ids |= {r[1] for r in dependent}
     scope.partial_agent_task_ids = child_parent_ids - scope.agent_task_ids
 
     # ── Knowledge（仅 all_user_data，或 everywhere + time_range）──

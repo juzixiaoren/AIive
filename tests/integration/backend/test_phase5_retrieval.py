@@ -94,6 +94,32 @@ def _mk_thread(db, tid="t1") -> Thread:
     return th
 
 
+def _attach_summary_source(db, summary):
+    from tests.support import create_memory_source_event
+    event = create_memory_source_event(db, "t1", summary.goal or "summary source")
+    summary.source_event_ids = [event.id]
+    db.flush()
+
+
+def _attach_checkpoint_source(db, checkpoint):
+    if db.get(Thread, "t1") is None:
+        _mk_thread(db, "t1")
+    if db.get(Epoch, "e1") is None:
+        db.add(Epoch(id="e1", thread_id="t1", epoch_no=1, status="active"))
+        db.flush()
+    segment = db.get(Segment, "s_audit")
+    if segment is None:
+        segment = Segment(id="s_audit", epoch_id="e1", thread_id="t1", segment_no=99, start_turn_sequence=0)
+        db.add(segment)
+        db.flush()
+        summary = SegmentSummary(id="ss_audit", segment_id=segment.id, goal="checkpoint source")
+        db.add(summary)
+        db.flush()
+        _attach_summary_source(db, summary)
+    checkpoint.source_segment_ids = [segment.id]
+    db.flush()
+
+
 def _mk_summary_chain(db, goal="Python 编程偏好") -> SegmentSummary:
     _mk_thread(db, "t1")
     epoch = Epoch(id="e1", thread_id="t1", epoch_no=1, status="active")
@@ -109,6 +135,7 @@ def _mk_summary_chain(db, goal="Python 编程偏好") -> SegmentSummary:
     )
     db.add(summ)
     db.flush()
+    _attach_summary_source(db, summ)
     return summ
 
 
@@ -120,6 +147,7 @@ def _mk_checkpoint(db, goal="Python 项目目标") -> EpochCheckpoint:
     )
     db.add(cp)
     db.flush()
+    _attach_checkpoint_source(db, cp)
     return cp
 
 
@@ -1056,6 +1084,7 @@ def test_rebuild_concurrent_update_preserved_after_switch(db):
         )
         db.add(cp)
         db.flush()
+        _attach_checkpoint_source(db, cp)
         refresh_source(db, "epoch_checkpoint", cp.id, "epoch.checkpointed")
     db.commit()
 
@@ -1352,8 +1381,8 @@ def test_deep_event_not_in_manifest_rejected(db):
     ))
     parent = [h for h in res.hits if h.source_type == "segment_summary"]
     raw = [h for h in res.hits if h.is_raw]
-    assert parent and parent[0].source_id == "ss1"
-    assert parent[0].provenance.get("verification_status") == "degraded"
+    # An absent declared source now fails closed before raw expansion.
+    assert not parent
     assert not any(h.source_id == ev.id for h in raw)
 
 
@@ -1398,6 +1427,8 @@ def test_hot_summary_excluded_from_unified_recall(db):
                                summary_version=1, source_hash="h")
     db.add_all([summ_hot, summ_old])
     db.flush()
+    _attach_summary_source(db, summ_hot)
+    _attach_summary_source(db, summ_old)
     refresh_source(db, "segment_summary", "ss_hot", "segment.sealed")
     refresh_source(db, "segment_summary", "ss_old", "segment.sealed")
     db.commit()

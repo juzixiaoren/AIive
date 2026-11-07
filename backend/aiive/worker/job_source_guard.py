@@ -605,3 +605,17 @@ def task_sources_visible(db: Session, task_id: str) -> bool:
         return not sources.empty and not blocked_source_reason(db, claimed, sources)
     except Exception:
         return False
+
+
+def conflict_case_sources_visible(db: Session, case_id: str) -> bool:
+    """Shared source check for direct API, reply parser, and confirmation execution."""
+    try:
+        claimed = ClaimedJob("runtime", "memory_conflict_reply", {"conflict_case_id": case_id}, None, 0, 1, "", 1, "")
+        from aiive.db.models import MemoryConflictCase
+        case = db.get(MemoryConflictCase, case_id)
+        if case is None:
+            return False
+        sources = resolve_job_sources(db, claimed)
+        return not sources.empty and not blocked_source_reason(db, claimed, sources, job_created_at=case.created_at)
+    except Exception:
+        return False

@@ -313,6 +313,25 @@ class MemoryWriteService:
         数百次查询；缓存只在单个事务的 write_batch 内复用，不跨事务。
         """
         event_ids, turn_ids = self._collect_forget_sources(proposal, run_context)
+        # Turn-only is not a durable source contract: resolve real events or reject.
+        if turn_ids:
+            from aiive.db.models import TurnRecord, Event
+            from sqlalchemy import or_
+            turns = self._db.query(TurnRecord).filter(or_(
+                TurnRecord.id.in_(turn_ids), TurnRecord.turn_id.in_(turn_ids))).all()
+            if not event_ids:
+                tokens = {t.turn_id for t in turns}
+                event_ids.update(r[0] for r in self._db.query(Event.id).filter(Event.turn_id.in_(tokens)).all())
+                if not event_ids:
+                    return True
+            record_match = next((t for t in turns if proposal.source_turn_record_id in {t.id, t.turn_id}), None)
+            logical_match = next((t for t in turns if proposal.source_turn_id in {t.id, t.turn_id}), None)
+            if record_match is not None and logical_match is not None and record_match.id != logical_match.id:
+                return True
+            resolved = record_match or logical_match
+            if resolved is not None:
+                proposal.source_turn_record_id = resolved.id
+                proposal.source_turn_id = resolved.turn_id
         proposal.source_event_ids = sorted(event_ids)
         cache = memo if memo is not None else {}
 
@@ -381,6 +400,9 @@ class MemoryWriteService:
                 reason=plan.adjudication.reason or "semantic_conflict_needs_confirmation",
             )
 
+        replay = self._replay_completed_write(proposal)
+        if replay is not None:
+            return replay
         existing_active = self._load_existing_or_wake_sleeping(proposal, run_context)
         resolution = self._resolver.resolve(proposal, existing_active)
         tid = run_context.thread_id
@@ -437,6 +459,8 @@ class MemoryWriteService:
                 reason="重复请求（幂等键已存在），跳过强化",
             )
 
+        if existing.validity_state != "valid" or not ForgetVisibilityService.filter_memory_ids(self._db, [existing.id]):
+            return WriteResult(outcome=WriteOutcome.FAILED, reason="decision_target_stale")
         new_event_ids = set(proposal.source_event_ids or [])
         if new_event_ids:
             existing_event_ids = {
@@ -539,6 +563,10 @@ class MemoryWriteService:
             self._acquire_lock(lid)
 
         try:
+            replay = self._replay_completed_write(proposal)
+            if replay is not None:
+                self._db.commit()
+                return replay
             # 3. SELECT FOR UPDATE existing active records（无 active 则先唤醒 sleeping 同键记录）
             existing_active: Sequence[MemoryRecord] = self._load_existing_or_wake_sleeping(
                 proposal, run_context
@@ -858,7 +886,12 @@ class MemoryWriteService:
         if decision in ("accept_new", "revise", "merge"):
             target: MemoryRecord | None = None
             if target_id:
-                target = self._store.get_by_id(target_id)
+                targets = self._db.query(MemoryRecord).filter(MemoryRecord.id == target_id).with_for_update().all()
+                target = targets[0] if targets else None
+            if target_id and (target is None or target.scope_type != proposal.scope_type or target.scope_id != proposal.scope_id
+                    or target.validity_state != "valid" or target.lifecycle_state not in {"active", "candidate"}
+                    or not ForgetVisibilityService.filter_memory_ids(self._db, [target_id])):
+                return WriteResult(outcome=WriteOutcome.FAILED, reason="decision_target_stale")
             if target is None and existing_active:
                 target = existing_active[0]
             if target is None:
@@ -892,6 +925,9 @@ class MemoryWriteService:
                 outcome=WriteOutcome.FAILED,
                 reason="没有可提升的 candidate 记忆",
             )
+
+        if not ForgetVisibilityService.filter_memory_ids(self._db, [candidate.id]) or candidate.validity_state != "valid":
+            return WriteResult(outcome=WriteOutcome.FAILED, reason="decision_target_stale")
 
         self._db.add(MemoryLineage(
             predecessor_id=candidate.id,
@@ -941,6 +977,8 @@ class MemoryWriteService:
             )
 
         # 检查 source_event 是否已被计算过（防重复强化）
+        if existing.validity_state != "valid" or not ForgetVisibilityService.filter_memory_ids(self._db, [existing.id]):
+            return WriteResult(outcome=WriteOutcome.FAILED, reason="decision_target_stale")
         new_event_ids = set(proposal.source_event_ids or [])
         if new_event_ids:
             existing_event_ids = {
@@ -1001,6 +1039,23 @@ class MemoryWriteService:
             merged_keywords.update(proposal.keywords)
             existing.keywords = sorted(merged_keywords)
 
+    def _replay_completed_write(self, proposal: MemoryProposal) -> WriteResult | None:
+        """Request identity survives Forget: never turn a hidden replay into a new write."""
+        if not proposal.idempotency_key:
+            return None
+        prior = self._db.query(MemoryProposalModel).filter(
+            MemoryProposalModel.idempotency_key == proposal.idempotency_key,
+        ).first()
+        if prior is None or prior.final_operation not in {
+            "create", "reinforce", "supersede", "revise", "merge", "promote", "ignore",
+        }:
+            return None
+        visible_id = prior.final_memory_id or ""
+        if visible_id and not ForgetVisibilityService.filter_memory_ids(self._db, [visible_id]):
+            visible_id = ""
+        return WriteResult(outcome=WriteOutcome.REINFORCE_SKIPPED, operation="ignore",
+                           memory_id=visible_id, reason="request_already_processed")
+
     def _proposal_already_persisted(self, proposal: MemoryProposal) -> bool:
         """同 idempotency_key 的 proposal 是否已持久化（重复请求判定）。"""
         ikey = proposal.idempotency_key
@@ -1028,6 +1083,9 @@ class MemoryWriteService:
                 outcome=WriteOutcome.FAILED,
                 reason="没有可 supersede 或 revise 的现有记忆",
             )
+
+        if not ForgetVisibilityService.filter_memory_ids(self._db, [old.id]):
+            return WriteResult(outcome=WriteOutcome.FAILED, reason="decision_target_stale")
 
         if gate_decision.decision == "candidate":
             # 低置信提案不得 supersede 高置信 active 记忆：仅新建 candidate。
@@ -1108,6 +1166,8 @@ class MemoryWriteService:
     ) -> WriteResult:
         """Merge multiple existing records into one new record."""
         old_ids: list[str] = [r.id for r in resolution.existing_records]
+        if set(ForgetVisibilityService.filter_memory_ids(self._db, old_ids)) != set(old_ids):
+            return WriteResult(outcome=WriteOutcome.FAILED, reason="merge_source_blocked")
         inherited = {
             ref.source_id for ref in self._db.query(ContentProvenanceRef).filter(
                 ContentProvenanceRef.owner_type == "memory_record",
@@ -1216,6 +1276,7 @@ class MemoryWriteService:
             retention_policy=proposal.retention_policy,
             valid_to=proposal.valid_to,
             durable=proposal.durable,
+            source_turn_id=proposal.source_turn_id or None,
             source_turn_record_id=proposal.source_turn_record_id or None,
         )
         # 防御层：极端并发/重试下唯一约束仍可能冲突，用保存点隔离单次插入。
