@@ -42,6 +42,9 @@ from aiive.task_runtime.goal_triggers import (
     match_event,
 )
 from aiive.task_runtime.repository import TaskRepository, utcnow
+from aiive.task_runtime.read_repository import TaskReadRepository, inherit_sources
+from aiive.forget.durable_sources import persist_sources
+from aiive.forget.visibility_service import ForgetVisibilityService
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +98,8 @@ class GoalTriggerService:
     # ------------------------------------------------------------------
     def scan(self, *, now: datetime | None = None, limit: int = 50) -> int:
         """扫描活跃目标并触发到期规则；返回本轮新触发的数量。"""
+        from aiive.forget.concurrency import acquire_forget_shared_lock
+        acquire_forget_shared_lock(self.db)
         moment = now or utcnow()
         tasks = self.db.query(AgentTask).filter(
             AgentTask.task_type == GOAL_TASK_TYPE,
@@ -167,6 +172,8 @@ class GoalTriggerService:
         没有订阅者时不调用 LLM。逐目标提交：单个目标失败不影响其他目标，
         已产生的决策作业也不会因回滚丢失（Outbox 重试时按幂等键去重）。
         """
+        from aiive.forget.concurrency import acquire_forget_shared_lock
+        acquire_forget_shared_lock(self.db)
         moment = utcnow()
         query = self.db.query(AgentTask).filter(
             AgentTask.task_type == GOAL_TASK_TYPE,
@@ -242,6 +249,14 @@ class GoalTriggerService:
         firing: Any,
         now: datetime,
     ) -> bool:
+        from aiive.runtime.turn_events import trigger_event_sources
+        proof = trigger_event_sources(self.db, str(firing.event_id or ""),
+            str(firing.metadata.get("event_type") or ""), firing.metadata.get("event_payload"))
+        if proof is None or not TaskReadRepository(self.db).task_visible(task):
+            return False
+        chat_event_id = firing.event_id if firing.event_id and self.db.get(Event, firing.event_id) is not None else None
+        # Step completion IDs are virtual references, not chat Event primary keys.
+        job_event_id = None if str(firing.event_id or "").startswith("step-done:") else firing.event_id
         operation_id = _trigger_operation_id(task.id, step.id, firing.key)
         trace_id = _trigger_trace_id(operation_id)
         step.last_trigger_key = firing.key
@@ -257,20 +272,23 @@ class GoalTriggerService:
                 *step.opportunistic_hits[-(rule.max_per_week * 2):],
                 _iso(now),
             ]
-        self.repo.append_event(
+        trigger_row = self.repo.append_event(
             task.id,
             "goal_trigger_fired",
             {
                 "step_id": step.id,
                 "trigger_key": firing.key,
                 "reason": firing.reason,
-                "event_id": firing.event_id,
+                "event_id": chat_event_id,
+                "trigger_reference_id": firing.event_id,
                 "next_trigger_at": step.next_trigger_at,
                 "trigger_count": step.trigger_count,
             },
             visibility="internal",
             dedupe_key=f"trigger:{operation_id}",
         )
+        persist_sources(self.db, "agent_task_event", trigger_row.id, proof[0])
+        inherit_sources(self.db, "agent_task_event", trigger_row.id, proof[1])
         existing = self.db.query(OutboxJob).filter(
             OutboxJob.operation_id == operation_id,
         ).one_or_none()
@@ -287,7 +305,8 @@ class GoalTriggerService:
                     "step_id": step.id,
                     "trigger_key": firing.key,
                     "reason": firing.reason,
-                    "trigger_event_id": firing.event_id,
+                    "trigger_event_id": job_event_id,
+                    **proof[0],
                     # 外部运行事件没有聊天 Event 行：类型与元数据随载荷传递，
                     # 详细上下文仍由决策消费者按需读取（计划/Evidence/对话）。
                     "trigger_event_type": firing.metadata.get("event_type"),
@@ -322,6 +341,7 @@ class GoalTriggerService:
                     "event_type": firing.metadata.get("event_type") or "goal_trigger_fired",
                     "event_payload": firing.metadata.get("event_payload"),
                     "outbox_operation_id": operation_id,
+                    "trigger_event_id": firing.event_id,
                 },
             )
         self.db.flush()
@@ -359,6 +379,8 @@ class GoalTriggerService:
         if since is not None:
             query = query.filter(Event.created_at >= since)
         rows = query.order_by(Event.created_at.desc()).limit(TRIGGER_EVENT_LIMIT).all()
+        allowed = set(ForgetVisibilityService.filter_blocked_ids(self.db, "event", [row.id for row in rows]))
+        rows = [row for row in rows if row.id in allowed]
         events: list[TriggerEvent] = []
         for row in reversed(rows):
             created = row.created_at
@@ -384,9 +406,11 @@ class GoalTriggerService:
         )
         if since is not None:
             query = query.filter(AgentTaskEvent.created_at >= since)
-        row = query.order_by(AgentTaskEvent.created_at.desc()).first()
-        if row is None:
+        rows = query.order_by(AgentTaskEvent.created_at.desc()).limit(TRIGGER_EVENT_LIMIT).all()
+        visible = TaskReadRepository(self.db).filter_children("agent_task_event", rows)
+        if not visible:
             return None
+        row = visible[0]
         created = row.created_at
         if created.tzinfo is None:
             created = created.replace(tzinfo=timezone.utc)

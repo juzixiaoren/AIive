@@ -230,6 +230,10 @@ class TaskReadRepository:
             else None
         )
 
+    def get_event(self, event_id: str) -> AgentTaskEvent | None:
+        item = self.db.get(AgentTaskEvent, event_id)
+        return item if item is not None and self.visible_child("agent_task_event", item) else None
+
     def event_by_dedupe(self, task_id: str, dedupe_key: str) -> AgentTaskEvent | None:
         item = (
             self.db.query(AgentTaskEvent)

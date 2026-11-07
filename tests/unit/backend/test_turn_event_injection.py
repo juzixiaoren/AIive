@@ -129,6 +129,14 @@ def _run_graph(db, thread: Thread, turn: TurnRecord, assistant, registry, tools)
     })
 
 
+def _signal_payload(db, thread_id: str, reason: str) -> dict:
+    # A durable producer event, rather than an originless prompt fixture.
+    event = Event(thread_id=thread_id, trace_id=str(uuid.uuid4()), event_type="test_runtime_signal", payload={"reason": reason})
+    db.add(event)
+    db.flush()
+    return {"reason": reason, "source_event_id": event.id, "task_id": "", "step_id": "s1"}
+
+
 def _enqueue(db, thread: Thread, *, key: str, priority: int = 50, label: str = "") -> TurnEventInbox:
     row = enqueue_turn_event(
         db,
@@ -137,7 +145,7 @@ def _enqueue(db, thread: Thread, *, key: str, priority: int = 50, label: str = "
         source="goal_trigger",
         dedupe_key=key,
         priority=priority,
-        payload={"reason": label or key, "task_id": "", "step_id": "s1"},
+        payload=_signal_payload(db, thread.id, label or key),
     )
     db.commit()
     assert row is not None
@@ -168,7 +176,7 @@ def test_event_arriving_during_tool_execution_is_injected_after_batch(db_session
                 source="goal_trigger",
                 dedupe_key="goal_trigger:op-during-tool",
                 priority=80,
-                payload={"reason": "任务完成事件", "task_id": "", "step_id": "s1"},
+                payload=_signal_payload(tool_db, thread_id, "任务完成事件"),
             )
             tool_db.commit()
             assert row is not None

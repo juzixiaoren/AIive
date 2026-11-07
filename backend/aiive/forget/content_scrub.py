@@ -209,7 +209,7 @@ def attention_ids(db: Session, scope: ContentScope) -> set[str]:
 
 
 def inbox_ids(db: Session, scope: ContentScope) -> set[str]:
-    ids = _thread_or_time_ids(db, "turn_event_inbox", "created_at", scope)
+    ids = _thread_or_time_ids(db, "turn_event_inbox", "created_at", scope) | scope.turn_event_inbox_ids
     if scope.turn_tokens:
         ids |= _ids_from(
             db,
@@ -345,6 +345,8 @@ def retrieval_entry_ids(db: Session, scope: ContentScope) -> set[str]:
 def scrub_raw_history(db: Session, scope: ContentScope) -> dict[str, int]:
     counts: dict[str, int] = {}
     if scope.preserve_raw_history:
+        counts["turn_event_inbox"] = _execute_ids(
+            db, "UPDATE turn_event_inbox SET payload = '{}' WHERE id IN :ids", scope.turn_event_inbox_ids)
         return counts
     counts["events"] = _execute_ids(
         db, "UPDATE events SET payload = '{}' WHERE id IN :ids", scope.raw_event_ids,
@@ -1470,13 +1472,13 @@ def verify_scope(db: Session, scope: ContentScope) -> VerifyReport:
             "AND response_payload IS NOT NULL",
             scope.raw_turn_tokens,
         ))
-        inbox = inbox_ids(db, scope)
-        report.add("turn_event_inbox.payload", _sum_in(
-            db,
-            "SELECT COUNT(*) FROM turn_event_inbox WHERE id IN :ids AND payload IS NOT NULL "
-            "AND CAST(payload AS TEXT) NOT IN ('{}', 'null')",
-            inbox,
-        ))
+    inbox = scope.turn_event_inbox_ids if scope.preserve_raw_history else inbox_ids(db, scope)
+    report.add("turn_event_inbox.payload", _sum_in(
+        db,
+        "SELECT COUNT(*) FROM turn_event_inbox WHERE id IN :ids AND payload IS NOT NULL "
+        "AND CAST(payload AS TEXT) NOT IN ('{}', 'null')",
+        inbox,
+    ))
 
     # Summaries / checkpoints / compaction
     summaries = affected_summary_ids(db, scope)

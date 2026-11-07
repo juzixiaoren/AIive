@@ -49,6 +49,7 @@ from aiive.db.models import (
     TaskArtifact,
     TaskEvidence,
     TurnRecord,
+    TurnEventInbox,
 )
 from aiive.db.forget_models import ContentProvenanceRef
 
@@ -88,6 +89,7 @@ class ContentScope:
     agent_task_checkpoint_ids: set[str] = field(default_factory=set)
     task_evidence_ids: set[str] = field(default_factory=set)
     task_artifact_ids: set[str] = field(default_factory=set)
+    turn_event_inbox_ids: set[str] = field(default_factory=set)
     trace_ids: set[str] = field(default_factory=set)
     conflict_case_ids: set[str] = field(default_factory=set)
     tool_operation_ids: set[str] = field(default_factory=set)
@@ -682,6 +684,10 @@ def build_scope(
             dependency_conditions.append(and_(ContentProvenanceRef.source_type == kind,
                                                ContentProvenanceRef.source_id.in_(ids)))
     if dependency_conditions:
+        inbox_dependencies = db.query(ContentProvenanceRef.owner_id).filter(
+            ContentProvenanceRef.owner_type == "turn_event_inbox", or_(*dependency_conditions))
+        scope.turn_event_inbox_ids.update(row[0] for row in db.query(TurnEventInbox.id).filter(
+            TurnEventInbox.id.in_(inbox_dependencies), TurnEventInbox.created_at <= scope.cutoff).all())
         for model, owner_type, attr in (
             (TaskEvidence, "task_evidence", "task_evidence_ids"),
             (TaskArtifact, "task_artifact", "task_artifact_ids"),

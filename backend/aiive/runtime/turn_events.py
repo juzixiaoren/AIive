@@ -21,7 +21,10 @@ from typing import Any
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from aiive.db.models import TurnEventInbox, TurnRecord
+from aiive.db.models import Event, OutboxJob, SelfDevRequest, TurnEventInbox, TurnRecord
+from aiive.db.forget_models import ContentProvenanceRef
+from aiive.forget.durable_sources import collect_sources, persist_sources, references_visible, sources_visible
+from aiive.task_runtime.read_repository import TaskReadRepository, inherit_sources
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +263,89 @@ def active_turn_for_thread(db: Session, thread_id: str) -> TurnRecord | None:
     ).order_by(TurnRecord.turn_sequence.desc()).first()
 
 
+def trigger_event_sources(
+    db: Session, event_id: str, event_type: str, payload: dict[str, Any] | None,
+) -> tuple[dict[str, Any], list[tuple[str, str]]] | None:
+    """Resolve existing trigger types without treating domain IDs as chat Event IDs."""
+    from aiive.forget.source_policy import SourceReferences, blocked_sources_reason
+    from aiive.task_runtime.goal_events import SUPPORTED_EVENT_TYPES
+
+    reader = TaskReadRepository(db)
+    parents: list[tuple[str, str]] = []
+    refs: set[tuple[str, str]] = set()
+    event = db.get(Event, event_id) if event_id else None
+    if not event_id:
+        # Timers have no Event body; explicit source fields in other bodies still matter.
+        try:
+            collect_sources(payload, refs)
+        except ValueError:
+            return None
+        if payload and not refs:
+            return None
+    elif event is not None:
+        refs.add(("event", event.id))
+    elif event_id.startswith("step-done:"):
+        step_event = reader.get_event(event_id.removeprefix("step-done:"))
+        if step_event is None:
+            return None
+        parents.append(("agent_task_event", step_event.id))
+    elif event_type in SUPPORTED_EVENT_TYPES:
+        data = payload or {}
+        if event_type in {"task_completed", "task_cancelled"}:
+            task_id = data.get("task_id")
+            task = reader.get_task(task_id) if isinstance(task_id, str) else None
+            if task is None:
+                return None
+            parents.extend([("agent_task", task.id), ("goal_plan", task.id)])
+            if task.source_turn_record_id:
+                refs.add(("turn_record", task.source_turn_record_id))
+        else:
+            # Keep the domain source-time guard used by existing event dispatch.
+            if event_type.startswith("knowledge_maintenance_"):
+                operation_id = data.get("operation_id")
+                origin = db.query(OutboxJob).filter(OutboxJob.job_type == "knowledge_maintenance",
+                    OutboxJob.operation_id.in_([operation_id, f"knowledge_maintenance:{operation_id}"])).first() if isinstance(operation_id, str) else None
+            else:
+                request_id = data.get("request_id")
+                origin = db.get(SelfDevRequest, request_id) if isinstance(request_id, str) else None
+            if origin is None or blocked_sources_reason(db, SourceReferences(source_times=[origin.created_at])):
+                return None
+            if isinstance(origin, SelfDevRequest) and origin.source_event_id:
+                refs.add(("event", origin.source_event_id))
+            if isinstance(origin, OutboxJob):
+                try:
+                    collect_sources(origin.payload, refs)
+                except ValueError:
+                    return None
+        try:
+            collect_sources(data, refs)
+        except ValueError:
+            return None
+    else:
+        return None
+    for kind, owner_id in parents:
+        refs.update((r.source_type, r.source_id) for r in db.query(ContentProvenanceRef).filter_by(
+            owner_type=kind, owner_id=owner_id).all())
+    grouped: dict[str, list[str]] = {}
+    for kind, token in refs:
+        grouped.setdefault(kind, []).append(token)
+    if not references_visible(db, grouped):
+        return None
+    keys = {"event": "source_event_ids", "turn_record": "source_turn_record_id", "memory_record": "memory_id"}
+    return {keys[kind]: ids for kind, ids in grouped.items()}, parents
+
+
+def _inbox_visible(db: Session, row: TurnEventInbox) -> bool:
+    if not sources_visible(db, "turn_event_inbox", row.id):
+        return False
+    data = row.payload or {}
+    task_id = data.get("task_id")
+    if task_id and (not isinstance(task_id, str) or TaskReadRepository(db).get_task(task_id) is None):
+        return False
+    return trigger_event_sources(db, str(data.get("trigger_event_id") or data.get("event_id") or ""),
+        str(data.get("event_type") or ""), data.get("event_payload")) is not None
+
+
 def enqueue_turn_event(
     db: Session,
     *,
@@ -278,6 +364,8 @@ def enqueue_turn_event(
     """
     if not thread_id or not dedupe_key:
         return None
+    from aiive.forget.concurrency import acquire_forget_shared_lock
+    acquire_forget_shared_lock(db)
     if only_if_active and active_turn_for_thread(db, thread_id) is None:
         return None
     existing = db.query(TurnEventInbox).filter(
@@ -327,6 +415,28 @@ def enqueue_turn_event(
     )
     db.add(row)
     db.flush()
+    data = dict(row.payload or {})
+    proof = trigger_event_sources(db, str(data.get("trigger_event_id") or data.get("event_id") or ""),
+        str(data.get("event_type") or ""), data.get("event_payload"))
+    task_id = data.get("task_id")
+    parents = list(proof[1]) if proof is not None else []
+    if isinstance(task_id, str) and task_id:
+        task = TaskReadRepository(db).get_task(task_id)
+        if task is None:
+            proof = None
+        else:
+            parents.extend([("agent_task", task_id), ("goal_plan", task_id)])
+            if task.source_turn_record_id:
+                persist_sources(db, "turn_event_inbox", row.id, {"source_turn_record_id": task.source_turn_record_id})
+    # The wrapper ID can identify a Task/domain event; only persist verified chat IDs.
+    for key in ("trigger_event_id", "event_id", "event_payload"):
+        data.pop(key, None)
+    persist_sources(db, "turn_event_inbox", row.id, data, proof[0] if proof else {})
+    inherit_sources(db, "turn_event_inbox", row.id, parents)
+    if proof is None:
+        db.add(ContentProvenanceRef(owner_type="turn_event_inbox", owner_id=row.id,
+            source_type="unresolved", source_id="trigger_source_unavailable"))
+    db.flush()
     return row
 
 
@@ -339,6 +449,8 @@ def claim_pending_events(
     limit: int = MAX_INJECT_PER_CALL,
 ) -> list[TurnEventInbox]:
     """按优先级领取待注入事件；领取后状态置 injected，重复调用不会重复注入。"""
+    from aiive.forget.concurrency import acquire_forget_shared_lock
+    acquire_forget_shared_lock(db)
     rows = db.query(TurnEventInbox).filter(
         TurnEventInbox.thread_id == thread_id,
         TurnEventInbox.status == STATUS_PENDING,
@@ -346,17 +458,26 @@ def claim_pending_events(
         TurnEventInbox.priority.desc(),
         TurnEventInbox.created_at.asc(),
         TurnEventInbox.id.asc(),
-    ).limit(max(1, limit)).with_for_update(skip_locked=True).all()
+    ).limit(max(MAX_PENDING_PER_THREAD, limit)).with_for_update(skip_locked=True).all()
     if not rows:
         return []
     moment = _now()
+    claimed: list[TurnEventInbox] = []
     for row in rows:
+        if not _inbox_visible(db, row):
+            row.status = STATUS_EXPIRED
+            row.decision = "source_blocked"
+            row.handled_at = moment
+            continue
+        if len(claimed) >= max(1, limit):
+            continue
         row.status = STATUS_INJECTED
         row.turn_record_id = turn_record_id
         row.turn_id = turn_id
         row.injected_at = moment
+        claimed.append(row)
     db.flush()
-    return rows
+    return claimed
 
 
 def inbox_state(db: Session, dedupe_key: str) -> str:
@@ -469,6 +590,9 @@ def _task_snapshot(db: Session, task_id: str) -> dict[str, Any]:
 
 def build_internal_context(db: Session, rows: list[TurnEventInbox]) -> str:
     """构造注入给现有 LLM 的内部系统上下文（不写入聊天时间线）。"""
+    rows = [row for row in rows if _inbox_visible(db, row)]
+    if not rows:
+        return ""
     lines = [
         INTERNAL_CONTEXT_HEADER,
         "以下事件在你的任务执行期间到达。当前工具调用批次已经完成，工具调用与结果均已配对。",
