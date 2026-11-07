@@ -25,14 +25,15 @@ Phase A 提交后 Shield 立即生效，但旧 Outbox Job 的 payload 仍在内�
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session
 
-from aiive.forget.visibility_service import ForgetVisibilityService
+from aiive.forget.source_policy import SourceReferences, blocked_sources_reason, blocked_reference_ids as _blocked_ids
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome, HandlerResult
+
+JobSources = SourceReferences
 
 logger = logging.getLogger(__name__)
 
@@ -40,32 +41,10 @@ logger = logging.getLogger(__name__)
 BLOCKED_REASON = "forget_source_blocked"
 
 
-@dataclass
-class JobSources:
-    """Job 的类型化来源引用。"""
-
-    events: dict[str, datetime | None] = field(default_factory=dict)
-    turns: dict[str, datetime | None] = field(default_factory=dict)
-    memories: dict[str, datetime | None] = field(default_factory=dict)
-    summaries: dict[str, datetime | None] = field(default_factory=dict)
-    checkpoints: dict[str, datetime | None] = field(default_factory=dict)
-    segments: dict[str, datetime | None] = field(default_factory=dict)
-    epochs: dict[str, datetime | None] = field(default_factory=dict)
-    thread_ids: set[str] = field(default_factory=set)
-    thread_times: dict[str, datetime | None] = field(default_factory=dict)
-    #: 非空表示来源无法可靠解析 → fail-closed。
-    source_times: list[datetime] = field(default_factory=list)
-    unresolved: str = ""
-
-    @property
-    def empty(self) -> bool:
-        return not any((self.events, self.turns, self.memories, self.summaries,
-                        self.checkpoints, self.segments, self.epochs,
-                        self.thread_ids, self.source_times))
 
 
 def _add(payload: Any, key: str, out: dict[str, datetime | None]) -> None:
-    from aiive.worker.outbox_payload_contract import parse_reference_ids
+    from aiive.forget.reference_ids import parse_reference_ids
 
     if not isinstance(payload, dict) or key not in payload:
         return
@@ -238,6 +217,18 @@ def _resolve_task(db: Session, claimed: ClaimedJob, sources: JobSources) -> None
     if task is None:
         sources.unresolved = "agent_task_missing"
         return
+    from aiive.task_runtime.read_repository import TaskReadRepository
+    if not TaskReadRepository(db).task_visible(task):
+        sources.unresolved = "task_content_source_blocked"
+        return
+    from aiive.db.forget_models import ContentProvenanceRef
+    for ref in db.query(ContentProvenanceRef).filter(ContentProvenanceRef.owner_id == task.id,
+            ContentProvenanceRef.owner_type.in_(["agent_task", "goal_plan"])).all():
+        bucket = {"event": sources.events, "turn_record": sources.turns, "memory_record": sources.memories}.get(ref.source_type)
+        if bucket is None:
+            sources.unresolved = "task_source_type_unknown"
+            return
+        bucket[ref.source_id] = None
     if task.thread_id:
         sources.thread_ids.add(task.thread_id)
         stamp = task.created_at
@@ -487,61 +478,13 @@ def resolve_job_sources(db: Session, claimed: ClaimedJob) -> JobSources:
         return JobSources(unresolved="source_resolution_failed")
 
 
-def _blocked_ids(
-    db: Session, target_type: str, ids: dict[str, datetime | None],
-) -> set[str]:
-    if not ids:
-        return set()
-    meta = ForgetVisibilityService.load_target_meta(db, target_type, list(ids))
-    missing = set(ids) - {row["id"] for row in meta if row["created_at"] is not None}
-    return missing | ForgetVisibilityService.blocked_target_ids(
-        db, target_type, list(ids.items()),
-    )
 
 
 def blocked_source_reason(
     db: Session, _claimed: ClaimedJob, sources: JobSources,
     job_created_at: datetime | None = None,
 ) -> str:
-    """返回屏蔽原因；空串表示来源可见。"""
-    if sources.unresolved:
-        return sources.unresolved
-    if sources.turns:
-        from sqlalchemy import or_
-        from aiive.db.models import Event, TurnRecord
-
-        turns = db.query(TurnRecord).filter(or_(
-            TurnRecord.id.in_(sources.turns), TurnRecord.turn_id.in_(sources.turns),
-        )).all()
-        tokens = set(sources.turns) | {turn.turn_id for turn in turns}
-        events: dict[str, datetime | None] = {row.id: row.created_at for row in db.query(Event).filter(Event.turn_id.in_(tokens)).all()}
-        if _blocked_ids(db, "event", events):
-            return "blocked:turn_source_event"
-    # 只使用 ForgetVisibilityService 支持元数据重载的目标类型；segment / epoch
-    # 的屏蔽通过其 Summary / Checkpoint 与 Thread 选择器传递，不在本层重复判定
-    # （未知 created_at 会被 all_user_data 分支 fail-closed 过度拦截）。
-    groups = (
-        ("event", sources.events),
-        ("turn_record", sources.turns),
-        ("memory_record", sources.memories),
-        ("segment_summary", sources.summaries),
-        ("epoch_checkpoint", sources.checkpoints),
-    )
-    for target_type, ids in groups:
-        if _blocked_ids(db, target_type, ids):
-            return f"blocked:{target_type}"
-    for stamp in sources.source_times:
-        if ForgetVisibilityService.is_shielded(db, target_time=stamp):
-            return "blocked:source_time"
-    for thread_id in sorted(sources.thread_ids):
-        source_time = sources.thread_times.get(thread_id, job_created_at)
-        if source_time is None:
-            return "source_time_missing"
-        if ForgetVisibilityService.is_shielded(
-            db, thread_id=thread_id, target_time=source_time,
-        ):
-            return "blocked:thread"
-    return ""
+    return blocked_sources_reason(db, sources, job_created_at)
 
 
 def guard_job_sources_visible(

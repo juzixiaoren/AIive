@@ -37,7 +37,6 @@ from aiive.db.models import (
     Event,
     LLMCall,
     MemoryRecord,
-    TaskEvidence,
     TurnRecord,
 )
 from aiive.task_runtime.goal_plan import (
@@ -140,7 +139,8 @@ class GoalDecisionEngine:
         self._source_task_id = task.id
         self._evidence_ids = []
         self._source_ids = {}
-        if not task_sources_visible(self.db, task.id):
+        from aiive.task_runtime.read_repository import TaskReadRepository
+        if not task_sources_visible(self.db, task.id) or not TaskReadRepository(self.db).task_visible(task):
             return {"source_blocked": True}
         from aiive.forget.durable_sources import collect_sources
         from aiive.worker.job_source_guard import resolve_job_sources, blocked_source_reason
@@ -223,11 +223,8 @@ class GoalDecisionEngine:
         }
 
     def _evidence(self, task_id: str) -> list[dict[str, Any]]:
-        rows = self.db.query(TaskEvidence).filter(
-            TaskEvidence.task_id == task_id,
-        ).order_by(TaskEvidence.created_at.desc()).limit(8).all()
-        from aiive.forget.durable_sources import sources_visible
-        rows = [r for r in rows if sources_visible(self.db, "task_evidence", r.id)]
+        from aiive.task_runtime.read_repository import TaskReadRepository
+        rows = list(reversed(TaskReadRepository(self.db).evidence(task_id)[-8:]))
         self._evidence_ids = [r.id for r in rows]
         return [
             {"id": row.id, "kind": row.kind, "summary": _bounded(row.summary or "", 400)}
@@ -318,16 +315,28 @@ class GoalDecisionEngine:
             or not references_visible(self.db, self._source_ids)
         ):
             return GoalDecision(action="no_action", reason="forget_source_blocked"), {"model": "", "latency_ms": 0, "raw": "", "usage": {}}
+        self.db.commit()  # No database transaction spans the model request.
         response = self.llm.chat(
             messages, temperature=0.1, trace_id=trace_id, json_mode=True,
         )
+        source_changed = self._source_revision is not None and forget_revision(self.db) != self._source_revision
+        self.db.commit()
+        if source_changed:
+            return GoalDecision(action="no_action", reason="forget_source_blocked"), {}
         decision = self.parse(response.content)
         return decision, {
+            "source_references": self.source_payload(),
+            "source_evidence_ids": list(self._evidence_ids),
             "model": response.model,
             "latency_ms": response.latency_ms,
             "raw": response.content,
             "usage": response.usage,
         }
+
+    def source_payload(self) -> dict[str, Any]:
+        return {"source_event_ids": list(set(self._source_ids.get("event", [])) | set(self._trigger_sources.events)),
+                "memory_ids": list(set(self._source_ids.get("memory_record", [])) | set(self._trigger_sources.memories)),
+                "source_turn_record_id": list(set(self._source_ids.get("turn_record", [])) | set(self._trigger_sources.turns))}
 
     @staticmethod
     def parse(raw: str) -> GoalDecision:
@@ -396,6 +405,13 @@ class GoalDecisionEngine:
         task = self.repo.get_task(task_id, for_update=True)
         if task is None:
             return {"status": "rejected", "reason": "task_not_found"}
+        from aiive.task_runtime.read_repository import TaskReadRepository, inherit_sources
+        if decision_id:
+            source_event = TaskReadRepository(self.db).event_by_dedupe(task.id, _decision_event_key(decision_id))
+            if source_event is None:
+                return {"status": "rejected", "reason": "decision_source_unavailable"}
+            inherit_sources(self.db, "goal_plan", task.id, [("agent_task_event", source_event.id)])
+            self.db.flush()
         plan = self.goals.load_plan(task)
         if plan is None:
             return {"status": "rejected", "reason": "goal_not_found"}
@@ -421,7 +437,10 @@ class GoalDecisionEngine:
                     task.id, decision.step_id or step.id, decision.reason or "等待你的输入",
                 )
             elif decision.action == "modify_plan":
-                self.goals.modify(task.id, dict(decision.plan_changes or {}))
+                from aiive.task_runtime.read_repository import inherit_sources
+                inherit_sources(self.db, "goal_plan", task.id, [("task_evidence", i) for i in self._evidence_ids])
+                self.goals.modify(task.id, dict(decision.plan_changes or {}), source_kind="model",
+                                  source_payload=self.source_payload())
             elif decision.action == "complete_goal":
                 self.goals.complete_goal(task.id)
             elif decision.action == "ask_user":
@@ -603,10 +622,9 @@ def load_persisted_decision(
     if not task_id or not step_id or not trigger_key:
         return None
     decision_id = decision_id_for(task_id, step_id, trigger_key)
-    recorded = db.query(AgentTaskEvent).filter(
-        AgentTaskEvent.task_id == task_id,
-        AgentTaskEvent.dedupe_key == _decision_event_key(decision_id),
-    ).one_or_none()
+    from aiive.task_runtime.read_repository import TaskReadRepository
+    reader = TaskReadRepository(db)
+    recorded = reader.event_by_dedupe(task_id, _decision_event_key(decision_id))
     if recorded is None:
         return None
     payload = dict(recorded.payload or {})
@@ -618,10 +636,7 @@ def load_persisted_decision(
             task_id, decision_id,
         )
         return None
-    applied_row = db.query(AgentTaskEvent).filter(
-        AgentTaskEvent.task_id == task_id,
-        AgentTaskEvent.dedupe_key == _applied_event_key(decision_id),
-    ).one_or_none()
+    applied_row = reader.event_by_dedupe(task_id, _applied_event_key(decision_id))
     return PersistedDecision(
         decision_id=decision_id,
         decision=decision,
@@ -642,7 +657,7 @@ def persist_decision(
 ) -> str:
     """在短事务中保存结构化决策（幂等）；调用方负责 commit。"""
     decision_id = decision_id_for(task_id, step_id, trigger_key)
-    TaskRepository(db).append_event(
+    event = TaskRepository(db).append_event(
         task_id,
         DECISION_RECORDED_EVENT,
         {
@@ -655,6 +670,13 @@ def persist_decision(
         visibility="internal",
         dedupe_key=_decision_event_key(decision_id),
     )
+    from aiive.forget.durable_sources import persist_sources
+    from aiive.task_runtime.read_repository import inherit_sources
+    source_meta = meta or {}
+    persist_sources(db, "agent_task_event", event.id, source_meta.get("source_references") or {})
+    evidence_ids = source_meta.get("source_evidence_ids") or []
+    inherit_sources(db, "agent_task_event", event.id, [("task_evidence", item) for item in evidence_ids if isinstance(item, str)])
+    db.flush()
     return decision_id
 
 
@@ -675,7 +697,7 @@ def decisions_today(db: Session, task_id: str, *, now: datetime | None = None) -
     """24 小时内该目标的决策次数；用于硬上限，避免触发风暴。"""
     moment = now or utcnow()
     since = moment - timedelta(days=1)
-    return int(db.query(AgentTaskEvent).filter(
+    return int(db.query(AgentTaskEvent.id).filter(
         AgentTaskEvent.task_id == task_id,
         AgentTaskEvent.event_type == "goal_decision",
         AgentTaskEvent.created_at >= since,

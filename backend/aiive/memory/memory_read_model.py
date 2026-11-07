@@ -11,7 +11,7 @@ Policy (exact keys) only.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections.abc import Sequence
 from typing import Any
 
@@ -33,21 +33,24 @@ class RuntimeIdentity:
     user_name: str = ""
     relationship_style: str = ""
     response_style: str = ""
+    persona_tone: str = ""
+
+    source_memory_ids: dict[str, str] = field(default_factory=dict)
+
+    def to_slots(self) -> dict[str, dict[str, str | None]]:
+        slots = {"agent.display_name": "agent_display_name", "user.display_name": "user_display_name",
+                 "user.name": "user_name", "agent.persona.relationship": "relationship_style",
+                 "agent.persona.tone": "persona_tone"}
+        return {key: {"state": "set" if getattr(self, attr) else "unset",
+                      "value": getattr(self, attr) or None,
+                      "source_memory_id": self.source_memory_ids.get(attr)} for key, attr in slots.items()}
 
     def to_dict(self) -> dict[str, str]:
-        result: dict[str, str] = {}
-        if self.agent_display_name:
-            result["agent_display_name"] = self.agent_display_name
+        """Stable prompt values. UNSET is presentation only, never persisted as a fact."""
+        result = {attr: getattr(self, attr) or "[暂未设置]" for attr in (
+            "agent_display_name", "user_display_name", "user_name", "relationship_style", "response_style")}
         if self.agent_runtime_id:
             result["agent_runtime_id"] = self.agent_runtime_id
-        if self.user_display_name:
-            result["user_display_name"] = self.user_display_name
-        if self.user_name:
-            result["user_name"] = self.user_name
-        if self.relationship_style:
-            result["relationship_style"] = self.relationship_style
-        if self.response_style:
-            result["response_style"] = self.response_style
         return result
 
 
@@ -90,6 +93,18 @@ class MemoryReadModel:
             if content is None:
                 continue
             seen.add(rec.canonical_key)
+            fields = {"agent.display_name": "agent_display_name", "user.display_name": "user_display_name",
+                      "user.name": "user_name", "agent.persona.relationship": "relationship_style",
+                      "agent.persona.tone": "response_style", "user.preference.response_style": "response_style"}
+            attribute = fields.get(rec.canonical_key)
+            if attribute is None:
+                continue
+            if rec.canonical_key == "agent.persona.tone":
+                identity.persona_tone = content
+                identity.source_memory_ids["persona_tone"] = rec.id
+                if "user.preference.response_style" in seen:
+                    continue
+            identity.source_memory_ids[attribute] = rec.id
             if rec.canonical_key == "agent.display_name":
                 identity.agent_display_name = content
             elif rec.canonical_key == "user.display_name":
@@ -104,8 +119,6 @@ class MemoryReadModel:
             elif rec.canonical_key == "user.preference.response_style":
                 identity.response_style = content
 
-        if not identity.user_display_name:
-            identity.user_display_name = identity.user_name
         return identity
 
     # ------------------------------------------------------------------

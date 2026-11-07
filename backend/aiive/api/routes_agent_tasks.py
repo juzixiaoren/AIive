@@ -13,9 +13,10 @@ from sqlalchemy.orm import Session
 
 from aiive.auth.guard import authenticate_websocket
 from aiive.db.base import SessionLocal, get_db
-from aiive.db.models import AgentTask, AgentTaskEvent, TaskArtifact, TaskEvidence
+from aiive.db.models import AgentTaskEvent
 from aiive.task_runtime.evidence import EvidenceStore, artifact_bytes
 from aiive.task_runtime.repository import TaskRepository
+from aiive.task_runtime.read_repository import TaskReadRepository, TaskContentUnavailable
 from aiive.task_runtime.router import normalize_task_brief
 from aiive.task_runtime.schemas import TaskBudget, TaskBrief
 
@@ -74,12 +75,7 @@ def list_agent_tasks(
     limit: int = Query(default=100, ge=1, le=500),
     db: Session = Depends(get_db),
 ) -> list[dict[str, Any]]:
-    query = db.query(AgentTask)
-    if thread_id:
-        query = query.filter(AgentTask.thread_id == thread_id)
-    if status:
-        query = query.filter(AgentTask.status == status)
-    tasks = query.order_by(AgentTask.updated_at.desc()).limit(limit).all()
+    tasks = TaskReadRepository(db).tasks(thread_id=thread_id, status=status, limit=limit)
     repo = TaskRepository(db)
     return [repo.summary(task) for task in tasks]
 
@@ -101,10 +97,7 @@ def get_agent_task_events(
 ) -> list[dict[str, Any]]:
     if TaskRepository(db).get_task(task_id) is None:
         raise HTTPException(status_code=404, detail="任务不存在")
-    events = db.query(AgentTaskEvent).filter(
-        AgentTaskEvent.task_id == task_id,
-        AgentTaskEvent.sequence > after_sequence,
-    ).order_by(AgentTaskEvent.sequence.asc()).limit(limit).all()
+    events = TaskReadRepository(db).events(task_id, after_sequence, limit)
     return [
         {
             "id": item.id, "sequence": item.sequence, "event_type": item.event_type,
@@ -264,10 +257,13 @@ def read_task_evidence(
     max_bytes: int = Query(default=65536, ge=1, le=1_048_576),
     db: Session = Depends(get_db),
 ) -> Response:
-    evidence = db.get(TaskEvidence, evidence_id)
+    evidence = TaskReadRepository(db).get_evidence(task_id, evidence_id)
     if evidence is None or evidence.task_id != task_id:
         raise HTTPException(status_code=404, detail="Evidence 不存在")
-    data, truncated = EvidenceStore.read(db, evidence, offset, max_bytes)
+    try:
+        data, truncated = EvidenceStore.read(db, evidence, offset, max_bytes)
+    except TaskContentUnavailable as error:
+        raise HTTPException(status_code=404, detail="Evidence 不存在") from error
     return Response(
         content=data,
         media_type=evidence.mime_type,
@@ -287,10 +283,13 @@ def read_task_artifact(
     max_bytes: int = Query(default=1_048_576, ge=1, le=1_048_576),
     db: Session = Depends(get_db),
 ) -> Response:
-    artifact = db.get(TaskArtifact, artifact_id)
+    artifact = TaskReadRepository(db).get_artifact(task_id, artifact_id)
     if artifact is None or artifact.task_id != task_id:
         raise HTTPException(status_code=404, detail="Artifact 不存在")
-    data, truncated = artifact_bytes(artifact, offset, max_bytes)
+    try:
+        data, truncated = artifact_bytes(db, artifact, offset, max_bytes)
+    except TaskContentUnavailable as error:
+        raise HTTPException(status_code=404, detail="Artifact 不存在") from error
     # Header 只使用 ASCII fallback + RFC 5987 编码，拒绝文件名中的路径和换行语义。
     raw_name = PurePath(artifact.name.replace("\\", "/")).name
     safe_name = "".join(char if char.isascii() and (char.isalnum() or char in "._-") else "_" for char in raw_name)
@@ -330,7 +329,7 @@ async def agent_task_event_socket(websocket: WebSocket, task_id: str) -> None:
         while True:
             db = SessionLocal()
             try:
-                if db.get(AgentTask, task_id) is None:
+                if TaskReadRepository(db).get_task(task_id) is None:
                     await websocket.close(code=1008, reason="task not found")
                     return
                 if cursor is None:
@@ -338,10 +337,7 @@ async def agent_task_event_socket(websocket: WebSocket, task_id: str) -> None:
                         AgentTaskEvent.task_id == task_id,
                     ).order_by(AgentTaskEvent.sequence.desc()).first()
                     cursor = int(latest[0]) if latest else 0
-                events = db.query(AgentTaskEvent).filter(
-                    AgentTaskEvent.task_id == task_id,
-                    AgentTaskEvent.sequence > cursor,
-                ).order_by(AgentTaskEvent.sequence.asc()).limit(200).all()
+                events = TaskReadRepository(db).events(task_id, cursor, 200)
                 for item in events:
                     cursor = int(item.sequence)
                     await websocket.send_text(json.dumps({

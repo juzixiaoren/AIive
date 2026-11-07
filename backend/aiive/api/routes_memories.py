@@ -164,18 +164,9 @@ def get_memory_relations(memory_id: str, db: Session = Depends(get_db)):
         for r in relations
         if r.status == "active" and is_single_valued(r.predicate)
     }
-    peers = (
-        db.query(GraphRelation)
-        .filter(
-            GraphRelation.status == "active",
-            GraphRelation.subject_entity_id.in_(single_subjects),
-        )
-        .limit(1000)
-        .all()
-    ) if single_subjects else []
-    peer_allowed = set(ForgetVisibilityService.filter_memory_ids(db, [r.source_memory_id for r in peers]))
-    peers = [r for r in peers if r.source_memory_id in peer_allowed
-             and r.scope_type == record.scope_type and r.scope_id == record.scope_id]
+    from aiive.memory.graph_read_repository import GraphReadRepository
+    peers = GraphReadRepository(db).current_peers(single_subjects, [(record.scope_type, record.scope_id)],
+                                                 channel=MemoryReadChannel.API)
     conflict_keys = conflicted_group_keys([
         (
             r.subject_entity_id, r.predicate, r.object_entity_id,

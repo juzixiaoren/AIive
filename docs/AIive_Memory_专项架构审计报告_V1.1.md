@@ -49,7 +49,7 @@ AIive 的 Memory 已经不是简单的 Key-Value
 -   `MemoryRecord` 的 Lifecycle、Validity、Forget Visibility、Lineage
     是不同维度，但部分调用方只检查其中一部分。
 -   Graph 历史关系和 Sealing Bridge 等路径仍有绕过统一可见性判断的可能。
--   身份读取须过滤来源并稳定选择合法值；显式 Identity Slot 与占位符属于暂缓的产品设计。
+-   身份读取须过滤来源并按 Scope 优先级稳定选值；Identity 必须提供 SET/UNSET，未设置时 Prompt 显示 `[暂未设置]`，禁止从其他 Key 推断恢复。
 -   Merge、Revise、Supersede 在不同执行入口中的语义并不完全一致。
 
 ### 0.1.1 本轮修订结论（优先阅读）
@@ -58,7 +58,7 @@ AIive 的 Memory 已经不是简单的 Key-Value
 
 原第 22～24 章已经重写：14 项 D 计划逐项给出保留、收缩、合并或暂缓结论，并归并为 8 个可验收工作包。D01/D11 不再作为大规模重构的 P0 前置；D10 暂缓；D07 收缩为来源字段修复与 Turn-only 明确策略；D12/D13/D14 在现有实现上增量补缺。
 
-第 1～21 章中的设计示意不等于现状缺陷或已批准需求。特别是 Identity Slot、统一 Source 类型扩展和通用 AccessContext，均为可选设计；下文与新计划有冲突时，以本节和第 22～24 章为准。
+第 1～21 章中的设计示意不等于现状缺陷或已批准需求。其中 Identity SET/UNSET 与占位符为本次明确需求；数据库 Slot 表、统一 Source 类型扩展和通用 AccessContext 仍为可选设计；下文与新计划有冲突时，以本节和第 22～24 章为准。
 
 ### 0.2 最重要的审计判断
 
@@ -145,7 +145,7 @@ M1 可能仍然进入 ConflictResolver
 
   Forget             已实现复杂机制     不是所有消费者都强制使用
 
-  Identity Slot      可选模型暂缓       现有空值契约可继续使用
+  Identity Slot      必须落实           逻辑 SET/UNSET 与展示占位，无需新增表
   --------------------------------------------------------------------------------
 
 ------------------------------------------------------------------------
@@ -2149,9 +2149,9 @@ operation = create
 
 ------------------------------------------------------------------------
 
-# 16. Identity Slot：身份记忆可选设计（暂缓实施）
+# 16. Identity Slot：逻辑 SET/UNSET 与展示契约
 
-> **复核修正：** 本章是产品可选方案，不是 Forget 正确性的前提。`RuntimeIdentity` 已以空字符串/省略字段表达无值。只要所有候选均通过可见性检查，独立合法的 `user.name` 回退不构成泄漏。暂不要求数据库 Slot、Registry 全量 semantic_role 或强制 Prompt 占位符；若将来实施，结构化返回 `value=null`，`[暂未设置]` 仅由展示层生成。重新设置仅在没有可见合法旧目标时创建新记录。
+> **二次复核修正：** 上一轮把明确需求降为可选不正确。每个身份 Key 独立解析为 `state=set/unset`、`value` 与来源 Memory ID；UNSET 的 Prompt 显示 `[暂未设置]`，禁止从 `user.name`、历史或模型推断恢复 `user.display_name`。不要求新增数据库 Slot 表或全量 semantic_role；占位符只在展示层生成，绝不写进 MemoryRecord/Vector。无可见合法旧目标时重新设置使用新记录。
 
 ## 16.1 为什么身份记忆需要特殊语义？
 
@@ -2196,7 +2196,7 @@ UNSET
 [暂未设置]
 ```
 
-若未来采用 Slot，Read Model 用 `state=unset,value=null` 表达，`[暂未设置]` 仅由展示层生成，不是 MemoryRecord 内容。
+Read Model 用 `state=unset,value=null` 表达，`[暂未设置]` 仅由展示层生成，不是 MemoryRecord 内容。
 
 不能把它写成：
 
@@ -2272,7 +2272,7 @@ MemoryRecord.content = "[暂未设置]"
   Graph              当前关系过滤                   历史关系也完整过滤           高
   Retrieval          多路融合过滤                   全部消费者统一过滤           中
   Forget             Shield / Tombstone / Cascade   所有消费者强制遵守           高
-  Identity Slot      依赖 Key 和 ReadModel          可选 SET / UNSET             暂缓
+  Identity Slot      依赖 Key 和 ReadModel          SET / UNSET                  必须落实
 
 ------------------------------------------------------------------------
 
@@ -2436,7 +2436,7 @@ MemoryRecord.content = "[暂未设置]"
 -   Provenance 为空且不是明确人工创建。
 -   Provenance 中存在未知 source_type。
 
-## 19.4 Identity Slot 可选测试（暂不作为交付门槛）
+## 19.4 Identity Slot 验收测试
 
 ``` text
 初始：
@@ -2537,7 +2537,7 @@ MemoryOperation
 
 这样可以避免不同入口各自实现相似但不一致的逻辑。
 
-## 20.4 Identity Slot Contract（可选、暂缓）
+## 20.4 Identity Slot Contract（必须落实）
 
 身份槽应该是 Memory 的特殊消费者，不是另一套独立事实数据库。
 
@@ -2716,7 +2716,7 @@ P0 表示直接影响遗忘承诺、应优先修复的缺陷；P1 表示确定�
 | D07 Event / Turn | 拆分：字段修复 P1；纯 Turn 支持暂缓 | P1-A | DB 已有两种 Turn 字段，无需为字段补迁移；纯 Turn 缺 Event 时通常被 fail-closed 隐藏，并非已证实的读取放行 |
 | D08 三种关系职责 | 值得做，合并到实际操作修复 | P0-B / P1-A | 增加操作规则和测试即可；不另建关系框架，不因区分职责而删除现有来源边 |
 | D09 操作独立性 | 保留 P0，与 D03 合并 | P0-B | Forced target、直接 Wake/Promote 和 Resolver Promote 都要校验；Merge 不可选择性丢弃来源后继续使用旧合成内容 |
-| D10 Identity Slot | 暂缓，取消强制实现 | 可选需求 | 无值已有表示；无证据证明必须增加 SET/UNSET 模型、semantic_role 或稳定 Prompt 占位符 |
+| D10 Identity Slot | 恢复明确需求 | P1-B | 逻辑 SET/UNSET、独立 Key、Prompt `[暂未设置]`；数据库 Slot 表及全量 semantic_role 不作为前置 |
 | D11 访问决策 | 收缩为状态矩阵与已有策略组合，P1 | P1-B | `MemoryPolicyEngine` 已集中处理敏感度；Scope 已有解析器，不能新造另一份权限规则 |
 | D12 投影统一 | 保留增量 P1，取消重写已有保护 | P1-C | Core build/load、Graph refresh、召回回源、Worker Guard 已有实现；重点补 repair 入口及状态/敏感度新鲜性 |
 | D13 防旁路测试 | 保留，但缩窄静态检查，P1；各漏洞回归随 P0 交付 | P1-B | 仅扫描 `db.query(MemoryRecord)` 会漏 `get`、`select`、别名、快照和原生 SQL；全库 ORM 禁令成本高且误报多 |
@@ -2732,7 +2732,7 @@ P0 表示直接影响遗忘承诺、应优先修复的缺陷；P1 表示确定�
 | Merge 只继承可见 Evidence / Provenance 即可 | 若正文已依赖不可见输入，删边会洗掉来源。应整次拒绝/过期；另起新提案从合法输入重新生成内容 | `_execute_merge():1110` 保留所有参与者 Event 来源是正确机制；`tests/integration/backend/test_forget_v6261.py:431` 验证后续任一来源屏蔽即不可见 |
 | Supersede/Revise 都必须无条件“来源独立” | 应区分新事实替换与依赖旧内容的改写。完全独立的新陈述可只用 E2；改写若使用旧文本/结构值，须保留实际依赖。Lineage 不自动等于来源边 | `memory_write_service.py:1013`、`:1102`；维护 clone 的来源已有专门实现与测试 `test_forget_v6261.py:408` |
 | Forget 后重新设置一律强制 Create | 仅当没有可见合法候选且 Gate 接受时成立。合法独立的同 Key 记录可正常参与；显式失效 target 应报冲突，不暗中换目标 | `_load_existing_or_wake_sleeping():237`、`_execute_forced_decision():858` |
-| `user.name` fallback 会恢复已遗忘称呼，所以必须删除 | 只能说未过滤的 fallback 可能泄漏；若该 name 是独立合法来源，允许回退属于产品语义。应先过滤，再显式定义优先级 | `memory_read_model.py:96` 附近；`memory_store.py:230` 返回更新时间倒序，但循环仍覆盖字段，存在确定性问题 |
+| `user.name` fallback 会恢复已遗忘称呼，所以必须删除 | 独立合法 name 仍可作为 user.name 展示，但不能代填已经 UNSET 的 user.display_name；上一轮以“独立来源”为由保留跨 Key fallback，违反明确需求 | `memory_read_model.py:96` 附近；`memory_store.py:230` 返回更新时间倒序，但循环仍覆盖字段，存在确定性问题 |
 | Graph 历史和当前关系应使用完全相同状态规则 | 共享 Forget、Scope、敏感度检查，状态矩阵必须不同：历史可以展示 superseded 的合法旧事实，标为非当前 | `graph_expansion.py:245` 与 `:378`；后者仅排除 forgotten，缺少其余检查 |
 | 缺少统一访问决策，需新建一套敏感度/Scope 权限引擎 | 集成已有策略即可；新接口可以组合规则，不复制规则。Forget 拒绝应先于正文脱敏，不能用占位符掩盖其余字段泄漏 | `memory_policy.py:104`、`:125`；`memory/scope_resolver.py` |
 | 未来所有旁路都能由 ORM AST 白名单发现 | 这是无法保证的验收目标。静态扫描只是补充，必须靠真实 API、Tool、Prompt 和操作结果测试 | 旁路不仅是 ORM 查询，还包括 Conflict Snapshot、GraphEntity aliases、TaskEvidence summary 和幂等 Proposal 副本 |
@@ -2846,7 +2846,7 @@ P0 表示直接影响遗忘承诺、应优先修复的缺陷；P1 表示确定�
 
 1. 从 P0 已修调用点提取少量安全方法，优先扩展现有 Store/服务；新增方法必须有实际消费者。批量授权、Scope、状态筛选与敏感度渲染可组合，但仍分别维护于已有模块。
 2. 固化用途矩阵：Runtime/Recall 通常 active+valid；历史允许合法 superseded；候选允许有效 active/candidate；wake 只允许有效 sleeping；维护动作按前置条件；Cascade 可读原始数据。所有普通用途均不能绕过 Forget。
-3. Identity 按每 Key 选择最新合法值，增加稳定 tie-break（例如 updated_at、id）；明确 user display_name 对 name 的优先级，以及 response_style 的用户偏好/agent tone 优先级。保留回退兼容，除非产品明确更改。空值继续沿现有契约，不引入强制占位文本。
+3. Identity 先按 thread > project > workspace > capability > environment > global，再按 updated_at、id 选择每 Key 的最新合法值。提供逻辑 Slot SET/UNSET 和 source_memory_id；禁止 user.name 回填 user.display_name；用户响应偏好可覆盖有效响应风格，但 agent.persona.tone 自身 Slot 仍独立。UNSET 渲染 `[暂未设置]` 和禁止推断恢复的提示，不持久化占位符。
 4. 盘点 API/Tool/Runtime/Goal 的受保护入口，建立检查清单：对象、来源、Scope、状态、敏感度、快照、测试名。内部原始访问注明理由，不能由调用者任意选择审计权限。
 5. CI 先约束已迁移的目录/模块：禁止新增直读受保护内容的已知模式；覆盖 query/get/select 与别名的常见写法，异常名单精确到用途。另加一条真实新增旁路的扫描器自测。不要宣称扫描可证明所有数据流安全。
 6. P0 的真实 ORM/API/Prompt 回归是必需防线；AST、import 边界和扫描报告是补充。扫描只报存量清单的变化，避免一次性把整库内部维护代码禁掉。
@@ -2875,7 +2875,7 @@ P0 表示直接影响遗忘承诺、应优先修复的缺陷；P1 表示确定�
 3. 涉及存量回填时先 dry-run 并备份，按可验证来源幂等补齐。无法证明的数据保持关闭/隔离，禁止猜测来源或清空 ref 后放行。
 4. 更新每个入口及计划状态，记录修改文件、迁移、实际命令、测试结果和剩余限制。普通诊断不保存被遗忘正文，生产日志只记录拒绝原因和对象 ID。
 
-交付完成条件：所有 P0 均有失败于修复前、通过于修复后的真实入口回归；独立来源、合法历史、manual creation、memory_only 例外和无副作用断言通过。P1 的完成状态按实际证据单独维护，不要求为结束 P0 而实施可选 Identity Slot。
+交付完成条件：所有 P0 均有失败于修复前、通过于修复后的真实入口回归；独立来源、合法历史、manual creation、memory_only 例外和无副作用断言通过。P1 的完成状态按实际证据单独维护，Identity 的逻辑 SET/UNSET 与占位符须单独验收，不得未经确认降级为可选。
 
 ------------------------------------------------------------------------
 
@@ -2913,14 +2913,16 @@ P0 表示直接影响遗忘承诺、应优先修复的缺陷；P1 表示确定�
 
 ## 24.3 暂不投入的工作
 
-不安排完整 Identity Slot 状态机、所有 Registry Key 的 semantic_role 分类、外部文档来源体系、全库 ORM 一刀切白名单、第二套敏感度/Scope 引擎，也不将统一 Repository 全迁移作为修漏洞的前置条件。它们尚无与当前成本相称的需求或安全收益证据；将来若有明确消费者和验收目标，再单独立项。
+不安排独立数据库 Identity Slot 状态机、所有 Registry Key 的 semantic_role 分类、外部文档来源体系、全库 ORM 一刀切白名单、第二套敏感度/Scope 引擎，也不将统一 Repository 全迁移作为修漏洞的前置条件。它们尚无与当前成本相称的需求或安全收益证据；将来若有明确消费者和验收目标，再单独立项。
 
 保留现有 Lineage 历史不等于允许读取遗忘正文；新增事实也不因存在同 Key 历史就必须绑定旧谱系。安全修复优先保证“不可用的来源不再被消费”，而非用大量新抽象取代已经有效的机制。
 
 原审计轮交付为文档复核。用户随后授权按优先级实施修复，实施记录与验证状态如下；不再将下述已修改代码描述为“未实施”。
 
 
-## 24.4 修复实施记录（2026-11-07）
+## 24.4 首轮修复历史记录（2026-11-07）
+
+本节是首轮实现范围，表中“相关回归通过”不代表二次审查发现的旁路已关闭。当前实现与验证以 24.6 为准。
 
 按用户要求，先集中完成代码改动再统一测试，未逐功能运行全量套件。没有修改数据库 Schema，新增来源记录复用 ContentProvenanceRef；没有自动回填无法证明的旧来源或清理生产数据。
 
@@ -2945,7 +2947,7 @@ P0 表示直接影响遗忘承诺、应优先修复的缺陷；P1 表示确定�
 
 首轮全量离线测试：1661 passed、63 failed、123 skipped，319.45 秒；失败包含两个实现问题、旧测试缺少真实 Event/Provenance，以及本机默认 Bash 解析到无可用 Linux 的 WSL 入口。修复实现问题、完善真实来源 fixture，并在测试进程中指定已安装的 `E:/git/Git/bin/bash.exe` 后集中复验：123 passed、1 failed，33.50 秒。剩余失败揭示隐藏旧结果的请求幂等缺口，随后已在 single/batch 写入事务中补齐，最终全量曾得到 1731 passed、1 failed、119 skipped（300.99 秒）；该领域事件误判已修复，后续相关用例复验通过，完整收口结果见下段。
 
-PostgreSQL：本机有 Docker CLI，但原先引擎未运行。尝试隐藏启动 Docker Desktop 后，Docker info 在 10 秒内仍未响应。不得将默认跳过的 PG 用例记为通过；PG 专项及真实存量审计尚无运行证据。只读审计入口为 `aiive.memory.integrity_audit.audit_memory_integrity(session)`，本轮不连接生产库执行。
+PostgreSQL：本机有 Docker CLI，但原先引擎未运行。尝试隐藏启动 Docker Desktop 后，Docker info 在 10 秒内仍未响应。不得将默认跳过的 PG 用例记为通过；首轮交付时 PG 专项及真实存量审计尚无本地运行证据；后续远程 PG 证据见 24.5，真实存量审计仍未执行。只读审计入口为 `aiive.memory.integrity_audit.audit_memory_integrity(session)`，本轮不连接生产库执行。
 
 
 ### 24.4.1 最终离线收口结果
@@ -2970,7 +2972,7 @@ $env:PATH = 'E:\git\Git\bin;' + $env:PATH
 
 测试详细输出保留在本地忽略目录 `.pytest_cache/memory_audit_20261107_implementation/`；核心结果与限制已写入本文，不依赖缓存文件作为唯一证据。
 
-**代码实现与离线相关回归已完成。PostgreSQL 并发专项仍未运行，不能标记为完整并发验收通过；真实存量数据审计/回填未执行。** Schema 迁移：无。Git 提交：未创建。
+**上述为首轮提交时的历史记录，不能作为全部闭环验收结论；Task/Artifact/Goal Plan 等遗留问题见 24.6。** Schema 迁移：无。首轮实现提交 `fcd8948995f907e79dfa3c13d1fa6f5003c71ece`；静态检查修复提交 `bb35842`。PG 已取得远程 80 passed/39 skipped 的历史证据，见 24.5；真实存量数据审计/回填未执行。
 
 
 ## 24.5 推送后 CI 修复记录（2026-11-07）
@@ -2986,3 +2988,42 @@ CI Run：[42351233448](https://github.com/juzixiaoren/AIive/actions/runs/4235123
 - Memory ReadModel、Graph、Goal 事件/决策序列化、Memory 审计回归、生命周期与访问边界：112 passed，29.21 秒。未重新运行耗时全量；最后补充类型注解后另做运行时导入检查。
 
 远程 PostgreSQL 证据补充：上述提交的 [PG 契约 Job](https://github.com/juzixiaoren/AIive/actions/runs/42351233448/job/128339613249) 为 **80 passed、39 skipped，41.03 秒**。这补充了前文“本地 PG 未运行”的限制，但不能将 39 项跳过记成通过，也不等于本次修复提交的新 CI 已运行。
+
+
+## 24.6 二次审查修复（2026-11-07）
+
+附件审查指出的 Task Evidence/Artifact 原文、评测内联分支、Task 派生副本、独立 Goal 修改来源、Scope 排序和 Core 投影版本问题均已由源码确认。Graph 冲突 peer 原本只验证关系状态，不能证明来源可见。Identity 明确需求曾被错误降级，已恢复第 16/19/20 章及执行计划。附件针对 fcd8948 的 Ruff/Basedpyright 失败属历史事实，bb35842 已修复，不能继续描述为当前未处理问题。
+
+### 24.6.1 执行范围与领域边界
+
+| 优先级 | 修复与实际入口 | 来源与失效策略 |
+| --- | --- | --- |
+| P0 | `TaskReadRepository` 默认安全查询 Task、Evidence、Artifact、Action 和事件；TaskRepository 对外 get/detail/summary、Task API/WS、TaskContextAssembler、前台 Turn 事件注入、Goal Evidence、评测晋升均使用该边界 | 对子对象先验证 Task，再验证子对象的真实来源；缺少 Evidence/Artifact/Checkpoint 证明时关闭读取；旧 Task 含 inputs/last_decision/report 等合并正文但缺少自身来源证明时关闭整体读取，原始 Turn 不能替其担保。EvidenceStore/ArtifactStore 在 inline/object bytes 前独立复核，404 不返回正文；内部原始访问明确为 `get_raw_task` |
+| P0 | Task 创建/输入、Goal attach/modify/question answer 记录来源 | API 实际收到的输入持久化为 internal `task_input` Event；已提供 user_event_id 时验证真实同 Thread Event，原样保留。模型决策将真实输入、触发与 Evidence 来源持久化在决策事件上，应用阶段的新 Engine 继续继承，重试也复核该事件；不依赖原 Engine 的内存字段，不伪造手工来源 |
+| P0 | Action、Evidence、Artifact、TaskEvent、Run、Checkpoint 传递来源；Goal 当前 plan 与 task_state 参与读取和 Worker 授权 | 复用 ContentProvenanceRef 的领域 owner_type；证据生成后 Action.result_summary 继承来源，Artifact 和事件继续继承。当前合并状态采取保守依赖并集；模型输入、报告和检查点继承其消费的来源，任一来源失效使合并对象不可用 |
+| P0 | Cascade 发现并清理上述副本 | 按持久来源精确发现子对象；旧 Evidence 无子副本边时沿 Action 发现 Artifact、事件和关联 Run。当前 Task/Goal 有直接依赖时清理合并正文；只命中子对象时保持既有部分范围规则。先授权拒绝读取，再异步清理，不能等待对象存储清理才生效 |
+| P1 | `forget/source_policy.py` 与 `reference_ids.py` | 提取纯来源集合和授权判定，领域读者不构造 ClaimedJob，也不依赖 Worker。Job 类型载荷解析仍属于 Worker，未建立巨型通用 Repository 或 ORM 全局 Hook |
+| P1 | GraphReadRepository.current_peers | Runtime 冲突和 API peers 统一验证来源可见、active+valid、Scope、通道敏感度与 canonical GraphFact，隐藏 peer 不得影响冲突标记 |
+| P1 | Core 缓存新鲜性 | 用既有 record_versions JSON 保存全体有效来源版本与内容/Key/敏感度/更新时间/配置指纹；projection_version 是生成代数，不参加业务相等判定。命中不再执行 build_blocks；来源或配置变化实时重建，无 Schema 迁移 |
+| P1 | Identity 与 Scope | 独立 Slot SET/UNSET、来源 ID、展示占位符；移除 name→display_name 回退。Scope 优先于更新时间，时间相同以 ID 稳定排序；agent tone Slot 不被用户响应偏好的有效渲染值代填 |
+| P1 | MemoryStore 与生命周期 | get_by_id 默认验证来源，get_raw_by_id 明确用于内部原始访问；Sleep/Archive 在状态迁移、版本、Lineage、事件和 Outbox 前验证来源，关闭隐藏来源零副作用 |
+| P1 | 增量架构约束 | 保留 Memory ORM 数量基线，增加 Task API/Broker/Context/Goal 禁止直接查询受保护子对象、Broker 禁止 inline_payload、纯来源模块禁止 Worker 依赖；不宣称 AST 能证明任意数据流安全 |
+
+Task 模型调用同样记录 Forget revision，在组装后发送前复核，模型响应返回后再次复核，避免失效响应写回。数据库事务在远程模型调用之前结束。最后一次授权之后才提交的 Forget 不能撤回已发送网络请求，此语义与前台/Goal 一致。
+
+### 24.6.2 验证与限制
+
+本轮先集中修改后统一执行测试，再按实际失败集中修复和复验，未逐功能执行全量套件。
+
+- Ruff 0.17.1：`ruff check backend/aiive --select F,E9` 通过。
+- Basedpyright 1.40.2：检查 289 个文件，0 errors / 0 warnings，退出码 0；本地使用 `--pythonpath .venv/Scripts/python.exe`。
+- `git diff --check`：通过。
+- 首轮全量：1606 passed / 148 failed / 119 skipped，251.74 秒。138 项失败共因是新输入 Event 错用不存在的 visibility 字段，已修正为真实模型字段；其余包含来源 fixture、Graph 测试置信度、直接 Event selector 尚未物化到 ForgetTarget、架构扫描与安全默认读取的旧断言。未关闭安全检查以迁就旧 fixture。
+- 集中复验：295 passed / 2 failed，69.65 秒；两项为外部存储测试未提供读取替身、Store 正向 fixture 缺少真实来源，均已补齐。
+- 第二轮全量：1755 passed / 1 failed / 119 skipped，267.59 秒。唯一失败 `test_partial_task_new_run_job_preserved` 揭示把 partial Task 的 ID 当成全量 trace 关联会误清理独立新 Run 的 Job。已改为只传播有直接来源证明的 root IDs，不把部分时间命中的父 Task 扩为强关联。
+- 最终 Task/Goal/Turn 注入/Core/Graph/Identity/架构边界集中回归：235 passed，4 warnings，61.16 秒，包含旧 Task 合并状态缺证明关闭的新增用例。
+- 最终全部 Forget 集成文件 + 本轮新回归 + AST 边界检查：115 passed，5233 warnings，26.00 秒；包含上述唯一全量失败及新增 Task 模型发送前失效零调用测试。两组最终回归存在交集，不相加宣称独立用例数量。修复该范围扩大问题后未再次重复全量，历史全量输出保留原有失败，不改写为全量零失败。
+
+本地日志位于忽略目录 `.pytest_cache/audit_followup_*.log`、类型检查 JSON；核心结果已记录于本文，不依赖缓存文件保存唯一证据。新回归文件为 `tests/integration/backend/test_memory_audit_followup.py`，覆盖独立 E2 被屏蔽而 E1 仍保留、inline/object 零读取、Task 副本、Goal 修改证明、Identity UNSET/重新设置、Scope 排序、Core 缓存命中/失效、Graph peer 授权与生命周期零副作用。
+
+本轮不执行生产存量审计/回填，不为旧内容补造来源。PG 的既有远程 80 passed/39 skipped 仅证明 fcd8948 的对应运行，不是本轮新增代码的并发验收。新增实现仍需推送后 CI 的 PG 运行证据；本机 Docker 环境限制保持如实记录。

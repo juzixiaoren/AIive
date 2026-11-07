@@ -36,3 +36,24 @@ def test_new_raw_memory_readers_require_boundary_review():
         assert len(calls) <= baseline.get(relative, 0), (
             f"{relative}: new raw Memory reader; use a safe boundary or document its purpose and add runtime regression"
         )
+
+
+def test_task_consumers_use_domain_read_boundaries():
+    root = Path(__file__).resolve().parents[3] / "backend/aiive"
+    for name in ("api/routes_agent_tasks.py", "control/capability_broker.py",
+                 "task_runtime/context_assembler.py", "task_runtime/goal_decision.py", "runtime/turn_events.py"):
+        tree = ast.parse((root / name).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in {"query", "get"}:
+                assert not any(isinstance(arg, ast.Name) and arg.id in {
+                    "TaskEvidence", "TaskArtifact", "AgentTaskEvent"} for arg in node.args), name
+            if name == "control/capability_broker.py" and isinstance(node, ast.Attribute):
+                assert node.attr != "inline_payload", "evaluation must authorize before reading bytes"
+
+
+def test_source_policy_has_no_worker_dependency():
+    root = Path(__file__).resolve().parents[3] / "backend/aiive/forget"
+    for name in ("source_policy.py", "durable_sources.py", "reference_ids.py"):
+        tree = ast.parse((root / name).read_text(encoding="utf-8"))
+        assert not any(isinstance(node, ast.ImportFrom) and (node.module or "").startswith("aiive.worker")
+                       for node in ast.walk(tree))

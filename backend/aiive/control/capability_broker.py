@@ -104,9 +104,8 @@ class CapabilityBroker:
 
             from aiive.task_runtime.evidence import EvidenceStore
 
-            evidence = self.db.query(TaskEvidence).filter(
-                TaskEvidence.task_id == task.id,
-            ).order_by(TaskEvidence.created_at.desc()).limit(20).all()
+            from aiive.task_runtime.read_repository import TaskReadRepository
+            evidence = list(reversed(TaskReadRepository(self.db).evidence(task.id)[-20:]))
 
             def passed(value: Any) -> bool:
                 if isinstance(value, dict):
@@ -119,8 +118,6 @@ class CapabilityBroker:
                 return False
 
             def payload(item: TaskEvidence) -> Any:
-                if item.inline_payload is not None:
-                    return item.inline_payload
                 try:
                     raw, _ = EvidenceStore.read(self.db, item, 0, min(item.content_size, 1_048_576))
                     return json.loads(raw)
@@ -191,7 +188,8 @@ class CapabilityBroker:
         from aiive.worker.job_source_guard import task_sources_visible
 
         require_execution_authorization()
-        if not task_sources_visible(self.db, task.id):
+        from aiive.task_runtime.read_repository import TaskReadRepository
+        if not task_sources_visible(self.db, task.id) or not TaskReadRepository(self.db).visible_child("agent_action", action):
             return {"ok": False, "error": "forget_source_blocked", "error_type": "source_blocked"}
         scope = TaskScope.from_brief(task.task_brief or {})
         registry = self.registry_for(task)

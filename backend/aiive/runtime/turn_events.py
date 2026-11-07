@@ -21,7 +21,7 @@ from typing import Any
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from aiive.db.models import AgentTask, TaskEvidence, TurnEventInbox, TurnRecord
+from aiive.db.models import TurnEventInbox, TurnRecord
 
 logger = logging.getLogger(__name__)
 
@@ -452,12 +452,12 @@ def mark_notified(
 def _task_snapshot(db: Session, task_id: str) -> dict[str, Any]:
     if not task_id:
         return {}
-    task = db.get(AgentTask, task_id)
+    from aiive.task_runtime.read_repository import TaskReadRepository
+    reader = TaskReadRepository(db)
+    task = reader.get_task(task_id)
     if task is None:
         return {}
-    evidence = db.query(TaskEvidence).filter(
-        TaskEvidence.task_id == task_id,
-    ).order_by(TaskEvidence.created_at.desc()).limit(3).all()
+    evidence = list(reversed(reader.evidence(task_id)[-3:]))
     return {
         "title": _bounded(task.title or task.goal or "", 200),
         "status": str(task.status or ""),

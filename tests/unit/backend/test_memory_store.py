@@ -28,6 +28,8 @@ class TestMemoryStore:
         record = store.create_record(proposal, lifecycle_state=LifecycleState.ACTIVE.value)
         db_session.flush()
 
+        from tests.support import attach_memory_event_source
+        attach_memory_event_source(db_session, record)
         retrieved = store.get_by_id(record.id)
         assert retrieved is not None
         assert retrieved.content == "User loves coffee"

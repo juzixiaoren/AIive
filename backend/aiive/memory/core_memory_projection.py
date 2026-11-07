@@ -13,6 +13,8 @@ Core Memory Blocks are a derived projection — only keys explicitly declaring a
 from __future__ import annotations
 
 import hashlib
+import json
+from datetime import timezone
 
 from sqlalchemy.orm import Session
 
@@ -55,6 +57,7 @@ def build_blocks(db: Session, config: RecallConfig | None = None) -> list[CoreMe
                 MemoryRecord.validity_state == ValidityState.VALID.value,
             )
             .order_by(MemoryRecord.updated_at.desc())
+            .populate_existing()
             .all()
         )
         from aiive.forget.visibility_service import ForgetVisibilityService
@@ -114,6 +117,29 @@ def _enforce_budget(blocks: list[CoreMemoryBlock], config: RecallConfig) -> list
     return kept[: config.core_memory_max_blocks]
 
 
+def _projection_source_state(db: Session, config: RecallConfig) -> dict[str, int]:
+    """One bounded-key batch for cache freshness; projection generation is not source identity."""
+    from aiive.forget.visibility_service import ForgetVisibilityService
+    roles = get_memory_key_registry().get_core_memory_keys()
+    records = db.query(MemoryRecord).filter(MemoryRecord.canonical_key.in_(roles),
+        MemoryRecord.scope_type == "global", MemoryRecord.scope_id.is_(None),
+        MemoryRecord.lifecycle_state == "active", MemoryRecord.validity_state == "valid").populate_existing().all()
+    allowed = set(ForgetVisibilityService.filter_memory_ids(db, [r.id for r in records]))
+    records = [r for r in records if r.id in allowed and MemoryPolicyEngine().decide_read(
+        r.sensitivity, MemoryReadChannel.LLM_CONTEXT).allowed]
+    values = []
+    for record in sorted(records, key=lambda r: r.id):
+        stamp = record.updated_at
+        stamp = stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None else stamp.astimezone(timezone.utc)
+        values.append((record.id, record.record_version, record.canonical_key, record.content,
+                       record.sensitivity, stamp.isoformat()))
+    signature = json.dumps([values, roles, config.core_memory_total_token_budget,
+                            config.core_memory_max_blocks], sort_keys=True, ensure_ascii=False)
+    versions = {r.id: r.record_version for r in records}
+    versions["@source_fingerprint"] = int(hashlib.sha256(signature.encode()).hexdigest()[:16], 16)
+    return versions
+
+
 def load_core_memory(db: Session, config: RecallConfig | None = None) -> list[CoreMemoryBlock]:
     """Read path: load persisted blocks; fall back to live rebuild if empty."""
     rows = db.query(CoreMemoryBlockRow).all()
@@ -135,10 +161,9 @@ def load_core_memory(db: Session, config: RecallConfig | None = None) -> list[Co
             for r in rows
         ]
         blocks.sort(key=lambda b: _ROLE_PRIORITY.get(b.block_name, 9))
-        # Compare authoritative content too: lifecycle/sensitivity changes can precede refresh.
-        current = build_blocks(db, config)
-        if [b.model_dump() for b in current] != [b.model_dump() for b in blocks]:
-            return current
+        state = _projection_source_state(db, config or RecallConfig())
+        if any(row.record_versions != state for row in rows):
+            return build_blocks(db, config)
         return blocks
     # Lost projection → reconstruct from memory_records (requirement #30).
     return build_blocks(db, config)
@@ -156,7 +181,10 @@ class CoreMemoryProjection:
         record_version are skipped (requirement #21).
         """
         config = config or RecallConfig()
+        source_state = _projection_source_state(db, config)
         blocks = build_blocks(db, config)
+        if source_state != _projection_source_state(db, config):
+            return  # Concurrent source mutation: leave old cache fenced; the next job/read refreshes.
 
         existing = {r.block_name: r for r in db.query(CoreMemoryBlockRow).all()}
         seen: set[str] = set()
@@ -174,17 +202,14 @@ class CoreMemoryProjection:
                 row.token_count = b.token_count
                 row.checksum = checksum
                 row.projection_version = (row.projection_version or 1) + 1
-                rv = dict(row.record_versions or {})
-                if memory_id:
-                    rv[memory_id] = record_version
-                row.record_versions = rv
+                row.record_versions = dict(source_state)
             else:
                 db.add(CoreMemoryBlockRow(
                     block_name=b.block_name,
                     content=b.content,
                     source_memory_ids=b.source_memory_ids,
                     projection_version=1,
-                    record_versions={memory_id: record_version} if memory_id else {},
+                    record_versions=dict(source_state),
                     token_count=b.token_count,
                     checksum=checksum,
                 ))

@@ -169,7 +169,8 @@ class TestMemoryWriteService:
         assert result2.written
 
         store = MemoryStore(db_session)
-        record = store.get_by_id(result1.memory_id)
+        assert store.get_by_id(result1.memory_id) is None
+        record = store.get_raw_by_id(result1.memory_id)
         assert record.lifecycle_state == LifecycleState.FORGOTTEN.value
         assert record.content == "Temp memory"
 

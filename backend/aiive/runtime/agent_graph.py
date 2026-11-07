@@ -305,6 +305,11 @@ def _build_runtime_identity(runtime_identity: dict[str, str] | None) -> str:
     rstyle = runtime_identity.get("relationship_style", "")
     if rstyle:
         lines.append(f"- relationship_style: {rstyle}")
+    unset_fields = [key for key in ("user_display_name", "user_name", "response_style")
+                    if runtime_identity.get(key) == "[暂未设置]"]
+    lines.extend(f"- {key}: [暂未设置]" for key in unset_fields)
+    if any(value == "[暂未设置]" for value in runtime_identity.values()):
+        lines.append("未设置的身份槽不得从其他 Key、历史摘要或模型推断恢复；只有用户的新设置可以赋值。")
     if len(lines) == 1:
         return ""
     return "\n".join(lines) + "\n"

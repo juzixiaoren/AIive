@@ -298,15 +298,9 @@ class GraphExpansionService:
         if not candidates:
             return
         subject_ids = {view.subject_entity_id for view in candidates}
-        rows = (
-            self._db.query(GraphRelation)
-            .filter(
-                GraphRelation.status == "active",
-                GraphRelation.subject_entity_id.in_(subject_ids),
-            )
-            .limit(self._config.batch_size * 4)
-            .all()
-        )
+        from aiive.memory.graph_read_repository import GraphReadRepository
+        rows = GraphReadRepository(self._db).current_peers(subject_ids,
+            list({(v.scope_type, v.scope_id) for v in candidates}), self._config.batch_size * 4)
         keys = conflicted_group_keys([
             (
                 row.subject_entity_id,

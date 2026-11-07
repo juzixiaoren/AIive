@@ -414,6 +414,12 @@ def build_scope(
         )
     )
 
+    # Phase A persists explicit selectors in the manifest; Cascade may not have
+    # materialized ForgetTarget rows yet. Use the authoritative selector too.
+    explicit_events |= _ids_from_query(db, db.query(Event.id).filter(
+        Event.id.in_(selector_payload.get("event_ids") or []), Event.created_at <= scope.cutoff))
+    explicit_turns.update(str(token) for token in (selector_payload.get("turn_ids") or []))
+
     tid = selector_payload.get("thread_id")
     if tid:
         scope.thread_ids = {str(tid)}
@@ -676,13 +682,45 @@ def build_scope(
             dependency_conditions.append(and_(ContentProvenanceRef.source_type == kind,
                                                ContentProvenanceRef.source_id.in_(ids)))
     if dependency_conditions:
-        evidence_ids = db.query(ContentProvenanceRef.owner_id).filter(
-            ContentProvenanceRef.owner_type == "task_evidence", or_(*dependency_conditions))
-        dependent = db.query(TaskEvidence.id, TaskEvidence.task_id).filter(
-            TaskEvidence.id.in_(evidence_ids), TaskEvidence.created_at <= scope.cutoff).all()
-        scope.task_evidence_ids |= {r[0] for r in dependent}
-        child_parent_ids |= {r[1] for r in dependent}
+        for model, owner_type, attr in (
+            (TaskEvidence, "task_evidence", "task_evidence_ids"),
+            (TaskArtifact, "task_artifact", "task_artifact_ids"),
+            (AgentAction, "agent_action", "agent_action_ids"),
+            (AgentTaskEvent, "agent_task_event", "agent_task_event_ids"),
+            (AgentTaskCheckpoint, "agent_task_checkpoint", "agent_task_checkpoint_ids"),
+            (AgentRun, "agent_run", "agent_run_ids"),
+        ):
+            dependent_ids = db.query(ContentProvenanceRef.owner_id).filter(
+                ContentProvenanceRef.owner_type == owner_type, or_(*dependency_conditions))
+            dependent = db.query(model.id, model.task_id).filter(model.id.in_(dependent_ids),
+                                                                model.created_at <= scope.cutoff).all()
+            getattr(scope, attr).update(r[0] for r in dependent)
+            child_parent_ids.update(r[1] for r in dependent)
+        # Legacy result copies share the producing action even if they lack their own edge.
+        action_ids = {action_id for (action_id,) in db.query(TaskEvidence.action_id).filter(
+            TaskEvidence.id.in_(scope.task_evidence_ids), TaskEvidence.action_id.isnot(None)).all() if action_id is not None}
+        scope.agent_action_ids.update(action_ids)
+        for model, attr in ((TaskArtifact, "task_artifact_ids"), (AgentTaskEvent, "agent_task_event_ids")):
+            rows = db.query(model.id, model.task_id).filter(model.action_id.in_(action_ids),
+                                                          model.created_at <= scope.cutoff).all()
+            getattr(scope, attr).update(r[0] for r in rows)
+            child_parent_ids.update(r[1] for r in rows)
+        dependent_actions = db.query(AgentAction).filter(AgentAction.id.in_(action_ids)).all()
+        run_ids = {run_id for action in dependent_actions for run_id in (action.run_id, action.execution_run_id) if run_id}
+        scope.agent_run_ids.update(r[0] for r in db.query(AgentRun.id).filter(
+            AgentRun.id.in_(run_ids), AgentRun.created_at <= scope.cutoff).all())
+        root_ids = {r[0] for r in db.query(ContentProvenanceRef.owner_id).filter(
+            ContentProvenanceRef.owner_type.in_(["agent_task", "goal_plan"]), or_(*dependency_conditions)).all()}
+        # The current task state/plan/report is a merged content object. A direct
+        # dependency authorizes scrubbing the root, not only references inside it.
+        scope.agent_task_ids.update(root_ids)
+        scope.trace_ids.update(root_ids)  # Proven merged content, not partial time-range parents.
+        child_parent_ids.update(root_ids)
+        checkpoint_rows = db.query(AgentTaskCheckpoint.id).filter(
+            AgentTaskCheckpoint.task_id.in_(root_ids), AgentTaskCheckpoint.created_at <= scope.cutoff).all()
+        scope.agent_task_checkpoint_ids.update(r[0] for r in checkpoint_rows)
     scope.partial_agent_task_ids = child_parent_ids - scope.agent_task_ids
+
 
     # ── Knowledge（仅 all_user_data，或 everywhere + time_range）──
     documents: set[str] = set()

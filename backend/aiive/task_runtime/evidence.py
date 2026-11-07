@@ -63,6 +63,9 @@ class EvidenceStore:
         from aiive.forget.durable_sources import collect_sources, references_visible
         acquire_forget_shared_lock(db)
         task = db.get(AgentTask, task_id)
+        from aiive.task_runtime.read_repository import TaskReadRepository, TaskContentUnavailable
+        if task is not None and not TaskReadRepository(db).task_visible(task):
+            raise TaskContentUnavailable("task_unavailable")
         origin = {"source_event_id": getattr(task, "source_event_id", None),
                   "source_turn_record_id": getattr(task, "source_turn_record_id", None)} if task else {}
         dependencies = set()
@@ -110,6 +113,9 @@ class EvidenceStore:
         db.flush()
         from aiive.forget.durable_sources import persist_sources
         persist_sources(db, "task_evidence", evidence.id, origin, action.arguments, result)
+        from aiive.task_runtime.read_repository import inherit_sources
+        inherit_sources(db, "task_evidence", evidence.id, [("agent_task", task_id), ("goal_plan", task_id), ("agent_action", action.id)])
+        inherit_sources(db, "agent_action", action.id, [("task_evidence", evidence.id)])
         refs = list(action.evidence_refs or [])
         refs.append({"evidence_id": evidence.id, "kind": kind, "content_hash": digest})
         action.evidence_refs = refs
@@ -165,12 +171,17 @@ class EvidenceStore:
                 content_size=len(data),
             )
             db.add(artifact)
+            db.flush()
+            from aiive.task_runtime.read_repository import inherit_sources
+            inherit_sources(db, "task_artifact", artifact.id, [("agent_task", task_id), ("goal_plan", task_id), ("agent_action", action.id)])
             captured.append(artifact)
         return captured
 
     @staticmethod
     def read(db: Session, evidence: TaskEvidence, offset: int, max_bytes: int) -> tuple[bytes, bool]:
-        _ = db  # 保留兼容的存储接口；对象存储和内联证据读取均不需要会话。
+        from aiive.task_runtime.read_repository import TaskReadRepository, TaskContentUnavailable
+        if not TaskReadRepository(db).visible_child("task_evidence", evidence):
+            raise TaskContentUnavailable("evidence_unavailable")
         if evidence.object_bucket and evidence.object_key:
             data = get_range(
                 ObjectRef(evidence.object_bucket, evidence.object_key),
@@ -182,10 +193,16 @@ class EvidenceStore:
         return raw[offset:offset + max_bytes], offset + max_bytes < len(raw)
 
 
-def artifact_bytes(artifact: TaskArtifact, offset: int, max_bytes: int) -> tuple[bytes, bool]:
-    data = get_range(
-        ObjectRef(artifact.object_bucket, artifact.object_key),
-        offset=offset,
-        max_bytes=max_bytes,
-    )
-    return data, offset + len(data) < artifact.content_size
+class ArtifactStore:
+    @staticmethod
+    def read(db: Session, artifact: TaskArtifact, offset: int, max_bytes: int) -> tuple[bytes, bool]:
+        from aiive.task_runtime.read_repository import TaskReadRepository, TaskContentUnavailable
+        if not TaskReadRepository(db).visible_child("task_artifact", artifact):
+            raise TaskContentUnavailable("artifact_unavailable")
+        data = get_range(ObjectRef(artifact.object_bucket, artifact.object_key), offset=offset, max_bytes=max_bytes)
+        return data, offset + len(data) < artifact.content_size
+
+
+def artifact_bytes(db: Session, artifact: TaskArtifact, offset: int, max_bytes: int) -> tuple[bytes, bool]:
+    """Compatibility wrapper; a Session and authorization are mandatory."""
+    return ArtifactStore.read(db, artifact, offset, max_bytes)

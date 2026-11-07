@@ -64,6 +64,9 @@ class GoalService:
         return task.task_type == GOAL_TASK_TYPE and isinstance((task.task_state or {}).get("goal"), dict)
 
     def load_plan(self, task: AgentTask) -> GoalPlan | None:
+        from aiive.task_runtime.read_repository import TaskReadRepository
+        if not TaskReadRepository(self.db).task_visible(task):
+            return None
         raw = (task.task_state or {}).get("goal")
         if not isinstance(raw, dict):
             return None
@@ -104,6 +107,7 @@ class GoalService:
             step.status = GoalStepStatus.PENDING
             # 规则从提案时刻开始生效：避免确认后到首次扫描之间的事件被漏掉。
             step.armed_at = _iso(now)
+        self._record_plan_sources(task, raw_plan)
         task.task_type = GOAL_TASK_TYPE
         task.task_state = self._state_with_plan(task, plan)
         self.repo.transition_task(
@@ -244,7 +248,8 @@ class GoalService:
     # 执行内容字段：任一变化都意味着这一步要重做，旧状态/证据/审批不再可信。
     CONTENT_FIELDS: ClassVar[tuple[str, ...]] = ("title", "kind", "acceptance", "depends_on", "requires_evidence")
 
-    def modify(self, task_id: str, changes: dict[str, Any]) -> dict[str, Any]:
+    def modify(self, task_id: str, changes: dict[str, Any], *, user_event_id: str = "",
+               source_kind: str = "api", source_payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """修改计划：执行内容变化与调度时间变化分开处理。
 
         - 执行内容（任务说明/验收标准/依赖/执行模式）变化：步骤回到 pending，清空证据与审批，
@@ -316,6 +321,8 @@ class GoalService:
             candidate.current_step_id = None
         candidate.revision = plan.revision + 1
         candidate.confirmed_at = plan.confirmed_at
+        source_id = self._record_plan_sources(task, changes, user_event_id=user_event_id,
+                                               source_kind=source_kind, source_payload=source_payload)
         self.cancel_watches(task)
         self._save(task, candidate)
         self.schedule_pending_watches(task, candidate)
@@ -323,6 +330,7 @@ class GoalService:
             task.id, "goal_modified",
             {
                 "revision": candidate.revision,
+                "user_event_id": source_id or None,
                 "added": added,
                 "rescheduled": rescheduled,
                 "invalidated": [
@@ -561,15 +569,18 @@ class GoalService:
         if self._needs_approval(step):
             # 审批边界：对话里的回答不能替代人工审批。
             raise GoalError("step_requires_approval")
+        from aiive.task_runtime.read_repository import record_input_source
+        user_event_id = record_input_source(self.db, task, {"answer": text, "intent": intent, "plan_changes": plan_changes}, user_event_id)
         now = utcnow()
         if intent == "modify_plan":
             if not plan_changes:
                 raise GoalError("plan_changes_invalid")
-            self.modify(task.id, dict(plan_changes))
+            self.modify(task.id, dict(plan_changes), user_event_id=user_event_id)
             return {"status": "applied", "action": "modify_plan", "step_id": step.id}
         if step.status != GoalStepStatus.WAITING_USER:
             raise GoalError("step_not_waiting_user")
         if intent == "reject":
+            self._record_plan_sources(task, {"answer": text}, user_event_id=user_event_id)
             step.status = GoalStepStatus.SKIPPED
             step.note = f"用户拒绝：{text}"[:500]
             plan.reminder.pop(f"wait_reminded:{step.id}", None)
@@ -595,7 +606,7 @@ class GoalService:
         # answer：先按既有输入语义记录回答（BLOCKED_USER → QUEUED 并唤醒），
         # 再把步骤从 waiting_user 解除，让回答进入下一次 Run 的上下文。
         was_blocked = task.status == TaskStatus.BLOCKED_USER.value
-        task = self.repo.send_input(task.id, text)
+        task = self.repo.send_input(task.id, text, user_event_id=user_event_id)
         plan = self._require_plan(task)
         step = plan.step(step_id)
         if step is None:
@@ -1143,7 +1154,30 @@ class GoalService:
             and not step.approved_at
         )
 
+    def _record_plan_sources(
+        self, task: AgentTask, changes: dict[str, Any], *, user_event_id: str = "",
+        source_kind: str = "api", source_payload: dict[str, Any] | None = None,
+    ) -> str:
+        from aiive.forget.concurrency import acquire_forget_shared_lock
+        from aiive.forget.durable_sources import persist_sources
+        from aiive.task_runtime.read_repository import record_input_source, inherit_sources
+        acquire_forget_shared_lock(self.db)
+        inherit_sources(self.db, "goal_plan", task.id, [("agent_task", task.id)])
+        if source_kind == "api":
+            user_event_id = record_input_source(self.db, task, changes, user_event_id)
+            persist_sources(self.db, "goal_plan", task.id, {"source_event_id": user_event_id})
+        elif source_kind == "model":
+            persist_sources(self.db, "goal_plan", task.id, source_payload or {})
+        else:
+            raise GoalError("plan_source_kind_invalid")
+        self.db.flush()
+        return user_event_id
+
     def _save(self, task: AgentTask, plan: GoalPlan) -> None:
+        from aiive.task_runtime.read_repository import inherit_sources
+        parents = [("agent_task", task.id)] + [("task_evidence", evidence_id)
+                    for step in plan.steps for evidence_id in step.evidence_refs]
+        inherit_sources(self.db, "goal_plan", task.id, parents)
         task.task_state = self._state_with_plan(task, plan)
         self.db.flush()
 
@@ -1158,6 +1192,8 @@ class GoalService:
         return state
 
     def _require_task(self, task_id: str) -> AgentTask:
+        from aiive.forget.concurrency import acquire_forget_shared_lock
+        acquire_forget_shared_lock(self.db)
         task = self.repo.get_task(task_id, for_update=True)
         if task is None:
             raise GoalError("task_not_found")

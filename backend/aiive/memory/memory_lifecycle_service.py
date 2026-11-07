@@ -328,6 +328,9 @@ class MemoryLifecycleService:
             return False, "Memory not found"
         if record.lifecycle_state == LifecycleState.FORGOTTEN.value:
             return False, "Cannot sleep: memory is forgotten (terminal state)"
+        from aiive.forget.visibility_service import ForgetVisibilityService
+        if not ForgetVisibilityService.filter_memory_ids(self._db, [memory_id]):
+            return False, "forget_source_blocked"
         if record.lifecycle_state not in self._SLEEP_ALLOWED_STATES:
             return False, f"Cannot sleep: current state is {record.lifecycle_state}"
         now = datetime.now(timezone.utc)
@@ -358,6 +361,9 @@ class MemoryLifecycleService:
             return False, "Memory not found"
         if record.lifecycle_state == LifecycleState.FORGOTTEN.value:
             return False, "Cannot archive: memory is forgotten (terminal state)"
+        from aiive.forget.visibility_service import ForgetVisibilityService
+        if not ForgetVisibilityService.filter_memory_ids(self._db, [memory_id]):
+            return False, "forget_source_blocked"
         if record.lifecycle_state not in self._ARCHIVE_ALLOWED_STATES:
             return False, f"Cannot archive: current state is {record.lifecycle_state}"
         now = datetime.now(timezone.utc)

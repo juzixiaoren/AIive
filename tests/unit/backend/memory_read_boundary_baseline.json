@@ -9,7 +9,7 @@
   "backend/aiive/memory/automatic_recall.py": 3,
   "backend/aiive/memory/conflict_candidates.py": 4,
   "backend/aiive/memory/conflict_confirmation.py": 1,
-  "backend/aiive/memory/core_memory_projection.py": 1,
+  "backend/aiive/memory/core_memory_projection.py": 2,
   "backend/aiive/memory/graph_expansion.py": 2,
   "backend/aiive/memory/graph_projection.py": 2,
   "backend/aiive/memory/graph_rebuild.py": 3,
@@ -27,5 +27,6 @@
   "backend/aiive/runtime/rhythm_manager.py": 1,
   "backend/aiive/task_runtime/goal_decision.py": 1,
   "backend/aiive/tools/builtin_memory_recall.py": 4,
-  "backend/aiive/worker/handlers_forget.py": 7
+  "backend/aiive/worker/handlers_forget.py": 7,
+  "backend/aiive/memory/graph_read_repository.py": 1
 }

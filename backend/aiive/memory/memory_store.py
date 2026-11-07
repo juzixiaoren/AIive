@@ -129,9 +129,19 @@ class MemoryStore:
     # Read operations — safe for any consumer
     # ------------------------------------------------------------------
 
-    def get_by_id(self, memory_id: str) -> MemoryRecord | None:
-        """Get a single record by ID."""
+    def get_raw_by_id(self, memory_id: str) -> MemoryRecord | None:
+        """Internal mutation/control lookup. Never serialize without purpose authorization."""
         return self._db.get(MemoryRecord, memory_id)
+
+    def get_by_id(self, memory_id: str) -> MemoryRecord | None:
+        """Safe content read by default; explicit raw lookup is reserved for internal code."""
+        record = self.get_raw_by_id(memory_id)
+        if record is None or record.lifecycle_state == "forgotten":
+            return None
+        return record if self._maintenance_visible([record]) else None
+
+    def get_visible_by_id(self, memory_id: str) -> MemoryRecord | None:
+        return self.get_by_id(memory_id)
 
     # Active = lifecycle='active' AND validity='valid'
     _ACTIVE_VALID: tuple[Any, Any] = (
@@ -219,13 +229,16 @@ class MemoryStore:
         scopes = scope_chain if scope_chain is not None else [("global", None)]
         if not scopes:
             return []
+        scope_rank = case(*[(and_(MemoryRecord.scope_type == kind, MemoryRecord.scope_id == token
+                            if token is not None else MemoryRecord.scope_id.is_(None)), rank)
+                            for rank, (kind, token) in enumerate(scopes)], else_=len(scopes))
         scope_filter = or_(*(and_(MemoryRecord.scope_type == kind, MemoryRecord.scope_id == token
                                  if token is not None else MemoryRecord.scope_id.is_(None))
                              for kind, token in scopes))
         return self._maintenance_visible(list(
             self._db.query(MemoryRecord)
             .filter(or_(*conditions), *self._ACTIVE_VALID, scope_filter)
-            .order_by(MemoryRecord.updated_at.desc(), MemoryRecord.id.asc())
+            .order_by(scope_rank.asc(), MemoryRecord.updated_at.desc(), MemoryRecord.id.asc())
             .all()
         ))
 

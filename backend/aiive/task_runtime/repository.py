@@ -132,8 +132,14 @@ class TaskRepository:
         priority: int = 50,
         enqueue: bool = True,
     ) -> AgentTask:
+        from aiive.forget.concurrency import acquire_forget_shared_lock
+        acquire_forget_shared_lock(self.db)
         if self.db.get(Thread, thread_id) is None:
             raise ValueError("thread_not_found")
+        if source_turn_record_id:
+            from aiive.forget.durable_sources import references_visible
+            if not references_visible(self.db, {"turn_record": [source_turn_record_id]}):
+                raise ValueError("task_source_unavailable")
         # ``goal`` 是 API/Meta Tool 的权威用户输入，不能被 task_brief 内同名字段覆盖。
         brief = TaskBrief.model_validate({**(task_brief or {}), "goal": goal})
         budget = TaskBudget.model_validate(budgets or {})
@@ -164,6 +170,14 @@ class TaskRepository:
         )
         self.db.add(task)
         self.db.flush()
+        from aiive.task_runtime.read_repository import record_input_source
+        from aiive.forget.durable_sources import persist_sources
+        if source_turn_record_id:
+            persist_sources(self.db, "agent_task", task.id, {"source_turn_record_id": source_turn_record_id})
+        else:
+            input_id = record_input_source(self.db, task, {"goal": task.goal, "title": task.title, "task_brief": task.task_brief})
+            persist_sources(self.db, "agent_task", task.id, {"source_event_id": input_id})
+        self.db.flush()
         self.append_event(
             task.id,
             "task_created",
@@ -177,6 +191,11 @@ class TaskRepository:
         return task
 
     def get_task(self, task_id: str, *, for_update: bool = False) -> AgentTask | None:
+        from aiive.task_runtime.read_repository import TaskReadRepository
+        return TaskReadRepository(self.db).get_task(task_id, for_update=for_update)
+
+    def get_raw_task(self, task_id: str, *, for_update: bool = False) -> AgentTask | None:
+        """Internal control/recovery metadata access; never serialize this result directly."""
         query = self.db.query(AgentTask).filter(AgentTask.id == task_id)
         if for_update:
             query = query.with_for_update()
@@ -193,6 +212,8 @@ class TaskRepository:
         event_payload: dict[str, Any] | None = None,
         visibility: str = "task",
     ) -> AgentTask:
+        from aiive.forget.concurrency import acquire_forget_shared_lock
+        acquire_forget_shared_lock(self.db)
         ensure_transition("task", task.status, status)
         task.status = status
         task.version += 1
@@ -200,6 +221,9 @@ class TaskRepository:
         if error is not None:
             task.last_error = error[:8000]
         if report is not None:
+            from aiive.task_runtime.read_repository import inherit_sources
+            parents = [("task_evidence", row.id) for row in self.db.query(TaskEvidence).filter_by(task_id=task.id).all()]
+            inherit_sources(self.db, "agent_task", task.id, parents)
             task.report = report
         if status in TERMINAL_TASK_STATES:
             task.completed_at = utcnow()
@@ -240,6 +264,8 @@ class TaskRepository:
         action_id: str | None = None,
         dedupe_key: str | None = None,
     ) -> AgentTaskEvent:
+        from aiive.forget.concurrency import acquire_forget_shared_lock
+        acquire_forget_shared_lock(self.db)
         # 锁 Task 行即可串行化 sequence 分配；SQLite 写事务也会序列化。
         self.db.query(AgentTask).filter(AgentTask.id == task_id).with_for_update().one()
         if dedupe_key:
@@ -252,6 +278,10 @@ class TaskRepository:
         sequence = int(self.db.query(func.max(AgentTaskEvent.sequence)).filter(
             AgentTaskEvent.task_id == task_id,
         ).scalar() or 0) + 1
+        from aiive.task_runtime.read_repository import TaskReadRepository
+        source_task = self.db.get(AgentTask, task_id)
+        if source_task is not None and not TaskReadRepository(self.db).task_visible(source_task):
+            payload = {"source_blocked": True}
         event = AgentTaskEvent(
             task_id=task_id,
             sequence=sequence,
@@ -264,7 +294,15 @@ class TaskRepository:
         )
         self.db.add(event)
         self.db.flush()
-        if visibility == "conversation":
+        from aiive.task_runtime.read_repository import inherit_sources, TaskReadRepository
+        from aiive.forget.durable_sources import persist_sources
+        parents = [("agent_task", task_id), ("goal_plan", task_id)]
+        if action_id:
+            parents.append(("agent_action", action_id))
+        inherit_sources(self.db, "agent_task_event", event.id, parents)
+        persist_sources(self.db, "agent_task_event", event.id, payload or {})
+        self.db.flush()
+        if visibility == "conversation" and TaskReadRepository(self.db).visible_child("agent_task_event", event):
             task = self.db.get(AgentTask, task_id)
             if task is not None:
                 self.db.info.setdefault(_TASK_BROADCASTS_KEY, []).append((task.thread_id, {
@@ -285,6 +323,8 @@ class TaskRepository:
         plan: dict[str, Any] | list[Any] | None = None,
         pending_action_refs: list[str] | None = None,
     ) -> AgentTaskCheckpoint:
+        from aiive.forget.concurrency import acquire_forget_shared_lock
+        acquire_forget_shared_lock(self.db)
         task = self.get_task(task_id, for_update=True)
         if task is None:
             raise ValueError("task_not_found")
@@ -294,9 +334,10 @@ class TaskRepository:
         event_sequence = int(self.db.query(func.max(AgentTaskEvent.sequence)).filter(
             AgentTaskEvent.task_id == task_id,
         ).scalar() or 0)
-        evidence_refs = [row[0] for row in self.db.query(TaskEvidence.id).filter(
-            TaskEvidence.task_id == task_id,
-        ).order_by(TaskEvidence.created_at.asc()).all()]
+        from aiive.task_runtime.read_repository import TaskReadRepository
+        evidence_refs = [row.id for row in TaskReadRepository(self.db).evidence(task_id)]
+        from aiive.task_runtime.read_repository import inherit_sources
+        inherit_sources(self.db, "agent_task", task_id, [("task_evidence", i) for i in evidence_refs])
         snapshot = {
             "task_status": task.status,
             "task_state": task.task_state or {},
@@ -319,6 +360,10 @@ class TaskRepository:
             snapshot_hash=sha256_json(snapshot),
         )
         self.db.add(checkpoint)
+        self.db.flush()
+        from aiive.task_runtime.read_repository import inherit_sources
+        inherit_sources(self.db, "agent_task_checkpoint", checkpoint.id,
+                        [("agent_task", task_id), ("goal_plan", task_id)] + [("task_evidence", i) for i in evidence_refs])
         self.db.flush()
         return checkpoint
 
@@ -396,8 +441,14 @@ class TaskRepository:
         token_usage: dict[str, Any] | None = None,
         model: str | None = None,
     ) -> None:
+        from aiive.forget.concurrency import acquire_forget_shared_lock
+        acquire_forget_shared_lock(self.db)
         ensure_transition("run", run.status, status)
         run.status = status
+        from aiive.task_runtime.read_repository import inherit_sources
+        parents = [("agent_task", run.task_id), ("goal_plan", run.task_id)] + [("task_evidence", row.id)
+                    for row in self.db.query(TaskEvidence).filter_by(task_id=run.task_id).all()]
+        inherit_sources(self.db, "agent_run", run.id, parents)
         run.output_summary = summary
         run.error_message = error[:8000] if error else None
         run.token_usage = token_usage or {}
@@ -426,6 +477,11 @@ class TaskRepository:
         effects: dict[str, Any] | None = None,
         target_node_id: str | None = None,
     ) -> AgentAction:
+        from aiive.forget.concurrency import acquire_forget_shared_lock
+        acquire_forget_shared_lock(self.db)
+        from aiive.task_runtime.read_repository import TaskReadRepository, TaskContentUnavailable
+        if not TaskReadRepository(self.db).task_visible(task):
+            raise TaskContentUnavailable("task_unavailable")
         sequence = int(self.db.query(func.max(AgentAction.sequence)).filter(
             AgentAction.task_id == task.id,
         ).scalar() or 0) + 1
@@ -450,6 +506,11 @@ class TaskRepository:
         usage["actions"] = int(usage.get("actions", 0)) + 1
         task.usage = usage
         self.db.flush()
+        from aiive.task_runtime.read_repository import inherit_sources
+        from aiive.forget.durable_sources import persist_sources
+        inherit_sources(self.db, "agent_action", action.id, [("agent_task", task.id), ("goal_plan", task.id)])
+        persist_sources(self.db, "agent_action", action.id, arguments)
+        self.db.flush()
         self.append_event(
             task.id,
             "action_planned",
@@ -467,6 +528,8 @@ class TaskRepository:
         payload: dict[str, Any] | None = None,
         error: str | None = None,
     ) -> None:
+        from aiive.forget.concurrency import acquire_forget_shared_lock
+        acquire_forget_shared_lock(self.db)
         ensure_transition("action", action.status, status)
         action.status = status
         action.updated_at = utcnow()
@@ -489,9 +552,12 @@ class TaskRepository:
         )
 
     def latest_checkpoint(self, task_id: str) -> AgentTaskCheckpoint | None:
-        return self.db.query(AgentTaskCheckpoint).filter(
+        row = self.db.query(AgentTaskCheckpoint).filter(
             AgentTaskCheckpoint.task_id == task_id,
         ).order_by(AgentTaskCheckpoint.version.desc()).first()
+
+        from aiive.task_runtime.read_repository import TaskReadRepository
+        return row if row is not None and TaskReadRepository(self.db).visible_child("agent_task_checkpoint", row) else None
 
     def ready_action(self, task_id: str) -> AgentAction | None:
         return self.db.query(AgentAction).filter(
@@ -538,12 +604,17 @@ class TaskRepository:
         self.checkpoint(task.id, reason="cancelled")
         return task
 
-    def send_input(self, task_id: str, content: str) -> AgentTask:
+    def send_input(self, task_id: str, content: str, *, user_event_id: str = "") -> AgentTask:
         task = self.get_task(task_id, for_update=True)
         if task is None:
             raise ValueError("task_not_found")
         if task.status in TERMINAL_TASK_STATES:
             raise ValueError("task_terminal")
+        from aiive.task_runtime.read_repository import record_input_source
+        from aiive.forget.durable_sources import persist_sources
+        source_id = record_input_source(self.db, task, {"content": content}, user_event_id)
+        persist_sources(self.db, "agent_task", task.id, {"source_event_id": source_id})
+        self.db.flush()
         state = dict(task.task_state or {})
         inputs = list(state.get("inputs") or [])
         inputs.append({"content": content, "created_at": utcnow().isoformat()})
@@ -564,6 +635,9 @@ class TaskRepository:
 
     def summary(self, task: AgentTask) -> dict[str, Any]:
         """Task 列表的轻量投影；避免对每张卡片查询完整时间线。"""
+        from aiive.task_runtime.read_repository import TaskReadRepository, TaskContentUnavailable
+        if not TaskReadRepository(self.db).task_visible(task):
+            raise TaskContentUnavailable("task_unavailable")
         return {
             "id": task.id,
             "thread_id": task.thread_id,
@@ -589,6 +663,10 @@ class TaskRepository:
         include_events: bool = True,
         event_limit: int = 500,
     ) -> dict[str, Any]:
+        from aiive.task_runtime.read_repository import TaskReadRepository, TaskContentUnavailable
+        reader = TaskReadRepository(self.db)
+        if not reader.task_visible(task):
+            raise TaskContentUnavailable("task_unavailable")
         result: dict[str, Any] = {
             "id": task.id,
             "thread_id": task.thread_id,
@@ -614,7 +692,7 @@ class TaskRepository:
                 "status": run.status, "model": run.model, "token_usage": run.token_usage or {},
                 "started_at": run.started_at, "completed_at": run.completed_at,
             }
-            for run in self.db.query(AgentRun).filter(AgentRun.task_id == task.id).order_by(AgentRun.run_index.asc()).all()
+            for run in reader.filter_children("agent_run", self.db.query(AgentRun).filter(AgentRun.task_id == task.id).order_by(AgentRun.run_index.asc()).all())
         ]
         result["actions"] = [
             {
@@ -626,7 +704,7 @@ class TaskRepository:
                 "evidence_refs": action.evidence_refs or [], "error": action.error_message,
                 "created_at": action.created_at, "completed_at": action.completed_at,
             }
-            for action in self.db.query(AgentAction).filter(AgentAction.task_id == task.id).order_by(AgentAction.sequence.asc()).all()
+            for action in reader.filter_children("agent_action", self.db.query(AgentAction).filter(AgentAction.task_id == task.id).order_by(AgentAction.sequence.asc()).all())
         ]
         result["evidence"] = [
             {
@@ -635,7 +713,7 @@ class TaskRepository:
                 "content_size": item.content_size, "content_hash": item.content_hash,
                 "stored": bool(item.object_key), "created_at": item.created_at,
             }
-            for item in self.db.query(TaskEvidence).filter(TaskEvidence.task_id == task.id).order_by(TaskEvidence.created_at.asc()).all()
+            for item in reader.filter_children("task_evidence", self.db.query(TaskEvidence).filter(TaskEvidence.task_id == task.id).order_by(TaskEvidence.created_at.asc()).all())
         ]
         result["artifacts"] = [
             {
@@ -644,8 +722,9 @@ class TaskRepository:
                 "mime_type": item.mime_type, "content_size": item.content_size,
                 "content_hash": item.content_hash, "created_at": item.created_at,
             }
-            for item in self.db.query(TaskArtifact).filter(TaskArtifact.task_id == task.id).order_by(TaskArtifact.created_at.asc()).all()
+            for item in reader.filter_children("task_artifact", self.db.query(TaskArtifact).filter(TaskArtifact.task_id == task.id).order_by(TaskArtifact.created_at.asc()).all())
         ]
+        visible_action_ids = {item["id"] for item in result["actions"] if isinstance(item["id"], str)}
         result["approvals"] = [
             {
                 "id": item.id, "action_id": item.action_id, "tool_name": item.tool_name,
@@ -654,6 +733,7 @@ class TaskRepository:
                 "expires_at": item.expires_at, "created_at": item.created_at,
             }
             for item in self.db.query(ApprovalRequest).filter(ApprovalRequest.task_id == task.id).order_by(ApprovalRequest.created_at.asc()).all()
+            if item.action_id in visible_action_ids
         ]
         if include_events:
             event_limit = max(1, min(2000, event_limit))
@@ -667,7 +747,7 @@ class TaskRepository:
                     "run_id": event.run_id, "action_id": event.action_id,
                     "payload": event.payload or {}, "created_at": event.created_at,
                 }
-                for event in reversed(events)
+                for event in reader.filter_children("agent_task_event", list(reversed(events)))
             ]
         return result
 

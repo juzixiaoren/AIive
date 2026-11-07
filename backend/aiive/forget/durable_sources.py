@@ -4,10 +4,10 @@ from collections.abc import Collection, Mapping
 from sqlalchemy.orm import Session
 from aiive.db.models import SegmentSummary
 from aiive.db.forget_models import ContentProvenanceRef
-from aiive.worker.outbox_payload_contract import parse_reference_ids
+from aiive.forget.reference_ids import parse_reference_ids
 
 REFERENCE_KEYS = {
-    "trigger_event_id": "event", "event_ids": "event",
+    "user_event_id": "event", "trigger_event_id": "event", "event_ids": "event",
     "event_id": "event", "source_event_id": "event", "source_event_ids": "event",
     "memory_id": "memory_record", "source_memory_id": "memory_record", "memory_ids": "memory_record",
     "turn_record_id": "turn_record", "source_turn_record_id": "turn_record",
@@ -46,14 +46,11 @@ def persist_sources(db: Session, owner_type: str, owner_id: str, *payloads: obje
 def references_visible(db: Session, grouped: Mapping[str, Collection[str]]) -> bool:
     if any(kind not in {"event", "memory_record", "turn_record"} for kind in grouped):
         return False
-    # Reuse the worker contract, including Turn -> child Event closure and missing metadata.
-    from aiive.worker.job_source_guard import JobSources, blocked_source_reason
-    from aiive.worker.outbox_dto import ClaimedJob
-    sources = JobSources(events={i: None for i in grouped.get("event", [])},
-                         memories={i: None for i in grouped.get("memory_record", [])},
-                         turns={i: None for i in grouped.get("turn_record", [])})
-    claimed = ClaimedJob("content", "content_read", {}, None, 0, 1, "", 1, "")
-    return not blocked_source_reason(db, claimed, sources)
+    from aiive.forget.source_policy import SourceReferences, blocked_sources_reason
+    sources = SourceReferences(events={i: None for i in grouped.get("event", [])},
+                               memories={i: None for i in grouped.get("memory_record", [])},
+                               turns={i: None for i in grouped.get("turn_record", [])})
+    return not blocked_sources_reason(db, sources)
 
 
 def sources_visible(db: Session, owner_type: str, owner_id: str) -> bool:

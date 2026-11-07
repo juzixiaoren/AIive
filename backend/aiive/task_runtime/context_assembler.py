@@ -7,7 +7,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from aiive.db.models import AgentAction, AgentTask, AgentTaskEvent, TaskArtifact, TaskEvidence
+from aiive.db.models import AgentTask
 from aiive.prompts import get_prompt_registry
 from aiive.skills import SkillDefinition
 from aiive.task_runtime.repository import TaskRepository
@@ -33,6 +33,10 @@ class TaskContextAssembler:
         tools.discovered / tools.loaded 暴露，且每次都按当前注册表重建，
         因此注册、卸载或定义变化不会被旧缓存掩盖。
         """
+        from aiive.task_runtime.read_repository import TaskReadRepository, TaskContentUnavailable
+        reader = TaskReadRepository(self.db)
+        if not reader.task_visible(task):
+            raise TaskContentUnavailable("task_unavailable")
         skill = self._active_skill(task)
         execution, available = self._registries(task, registry, discovery_registry)
         tool_view = build_tool_view(
@@ -42,22 +46,11 @@ class TaskContextAssembler:
             discovery_registry=available,
         )
         checkpoint = TaskRepository(self.db).latest_checkpoint(task.id)
-        actions = self.db.query(AgentAction).filter(
-            AgentAction.task_id == task.id,
-        ).order_by(AgentAction.sequence.desc()).limit(20).all()
-        evidence = self.db.query(TaskEvidence).filter(
-            TaskEvidence.task_id == task.id,
-        ).order_by(TaskEvidence.created_at.desc()).limit(20).all()
-        artifacts = self.db.query(TaskArtifact).filter(
-            TaskArtifact.task_id == task.id,
-        ).order_by(TaskArtifact.created_at.desc()).limit(20).all()
-        events = self.db.query(AgentTaskEvent).filter(
-            AgentTaskEvent.task_id == task.id,
-            AgentTaskEvent.event_type.in_([
-                "user_input_received", "watch_triggered", "approval_denied",
-                "task_recovered", "action_invalidated",
-            ]),
-        ).order_by(AgentTaskEvent.sequence.desc()).limit(10).all()
+        actions = reader.actions(task.id)
+        evidence = list(reversed(reader.evidence(task.id)[-20:]))
+        artifacts = reader.artifacts(task.id)
+        events = reader.signals(task.id, ["user_input_received", "watch_triggered", "approval_denied",
+            "task_recovered", "action_invalidated"])
         return {
             "task": {
                 "id": task.id,
@@ -96,7 +89,7 @@ class TaskContextAssembler:
                 for item in reversed(artifacts)
             ],
             "signals": [
-                {"event_type": item.event_type, "payload": _bounded_value(item.payload, 4000)}
+                {"id": item.id, "event_type": item.event_type, "payload": _bounded_value(item.payload, 4000)}
                 for item in reversed(events)
             ],
             "tools": _bounded_value(tool_view, 24_000),

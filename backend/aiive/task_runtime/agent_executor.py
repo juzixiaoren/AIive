@@ -29,9 +29,23 @@ class TaskAgentExecutor:
         self.llm: LLMClient = llm_client or default_llm_client()
 
     def decide(self, task: AgentTask, capabilities: list[dict[str, Any]]) -> AgentDecision:
+        from aiive.forget.concurrency import forget_revision
+        from aiive.task_runtime.read_repository import TaskReadRepository, TaskContentUnavailable, inherit_sources
         task_id = task.id
+        revision = forget_revision(self.db)
         messages, snapshot, prompt_refs = TaskContextAssembler(self.db).messages(task, capabilities)
+        parents = [(kind, item["id"]) for key, kind in (
+            ("actions", "agent_action"), ("evidence", "task_evidence"),
+            ("artifacts", "task_artifact"), ("signals", "agent_task_event")) for item in snapshot.get(key, [])]
+        # Subsequent model decisions/state are derived from this exact input.
+        inherit_sources(self.db, "agent_task", task_id, parents + [("goal_plan", task_id)])
+        if task.current_run_id:
+            inherit_sources(self.db, "agent_run", task.current_run_id, [("agent_task", task_id)])
+        self.db.flush()
         # Task Context 读取完成后立即结束读事务；远程 LLM 调用期间不占数据库事务。
+        self.db.commit()
+        if forget_revision(self.db) != revision or not TaskReadRepository(self.db).task_visible(task):
+            raise TaskContentUnavailable("task_context_source_changed")
         self.db.commit()
         response = self.llm.chat(
             messages,
@@ -39,6 +53,8 @@ class TaskAgentExecutor:
             trace_id=task_id,
             json_mode=True,
         )
+        if forget_revision(self.db) != revision or not TaskReadRepository(self.db).task_visible(task):
+            raise TaskContentUnavailable("task_context_source_changed")
         proposal = self.parse(response.content)
         return AgentDecision(
             proposal=proposal,
