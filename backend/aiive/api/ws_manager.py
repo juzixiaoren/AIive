@@ -32,6 +32,12 @@ class ConnectionManager:
         """绑定主事件循环，用于从后台线程安全推送。"""
         self._main_loop = loop
 
+    @property
+    def is_bound(self) -> bool:
+        """是否已绑定可用事件循环；未绑定或已关闭时后台广播应静默跳过。"""
+        loop = self._main_loop
+        return loop is not None and not loop.is_closed()
+
     async def connect(self, thread_id: str, ws: WebSocket) -> None:
         """接受 WebSocket 连接并注册到指定线程。"""
         await ws.accept()
@@ -71,13 +77,17 @@ class ConnectionManager:
 
         通过 asyncio.run_coroutine_threadsafe 将 async 操作投递到主事件循环。
         """
-        if self._main_loop is None:
-            logger.warning("主事件循环未绑定，跳过广播: thread_id=%s", thread_id)
+        if not self.is_bound:
+            logger.warning("主事件循环未绑定或已关闭，跳过广播: thread_id=%s", thread_id)
             return
-        asyncio.run_coroutine_threadsafe(
-            self.broadcast_to_thread(thread_id, event_type, data),
-            self._main_loop,
-        )
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self.broadcast_to_thread(thread_id, event_type, data),
+                self._main_loop,  # pyright: ignore[reportArgumentType]
+            )
+        except RuntimeError:
+            # 事件循环在检查与投递之间关闭（测试/停机竞态）：广播是尽力而为，不阻断业务。
+            logger.warning("事件循环已关闭，跳过广播: thread_id=%s", thread_id)
 
     async def broadcast_notification(self, pending_count: int) -> None:
         """向全局通知通道推送最新 pending 数量，供前端角标即时更新（替代轮询）。

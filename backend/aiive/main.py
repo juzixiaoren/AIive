@@ -25,6 +25,7 @@ from aiive.api.routes_attention import router as attention_router
 from aiive.api.routes_auth import router as auth_router
 from aiive.api.routes_capabilities import router as capabilities_router
 from aiive.api.routes_chat import router as chat_router
+from aiive.api.routes_conversation import router as conversation_router
 from aiive.api.routes_debug import router as debug_router
 from aiive.api.routes_desktop import router as desktop_router
 from aiive.api.routes_epochs import router as epochs_router
@@ -58,6 +59,16 @@ def _ensure_system_thread():
         ThreadBootstrapService.ensure_system_thread()
     except Exception:
         logger.exception("Failed to ensure system thread")
+
+
+def _ensure_current_thread():
+    """确保唯一长期对话的 ConversationState 已初始化（幂等）。"""
+    from aiive.runtime.conversation_state import ensure_current_thread
+
+    try:
+        ensure_current_thread()
+    except Exception:
+        logger.exception("当前对话初始化失败")
 
 
 def _ensure_retrieval_generation():
@@ -229,6 +240,7 @@ def create_app() -> FastAPI:
             _ensure_system_thread()
         except Exception:
             logger.exception("系统线程初始化失败")
+        _ensure_current_thread()
         try:
             _ensure_retrieval_generation()
         except Exception:
@@ -362,6 +374,7 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(auth_router)
     app.include_router(chat_router)
+    app.include_router(conversation_router)
     app.include_router(debug_router)
     app.include_router(eval_router)
     app.include_router(memories_router)

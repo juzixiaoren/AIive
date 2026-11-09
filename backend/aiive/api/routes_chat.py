@@ -179,7 +179,12 @@ async def chat_stream(request: ChatRequest):
                     yield f"event: error\ndata: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
                     return
                 if event.get("type") == "started":
-                    yield f"event: started\ndata: {json.dumps({'thread_id': event.get('thread_id', ''), 'turn_id': event.get('turn_id', ''), 'trace_id': event.get('trace_id', '')}, ensure_ascii=False)}\n\n"
+                    yield f"event: started\ndata: {json.dumps({'thread_id': event.get('thread_id', ''), 'turn_id': event.get('turn_id', ''), 'turn_record_id': event.get('turn_record_id', ''), 'trace_id': event.get('trace_id', '')}, ensure_ascii=False)}\n\n"
+                elif event.get("type") == "cancelled":
+                    # 取消已由服务端收口（标记 cancelled、丢弃用户消息、释放锁）。
+                    # 客户端据此清理本地乐观消息并从服务器历史恢复。
+                    yield f"event: cancelled\ndata: {json.dumps({'thread_id': event.get('thread_id', ''), 'turn_id': event.get('turn_id', ''), 'turn_record_id': event.get('turn_record_id', ''), 'reason': event.get('reason', 'user_interrupt')}, ensure_ascii=False)}\n\n"
+                    return
                 elif event.get("type") == "token":
                     yield f"event: token\ndata: {json.dumps({'text': event.get('text', '')}, ensure_ascii=False)}\n\n"
                 elif event.get("type") == "tool_call":

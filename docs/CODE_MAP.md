@@ -73,6 +73,7 @@
 |---|---|---|---|
 | 聊天入口（同步/SSE/错误契约） | `api/routes_chat.py` | `runtime/turn_execution.py`、`api/ws_manager.py` | `tests/unit/backend/test_chat_*.py` |
 | 回合生命周期（抢占/租约/心跳/收尾） | `runtime/turn_execution.py` | `db/models.py::turn_records`、`runtime/event_logger.py` | `test_turn_execution*.py` |
+| 唯一长期对话 / 三端互斥执行 / 远程中断（V63） | `runtime/conversation_state.py`（ConversationState 单例 + 执行状态视图）、`api/routes_conversation.py`（GET /conversation/current、GET /conversation/status、POST /conversation/interrupt）、`runtime/turn_execution.py`（`_resolve_and_preempt` 先抢锁后落库、`_finalize_cancelled_turn`） | `runtime/agent_graph.py`（`TurnCancelled` + 流式 cancel_check）、`runtime/thread_lease.py`、`api/routes_ws.py`（连接即补发状态）、`frontend/src/pages/ChatPage.tsx`、`apps/android/src/App.tsx` | `tests/unit/backend/test_single_thread_conversation.py`（13 例） |
 | Agent 图节点 / 工具循环 / 流式 | `runtime/agent_graph.py` | `tools/langchain_adapter.py`、`core/llm_client.py` | `test_agent_graph*.py` |
 | 上下文组装与 token 预算 | `runtime/context_assembler.py`、`runtime/context_budget.py` | `memory/automatic_recall.py`、`runtime/thread_state.py` | `test_context_assembler*.py` |
 | LLM 客户端（json_mode 降级/错误归一） | `core/llm_client.py` | `config.py`（LLM 配置项） | `test_llm_client*.py` |
@@ -218,6 +219,7 @@
 | `routes_notifications.py` | `/api/notifications` |
 | `routes_attention.py` | `/api/attention/current`、`/rhythm/daily|weekly` |
 | `routes_threads.py` | `POST /api/thread/reset`、`GET /threads/{id}/messages` |
+| `routes_conversation.py` | `GET /api/conversation/current`、`GET /api/conversation/status`、`POST /api/conversation/interrupt` |
 | `routes_desktop.py` | `GET /api/desktop/nodes`、`POST /api/desktop/bind`、`WS /ws/desktop/{node_id}` |
 | `routes_ws.py` | `WS /ws/{thread_id}` |
 | `routes_debug.py` | `/api/debug/events`、`/llm_calls`、`/traces/{id}`（`require_local_developer`） |
@@ -523,14 +525,15 @@
 
 ---
 
-## 6. 数据库表地图（75 表）
+## 6. 数据库表地图（76 表）
 
-> 模型定义：`db/models.py`（63）+ `db/forget_models.py`（10）+ `db/retention_models.py`（2）。迁移：baseline `69da20d1e47c`，HEAD `f1a2c3d4e5b6`。
+> 模型定义：`db/models.py`（64）+ `db/forget_models.py`（10）+ `db/retention_models.py`（2）。迁移：baseline `69da20d1e47c`，HEAD `b3e6f9c2d7a4`。
 
 | 域 | 表 | 说明 |
 |---|---|---|
 | 会话基础 | `threads`、`events`、`llm_calls`、`context_snapshots` | 线程/事件日志/LLM 调用/上下文快照 |
-| 回合执行 | `turn_records` | 单回合状态机（租约/指纹/响应） |
+| 唯一当前对话 | `conversation_state` | 单用户单例（主键 `default`）：唯一 `current_thread_id`；后端是 Thread ID 唯一事实源，启动时幂等初始化，存量库确定性选择 Turn 最多的既有线程（不合并/不删除其他线程） |
+| 回合执行 | `turn_records` | 单回合状态机（租约/指纹/响应/`cancel_requested_at` 持久化取消信号；新增 `cancelled` 终态） |
 | 上下文压缩 | `epochs`、`segments`、`segment_summaries`、`epoch_checkpoints`、`working_states`、`compaction_inputs`、`compaction_runs`、`epoch_compaction_inputs`、`checkpoint_runs` | Epoch/Segment/摘要/检查点/工作状态/压缩流水线 |
 | 记忆 V2 | `memory_records`、`memory_proposals`、`memory_ingestion_runs`、`memory_evidence`、`memory_lineage` | 记忆主档/提案/摄取运行/证据/血缘 |
 | 记忆向量 | `memory_vector_projections` | pgvector 512 维投影 |

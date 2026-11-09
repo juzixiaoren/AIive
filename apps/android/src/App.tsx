@@ -3,10 +3,17 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   type ChatMessage,
+  type ExecutionStatus,
+  type ThreadHistoryMessage,
+  approvalsFromCards,
+  getCurrentConversation,
+  getExecutionStatus,
+  getThreadMessages,
   hasBackendConfig,
+  interruptTurn,
   respondApproval,
-  resetConversation,
   streamMessage,
+  subscribeThreadEvents,
 } from "./api/chat";
 import { appConfig } from "./config";
 import LoginScreen from "./LoginScreen";
@@ -64,15 +71,6 @@ function MoonIcon() {
   );
 }
 
-function NewChatIcon() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M12 20H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h9" />
-      <path d="M16 3v6m-3-3h6M8 11h8M8 15h5" />
-    </svg>
-  );
-}
-
 function SendIcon() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -90,6 +88,18 @@ function StopIcon() {
   );
 }
 
+/** 服务器历史是事实来源：本地缓存只用于展示加速，启动时一律以服务端覆盖。 */
+function historyToMessages(messages: ThreadHistoryMessage[]): ChatMessage[] {
+  return messages
+    .map((message) => ({
+      id: message.event_id || messageId(),
+      role: message.role === "user" ? "user" as const : "assistant" as const,
+      content: message.content,
+      approvals: approvalsFromCards(Array.isArray(message.action_cards) ? message.action_cards : []),
+    }))
+    .filter((message) => message.content || (message.approvals?.length ?? 0) > 0);
+}
+
 function ChatApp({ username, onLogout }: { username: string; onLogout: () => void }) {
   const [initialChat] = useState(loadChat);
   const [messages, setMessages] = useState<ChatMessage[]>(initialChat.messages);
@@ -99,10 +109,32 @@ function ChatApp({ username, onLogout }: { username: string; onLogout: () => voi
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState("");
   const [approvalBusyId, setApprovalBusyId] = useState("");
+  /** 服务端线程级执行状态：idle / running（可中断）/ busy（后台占用）。 */
+  const [execState, setExecState] = useState<"idle" | "running" | "busy">("idle");
+  const [remoteRunning, setRemoteRunning] = useState(false);
+  const remoteRunningRef = useRef(false);
+  const [stopping, setStopping] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+  const streamingRef = useRef(false);
+  const activeTurnRecordIdRef = useRef("");
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const configured = hasBackendConfig();
+
+  /** 用服务端状态收敛发送/停止按钮（初始化、WS 广播、重连共用）。 */
+  const applyStatus = useCallback((status: ExecutionStatus) => {
+    setExecState(status.state);
+    if (status.state === "running" && status.active_turn?.turn_record_id) {
+      activeTurnRecordIdRef.current = status.active_turn.turn_record_id;
+      const remote = !streamingRef.current && !status.interrupting;
+      remoteRunningRef.current = remote;
+      setRemoteRunning(remote);
+    } else {
+      activeTurnRecordIdRef.current = "";
+      remoteRunningRef.current = false;
+      setRemoteRunning(false);
+    }
+  }, []);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -131,6 +163,46 @@ function ChatApp({ username, onLogout }: { username: string; onLogout: () => voi
 
   useEffect(() => () => abortRef.current?.abort(), []);
 
+  // 启动即从服务器获取唯一长期 Thread 与历史（三端共用同一 Thread ID）。
+  useEffect(() => {
+    if (!configured) return;
+    let disposed = false;
+    const bootstrap = async () => {
+      try {
+        const tid = await getCurrentConversation();
+        if (disposed || !tid) return;
+        setThreadId(tid);
+        setMessages(historyToMessages((await getThreadMessages(tid)).messages));
+        if (disposed) return;
+        applyStatus(await getExecutionStatus(tid));
+      } catch (cause) {
+        if (!disposed) setError(cause instanceof Error ? cause.message : "对话恢复失败");
+      }
+    };
+    void bootstrap();
+    return () => { disposed = true; };
+  }, [applyStatus, configured]);
+
+  /** 以服务器历史为准刷新消息（其他设备结束/取消后调用）。 */
+  const refreshHistory = useCallback(async () => {
+    if (!threadId) return;
+    try {
+      setMessages(historyToMessages((await getThreadMessages(threadId)).messages));
+    } catch {
+      // 历史刷新失败不打断当前会话，下一次操作会再次对齐。
+    }
+  }, [threadId]);
+
+  // 订阅线程 WebSocket：其他设备开始执行/结束/取消时同步按钮状态。
+  useEffect(() => {
+    if (!configured || !threadId) return;
+    return subscribeThreadEvents(threadId, (status) => {
+      const wasRemote = remoteRunningRef.current;
+      applyStatus(status);
+      if (status.state === "idle" && wasRemote) void refreshHistory();
+    });
+  }, [applyStatus, configured, refreshHistory, threadId]);
+
   const resizeTextarea = useCallback(() => {
     const element = textareaRef.current;
     if (!element) return;
@@ -140,23 +212,18 @@ function ChatApp({ username, onLogout }: { username: string; onLogout: () => voi
 
   useEffect(resizeTextarea, [input, resizeTextarea]);
 
-  const startNewChat = async () => {
-    if (streaming) return;
+  /** 停止：走服务端中断（持久化取消信号），不本地 abort，等收口广播/事件。 */
+  const stopStreaming = async () => {
+    if (!threadId || stopping) return;
+    setStopping(true);
     setError("");
     try {
-      await resetConversation(threadId || undefined);
-      setThreadId("");
-      setMessages([]);
-      setInput("");
+      await interruptTurn(threadId, activeTurnRecordIdRef.current || undefined);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "新建对话失败");
+      setError(cause instanceof Error ? cause.message : "停止失败，请稍后重试");
+    } finally {
+      setStopping(false);
     }
-  };
-
-  const stopStreaming = () => {
-    abortRef.current?.abort();
-    abortRef.current = null;
-    setStreaming(false);
   };
 
   const handleApproval = async (approvalId: string, action: "approve" | "deny") => {
@@ -201,6 +268,11 @@ function ChatApp({ username, onLogout }: { username: string; onLogout: () => voi
   const send = async () => {
     const content = input.trim();
     if (!content || streaming || !configured) return;
+    if (execState !== "idle") {
+      // 忙状态下的消息不排队、不落库。
+      setError(execState === "busy" ? "后台任务处理中，请稍候" : "Agent 正在回复，请稍候");
+      return;
+    }
 
     const userMessage: ChatMessage = { id: messageId(), role: "user", content };
     const replyId = messageId();
@@ -209,7 +281,11 @@ function ChatApp({ username, onLogout }: { username: string; onLogout: () => voi
     abortRef.current = controller;
     setInput("");
     setError("");
+    setExecState("running");
+    setRemoteRunning(false);
+    activeTurnRecordIdRef.current = "";
     setStreaming(true);
+    streamingRef.current = true;
     setMessages((current) => [...current, userMessage, replyPlaceholder]);
 
     try {
@@ -217,7 +293,10 @@ function ChatApp({ username, onLogout }: { username: string; onLogout: () => voi
         content,
         threadId || undefined,
         {
-          onStarted: setThreadId,
+          onStarted: (nextThreadId, turnRecordId) => {
+            setThreadId(nextThreadId);
+            activeTurnRecordIdRef.current = turnRecordId;
+          },
           onToken: (token) => {
             setMessages((current) => current.map((message) => (
               message.id === replyId ? { ...message, content: message.content + token } : message
@@ -226,12 +305,20 @@ function ChatApp({ username, onLogout }: { username: string; onLogout: () => voi
         },
         controller.signal,
       );
-      setThreadId(result.threadId);
-      setMessages((current) => current.map((message) => (
-        message.id === replyId
-          ? { ...message, content: result.reply || message.content, approvals: result.approvals }
-          : message
-      )));
+      if (result.cancelled) {
+        // 服务端已丢弃本轮用户消息：本地移除乐观气泡并恢复服务器历史。
+        setMessages((current) => current.filter(
+          (message) => message.id !== userMessage.id && message.id !== replyId,
+        ));
+        setMessages(historyToMessages((await getThreadMessages(result.threadId || threadId)).messages));
+      } else {
+        setThreadId(result.threadId);
+        setMessages((current) => current.map((message) => (
+          message.id === replyId
+            ? { ...message, content: result.reply || message.content, approvals: result.approvals }
+            : message
+        )));
+      }
     } catch (cause) {
       if (!controller.signal.aborted) {
         setError(cause instanceof Error ? cause.message : "发送失败，请稍后重试");
@@ -247,6 +334,9 @@ function ChatApp({ username, onLogout }: { username: string; onLogout: () => voi
     } finally {
       if (abortRef.current === controller) abortRef.current = null;
       setStreaming(false);
+      streamingRef.current = false;
+      // 本轮结束先恢复发送；若随后进入后台占用，WS 广播会再次收敛为处理中。
+      setExecState("idle");
     }
   };
 
@@ -273,16 +363,6 @@ function ChatApp({ username, onLogout }: { username: string; onLogout: () => voi
             title="退出登录"
           >
             退出
-          </button>
-          <button
-            type="button"
-            className="icon-button"
-            onClick={startNewChat}
-            disabled={streaming || messages.length === 0}
-            aria-label="新建对话"
-            title="新建对话"
-          >
-            <NewChatIcon />
           </button>
           <button
             type="button"
@@ -376,12 +456,19 @@ function ChatApp({ username, onLogout }: { username: string; onLogout: () => voi
       <footer className="composer-area">
         <div className="composer-inner">
           {error && <div className="error-banner" role="alert">{error}</div>}
+          {execState !== "idle" && (
+            <div className="status-banner" role="status">
+              {execState === "busy"
+                ? "后台任务处理中，请稍候…"
+                : remoteRunning ? "Agent 正在其他设备回复…" : "Agent 正在回复…"}
+            </div>
+          )}
           <div className={`composer ${streaming ? "is-streaming" : ""}`}>
             <textarea
               ref={textareaRef}
               rows={1}
               value={input}
-              disabled={streaming || !configured}
+              disabled={streaming || execState !== "idle" || !configured}
               onChange={(event) => setInput(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
@@ -394,12 +481,18 @@ function ChatApp({ username, onLogout }: { username: string; onLogout: () => voi
             />
             <button
               type="button"
-              className={streaming ? "send-button stop" : "send-button"}
-              onClick={streaming ? stopStreaming : send}
-              disabled={!streaming && (!input.trim() || !configured)}
-              aria-label={streaming ? "停止生成" : "发送消息"}
+              className={execState === "running" ? "send-button stop" : "send-button"}
+              onClick={execState === "running" ? () => void stopStreaming() : send}
+              disabled={
+                execState === "busy"
+                || stopping
+                || (execState === "idle" && (!input.trim() || !configured))
+              }
+              aria-label={
+                execState === "running" ? "停止生成" : execState === "busy" ? "处理中" : "发送消息"
+              }
             >
-              {streaming ? <StopIcon /> : <SendIcon />}
+              {execState === "running" ? <StopIcon /> : <SendIcon />}
             </button>
           </div>
           <p className="composer-note">AI 可能会出错，请核对重要信息</p>

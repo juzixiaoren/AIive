@@ -11,10 +11,13 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import {
   sendMessageStream,
-  resetThread,
+  getCurrentConversation,
+  getExecutionStatus,
+  interruptTurn,
   getThreadMessages,
   respondApproval,
   ActionCard,
+  ExecutionStatus,
   StreamIncompleteError,
 } from "../api/chat";
 import { BASE_PATH } from "../lib/base";
@@ -251,6 +254,31 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
   const [hasMoreHistory, setHasMoreHistory] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [approvalBusyId, setApprovalBusyId] = useState<string | null>(null);
+  /** 服务端线程级执行状态：idle / running（可中断）/ busy（后台占用）。 */
+  const [execState, setExecState] = useState<"idle" | "running" | "busy">("idle");
+  /** 当前 Turn 由其他设备发起（用于提示"Agent 正在回复"）。 */
+  const [remoteRunning, setRemoteRunning] = useState(false);
+  /** 同步给 WS 回调：远端 Turn 结束后需要从服务器恢复最终历史。 */
+  const remoteRunningRef = useRef(false);
+  const [stopping, setStopping] = useState(false);
+  /** 当前前台 Turn 的 TurnRecord 主键：中断请求必须携带，防止误伤新 Turn。 */
+  const activeTurnRecordIdRef = useRef<string | undefined>(undefined);
+
+  /** 用服务端状态统一收敛发送/停止按钮与提示（初始化、WS 广播、重连共用）。 */
+  const applyExecutionStatus = useCallback((status: ExecutionStatus) => {
+    setExecState(status.state);
+    if (status.state === "running" && status.active_turn?.turn_record_id) {
+      activeTurnRecordIdRef.current = status.active_turn.turn_record_id;
+      // 本地请求在途时不算远端执行；否则提示来自其他设备。
+      const remote = !inFlightRef.current && !status.interrupting;
+      remoteRunningRef.current = remote;
+      setRemoteRunning(remote);
+    } else {
+      activeTurnRecordIdRef.current = undefined;
+      remoteRunningRef.current = false;
+      setRemoteRunning(false);
+    }
+  }, []);
 
   /** 按占位消息 ID 更新当前流，避免并发或线程切换时写入其他消息。 */
   const updateStreamingAgent = useCallback((messageId: string, updater: (m: Message) => Message) => {
@@ -318,28 +346,27 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
   const loadRemoteMessages = useCallback(async (tid: string) => {
     try {
       const page = await getThreadMessages(tid);
-      if (page.messages.length > 0) {
-        const loaded: Message[] = page.messages.map((message) => ({
-          id: message.event_id || genMessageId(),
-          role: message.role === "user" ? "user" : "agent",
-          content: message.content,
-          traceId: message.trace_id || "",
-          threadId: tid,
-          actionCards: message.action_cards || [],
-          toolCalls: message.tool_calls.map((call) => ({
-            id: call.tool_call_id,
-            name: call.name,
-            params: call.params || {},
-            status: normalizeToolCallStatus(call.status),
-            result: call.result === undefined || call.result === null
-              ? undefined
-              : typeof call.result === "string" ? call.result : JSON.stringify(call.result),
-          })),
-        }));
-        prevMsgCountRef.current = loaded.length;
-        setUnreadCount(0);
-        setMessages(loaded);
-      }
+      // 服务器历史是事实来源：即使为空也覆盖本地缓存（取消的轮次必须消失）。
+      const loaded: Message[] = page.messages.map((message) => ({
+        id: message.event_id || genMessageId(),
+        role: message.role === "user" ? "user" : "agent",
+        content: message.content,
+        traceId: message.trace_id || "",
+        threadId: tid,
+        actionCards: message.action_cards || [],
+        toolCalls: message.tool_calls.map((call) => ({
+          id: call.tool_call_id,
+          name: call.name,
+          params: call.params || {},
+          status: normalizeToolCallStatus(call.status),
+          result: call.result === undefined || call.result === null
+            ? undefined
+            : typeof call.result === "string" ? call.result : JSON.stringify(call.result),
+        })),
+      }));
+      prevMsgCountRef.current = loaded.length;
+      setUnreadCount(0);
+      setMessages(loaded);
       setHistoryCursor(page.next_cursor);
       setHasMoreHistory(page.has_more);
     } catch (reason) {
@@ -347,13 +374,26 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
     }
   }, []);
 
-  // 组件挂载时始终以服务端历史为准恢复已有线程，避免本地残缺流式状态覆盖真实结果。
+  // 启动时从服务器获取唯一长期 Thread：三端共用同一 ID，本地缓存仅用于展示加速。
   useEffect(() => {
-    const tid = stored.threadId;
-    if (tid) {
-      void loadRemoteMessages(tid);
-    }
-  }, [loadRemoteMessages, stored.threadId]);
+    let disposed = false;
+    const bootstrap = async () => {
+      try {
+        const conversation = await getCurrentConversation();
+        if (disposed) return;
+        setThreadId(conversation.thread_id);
+        await loadRemoteMessages(conversation.thread_id);
+        if (disposed) return;
+        applyExecutionStatus(await getExecutionStatus(conversation.thread_id));
+      } catch (reason) {
+        if (!disposed) {
+          setError(reason instanceof Error ? reason.message : "当前对话获取失败");
+        }
+      }
+    };
+    void bootstrap();
+    return () => { disposed = true; };
+  }, [applyExecutionStatus, loadRemoteMessages]);
 
   const loadOlderMessages = useCallback(async () => {
     if (!threadId || historyCursor === null || loadingHistory) return;
@@ -446,6 +486,14 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
                 return [...prev, newMsg];
               });
             }
+          } else if (msg.type === "execution_status" && msg.data) {
+            const status = msg.data as ExecutionStatus;
+            const wasRemote = remoteRunningRef.current;
+            applyExecutionStatus(status);
+            if (status.state === "idle" && wasRemote) {
+              // 其他设备本轮结束后，以服务器历史为准刷新最终内容。
+              void loadRemoteMessages(String(status.thread_id || threadId));
+            }
           } else if (msg.type === "maintenance_report" && msg.data?.operation_id && msg.data?.card) {
             const operationId = String(msg.data.operation_id);
             const terminalCard = msg.data.card as ActionCard;
@@ -525,7 +573,7 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
       ws?.close();
       if (reconnectTimer) clearTimeout(reconnectTimer);
     };
-  }, [threadId]);
+  }, [applyExecutionStatus, loadRemoteMessages, threadId]);
 
   /** 执行或拒绝服务端冻结的工具调用；客户端永远不回传可篡改的工具参数。 */
   const handleApprovalAction = async (approvalId: string, action: "approve" | "deny") => {
@@ -658,34 +706,23 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
     }
   };
 
-  /** 重置对话上下文 */
-  const handleReset = async () => {
-    if (!window.confirm("确定要清空当前对话上下文吗？")) return;
-    try {
-      await resetThread(threadId);
-      setError(null);
-    } catch {
-      // 本地照常清空（用户意图是开新对话），但如实告知服务端未记录本次重置
-      setError("本地已清空，但服务端重置请求失败（可能后端未启动）");
-    }
-    setThreadId(undefined);
-    prevMsgCountRef.current = 0;
-    setHistoryCursor(null);
-    setHasMoreHistory(false);
-    setUnreadCount(0);
-    setMessages([]);
-    localStorage.removeItem(STORAGE_KEY);
-  };
-
   /** 发送消息并处理流式响应 */
   const handleSend = async () => {
     const text = input.trim();
     if (!text || inFlightRef.current) return;
+    if (execState !== "idle") {
+      // 忙状态下的消息不排队、不落库：明确提示，保留用户输入。
+      setError(execState === "busy" ? "后台任务正在处理中，请稍候" : "Agent 正在回复，请稍候");
+      return;
+    }
 
     inFlightRef.current = true;
     setInput("");
     setError(null);
     setLoading(true);
+    setExecState("running");
+    setRemoteRunning(false);
+    activeTurnRecordIdRef.current = undefined;
 
     // 构造用户消息
     const userMsg: Message = {
@@ -717,6 +754,7 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
         // onStarted：Turn 已持久化后立即记录真实线程 ID，供首次对话断流恢复。
         (event) => {
           activeStreamThreadIdRef.current = event.thread_id;
+          activeTurnRecordIdRef.current = event.turn_record_id || undefined;
           setThreadId(event.thread_id);
           setMessages((prev) => prev.map((message) => (
             message.id === userMsg.id || message.id === placeholderMsg.id
@@ -778,7 +816,14 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
         ac.signal,
       );
 
-      if (ac.signal.aborted) {
+      if (result.cancelled) {
+        // 服务端已完成取消收口：本轮用户消息不进入历史，本地同步移除并恢复服务器历史。
+        setMessages((prev) => prev.filter(
+          (message) => message.id !== userMsg.id && message.id !== placeholderMsg.id,
+        ));
+        setError(null);
+        if (threadId) await loadRemoteMessages(threadId);
+      } else if (ac.signal.aborted) {
         // 用户主动中断：将未完成的工具调用标记为已停止，并清理空占位气泡
         setMessages((prev) => prev.flatMap((message) => {
           if (message.id !== placeholderMsg.id) return [message];
@@ -881,6 +926,27 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
       inFlightRef.current = false;
       setLoading(false);
       abortRef.current = null;
+      // 本轮已结束：服务端广播会给出最终状态（可能随后进入后台占用），
+      // 这里先恢复可发送，避免 WS 未连接时按钮永久卡在停止。
+      setExecState("idle");
+    }
+  };
+
+  /** 停止：走服务端中断（持久化取消信号），不 abort 本地流，等收口广播。 */
+  const handleStop = async () => {
+    if (!threadId || stopping) return;
+    setStopping(true);
+    setError(null);
+    try {
+      const result = await interruptTurn(threadId, activeTurnRecordIdRef.current);
+      if (result.status === "idle" || result.status === "completed" || result.status === "cancelled") {
+        setExecState("idle");
+        activeTurnRecordIdRef.current = undefined;
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "中断请求失败");
+    } finally {
+      setStopping(false);
     }
   };
 
@@ -907,15 +973,6 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
             <span className="text-[11px] font-mono text-faint">thread:{threadId.slice(0, 8)}</span>
           )}
         </div>
-        {messages.length > 0 && (
-          <button
-            onClick={handleReset}
-            disabled={loading}
-            className="text-xs text-faint hover:text-danger transition-colors px-2 py-1 rounded hover:bg-danger-soft disabled:opacity-30"
-          >
-            清空上下文
-          </button>
-        )}
       </div>
 
       {/* 消息列表区域：占满剩余高度并独立滚动 */}
@@ -1195,6 +1252,19 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
           </div>
         )}
 
+        {/* 执行状态提示：其他设备正在回复 / 后台占用（不可中断） */}
+        {execState !== "idle" && (
+          <div className="mb-2 flex items-center justify-between rounded-lg border border-divider bg-background px-3 py-2 text-xs text-muted">
+            <span className="inline-flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
+              {execState === "busy"
+                ? "后台任务处理中，请稍候…"
+                : remoteRunning ? "Agent 正在其他设备回复…" : "Agent 正在回复…"}
+            </span>
+            {execState === "running" && <span className="text-faint">点击停止可中断</span>}
+          </div>
+        )}
+
         {/* 输入区域 */}
         <div className="flex gap-2 items-end">
           <textarea
@@ -1205,18 +1275,24 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
             placeholder="输入消息...（Enter 发送，Shift+Enter 换行）"
-            disabled={loading}
+            disabled={loading || execState !== "idle"}
             className="flex-1 resize-none rounded-xl border border-divider bg-surface px-4 py-2.5 text-sm text-content placeholder-faint focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary-soft disabled:opacity-50 shadow-sm leading-relaxed max-h-40 overflow-y-auto"
           />
-          {loading ? (
+          {execState === "running" ? (
             <button
-              onClick={() => {
-                setError(null);
-                abortRef.current?.abort();
-              }}
-              className="rounded-xl bg-danger px-6 py-2.5 text-sm font-medium text-on-primary hover:bg-danger-hover active:scale-95 transition-all shadow-sm"
+              onClick={handleStop}
+              disabled={stopping}
+              className="rounded-xl bg-danger px-6 py-2.5 text-sm font-medium text-on-primary hover:bg-danger-hover active:scale-95 disabled:opacity-60 transition-all shadow-sm"
             >
-              停止
+              {stopping ? "停止中…" : "停止"}
+            </button>
+          ) : execState === "busy" ? (
+            <button
+              type="button"
+              disabled
+              className="rounded-xl bg-muted px-6 py-2.5 text-sm font-medium text-on-primary opacity-60 cursor-not-allowed shadow-sm"
+            >
+              处理中
             </button>
           ) : (
             <button

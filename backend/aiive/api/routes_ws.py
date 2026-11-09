@@ -8,6 +8,7 @@ from aiive.api.routes_notifications import count_pending_notifications
 from aiive.auth.guard import authenticate_websocket
 from aiive.api.ws_manager import GLOBAL_THREAD_ID, ws_manager
 from aiive.db.base import SessionLocal
+from aiive.runtime.conversation_state import describe_execution_status
 
 router = APIRouter()
 
@@ -45,6 +46,18 @@ async def websocket_endpoint(ws: WebSocket, thread_id: str):
                 ensure_ascii=False,
             )
             await ws.send_text(snapshot)
+        else:
+            # 断线重连/首次连接即同步当前执行状态，避免其他设备正在生成时
+            # 本端仍显示可发送。
+            status_db = SessionLocal()
+            try:
+                status_payload = describe_execution_status(status_db, thread_id)
+            finally:
+                status_db.close()
+            await ws.send_text(json.dumps(
+                {"type": "execution_status", "data": status_payload},
+                ensure_ascii=False,
+            ))
         # 保持连接，接收客户端消息（心跳等）
         while True:
             await ws.receive_text()

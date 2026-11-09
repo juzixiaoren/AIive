@@ -43,6 +43,7 @@ from aiive.runtime.agent_graph import (
     AgentGraphResult,
     GraphExecutionInterrupted,
     ToolRecord,
+    TurnCancelled,
     flatten_tool_result,
 )
 from aiive.runtime.context_assembler import (
@@ -54,8 +55,11 @@ from aiive.runtime.context_budget import ContextBudget
 from aiive.runtime.epoch_manager import EpochManager
 from aiive.runtime.execution_context import TurnExecutionContext
 from aiive.runtime.thread_bootstrap import ThreadBootstrapService
+from aiive.runtime.conversation_state import (
+    broadcast_execution_status,
+    get_current_thread_id,
+)
 from aiive.runtime.thread_lease import (
-    FOREGROUND_WAIT_SECONDS,
     OWNER_TURN,
     TURN_LEASE_SECONDS,
     acquire_thread_lease,
@@ -80,6 +84,11 @@ def _compute_request_fingerprint(message: str, thread_id: str | None) -> str:
         "thread_id": thread_id or "",
     }, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
+def _as_aware(value: datetime) -> datetime:
+    """SQLite 读回的时间可能无时区；统一补 UTC 后再比较。"""
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
 def _next_turn_sequence(db: Session, thread_id: str) -> int:
@@ -306,6 +315,7 @@ class TurnExecutionService:
                 "type": "started",
                 "thread_id": turn.thread_id,
                 "turn_id": turn.turn_id,
+                "turn_record_id": turn.id,
                 "trace_id": trace_id,
             }
         except (asyncio.CancelledError, GeneratorExit):
@@ -367,6 +377,19 @@ class TurnExecutionService:
             yield {"type": "error", "error": "internal_error", "trace_id": trace_id}
             return
 
+        # 取消可能在上游（上下文加载）期间到达：进入图执行前先收口。
+        if await asyncio.to_thread(self._is_cancel_requested, turn.id):
+            heartbeat.stop()
+            if self._finalize_cancelled_turn(turn, execution_id, trace_id, []):
+                yield {
+                    "type": "cancelled",
+                    "thread_id": turn.thread_id,
+                    "turn_id": turn.turn_id,
+                    "turn_record_id": turn.id,
+                    "reason": "user_interrupt",
+                }
+            return
+
         # ── Phase 2: 流式图执行 ──
         graph_db = SessionLocal()
         try:
@@ -375,11 +398,31 @@ class TurnExecutionService:
 
             async for event in graph._execute_graph_stream(  # pyright: ignore[reportPrivateUsage]
                 message=message, exec_ctx=exec_ctx, ctx_bundle=ctx_bundle,
+                cancel_check=lambda: self._is_cancel_requested(turn.id),
             ):
                 if event.get("type") == "__graph_result__":
                     ag_result = event["result"]
                 else:
                     yield event
+        except TurnCancelled as cancelled:
+            heartbeat.stop()
+            try:
+                finalized = self._finalize_cancelled_turn(
+                    turn, execution_id, cancelled.trace_id, cancelled.tool_records,
+                )
+            except Exception:
+                logger.exception("取消收口失败: turn_record_id=%s", turn.id)
+                yield {"type": "error", "error": "internal_error", "trace_id": trace_id}
+                return
+            if finalized:
+                yield {
+                    "type": "cancelled",
+                    "thread_id": turn.thread_id,
+                    "turn_id": turn.turn_id,
+                    "turn_record_id": turn.id,
+                    "reason": "user_interrupt",
+                }
+            return
         except (asyncio.CancelledError, GeneratorExit):
             heartbeat.stop()
             self._mark_turn_interrupted_safely(turn.id, execution_id, "graph_execution_cancelled")
@@ -452,6 +495,20 @@ class TurnExecutionService:
             response = await asyncio.to_thread(
                 self._finalize_turn, turn, execution_id, ag_result, heartbeat, assembled_ctx,
             )
+        except TurnCancelled as cancelled:
+            heartbeat.stop()
+            finalized = self._finalize_cancelled_turn(
+                turn, execution_id, cancelled.trace_id, cancelled.tool_records,
+            )
+            if finalized:
+                yield {
+                    "type": "cancelled",
+                    "thread_id": turn.thread_id,
+                    "turn_id": turn.turn_id,
+                    "turn_record_id": turn.id,
+                    "reason": "user_interrupt",
+                }
+            return
         except FencingViolationError:
             heartbeat.stop()
             yield {"type": "error", "error": "lease_lost"}
@@ -482,112 +539,50 @@ class TurnExecutionService:
     def _resolve_and_preempt(
         self, message: str, thread_id: str | None, turn_id: str | None,
     ) -> tuple[TurnRecord, str, int]:
+        """取得线程占用并把 Turn 置为 running；忙则立刻失败且不落任何业务行。
+
+        顺序（关键）：幂等检查（只读）→ 用预生成 TurnRecord ID 抢占线程租约
+        → 持久化 TurnRecord + user_message Event → 原子置 running。前台请求
+        不等待其他 Turn：拿不到占用直接返回 busy，输入不排队、不入库。
+        """
         turn_id = turn_id or str(_uuid.uuid4())
-        fingerprint = _compute_request_fingerprint(message, thread_id)
+        # 后端是 Thread ID 的唯一事实来源：缺省 thread_id 时解析到
+        # ConversationState 指针，绝不隐式创建新的长期 Thread。
+        if not thread_id:
+            conv_db = SessionLocal()
+            try:
+                thread_id = get_current_thread_id(conv_db)
+            finally:
+                conv_db.close()
         committed_tid = ThreadBootstrapService.ensure_committed_thread(thread_id)
+        # 指纹必须用解析后的线程计算：同一 turn_id 在不同入口（缺省/显式
+        # thread_id）重试时才能命中幂等，不会误判为 idempotency_key_mismatch。
+        fingerprint = _compute_request_fingerprint(message, committed_tid)
         execution_id = str(_uuid.uuid4())
+        # 预生成主键：租约 owner_id 必须先于任何持久化确定下来，才能保证
+        # “占用成功 → 写 Turn/消息”之间没有第三条路径插入。
+        turn_record_id = str(_uuid.uuid4())
 
-        # ── Short transaction: Thread row lock + epoch/segment attribution ──
+        # ── 幂等检查（只读；未取得占用前不产生任何业务行） ──
         db = SessionLocal()
-        turn_record_id = ""
         try:
-            # Ensure Thread row exists (lazy creation if needed)
-            existing_thread = db.get(Thread, committed_tid)
-            if existing_thread is None:
-                existing_thread = Thread(id=committed_tid)
-                db.add(existing_thread)
-                db.flush()
-            # Lock Thread row for epoch/segment serialization
-            locked_thread = db.query(Thread).with_for_update().filter(Thread.id == committed_tid).one()
-            # 记录线程活动时间：Idle Scanner / epoch_manager 依赖该字段判定空闲。
-            # 与 Turn 创建同一事务提交（_finalize_turn 也会再次更新，双保险）。
-            locked_thread.last_activity_at = datetime.now(timezone.utc)
-
             existing = db.query(TurnRecord).filter(
                 TurnRecord.thread_id == committed_tid,
                 TurnRecord.turn_id == turn_id,
             ).first()
-
-            if existing is None:
-                # Attribute epoch/segment（在 Thread 行锁保护下计算递增 turn_sequence）
-                try:
-                    next_seq = _next_turn_sequence(db, committed_tid)
-                    epoch, segment = self._epoch_mgr.ensure_epoch_and_segment(
-                        db, committed_tid, next_seq,
-                    )
-                except IntegrityError:
-                    # 并发请求已创建 epoch/segment：回滚后在新事务中重读；
-                    # 若重读不到（并发方又回滚等极端情况），重新走
-                    # ensure_epoch_and_segment，保证新 Turn 必有 epoch/segment 归属。
-                    db.rollback()
-                    db.close()
-                    db = SessionLocal()
-                    locked_thread = db.query(Thread).with_for_update().filter(Thread.id == committed_tid).one()
-                    locked_thread.last_activity_at = datetime.now(timezone.utc)
-                    next_seq = _next_turn_sequence(db, committed_tid)
-                    epoch = db.query(Epoch).filter(Epoch.thread_id == committed_tid, Epoch.status == "active").first()
-                    segment = None
-                    if epoch is not None:
-                        segment = db.query(Segment).filter(Segment.epoch_id == epoch.id, Segment.status == "open").first()
-                    if epoch is None or segment is None:
-                        epoch, segment = self._epoch_mgr.ensure_epoch_and_segment(
-                            db, committed_tid, next_seq,
-                        )
-
-                turn = TurnRecord(
-                    thread_id=committed_tid,
-                    turn_id=turn_id,
-                    turn_sequence=next_seq,
-                    status="not_started",
-                    attempt_no=1,
-                    request_fingerprint=fingerprint,
-                    epoch_id=epoch.id if epoch else None,
-                    segment_id=segment.id if segment else None,
-                    # 显式记录消息来源，避免取默认 'user' 后与 user_message 事件的
-                    # message_source 不一致（runtime_event 提醒被误判为普通用户消息）。
-                    source=self._message_source.value,
-                )
-                event_id = str(_uuid.uuid4())
-                event = Event(
-                    id=event_id, thread_id=committed_tid, turn_id=turn_id,
-                    turn_event_index=0, trace_id="", event_type="user_message",
-                    payload={
-                        "content": message,
-                        "message_source": self._message_source.value,
-                    },
-                )
-                db.add(turn)
-                db.add(event)
-                db.flush()
-                turn.request_event_id = event.id
-                # 记忆冲突待确认：若该 Thread 有未决冲突，把本轮用户消息作为
-                # "对澄清问题的回复"入队后台解析（与用户消息事件同事务提交，
-                # 进程重启也不会丢失"回复—案例"关联）。仅真实用户消息参与。
-                if self._message_source is MessageSource.USER:
-                    try:
-                        from aiive.memory.conflict_confirmation import MemoryConflictService
-
-                        MemoryConflictService.enqueue_reply_jobs(
-                            db,
-                            thread_id=committed_tid,
-                            user_message=message,
-                            turn_id=turn_id,
-                            turn_record_id=turn.id,
-                            source_event_ids=[event.id],
-                        )
-                    except Exception:
-                        logger.exception("记忆冲突回复入队失败（不影响本轮对话）")
-                db.commit()
-                db.refresh(turn)
-                turn_record_id = turn.id
-            else:
-                # Existing Turn logic unchanged
+            if existing is not None:
                 if existing.status == "completed":
                     if existing.request_fingerprint != fingerprint:
                         raise TurnConflictError("idempotency_key_mismatch")
                     raise TurnConflictError("turn_cached")
+                if existing.status == "cancelled":
+                    # 被取消的输入已从历史中丢弃，同一 turn_id 不复活执行。
+                    raise TurnConflictError("turn_cancelled")
                 if existing.status == "running":
-                    if existing.lease_expires_at and existing.lease_expires_at > datetime.now(timezone.utc):
+                    if (
+                        existing.lease_expires_at is not None
+                        and _as_aware(existing.lease_expires_at) > datetime.now(timezone.utc)
+                    ):
                         raise TurnConflictError("turn_in_progress")
                     self._mark_interrupted(db, existing.id, existing.execution_id or "")
                     db.commit()
@@ -597,27 +592,28 @@ class TurnExecutionService:
                 if existing.status == "not_started":
                     if existing.request_fingerprint != fingerprint:
                         raise TurnConflictError("idempotency_key_mismatch")
-                    existing.attempt_no = (existing.attempt_no or 1) + 1
-                    db.commit()
                     turn_record_id = existing.id
         finally:
             db.close()
 
-        # ── Thread-level mutual exclusion (V57) ──
-        # “检查没有活跃 Turn → 调用 LLM”之间仍有窗口：后台目标决策可能在检查
-        # 通过后立刻开始。这里用持久化租约做真正的互斥——前台 Turn 与后台决策
-        # 抢占同一行，后台持有时前台短暂让路（用户消息已在上面的短事务里落库，
-        # 不会丢失输入）。超过等待上限仍未拿到占用则返回既有可重试冲突，
-        # 前端按 202 契约重试同一 turn_id 即可继续，不会产生第二条用户消息。
+        # ── 线程级占用：立即尝试（wait_seconds=0），不等待任何其他 Turn ──
         lease = acquire_thread_lease(
             committed_tid,
             owner_kind=OWNER_TURN,
             owner_id=turn_record_id,
             ttl_seconds=TURN_LEASE_SECONDS,
-            wait_seconds=FOREGROUND_WAIT_SECONDS,
         )
         if lease is None:
             raise TurnConflictError("turn_in_progress")
+
+        try:
+            turn_record_id = self._persist_started_turn(
+                committed_tid, turn_id, fingerprint, turn_record_id, message,
+            )
+        except BaseException:
+            # 占用已取得但持久化失败：必须交还，否则后台决策被阻塞到租约过期。
+            self._release_lease_quietly(committed_tid, turn_record_id)
+            raise
 
         # ── Atomic preemption ──
         db2 = SessionLocal()
@@ -657,9 +653,131 @@ class TurnExecutionService:
                 epoch_id=turn.epoch_id, segment_id=turn.segment_id,
                 source=turn.source,
             )
-            return result, execution_id, lease.fencing_token
         finally:
             db3.close()
+
+        broadcast_execution_status(committed_tid)
+        return result, execution_id, lease.fencing_token
+
+    def _persist_started_turn(
+        self,
+        thread_id: str,
+        turn_id: str,
+        fingerprint: str,
+        turn_record_id: str,
+        message: str,
+    ) -> str:
+        """在已持有租约的前提下持久化 TurnRecord 与 user_message 事件。
+
+        只处理 not_started（新建或崩溃遗留），其余状态一律视为冲突；
+        任何异常都向上抛出，由调用方交还租约。
+        """
+        db = SessionLocal()
+        try:
+            # Lock Thread row for epoch/segment serialization
+            locked_thread = db.query(Thread).with_for_update().filter(Thread.id == thread_id).one()
+            # 记录线程活动时间：Idle Scanner / epoch_manager 依赖该字段判定空闲。
+            locked_thread.last_activity_at = datetime.now(timezone.utc)
+
+            existing = db.query(TurnRecord).filter(
+                TurnRecord.thread_id == thread_id,
+                TurnRecord.turn_id == turn_id,
+            ).first()
+            if existing is not None:
+                if existing.status != "not_started":
+                    raise TurnConflictError("preemption_failed")
+                # 崩溃遗留的未启动 Turn：续跑同一行，不重复写用户消息。
+                existing.attempt_no = (existing.attempt_no or 1) + 1
+                db.commit()
+                return existing.id
+
+            try:
+                next_seq = _next_turn_sequence(db, thread_id)
+                epoch, segment = self._epoch_mgr.ensure_epoch_and_segment(
+                    db, thread_id, next_seq,
+                )
+            except IntegrityError:
+                # 并发方已创建 epoch/segment：回滚后在新事务中重读；若仍缺失则重试。
+                db.rollback()
+                db.close()
+                db = SessionLocal()
+                locked_thread = db.query(Thread).with_for_update().filter(Thread.id == thread_id).one()
+                locked_thread.last_activity_at = datetime.now(timezone.utc)
+                next_seq = _next_turn_sequence(db, thread_id)
+                epoch = db.query(Epoch).filter(Epoch.thread_id == thread_id, Epoch.status == "active").first()
+                segment = None
+                if epoch is not None:
+                    segment = db.query(Segment).filter(Segment.epoch_id == epoch.id, Segment.status == "open").first()
+                if epoch is None or segment is None:
+                    epoch, segment = self._epoch_mgr.ensure_epoch_and_segment(
+                        db, thread_id, next_seq,
+                    )
+
+            turn = TurnRecord(
+                id=turn_record_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                turn_sequence=next_seq,
+                status="not_started",
+                attempt_no=1,
+                request_fingerprint=fingerprint,
+                epoch_id=epoch.id if epoch else None,
+                segment_id=segment.id if segment else None,
+                # 显式记录消息来源，避免取默认 'user' 后与 user_message 事件的
+                # message_source 不一致（runtime_event 提醒被误判为普通用户消息）。
+                source=self._message_source.value,
+            )
+            event = Event(
+                id=str(_uuid.uuid4()), thread_id=thread_id, turn_id=turn_id,
+                turn_event_index=0, trace_id="", event_type="user_message",
+                payload={
+                    "content": message,
+                    "message_source": self._message_source.value,
+                },
+            )
+            db.add(turn)
+            db.add(event)
+            db.flush()
+            turn.request_event_id = event.id
+            # 记忆冲突待确认：若该 Thread 有未决冲突，把本轮用户消息作为
+            # "对澄清问题的回复"入队后台解析（与用户消息事件同事务提交）。
+            # 取消收口时必须一并撤销这些任务（见 _finalize_cancelled_turn）。
+            if self._message_source is MessageSource.USER:
+                try:
+                    from aiive.memory.conflict_confirmation import MemoryConflictService
+
+                    MemoryConflictService.enqueue_reply_jobs(
+                        db,
+                        thread_id=thread_id,
+                        user_message=message,
+                        turn_id=turn_id,
+                        turn_record_id=turn.id,
+                        source_event_ids=[event.id],
+                    )
+                except Exception:
+                    logger.exception("记忆冲突回复入队失败（不影响本轮对话）")
+            db.commit()
+            return turn.id
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    @staticmethod
+    def _release_lease_quietly(thread_id: str, turn_record_id: str) -> None:
+        """持久化失败/异常路径交还租约；失败只记录，不掩盖原始异常。"""
+        db = SessionLocal()
+        try:
+            release_thread_lease(
+                db, thread_id, owner_kind=OWNER_TURN, owner_id=turn_record_id,
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("交还线程占用失败: thread_id=%s turn=%s", thread_id, turn_record_id)
+        finally:
+            db.close()
 
     def _load_cached_response(
         self, thread_id: str | None, turn_id: str | None,
@@ -667,8 +785,10 @@ class TurnExecutionService:
         """加载已完成 Turn 的缓存响应载荷（幂等重放）。"""
         db = SessionLocal()
         try:
+            # 缺省 thread_id 同样解析到唯一当前对话，绝不隐式新建 Thread。
+            resolved_tid = thread_id or get_current_thread_id(db)
             existing = db.query(TurnRecord).filter(
-                TurnRecord.thread_id == ThreadBootstrapService.ensure_committed_thread(thread_id),
+                TurnRecord.thread_id == ThreadBootstrapService.ensure_committed_thread(resolved_tid),
                 TurnRecord.turn_id == (turn_id or ""),
             ).first()
             if existing is not None and existing.response_payload:
@@ -679,27 +799,61 @@ class TurnExecutionService:
 
     def _mark_interrupted(
         self, db: Session, turn_record_id: str, execution_id: str,
-        thread_id: str | None = None,
     ) -> None:
-        affected = db.query(TurnRecord).filter(
+        query = db.query(TurnRecord).filter(
             TurnRecord.id == turn_record_id,
-            TurnRecord.execution_id == execution_id,
             TurnRecord.status == "running",
+        )
+        if execution_id:
+            # 遗留行可能没有 execution_id：此时只按主键 + running 收口。
+            query = query.filter(TurnRecord.execution_id == execution_id)
+        row = query.one_or_none()
+        if row is None:
+            return
+        now = datetime.now(timezone.utc)
+        if row.cancel_requested_at is not None:
+            # 中断（断流/进程异常）时若已有中止请求，按 cancelled 收口：
+            # 用户消息同样必须从历史与后续上下文中丢弃。
+            row.status = "cancelled"
+            self._scrub_request_event(db, row)
+            self._cancel_pending_conflict_jobs(db, row.turn_id, now)
+        else:
+            row.status = "interrupted_unknown"
+        row.lease_expires_at = None
+        row.last_heartbeat_at = None
+        row.updated_at = now
+        # 中断即交还线程级占用：后台目标决策不必等到租约自然过期。
+        release_thread_lease(
+            db, row.thread_id, owner_kind=OWNER_TURN, owner_id=row.id,
+        )
+
+    @staticmethod
+    def _scrub_request_event(db: Session, turn: TurnRecord) -> None:
+        """清除被取消轮次的用户消息正文（保留行与 ID 供审计/外键引用）。"""
+        if not turn.request_event_id:
+            return
+        event = db.get(Event, turn.request_event_id)
+        if event is None:
+            return
+        payload = dict(event.payload or {})
+        payload.update({"content": "", "redacted": True, "cancelled": True})
+        event.payload = payload
+
+    @staticmethod
+    def _cancel_pending_conflict_jobs(db: Session, turn_id: str, now: datetime) -> None:
+        """撤销本轮提前入队的记忆冲突回复任务，避免取消的输入继续写记忆。"""
+        from aiive.memory.conflict_confirmation import JOB_CONFLICT_REPLY
+
+        db.query(OutboxJob).filter(
+            OutboxJob.job_type == JOB_CONFLICT_REPLY,
+            OutboxJob.status.in_(("pending", "running")),
+            OutboxJob.operation_id.like(f"conflict_reply:%:{turn_id}"),
         ).update({
-            TurnRecord.status: "interrupted_unknown",
-            TurnRecord.lease_expires_at: None,
-            TurnRecord.updated_at: datetime.now(timezone.utc),
+            OutboxJob.status: "cancelled",
+            OutboxJob.terminal_reason: "turn_cancelled",
+            OutboxJob.terminal_at: now,
+            OutboxJob.updated_at: now,
         }, synchronize_session=False)
-        if affected:
-            if thread_id is None:
-                thread_id = db.query(TurnRecord.thread_id).filter(
-                    TurnRecord.id == turn_record_id,
-                ).scalar()
-            if thread_id:
-                # 中断即交还线程级占用：后台目标决策不必等到租约自然过期。
-                release_thread_lease(
-                    db, str(thread_id), owner_kind=OWNER_TURN, owner_id=turn_record_id,
-                )
 
     def _mark_turn_interrupted_safely(
         self, turn_record_id: str, execution_id: str, stage: str,
@@ -717,9 +871,41 @@ class TurnExecutionService:
                 "标记流式 Turn 中断失败: turn_record_id=%s execution_id=%s stage=%s",
                 turn_record_id, execution_id, stage,
             )
+            return
         finally:
             if db is not None:
                 db.close()
+        thread_id = self._turn_thread_id(turn_record_id)
+        if thread_id:
+            broadcast_execution_status(thread_id)
+
+    @staticmethod
+    def _is_cancel_requested(turn_record_id: str) -> bool:
+        """读取持久化取消信号；查询失败按未取消处理（不打断正常生成）。"""
+        db = SessionLocal()
+        try:
+            value = db.query(TurnRecord.cancel_requested_at).filter(
+                TurnRecord.id == turn_record_id,
+            ).scalar()
+            return value is not None
+        except Exception:
+            logger.exception("读取取消信号失败: turn=%s", turn_record_id)
+            return False
+        finally:
+            db.close()
+
+    @staticmethod
+    def _turn_thread_id(turn_record_id: str) -> str | None:
+        db = SessionLocal()
+        try:
+            return db.query(TurnRecord.thread_id).filter(
+                TurnRecord.id == turn_record_id,
+            ).scalar()
+        except Exception:
+            logger.exception("查询 Turn 线程失败: turn=%s", turn_record_id)
+            return None
+        finally:
+            db.close()
 
     def _persist_interrupted_tool_facts(
         self,
@@ -729,6 +915,7 @@ class TurnExecutionService:
         tool_records: list[ToolRecord],
     ) -> None:
         """原子保存流式中断前完成的工具事实，并将 Turn 标记为中断。"""
+        thread_id = turn.thread_id
         db = SessionLocal()
         try:
             affected = db.query(TurnRecord).filter(
@@ -777,6 +964,101 @@ class TurnExecutionService:
             raise
         finally:
             db.close()
+        broadcast_execution_status(thread_id)
+
+
+    def _finalize_cancelled_turn(
+        self,
+        turn: TurnRecord,
+        execution_id: str,
+        trace_id: str,
+        tool_records: list[ToolRecord],
+    ) -> bool:
+        """取消收口：标记 cancelled、丢弃用户消息、保留工具事实、原子释放占用。
+
+        不做正常 _finalize_turn 的任何事：不写 llm_response/chat_ended、
+        不轮转快照、不入队记忆抽取。返回 False 表示 Turn 已不在 running
+        （已正常完成或已被其他路径收口），调用方不得覆盖既有结果。
+        """
+        thread_id = turn.thread_id
+        turn_id = turn.turn_id
+        db = SessionLocal()
+        try:
+            now = datetime.now(timezone.utc)
+            affected = db.query(TurnRecord).filter(
+                TurnRecord.id == turn.id,
+                TurnRecord.execution_id == execution_id,
+                TurnRecord.status == "running",
+            ).update({
+                TurnRecord.status: "cancelled",
+                TurnRecord.lease_expires_at: None,
+                TurnRecord.last_heartbeat_at: None,
+                TurnRecord.updated_at: now,
+            }, synchronize_session=False)
+            if affected != 1:
+                db.rollback()
+                logger.info(
+                    "取消收口跳过（Turn 已不在 running）: turn_record_id=%s exec=%s",
+                    turn.id, execution_id,
+                )
+                return False
+
+            # 中断前已完成的工具调用是真实副作用凭证，如实保留，不伪装回滚。
+            max_index = db.query(func.max(Event.turn_event_index)).filter(
+                Event.thread_id == thread_id,
+                Event.turn_id == turn_id,
+            ).scalar()
+            idx = int(max_index or 0) + 1
+            for record in tool_records:
+                db.add(Event(
+                    id=str(_uuid.uuid4()), trace_id=trace_id,
+                    thread_id=thread_id, event_type="tool_call",
+                    turn_id=turn_id, turn_event_index=idx,
+                    payload={
+                        "name": record.name, "params": record.params,
+                        "tool_call_id": record.tool_call_id,
+                        "batch_index": record.batch_index,
+                        "interrupted": True, "cancelled": True,
+                    },
+                ))
+                idx += 1
+                db.add(Event(
+                    id=str(_uuid.uuid4()), trace_id=trace_id,
+                    thread_id=thread_id, event_type="tool_result",
+                    turn_id=turn_id, turn_event_index=idx,
+                    payload={
+                        "name": record.name, "result": record.result,
+                        "status": record.status,
+                        "tool_call_id": record.tool_call_id,
+                        "batch_index": record.batch_index,
+                        "interrupted": True, "cancelled": True,
+                    },
+                ))
+                idx += 1
+
+            row = db.get(TurnRecord, turn.id)
+            if row is not None:
+                self._scrub_request_event(db, row)
+                self._cancel_pending_conflict_jobs(db, row.turn_id, now)
+
+            # 取消完成后才原子释放锁：请求到达时不提前释放，避免新 Turn 在
+            # Agent 尚未真正停止时插入。
+            release_thread_lease(
+                db, thread_id, owner_kind=OWNER_TURN, owner_id=turn.id,
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception(
+                "取消 Turn 收口失败: turn_record_id=%s execution_id=%s",
+                turn.id, execution_id,
+            )
+            raise
+        finally:
+            db.close()
+
+        broadcast_execution_status(thread_id)
+        return True
 
     # =====================================================================
     # Phase 5: Finalize (with snapshot rotation)
@@ -791,6 +1073,9 @@ class TurnExecutionService:
         if heartbeat.lease_lost:
             raise FencingViolationError("lease lost")
 
+        # commit 会 expire ORM 属性；广播发生在会话关闭之后，必须先固化标量。
+        thread_id = turn.thread_id
+
         # 同步抽取路径会提前生成 assistant 回复事件的真实 Event.id 并传入，
         # 以保证记忆 provenance 与 finalize 持久化事件一致；其余路径在此生成。
         if not assistant_event_id:
@@ -798,6 +1083,18 @@ class TurnExecutionService:
 
         db = SessionLocal()
         try:
+            # 取消与完成收口的竞态：取消信号已落库就必须走取消路径，
+            # 不能把本轮标成 completed 或产生记忆抽取任务。
+            cancel_value = db.query(TurnRecord.cancel_requested_at).filter(
+                TurnRecord.id == turn.id,
+            ).scalar()
+            if cancel_value is not None:
+                raise TurnCancelled(
+                    trace_id=ag_result.trace_id,
+                    partial_reply=ag_result.reply,
+                    tool_records=ag_result.tool_records,
+                )
+
             now = datetime.now(timezone.utc)
             response_dict = ChatResponse(
                 reply=ag_result.reply,
@@ -1004,12 +1301,14 @@ class TurnExecutionService:
             )
 
             db.commit()
-            return response_dict
         except Exception:
             db.rollback()
             raise
         finally:
             db.close()
+
+        broadcast_execution_status(thread_id)
+        return response_dict
 
     def _rotate_snapshot(
         self, db: Session, turn: TurnRecord,
@@ -1162,6 +1461,18 @@ class TurnExecutionService:
             )
             return response
 
+        except TurnCancelled as cancelled:
+            # 同步路径没有 token 流，取消只能在收口点感知（流式路径已在
+            # LangGraph 事件循环内逐段检查并提前停止）。
+            self._finalize_cancelled_turn(
+                turn, execution_id, cancelled.trace_id, cancelled.tool_records,
+            )
+            return {
+                "reply": "",
+                "error": "turn_cancelled",
+                "cancelled": True,
+                "_status": 409,
+            }
         except ContextBudgetExceededError as e:
             logger.error("Context budget exceeded: %s", e)
             db = SessionLocal()

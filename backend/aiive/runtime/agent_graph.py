@@ -26,6 +26,7 @@ import hashlib
 import json as _json
 import logging
 import operator
+import time
 import uuid as _uuid
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass, field
@@ -272,6 +273,31 @@ def parse_tool_execution_receipt(content: str) -> ToolExecutionReceipt:
         operation_id=operation_id,
         error_type=error_type,
     )
+
+
+# 流式执行期间检测持久化取消信号的间隔：过密会拖慢 token 流，过疏会增加
+# 取消后的额外模型输出。0.5s 在交互体验与 DB 压力之间取平衡。
+CANCEL_CHECK_INTERVAL_SECONDS = 0.5
+
+
+class TurnCancelled(Exception):
+    """前台 Turn 收到持久化取消信号（cancel_requested_at）。
+
+    与 GraphExecutionInterrupted 区分：取消不是错误，执行链必须停止后续 LLM
+    调用与工具执行，由 Turn 层完成状态收口（丢弃用户消息、保留已完成工具事实）。
+    """
+
+    def __init__(
+        self,
+        *,
+        trace_id: str = "",
+        partial_reply: str = "",
+        tool_records: list["ToolRecord"] | None = None,
+    ) -> None:
+        self.trace_id: str = trace_id
+        self.partial_reply: str = partial_reply
+        self.tool_records: list[ToolRecord] = list(tool_records or [])
+        super().__init__("turn_cancelled")
 
 
 class GraphExecutionInterrupted(Exception):
@@ -1420,6 +1446,7 @@ class AgentGraph:
         self, message: str, exec_ctx: TurnExecutionContext,
         ctx_bundle: Any = None,
         normalizer: "ToolResultNormalizer | None" = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """流式执行图推理，逐渐产出 token / tool_call / tool_result 事件。
 
@@ -1449,8 +1476,38 @@ class AgentGraph:
         decision_filters: dict[str, _DecisionMarkerStreamFilter] = {}
         input_state: dict[str, Any] = {"messages": initial_messages, "tool_records": []}
 
+        def _cancel_snapshot() -> list[ToolRecord]:
+            """取消时的工具事实快照：已进 graph state 的 + 流式已完成的。"""
+            state_records = self._tool_records_from_state(_records_raw)
+            known_ids = {record.tool_call_id for record in state_records if record.tool_call_id}
+            merged = [
+                *state_records,
+                *[
+                    record for record in completed_stream_records
+                    if not record.tool_call_id or record.tool_call_id not in known_ids
+                ],
+            ]
+            for index, record in enumerate(merged):
+                record.order_index = index
+            return merged
+
+        last_cancel_check = 0.0
+        event_stream = compiled.astream_events(input_state, version="v2")
+
         try:
-            async for event in compiled.astream_events(input_state, version="v2"):
+            async for event in event_stream:
+                if cancel_check is not None:
+                    monotonic_now = time.monotonic()
+                    if monotonic_now - last_cancel_check >= CANCEL_CHECK_INTERVAL_SECONDS:
+                        last_cancel_check = monotonic_now
+                        # 取消信号来自持久化字段（跨进程可见），同步 DB 查询
+                        # 不得阻塞事件循环，因此丢到线程池。
+                        if await asyncio.to_thread(cancel_check):
+                            raise TurnCancelled(
+                                trace_id=trace.trace_id,
+                                partial_reply="".join(accumulated),
+                                tool_records=_cancel_snapshot(),
+                            )
                 kind = event["event"]
                 evt_name = event.get("name", "")
                 run_id = str(event.get("run_id", "") or "")
@@ -1580,6 +1637,9 @@ class AgentGraph:
                         "result": content,
                         "status": result_status,
                     }
+        except TurnCancelled:
+            # 取消是主动收口，不是异常：保留已确认工具事实并原样向上传递。
+            raise
         except Exception as error:
             logger.exception(
                 "[TRACE:graph] astream_events 异常: trace_id=%s model=%s partial_tools=%d",
@@ -1603,6 +1663,15 @@ class AgentGraph:
                 partial_reply="".join(accumulated),
                 tool_records=partial_records,
             ) from error
+        finally:
+            # 取消/异常退出时显式关闭事件流，把停止信号传播到 LangGraph 内部，
+            # 停止后续 LLM 调用与工具节点（不能只依赖 GC 回收临时生成器）。
+            closer = getattr(event_stream, "aclose", None)
+            if closer is not None:
+                try:
+                    await closer()
+                except Exception:
+                    logger.debug("关闭 LangGraph 事件流时出现非致命异常", exc_info=True)
 
         reply = "".join(accumulated)
         final_messages: list[Any] = []

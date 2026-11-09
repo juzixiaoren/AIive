@@ -60,10 +60,17 @@ def working_state_snapshot_hash(snapshot: dict[str, Any]) -> str:
 
 
 def build_turn_manifest(db: Session, segment_id: str) -> list[dict[str, Any]]:
-    """Segment 内所有 TurnRecord 的有序清单。"""
+    """Segment 内所有有效 TurnRecord 的有序清单。
+
+    被用户取消的 Turn 不进入密封清单：其用户消息已从历史丢弃，工具事实只作
+    审计凭证保留在事件表中，不应再通过 Segment 摘要回到后续上下文。
+    """
     turns = (
         db.query(TurnRecord)
-        .filter(TurnRecord.segment_id == segment_id)
+        .filter(
+            TurnRecord.segment_id == segment_id,
+            TurnRecord.status != "cancelled",
+        )
         .order_by(TurnRecord.turn_sequence)
         .all()
     )

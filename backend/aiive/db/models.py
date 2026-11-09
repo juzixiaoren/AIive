@@ -180,6 +180,9 @@ class TurnRecord(Base):
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     attempt_no: Mapped[int] = mapped_column(default=1)
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 用户中断请求（持久化取消信号）：Turn 执行链路在安全边界读取该字段后
+    # 停止后续 LLM 调用与工具执行，由执行者自己完成状态收口并释放占用。
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     request_event_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     response_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
@@ -262,6 +265,25 @@ class ThreadExecutionLease(Base):
 
     __table_args__: tuple[Index, ...] = (
         Index("ix_thread_execution_leases_expiry", "lease_expires_at"),
+    )
+
+
+class ConversationState(Base):
+    """单用户单例：唯一长期对话的当前 Thread 指针。
+
+    后端是 Thread ID 的唯一事实来源：所有客户端启动时读取同一行，
+    不接受客户端通过缺省 thread_id 隐式创建新的长期会话。
+    """
+
+    __tablename__: str = "conversation_state"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default="default")
+    current_thread_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("threads.id", ondelete="RESTRICT"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
     )
 
 

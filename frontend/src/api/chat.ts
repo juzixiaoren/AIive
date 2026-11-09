@@ -75,7 +75,7 @@ export async function getThreadMessages(threadId: string, beforeSequence?: numbe
 
 /** SSE 流式事件类型定义 */
 export interface StreamEvent {
-  event: "started" | "token" | "tool_call" | "tool_result" | "done" | "error";
+  event: "started" | "token" | "tool_call" | "tool_result" | "done" | "cancelled" | "error";
   data: Record<string, unknown>;
 }
 
@@ -83,6 +83,8 @@ export interface StreamEvent {
 export interface StreamStartedEvent {
   thread_id: string;
   turn_id: string;
+  /** 服务端 TurnRecord 主键：中断接口必须携带，防止旧停止请求误伤新 Turn。 */
+  turn_record_id: string;
   trace_id: string;
 }
 
@@ -139,6 +141,7 @@ export async function sendMessageStream(
   pending_operations: PendingOperation[];
   tool_calls?: Array<{ tool_call_id: string; name: string; params?: Record<string, unknown>; status?: string }>;
   tool_results?: Array<{ tool_call_id: string; name: string; params?: Record<string, unknown>; result?: unknown; status?: string }>;
+  cancelled?: boolean;
 }> {
   const res = await apiFetch("api/chat/stream", {
     method: "POST",
@@ -159,6 +162,7 @@ export async function sendMessageStream(
   let buffer = "";
   let currentEvent = "";
   let seenDone = false;
+  let seenCancelled = false;
   let result = {
     thread_id: "",
     trace_id: "",
@@ -200,6 +204,7 @@ export async function sendMessageStream(
                 onStarted({
                   thread_id: data.thread_id as string,
                   turn_id: data.turn_id as string,
+                  turn_record_id: (data.turn_record_id as string) || "",
                   trace_id: data.trace_id as string,
                 });
                 break;
@@ -214,6 +219,10 @@ export async function sendMessageStream(
               case "tool_result":
                 // 工具执行结果（含状态：completed / failed）
                 onToolResult(data.tool_call_id as string || "", data.name as string, data.result, data.status as string);
+                break;
+              case "cancelled":
+                // 服务端已完成取消收口：本轮用户消息不再进入历史。
+                seenCancelled = true;
                 break;
               case "done":
                 // 流式传输完成，收集最终结果
@@ -259,11 +268,70 @@ export async function sendMessageStream(
     reader.releaseLock();
   }
 
+  if (seenCancelled) {
+    return { ...result, cancelled: true };
+  }
   if (!signal?.aborted && !seenDone) {
     throw new StreamIncompleteError();
   }
 
   return result;
+}
+
+/** 服务端唯一长期对话的执行状态（由线程级租约派生）。 */
+export interface ExecutionStatus {
+  thread_id: string;
+  state: "idle" | "running" | "busy";
+  cancellable: boolean;
+  interrupting: boolean;
+  owner_kind: string | null;
+  active_turn: {
+    turn_record_id: string | null;
+    turn_id: string | null;
+    started_at: string | null;
+    cancel_requested_at: string | null;
+  } | null;
+}
+
+/** 获取或初始化唯一长期对话的 Thread ID（后端是唯一事实来源）。 */
+export async function getCurrentConversation(): Promise<{ thread_id: string }> {
+  const res = await apiFetch("api/conversation/current");
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`当前对话获取失败 ${res.status}: ${text}`);
+  }
+  return res.json();
+}
+
+/** 查询当前执行状态：idle / running（可中断）/ busy（后台占用）。 */
+export async function getExecutionStatus(threadId?: string): Promise<ExecutionStatus> {
+  const query = threadId ? `?thread_id=${encodeURIComponent(threadId)}` : "";
+  const res = await apiFetch(`api/conversation/status${query}`);
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`执行状态获取失败 ${res.status}: ${text}`);
+  }
+  return res.json();
+}
+
+/** 请求服务端中断前台 Turn；只登记取消信号，锁在执行者收口后释放。 */
+export async function interruptTurn(
+  threadId: string,
+  turnRecordId?: string,
+): Promise<{ ok: boolean; status: string; turn_record_id: string | null }> {
+  const res = await apiFetch("api/conversation/interrupt", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      thread_id: threadId,
+      turn_record_id: turnRecordId ?? null,
+    }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`中断请求失败 ${res.status}: ${text}`);
+  }
+  return res.json();
 }
 
 /**

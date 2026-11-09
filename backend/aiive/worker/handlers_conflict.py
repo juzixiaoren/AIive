@@ -14,7 +14,7 @@ import logging
 from aiive.context.run_context import RUN_CTX_OUTBOX_WORKER, RunContext
 from aiive.core.llm_client import default_llm_client
 from aiive.db.base import SessionLocal
-from aiive.db.models import MemoryConflictCase
+from aiive.db.models import MemoryConflictCase, TurnRecord
 from aiive.memory.conflict_adjudication import (
     ConflictQuestionGenerator,
     ConflictReplyParser,
@@ -135,6 +135,23 @@ def handle_memory_conflict_reply(claimed: ClaimedJob) -> HandlerResult:
     case_id = str(payload.get("conflict_case_id", ""))
     thread_id = str(payload.get("thread_id", ""))
     user_message = str(payload.get("user_message", ""))
+    # 本轮已在执行中被取消（用户消息已丢弃）：即便任务在取消前已被领取，
+    # 也必须放弃解析与写入，避免取消的输入继续影响记忆。
+    turn_record_id = str(payload.get("turn_record_id", "") or "")
+    if turn_record_id:
+        db = SessionLocal()
+        try:
+            turn_status = db.query(TurnRecord.status).filter(
+                TurnRecord.id == turn_record_id,
+            ).scalar()
+        finally:
+            db.close()
+        if turn_status == "cancelled":
+            return HandlerResult(
+                HandlerOutcome.COMPLETED,
+                "turn_cancelled",
+                terminal_reason="turn_cancelled",
+            )
     if not case_id or not thread_id or not user_message.strip():
         return HandlerResult(
             HandlerOutcome.NON_RETRYABLE,

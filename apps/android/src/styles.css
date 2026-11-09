@@ -493,6 +493,16 @@ textarea:focus-visible {
   margin: 0 auto;
 }
 
+.status-banner {
+  margin-bottom: 8px;
+  padding: 9px 11px;
+  border-radius: 10px;
+  background: var(--surface-muted);
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
 .error-banner {
   margin-bottom: 8px;
   padding: 9px 11px;
