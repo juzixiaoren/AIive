@@ -29,8 +29,8 @@ def upgrade() -> None:
         "conversation_state",
         sa.Column("id", sa.String(length=32), primary_key=True),
         sa.Column("current_thread_id", sa.String(length=36), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.ForeignKeyConstraint(
             ["current_thread_id"], ["threads.id"], ondelete="RESTRICT",
         ),

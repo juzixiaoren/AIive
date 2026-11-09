@@ -651,6 +651,7 @@ class AgentGraph:
         execution_id: str = "",
         turn_id: str = "",
         context_forget_revision: int | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> tuple[Any, list[dict[str, Any]], list[dict[str, Any]]]:
         """构建并返回编译后的 StateGraph、工具记录引用列表和待审批列表。
 
@@ -662,6 +663,11 @@ class AgentGraph:
         args_by_id: dict[str, dict[str, Any]] = {}
         from aiive.config import settings
         from aiive.tools.tool_validation import validate_tool_params
+
+        def _ensure_not_cancelled() -> None:
+            """节点边界检查持久化取消信号：同步/流式两条链路都在下一节点前停止。"""
+            if cancel_check is not None and cancel_check():
+                raise TurnCancelled(trace_id=trace_id)
 
         def _load_event_injection() -> tuple[str | None, list[dict[str, Any]]]:
             """在安全边界领取待注入事件；没有事件时不产生任何额外 LLM 调用。"""
@@ -749,6 +755,7 @@ class AgentGraph:
             事件注入边界：只有工具调用与 ToolMessage 全部配对后才追加内部
             SystemMessage；注入复用本次 LLM 请求，不额外发起模型调用。
             """
+            _ensure_not_cancelled()
             msgs = state["messages"]
             logger.info("[TRACE:graph] ASSISTANT(ns) msgs_count=%d", len(msgs))
             injection_text: str | None = None
@@ -1007,6 +1014,7 @@ class AgentGraph:
               并从 running_tool_state 移除、写入 verified_tool_states、
               若有 artifact 引用则写入 artifact_refs。
             """
+            _ensure_not_cancelled()
             native_tool_node = ToolNode(tools)
             last_msg = state["messages"][-1]
             tc_list = (last_msg.tool_calls or []) if isinstance(last_msg, AIMessage) else []
@@ -1172,6 +1180,7 @@ class AgentGraph:
         ctx_bundle: Any,
         normalizer: "ToolResultNormalizer | None",
         trace: "Trace",
+        cancel_check: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         """Assemble context, build registry/tools and compile the LangGraph graph.
 
@@ -1245,6 +1254,7 @@ class AgentGraph:
             thread_id=thread.id, turn_record_id=exec_ctx.turn_record_id,
             execution_id=exec_ctx.execution_id, turn_id=exec_ctx.turn_id,
             context_forget_revision=getattr(assembled_ctx, "forget_revision", None),
+            cancel_check=cancel_check,
         )
         return {
             "trace": trace,
@@ -1381,6 +1391,7 @@ class AgentGraph:
         self, message: str, exec_ctx: TurnExecutionContext,
         ctx_bundle: Any = None,
         normalizer: "ToolResultNormalizer | None" = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> "AgentGraphResult":
         """Execute graph inference. Uses pre-assembled context from ContextAssembler."""
         thread_id = exec_ctx.thread_id
@@ -1389,7 +1400,10 @@ class AgentGraph:
         trace = Trace(trace_id=trace_id) if trace_id else Trace.new()
         thread = self._thread_state.get_or_create_thread(thread_id)
 
-        prep = self._prepare_execution(thread, exec_ctx, ctx_bundle, normalizer, trace=trace)
+        prep = self._prepare_execution(
+            thread, exec_ctx, ctx_bundle, normalizer, trace=trace,
+            cancel_check=cancel_check,
+        )
         context_snapshot = prep["context_snapshot"]
         compiled = prep["compiled"]
         _records_raw = prep["_records_raw"]
@@ -1398,6 +1412,9 @@ class AgentGraph:
         tools = prep["tools"]
         try:
             result = compiled.invoke({"messages": initial_messages, "tool_records": []})
+        except TurnCancelled:
+            # 取消是主动收口，不是模型错误：交给 Turn 层标记 cancelled。
+            raise
         except Exception as error:
             logger.exception(
                 "[TRACE:graph] compiled.invoke 异常: trace_id=%s model=%s msgs_count=%d tools_count=%d",
@@ -1460,7 +1477,10 @@ class AgentGraph:
         # 同步 DB 调用不得阻塞事件循环（与 Phase 1 to_thread 先例一致）
         thread = await asyncio.to_thread(self._thread_state.get_or_create_thread, thread_id)
 
-        prep = self._prepare_execution(thread, exec_ctx, ctx_bundle, normalizer, trace=trace)
+        prep = self._prepare_execution(
+            thread, exec_ctx, ctx_bundle, normalizer, trace=trace,
+            cancel_check=cancel_check,
+        )
         context_snapshot = prep["context_snapshot"]
         compiled = prep["compiled"]
         _records_raw = prep["_records_raw"]

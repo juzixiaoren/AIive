@@ -256,15 +256,13 @@ def test_background_decision_yields_to_foreground_lease(db_session, monkeypatch)
 
 
 # ----------------------------------------------------------------------
-# 4. 前台 Turn 等待后台决策：用户输入不丢失，重试续跑同一 Turn
+# 4. 前台 Turn 遇到后台决策占用：立即 busy，且不落任何业务行（V63）
 # ----------------------------------------------------------------------
-def test_foreground_waits_for_background_decision_and_keeps_input(
+def test_foreground_fails_fast_when_background_decision_holds_lease(
     db_session, monkeypatch,
 ) -> None:
     thread_id = _thread(db_session)
 
-    monkeypatch.setattr("aiive.runtime.turn_execution.FOREGROUND_WAIT_SECONDS", 0.2)
-    monkeypatch.setattr(thread_lease, "ACQUIRE_POLL_SECONDS", 0.02)
     monkeypatch.setattr(
         "aiive.runtime.turn_execution.ThreadBootstrapService.ensure_committed_thread",
         staticmethod(lambda tid=None: tid),
@@ -282,17 +280,17 @@ def test_foreground_waits_for_background_decision_and_keeps_input(
         service._resolve_and_preempt("帮我整理周报", thread_id, turn_id)  # pyright: ignore[reportPrivateUsage]
     assert str(blocked.value) == "turn_in_progress"
 
-    # 用户输入已落库：Turn 停在 not_started，用户消息事件存在且只有一条。
-    stored = db_session.query(TurnRecord).filter(
+    # 忙状态不排队、不落库：不得创建 TurnRecord / user_message 事件。
+    assert db_session.query(TurnRecord).filter(
         TurnRecord.thread_id == thread_id, TurnRecord.turn_id == turn_id,
-    ).one()
-    assert stored.status == "not_started"
-    user_events = db_session.query(Event).filter(
+    ).count() == 0
+    assert db_session.query(Event).filter(
         Event.thread_id == thread_id, Event.event_type == "user_message",
-    ).all()
-    assert [item.payload["content"] for item in user_events] == ["帮我整理周报"]
+    ).count() == 0
+    holder = lease_holder(db_session, thread_id)
+    assert holder is not None and holder["owner_kind"] == OWNER_GOAL_DECISION
 
-    # 后台决策收尾交还占用后，同一 turn_id 重试直接续跑，不产生第二条用户消息。
+    # 后台决策收尾交还占用后，前台用同一 turn_id 正常执行，只落一条用户消息。
     assert release_thread_lease(
         db_session, thread_id, owner_kind=OWNER_GOAL_DECISION,
         owner_id=decision_id, fencing_token=goal_lease.fencing_token,
@@ -304,9 +302,10 @@ def test_foreground_waits_for_background_decision_and_keeps_input(
     )
     assert turn.status == "running"
     assert token >= 2
-    assert db_session.query(Event).filter(
+    user_events = db_session.query(Event).filter(
         Event.thread_id == thread_id, Event.event_type == "user_message",
-    ).count() == 1
+    ).all()
+    assert [item.payload["content"] for item in user_events] == ["帮我整理周报"]
     holder = lease_holder(db_session, thread_id)
     assert holder is not None and holder["owner_kind"] == OWNER_TURN
     assert holder["owner_id"] == turn.id

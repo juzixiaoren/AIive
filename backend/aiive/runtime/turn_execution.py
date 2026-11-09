@@ -1395,7 +1395,10 @@ class TurnExecutionService:
                     return cached
                 return {"reply": "", "error": "turn_cached_no_payload"}
             if err_msg == "turn_in_progress":
-                return {"reply": "", "error": "turn_in_progress", "_status": 202}
+                return {
+                    "reply": "", "error": "turn_in_progress",
+                    "retryable": True, "_status": 202,
+                }
             return {"reply": "", "error": err_msg, "_status": 409}
 
         heartbeat = TurnHeartbeat(
@@ -1432,6 +1435,9 @@ class TurnExecutionService:
                 graph = AgentGraph(self._llm_client, graph_db)
                 ag_result = graph._execute_graph(  # pyright: ignore[reportPrivateUsage]
                     message=message, exec_ctx=exec_ctx, ctx_bundle=ctx_bundle,
+                    # 同步路径也在节点边界检查取消：下一轮 LLM/工具调用前停止，
+                    # 不必等到最终收口点。
+                    cancel_check=lambda: self._is_cancel_requested(turn.id),
                 )
             finally:
                 graph_db.close()

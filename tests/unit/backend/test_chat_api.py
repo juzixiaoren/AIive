@@ -105,8 +105,8 @@ class TestAgentGraph:
         result = self._run(message="Hi", thread_id="thread-42")
         assert result["thread_id"] == "thread-42"
 
-    def test_generates_thread_id_when_not_provided(self, db_session, monkeypatch):
-        """未提供 thread_id 时，每次应生成新的。"""
+    def test_reuses_current_thread_when_not_provided(self, db_session, monkeypatch):
+        """V63 单会话契约：未提供 thread_id 时复用服务器唯一当前 Thread。"""
         mock_llm = DeterministicLLM(content="OK")
         monkeypatch.setattr(
             "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
@@ -119,7 +119,9 @@ class TestAgentGraph:
 
         r1 = self._run(message="A")
         r2 = self._run(message="B")
-        assert r1["thread_id"] != r2["thread_id"]
+        assert r1["thread_id"] == r2["thread_id"]
+        assert r1["thread_id"]
+        assert db_session.query(Thread).filter(Thread.id == r1["thread_id"]).count() == 1
 
     def test_continues_existing_thread(self, db_session, monkeypatch):
         """提供 thread_id 时应继续同一线程。"""

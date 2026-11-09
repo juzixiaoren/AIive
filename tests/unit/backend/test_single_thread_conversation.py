@@ -468,3 +468,92 @@ def test_completed_turn_releases_lease_for_next_sender(db_session) -> None:
     assert second.status == "running"
     holder = lease_holder(db_session, thread_id)
     assert holder is not None and holder["owner_id"] == second.id
+
+
+# ----------------------------------------------------------------------
+# 8. 三端一致 + 跨端中断（HTTP 层）
+# ----------------------------------------------------------------------
+@pytest.fixture
+def api_client(db_session):
+    from fastapi.testclient import TestClient
+
+    from aiive.db.base import get_db
+    from aiive.main import create_app
+
+    app = create_app()
+    app.dependency_overrides[get_db] = lambda: db_session
+    return TestClient(app)
+
+
+def test_three_clients_resolve_same_thread_id(api_client) -> None:
+    """Web / Android / Desktop 三个客户端启动读取到同一个 Thread ID。"""
+    ids = [
+        api_client.get("/api/conversation/current").json()["thread_id"]
+        for _ in range(3)
+    ]
+    assert len(set(ids)) == 1
+    assert ids[0]
+
+    status = api_client.get("/api/conversation/status").json()
+    assert status["thread_id"] == ids[0]
+    assert status["state"] == "idle"
+    assert status["cancellable"] is False
+
+
+def test_other_client_sees_running_and_can_interrupt(api_client, db_session) -> None:
+    """A 端开始执行 → B 端看到 running/可中断 → B 端停止 → 收口后回到 idle。"""
+    thread_id = api_client.get("/api/conversation/current").json()["thread_id"]
+    service = _service()
+    turn, execution_id, _token = service._resolve_and_preempt(  # pyright: ignore[reportPrivateUsage]
+        "跨端中断", thread_id, str(uuid.uuid4()),
+    )
+
+    # B 端视角：当前有前台 Turn，按钮应切换为停止。
+    status = api_client.get(f"/api/conversation/status?thread_id={thread_id}").json()
+    assert status["state"] == "running"
+    assert status["cancellable"] is True
+    assert status["active_turn"]["turn_record_id"] == turn.id  # type: ignore[index]
+
+    response = api_client.post("/api/conversation/interrupt", json={
+        "thread_id": thread_id, "turn_record_id": turn.id,
+    })
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelling"
+
+    # 执行者真正停止后才收口：标记 cancelled、释放锁、广播 idle。
+    assert service._finalize_cancelled_turn(  # pyright: ignore[reportPrivateUsage]
+        turn, execution_id, "trace-http-cancel", [],
+    ) is True
+    assert api_client.get(f"/api/conversation/status?thread_id={thread_id}").json()["state"] == "idle"
+
+    # 取消的用户消息不出现在历史 API。
+    messages = api_client.get(f"/api/threads/{thread_id}/messages").json()["messages"]
+    assert all(item.get("role") != "user" for item in messages)
+
+
+def test_busy_chat_request_is_rejected_without_saving_message(
+    api_client, db_session, monkeypatch,
+) -> None:
+    """Agent 输出/后台占用期间，另一端的请求被拒绝且不保存用户消息。"""
+    from aiive.api.routes_chat import ChatRequest, chat as chat_route
+
+    thread_id = api_client.get("/api/conversation/current").json()["thread_id"]
+    held = acquire_thread_lease(
+        thread_id,
+        owner_kind=OWNER_GOAL_DECISION,
+        owner_id="decision-busy",
+        ttl_seconds=60,
+    )
+    assert held is not None
+
+    monkeypatch.setattr(
+        "aiive.api.routes_chat.default_llm_client", lambda: FakeLLMClient(),
+    )
+    with pytest.raises(HTTPException) as rejected:
+        chat_route(ChatRequest(message="忙时不应保存", thread_id=thread_id))
+    assert rejected.value.status_code == 202
+    assert rejected.value.detail["code"] == "turn_in_progress"
+    assert db_session.query(Event).filter(
+        Event.thread_id == thread_id,
+        Event.event_type == "user_message",
+    ).count() == 0

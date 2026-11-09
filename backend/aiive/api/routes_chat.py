@@ -49,7 +49,9 @@ def _http_status(value: object, default: int = 500) -> int:
         status = int(value) if isinstance(value, (int, str)) else default
     except ValueError:
         return default
-    return status if 400 <= status <= 599 else default
+    # 额外允许 202：忙状态沿用既有「已受理但未执行」契约，不是 5xx 错误；
+    # 其余非 4xx/5xx（如 399）仍回落到 500，保持既有错误契约。
+    return status if 400 <= status <= 599 or status == 202 else default
 
 
 def _chat_error_payload(result: dict[str, object]) -> dict[str, object]:
