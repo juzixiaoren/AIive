@@ -179,15 +179,22 @@ class TestChatAPI:
         assert data["action_cards"] == []
         assert data["pending_operations"] == []
 
-    def test_post_chat_accepts_custom_thread_id(self, client):
-        """POST /api/chat 应接受自定义 thread_id。"""
+    def test_post_chat_accepts_custom_thread_id(self, client, db_session):
+        """POST /api/chat 接受等于服务器当前 Thread 的显式 thread_id（V63）。"""
+        from aiive.db.models import ConversationState, Thread
+
+        db_session.add(Thread(id="my-thread"))
+        db_session.flush()
+        db_session.add(ConversationState(id="default", current_thread_id="my-thread"))
+        db_session.commit()
+
         response = client.post(
             "/api/chat",
             json={"message": "Hello", "thread_id": "my-thread"},
         )
         assert response.status_code == 200
         data = response.json()
-        assert data["thread_id"]
+        assert data["thread_id"] == "my-thread"
 
     def test_post_chat_stream_emits_started_before_done(self, client, monkeypatch):
         """流式接口应先发送已提交 Turn 的恢复锚点。"""

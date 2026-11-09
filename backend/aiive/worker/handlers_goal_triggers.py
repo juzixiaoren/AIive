@@ -20,6 +20,7 @@ from typing import Any
 from aiive.config import settings
 from aiive.db.base import SessionLocal
 from aiive.db.models import Event
+from aiive.runtime.conversation_state import broadcast_execution_status
 from aiive.runtime.proactive_message import ProactiveBlocked
 from aiive.runtime.thread_lease import (
     GOAL_DECISION_LEASE_SECONDS,
@@ -85,6 +86,7 @@ def _retry_later(reason: str, until: datetime | None = None) -> HandlerResult:
 def _release_lease(thread_id: str, owner_id: str, fencing_token: int) -> None:
     """短事务交还占用；失败只记日志，租约到期后仍可被接管。"""
     db = SessionLocal()
+    released = False
     try:
         release_thread_lease(
             db, thread_id,
@@ -93,11 +95,15 @@ def _release_lease(thread_id: str, owner_id: str, fencing_token: int) -> None:
             fencing_token=fencing_token,
         )
         db.commit()
+        released = True
     except Exception:
         db.rollback()
         logger.exception("释放线程级占用失败: thread_id=%s owner_id=%s", thread_id, owner_id)
     finally:
         db.close()
+    if released:
+        # 提交并关闭会话后再广播，客户端读到的必是已落库的空闲状态。
+        broadcast_execution_status(thread_id)
 
 
 def _active_turn_until(thread_id: str) -> datetime | None:
@@ -222,7 +228,11 @@ def handle_goal_trigger_decision(claimed: ClaimedJob) -> HandlerResult:
         ttl_seconds=GOAL_DECISION_LEASE_SECONDS,
     )
     if lease is None:
+        # 未取得占用不广播：当前状态仍属于实际持有者（前台 Turn 或其它作业）。
         return _retry_later("thread_lease_busy")
+
+    # 后台决策接管线程：立即广播 busy（不可中断），客户端显示处理中。
+    broadcast_execution_status(thread_id)
 
     try:
         # 升级前启动的 Turn 可能没有占用行：拿到占用后再确认一次，

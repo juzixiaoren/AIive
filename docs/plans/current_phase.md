@@ -1,8 +1,8 @@
 # Current Phase
 
 ## 版本索引
-- 当前工作版本：**V62.6.1 Forget 来源闭包与跨线程执行授权修复**（2026-11-06）→ 见文末「### V62.6 …」；上一版为 V62.5 Outbox 精确关联与执行授权。
-- 历史版本：V62.4 / V62.5 依次见文末。
+- 当前工作版本：**V63 单会话闭环修复与跨端状态一致性**（2026-11-09）→ 见文末「### V63 …」；上一版为 V62.6.1 Forget 来源闭包与跨线程执行授权修复。
+- 历史版本：V62.4 / V62.5 / V62.6.1 依次见文末。
 - 历史阶段：V34 → V54 按时间顺序记录在下方各节；下方 `## Phase` / `## Status` 是 V34 阶段的原始记录，不再代表当前主干。
 
 ## Phase
@@ -1065,3 +1065,16 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - 清理：SQLite rollback / tmp_path；PG 测试使用一次性容器，fixture teardown 删除；Alembic 使用独立一次性容器并在 finally 清理，保留原有用户容器。
 
 - V62.6.1 清理补验：根 conftest 先关闭 Session/连接池再删除本进程测试库，失败写报告并返回非零码；真实子进程回归 3 passed，最终全量 1716 passed、PG 105 passed，清理报告 verified。
+
+### V63 单会话闭环修复与跨端状态一致性（2026-11-09）
+- 基线：`750a06b`（唯一长期对话 / 互斥执行 / 远程中断首版）；本轮为闭环修复。
+- 状态：completed。P0/P1 全部落地，单测 1226 passed；integration+flow 574 passed / 119 skipped；Web/Android build 通过；ruff F,E9 与 basedpyright 通过。
+- 强制唯一 Thread：`TurnExecutionService._resolve_and_preempt` 对 `MessageSource.USER` 每次读取 `get_current_thread_id()`；缺省使用当前 Thread，显式与之不一致时在租约/TurnRecord/Event 之前抛 `stale_thread_id`，不再通过 `ensure_committed_thread` 合法化旧 Thread。`system_command` / `runtime_event` 保持原有线程行为。
+- 启动握手：Web/Android 新增 `conversationReady`（初始 false），严格按 current Thread → 服务器历史 → execution status 顺序成功后置 true；Ready 前禁用输入与发送。Web 不再把 localStorage 的 threadId 当作启动权威（Android 同理），本地缓存只做展示。收到 `stale_thread_id` 时撤回本次乐观气泡、恢复原始输入（不覆盖用户已重新输入的内容）、重新握手。
+- 流式 Busy 契约：`execute_turn_stream` 对冲突统一输出结构化 error（`turn_in_progress`：202 + retryable；`stale_thread_id` 等：409），经 `routes_chat._chat_error_payload` 转换；SSE 的 HTTP 状态保持 200，事件内 status 正确。Android 新增 `ChatApiError`（code/status/retryable）；两端在未收到 started 时收到 turn_in_progress 即删除 user/assistant 两个乐观气泡、恢复输入并重新读取 `GET /conversation/status`。
+- 取消与记忆保护：`handle_memory_conflict_reply` 在解析前后各查一次 `status == cancelled || cancel_requested_at != null`；命中直接返回 COMPLETED / turn_cancelled，不调用 `apply_decision`，不改冲突案例、MemoryRecord、Evidence 或 Graph。真实并发测试用阻塞解析器在解析中取消 Turn 验证。
+- 跨端状态：远端 Turn 是否活跃（`remoteTurnActive`）与 UI 提示 `remoteRunning` 解耦；running（含 `interrupting`）置位，只有 idle 清除；此前存在远端 Turn 时，idle 后立即以服务器历史覆盖本地消息（其他设备取消后本端用户消息消失）。本地 Turn 结束不再无条件置 idle，而是重新读取状态，正确呈现随后的后台占用。
+- 后台广播：`handlers_goal_triggers` 取得租约后广播 busy；`_release_lease` 在提交并关闭 Session 后广播 idle；抢锁失败不广播，避免覆盖实际持有者状态。
+- 状态机：idle ⇄ running（前台 Turn，cancellable）/ busy（后台 GoalDecision，不可中断）；取消为 running → 登记 `cancel_requested_at` → 执行者收口为 cancelled，锁仅在收口事务内原子释放；已完成 Turn 的停止请求返回 completed。
+- 关键测试：唯一 Thread（stale 拒绝无写入 / 缺省复用 / 内部来源不受限）、流式 202/409 结构化错误、跨端 HTTP 中断与历史消失、解析期间取消不写记忆、GoalDecision 占用广播、完成后释放锁。
+- 剩余风险：无浏览器/真机自动化；同步 `/api/chat` 取消为节点边界停止且不保留部分工具快照；本地遗留 `%TEMP%/aiive_test_*.db` 需用独立 TMPDIR 复跑。

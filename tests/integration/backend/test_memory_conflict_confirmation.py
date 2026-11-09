@@ -909,3 +909,83 @@ class TestExpiryCleanup:
         assert (
             db.query(OutboxJob).filter(OutboxJob.job_type == JOB_CONFLICT_CLEANUP).count() == 1
         )
+
+
+    def test_cancel_during_parse_skips_apply_decision(self, db, monkeypatch):
+        """Worker 停在 LLM 解析阶段时取消 Turn：不得写入任何记忆变更。"""
+        import threading
+
+        thread_id = _new_thread(db)
+        old = _seed_record(db, _proposal("user.lives_in", "用户住在北京"))
+        new = _proposal("user.lives_in", "用户现在住在上海")
+        case = _park_case(db, thread_id=thread_id, proposal=new, old=old)
+
+        turn = TurnRecord(id="turn-cancel", turn_id="turn-cancel", thread_id=thread_id, status="running")
+        db.add(turn)
+        db.flush()
+        db.add(Event(
+            id="evt-cancel", trace_id="trace-cancel", thread_id=thread_id,
+            turn_id=turn.turn_id, event_type="user_message", payload={"text": "以新的为准"},
+        ))
+        db.flush()
+        MemoryConflictService.enqueue_reply_jobs(
+            db, thread_id=thread_id, user_message="以新的为准",
+            turn_id=turn.turn_id, turn_record_id=turn.id, source_event_ids=["evt-cancel"],
+        )
+        db.commit()
+        job = db.query(OutboxJob).filter(OutboxJob.job_type == JOB_CONFLICT_REPLY).one()
+        claimed = claim_job(db, job)
+
+        parse_started = threading.Event()
+        release_parse = threading.Event()
+
+        class BlockingParser:
+            def __init__(self, _llm) -> None:
+                self.calls = 0
+
+            def parse(self, **_kwargs):
+                self.calls += 1
+                parse_started.set()
+                assert release_parse.wait(timeout=10)
+                return ReplyDecision(decision=DECISION_ACCEPT_NEW, reason="用户选择新记忆")
+
+        monkeypatch.setattr(handlers_conflict, "ConflictReplyParser", BlockingParser)
+        monkeypatch.setattr(handlers_conflict, "default_llm_client", lambda: ScriptedLLM("{}"))
+
+        applied: list[dict] = []
+        monkeypatch.setattr(
+            MemoryConflictService,
+            "apply_decision",
+            staticmethod(lambda _db, **kwargs: applied.append(kwargs)),
+        )
+
+        box: dict[str, object] = {}
+
+        def _run() -> None:
+            box["result"] = handlers_conflict.handle_memory_conflict_reply(claimed)
+
+        worker = threading.Thread(target=_run, daemon=True)
+        worker.start()
+        assert parse_started.wait(timeout=10)
+
+        # 另一执行路径在解析期间取消本轮。
+        db.query(TurnRecord).filter(TurnRecord.id == turn.id).update({
+            TurnRecord.status: "cancelled",
+            TurnRecord.cancel_requested_at: datetime.now(UTC),
+            TurnRecord.updated_at: datetime.now(UTC),
+        }, synchronize_session=False)
+        db.commit()
+
+        release_parse.set()
+        worker.join(timeout=10)
+        assert not worker.is_alive()
+
+        result = box["result"]
+        assert result.outcome.value == "completed"
+        assert result.reason == "turn_cancelled"
+        assert applied == []
+
+        db.expire_all()
+        assert db.get(MemoryConflictCase, case.id).status == STATUS_PENDING
+        assert db.query(MemoryRecord).count() == 1
+        assert db.get(MemoryRecord, old.id).validity_state == ValidityState.VALID.value

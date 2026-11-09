@@ -51,6 +51,20 @@ def patched(monkeypatch, db_session):
 
 
 def _run_turn(patched, message, thread_id=None):
+    # V63：普通用户消息只能进入服务器唯一当前 Thread。本流程用例显式构造
+    # 线程并把它设为当前 Thread，再验证同一 Thread 内的序号/快照约束。
+    if thread_id:
+        from aiive.db.models import ConversationState
+
+        if patched.get(Thread, thread_id) is None:
+            patched.add(Thread(id=thread_id))
+            patched.flush()
+        state = patched.get(ConversationState, "default")
+        if state is None:
+            patched.add(ConversationState(id="default", current_thread_id=thread_id))
+        else:
+            state.current_thread_id = thread_id
+        patched.commit()
     svc = TurnExecutionService(llm_client=FakeLLMClient(), message_source="user")
     return svc.execute_turn(message, thread_id=thread_id)
 

@@ -17,6 +17,7 @@ import {
   getThreadMessages,
   respondApproval,
   ActionCard,
+  ApiError,
   ExecutionStatus,
   StreamIncompleteError,
 } from "../api/chat";
@@ -232,9 +233,12 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
   const [stored] = useState(loadStored);
   const [messages, setMessages] = useState<Message[]>(stored.messages);
   const [input, setInput] = useState("");
-  const [threadId, setThreadId] = useState<string | undefined>(stored.threadId);
+  // localStorage 只提供展示缓存：Thread 权威来源是服务器，启动阶段不信任本地 ID。
+  const [threadId, setThreadId] = useState<string | undefined>(undefined);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** 启动握手（current Thread → 历史 → 执行状态）完成前不允许发送。 */
+  const [conversationReady, setConversationReady] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   /** 当前流式请求的 AbortController，用于“停止”按钮中断生成 */
@@ -258,8 +262,8 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
   const [execState, setExecState] = useState<"idle" | "running" | "busy">("idle");
   /** 当前 Turn 由其他设备发起（用于提示"Agent 正在回复"）。 */
   const [remoteRunning, setRemoteRunning] = useState(false);
-  /** 同步给 WS 回调：远端 Turn 结束后需要从服务器恢复最终历史。 */
-  const remoteRunningRef = useRef(false);
+  /** 远端 Turn 是否仍活跃：只在 idle 时清除（interrupting 不清除）。 */
+  const remoteTurnActiveRef = useRef(false);
   const [stopping, setStopping] = useState(false);
   /** 当前前台 Turn 的 TurnRecord 主键：中断请求必须携带，防止误伤新 Turn。 */
   const activeTurnRecordIdRef = useRef<string | undefined>(undefined);
@@ -269,13 +273,18 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
     setExecState(status.state);
     if (status.state === "running" && status.active_turn?.turn_record_id) {
       activeTurnRecordIdRef.current = status.active_turn.turn_record_id;
-      // 本地请求在途时不算远端执行；否则提示来自其他设备。
-      const remote = !inFlightRef.current && !status.interrupting;
-      remoteRunningRef.current = remote;
+      // 本地请求在途时不算远端执行；interrupting 只影响提示文案，
+      // 不能清除「远端仍活跃」标记（否则取消收口后不会刷新历史）。
+      const remote = !inFlightRef.current;
+      if (remote) remoteTurnActiveRef.current = true;
       setRemoteRunning(remote);
-    } else {
+    } else if (status.state === "idle") {
       activeTurnRecordIdRef.current = undefined;
-      remoteRunningRef.current = false;
+      remoteTurnActiveRef.current = false;
+      setRemoteRunning(false);
+    } else {
+      // busy（后台占用）：前台 Turn 已不在执行，但远端活跃标记只在 idle 清除。
+      activeTurnRecordIdRef.current = undefined;
       setRemoteRunning(false);
     }
   }, []);
@@ -369,31 +378,38 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
       setMessages(loaded);
       setHistoryCursor(page.next_cursor);
       setHasMoreHistory(page.has_more);
+      return true;
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "历史消息加载失败");
+      return false;
     }
   }, []);
+
+  /** 启动握手 / stale 恢复：current Thread → 服务器历史 → 执行状态。 */
+  const syncConversation = useCallback(async (): Promise<boolean> => {
+    try {
+      const conversation = await getCurrentConversation();
+      setThreadId(conversation.thread_id);
+      if (!(await loadRemoteMessages(conversation.thread_id))) return false;
+      applyExecutionStatus(await getExecutionStatus(conversation.thread_id));
+      return true;
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "当前对话获取失败");
+      return false;
+    }
+  }, [applyExecutionStatus, loadRemoteMessages]);
 
   // 启动时从服务器获取唯一长期 Thread：三端共用同一 ID，本地缓存仅用于展示加速。
   useEffect(() => {
     let disposed = false;
     const bootstrap = async () => {
-      try {
-        const conversation = await getCurrentConversation();
-        if (disposed) return;
-        setThreadId(conversation.thread_id);
-        await loadRemoteMessages(conversation.thread_id);
-        if (disposed) return;
-        applyExecutionStatus(await getExecutionStatus(conversation.thread_id));
-      } catch (reason) {
-        if (!disposed) {
-          setError(reason instanceof Error ? reason.message : "当前对话获取失败");
-        }
-      }
+      setConversationReady(false);
+      const ok = await syncConversation();
+      if (!disposed && ok) setConversationReady(true);
     };
     void bootstrap();
     return () => { disposed = true; };
-  }, [applyExecutionStatus, loadRemoteMessages]);
+  }, [syncConversation]);
 
   const loadOlderMessages = useCallback(async () => {
     if (!threadId || historyCursor === null || loadingHistory) return;
@@ -488,10 +504,12 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
             }
           } else if (msg.type === "execution_status" && msg.data) {
             const status = msg.data as ExecutionStatus;
-            const wasRemote = remoteRunningRef.current;
+            // 先取「此前是否仍有远端 Turn」再应用状态：idle 会清除该标记。
+            const hadRemoteTurn = remoteTurnActiveRef.current;
             applyExecutionStatus(status);
-            if (status.state === "idle" && wasRemote) {
-              // 其他设备本轮结束后，以服务器历史为准刷新最终内容。
+            if (status.state === "idle" && hadRemoteTurn) {
+              // 其他设备完成/取消后，以服务器历史为准覆盖本地消息
+              // （取消的用户消息必须在本端消失）。
               void loadRemoteMessages(String(status.thread_id || threadId));
             }
           } else if (msg.type === "maintenance_report" && msg.data?.operation_id && msg.data?.card) {
@@ -709,7 +727,7 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
   /** 发送消息并处理流式响应 */
   const handleSend = async () => {
     const text = input.trim();
-    if (!text || inFlightRef.current) return;
+    if (!text || inFlightRef.current || !conversationReady) return;
     if (execState !== "idle") {
       // 忙状态下的消息不排队、不落库：明确提示，保留用户输入。
       setError(execState === "busy" ? "后台任务正在处理中，请稍候" : "Agent 正在回复，请稍候");
@@ -745,6 +763,11 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
 
     setMessages((prev) => [...prev, userMsg, placeholderMsg]);
 
+    /** 是否已收到 started（服务端已创建 Turn）；用于区分「未落库的 Busy」回滚。 */
+    let started = false;
+    /** catch/finally 是否已重新同步过执行状态，避免重复或覆盖新状态。 */
+    let statusSynced = false;
+
     try {
       const ac = new AbortController();
       abortRef.current = ac;
@@ -753,6 +776,7 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
         threadId,
         // onStarted：Turn 已持久化后立即记录真实线程 ID，供首次对话断流恢复。
         (event) => {
+          started = true;
           activeStreamThreadIdRef.current = event.thread_id;
           activeTurnRecordIdRef.current = event.turn_record_id || undefined;
           setThreadId(event.thread_id);
@@ -911,24 +935,70 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
         }
       }
     } catch (e: unknown) {
+      const errorCode = e instanceof ApiError ? e.code : "";
+      const busyBeforeStart = !started && errorCode === "turn_in_progress";
+      const staleBeforeStart = !started && errorCode === "stale_thread_id";
       if (!abortRef.current?.signal.aborted) {
-        setError(e instanceof Error ? e.message : "未知错误");
-        const recoveryThreadId = activeStreamThreadIdRef.current || threadId;
-        if (e instanceof StreamIncompleteError && recoveryThreadId) {
-          await loadRemoteMessages(recoveryThreadId);
+        if (busyBeforeStart || staleBeforeStart) {
+          // 服务端没有创建 Turn / 已切换到新 Thread：撤回两个乐观气泡，
+          // 恢复输入（不覆盖用户已经重新输入的内容）。
+          setMessages((prev) => prev.filter(
+            (message) => message.id !== userMsg.id && message.id !== placeholderMsg.id,
+          ));
+          setInput((prev) => (prev.trim() ? prev : text));
+          setError(staleBeforeStart ? "对话已切换，正在重新同步…" : "Agent 正在回复，请稍候");
+          if (staleBeforeStart) {
+            const ok = await syncConversation();
+            setConversationReady(ok);
+          } else {
+            try {
+              applyExecutionStatus(await getExecutionStatus(threadId));
+            } catch {
+              // 状态查询失败时保留提示，后续 WS 广播会恢复按钮。
+            }
+          }
+          statusSynced = true;
         } else {
-          // 发生错误时只移除当前请求的占位消息
-          setMessages((prev) => prev.filter((message) => message.id !== placeholderMsg.id));
+          setError(e instanceof Error ? e.message : "未知错误");
+          const recoveryThreadId = activeStreamThreadIdRef.current || threadId;
+          if (e instanceof StreamIncompleteError && recoveryThreadId) {
+            await loadRemoteMessages(recoveryThreadId);
+          } else if (!started) {
+            // 未收到 started 说明服务端没有为本轮创建 Turn：
+            // 不能留下数据库里不存在的幻影用户消息。
+            setMessages((prev) => prev.filter(
+              (message) => message.id !== userMsg.id && message.id !== placeholderMsg.id,
+            ));
+            setInput((prev) => (prev.trim() ? prev : text));
+            if (recoveryThreadId) await loadRemoteMessages(recoveryThreadId);
+            try {
+              applyExecutionStatus(await getExecutionStatus(recoveryThreadId));
+            } catch {
+              // 状态查询失败时保留现有提示。
+            }
+            statusSynced = true;
+          } else {
+            // 已创建 Turn：保留用户消息，只移除未完成的占位气泡。
+            setMessages((prev) => prev.filter((message) => message.id !== placeholderMsg.id));
+          }
         }
       }
     } finally {
+      const resolvedThreadId = activeStreamThreadIdRef.current || threadId;
+      const wasAborted = abortRef.current?.signal.aborted ?? false;
       activeStreamThreadIdRef.current = undefined;
       inFlightRef.current = false;
       setLoading(false);
       abortRef.current = null;
-      // 本轮已结束：服务端广播会给出最终状态（可能随后进入后台占用），
-      // 这里先恢复可发送，避免 WS 未连接时按钮永久卡在停止。
-      setExecState("idle");
+      // 本轮结束后不要无条件置 idle：后台 GoalDecision 可能已接手占用。
+      // 重新读取服务端状态；查询失败时才退回 idle 以保证按钮可用。
+      if (!wasAborted && !statusSynced) {
+        try {
+          applyExecutionStatus(await getExecutionStatus(resolvedThreadId));
+        } catch {
+          setExecState("idle");
+        }
+      }
     }
   };
 
@@ -940,8 +1010,12 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
     try {
       const result = await interruptTurn(threadId, activeTurnRecordIdRef.current);
       if (result.status === "idle" || result.status === "completed" || result.status === "cancelled") {
-        setExecState("idle");
         activeTurnRecordIdRef.current = undefined;
+        try {
+          applyExecutionStatus(await getExecutionStatus(threadId));
+        } catch {
+          setExecState("idle");
+        }
       }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "中断请求失败");
@@ -1274,8 +1348,8 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
-            placeholder="输入消息...（Enter 发送，Shift+Enter 换行）"
-            disabled={loading || execState !== "idle"}
+            placeholder={conversationReady ? "输入消息...（Enter 发送，Shift+Enter 换行）" : "正在同步对话…"}
+            disabled={!conversationReady || loading || execState !== "idle"}
             className="flex-1 resize-none rounded-xl border border-divider bg-surface px-4 py-2.5 text-sm text-content placeholder-faint focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary-soft disabled:opacity-50 shadow-sm leading-relaxed max-h-40 overflow-y-auto"
           />
           {execState === "running" ? (
@@ -1297,7 +1371,7 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
           ) : (
             <button
               onClick={handleSend}
-              disabled={!input.trim()}
+              disabled={!conversationReady || !input.trim()}
               className="rounded-xl bg-primary px-6 py-2.5 text-sm font-medium text-on-primary hover:bg-primary-hover active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed transition-all shadow-sm"
             >
               发送

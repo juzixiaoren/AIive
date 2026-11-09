@@ -445,3 +445,50 @@ def test_foreground_turn_releases_lease_after_completion(db_session, monkeypatch
         ttl_seconds=60,
     )
     assert takeover is not None
+
+
+# ----------------------------------------------------------------------
+# 8. 后台决策占用状态广播（V63）
+# ----------------------------------------------------------------------
+def test_goal_decision_broadcasts_busy_then_idle(db_session, monkeypatch) -> None:
+    thread_id = _thread(db_session)
+    task_id = _confirmed(db_session, thread_id, [_due_step("report", "交周报")])
+    assert GoalTriggerService(db_session).scan() == 1
+    _patch_llm(monkeypatch, {"action": "send_message", "message": "该交周报了"})
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "aiive.worker.handlers_goal_triggers.broadcast_execution_status",
+        lambda tid: calls.append(tid),
+    )
+
+    result = handle_goal_trigger_decision(_claimed(db_session, task_id))
+
+    assert result.outcome == HandlerOutcome.COMPLETED
+    # 取得占用后广播 busy，释放并提交后广播 idle（同一线程各一次）。
+    assert calls == [thread_id, thread_id]
+
+
+def test_goal_decision_lease_busy_does_not_broadcast(db_session, monkeypatch) -> None:
+    thread_id = _thread(db_session)
+    task_id = _confirmed(db_session, thread_id, [_due_step("report", "交周报")])
+    assert GoalTriggerService(db_session).scan() == 1
+    _patch_llm(monkeypatch, {"action": "send_message", "message": "该交周报了"})
+
+    foreground = acquire_thread_lease(
+        thread_id, owner_kind=OWNER_TURN, owner_id="turn-fg", ttl_seconds=60,
+    )
+    assert foreground is not None
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "aiive.worker.handlers_goal_triggers.broadcast_execution_status",
+        lambda tid: calls.append(tid),
+    )
+
+    result = handle_goal_trigger_decision(_claimed(db_session, task_id))
+
+    assert result.outcome == HandlerOutcome.RETRY_LATER
+    assert result.reason == "thread_lease_busy"
+    # 没抢到占用不得广播，避免覆盖实际持有者的状态。
+    assert calls == []

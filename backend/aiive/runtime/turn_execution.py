@@ -86,6 +86,23 @@ def _compute_request_fingerprint(message: str, thread_id: str | None) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
 
+def _turn_conflict_error_payload(message: str) -> dict[str, Any]:
+    """把 Turn 冲突转换为 SSE error payload（status/retryable 与 HTTP 契约一致）。
+
+    turn_in_progress 是「忙，可稍后重试」：202 + retryable；
+    stale_thread_id 及其他冲突是客户端状态过期：409 且不可盲目重试。
+    """
+    busy = message == "turn_in_progress"
+    return {
+        "type": "error",
+        "error": message,
+        "message": message,
+        "retryable": busy,
+        "trace_id": None,
+        "_status": 202 if busy else 409,
+    }
+
+
 def _as_aware(value: datetime) -> datetime:
     """SQLite 读回的时间可能无时区；统一补 UTC 后再比较。"""
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
@@ -294,7 +311,7 @@ class TurnExecutionService:
                 else:
                     yield {"type": "error", "error": "turn_cached_no_payload"}
                 return
-            yield {"type": "error", "error": err_msg}
+            yield _turn_conflict_error_payload(err_msg)
             return
 
         heartbeat = TurnHeartbeat(
@@ -546,14 +563,20 @@ class TurnExecutionService:
         不等待其他 Turn：拿不到占用直接返回 busy，输入不排队、不入库。
         """
         turn_id = turn_id or str(_uuid.uuid4())
-        # 后端是 Thread ID 的唯一事实来源：缺省 thread_id 时解析到
-        # ConversationState 指针，绝不隐式创建新的长期 Thread。
-        if not thread_id:
+        # 普通用户消息只能进入 ConversationState 指向的唯一 Thread。
+        # 校验必须先于租约/TurnRecord/Event：显式传入的旧 thread_id 一律拒绝，
+        # 不能通过 ensure_committed_thread 把它“合法化”后继续执行。
+        if self._message_source is MessageSource.USER:
             conv_db = SessionLocal()
             try:
-                thread_id = get_current_thread_id(conv_db)
+                current_tid = get_current_thread_id(conv_db)
             finally:
                 conv_db.close()
+            if thread_id and thread_id != current_tid:
+                raise TurnConflictError("stale_thread_id")
+            thread_id = current_tid
+        # 内部来源（system_command / runtime_event）保持原有行为：缺省时由
+        # ensure_committed_thread 负责创建，且不受唯一 Thread 约束。
         committed_tid = ThreadBootstrapService.ensure_committed_thread(thread_id)
         # 指纹必须用解析后的线程计算：同一 turn_id 在不同入口（缺省/显式
         # thread_id）重试时才能命中幂等，不会误判为 idempotency_key_mismatch。

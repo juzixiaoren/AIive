@@ -32,6 +32,35 @@ logger = logging.getLogger(__name__)
 _OPEN_STATUSES = ("pending", "asking")
 
 
+def _turn_cancelled_or_cancelling(turn_record_id: str) -> bool:
+    """本轮是否已取消或已登记取消请求。
+
+    解析（LLM）前后各查一次：解析期间用户可能刚点了停止，写入前必须再确认，
+    避免取消的输入继续触发 Memory Conflict 写入。
+    """
+    if not turn_record_id:
+        return False
+    db = SessionLocal()
+    try:
+        row = db.query(TurnRecord.status, TurnRecord.cancel_requested_at).filter(
+            TurnRecord.id == turn_record_id,
+        ).one_or_none()
+    finally:
+        db.close()
+    if row is None:
+        return False
+    status, cancel_requested_at = row
+    return status == "cancelled" or cancel_requested_at is not None
+
+
+def _cancelled_result() -> HandlerResult:
+    return HandlerResult(
+        HandlerOutcome.COMPLETED,
+        "turn_cancelled",
+        terminal_reason="turn_cancelled",
+    )
+
+
 def _snapshot_question_input(case_id: str) -> tuple[bool, dict[str, str], str]:
     """Phase A：读取生成问题所需的最小快照（不持有会话）。"""
     db = SessionLocal()
@@ -138,20 +167,8 @@ def handle_memory_conflict_reply(claimed: ClaimedJob) -> HandlerResult:
     # 本轮已在执行中被取消（用户消息已丢弃）：即便任务在取消前已被领取，
     # 也必须放弃解析与写入，避免取消的输入继续影响记忆。
     turn_record_id = str(payload.get("turn_record_id", "") or "")
-    if turn_record_id:
-        db = SessionLocal()
-        try:
-            turn_status = db.query(TurnRecord.status).filter(
-                TurnRecord.id == turn_record_id,
-            ).scalar()
-        finally:
-            db.close()
-        if turn_status == "cancelled":
-            return HandlerResult(
-                HandlerOutcome.COMPLETED,
-                "turn_cancelled",
-                terminal_reason="turn_cancelled",
-            )
+    if _turn_cancelled_or_cancelling(turn_record_id):
+        return _cancelled_result()
     if not case_id or not thread_id or not user_message.strip():
         return HandlerResult(
             HandlerOutcome.NON_RETRYABLE,
@@ -178,6 +195,11 @@ def handle_memory_conflict_reply(claimed: ClaimedJob) -> HandlerResult:
     except Exception as exc:
         logger.exception("冲突回复解析异常: case=%s", case_id)
         return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, str(exc))
+
+    # 解析（可能耗时数秒）期间用户可能取消本轮：写入前再检查一次，
+    # 已取消/已请求取消则直接收口，不修改案例、不产生记忆/证据/图谱变更。
+    if _turn_cancelled_or_cancelling(turn_record_id):
+        return _cancelled_result()
 
     run_ctx = RunContext(
         thread_id=thread_id,

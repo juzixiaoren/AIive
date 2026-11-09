@@ -30,6 +30,20 @@ interface StreamResult {
   cancelled: boolean;
 }
 
+/** 结构化聊天错误：保留服务端 code / status / retryable，供 UI 精确回滚。 */
+export class ChatApiError extends Error {
+  constructor(
+    message: string,
+    public readonly code: string,
+    public readonly status: number,
+    public readonly retryable: boolean,
+    public readonly traceId?: string,
+  ) {
+    super(message);
+    this.name = "ChatApiError";
+  }
+}
+
 export interface ApprovalResponse {
   ok: boolean;
   action: "succeeded" | "denied" | "failed" | "interrupted_unknown";
@@ -71,6 +85,29 @@ export interface ThreadHistoryPage {
 async function responseError(response: Response): Promise<Error> {
   const detail = await response.text();
   return new Error(`服务器请求失败 (${response.status})${detail ? `：${detail}` : ""}`);
+}
+
+/** 把非 2xx 响应解析为结构化错误（detail 为 FastAPI 包装层）。 */
+async function chatResponseError(response: Response): Promise<ChatApiError> {
+  const text = await response.text();
+  try {
+    const body = JSON.parse(text) as { detail?: Record<string, unknown> };
+    const detail = (body.detail ?? body) as Record<string, unknown>;
+    return new ChatApiError(
+      String(detail.message || detail.code || "对话请求失败"),
+      String(detail.code || "chat_stream_failed"),
+      Number(detail.status || response.status),
+      Boolean(detail.retryable),
+      typeof detail.trace_id === "string" ? detail.trace_id : undefined,
+    );
+  } catch {
+    return new ChatApiError(
+      `服务器请求失败 (${response.status})${text ? `：${text}` : ""}`,
+      "chat_stream_failed",
+      response.status,
+      false,
+    );
+  }
 }
 
 export function hasBackendConfig(): boolean {
@@ -207,7 +244,7 @@ export async function streamMessage(
     body: JSON.stringify({ message, thread_id: threadId ?? null }),
     signal,
   });
-  if (!response.ok) throw await responseError(response);
+  if (!response.ok) throw await chatResponseError(response);
   if (!response.body) throw new Error("服务器没有返回流式响应");
 
   const reader = response.body.getReader();
@@ -254,7 +291,13 @@ export async function streamMessage(
         cancelled: false,
       };
     } else if (activeEvent === "error") {
-      throw new Error(String(data.message || "对话请求失败"));
+      throw new ChatApiError(
+        String(data.message || data.code || "对话请求失败"),
+        String(data.code || "chat_stream_failed"),
+        Number(data.status || 500),
+        Boolean(data.retryable),
+        typeof data.trace_id === "string" ? data.trace_id : undefined,
+      );
     }
     // 普通 tool_call / tool_result 暂不展示；审批卡片必须呈现，才能远程放行桌面高危操作。
   };

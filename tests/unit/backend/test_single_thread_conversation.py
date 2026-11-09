@@ -50,6 +50,11 @@ def _thread(db: Session, title: str = "main") -> str:
     return thread.id
 
 
+def _current_thread(db: Session) -> str:
+    """取服务器唯一当前 Thread（必要时初始化）。"""
+    return get_current_thread_id(db)
+
+
 def _service() -> TurnExecutionService:
     return TurnExecutionService(llm_client=FakeLLMClient(), message_source="user")
 
@@ -96,7 +101,7 @@ def test_current_thread_created_only_when_library_is_empty(db_session) -> None:
 # 2. 忙状态：立即失败且不落库
 # ----------------------------------------------------------------------
 def test_busy_foreground_fails_without_persisting_anything(db_session) -> None:
-    thread_id = _thread(db_session)
+    thread_id = _current_thread(db_session)
     held = acquire_thread_lease(
         thread_id,
         owner_kind=OWNER_GOAL_DECISION,
@@ -122,7 +127,7 @@ def test_busy_foreground_fails_without_persisting_anything(db_session) -> None:
 # 3. 取得占用后才落库
 # ----------------------------------------------------------------------
 def test_foreground_persists_only_after_lease_acquired(db_session) -> None:
-    thread_id = _thread(db_session)
+    thread_id = _current_thread(db_session)
     service = _service()
     turn_id = str(uuid.uuid4())
 
@@ -166,7 +171,7 @@ def _cancel_turn(db_session, service, thread_id, message="取消我"):
 
 
 def test_cancelled_turn_drops_message_keeps_tool_facts_and_releases_lease(db_session) -> None:
-    thread_id = _thread(db_session)
+    thread_id = _current_thread(db_session)
     service = _service()
     turn = _cancel_turn(db_session, service, thread_id)
 
@@ -199,7 +204,7 @@ def test_cancelled_turn_drops_message_keeps_tool_facts_and_releases_lease(db_ses
 
 
 def test_cancel_revokes_pending_conflict_reply_jobs(db_session) -> None:
-    thread_id = _thread(db_session)
+    thread_id = _current_thread(db_session)
     service = _service()
     turn, execution_id, _token = service._resolve_and_preempt(  # pyright: ignore[reportPrivateUsage]
         "取消我", thread_id, str(uuid.uuid4()),
@@ -224,7 +229,7 @@ def test_cancel_revokes_pending_conflict_reply_jobs(db_session) -> None:
 
 
 def test_cancelled_turn_is_hidden_from_history_api(db_session) -> None:
-    thread_id = _thread(db_session)
+    thread_id = _current_thread(db_session)
     service = _service()
     _cancel_turn(db_session, service, thread_id, message="这段输入必须消失")
 
@@ -238,7 +243,7 @@ def test_cancelled_turn_not_injected_into_llm_history(db_session) -> None:
     from aiive.runtime.token_counter import LiteLLMTokenCounter
     from aiive.runtime.token_models import ModelProfile, TokenSafetyConfig
 
-    thread_id = _thread(db_session)
+    thread_id = _current_thread(db_session)
     service = _service()
     _cancel_turn(db_session, service, thread_id, message="不要进入上下文")
 
@@ -254,7 +259,7 @@ def test_cancelled_turn_not_injected_into_llm_history(db_session) -> None:
 # 5. 中断接口
 # ----------------------------------------------------------------------
 def test_interrupt_rejects_stale_turn_and_keeps_lease(db_session) -> None:
-    thread_id = _thread(db_session)
+    thread_id = _current_thread(db_session)
     service = _service()
     turn, _execution_id, _token = service._resolve_and_preempt(  # pyright: ignore[reportPrivateUsage]
         "正在回复", thread_id, str(uuid.uuid4()),
@@ -281,7 +286,7 @@ def test_interrupt_rejects_stale_turn_and_keeps_lease(db_session) -> None:
 
 
 def test_interrupt_is_idempotent_and_never_releases_background_lease(db_session) -> None:
-    thread_id = _thread(db_session)
+    thread_id = _current_thread(db_session)
     held = acquire_thread_lease(
         thread_id, owner_kind=OWNER_GOAL_DECISION, owner_id="decision-2", ttl_seconds=60,
     )
@@ -294,7 +299,7 @@ def test_interrupt_is_idempotent_and_never_releases_background_lease(db_session)
 
 
 def test_interrupt_after_completion_reports_idle(db_session) -> None:
-    thread_id = _thread(db_session)
+    thread_id = _current_thread(db_session)
     service = _service()
     turn, _execution_id, _token = service._resolve_and_preempt(  # pyright: ignore[reportPrivateUsage]
         "已完成", thread_id, str(uuid.uuid4()),
@@ -319,7 +324,7 @@ def test_interrupt_after_completion_reports_idle(db_session) -> None:
 
 
 def test_stale_interrupt_does_not_cancel_newer_running_turn(db_session) -> None:
-    thread_id = _thread(db_session)
+    thread_id = _current_thread(db_session)
     service = _service()
     finished, _execution_id, _token = service._resolve_and_preempt(  # pyright: ignore[reportPrivateUsage]
         "已完成的旧轮次", thread_id, str(uuid.uuid4()),
@@ -442,7 +447,7 @@ def test_completed_turn_releases_lease_for_next_sender(db_session) -> None:
 
     from aiive.runtime.agent_graph import AgentGraphResult
 
-    thread_id = _thread(db_session)
+    thread_id = _current_thread(db_session)
     service = _service()
     turn, execution_id, _token = service._resolve_and_preempt(  # pyright: ignore[reportPrivateUsage]
         "第一轮", thread_id, str(uuid.uuid4()),
@@ -520,6 +525,12 @@ def test_other_client_sees_running_and_can_interrupt(api_client, db_session) -> 
     assert response.status_code == 200
     assert response.json()["status"] == "cancelling"
 
+    # 取消请求已登记但尚未收口：状态仍是 running，interrupting=True。
+    interrupting = api_client.get(f"/api/conversation/status?thread_id={thread_id}").json()
+    assert interrupting["state"] == "running"
+    assert interrupting["interrupting"] is True
+    assert interrupting["cancellable"] is True
+
     # 执行者真正停止后才收口：标记 cancelled、释放锁、广播 idle。
     assert service._finalize_cancelled_turn(  # pyright: ignore[reportPrivateUsage]
         turn, execution_id, "trace-http-cancel", [],
@@ -557,3 +568,97 @@ def test_busy_chat_request_is_rejected_without_saving_message(
         Event.thread_id == thread_id,
         Event.event_type == "user_message",
     ).count() == 0
+
+
+# ----------------------------------------------------------------------
+# 9. 强制唯一 Thread（V63 闭环）
+# ----------------------------------------------------------------------
+def test_user_message_with_stale_thread_id_is_rejected_before_any_write(db_session) -> None:
+    current = _current_thread(db_session)
+    stale = _thread(db_session, "old-thread")
+    service = _service()
+    turn_id = str(uuid.uuid4())
+
+    with pytest.raises(TurnConflictError) as rejected:
+        service._resolve_and_preempt("旧线程消息", stale, turn_id)  # pyright: ignore[reportPrivateUsage]
+
+    assert str(rejected.value) == "stale_thread_id"
+    assert db_session.query(TurnRecord).filter(TurnRecord.thread_id == stale).count() == 0
+    assert _user_events(db_session, stale) == []
+    assert lease_holder(db_session, stale) is None
+    assert db_session.query(TurnRecord).filter(TurnRecord.thread_id == current).count() == 0
+
+
+def test_user_message_without_thread_id_uses_current_thread(db_session) -> None:
+    current = _current_thread(db_session)
+    service = _service()
+    turn, _execution_id, _token = service._resolve_and_preempt(  # pyright: ignore[reportPrivateUsage]
+        "没传 thread_id", None, str(uuid.uuid4()),
+    )
+    assert turn.thread_id == current
+
+
+@pytest.mark.parametrize("source", ["system_command", "runtime_event"])
+def test_internal_sources_keep_their_own_thread_behavior(db_session, source: str) -> None:
+    """内部来源不受唯一 Thread 约束（系统线程/提醒线程保持原行为）。"""
+    _current_thread(db_session)
+    internal_thread = _thread(db_session, "internal-thread")
+    service = TurnExecutionService(llm_client=FakeLLMClient(), message_source=source)
+
+    turn, _execution_id, _token = service._resolve_and_preempt(  # pyright: ignore[reportPrivateUsage]
+        "内部消息", internal_thread, str(uuid.uuid4()),
+    )
+    assert turn.status == "running"
+    assert turn.thread_id == internal_thread
+
+
+def test_stream_busy_payload_has_202_retryable_contract(db_session) -> None:
+    import asyncio
+
+    from aiive.api.routes_chat import _chat_error_payload
+
+    thread_id = _current_thread(db_session)
+    held = acquire_thread_lease(
+        thread_id,
+        owner_kind=OWNER_GOAL_DECISION,
+        owner_id="decision-stream-busy",
+        ttl_seconds=60,
+    )
+    assert held is not None
+
+    service = _service()
+
+    async def _first_event() -> dict | None:
+        async for event in service.execute_turn_stream(
+            "流式忙时请求", thread_id, str(uuid.uuid4()),
+        ):
+            return event
+        return None
+
+    event = asyncio.run(_first_event())
+    assert event is not None
+    assert event["type"] == "error"
+    assert event["error"] == "turn_in_progress"
+    # SSE 的 HTTP 状态保持 200，但 error 事件内的 status 必须正确。
+    assert event["_status"] == 202
+    assert event["retryable"] is True
+
+    payload = _chat_error_payload(event)
+    assert payload["code"] == "turn_in_progress"
+    assert payload["status"] == 202
+    assert payload["retryable"] is True
+
+def test_background_lease_reports_busy_and_not_cancellable(db_session) -> None:
+    thread_id = _current_thread(db_session)
+    held = acquire_thread_lease(
+        thread_id,
+        owner_kind=OWNER_GOAL_DECISION,
+        owner_id="decision-busy-status",
+        ttl_seconds=60,
+    )
+    assert held is not None
+
+    status = describe_execution_status(db_session, thread_id)
+    assert status["state"] == "busy"
+    assert status["cancellable"] is False
+    assert status["active_turn"] is not None
