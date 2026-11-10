@@ -139,51 +139,21 @@ Goal 恢复，步骤仍 waiting_user -> Q1 重新变为 open
 
 回答工具按 `agent_ctx["open_questions"]` 条件绑定；即便绕过聊天工具直接调用服务层，`answer_step_question()` 也会复核 question_id、task/step 归属和 open 状态，防止旧问题修改计划。
 
-## 2.3 Token 预算：分区限制不是总量保证
+## 2.3 全局 Token 硬预算（V64.1，2026-11-10）
 
-`ContextBudget` 将上下文拆成若干逻辑分区，例如 Stable Contract、Core Memory、WorkingState、Tool Definitions、Recent Messages、Retrieved Memory、Tool Results、Epoch Checkpoint、Segment Summaries、Sealing Bridge、Retrieved History Summary，以及输出预留。
+`model_context_window = AIIVE_LLM_CONTEXT_WINDOW`，`reserved_output_tokens = AIIVE_LLM_MAX_OUTPUT_TOKENS`，`hard_input_limit = model_context_window - reserved_output_tokens`。`TokenCount.safe_tokens` 已包含现有安全余量，最终检查 **safe_tokens + requested_output_tokens <= model_context_window**。不再存在分区 hard/soft 配额、Recent 弹性额度、Graph 35% 预留或分区总额校验；旧 `AIIVE_CONTEXT_BUDGET_JSON` 仅输出弃用警告并被忽略。`ModelProfile`、`TokenCounter` 安全余量和 TurnExecution 共享缓存保持不变。
 
-要区分三个数：
+## 2.4 来源感知 Overflow Packer
 
-- **soft limit**：希望某分区通常控制在的预算；
-- **hard limit**：分区允许的上限/默认边界；
-- **model context window**：模型端最终总窗口。
+一次收集可见候选后构建完整 messages + tools，并调用真实 TokenCounter。超限时按顺序逐项移除，每次重新渲染并重新计数：最旧完整历史 Turn → 统一 RetrievalHit 中 final_score 最低的 Memory/历史摘要 → score 较低、hop 较远的完整 Graph 关系 → 较旧完整 SegmentSummary → WorkingState Artifact 引用及低优先级 open_loop → 按原角色优先级反向移除完整 Core Block（优先保留 human_identity）。Stable Contract、安全约束、当前消息、目标、关键约束、P0/P1 循环、待审批、未确认副作用及运行中工具状态保留；interrupted_unknown 工具事实整组保护。保留工具调用与结果成对。必要内容仍超限则 ContextBudgetExceededError，不调用模型；不做字符比例截断或即时 LLM 压缩。
 
-各分区限制用于局部装配和裁剪，最终是否能发给模型由完整 messages + tools 的 TokenCounter 重新计数决定。不能把分区预算简单相加后当成最终模型实际 token 数。
-
-上述数字属于配置默认值/某个预算配置快照，不是所有模型、所有部署的恒定值。模型上下文窗口、最大输出 token、环境变量都可能改变弹性 Recent Messages 预算。实际部署必须读取 `ContextBudget.from_env()` 和 ModelProfile，而不是仅抄文档中的固定数字。
-
-## 2.4 五轮裁剪到底怎么发生
-
-`TrimPlan.from_budget()` 每轮生成独立裁剪计划，不修改共享 `ContextBudget`。最多执行 `MAX_TRIM_ROUNDS = 5` 次组装：
-
-| attempt | Recent Messages / Tool Definitions 系数 | 额外限制 |
-|---:|---:|---|
-| 0 | 1.00 | 使用各分区 soft limit |
-| 1 | 0.80 | Recent / Tool definitions 收紧 |
-| 2 | 0.60 | Tool Results ≤ 2000 |
-| 3 | 0.40 | Tool Results ≤ 1000；Retrieved Memory ≤ 400 |
-| 4 | 0.25 | Tool Results ≤ 500；Retrieved Memory ≤ 200；WorkingState ≤ 500 |
-
-每轮都会重新渲染 WorkingState、重新读取有界历史、重新装载摘要/桥接/Recall，再重新构建工具 schema。不是只对上一轮最终字符串做一次截断。
-
-随后 `TokenCounter.count_messages(model, messages, tools)` 统计完整输入。若 `safe_tokens + requested_output <= context_window`，才返回 `is_safe=True` 的 `AssembledContext`。五轮仍不满足则抛 `ContextBudgetExceededError`，不把超限上下文硬塞给模型。
-
-### 2.4.1 Soft Limit 的副作用
-
-第一次组装后，若 `safe_tokens > budget.soft_input_limit`，会调用 `EpochManager.mark_pending_seal()` 标记当前 open Segment 的 `pending_seal_at` 和 `sealed_by_turn`，并显式 commit。此标记表达“上下文已达到软阈值，需要后台考虑密封”，不是“当前已经执行了压缩”。
-
-这意味着：
-
-- token 裁剪是当前 Turn 的即时措施；
-- `pending_seal` 是后台 Segment 密封的提示信号；
-- 真正密封还要经过调度扫描、状态检查、冻结和 Outbox Handler。
+候选只加载一次，Packer 不查数据库。AUTO 在现有 Scope/Forget/版本校验后加载完整来源内容，以调用方传入的 hard_input_limit 作为候选总量上限。SEARCH/DEEP 的显式工具预算保持原样。最终保留的 Memory 才 touch、进入 injected_memory_ids；各来源诊断只报告真实使用量和裁剪原因，不分配固定额度。
 
 ## 2.5 历史消息如何有界读取
 
 `ThreadState.load_recent_messages_bounded()` 使用 Keyset/序列边界读取，而不是一次性加载全 Thread 全部 Event。源码中的默认约束包括按 Turn 分页、最大 Turn/Event 数和原始字节上限；具体值应以当前 `thread_state.py` 配置为准。
 
-读取过程按较新的 Turn 向前扫描，并结合 token 预算决定是否继续纳入更旧 Turn。对大型工具输出，先尝试引用化/有界回填，再重新计数；如果完整某轮历史放不下，则停止继续向更旧方向扩展，避免只保留更早碎片而丢失近因。
+读取过程按较新的 Turn 向前扫描，保留 max_pages/max_turns/max_events/max_raw_bytes。ContextAssembler 与密封统计传 token_budget=None，不预先套分区额度；所有事件带 turn_id，用于整 Turn 淘汰。大型工具结果保留现有引用化限制。当前 Segment 统计另带 segment_id，避免计入其他 Segment。
 
 `interrupted_unknown` 是特殊情况：工具调用可能已经发生副作用但执行结果未知，不能伪装成普通成功的 assistant/tool 消息重放。系统将其降级为说明性 System 内容，提示模型该调用状态未知，从而避免模型据此盲目重复执行。
 
@@ -210,13 +180,16 @@ Goal 恢复，步骤仍 waiting_user -> Q1 重新变为 open
 
 | 类型 | 发生时机 | 改变什么 | 是否调用 LLM | 是否持久化 |
 |---|---|---|---|---|
-| Turn 内裁剪 | 每次上下文组装超出 soft/hard 预算时 | 当前请求的 prompt 内容 | 否 | 通常不保存压缩摘要；soft 超限会留下 pending_seal 标记 |
-| Segment Sealing | 空闲扫描、达到 Segment 上限、soft-limit 标记等条件满足后 | 一段历史转成 SegmentSummary | 是（语义阶段） | 是 |
+| Turn 内裁剪 | 完整输入加请求输出超模型窗口时 | 当前请求的完整来源单元 | 否 | 不触发历史密封 |
+| Segment Sealing | 历史 Token 阈值 / 32 Turn / 空闲扫描 | 一段历史转成 SegmentSummary | 语义摘要；Prompt 超限则确定性抽取 | 是 |
 | Epoch Rollover / Checkpoint | Epoch 达到 Segment 数量/阶段边界 | 多个 Segment 归档成 EpochCheckpoint | Checkpoint 聚合为确定性过程 | 是 |
 
 ## 3.2 Segment 密封触发与阻塞条件
 
-从配置说明和 `EpochManager` 源码可确认：系统有空闲扫描和 Segment 容量上限；Soft Limit 触发 pending seal；达到容量后也会产生待密封信号。空闲扫描的候选还必须在事务内复核 Thread 是否仍空闲，避免扫描后用户重新发消息仍密封旧边界。
+`compaction.validate_compaction_prompt()` 使用 LiteLLMTokenCounter、ModelProfile、TokenSafetyConfig 检查完整摘要 Prompt 的 safe_tokens + 配置最大输出 <= 配置模型窗口。`handle_segment_sealing()` 每次 llm.chat 前计数，包括追加错误回复后的 JSON retry Prompt；确定性超限立即走 `_build_extract_fallback_summary()`，记录 compaction_prompt_overflow 与 deterministic-extractive-fallback，继续 merge_summary、Cover Check、source_hash/fencing 和事务提交，不消耗 Worker 重试。Forget `_try_generate_summary()` 同样门禁，超限返回 None，沿用 redacted 降级；不改变来源过滤与重建语义。Epoch Checkpoint 仍为确定性聚合，无新增模型调用。
+
+
+`_finalize_turn()` 完成 Turn 并 flush 当前 Event 后，通过 `ThreadState.load_recent_messages_bounded(token_budget=None, segment_id=...)`、现有 TokenCounter 和 ToolResultNormalizer 统计当前 Segment 的实际历史 Token（`BoundedReadStats.estimated_tokens`）。有效阈值为 `min(AIIVE_SEGMENT_SEAL_TOKEN_THRESHOLD=64000, hard_input_limit * 0.5)`；达到该阈值或 `max_segment_turn_records=32` 时设置现有 pending_seal_at/sealed_by_turn，与当前 Turn 同事务提交。Memory/Graph/工具定义等 Prompt 内容不计入历史密封触发。保留 15 分钟 Idle Sealing、Scheduler、EpochManager、Outbox 和原有非终态/副作用阻塞条件。
 
 密封入口 `begin_segment_sealing()` 会锁 Thread 行，核对传入的 `expected_segment_id` 仍是当前 open Segment，并检查 idle cutoff。以下情况会阻止密封：
 
@@ -417,7 +390,7 @@ Memory 向量目前看到的是“按源版本回填/增量修复”的机制；
 
 ## 4.5 召回结果如何注入 Prompt
 
-AutomaticRecall 的 Pack 在 `_load_agent_context()` 被转换为 `recall_messages` / `recall_text`。`ContextAssembler` 将 Recall 文本与 Graph Expansion 共用 `retrieved_memory` 分区预算：先按 GraphConfig 的 `budget_ratio` 给图谱预留预算，再给 Memory 文本分配剩余预算；Memory 没用完的预算可回补给 Graph。图谱按关系价值顺序整条注入，预算不足时丢弃低价值关系，不把单条关系定义从中间截断。
+AUTO 返回经可见性与源版本校验的完整 RetrievalHit；ContextAssembler 保留原 final_score/source_id，与完整 GraphRelationView 一起交给全局 Packer。超限先淘汰低分 RetrievalHit，再整条淘汰 Graph 关系，不再按 GraphConfig.budget_ratio 预留空间，也不按字符比例截断 Recall。只有最终保留并注入的 Memory 才记录访问。
 
 注入形式是一个或多个 `role=system` 的上下文块，位于原始聊天历史之后、待回答问题和当前消息之前。只有最终通过 hard gate 后，才调用 `_touch_injected_memory(recall_pack)` 更新记忆访问记录；所以“检索候选”不等于“实际注入并计为访问”。
 
@@ -766,7 +739,7 @@ MemoryRecord 的 `graph_facts` 保存结构化事实候选，GraphEntity/GraphRe
 
 普通聊天的 Memory Recall 得到 Memory ID 后，图谱扩展可从这些 Memory 的关系事实中抽取实体种子；也可从 Query 匹配已知实体名/别名。随后按有限 Hop 遍历 active 且有效关系，回查来源 Memory 状态、Forget 屏蔽、Scope 和时间有效性，再按置信度/价值排序。
 
-它不是全图 BFS，也不是每轮让 LLM 判断扩展策略；扩展有最大 hop、候选和 token 预算，失败不应破坏普通 Memory Recall。最终 Graph Expansion 文本与记忆召回共用 `retrieved_memory` 分区，关系以完整结构块注入 system context。
+它不是全图 BFS，也不是每轮让 LLM 判断扩展策略；扩展保留最大 hop、batch_size 和 max_relations 数据访问边界，Token 由全局门禁控制，失败不应破坏普通 Memory Recall。最终 Graph Expansion 保留完整关系，并在全局溢出时按现有 score/hop 顺序整条淘汰，不再按 35% 分配 Token。
 
 ## 7.4 图谱重建
 
@@ -871,7 +844,7 @@ Forget 不是单条 `DELETE`，而是一个“先屏蔽、再发现依赖、重�
 |---|---|---|---|
 | 对话 AgentGraph / Tool Policy | 已实现 | 正常对话路径 | 未逐节点审计全部异常分支 |
 | Context Assembler | 已实现 | 每次普通聊天组装上下文 | 预算值随模型和环境配置变化 |
-| Turn 内多轮裁剪 | 已实现 | 超预算时最多 5 轮 | 不等于持久化压缩 |
+| 来源感知溢出裁剪 | V64.1 已实现 | 完整单元逐项移除并真实重计数 | 必要内容仍超限则拒绝调用 |
 | Segment Sealing / Epoch Checkpoint | 已实现 | Worker 扫描、阈值和边界触发 | 未重新测量生产调度频率 |
 | Automatic Memory Recall | 已实现 | 普通对话上下文装配路径 | 受 Scope、生命周期和 Forget 过滤限制 |
 | Memory Vector | 已实现、可选 | 默认关闭 | 开启依赖 PostgreSQL/pgvector + Embedding 服务 |

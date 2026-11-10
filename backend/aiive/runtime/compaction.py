@@ -475,3 +475,20 @@ def derive_unresolved_failures(db: Session, segment_id: str) -> list[dict[str, A
         seen.add(tc)
         dedup.append(f)
     return dedup
+
+
+class CompactionPromptExceededError(ValueError):
+    """Deterministic overflow; never retry an oversized summary prompt."""
+
+
+def validate_compaction_prompt(messages: list[dict[str, Any]]) -> None:
+    """Count the actual initial or retry prompt with the production safety margin."""
+    from aiive.config import settings
+    profile = ModelProfile.from_config("deepseek", settings.aiive_llm_model)
+    counter = LiteLLMTokenCounter(safety=TokenSafetyConfig(), profile=profile)
+    count = counter.count_messages(profile.full_name, messages)
+    if count.safe_tokens + settings.aiive_llm_max_output_tokens > settings.aiive_llm_context_window:
+        raise CompactionPromptExceededError(
+            f"compaction_prompt_overflow: safe={count.safe_tokens}, "
+            + f"output={settings.aiive_llm_max_output_tokens}, window={settings.aiive_llm_context_window}"
+        )

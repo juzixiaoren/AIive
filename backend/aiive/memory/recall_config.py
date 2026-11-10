@@ -13,12 +13,10 @@ class RecallConfig:
     """All recall-side budgets, weights, and limits."""
 
     # --- Core Memory Blocks ---
-    core_memory_total_token_budget: int = 600
     core_memory_max_blocks: int = 3
 
     # --- Automatic Recall ---
     automatic_recall_top_k: int = 8
-    automatic_recall_token_budget: int = 1200
     recall_relevance_threshold: float = 0.08  # lowered for CJK bigram noise
 
     # --- Agent-Initiated Recall limits (Kernel enforcement) ---
@@ -60,7 +58,7 @@ class RecallConfig:
     # --- Phase 3: Idle Scanner / 摘要加载 ---
     idle_threshold_seconds: int = 900          # 15 分钟无活动视为空闲
     min_segment_turn_records: int = 3          # 未标记 pending_seal 时的最小 Turn 数
-    # 长期持续活跃会话不能只依赖 idle/上下文软阈值，否则单个压缩输入会无限增长。
+    # Turn 数兜底；历史 Token 阈值由 settings.aiive_segment_seal_token_threshold 配置。
     max_segment_turn_records: int = 32
     max_segment_summaries: int = 5             # ContextAssembler 加载的最近 Summary 数
 
@@ -75,12 +73,10 @@ class RetrievalConfig:
     """Phase 5 统一检索的全部可调阈值、权重与 generation 策略。"""
 
     # --- 分区 token 预算 ---
-    retrieved_history_summary_token_budget: int = 800
     deep_history_raw_token_budget: int = 1500
 
     # --- auto 模式（ContextAssembler 自动召回）---
     auto_max_results: int = 8
-    auto_token_budget: int = 1000
 
     # --- search 模式（工具显式检索）---
     search_max_results: int = 20

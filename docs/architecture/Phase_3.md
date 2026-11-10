@@ -1,6 +1,6 @@
 # Phase 3：Segment Sealing、SegmentSummary、EpochCheckpoint 与 Idle Compaction
 
-> **状态**：审计完成，待确认后实施
+> **状态**：已实现；V64.1（2026-11-10）更新历史 Token 触发与摘要 Prompt 硬门禁，其他章节保留原阶段设计背景
 > **前置**：Phase 0.5A / 0.5B / Phase 1 / Phase 2
 > **约束**：不新建 Supervisor LLM；不删除原始 Turn/Event；不修改 Phase 2 Memory Ingestion
 
@@ -37,7 +37,7 @@ start_turn_sequence  | ✅ | BigInteger NOT NULL, CK constraint
 end_turn_sequence    | ✅ | BigInteger nullable, CK >= start_turn_sequence
 source_hash          | ✅ | String(64) nullable（供 CompactionRun 校验）
 summary_id           | ✅ | String(36) nullable（指向 SegmentSummary.id）
-pending_seal_at      | ✅ | DateTime nullable（ContextAssembler 软阈值标记）
+pending_seal_at      | ✅ | DateTime nullable（Turn finalize 后历史 Token / Turn 数标记）
 sealed_by_turn       | ✅ | BigInteger nullable（标记触发序列号）
 created_at           | ✅ | DateTime
 sealed_at            | ✅ | DateTime nullable
@@ -153,20 +153,9 @@ version                   | int（每次写入递增）
 
 **关键**：Segment 分配在 Thread 行锁保护下，不存在竞争。
 
-### B.2 pending_seal 触发
+### B.2 pending_seal 触发（V64.1）
 
-`ContextAssembler.assemble()` 中：
-
-```python
-# 第 201-209 行
-soft_exceeded = final_safe > self._budget.soft_input_limit
-if soft_exceeded and attempt == 0:
-    epoch_mgr.mark_pending_seal(db, thread.id, assembly_started_at_seq or 0)
-```
-
-`EpochManager.mark_pending_seal()` 设置 `Segment.pending_seal_at = datetime.now()` 和 `Segment.sealed_by_turn = turn_sequence`。
-
-**已存在但未自动化**：只标记，不触发任何 sealing 动作。Idle scanner 需读取此字段。
+`_finalize_turn()` 完成 Turn 并 flush 当前 Event 后，通过 `ThreadState.load_recent_messages_bounded(token_budget=None, segment_id=...)`、现有 TokenCounter 和 ToolResultNormalizer 统计当前 Segment 的实际历史 Token（`BoundedReadStats.estimated_tokens`）。有效阈值为 `min(AIIVE_SEGMENT_SEAL_TOKEN_THRESHOLD=64000, hard_input_limit * 0.5)`；达到该阈值或 `max_segment_turn_records=32` 时设置现有 pending_seal_at/sealed_by_turn，与当前 Turn 同事务提交。Memory/Graph/工具定义等 Prompt 内容不计入历史密封触发。保留 15 分钟 Idle Sealing、Scheduler、EpochManager、Outbox 和原有非终态/副作用阻塞条件。
 
 ### B.3 移除直接 sealed 旁路
 
@@ -504,13 +493,18 @@ Phase B **不得读取实时 WorkingState**。Phase B 用短只读 Session 加�
 - Turn.segment_id = 新 Segment.id
 - **旧 Segment 永不接收新 Turn；失败的 sealing Segment 禁止 reset 为 open**（否则产生两个 open Segment + 范围重叠）
 
-### E.6 `ContextBudget.soft_input_limit` 触发
+### E.6 全局 Prompt 与历史 Token 分离（V64.1）
 
-同 Phase 1：`soft_exceeded` → `mark_pending_seal`。
+ContextAssembler 不再写 pending_seal，也不提交密封信号。仅 finalize 的当前 Segment 历史量和 Turn 数决定容量触发。
 
 ---
 
 ## F. 三阶段 Handler
+
+### F.0 V64.1 摘要 Prompt 硬门禁
+
+`compaction.validate_compaction_prompt()` 使用 LiteLLMTokenCounter、ModelProfile、TokenSafetyConfig 检查完整摘要 Prompt 的 safe_tokens + 配置最大输出 <= 配置模型窗口。`handle_segment_sealing()` 每次 llm.chat 前计数，包括追加错误回复后的 JSON retry Prompt；确定性超限立即走 `_build_extract_fallback_summary()`，记录 compaction_prompt_overflow 与 deterministic-extractive-fallback，继续 merge_summary、Cover Check、source_hash/fencing 和事务提交，不消耗 Worker 重试。Forget `_try_generate_summary()` 同样门禁，超限返回 None，沿用 redacted 降级；不改变来源过滤与重建语义。Epoch Checkpoint 仍为确定性聚合，无新增模型调用。
+
 
 ### Handler 职责边界
 
@@ -974,7 +968,7 @@ Sealing Segment：
   - 此时加载 CompactionInput 中冻结范围的 bounded raw tail
   - Summary 成功后 → 停止读取 raw bridge，加载 Summary 替代
   - 最多 1 个 sealing Segment 作为 bridge
-  - bridge 有独立 token/数量上限
+  - bridge 保留现有最多 1 个 Segment、冻结事件尾部数量边界，内容完整装配后由全局门禁验证
   - 禁止因 bridge 缺失而加载全部旧历史
 ```
 
@@ -1002,7 +996,7 @@ ContextBudget:
 ### K.4 关键约束
 
 - sealed Segment 只加载 Summary
-- sealing + 无 Summary → bounded raw bridge（最多 1 个，有 token 上限）
+- sealing + 无 Summary → bounded raw bridge（最多 1 个，保留事件数量边界，无分区 Token 配额）
 - Summary 成功 → bridge 退化（不再加载 raw）
 - Summary 缺失 → degraded state，不静默加载全部历史
 - 当前 open Segment 仍走 Phase 1 keyset reader
@@ -1111,7 +1105,7 @@ SELECT id FROM segments WHERE status = 'sealed' AND summary_id IS NULL;
 
 | 编号 | 测试 | 类型 |
 |------|------|------|
-| 1 | soft threshold 标记 pending_seal | 单元 |
+| 1 | 当前 Segment 历史 Token / 32 Turn 标记 pending_seal；大 Memory/Graph 不触发 | 单元 / 集成 |
 | 2 | begin_segment_sealing 原子固定范围 + CompactionInput + 新 Segment | 集成 |
 | 3 | sealing 期间新 Turn 进入新 Segment | 集成 |
 | 4 | running Turn 阻止密封 | 单元 |

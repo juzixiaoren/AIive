@@ -504,14 +504,14 @@ def mark_single_valued_conflicts(views: list[GraphRelationView]) -> None:
 
 
 def render_expansion_block(
-    relations: list[GraphRelationView], budget_tokens: int,
+    relations: list[GraphRelationView], budget_tokens: int | None = None,
 ) -> tuple[str, int]:
     """按预算装配关系摘要（按价值顺序，整条取舍，绝不截断单条关系）。
 
     分组顺序：当前有效 → 历史（已被取代）→ 低置信（待确认）。
     返回 (文本, 实际消耗 token 估算)；预算装不下任何一条时返回 ("", 0)。
     """
-    if not relations or budget_tokens <= 0:
+    if not relations or (budget_tokens is not None and budget_tokens <= 0):
         return "", 0
     current = [
         r for r in relations
@@ -540,7 +540,7 @@ def render_expansion_block(
         block_cost = title_cost
         for item in items:
             cost = max(1, len(_view_line(item)) // 4)
-            if used + block_cost + cost > budget_tokens:
+            if budget_tokens is not None and used + block_cost + cost > budget_tokens:
                 break
             block_lines.append(_view_line(item))
             block_cost += cost

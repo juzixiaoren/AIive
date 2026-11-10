@@ -27,7 +27,7 @@ from aiive.memory.recall_config import RecallConfig
 from aiive.memory.recall_models import CoreMemoryBlock
 
 
-# Priority when trimming to budget (most important first).
+# Overflow retention priority (most important first).
 _ROLE_PRIORITY: dict[str, int] = {
     "core.human_identity": 0,
     "core.interaction_defaults": 1,
@@ -89,32 +89,14 @@ def build_blocks(db: Session, config: RecallConfig | None = None) -> list[CoreMe
             token_count=_estimate(content),
         ))
 
-    # Stable order, then budget enforcement.
+    # Stable role order and non-token block count bound.
     blocks.sort(key=lambda b: _ROLE_PRIORITY.get(b.block_name, 9))
-    return _enforce_budget(blocks, config)
+    return _limit_blocks(blocks, config)
 
 
-def _enforce_budget(blocks: list[CoreMemoryBlock], config: RecallConfig) -> list[CoreMemoryBlock]:
-    """Keep total tokens under budget; drop/trim lowest-priority blocks first."""
-    kept: list[CoreMemoryBlock] = []
-    total = 0
-    for b in blocks:
-        if total + b.token_count > config.core_memory_total_token_budget:
-            # try to trim content of this block to fit
-            remaining = config.core_memory_total_token_budget - total
-            if remaining > 20:
-                allowed_chars = remaining * 4
-                b = b.model_copy(update={
-                    "content": b.content[:allowed_chars] + "…",
-                    "token_count": _estimate(b.content[:allowed_chars] + "…"),
-                })
-                kept.append(b)
-                total += b.token_count
-            # else: drop this (and any lower-priority) block
-            continue
-        kept.append(b)
-        total += b.token_count
-    return kept[: config.core_memory_max_blocks]
+def _limit_blocks(blocks: list[CoreMemoryBlock], config: RecallConfig) -> list[CoreMemoryBlock]:
+    """Keep complete blocks in role priority order, bounded only by block count."""
+    return blocks[: config.core_memory_max_blocks]
 
 
 def _projection_source_state(db: Session, config: RecallConfig) -> dict[str, int]:
@@ -133,8 +115,7 @@ def _projection_source_state(db: Session, config: RecallConfig) -> dict[str, int
         stamp = stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None else stamp.astimezone(timezone.utc)
         values.append((record.id, record.record_version, record.canonical_key, record.content,
                        record.sensitivity, stamp.isoformat()))
-    signature = json.dumps([values, roles, config.core_memory_total_token_budget,
-                            config.core_memory_max_blocks], sort_keys=True, ensure_ascii=False)
+    signature = json.dumps([values, roles, "complete-blocks-v64.1", config.core_memory_max_blocks], sort_keys=True, ensure_ascii=False)
     versions = {r.id: r.record_version for r in records}
     versions["@source_fingerprint"] = int(hashlib.sha256(signature.encode()).hexdigest()[:16], 16)
     return versions

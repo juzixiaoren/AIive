@@ -1330,7 +1330,9 @@ def _try_generate_summary(
     若无剩余 source → 返回 None，由调用方使用 redacted。
     """
     from aiive.core.llm_client import LLMClient
-    from aiive.runtime.compaction import count_summary_tokens, merge_summary
+    from aiive.runtime.compaction import (
+        count_summary_tokens, merge_summary, validate_compaction_prompt, CompactionPromptExceededError,
+    )
     from aiive.worker.outbox_handlers import _build_summary_prompt, _extract_json  # pyright: ignore[reportPrivateUsage]
 
     import hashlib
@@ -1395,6 +1397,7 @@ def _try_generate_summary(
             timeout_seconds=settings.aiive_llm_timeout_seconds,
         )
         messages = _build_summary_prompt(source_turns, [], [])
+        validate_compaction_prompt(messages)
         resp = llm.chat(
             messages,
             model=settings.aiive_llm_model,
@@ -1420,6 +1423,9 @@ def _try_generate_summary(
             model_id=settings.aiive_llm_model,
             token_count=token_count,
         )
+    except CompactionPromptExceededError as error:
+        logger.warning("Forget summary redacted fallback for segment %s: %s", segment_id, error)
+        return None
     except Exception:
         logger.exception("P3 LLM summary rebuild failed for segment %s", segment_id)
         return None  # LLM 失败 → fallback 到 redacted

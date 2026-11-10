@@ -25,10 +25,12 @@ class Settings(BaseSettings):
     aiive_llm_timeout_seconds: int = 30
     # 模型上下文窗口（token）：按所用模型的真实能力配置。
     # 上下文预算（ContextBudget）与 token 安全校验（ModelProfile）均以此为基准，
-    # recent_messages 分区自动吸收扣除固定分区后的剩余空间，改此值即整体自适应。
+    # 全局输入硬上限 = context_window - max_output_tokens，不再分配分区额度。
     aiive_llm_context_window: int = 256000
     # 模型单次生成的最大输出 token（从上下文窗口中预留）。
     aiive_llm_max_output_tokens: int = 4096
+    # 当前 Segment 历史量的密封阈值，实际取与全局输入上限一半的较小值。
+    aiive_segment_seal_token_threshold: int = 64000
     # 内部分类/提取调用的 JSON mode。auto 遇到明确的不支持错误时回退为
     # prompt-only JSON；主 Agent 自然语言/工具调用路径不使用该选项。
     aiive_llm_json_mode: Literal["auto", "on", "off"] = "auto"
@@ -99,8 +101,6 @@ class Settings(BaseSettings):
     aiive_memory_graph_max_seed_entities: int = 32
     # 低于该置信度的关系不投影为可用事实、也不注入上下文
     aiive_memory_graph_min_confidence: float = 0.6
-    # 图谱在 retrieved_memory 分区中的动态预算占比（随窗口与裁剪轮次变化）
-    aiive_memory_graph_budget_ratio: float = 0.35
     # 单次扩展最多收集的关系数（安全阀，防止极端稠密图）
     aiive_memory_graph_max_relations: int = 2000
     # 额外声明为单值的谓词（逗号分隔 canonical 名）。未声明的谓词一律按多值处理，

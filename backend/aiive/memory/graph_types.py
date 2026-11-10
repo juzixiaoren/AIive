@@ -210,7 +210,6 @@ class GraphConfig:
     batch_size: int = 200
     max_seed_entities: int = 32
     min_confidence: float = 0.6
-    budget_ratio: float = 0.35
     max_relations_per_expansion: int = 2000
 
     @classmethod
@@ -223,7 +222,6 @@ class GraphConfig:
             batch_size=max(1, int(getattr(settings, "aiive_memory_graph_batch_size", 200))),
             max_seed_entities=max(1, int(getattr(settings, "aiive_memory_graph_max_seed_entities", 32))),
             min_confidence=float(getattr(settings, "aiive_memory_graph_min_confidence", 0.6)),
-            budget_ratio=min(1.0, max(0.0, float(getattr(settings, "aiive_memory_graph_budget_ratio", 0.35)))),
             max_relations_per_expansion=max(
                 1, int(getattr(settings, "aiive_memory_graph_max_relations", 2000)),
             ),

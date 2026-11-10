@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+import json
 from collections.abc import Iterable
 from typing import Any, cast
 
@@ -97,7 +98,7 @@ class UnifiedRetriever:
             # #10：装配去重的排除集必须透传，否则热分区已加载的摘要重复注入
             exclude_source_ids=request.exclude_source_ids,
             max_results=cfg.auto_max_results,
-            token_budget=cfg.auto_token_budget,
+            token_budget=request.token_budget,
             request_id=request.request_id,
         )
         return self._retrieve_indexed(req, include_sleeping=cfg.include_sleeping_auto)
@@ -186,6 +187,9 @@ class UnifiedRetriever:
         if invalid_count > 0:
             notes.append(f"fail_closed_filtered:{invalid_count}")
 
+        if request.mode == RetrievalMode.AUTO:
+            validated = self._load_complete_auto_content(validated)
+
         # 4. 最终去重 + token budget 打包
         hits = self._dedup_and_budget(validated, max_results, request.token_budget)
         degradation_notes = {
@@ -202,6 +206,39 @@ class UnifiedRetriever:
             ),
             notes=notes,
         )
+
+    def _load_complete_auto_content(self, hits: list[RetrievalHit]) -> list[RetrievalHit]:
+        """AUTO packs complete visible sources; explicit tool search keeps its snippet limits."""
+        from aiive.memory.memory_policy import MemoryPolicyEngine, MemoryReadChannel
+        fields = {
+            "segment_summary": ("goal", "outcome", "decisions", "entities", "open_loops",
+                                "active_constraints", "artifacts", "important_tool_results", "unresolved_failures"),
+            "epoch_checkpoint": ("current_goal", "open_loops", "active_constraints", "completed_milestones",
+                                 "current_decisions", "relevant_entities", "referenced_artifacts"),
+        }
+        sources: dict[str, dict[str, Any]] = {}
+        for source_type, table in (("memory_record", MemoryRecord), ("segment_summary", SegmentSummary),
+                                   ("epoch_checkpoint", EpochCheckpoint)):
+            ids = [hit.source_id for hit in hits if hit.source_type == source_type]
+            sources[source_type] = {row.id: row for row in self._db.query(table).filter(table.id.in_(ids)).all()} if ids else {}
+        complete = []
+        for hit in hits:
+            source = sources.get(hit.source_type, {}).get(hit.source_id)
+            if source is None:
+                continue  # source disappeared after validation: fail closed
+            if hit.source_type == "memory_record":
+                text = MemoryPolicyEngine().render_content(source.content, source.sensitivity, MemoryReadChannel.LLM_CONTEXT)
+                if text is None:
+                    continue
+                hit.canonical_key = source.canonical_key
+                hit.provenance["memory_type"] = source.memory_type
+            else:
+                text = json.dumps({key: getattr(source, key, None) for key in fields[hit.source_type]},
+                                  ensure_ascii=False, default=str)
+            hit.snippet = text
+            hit.token_count = LiteLLMTokenCounter.count_text(text)
+            complete.append(hit)
+        return complete
 
     # ── Exact 路由（按 canonical_key 精确命中）──
 
@@ -249,13 +286,12 @@ class UnifiedRetriever:
             return [], ""
         rc = RecallConfig(
             automatic_recall_top_k=top_k,
-            automatic_recall_token_budget=self._config.auto_token_budget,
         )
         eng_req = MemoryRecallRequest(
             query=request.query,
             scope_context=scope,
             top_k=top_k,
-            token_budget=self._config.auto_token_budget,
+            token_budget=request.token_budget,
         )
         engine = AutomaticRecallEngine(self._db, rc)
         pack, _ = engine.recall(
@@ -751,8 +787,8 @@ class UnifiedRetriever:
         return MemoryRecallItem(
             memory_id=h.memory_record_id or h.source_id,
             content=h.snippet,
-            memory_type="",
-            canonical_key=h.title,
+            memory_type=str(h.provenance.get("memory_type") or ""),
+            canonical_key=h.canonical_key or h.title,
             scope_type=h.scope_type,
             scope_id=h.scope_id,
             relevance_score=h.lexical_score,

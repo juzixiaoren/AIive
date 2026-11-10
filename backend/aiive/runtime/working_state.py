@@ -20,7 +20,6 @@ from aiive.db.models import TurnRecord, WorkingState
 logger = logging.getLogger(__name__)
 
 MAX_LIST_ITEMS = 10
-MAX_FIELD_TOKENS = 2000
 
 
 class WorkingStateService:
@@ -297,49 +296,24 @@ class WorkingStateService:
 
     # ── 渲染为上下文字段 ──
 
-    def render_for_context(self, db: Session, thread_id: str, token_budget: int) -> str:
-        """将 WorkingState 渲染为有界系统消息文本块，不超过 token_budget。"""
+    def context_fields(self, db: Session, thread_id: str) -> dict[str, Any]:
+        """Read visible structured state before overflow packing, retaining resource bounds."""
         ws = self.get_or_create(db, thread_id)
-        parts: list[str] = ["## Working State（当前操作上下文，有界）"]
+        fields = self.safe_boundary_snapshot(db, ws)
+        return {
+            key: value[:MAX_LIST_ITEMS] if isinstance(value, list) else value
+            for key, value in fields.items()
+        }
 
-        if ws.current_objective:
-            objective_block = f"### 当前目标\n{ws.current_objective}"
-            parts.append(objective_block)
+    def render_for_context(self, db: Session, thread_id: str) -> str:
+        return self.render_context_fields(self.context_fields(db, thread_id))
 
-        if ws.open_loops:
-            parts.append("### 未完成循环")
-            for loop in (ws.open_loops or [])[:MAX_LIST_ITEMS]:
-                prio = loop.get("priority", "P?")
-                desc = loop.get("description", "")
-                parts.append(f"- [{prio}] {desc}")
-
-        if ws.active_constraints:
-            parts.append("### 活跃约束")
-            for c in (ws.active_constraints or [])[:MAX_LIST_ITEMS]:
-                parts.append(f"- {c.get('description', '')} (来源: {c.get('source', 'unknown')})")
-
-        if ws.pending_approvals:
-            parts.append("### 待审批")
-            for a in (ws.pending_approvals or [])[:MAX_LIST_ITEMS]:
-                parts.append(f"- {a.get('action', '')} (请求时间: {a.get('requested_at', '')})")
-
-        if ws.artifact_refs:
-            parts.append("### 引用的 Artifact")
-            for a in (ws.artifact_refs or [])[:MAX_LIST_ITEMS]:
-                parts.append(f"- {a.get('ref', '')}: {a.get('description', '')}")
-
-        full_text = "\n".join(parts).rstrip() + "\n"
-        # token 预算裁剪：从末尾逐段删除直到满足预算
-        # 估算: UTF-8 字节数 / 2 ≈ token 数（保守）
-        estimated = len(full_text.encode("utf-8")) // 2
-        if estimated <= token_budget:
-            return full_text
-
-        truncated_parts = list(parts)
-        while len(truncated_parts) > 1:
-            truncated_parts.pop()
-            candidate = "\n".join(truncated_parts).rstrip() + "\n"
-            if len(candidate.encode("utf-8")) // 2 <= token_budget:
-                return candidate
-
-        return truncated_parts[0] if truncated_parts else ""
+    @staticmethod
+    def render_context_fields(fields: dict[str, Any]) -> str:
+        """Render whole structured items, including pending and uncertain side effects."""
+        keys = ("current_objective", "open_loops", "active_constraints", "pending_approvals",
+                "artifact_refs", "verified_tool_states", "uncommitted_side_effects", "running_tool_state")
+        selected = {key: fields[key] for key in keys if fields.get(key)}
+        if not selected:
+            return ""
+        return "## Working State（当前操作上下文）\n" + _json.dumps(selected, ensure_ascii=False, default=str)

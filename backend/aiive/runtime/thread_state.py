@@ -51,12 +51,13 @@ class ThreadState:
         self,
         db: Session,
         thread_id: str,
-        token_budget: int,
+        token_budget: int | None,
         token_counter: Any,  # TokenCounter Protocol
         model: str,
         normalizer: Any | None = None,
         upper_bound_sequence: int | None = None,
         lower_bound_sequence: int | None = None,
+        segment_id: str | None = None,
         max_pages: int = 20,
         max_turns: int = 100,
         max_events: int = 5000,
@@ -83,6 +84,8 @@ class ThreadState:
                     TurnRecord.status.in_(("completed", "interrupted_unknown")),
                 )
             )
+            if segment_id is not None:
+                base_query = base_query.filter(TurnRecord.segment_id == segment_id)
             if last_sequence is not None:
                 base_query = base_query.filter(TurnRecord.turn_sequence < last_sequence)
             if lower_bound_sequence is not None:
@@ -117,6 +120,7 @@ class ThreadState:
                         ]),
                     )
                     .order_by(Event.turn_event_index.asc())
+                    .limit(max_events - total_events + 1)
                     .all()
                 )
                 total_events += len(events)
@@ -125,10 +129,6 @@ class ThreadState:
                     break
 
                 turn_dicts = self._events_to_dicts(events, turn.source)
-                if turn.status == "interrupted_unknown":
-                    turn_dicts = self._degrade_interrupted_turn_dicts(turn_dicts)
-                    if not turn_dicts:
-                        continue
                 turn_bytes = sum(len(_json.dumps(d, ensure_ascii=False, default=str).encode()) for d in turn_dicts)
                 total_bytes += turn_bytes
                 if total_bytes > max_raw_bytes:
@@ -139,9 +139,14 @@ class ThreadState:
                 if normalizer is not None:
                     turn_dicts = normalizer.normalize_turn(turn_dicts)
 
+                if turn.status == "interrupted_unknown":
+                    turn_dicts = self._degrade_interrupted_turn_dicts(turn_dicts)
+                    if not turn_dicts:
+                        continue
+
                 turn_msgs = self._dicts_to_chat_messages(turn_dicts)
                 tc = token_counter.count_messages(model, turn_msgs)
-                if current_tokens + tc.safe_tokens > token_budget:
+                if token_budget is not None and current_tokens + tc.safe_tokens > token_budget:
                     if normalizer is not None:
                         turn_dicts_sparse = normalizer.normalize_turn_sparse(turn_dicts)
                         if turn_dicts_sparse != turn_dicts:
@@ -174,7 +179,9 @@ class ThreadState:
             turns_included=len(all_turns),
             total_events=total_events,
             total_bytes=total_bytes,
-            estimated_tokens=current_tokens,
+            estimated_tokens=(token_counter.count_messages(
+                model, self._dicts_to_chat_messages(result),
+            ).estimated_tokens if result else 0),
             stopped_by=stopped_by,
         )
 
@@ -191,7 +198,7 @@ class ThreadState:
         tool_lines: list[str] = []
         results_by_id: dict[str, dict[str, Any]] = {
             str(d.get("tool_call_id") or ""): d
-            for d in turn_dicts if d.get("type") == "tool_result"
+            for d in turn_dicts if d.get("type") in ("tool_result", "tool_result_ref")
         }
         for d in turn_dicts:
             if d.get("type") != "tool_call":
@@ -205,8 +212,6 @@ class ThreadState:
                 result_text = raw if isinstance(raw, str) else _json.dumps(
                     raw, ensure_ascii=False, default=str,
                 )
-                if len(result_text) > 300:
-                    result_text = result_text[:300] + "…[截断]"
             tool_lines.append(f"- {name} -> {status}: {result_text}")
         if not tool_lines:
             return []
@@ -216,9 +221,10 @@ class ThreadState:
         )
         parts = ["[上一轮 Turn 被中断，以下工具调用在中断前已实际执行，其副作用可能已生效，请勿盲目重复执行]"]
         if user_line:
-            parts.append(f"当时的请求: {user_line[:200]}")
+            parts.append(f"当时的请求: {user_line}")
         parts.extend(tool_lines)
-        return [{"type": "system", "content": "\n".join(parts)}]
+        return [{"type": "system", "content": "\n".join(parts),
+                 "turn_id": turn_dicts[0].get("turn_id"), "protected": True}]
 
     @staticmethod
     def _dicts_to_chat_messages(turn_dicts: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -487,7 +493,7 @@ class ThreadState:
                 if content:
                     source_val = turn_source or p.get("message_source")
                     msg_type = "user" if source_val in (None, "user") else "system"
-                    messages.append({"type": msg_type, "content": content, "event_id": event.id, "trace_id": event.trace_id})
+                    messages.append({"type": msg_type, "content": content, "event_id": event.id, "trace_id": event.trace_id, "turn_id": event.turn_id})
             elif etype == "tool_call":
                 # turn_id 供 stable_tool_call_id 在缺失 tool_call_id 时构造两侧一致的回退键
                 messages.append({"type": "tool_call", "tool_name": p.get("name", ""), "tool_params": p.get("params", {}), "event_id": event.id, "trace_id": event.trace_id, "tool_call_id": p.get("tool_call_id", ""), "batch_index": p.get("batch_index", 0), "turn_id": event.turn_id})
@@ -496,5 +502,5 @@ class ThreadState:
             elif etype == "llm_response":
                 content = p.get("content", "")
                 if content:
-                    messages.append({"type": "assistant", "content": content, "action_cards": p.get("action_cards", []), "event_id": event.id, "trace_id": event.trace_id})
+                    messages.append({"type": "assistant", "content": content, "action_cards": p.get("action_cards", []), "event_id": event.id, "trace_id": event.trace_id, "turn_id": event.turn_id})
         return messages

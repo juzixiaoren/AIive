@@ -56,7 +56,7 @@ class MemoryRecallRequest(BaseModel):
     active_goal: str | None = None
     scope_context: ScopeContext
     top_k: int = 8
-    token_budget: int = 1200
+    token_budget: int | None = None
     request_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
 
 

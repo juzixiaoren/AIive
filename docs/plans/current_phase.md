@@ -1105,3 +1105,38 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 3. C：手机本地发起流式回复，保持 SSE 可继续传输而单独断开并恢复 WS（调试代理或受控测试工具）；确认首快照不会立刻触发历史覆盖、Token 继续追加；Turn finally 结束后只执行一次待刷新请求。分别检查成功、取消和流式失败路径。
 
 剩余风险：离线回放不覆盖真实网络、浏览器渲染及 Android WebView 生命周期；上述人工流程仍需设备实测。历史请求失败沿用现有处理，不新增重试/轮询；慢历史响应与后续事件的跨请求排序仍沿用现有机制，本轮未引入复杂状态协调。
+
+
+### V64.1 全局上下文预算、来源感知溢出与历史 Token 密封（2026-11-10）
+
+- 基线：`c52387e`，main，工作区初始干净。未新增数据库表/字段/迁移、Model Router、即时 LLM 压缩或跨来源评分公式；Forget / MemoryWrite / Thread Lease / 取消及 Outbox fencing 语义保持原有边界。
+- 预算：ContextBudget 仅保留 model_context_window、reserved_output_tokens，hard_input_limit=两者之差。配置来自 AIIVE_LLM_CONTEXT_WINDOW / AIIVE_LLM_MAX_OUTPUT_TOKENS；旧 AIIVE_CONTEXT_BUDGET_JSON（包括非法 JSON）警告并忽略。删除 PartitionBudget、分区总额校验、弹性 Recent 及 soft_input_limit，保留 default/from_env 与 TurnExecution 缓存；ModelProfile / TokenCounter / 安全余量未改。
+- 完整候选：一次收集完整 Turn（全部事件带 turn_id）、RetrievalHit（Memory/摘要共用原 final_score）、GraphRelationView、独立 SegmentSummary、结构化 WorkingState 与原角色顺序 Core Block。AUTO 在现有可见性/版本校验后回源加载完整内容，候选总量沿用调用方传入的全局 hard_input_limit，解决旧 200 字符预览对普通对话的隐性截断；显式 SEARCH/DEEP 的工具预算/预览限制不变。Core 投影来源指纹更新，旧裁剪缓存会由已有回源机制重建为完整 Block。
+- Overflow：ContextOverflowPacker 是无数据库查询/无模型调用的纯逻辑模块。先整体 TokenCounter.count_messages，再依次删除最旧完整 Turn → 最低 final_score 的统一检索候选 → 低 score/远 hop Graph 关系 → 旧完整摘要 → WorkingState Artifact/低优先级循环 → 反向角色优先级 Core Block；每移除一项都重新渲染/真实计数。Stable Contract、当前消息、目标、关键约束、P0/P1 循环、待审批、未确认副作用/运行中工具和 interrupted_unknown 事实保护。保留工具调用与结果配对，必要内容仍超限则 ContextBudgetExceededError、不调用 LLM。
+- 非 Token 安全边界保留：历史 max_pages/max_turns/max_events/max_raw_bytes、Memory top_k/路由上限、Graph hops/batch/relations、摘要 max_segment_summaries、Core 3 Block、ToolResultNormalizer Artifact 引用与 SINGLE_TOOL_RESULT_INLINE_LIMIT。WorkingState 去掉 token_budget 渲染参数，保留 MAX_LIST_ITEMS 与全部结构字段，复用 safe_boundary_snapshot 逐项来源可见性（来源不明仍 fail-closed）。
+- 诊断：ContextSnapshot 输入项也通过真实 TokenCounter 计数；PartitionReport 记录真实估计/安全 Token 与具体淘汰来源/原因，分区 hard_limit=None，仅 total 报全局硬上限。MemoryAccessTracker.touch、ContextSnapshot.injected_memory_ids 均从最终保留 Memory 生成；被淘汰候选和装配失败均不 touch。ForgetVisibilityService 先于候选注入，Packer 不重新查询或绕过屏蔽。
+- 历史密封：_finalize_turn 完成 Turn、flush 当前回复和工具 Event 后，在同事务中调用 _mark_segment_pending_seal。ThreadState 仅读取指定 segment_id，token_budget=None 时保留所有访问上限；经 ToolResultNormalizer 后用 TokenCounter 汇总真实 estimated_tokens。阈值=min(AIIVE_SEGMENT_SEAL_TOKEN_THRESHOLD=64000, hard_input_limit*0.5)；达到阈值或 32 Turn 即写现有 pending_seal_at/sealed_by_turn。取消旧“总 Prompt 超 80%”密封；15 分钟 Idle 与 Scheduler/EpochManager/Outbox 流程保留。
+- 摘要门禁：compaction.validate_compaction_prompt 使用生产 LiteLLMTokenCounter / ModelProfile / TokenSafetyConfig 校验 safe_tokens+配置最大输出<=窗口。Segment Handler 初次及追加 JSON 重试前均校验；确定性超限记录 compaction_prompt_overflow，立即使用 deterministic-extractive-fallback，继续 merge、Cover Check、source_hash 与 fenced commit，不对同一超限输入做 Worker 重试。Forget Summary 同门禁，超限直接 None，沿用 redacted 安全降级。Checkpoint 仍确定性聚合。
+
+完整调用链：
+
+`TurnExecution._load_context → ContextAssembler（可见完整候选 / 全量工具定义）→ ContextOverflowPacker → TokenCounter 整体硬门禁 → 最终 Memory touch + ContextSnapshot → AgentGraph → _finalize_turn/Event flush → ThreadState 当前 Segment 统计 → pending_seal → Scheduler → EpochManager freeze/CompactionInput → segment_sealing Outbox → 摘要初次/重试硬门禁 → LLM 或抽取降级 → merge/Cover Check/source_hash/fencing → Summary/Segment 原子提交`。
+
+验收证据：
+
+- 本地全量：`SHELL_BASH_PATH=E:/git/Git/bin/bash.exe`、`PYTHONUTF8=1`，`.venv/Scripts/python.exe -m pytest tests -q`：**1824 passed / 124 skipped / 5280 warnings，311.48s**。跳过为默认关闭的 PG 专项与 5 个 Windows 不支持的 POSIX 部署脚本；新 PG 测试另在真实专项运行。警告为现有 SQLite 日期适配、SQLAlchemy 事务与未 await 广播协程，未扩大到本轮之外修复。
+- 真实 PostgreSQL：启动本机已有 Docker Desktop，`AIIVE_PG_TESTS=1` 运行 `pytest tests/integration/pg -q`，一次性 pgvector/ParadeDB 容器：**111 passed / 13 skipped，220.35s**。13 项均依赖本地真实 Embedding 服务；新增 5 项 V64.1（初次/重试超限降级提交、Token/32 Turn/跨 Segment 隔离）全部通过；测试容器已由 fixture 清理。
+- 定向测试：Overflow/Assembler/ThreadState 新旧回归 **38 passed**，最终预算/Overflow/完整来源与快照复验 **44 passed**；普通 AUTO Memory / 历史摘要可超原 1200/800 配额，Core 完整 Block 可超 600，且 Forget Tombstone 屏蔽仍生效。四窗口 32K/50K/256K/1M、旧 JSON 弃用、小窗口、整 Turn/工具 JSON 完整性、最终 touch、历史独立触发、摘要初次/重试与 Forget 超限无调用均有断言。
+- 静态检查：Ruff `check backend/aiive --select F,E9` 通过；basedpyright（仓库 .venv）0 errors / 0 warnings / 0 notes。
+- 本地日志（build 不提交）：v641-all-final.log、v641-pg-final.log、v641-new-tests.log、v641-retrieval-tests.log、v641-types.log、v641-final-focused.log。进程数据库清理由根 pytest_sessionfinish 验证；真实 PG 使用一次性容器，不连接或清理用户生产库。
+- GitHub CI：提交推送后跟进实际结果，单独保留运行链接与结论。
+
+修改文件：
+
+- 运行时：runtime/context_budget.py、context_overflow.py（新增）、context_assembler.py、thread_state.py、turn_execution.py、working_state.py、compaction.py。
+- 来源与配置：config.py；memory/core_memory_projection.py、recall_config.py、recall_models.py、recall_fusion.py、graph_types.py、graph_expansion.py；retrieval/unified_retriever.py。
+- Worker：worker/outbox_handlers.py、handlers_forget.py。
+- 新增测试：tests/unit/backend/test_context_overflow.py、tests/integration/backend/test_context_v641.py、tests/integration/pg/test_pg_context_v641.py；迁移既有 ContextAssembler、GoalQuestion、ThreadState、Recall 测试夹具与断言。
+- 文档：CODE_MAP、current_phase、architecture/Phase_1、architecture/Phase_3、AIive_核心架构与实现深度分析。
+
+剩余风险：候选完整装配可能增加 CPU 计数/Prompt 大小；现有数据库访问上限保留，所以“完整”指访问边界内的完整结构单元。极小窗口下必要契约/工具/执行事实本身仍可能装不下，此时明确拒绝，不截断或额外调用摘要模型。历史超过资源读取上限时统计仍受有界读取约束；32 Turn 和 15 分钟 Idle 兜底保留。未做真实外部 LLM/Embedding 调用或百万窗口性能压测，配置窗口需与实际模型能力匹配。

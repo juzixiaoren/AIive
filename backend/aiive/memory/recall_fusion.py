@@ -112,7 +112,7 @@ def fuse_and_pack(
             ))
             excluded += 1
             continue
-        if token_total + item.token_cost > request.token_budget:
+        if request.token_budget is not None and token_total + item.token_cost > request.token_budget:
             traces.append(RecallCandidateTrace(
                 memory_id=item.memory_id, route=item.route,
                 raw_score=item.relevance_score, fused_score=item.fused_score,

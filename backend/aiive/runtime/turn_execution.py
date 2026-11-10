@@ -54,6 +54,8 @@ from aiive.runtime.context_assembler import (
 from aiive.runtime.context_budget import ContextBudget
 from aiive.runtime.epoch_manager import EpochManager
 from aiive.runtime.execution_context import TurnExecutionContext
+from aiive.config import settings
+from aiive.runtime.thread_state import ThreadState
 from aiive.runtime.thread_bootstrap import ThreadBootstrapService
 from aiive.runtime.conversation_state import (
     broadcast_execution_status,
@@ -1087,6 +1089,25 @@ class TurnExecutionService:
     # Phase 5: Finalize (with snapshot rotation)
     # =====================================================================
 
+    def _mark_segment_pending_seal(self, db: Session, turn: TurnRecord, now: datetime) -> None:
+        """Only finalized history from this segment can trigger token sealing."""
+        if not turn.segment_id:
+            return
+        cfg = RecallConfig()
+        count = db.query(TurnRecord).filter(TurnRecord.segment_id == turn.segment_id).count()
+        _, stats = ThreadState(db).load_recent_messages_bounded(
+            db=db, thread_id=turn.thread_id, token_budget=None,
+            token_counter=self._token_counter, model=self._profile.full_name,
+            normalizer=self._normalizer, segment_id=turn.segment_id,
+        )
+        threshold = min(settings.aiive_segment_seal_token_threshold, self._budget.hard_input_limit * 0.5)
+        if count >= cfg.max_segment_turn_records or stats.estimated_tokens >= threshold:
+            db.query(Segment).filter(
+                Segment.id == turn.segment_id, Segment.status == "open",
+                Segment.pending_seal_at.is_(None),
+            ).update({Segment.pending_seal_at: now, Segment.sealed_by_turn: turn.turn_sequence},
+                     synchronize_session=False)
+
     def _finalize_turn(
         self, turn: TurnRecord, execution_id: str,
         ag_result: AgentGraphResult, heartbeat: TurnHeartbeat,
@@ -1159,26 +1180,6 @@ class TurnExecutionService:
             db.query(Thread).filter(Thread.id == turn.thread_id).update(
                 {Thread.last_activity_at: now}, synchronize_session=False,
             )
-            # 长期持续活跃的单会话可能永远达不到 idle 条件。达到确定性 Turn
-            # 上限后标记 pending，使调度器在当前 Turn 提交后主动密封，避免
-            # 单个 Segment 及其摘要 prompt 无界增长。
-            if turn.segment_id:
-                segment_turn_count = db.query(TurnRecord).filter(
-                    TurnRecord.segment_id == turn.segment_id,
-                ).count()
-                if segment_turn_count >= RecallConfig().max_segment_turn_records:
-                    db.query(Segment).filter(
-                        Segment.id == turn.segment_id,
-                        Segment.status == "open",
-                        Segment.pending_seal_at.is_(None),
-                    ).update(
-                        {
-                            Segment.pending_seal_at: now,
-                            Segment.sealed_by_turn: turn.turn_sequence,
-                        },
-                        synchronize_session=False,
-                    )
-
             # Events：pending_approval 工具不写入 tool_call/tool_result，等待审批后补充；
             # blocked 工具从未执行，也不写入（避免孤儿 tool_call 破坏历史配对），
             # 其事实由 llm_response 事件内的 tool_blocked action card 承载。
@@ -1239,6 +1240,9 @@ class TurnExecutionService:
             db.add(Event(id=str(_uuid.uuid4()), trace_id=ag_result.trace_id, thread_id=turn.thread_id,
                          event_type="chat_ended", turn_id=turn.turn_id, turn_event_index=idx,
                          payload={"tool_calls": len(ag_result.tool_records), "tool_succeeded": sum(1 for r in ag_result.tool_records if r.status == "completed"), "tool_failed": sum(1 for r in ag_result.tool_records if r.status == "failed"), "pending_approvals": pending_count, "parse_errors": 0, "llm_usage": ag_result.llm_usage.as_dict()}))
+
+            db.flush()
+            self._mark_segment_pending_seal(db, turn, now)
 
             # ContextSnapshot with Phase 1 rotation
             self._rotate_snapshot(db, turn, ag_result, assembled_ctx)

@@ -3,7 +3,7 @@
 覆盖三条验收点：
 1) 召回结果作为种子触发 GraphExpansionService.expand（不依赖额外 LLM 判断）；
 2) 关系与时间信息确实进入发给模型的 messages，而不是只落库；
-3) 图谱预算随 retrieved_memory 分区容量动态变化，且关系块整条装配。
+3) 取消旧分区比例预算，关系块完整进入全局装配。
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from aiive.memory.memory_store import MemoryStore
 from aiive.memory.memory_types import EvidenceItem, MemoryProposal, TrustLevel
 from aiive.memory.recall_models import MemoryRecallItem, MemoryRecallPack
 from aiive.runtime.context_assembler import ContextAssembler
-from aiive.runtime.context_budget import ContextBudget, PartitionBudget
+from aiive.runtime.context_budget import ContextBudget
 from aiive.runtime.token_models import ModelProfile, TokenCount
 
 from tests.integration.backend._util import new_thread
@@ -32,43 +32,27 @@ class _FakeTokenCounter:
 
 
 class _StubWorkingStateService:
-    def render_for_context(self, *args, **kwargs) -> str:
+    def context_fields(self, *args, **kwargs):
+        return {}
+
+    def render_context_fields(self, fields) -> str:
         return ""
 
 
-def _pb(name: str, tokens: int) -> PartitionBudget:
-    return PartitionBudget(
-        name=name, soft_limit_tokens=tokens, hard_limit_tokens=tokens, priority=1,
-    )
 
 
-def _budget(retrieved_tokens: int = 2000) -> ContextBudget:
-    return ContextBudget(
-        model_context_window=200_000,
-        reserved_output=_pb("reserved_output", 2_000),
-        stable_contract=_pb("stable_contract", 10_000),
-        core_memory=_pb("core_memory", 10_000),
-        working_state=_pb("working_state", 10_000),
-        tool_definitions=_pb("tool_definitions", 10_000),
-        recent_messages=_pb("recent_messages", 10_000),
-        retrieved_memory=_pb("retrieved_memory", retrieved_tokens),
-        tool_results=_pb("tool_results", 10_000),
-        epoch_checkpoint=_pb("epoch_checkpoint", 10_000),
-        segment_summaries=_pb("segment_summaries", 10_000),
-        sealing_bridge=_pb("sealing_bridge", 10_000),
-        retrieved_history_summary=_pb("retrieved_history_summary", 10_000),
-        deep_history_raw=_pb("deep_history_raw", 10_000),
-    )
+def _budget(window: int = 200000) -> ContextBudget:
+    return ContextBudget(model_context_window=window, reserved_output_tokens=2_000)
 
 
-def _assembler(retrieved_tokens: int = 2000) -> ContextAssembler:
+def _assembler(window: int = 200000) -> ContextAssembler:
     return ContextAssembler(
         token_counter=_FakeTokenCounter(),
-        budget=_budget(retrieved_tokens),
+        budget=_budget(window),
         profile=ModelProfile(
             provider="deepseek", model_id="deepseek-chat",
             full_name="deepseek/deepseek-chat",
-            context_window=200_000, max_output_tokens=2_000,
+            context_window=window, max_output_tokens=2_000,
         ),
     )
 
@@ -123,7 +107,7 @@ def test_load_agent_context_triggers_graph_expansion(db, monkeypatch) -> None:
         )],
         token_count=10,
     )
-    assembler._unified_recall = lambda *a, **k: (pack, "")  # type: ignore[method-assign]
+    assembler._unified_recall = lambda *a, **k: (pack, "", [])  # type: ignore[method-assign]
 
     calls: list[list[str]] = []
     original = GraphExpansionService.expand
@@ -146,7 +130,7 @@ def test_load_agent_context_triggers_graph_expansion(db, monkeypatch) -> None:
     assert expansion.relations[0].object == "AIive"
 
 
-def _stub_loader(assembler: ContextAssembler, relations: list[GraphRelationView]) -> None:
+def _stub_loader(assembler: ContextAssembler, relations: list[GraphRelationView], monkeypatch) -> None:
     import aiive.runtime.context_assembler as ca_mod
 
     def _load(db, message, thread, trace_id=None):
@@ -169,7 +153,7 @@ def _stub_loader(assembler: ContextAssembler, relations: list[GraphRelationView]
     assembler._load_sealing_bridge = lambda *a, **k: ""  # type: ignore[method-assign]
     assembler._build_tools_schema_list = lambda *a, **k: []  # type: ignore[method-assign]
     assembler._touch_injected_memory = lambda *a, **k: None  # type: ignore[method-assign]
-    ca_mod.WorkingStateService = _StubWorkingStateService
+    monkeypatch.setattr(ca_mod, "WorkingStateService", _StubWorkingStateService)
 
 
 def _relation(index: int, *, confidence: float = 0.9) -> GraphRelationView:
@@ -188,12 +172,12 @@ def _relation(index: int, *, confidence: float = 0.9) -> GraphRelationView:
     )
 
 
-def test_assemble_injects_relation_block_into_messages(db) -> None:
+def test_assemble_injects_relation_block_into_messages(db, monkeypatch) -> None:
     """关系与有效时间必须真的出现在发给模型的 messages 里。"""
     thread = new_thread(db)
     db.commit()
     assembler = _assembler()
-    _stub_loader(assembler, [_relation(1)])
+    _stub_loader(assembler, [_relation(1)], monkeypatch)
 
     assembled = assembler.assemble(
         db=db, message="当前消息", thread=thread, upper_bound_sequence=0,
@@ -209,15 +193,15 @@ def test_assemble_injects_relation_block_into_messages(db) -> None:
     assert "证据：“证据片段”" in joined
 
 
-def test_graph_budget_scales_with_partition(db) -> None:
-    """同一批关系在不同分区容量下装配条数不同：预算随真实容量变化。"""
+def test_graph_is_not_limited_by_partition_ratio(db, monkeypatch) -> None:
+    """32K 和 100K 全局窗口均有余量时，完整关系全部保留。"""
     thread = new_thread(db)
     db.commit()
     relations = [_relation(i) for i in range(20)]
 
-    def _count_lines(retrieved_tokens: int) -> int:
-        assembler = _assembler(retrieved_tokens)
-        _stub_loader(assembler, relations)
+    def _count_lines(window: int) -> int:
+        assembler = _assembler(window)
+        _stub_loader(assembler, relations, monkeypatch)
         assembled = assembler.assemble(
             db=db, message="当前消息", thread=thread, upper_bound_sequence=0,
         )
@@ -229,15 +213,15 @@ def test_graph_budget_scales_with_partition(db) -> None:
         assert graph_messages, "图谱分区应被注入"
         return sum(1 for line in graph_messages[0].splitlines() if line.startswith("- "))
 
-    small = _count_lines(120)
-    large = _count_lines(4000)
+    small = _count_lines(32000)
+    large = _count_lines(100000)
 
-    assert 0 < small < large
+    assert small == large == len(relations)
     # 大预算下关系块受总量控制，不会无限挤占
     assert large <= len(relations)
 
 
-def test_graph_block_is_atomic_and_ranked(db) -> None:
+def test_graph_block_is_atomic_and_ranked(db, monkeypatch) -> None:
     """预算不足时丢弃低价值关系，保留高置信关系且不截断单条定义。"""
     thread = new_thread(db)
     db.commit()
@@ -246,8 +230,8 @@ def test_graph_block_is_atomic_and_ranked(db) -> None:
         _relation(2, confidence=0.62),
         _relation(3, confidence=0.60),
     ]
-    assembler = _assembler(120)
-    _stub_loader(assembler, relations)
+    assembler = _assembler(32000)
+    _stub_loader(assembler, relations, monkeypatch)
 
     assembled = assembler.assemble(
         db=db, message="当前消息", thread=thread, upper_bound_sequence=0,

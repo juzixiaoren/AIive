@@ -13,6 +13,7 @@ class _TokenCount:
 
     def __init__(self, safe_tokens: int):
         self.safe_tokens = safe_tokens
+        self.estimated_tokens = safe_tokens
 
 
 class _TokenCounter:

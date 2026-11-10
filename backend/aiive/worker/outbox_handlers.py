@@ -1934,6 +1934,8 @@ def handle_segment_sealing(claimed: ClaimedJob) -> HandlerResult:
     from aiive.memory.recall_config import RecallConfig
     from aiive.runtime.compaction import (
         build_item_ref_map,
+        CompactionPromptExceededError,
+        validate_compaction_prompt,
         count_summary_tokens,
         derive_unresolved_failures,
         merge_summary,
@@ -2031,6 +2033,7 @@ def handle_segment_sealing(claimed: ClaimedJob) -> HandlerResult:
         warnings: list[str] = []
         try:
             for attempt in range(2):
+                validate_compaction_prompt(messages)
                 resp = llm.chat(
                     messages,
                     model=settings.aiive_llm_model,
@@ -2058,6 +2061,10 @@ def handle_segment_sealing(claimed: ClaimedJob) -> HandlerResult:
                             ).content,
                         },
                     ]
+        except CompactionPromptExceededError as error:
+            logger.warning("segment_sealing deterministic-extractive-fallback: %s", error)
+            llm_output = _build_extract_fallback_summary(source_turns)
+            summary_model_id = "deterministic-extractive-fallback"
         except Exception:
             if claimed.retry_count + 1 < claimed.max_retries:
                 raise

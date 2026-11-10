@@ -1,4 +1,4 @@
-﻿"""回归测试：ContextAssembler.assemble() 必须填充强类型上下文快照。
+"""回归测试：ContextAssembler.assemble() 必须填充强类型上下文快照。
 
 输入与输出快照统一由 ContextSnapshotData 承载，避免字典 meta 与恒空列表双轨。
 """
@@ -11,8 +11,10 @@ from aiive.runtime.context_assembler import (
 )
 from aiive.memory.recall_config import RecallConfig
 from aiive.memory.recall_models import ScopeContext
-from aiive.retrieval.retrieval_types import RetrievalResult
-from aiive.runtime.context_budget import ContextBudget, PartitionBudget
+from aiive.retrieval.retrieval_types import RetrievalResult, RetrievalHit
+from aiive.memory.recall_models import CoreMemoryBlock
+from aiive.db.models import SegmentSummary
+from aiive.runtime.context_budget import ContextBudget
 from aiive.runtime.token_models import ModelProfile, TokenCount
 from tests.integration.backend._util import new_thread, new_epoch, new_segment
 
@@ -29,32 +31,16 @@ class _FakeTokenCounter:
 
 
 class _StubWorkingStateService:
-    def render_for_context(self, *args, **kwargs) -> str:
+    def context_fields(self, *args, **kwargs):
+        return {}
+
+    def render_context_fields(self, fields) -> str:
         return "OPEN LOOPS: 完成上下文快照修复"
 
 
 def _build_budget() -> ContextBudget:
-    def pb(name: str, n: int) -> PartitionBudget:
-        return PartitionBudget(
-            name=name, soft_limit_tokens=n, hard_limit_tokens=n, priority=n,
-        )
 
-    return ContextBudget(
-        model_context_window=200_000,
-        reserved_output=pb("reserved_output", 2_000),
-        stable_contract=pb("stable_contract", 10_000),
-        core_memory=pb("core_memory", 10_000),
-        working_state=pb("working_state", 10_000),
-        tool_definitions=pb("tool_definitions", 10_000),
-        recent_messages=pb("recent_messages", 10_000),
-        retrieved_memory=pb("retrieved_memory", 10_000),
-        tool_results=pb("tool_results", 10_000),
-        epoch_checkpoint=pb("epoch_checkpoint", 10_000),
-        segment_summaries=pb("segment_summaries", 10_000),
-        sealing_bridge=pb("sealing_bridge", 10_000),
-        retrieved_history_summary=pb("retrieved_history_summary", 10_000),
-        deep_history_raw=pb("deep_history_raw", 10_000),
-    )
+    return ContextBudget(model_context_window=200_000, reserved_output_tokens=2_000)
 
 
 def _make_assembler() -> ContextAssembler:
@@ -96,7 +82,7 @@ def test_unified_recall_diagnostic_failure_does_not_retry_or_pollute_session(db,
     monkeypatch.setattr(assembler_module, "SessionLocal", lambda: _BrokenDiagnosticsSession())
     assembler = _make_assembler()
 
-    pack, history = assembler._unified_recall(
+    pack, history, hits = assembler._unified_recall(
         db,
         "Python",
         ScopeContext(thread_id=thread.id),
@@ -112,7 +98,7 @@ def test_unified_recall_diagnostic_failure_does_not_retry_or_pollute_session(db,
     assert db.get(type(thread), thread.id) is not None
 
 
-def test_assemble_populates_input_snapshot(db) -> None:
+def test_assemble_populates_input_snapshot(db, monkeypatch) -> None:
     """assemble() 必须产出非空的输入分区快照，且 meta 携带 full_contents。"""
     import aiive.runtime.context_assembler as ca_mod
 
@@ -129,6 +115,11 @@ def test_assemble_populates_input_snapshot(db) -> None:
         "history_summary_text": "历史摘要：讨论过性能优化",
         "stable_contract_text": "系统前缀契约内容",
         "core_memory_text": "核心记忆：用户名 Daniel",
+        "core_blocks": [CoreMemoryBlock(block_name="core.human_identity", content="用户名 Daniel", token_count=4)],
+        "retrieval_hits": [
+            RetrievalHit(source_type="memory_record", source_id="m1", source_version="1", snippet="用户偏好中文"),
+            RetrievalHit(source_type="segment_summary", source_id="s1", source_version="1", snippet="讨论过性能优化"),
+        ],
         "recall_text": "召回记忆：用户偏好中文",
     }
     assembler._load_history_bounded = lambda *a, **k: [
@@ -137,13 +128,13 @@ def test_assemble_populates_input_snapshot(db) -> None:
     ]
     assembler._dicts_to_chat_messages = lambda events: list(events)
     assembler._load_epoch_checkpoint = lambda *a, **k: "纪元检查点摘要"
-    assembler._load_segment_summaries = lambda *a, **k: "分段摘要内容"
+    assembler._recent_visible_segment_summaries = lambda *a, **k: [SegmentSummary(id="summary", goal="分段摘要内容")]
     assembler._load_sealing_bridge = lambda *a, **k: ""
     assembler._build_tools_schema_list = lambda *a, **k: [
         {"type": "function", "function": {"name": "search_memory", "parameters": {}}},
     ]
     assembler._touch_injected_memory = lambda *a, **k: None
-    ca_mod.WorkingStateService = _StubWorkingStateService
+    monkeypatch.setattr(ca_mod, "WorkingStateService", _StubWorkingStateService)
 
     assembled = assembler.assemble(
         db=db, message="当前用户消息", thread=thread, upper_bound_sequence=0,
@@ -201,7 +192,7 @@ def test_attention_failure_is_fail_open(db, monkeypatch) -> None:
     assembler._load_sealing_bridge = lambda *a, **k: ""
     assembler._build_tools_schema_list = lambda *a, **k: []
     assembler._touch_injected_memory = lambda *a, **k: None
-    ca_mod.WorkingStateService = _StubWorkingStateService
+    monkeypatch.setattr(ca_mod, "WorkingStateService", _StubWorkingStateService)
     monkeypatch.setattr(
         ca_mod.AttentionManager,
         "resolve_for_turn",
@@ -215,7 +206,7 @@ def test_attention_failure_is_fail_open(db, monkeypatch) -> None:
     assert db.is_active is True
 
 
-def test_input_snapshot_skips_empty_partitions(db) -> None:
+def test_input_snapshot_skips_empty_partitions(db, monkeypatch) -> None:
     """空分区不应产生 context_item（避免展示空白条目）。"""
     import aiive.runtime.context_assembler as ca_mod
 
@@ -236,7 +227,7 @@ def test_input_snapshot_skips_empty_partitions(db) -> None:
     assembler._load_sealing_bridge = lambda *a, **k: ""
     assembler._build_tools_schema_list = lambda *a, **k: []
     assembler._touch_injected_memory = lambda *a, **k: None
-    ca_mod.WorkingStateService = _StubWorkingStateService
+    monkeypatch.setattr(ca_mod, "WorkingStateService", _StubWorkingStateService)
 
     assembled = assembler.assemble(
         db=db, message="消息", thread=thread, upper_bound_sequence=0,

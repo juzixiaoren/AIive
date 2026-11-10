@@ -114,7 +114,7 @@ def test_token_budget_truncates_selection(db_session):
         _mk(db_session, f"project.fact_{i}", "word " * 40, memory_type="knowledge",
             importance=0.9)
 
-    cfg = RecallConfig(automatic_recall_token_budget=200)  # 很紧的预算
+    cfg = RecallConfig()  # 很紧的预算
     engine = AutomaticRecallEngine(db_session, cfg)
     req = MemoryRecallRequest(
         query="word", scope_context=ScopeContext(thread_id="t1"),

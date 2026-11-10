@@ -1,7 +1,7 @@
 # AIive Phase 1：有界上下文、Epoch 与 Segment
 
-> 版本：v2（修订版）  
-> 状态：方案确认，等待实施  
+> 版本：V64.1（2026-11-10，全局预算实现）
+> 状态：核心预算章节已按当前源码更新；其余保留原阶段设计记录，冲突处以 V64.1 规则为准
 > 前置：Phase 0.5A（TurnRecord、turn_id、ContextBundle）已完成  
 > 前置：Phase 0.5B（Outbox claim/lease/fencing、MemoryIngestionRun）已完成
 
@@ -12,15 +12,15 @@
 1. [目标与本阶段范围](#1-目标与本阶段范围)
 2. [当前上下文调用链审计](#2-当前上下文调用链审计)
 3. [绕过统一 ContextAssembler 的入口](#3-绕过统一-contextassembler-的入口)
-4. [最终预算公式](#4-最终预算公式)
-5. [完整请求整体计数流程](#5-完整请求整体计数流程)
+4. [最终预算公式](#4-最终预算公式v641)
+5. [完整请求整体计数与溢出](#5-完整请求整体计数与来源感知溢出v641)
 6. [有界历史读取算法](#6-有界历史读取算法)
 7. [TokenCounter 方案（LiteLLM）](#7-tokencounter-方案litellm)
-8. [ContextBudget 数据结构](#8-contextbudget-数据结构)
+8. [ContextBudget 数据结构](#8-contextbudget-数据结构v641)
 9. [WorkingState Schema 与生产者](#9-workingstate-schema-与生产者)
 10. [Epoch / Segment / Turn 数据关系](#10-epoch--segment--turn-数据关系)
 11. [数据模型与迁移](#11-数据模型与迁移)
-12. [Soft / Hard Threshold 时序](#12-soft--hard-threshold-时序)
+12. [历史 Token 密封与输入硬门禁](#12-历史-token-密封与输入硬门禁v641)
 13. [大工具结果引用方案](#13-大工具结果引用方案)
 14. [ContextSnapshot 保留策略与并发](#14-contextsnapshot-保留策略与并发)
 15. [系统事件与运行时事件](#15-系统事件与运行时事件)
@@ -142,142 +142,17 @@ POST /api/chat
 
 ---
 
-## 4. 最终预算公式（v3：统一 margin 模型）
+## 4. 最终预算公式（V64.1）
 
-### 4.1 唯一安全余量来源
-
-所有估算误差统一由 `TokenCount.safe_tokens` 表达（LiteLLM 路径 `estimated * 1.10 + 500`，fallback 路径 `estimated * 1.30 + 1000`）。
-
-**不存在独立的 `safety_margin` 分区。** 最终 Hard Gate 只使用：
-
-```python
-final_token_count.safe_tokens + requested_output_tokens <= context_window
-```
-
-### 4.2 核心公式
-
-```python
-@property
-def hard_input_limit(self) -> int:
-    """模型输入 token 硬上限（不含安全余量，余量在 TokenCount 内）。"""
-    return self.model_context_window - self.reserved_output.hard_limit_tokens
-
-@property
-def soft_input_limit(self) -> int:
-    return int(self.hard_input_limit * 0.80)
-```
-
-**reserved_output 永远先扣除**，不可被任何输入分区占用。
-
-### 4.3 分区表（deepseek-chat, context_window=128000）
-
-| 分区 | Soft Limit | Hard Limit | 优先级 | 说明 |
-|------|-----------|-----------|--------|------|
-| reserved_output | - | 4096 | - | 减除项，不可占用 |
-| stable_contract | 3500 | 4000 | 1 | Kernel Contract + identity + policies |
-| core_memory | 500 | 600 | 2 | Core Memory blocks 投影 |
-| working_state | 1500 | 2000 | 3 | 结构化渲染文本 |
-| tool_definitions | 4000 | 6000 | 4 | 工具 Schema |
-| recent_messages | 85000 | 97000 | 5 | 近期 Turn 消息 |
-| retrieved_memory | 1000 | 1200 | 6 | Recall pack |
-| tool_results | 5000 | 8000 | 7 | 当前/历史工具结果 |
-
-hard_input_limit = 128000 - 4096 = 123904
-
-分区 hard 之和: 4000+600+2000+6000+97000+1200+8000 = 118800 ≤ 123904 ✓
-
-### 4.4 启动时验证
-
-```python
-def validate(self) -> None:
-    total = sum(p.hard_limit_tokens for p in self._partitions) + self.reserved_output.hard_limit_tokens
-    if total > self.model_context_window:
-        raise ValueError(f"Partition hard limits ({total}) exceed context window ({self.model_context_window})")
-```
-
-### 4.5 最终 Hard Gate
-
-```python
-final_safe = token_counter.count_messages(model, final_messages, final_tools).safe_tokens
-if final_safe + requested_output_tokens <= context_window:
-    return assembled_context  # ✓
-# ✗ → 裁剪 → 重新整体计数 → 循环
-```
-
-不再存在第二套独立 margin 公式。
+`model_context_window = AIIVE_LLM_CONTEXT_WINDOW`，`reserved_output_tokens = AIIVE_LLM_MAX_OUTPUT_TOKENS`，`hard_input_limit = model_context_window - reserved_output_tokens`。`TokenCount.safe_tokens` 已包含现有安全余量，最终检查 **safe_tokens + requested_output_tokens <= model_context_window**。不再存在分区 hard/soft 配额、Recent 弹性额度、Graph 35% 预留或分区总额校验；旧 `AIIVE_CONTEXT_BUDGET_JSON` 仅输出弃用警告并被忽略。`ModelProfile`、`TokenCounter` 安全余量和 TurnExecution 共享缓存保持不变。
 
 ---
 
-## 5. 完整请求整体计数流程
+## 5. 完整请求整体计数与来源感知溢出（V64.1）
 
-### 5.1 两阶段计数
+一次收集可见候选后构建完整 messages + tools，并调用真实 TokenCounter。超限时按顺序逐项移除，每次重新渲染并重新计数：最旧完整历史 Turn → 统一 RetrievalHit 中 final_score 最低的 Memory/历史摘要 → score 较低、hop 较远的完整 Graph 关系 → 较旧完整 SegmentSummary → WorkingState Artifact 引用及低优先级 open_loop → 按原角色优先级反向移除完整 Core Block（优先保留 human_identity）。Stable Contract、安全约束、当前消息、目标、关键约束、P0/P1 循环、待审批、未确认副作用及运行中工具状态保留；interrupted_unknown 工具事实整组保护。保留工具调用与结果成对。必要内容仍超限则 ContextBudgetExceededError，不调用模型；不做字符比例截断或即时 LLM 压缩。
 
-**Phase I: 分区级计数** — 各分区独立计数，用于报告和裁剪决策。
-
-**Phase II: 最终整体 Hard Gate** — 完成裁剪后，对最终 `messages + tools schema + 实际 provider 请求结构` 整体调用 `TokenCounter.count_messages()`。只有 `final_safe_tokens + requested_output_tokens <= context_window` 才放行。
-
-### 5.2 整体计数与裁剪循环
-
-```python
-def assemble(self, ...) -> AssembledContext:
-    for attempt in range(MAX_TRIM_ROUNDS):  # MAX_TRIM_ROUNDS = 5
-        # ── 分区裁剪 ──
-        result = self._build_and_trim_partitions(attempt)
-        
-        # ── Phase II: 最终整体 Hard Gate ──
-        final_messages = result.messages
-        final_tools = result.tools_schema
-        
-        total_count = self._token_counter.count_messages(
-            model=self._profile.full_name,
-            messages=final_messages,
-            tools=final_tools,
-        )
-        
-        final_safe = total_count.safe_tokens
-        
-        if final_safe + self._requested_output_tokens <= self._profile.context_window:
-            return AssembledContext(
-                messages=final_messages,
-                tools=final_tools,
-                partition_report=result.report,
-                total_token_count=total_count,
-                is_safe=True,
-            )
-        
-        # 未通过 → 更激进裁剪
-        if attempt == MAX_TRIM_ROUNDS - 1:
-            raise ContextBudgetExceededError(
-                safe_tokens=final_safe,
-                context_window=self._profile.context_window,
-                partition_report=result.report,
-            )
-        
-        self._tighten_budget(attempt)
-```
-
-### 5.3 裁剪轮次策略
-
-| 轮次 | 动作 |
-|------|------|
-| 0 | 初始分区预算，soft limit 裁剪 |
-| 1 | 各分区 hard limit 裁剪；大 tool results → refs |
-| 2 | recent_messages 从最早 Turn 整 Turn 删除 |
-| 3 | tool_results 全部 refs |
-| 4 | retrieved_memory 按 relevance_score 截断到 top-3；working_state 缩减 |
-
-### 5.4 ContextBudgetExceededError
-
-API 返回 HTTP 413：
-
-```json
-{
-    "error": "context_budget_exceeded",
-    "safe_tokens": 135000,
-    "context_window": 128000,
-    "hard_input_limit": 121900
-}
-```
+候选保持完整 Turn、RetrievalHit（score/source_id）、GraphRelationView、独立摘要、结构化 WorkingState 与 Core Block。可见性过滤先于收集。`MemoryAccessTracker.touch` 与 snapshot.injected_memory_ids 只依据最终保留的 Memory，失败或被淘汰候选不 touch。PartitionReport 按真实计数记录各来源使用量、裁剪原因，分区 hard_limit 为 None，仅 total 保留全局上限。
 
 ---
 
@@ -613,56 +488,21 @@ litellm>=1.50.0,<2.0.0
 
 ---
 
-## 8. ContextBudget 数据结构
+## 8. ContextBudget 数据结构（V64.1）
 
 ```python
 @dataclass(frozen=True)
-class PartitionBudget:
-    name: str
-    soft_limit_tokens: int
-    hard_limit_tokens: int
-    priority: int                      # 裁剪优先级 (越小越优先保留)
-    description: str
-
-@dataclass(frozen=True)
 class ContextBudget:
     model_context_window: int
-    reserved_output: PartitionBudget
-    stable_contract: PartitionBudget
-    core_memory: PartitionBudget
-    working_state: PartitionBudget
-    tool_definitions: PartitionBudget
-    recent_messages: PartitionBudget
-    retrieved_memory: PartitionBudget
-    tool_results: PartitionBudget
-    
+    reserved_output_tokens: int
+
     @property
-    def hard_input_limit(self) -> int:
-        return self.model_context_window - self.reserved_output.hard_limit_tokens
-    
-    @property
-    def soft_input_limit(self) -> int:
-        return int(self.hard_input_limit * 0.80)
-    
-    def validate(self) -> None:
-        total = sum([
-            self.stable_contract.hard_limit_tokens,
-            self.core_memory.hard_limit_tokens,
-            self.working_state.hard_limit_tokens,
-            self.tool_definitions.hard_limit_tokens,
-            self.recent_messages.hard_limit_tokens,
-            self.retrieved_memory.hard_limit_tokens,
-            self.tool_results.hard_limit_tokens,
-            self.reserved_output.hard_limit_tokens,
-        ])
-        if total > self.model_context_window:
-            raise ValueError(
-                f"Partition hard limits ({total}) exceed context window "
-                f"({self.model_context_window})"
-            )
+    def hard_input_limit(self):
+        return self.model_context_window - self.reserved_output_tokens
 ```
 
-默认值由 `ModelProfile` 和模型确定。通过 `aiive.config.settings` 可按环境覆盖。
+`default()` / `from_env()` 为统一入口，不再提供 PartitionBudget、soft_input_limit 或分区覆盖。小窗口只要求输出预留小于模型窗口，不因固定分区总额而无法启动。
+
 
 ---
 
@@ -1005,51 +845,11 @@ Depends on: `c8d9e0f1a2b3` (Phase 0.5B outbox ingestion)
 
 ---
 
-## 12. Soft / Hard Threshold 时序
+## 12. 历史 Token 密封与输入硬门禁（V64.1）
 
-```
-ContextAssembler.assemble()
-│
-├─ 1. 加载各分区内容
-│
-├─ 2. Phase I: 逐分区 token 计数
-│   ├─ stable_contract:   3200 tokens  (limit 4000) ✓
-│   ├─ core_memory:        400 tokens  (limit 600)  ✓
-│   ├─ working_state:     1100 tokens  (limit 2000) ✓
-│   ├─ tool_definitions:  3500 tokens  (limit 6000) ✓
-│   ├─ recent_messages:  85000 tokens  (limit 97000) ✓
-│   ├─ retrieved_memory:   800 tokens  (limit 1200)  ✓
-│   ├─ tool_results:      2000 tokens  (limit 8000)  ✓
-│   └─ total:             96000 tokens
-│
-├─ 3. 检查分区 soft threshold
-│   └─ recent_messages 85000 > soft(85000)? → pending_seal=True
-│      → 标记 Segment 待密封（不阻塞当前 Turn）
-│
-├─ 4. 分区 hard threshold 裁剪
-│   └─ 所有分区 ≤ hard limit。无需裁剪。
-│
-├─ 5. Phase II: 最终整体 Hard Gate（安全余量统一来自 TokenCount.safe_tokens）
-│   ├─ final_messages = 组装后的完整消息列表
-│   ├─ final_tools = 工具 schema 列表
-│   ├─ total_count = token_counter.count_messages(model, final_messages, final_tools)
-│   ├─ final_safe = total_count.safe_tokens = 96000 + 9600(LiteLLM 10% margin) = 105600
-│   ├─ final_safe + requested_output(4096) = 109696
-│   └─ 109696 ≤ 128000 → ✓ 通过
-│
-├─ 6. 返回 AssembledContext
-│   ├─ messages: list[dict]
-│   ├─ tools: list[dict]
-│   ├─ partition_report: dict
-│   ├─ is_safe: True
-│   ├─ pending_seal: True
-│   └─ total_token_count: TokenCount
-│
-└─ 7. 调用模型
-    └─ 保证 safe_tokens + output ≤ context_window
-```
+`_finalize_turn()` 完成 Turn 并 flush 当前 Event 后，通过 `ThreadState.load_recent_messages_bounded(token_budget=None, segment_id=...)`、现有 TokenCounter 和 ToolResultNormalizer 统计当前 Segment 的实际历史 Token（`BoundedReadStats.estimated_tokens`）。有效阈值为 `min(AIIVE_SEGMENT_SEAL_TOKEN_THRESHOLD=64000, hard_input_limit * 0.5)`；达到该阈值或 `max_segment_turn_records=32` 时设置现有 pending_seal_at/sealed_by_turn，与当前 Turn 同事务提交。Memory/Graph/工具定义等 Prompt 内容不计入历史密封触发。保留 15 分钟 Idle Sealing、Scheduler、EpochManager、Outbox 和原有非终态/副作用阻塞条件。
 
-Hard gate 不通过时：重新裁剪 → 重新整体计数 → 直到通过或明确失败。
+`compaction.validate_compaction_prompt()` 使用 LiteLLMTokenCounter、ModelProfile、TokenSafetyConfig 检查完整摘要 Prompt 的 safe_tokens + 配置最大输出 <= 配置模型窗口。`handle_segment_sealing()` 每次 llm.chat 前计数，包括追加错误回复后的 JSON retry Prompt；确定性超限立即走 `_build_extract_fallback_summary()`，记录 compaction_prompt_overflow 与 deterministic-extractive-fallback，继续 merge_summary、Cover Check、source_hash/fencing 和事务提交，不消耗 Worker 重试。Forget `_try_generate_summary()` 同样门禁，超限返回 None，沿用 redacted 降级；不改变来源过滤与重建语义。Epoch Checkpoint 仍为确定性聚合，无新增模型调用。
 
 ---
 

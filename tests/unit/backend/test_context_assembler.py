@@ -168,7 +168,6 @@ def test_build_reports_includes_per_partition_and_total():
     asm = ContextAssembler(token_counter=_FakeTokenCounter(), budget=ContextBudget.default())
     total = TokenCount(estimated_tokens=100, safety_margin_tokens=0, source="fake", model="m")
     reports = asm._build_reports(
-        trim_plan=__import__("aiive.runtime.context_assembler", fromlist=["TrimPlan"]).TrimPlan.from_budget(ContextBudget.default(), 0),
         total=total,
         stable_contract_text="contract",
         core_memory_text="core",
@@ -231,39 +230,24 @@ def test_context_budget_from_env_default_without_env(monkeypatch):
     monkeypatch.delenv("AIIVE_CONTEXT_BUDGET_JSON", raising=False)
     budget = ContextBudget.from_env()
     assert budget.model_context_window == ContextBudget.default().model_context_window
-    assert budget.tool_results.hard_limit_tokens == ContextBudget.default().tool_results.hard_limit_tokens
+    assert budget.hard_input_limit == ContextBudget.default().hard_input_limit
 
 
-def test_context_budget_from_env_override(monkeypatch):
-    """P1-7: 通过环境变量覆盖某分区上限。"""
-    monkeypatch.setenv(
-        "AIIVE_CONTEXT_BUDGET_JSON",
-        '{"tool_results": {"soft_limit_tokens": 3000, "hard_limit_tokens": 5000}}',
-    )
+@pytest.mark.parametrize("raw", [
+    '{"tool_results": {"hard_limit_tokens": 5000}}',
+    '{"tool_results": {"hard_limit_tokens": "invalid"}}',
+    '{"tool_results": {"hard_limit_tokens": 999999}}', 'not-json', '',
+])
+def test_context_budget_ignores_deprecated_overrides(monkeypatch, caplog, raw):
+    monkeypatch.setenv("AIIVE_CONTEXT_BUDGET_JSON", raw)
+    assert ContextBudget.from_env() == ContextBudget.default()
+    assert "deprecated and ignored" in caplog.text
+
+
+@pytest.mark.parametrize("window", [32000, 50000, 256000, 1000000])
+def test_global_budget_windows(monkeypatch, window):
+    from aiive.config import settings
+    monkeypatch.setattr(settings, "aiive_llm_context_window", window)
+    monkeypatch.setattr(settings, "aiive_llm_max_output_tokens", 4096)
     budget = ContextBudget.from_env()
-    assert budget.tool_results.soft_limit_tokens == 3000
-    assert budget.tool_results.hard_limit_tokens == 5000
-    # 其他分区不受影响
-    assert budget.stable_contract.soft_limit_tokens == ContextBudget.default().stable_contract.soft_limit_tokens
-
-
-def test_context_budget_from_env_rejects_invalid_limit(monkeypatch):
-    """环境覆盖包含非整数 token 上限时必须在加载阶段明确失败。"""
-    monkeypatch.setenv(
-        "AIIVE_CONTEXT_BUDGET_JSON",
-        '{"tool_results": {"hard_limit_tokens": "invalid"}}',
-    )
-
-    with pytest.raises(ValueError, match="包含无效的 token 上限"):
-        ContextBudget.from_env()
-
-
-def test_context_budget_from_env_validates_partition_total(monkeypatch):
-    """环境覆盖使分区总额超过窗口时必须立即失败。"""
-    monkeypatch.setenv(
-        "AIIVE_CONTEXT_BUDGET_JSON",
-        '{"tool_results": {"hard_limit_tokens": 999999}}',
-    )
-
-    with pytest.raises(ValueError, match="超过"):
-        ContextBudget.from_env()
+    assert budget.hard_input_limit == window - 4096

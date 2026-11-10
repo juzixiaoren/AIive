@@ -162,37 +162,23 @@ class _FakeTokenCounter:
 
 
 class _StubWorkingState:
-    def render_for_context(self, *args, **kwargs) -> str:
+    def context_fields(self, *args, **kwargs):
+        return {}
+
+    def render_context_fields(self, fields) -> str:
         return ""
 
 
 def _stub_assembler(monkeypatch):
     import aiive.runtime.context_assembler as ca_mod
     from aiive.runtime.context_assembler import ContextAssembler
-    from aiive.runtime.context_budget import ContextBudget, PartitionBudget
+    from aiive.runtime.context_budget import ContextBudget
     from aiive.runtime.token_models import ModelProfile
 
-    def pb(name: str, n: int) -> PartitionBudget:
-        return PartitionBudget(name=name, soft_limit_tokens=n, hard_limit_tokens=n, priority=n)
 
     assembler = ContextAssembler(
         token_counter=_FakeTokenCounter(),
-        budget=ContextBudget(
-            model_context_window=200_000,
-            reserved_output=pb("reserved_output", 2_000),
-            stable_contract=pb("stable_contract", 10_000),
-            core_memory=pb("core_memory", 10_000),
-            working_state=pb("working_state", 10_000),
-            tool_definitions=pb("tool_definitions", 10_000),
-            recent_messages=pb("recent_messages", 10_000),
-            retrieved_memory=pb("retrieved_memory", 10_000),
-            tool_results=pb("tool_results", 10_000),
-            epoch_checkpoint=pb("epoch_checkpoint", 10_000),
-            segment_summaries=pb("segment_summaries", 10_000),
-            sealing_bridge=pb("sealing_bridge", 10_000),
-            retrieved_history_summary=pb("retrieved_history_summary", 10_000),
-            deep_history_raw=pb("deep_history_raw", 10_000),
-        ),
+        budget=ContextBudget(model_context_window=200_000, reserved_output_tokens=2_000),
         profile=ModelProfile(
             provider="deepseek", model_id="deepseek-chat",
             full_name="deepseek/deepseek-chat",

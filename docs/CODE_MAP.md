@@ -7,7 +7,7 @@
 > - **路径约定**：均相对项目根（`AIive/`），如 `backend/aiive/main.py`、`frontend/src/pages/ChatPage.tsx`
 > - **行号**：基于建图时的代码版本，仅供快速跳转，以实际代码为准
 > - **维护规则**：见文末第 9 节。**新增/删除/移动文件、改 key 符号行号、改表结构后必须同步更新本文档**
-> - 建图日期：2026-10-21；最近更新：2026-11-10（V63.2 WebSocket 重连历史恢复与聊天错误契约统一；V49 单用户认证、V50 目标步骤触发规则 + 主动消息、V51 工具结果回填预算、V52 后台回填统一 + Bash 流式日志、V53 通用计划事件源扩展、V54 安全边界事件注入 + 协作式主动消息、V55 决策标记全流式防泄漏、V56 收件箱溢出与决策串行化、V57 前后台 LLM 串行化 + 目标决策幂等、V58 主动提问与用户回复关联闭环、V59 待回答问题的状态一致性、V60 记忆检索 pg_search BM25、V61 知识库结构感知递归切分、V61.3 Chunker 兜底拆分正确性）
+> - 建图日期：2026-10-21；最近更新：2026-11-10（V64.1 全局上下文预算、来源感知溢出与历史 Token 密封；V63.2 WebSocket 重连历史恢复与聊天错误契约统一；V49 单用户认证、V50 目标步骤触发规则 + 主动消息、V51 工具结果回填预算、V52 后台回填统一 + Bash 流式日志、V53 通用计划事件源扩展、V54 安全边界事件注入 + 协作式主动消息、V55 决策标记全流式防泄漏、V56 收件箱溢出与决策串行化、V57 前后台 LLM 串行化 + 目标决策幂等、V58 主动提问与用户回复关联闭环、V59 待回答问题的状态一致性、V60 记忆检索 pg_search BM25、V61 知识库结构感知递归切分、V61.3 Chunker 兜底拆分正确性）
 
 ---
 
@@ -256,8 +256,9 @@
 |---|---|
 | `turn_execution.py` | **回合统一入口**：`TurnExecutionService` L195（`execute_turn` L222 / `execute_turn_stream` L228 / `_execute_turn_impl` L977）；`TurnHeartbeat` L100（30s 续租）；`_resolve_and_preempt` L451（Thread 行锁+epoch 归属+幂等）；`_load_context` L1090；`_finalize_turn` L705（Event+ApprovalRequest+memory_extraction Outbox 入队+LLMCall）；`_rotate_snapshot` L907。V57：`_resolve_and_preempt` 在把 Turn 置 running 前抢占 `thread_execution_leases`（后台决策持有时前台等待 `FOREGROUND_WAIT_SECONDS=35s`，仍失败返回 `turn_in_progress`——用户消息已在上一个短事务落库，前端按既有 202 契约重试同一 turn_id 续跑）；`TurnHeartbeat` 同步续租线程占用，续租失败即 `lease_lost`；`_finalize_turn` / `_mark_interrupted` / `_persist_interrupted_tool_facts` 在各自事务内释放占用 |
 | `agent_graph.py` | LangGraph `AgentGraph` L324；`_build_graph` L521 六节点：`_assistant` L546（bind_tools）→`_policy_check` L569→`_validate_tools` L619→`_tools_node` L766⇄assistant / `_confirm_node` L733；编译 L911；同步 `_execute_graph` L1110 / 流式 `_execute_graph_stream` L1178（`astream_events(v2)`）。第一轮重构后，同步与流式共享四个提取方法：上下文与图装配 `_prepare_execution` L919、`_extract_reply` L995（最终回复提取）、`_classify_memory_signal` L1012（记忆信号分类，流式经 `asyncio.to_thread` 包裹）、`_assemble_agent_result` L1036（统一 ToolRecord 转换 + blocked 合并 + approval 卡片 + 上下文快照）；纯数据 DTO `AgentGraphResult` L304、`ToolRecord` L262 契约不变。 |
-| `context_assembler.py` | `ContextAssembler` L185：唯一上下文组装器（有界+hard-gate+统一检索）；`_unified_recall` L518 → `MemoryRecallPack` |
-| `context_budget.py` | `ContextBudget`/`PartitionBudget`：12 个上下文分区 token 预算 |
+| `context_assembler.py` | `ContextAssembler.assemble`：一次收集可见候选 → ContextOverflowPacker → 完整输入真实 Token 门禁 → 最终 Memory touch / Snapshot；无分区配额或 Prompt 软阈值密封 |
+| `context_overflow.py` | `ContextCandidates` / `HistoryTurn` / `ContextOverflowPacker.pack`：纯逻辑，完整 Turn→统一 RetrievalHit→Graph→旧摘要→WorkingState 可选项→Core Block；每次淘汰重计数 |
+| `context_budget.py` | `ContextBudget`：model_context_window / reserved_output_tokens；hard_input_limit 为两者之差；from_env 弃用旧 JSON 配额 |
 | `attention_manager.py` | `AttentionManager` L28；`resolve_for_turn` L46；空闲切换阈值 4h/12h |
 | `policy_engine.py` | `check_tool_calls`；`PolicyAction` L17（ALLOW/BLOCK/CONFIRM），基于 ToolRegistry 元数据 |
 | `working_state.py` | `WorkingStateService`：有界结构化工作状态（运行中工具/未提交副作用/待审批） |
@@ -568,7 +569,7 @@ routes_chat.py (L163)
       → TurnHeartbeat (L100)  30s 续租
       → _load_context (L1090)
           → context_assembler.py::ContextAssembler (L185)
-              → context_budget.py 分区预算裁剪
+              → context_budget.py 全局预算 + context_overflow.py 整项裁剪
               → _unified_recall (L518) → memory/automatic_recall.py::recall (L136)
                     → recall_fusion.py::fuse_and_pack (L32) → MemoryRecallPack
               → _expand_relations（召回之后）→ memory/graph_expansion.py::expand
@@ -1096,3 +1097,18 @@ V62.6.1 测试清理：根 `conftest.py::_cleanup_test_db` / `pytest_sessionfini
 - 本地 `inFlightRef` / `streamingRef` 为 true 时仅置 `historyRefreshPendingRef`，本地 Turn finally 先退出流式状态，再消费标记并刷新一次；Web 系统指令 finally 同样收口。
 - `_raise_turn_conflict_error` 及 SSE 路由 TurnConflictError 兜底统一 retryable 规则：仅 `turn_in_progress` 为 true；`stale_thread_id`、`turn_cancelled`、`turn_interrupted`、`idempotency_key_mismatch` 及其他冲突为 false，保留已有状态码和字段。
 - 回归入口：`tests/unit/backend/test_chat_api.py::TestChatAPI::test_post_chat_turn_conflict_contract`（6 类同步 HTTP / SSE 对照）；`scripts/verify_chat_reconnect.cjs`（实际回调离线回放）。验收结果及真机人工步骤见 `docs/plans/current_phase.md` V63.2。
+
+
+## V64.1 版本索引（2026-11-10）
+
+`model_context_window = AIIVE_LLM_CONTEXT_WINDOW`，`reserved_output_tokens = AIIVE_LLM_MAX_OUTPUT_TOKENS`，`hard_input_limit = model_context_window - reserved_output_tokens`。`TokenCount.safe_tokens` 已包含现有安全余量，最终检查 **safe_tokens + requested_output_tokens <= model_context_window**。不再存在分区 hard/soft 配额、Recent 弹性额度、Graph 35% 预留或分区总额校验；旧 `AIIVE_CONTEXT_BUDGET_JSON` 仅输出弃用警告并被忽略。`ModelProfile`、`TokenCounter` 安全余量和 TurnExecution 共享缓存保持不变。
+
+一次收集可见候选后构建完整 messages + tools，并调用真实 TokenCounter。超限时按顺序逐项移除，每次重新渲染并重新计数：最旧完整历史 Turn → 统一 RetrievalHit 中 final_score 最低的 Memory/历史摘要 → score 较低、hop 较远的完整 Graph 关系 → 较旧完整 SegmentSummary → WorkingState Artifact 引用及低优先级 open_loop → 按原角色优先级反向移除完整 Core Block（优先保留 human_identity）。Stable Contract、安全约束、当前消息、目标、关键约束、P0/P1 循环、待审批、未确认副作用及运行中工具状态保留；interrupted_unknown 工具事实整组保护。保留工具调用与结果成对。必要内容仍超限则 ContextBudgetExceededError，不调用模型；不做字符比例截断或即时 LLM 压缩。
+
+`_finalize_turn()` 完成 Turn 并 flush 当前 Event 后，通过 `ThreadState.load_recent_messages_bounded(token_budget=None, segment_id=...)`、现有 TokenCounter 和 ToolResultNormalizer 统计当前 Segment 的实际历史 Token（`BoundedReadStats.estimated_tokens`）。有效阈值为 `min(AIIVE_SEGMENT_SEAL_TOKEN_THRESHOLD=64000, hard_input_limit * 0.5)`；达到该阈值或 `max_segment_turn_records=32` 时设置现有 pending_seal_at/sealed_by_turn，与当前 Turn 同事务提交。Memory/Graph/工具定义等 Prompt 内容不计入历史密封触发。保留 15 分钟 Idle Sealing、Scheduler、EpochManager、Outbox 和原有非终态/副作用阻塞条件。
+
+`compaction.validate_compaction_prompt()` 使用 LiteLLMTokenCounter、ModelProfile、TokenSafetyConfig 检查完整摘要 Prompt 的 safe_tokens + 配置最大输出 <= 配置模型窗口。`handle_segment_sealing()` 每次 llm.chat 前计数，包括追加错误回复后的 JSON retry Prompt；确定性超限立即走 `_build_extract_fallback_summary()`，记录 compaction_prompt_overflow 与 deterministic-extractive-fallback，继续 merge_summary、Cover Check、source_hash/fencing 和事务提交，不消耗 Worker 重试。Forget `_try_generate_summary()` 同样门禁，超限返回 None，沿用 redacted 降级；不改变来源过滤与重建语义。Epoch Checkpoint 仍为确定性聚合，无新增模型调用。
+
+- 完整调用链：TurnExecution._load_context → ContextAssembler（Forget 可见候选 / AUTO 全局候选上限 / 全量工具定义）→ ContextOverflowPacker → TokenCounter → final MemoryAccessTracker / ContextSnapshot → AgentGraph；finalize Event flush → 当前 Segment 统计 → pending_seal → Scheduler → EpochManager freeze → segment_sealing Outbox → Prompt gate → merge / Cover Check / fenced commit。
+- 数据访问上限保留：历史分页/Turn/Event/原始字节；Memory top_k/路由上限；Graph hops/batch/relations；近期摘要数；Core 3 Block；工具结果 Artifact 和 SINGLE_TOOL_RESULT_INLINE_LIMIT；显式 SEARCH/DEEP 独立预算。WorkingState 在收集时复用 safe_boundary_snapshot 的逐项来源可见性检查。
+- 测试导航：`tests/unit/backend/test_context_overflow.py`；`tests/integration/backend/test_context_v641.py`；`tests/integration/pg/test_pg_context_v641.py`；旧 ContextAssembler / Recall / ThreadState 测试已迁移到全局预算契约。结果见 current_phase V64.1。
