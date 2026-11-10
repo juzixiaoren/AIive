@@ -120,6 +120,8 @@ function ChatApp({ username, onLogout }: { username: string; onLogout: () => voi
   const [stopping, setStopping] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const streamingRef = useRef(false);
+  /** 本地流结束后合并执行连接快照/远端结束触发的历史刷新。 */
+  const historyRefreshPendingRef = useRef(false);
   const activeTurnRecordIdRef = useRef("");
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -215,10 +217,16 @@ function ChatApp({ username, onLogout }: { username: string; onLogout: () => voi
   // 订阅线程 WebSocket：其他设备开始执行/结束/取消时同步按钮状态。
   useEffect(() => {
     if (!configured || !threadId) return;
-    return subscribeThreadEvents(threadId, (status) => {
+    return subscribeThreadEvents(threadId, (status, { initialSnapshot }) => {
       const hadRemoteTurn = remoteTurnActiveRef.current;
       applyStatus(status);
-      if (status.state === "idle" && hadRemoteTurn) void refreshHistory();
+      if (initialSnapshot || (status.state === "idle" && hadRemoteTurn)) {
+        if (streamingRef.current) {
+          historyRefreshPendingRef.current = true;
+        } else {
+          void refreshHistory();
+        }
+      }
     });
   }, [applyStatus, configured, refreshHistory, threadId]);
 
@@ -403,6 +411,10 @@ function ChatApp({ username, onLogout }: { username: string; onLogout: () => voi
       if (abortRef.current === controller) abortRef.current = null;
       setStreaming(false);
       streamingRef.current = false;
+      if (historyRefreshPendingRef.current) {
+        historyRefreshPendingRef.current = false;
+        await refreshHistory();
+      }
       // 结束后重新读取服务端状态：后台 GoalDecision 可能已接手，不能盲置 idle。
       if (!controller.signal.aborted && !statusSynced) {
         try {

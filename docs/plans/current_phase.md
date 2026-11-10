@@ -1078,3 +1078,30 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - 状态机：idle ⇄ running（前台 Turn，cancellable）/ busy（后台 GoalDecision，不可中断）；取消为 running → 登记 `cancel_requested_at` → 执行者收口为 cancelled，锁仅在收口事务内原子释放；已完成 Turn 的停止请求返回 completed。
 - 关键测试：唯一 Thread（stale 拒绝无写入 / 缺省复用 / 内部来源不受限）、流式 202/409 结构化错误、跨端 HTTP 中断与历史消失、解析期间取消不写记忆、GoalDecision 占用广播、完成后释放锁。
 - 剩余风险：无浏览器/真机自动化；同步 `/api/chat` 取消为节点边界停止且不保留部分工具快照；本地遗留 `%TEMP%/aiive_test_*.db` 需用独立 TMPDIR 复跑。
+
+
+### V63.2 WebSocket 重连历史恢复与聊天错误契约统一（2026-11-10）
+
+- 基线：`8bc2c03`，main，开始时工作区干净；未修改 WebSocket 后端协议、ConversationState、TurnExecutionService、Thread Lease、取消语义、表结构或迁移，未新增轮询或 turn_id 重试机制。
+- 连接恢复：Web `connect()` 与 Android `subscribeThreadEvents.connect()` 每次创建连接时重置局部 `receivedInitialStatus=false`。第一次 `execution_status` 标记 initialSnapshot，先正常应用状态，再对 idle/running/busy 均请求历史；Android 回调新增 `{ initialSnapshot: boolean }` 元数据。
+- 历史同步：首快照与远端 running/interrupting→idle 合并判断，每个事件最多发起一次历史请求；直接复用 Web `loadRemoteMessages(threadId)` 和 Android `refreshHistory()`，服务器历史覆盖本地（包括空历史），不做数量比较或正文去重。Web 原有 new_message 的 event_id 去重保留。
+- 本地流保护：`inFlightRef` / `streamingRef` 为 true 时只置 `historyRefreshPendingRef`。本地 Turn finally 先清除本地流式状态，再消费标记、刷新一次；多次连接快照合并为一个布尔标记。Web 系统指令同样使用 inFlightRef，其 finally 也处理待刷新标记。
+- 错误契约：同步 `_raise_turn_conflict_error` 仅 `turn_in_progress` 为 HTTP 202 / retryable=true；stale_thread_id、turn_cancelled、turn_interrupted、idempotency_key_mismatch 及未知非 Busy 冲突均 HTTP 409 / false。检查发现 SSE 路由的异常兜底也有全 true 问题，已采用相同判断；其余响应字段、错误码和状态码保持现有结构，SSE HTTP 仍为 200。
+- HTTP 测试：`test_chat_api.py` 新增 6 类参数化用例，mock execute_turn 抛 TurnConflictError，断言完整 detail，并 mock 流式异常逐项比对 SSE 的 code/status/retryable。该文件 **24 passed**。
+- 自动化场景：`node scripts/verify_chat_reconnect.cjs` 使用 TypeScript AST 提取实际生产回调并执行，以 Mock WebSocket、历史 HTTP 和 React setter 离线回放（不是浏览器或真机测试）：
+  - A：Web/Android 均 PASS。断线期间服务器完成一轮，重连 idle 后请求历史；即使本地条数与正文相同也替换为服务器 event_id，重复 idle 不重复请求，无重复消息。
+  - B：Web/Android 均 PASS。重连 running 先同步历史/状态；interrupting 保留远端活跃标记，idle 再刷新；首 idle 同时满足远端完成条件时仅一次请求。另验证取消后空历史清除消息。
+  - C：Web/Android 均 PASS。本地流期间连续两次重连快照不覆盖乐观消息、不请求历史；实际 finally 退出本地流后仅请求一次，待刷新标记复位。
+  - 附加：首 busy 快照刷新、首帧认证、wss URL、每次重连标记复位、cleanup 不重连、Web 推送 event_id 去重均 PASS。
+- 生产构建：`frontend` 与 `apps/android` 各运行 `npm run build`（tsc + vite build）均通过；仅验证 Android TypeScript/Web 资产生产构建，未打包或安装 APK。
+- 静态检查：`.venv/Scripts/ruff.exe check backend/aiive --select F,E9` 通过（与 CI 规则一致）；`basedpyright --pythonpath .venv/Scripts/python.exe` 为 0 errors / 0 warnings / 0 notes。
+- 后端全量单元测试：**1227 passed / 5 skipped / 29 warnings，227.28s**。命令：设置进程环境 `SHELL_BASH_PATH=E:/git/Git/bin/bash.exe`、`PYTHONUTF8=1` 后运行 `.venv/Scripts/python.exe -m pytest tests/unit/backend -q`；5 个跳过均为 Windows 不支持的 POSIX 部署脚本测试。29 个警告涉及 SQLAlchemy 事务/日期适配及未 await 的广播协程，未在本轮扩展修复。首次默认环境 16 failed / 1211 passed / 5 skipped，失败均为真实 Shell 用例，本机 PATH 的 bash 指向 WSL 启动器；使用已有 Git Bash 解决测试环境问题，不改仓库配置，Shell 专项另有 30 passed。最终进程清理报告 `tests/artifacts/validation/cleanup/36368/cleanup_report.json` 为 test_exitstatus=0 / status=cleaned / exists_after_cleanup=false。
+- 本地证据（构建目录不提交）：`build/v632-chat-tests.log`、`build/v632-unit-tests-gitbash.log`、`build/v632-shell-gitbash.log`、`build/v632-basedpyright.log`。实现与离线验收完成，跨设备人工验收仍待执行。
+
+人工跨设备验收（待执行，未声称完成真实浏览器或 Android 真机测试；仓库未配置 Playwright/WebDriver 场景）：
+
+1. A：手机与电脑登录同一服务，确认同一 Thread；手机断网，电脑完成一轮问答，手机恢复网络。观察 WS 重连认证后的首 execution_status=idle，以及随后 GET `/api/threads/{threadId}/messages`；手机应显示完整用户消息与 Agent 回复各一条。
+2. B：手机断网后电脑开始较长回复，回复结束前恢复手机网络；确认首 running 快照即加载当前历史并显示执行中。电脑完成或取消后，手机收到 idle 并再次 GET 历史；完成内容应与服务器一致，取消时被回滚的用户消息应消失。
+3. C：手机本地发起流式回复，保持 SSE 可继续传输而单独断开并恢复 WS（调试代理或受控测试工具）；确认首快照不会立刻触发历史覆盖、Token 继续追加；Turn finally 结束后只执行一次待刷新请求。分别检查成功、取消和流式失败路径。
+
+剩余风险：离线回放不覆盖真实网络、浏览器渲染及 Android WebView 生命周期；上述人工流程仍需设备实测。历史请求失败沿用现有处理，不新增重试/轮询；慢历史响应与后续事件的跨请求排序仍沿用现有机制，本轮未引入复杂状态协调。

@@ -87,7 +87,7 @@ def _raise_turn_conflict_error(error: TurnConflictError) -> NoReturn:
     raise HTTPException(status_code=status, detail={
         "code": message,
         "message": message,
-        "retryable": True,
+        "retryable": message == "turn_in_progress",
         "trace_id": None,
         "retry_after_seconds": None,
         "status": status,
@@ -211,7 +211,8 @@ async def chat_stream(request: ChatRequest):
             yield f"event: done\ndata: {response.model_dump_json(exclude_none=True)}\n\n"
         except TurnConflictError as error:
             message = str(error)
-            payload = {"code": message, "message": message, "retryable": True,
+            payload = {"code": message, "message": message,
+                       "retryable": message == "turn_in_progress",
                        "trace_id": None, "retry_after_seconds": None,
                        "status": 409 if message != "turn_in_progress" else 202}
             yield f"event: error\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"

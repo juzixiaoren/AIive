@@ -245,6 +245,8 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
   const abortRef = useRef<AbortController | null>(null);
   /** 同步记录请求占用状态，阻止 React 状态提交前的重复发送。 */
   const inFlightRef = useRef(false);
+  /** 本地 Turn 期间收到的历史同步请求，在 finally 中合并执行。 */
+  const historyRefreshPendingRef = useRef(false);
   /** 当前流已收到的真实线程 ID，用于断流后不受 React 状态闭包影响地恢复历史。 */
   const activeStreamThreadIdRef = useRef<string | undefined>(undefined);
   /** 用户是否贴近消息底部（决定自动滚动 & 是否显示回到底部按钮） */
@@ -464,6 +466,7 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
     let disposed = false;
 
     const connect = () => {
+      let receivedInitialStatus = false;
       ws = new WebSocket(wsUrl);
       // 首帧认证：认证完成前后端不会推送任何消息事件。
       ws.onopen = () => {
@@ -504,13 +507,18 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
             }
           } else if (msg.type === "execution_status" && msg.data) {
             const status = msg.data as ExecutionStatus;
+            const initialSnapshot = !receivedInitialStatus;
+            receivedInitialStatus = true;
             // 先取「此前是否仍有远端 Turn」再应用状态：idle 会清除该标记。
             const hadRemoteTurn = remoteTurnActiveRef.current;
             applyExecutionStatus(status);
-            if (status.state === "idle" && hadRemoteTurn) {
-              // 其他设备完成/取消后，以服务器历史为准覆盖本地消息
-              // （取消的用户消息必须在本端消失）。
-              void loadRemoteMessages(String(status.thread_id || threadId));
+            if (initialSnapshot || (status.state === "idle" && hadRemoteTurn)) {
+              // 首状态快照补齐断线期间错过的完整 Turn；本地流结束前不能覆盖气泡。
+              if (inFlightRef.current) {
+                historyRefreshPendingRef.current = true;
+              } else {
+                void loadRemoteMessages(String(status.thread_id || threadId));
+              }
             }
           } else if (msg.type === "maintenance_report" && msg.data?.operation_id && msg.data?.card) {
             const operationId = String(msg.data.operation_id);
@@ -721,6 +729,10 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
     } finally {
       inFlightRef.current = false;
       setLoading(false);
+      if (historyRefreshPendingRef.current && threadId) {
+        historyRefreshPendingRef.current = false;
+        await loadRemoteMessages(threadId);
+      }
     }
   };
 
@@ -990,6 +1002,10 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
       inFlightRef.current = false;
       setLoading(false);
       abortRef.current = null;
+      if (historyRefreshPendingRef.current && resolvedThreadId) {
+        historyRefreshPendingRef.current = false;
+        await loadRemoteMessages(resolvedThreadId);
+      }
       // 本轮结束后不要无条件置 idle：后台 GoalDecision 可能已接手占用。
       // 重新读取服务端状态；查询失败时才退回 idle 以保证按钮可用。
       if (!wasAborted && !statusSynced) {

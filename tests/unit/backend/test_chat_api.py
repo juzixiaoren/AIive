@@ -179,6 +179,48 @@ class TestChatAPI:
         assert data["action_cards"] == []
         assert data["pending_operations"] == []
 
+    @pytest.mark.parametrize("code", [
+        "turn_in_progress", "stale_thread_id", "turn_cancelled",
+        "turn_interrupted", "idempotency_key_mismatch", "other_conflict",
+    ])
+    def test_post_chat_turn_conflict_contract(self, client, monkeypatch, code):
+        """同步 HTTP detail 与流式 SSE error 的冲突契约一致。"""
+        import json
+
+        from aiive.runtime.turn_execution import TurnConflictError
+
+        def fail_execute(self, **_kwargs):
+            raise TurnConflictError(code)
+
+        async def fail_stream(self, **_kwargs):
+            raise TurnConflictError(code)
+            yield  # async generator，异常由流式路由转换
+
+        monkeypatch.setattr(
+            "aiive.api.routes_chat.TurnExecutionService.execute_turn", fail_execute,
+        )
+        monkeypatch.setattr(
+            "aiive.api.routes_chat.TurnExecutionService.execute_turn_stream", fail_stream,
+        )
+        status = 202 if code == "turn_in_progress" else 409
+        response = client.post("/api/chat", json={"message": "Hello"})
+        assert response.status_code == status
+        detail = response.json()["detail"]
+        assert detail == {
+            "code": code, "message": code, "status": status,
+            "retryable": code == "turn_in_progress",
+            "trace_id": None, "retry_after_seconds": None,
+        }
+
+        stream = client.post("/api/chat/stream", json={"message": "Hello"})
+        assert stream.status_code == 200
+        event = json.loads(next(
+            line.removeprefix("data: ") for line in stream.text.splitlines()
+            if line.startswith("data: ")
+        ))
+        for field in ("code", "status", "retryable"):
+            assert event[field] == detail[field]
+
     def test_post_chat_accepts_custom_thread_id(self, client, db_session):
         """POST /api/chat 接受等于服务器当前 Thread 的显式 thread_id（V63）。"""
         from aiive.db.models import ConversationState, Thread

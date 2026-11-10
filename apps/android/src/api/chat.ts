@@ -188,7 +188,7 @@ export async function interruptTurn(
  */
 export function subscribeThreadEvents(
   threadId: string,
-  onStatus: (status: ExecutionStatus) => void,
+  onStatus: (status: ExecutionStatus, metadata: { initialSnapshot: boolean }) => void,
 ): () => void {
   let socket: WebSocket | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -196,6 +196,7 @@ export function subscribeThreadEvents(
 
   const connect = () => {
     if (disposed) return;
+    let receivedInitialStatus = false;
     const base = appConfig.backendBaseUrl.replace(/^http/i, "ws");
     socket = new WebSocket(`${base}/ws/${encodeURIComponent(threadId)}`);
     socket.onopen = () => {
@@ -208,7 +209,9 @@ export function subscribeThreadEvents(
           data?: Record<string, unknown>;
         };
         if (payload.type === "execution_status" && payload.data) {
-          onStatus(payload.data as unknown as ExecutionStatus);
+          const initialSnapshot = !receivedInitialStatus;
+          receivedInitialStatus = true;
+          onStatus(payload.data as unknown as ExecutionStatus, { initialSnapshot });
         }
       } catch {
         // 非 JSON 帧忽略，不打断连接。

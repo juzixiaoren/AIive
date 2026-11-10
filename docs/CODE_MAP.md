@@ -7,7 +7,7 @@
 > - **路径约定**：均相对项目根（`AIive/`），如 `backend/aiive/main.py`、`frontend/src/pages/ChatPage.tsx`
 > - **行号**：基于建图时的代码版本，仅供快速跳转，以实际代码为准
 > - **维护规则**：见文末第 9 节。**新增/删除/移动文件、改 key 符号行号、改表结构后必须同步更新本文档**
-> - 建图日期：2026-10-21；最近更新：2026-11-03（V49 单用户认证、V50 目标步骤触发规则 + 主动消息、V51 工具结果回填预算、V52 后台回填统一 + Bash 流式日志、V53 通用计划事件源扩展、V54 安全边界事件注入 + 协作式主动消息、V55 决策标记全流式防泄漏、V56 收件箱溢出与决策串行化、V57 前后台 LLM 串行化 + 目标决策幂等、V58 主动提问与用户回复关联闭环、V59 待回答问题的状态一致性、V60 记忆检索 pg_search BM25、V61 知识库结构感知递归切分、V61.3 Chunker 兜底拆分正确性）
+> - 建图日期：2026-10-21；最近更新：2026-11-10（V63.2 WebSocket 重连历史恢复与聊天错误契约统一；V49 单用户认证、V50 目标步骤触发规则 + 主动消息、V51 工具结果回填预算、V52 后台回填统一 + Bash 流式日志、V53 通用计划事件源扩展、V54 安全边界事件注入 + 协作式主动消息、V55 决策标记全流式防泄漏、V56 收件箱溢出与决策串行化、V57 前后台 LLM 串行化 + 目标决策幂等、V58 主动提问与用户回复关联闭环、V59 待回答问题的状态一致性、V60 记忆检索 pg_search BM25、V61 知识库结构感知递归切分、V61.3 Chunker 兜底拆分正确性）
 
 ---
 
@@ -71,9 +71,9 @@
 
 | 功能 | 核心文件 | 关联文件 | 测试 |
 |---|---|---|---|
-| 聊天入口（同步/SSE/错误契约） | `api/routes_chat.py` | `runtime/turn_execution.py`、`api/ws_manager.py` | `tests/unit/backend/test_chat_*.py` |
+| 聊天入口（同步/SSE/错误契约） | `api/routes_chat.py`（V63.2：同步 detail 与 SSE error 仅 turn_in_progress 为 202 / retryable=true，其余 TurnConflictError 为 409 / false；SSE HTTP 保持 200） | `runtime/turn_execution.py`、`api/ws_manager.py` | `tests/unit/backend/test_chat_*.py` |
 | 回合生命周期（抢占/租约/心跳/收尾） | `runtime/turn_execution.py` | `db/models.py::turn_records`、`runtime/event_logger.py` | `test_turn_execution*.py` |
-| 唯一长期对话 / 三端互斥执行 / 远程中断（V63 闭环） | `runtime/conversation_state.py`（ConversationState 单例 + 执行状态视图）、`api/routes_conversation.py`（current/status/interrupt）、`runtime/turn_execution.py`（USER 强制唯一 Thread：`stale_thread_id` 在任何写入前拒绝；先抢锁后落库；流式 Busy 202/409 结构化 SSE；`_finalize_cancelled_turn`） | `runtime/agent_graph.py`（`TurnCancelled` + 流式/节点级 cancel_check）、`runtime/thread_lease.py`、`worker/handlers_conflict.py`（解析前后双查取消）、`worker/handlers_goal_triggers.py`（占用 busy / 释放 idle 广播）、`api/routes_chat.py`、`frontend/src/pages/ChatPage.tsx`（conversationReady / remoteTurnActive）、`apps/android/src/App.tsx`、`apps/android/src/api/chat.ts`（ChatApiError） | `tests/unit/backend/test_single_thread_conversation.py`、`test_goal_decision_serialization.py`、`tests/integration/backend/test_memory_conflict_confirmation.py` |
+| 唯一长期对话 / 三端互斥执行 / 远程中断（V63 闭环 / V63.2 重连恢复） | `runtime/conversation_state.py`（ConversationState 单例 + 执行状态视图）、`api/routes_conversation.py`（current/status/interrupt）、`runtime/turn_execution.py`（USER 强制唯一 Thread：`stale_thread_id` 在任何写入前拒绝；先抢锁后落库；流式 Busy 202/409 结构化 SSE；`_finalize_cancelled_turn`） | `runtime/agent_graph.py`（`TurnCancelled` + 流式/节点级 cancel_check）、`runtime/thread_lease.py`、`worker/handlers_conflict.py`（解析前后双查取消）、`worker/handlers_goal_triggers.py`（占用 busy / 释放 idle 广播）、`api/routes_chat.py`、`frontend/src/pages/ChatPage.tsx`（conversationReady / remoteTurnActive / 首个 execution_status 快照同步历史 / historyRefreshPendingRef 本地 Turn finally 延迟刷新）、`apps/android/src/App.tsx`、`apps/android/src/api/chat.ts`（ChatApiError / onStatus initialSnapshot 每次连接重置） | `tests/unit/backend/test_single_thread_conversation.py`、`test_goal_decision_serialization.py`、`tests/integration/backend/test_memory_conflict_confirmation.py` |
 | Agent 图节点 / 工具循环 / 流式 | `runtime/agent_graph.py` | `tools/langchain_adapter.py`、`core/llm_client.py` | `test_agent_graph*.py` |
 | 上下文组装与 token 预算 | `runtime/context_assembler.py`、`runtime/context_budget.py` | `memory/automatic_recall.py`、`runtime/thread_state.py` | `test_context_assembler*.py` |
 | LLM 客户端（json_mode 降级/错误归一） | `core/llm_client.py` | `config.py`（LLM 配置项） | `test_llm_client*.py` |
@@ -886,6 +886,7 @@ POST /api/auth/login（失败统一 invalid_credentials；同 (client, username)
 
 | 文件 | 用途 |
 |---|---|
+| `scripts/verify_chat_reconnect.cjs` | V63.2 离线回放：提取实际 TypeScript 回调，模拟两端 A/B/C、busy 快照、interrupting→idle、认证、重连重置、清理与 Web event_id 去重；`node scripts/verify_chat_reconnect.cjs`（需 frontend npm 依赖） |
 | `scripts/start.sh` | 本地一键启动：按 `.env` 向量开关 + provider 决定是否拉起 local-embedding profile，模型缺失时先自动下载 |
 | `scripts/embedding_model.sh` | 本地 Embedding 模型缓存管理：`status`/`path`/`image-tag`/`ensure`；按 HF 缓存布局检测快照完整性，缺失时用 TEI 容器下载并支持多下载源回退 |
 | `scripts/build-app.sh` | 统一客户端构建入口（`list`/`android debug|release`/`desktop debug|release`），分发到 `scripts/app-builders/` |
@@ -1086,3 +1087,12 @@ WorkingState 的语义项保存 source_turn_id；objective 的来源复用 Conte
 `tests/support.py::attach_memory_event_source` 显式创建真实 Event 来源，孤儿测试不使用此助手。
 
 V62.6.1 测试清理：根 `conftest.py::_cleanup_test_db` / `pytest_sessionfinish` 在 fixture teardown 后关闭本进程 Session 和 engine，校验并移除本进程测试库，失败写 `tests/artifacts/validation/cleanup/<pid>/cleanup_report.json` 并置非零退出码；跨进程回归在 `tests/unit/backend/test_process_database_cleanup.py`。
+
+
+## V63.2 版本索引（2026-11-10）
+
+- WebSocket 首帧认证及现有 `routes_ws.py` 首个 `execution_status` 协议保持不变。Web `ChatPage.connect()` 和 Android `subscribeThreadEvents.connect()` 每次连接重置 `receivedInitialStatus`；首次状态无论 idle/running/busy 均同步服务器历史。
+- 首快照或远端 Turn 从 running/interrupting 进入 idle 合并为一个刷新判断；复用 `loadRemoteMessages` / `refreshHistory` 覆盖本地历史，不按数量或正文去重。Web 推送消息仍按 event_id 去重。
+- 本地 `inFlightRef` / `streamingRef` 为 true 时仅置 `historyRefreshPendingRef`，本地 Turn finally 先退出流式状态，再消费标记并刷新一次；Web 系统指令 finally 同样收口。
+- `_raise_turn_conflict_error` 及 SSE 路由 TurnConflictError 兜底统一 retryable 规则：仅 `turn_in_progress` 为 true；`stale_thread_id`、`turn_cancelled`、`turn_interrupted`、`idempotency_key_mismatch` 及其他冲突为 false，保留已有状态码和字段。
+- 回归入口：`tests/unit/backend/test_chat_api.py::TestChatAPI::test_post_chat_turn_conflict_contract`（6 类同步 HTTP / SSE 对照）；`scripts/verify_chat_reconnect.cjs`（实际回调离线回放）。验收结果及真机人工步骤见 `docs/plans/current_phase.md` V63.2。
