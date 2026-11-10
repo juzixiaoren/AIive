@@ -1113,7 +1113,7 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - 预算：ContextBudget 仅保留 model_context_window、reserved_output_tokens，hard_input_limit=两者之差。配置来自 AIIVE_LLM_CONTEXT_WINDOW / AIIVE_LLM_MAX_OUTPUT_TOKENS；旧 AIIVE_CONTEXT_BUDGET_JSON（包括非法 JSON）警告并忽略。删除 PartitionBudget、分区总额校验、弹性 Recent 及 soft_input_limit，保留 default/from_env 与 TurnExecution 缓存；ModelProfile / TokenCounter / 安全余量未改。
 - 完整候选：一次收集完整 Turn（全部事件带 turn_id）、RetrievalHit（Memory/摘要共用原 final_score）、GraphRelationView、独立 SegmentSummary、结构化 WorkingState 与原角色顺序 Core Block。AUTO 在现有可见性/版本校验后回源加载完整内容，候选总量沿用调用方传入的全局 hard_input_limit，解决旧 200 字符预览对普通对话的隐性截断；显式 SEARCH/DEEP 的工具预算/预览限制不变。Core 投影来源指纹更新，旧裁剪缓存会由已有回源机制重建为完整 Block。
 - Overflow：ContextOverflowPacker 是无数据库查询/无模型调用的纯逻辑模块。先整体 TokenCounter.count_messages，再依次删除最旧完整 Turn → 最低 final_score 的统一检索候选 → 低 score/远 hop Graph 关系 → 旧完整摘要 → WorkingState Artifact/低优先级循环 → 反向角色优先级 Core Block；每移除一项都重新渲染/真实计数。Stable Contract、当前消息、目标、关键约束、P0/P1 循环、待审批、未确认副作用/运行中工具和 interrupted_unknown 事实保护。保留工具调用与结果配对，必要内容仍超限则 ContextBudgetExceededError、不调用 LLM。
-- 非 Token 安全边界保留：历史 max_pages/max_turns/max_events/max_raw_bytes、Memory top_k/路由上限、Graph hops/batch/relations、摘要 max_segment_summaries、Core 3 Block、ToolResultNormalizer Artifact 引用与 SINGLE_TOOL_RESULT_INLINE_LIMIT。WorkingState 去掉 token_budget 渲染参数，保留 MAX_LIST_ITEMS 与全部结构字段，复用 safe_boundary_snapshot 逐项来源可见性（来源不明仍 fail-closed）。
+- 非 Token 安全边界保留：历史 max_pages/max_turns/max_events/max_raw_bytes、Memory top_k/路由上限、Graph hops/batch/relations、摘要 max_segment_summaries、Core 3 Block、ToolResultNormalizer Artifact 引用与 SINGLE_TOOL_RESULT_INLINE_LIMIT。WorkingState 去掉 token_budget 渲染参数，保留 MAX_LIST_ITEMS 与全部结构字段，复用 safe_boundary_snapshot 逐项来源可见性（来源不明仍 fail-closed，热上下文也复用该检查）。
 - 诊断：ContextSnapshot 输入项也通过真实 TokenCounter 计数；PartitionReport 记录真实估计/安全 Token 与具体淘汰来源/原因，分区 hard_limit=None，仅 total 报全局硬上限。MemoryAccessTracker.touch、ContextSnapshot.injected_memory_ids 均从最终保留 Memory 生成；被淘汰候选和装配失败均不 touch。ForgetVisibilityService 先于候选注入，Packer 不重新查询或绕过屏蔽。
 - 历史密封：_finalize_turn 完成 Turn、flush 当前回复和工具 Event 后，在同事务中调用 _mark_segment_pending_seal。ThreadState 仅读取指定 segment_id，token_budget=None 时保留所有访问上限；经 ToolResultNormalizer 后用 TokenCounter 汇总真实 estimated_tokens。阈值=min(AIIVE_SEGMENT_SEAL_TOKEN_THRESHOLD=64000, hard_input_limit*0.5)；达到阈值或 32 Turn 即写现有 pending_seal_at/sealed_by_turn。取消旧“总 Prompt 超 80%”密封；15 分钟 Idle 与 Scheduler/EpochManager/Outbox 流程保留。
 - 摘要门禁：compaction.validate_compaction_prompt 使用生产 LiteLLMTokenCounter / ModelProfile / TokenSafetyConfig 校验 safe_tokens+配置最大输出<=窗口。Segment Handler 初次及追加 JSON 重试前均校验；确定性超限记录 compaction_prompt_overflow，立即使用 deterministic-extractive-fallback，继续 merge、Cover Check、source_hash 与 fenced commit，不对同一超限输入做 Worker 重试。Forget Summary 同门禁，超限直接 None，沿用 redacted 安全降级。Checkpoint 仍确定性聚合。
@@ -1124,12 +1124,13 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 
 验收证据：
 
-- 本地全量：`SHELL_BASH_PATH=E:/git/Git/bin/bash.exe`、`PYTHONUTF8=1`，`.venv/Scripts/python.exe -m pytest tests -q`：**1824 passed / 124 skipped / 5280 warnings，311.48s**。跳过为默认关闭的 PG 专项与 5 个 Windows 不支持的 POSIX 部署脚本；新 PG 测试另在真实专项运行。警告为现有 SQLite 日期适配、SQLAlchemy 事务与未 await 广播协程，未扩大到本轮之外修复。
+- 本地全量：`SHELL_BASH_PATH=E:/git/Git/bin/bash.exe`、`PYTHONUTF8=1`，`.venv/Scripts/python.exe -m pytest tests -q`：**1824 passed / 129 skipped / 5280 warnings，299.34s**（提交 `23f33b2` 后完整复跑，包含新增 PG 文件的默认跳过）。跳过为默认关闭的 PG 专项与 5 个 Windows 不支持的 POSIX 部署脚本；新 PG 测试另在真实专项运行。警告为现有 SQLite 日期适配、SQLAlchemy 事务与未 await 广播协程，未扩大到本轮之外修复。
 - 真实 PostgreSQL：启动本机已有 Docker Desktop，`AIIVE_PG_TESTS=1` 运行 `pytest tests/integration/pg -q`，一次性 pgvector/ParadeDB 容器：**111 passed / 13 skipped，220.35s**。13 项均依赖本地真实 Embedding 服务；新增 5 项 V64.1（初次/重试超限降级提交、Token/32 Turn/跨 Segment 隔离）全部通过；测试容器已由 fixture 清理。
 - 定向测试：Overflow/Assembler/ThreadState 新旧回归 **38 passed**，最终预算/Overflow/完整来源与快照复验 **44 passed**；普通 AUTO Memory / 历史摘要可超原 1200/800 配额，Core 完整 Block 可超 600，且 Forget Tombstone 屏蔽仍生效。四窗口 32K/50K/256K/1M、旧 JSON 弃用、小窗口、整 Turn/工具 JSON 完整性、最终 touch、历史独立触发、摘要初次/重试与 Forget 超限无调用均有断言。
 - 静态检查：Ruff `check backend/aiive --select F,E9` 通过；basedpyright（仓库 .venv）0 errors / 0 warnings / 0 notes。
-- 本地日志（build 不提交）：v641-all-final.log、v641-pg-final.log、v641-new-tests.log、v641-retrieval-tests.log、v641-types.log、v641-final-focused.log。进程数据库清理由根 pytest_sessionfinish 验证；真实 PG 使用一次性容器，不连接或清理用户生产库。
-- GitHub CI：提交推送后跟进实际结果，单独保留运行链接与结论。
+- 本地日志（build 不提交）：v641-all-final.log、v641-committed-tests.log、v641-pg-final.log、v641-new-tests.log、v641-retrieval-tests.log、v641-types.log、v641-final-focused.log。进程数据库清理由根 pytest_sessionfinish 验证；真实 PG 使用一次性容器，不连接或清理用户生产库。
+- GitHub CI：实现提交 `23f33b2` 的 [CI #82](https://github.com/juzixiaoren/AIive/actions/runs/42847159230) **9/9 jobs success**：单元/关键流程、逐文件隔离、集成、真实 PostgreSQL、Ruff、basedpyright、前端生产构建、Alembic 空库 upgrade/check、Docker Compose 冒烟均成功。验收回执提交仅更新本段证据，使用 `[skip ci]` 避免重复执行已经通过的代码检查。
+- 清理证据：最终本地进程 `tests/artifacts/validation/cleanup/41972/cleanup_report.json` 为 test_exitstatus=0、status=cleaned、exists_after_cleanup=false；`docker ps` 确认一次性测试容器已清理。
 
 修改文件：
 
