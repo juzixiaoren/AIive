@@ -5,10 +5,12 @@ All API/tool consumers use these domain methods, not Forget internals.
 
 from __future__ import annotations
 from collections.abc import Sequence
+from datetime import datetime
 from typing import TypeVar
 from sqlalchemy.orm import Session
 from aiive.db.models import (
     AgentTask,
+    ApprovalRequest,
     AgentAction,
     AgentRun,
     AgentTaskEvent,
@@ -23,6 +25,7 @@ from aiive.forget.source_policy import SourceReferences, blocked_sources_reason
 
 Child = TypeVar(
     "Child",
+    ApprovalRequest,
     AgentAction,
     AgentRun,
     AgentTaskEvent,
@@ -283,7 +286,7 @@ class TaskReadRepository:
         return [task for task in rows if self.task_visible(task)][:limit]
 
 
-    def task_candidates(self, thread_id: str, before=None, limit: int = 128) -> list[AgentTask]:
+    def task_candidates(self, thread_id: str, before: tuple[datetime, str] | None = None, limit: int = 128) -> list[AgentTask]:
         from sqlalchemy import and_, or_
         query = self.db.query(AgentTask).filter_by(thread_id=thread_id)
         if before is not None:

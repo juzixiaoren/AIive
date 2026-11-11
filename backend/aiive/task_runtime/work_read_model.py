@@ -8,11 +8,14 @@ import json
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import Any, TypeVar
 
 from sqlalchemy import func
+from sqlalchemy.orm import Session
 
 from aiive.db.models import (
     AgentAction,
+    AgentTask,
     AgentTaskEvent,
     ApprovalRequest,
     ConversationState,
@@ -25,9 +28,14 @@ from aiive.task_runtime.goal_plan import (
     GoalPlan,
     next_runnable_step,
 )
-from aiive.task_runtime.goal_questions import list_open_questions_for_tasks
+from aiive.task_runtime.goal_questions import (
+    PendingQuestion,
+    list_open_questions_for_tasks,
+)
 from aiive.task_runtime.read_repository import TaskReadRepository
 from aiive.task_runtime.repository import TERMINAL_TASK_STATES, canonical_json
+
+Metadata = TypeVar("Metadata", TaskArtifact, TaskEvidence)
 
 
 class WorkBucket(StrEnum):
@@ -45,14 +53,14 @@ class WorkAttentionItem:
     question_id: str | None = None
     step_id: str | None = None
     approval_id: str | None = None
-    preview: dict | None = None
+    preview: dict[str, Any] | None = None
 
 
-def utc(value):
+def utc(value: datetime) -> datetime:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
-def approval_preview(approval):
+def approval_preview(approval: ApprovalRequest) -> dict[str, Any]:
     args = approval.tool_args or {}
     tool = approval.tool_name
     result = {
@@ -104,12 +112,12 @@ TIMELINE_TITLES = {
 
 
 class WorkReadModel:
-    def __init__(self, db):
-        self.db = db
-        self.reader = TaskReadRepository(db)
-        self._nodes = {}
+    def __init__(self, db: Session) -> None:
+        self.db: Session = db
+        self.reader: TaskReadRepository = TaskReadRepository(db)
+        self._nodes: dict[str, DesktopNode] = {}
 
-    def project_many(self, tasks):
+    def project_many(self, tasks: list[AgentTask]) -> list[dict[str, Any]]:
         ids = [task.id for task in tasks]
         if not ids:
             return []
@@ -169,7 +177,15 @@ class WorkReadModel:
             for task in tasks
         ]
 
-    def project(self, task, actions, events, approvals, questions, high):
+    def project(
+        self,
+        task: AgentTask,
+        actions: list[AgentAction],
+        events: list[AgentTaskEvent],
+        approvals: list[ApprovalRequest],
+        questions: list[PendingQuestion],
+        high: int,
+    ) -> dict[str, Any]:
         plan = None
         warning = None
         raw = (task.task_state or {}).get("goal")
@@ -180,7 +196,7 @@ class WorkReadModel:
                 warning = "invalid_goal_plan"
         items = []
 
-        def add(kind, identity, text, **kwargs):
+        def add(kind: str, identity: str, text: str, **kwargs: Any) -> None:
             items.append(
                 asdict(WorkAttentionItem(f"{kind}:{identity}", kind, text, **kwargs))
             )
@@ -311,14 +327,15 @@ class WorkReadModel:
             if device_action
             else ("configured" if node_id else "unknown")
         )
-        node = self._nodes.get(node_id)
+        node = self._nodes.get(node_id) if node_id else None
         from aiive.desktop.connection_manager import desktop_connection_manager
 
         device = {
             "node_id": node_id,
             "source": source,
             "online": bool(
-                node
+                node_id
+                and node
                 and node.lease_expires_at
                 and utc(node.lease_expires_at) > datetime.now(UTC)
                 and desktop_connection_manager.is_connected(node_id)
@@ -349,7 +366,9 @@ class WorkReadModel:
             "updated_at": task.updated_at,
         }
 
-    def timeline(self, task_id, after_sequence=0, limit=50):
+    def timeline(
+        self, task_id: str, after_sequence: int = 0, limit: int = 50
+    ) -> dict[str, Any]:
         rows = (
             self.db.query(AgentTaskEvent)
             .filter(
@@ -389,7 +408,9 @@ class WorkReadModel:
         )
         return {"items": items, "next_sequence": cursor, "has_more": more}
 
-    def inbox(self, bucket="attention", limit=30, cursor=None):
+    def inbox(
+        self, bucket: str = "attention", limit: int = 30, cursor: str | None = None
+    ) -> dict[str, Any]:
         state = self.db.get(ConversationState, "default")
         thread = state.current_thread_id if state else None
         before = None
@@ -463,7 +484,7 @@ class WorkReadModel:
             p.pop("attention_items")
         return {"items": items, "next_cursor": token, "has_more": more}
 
-    def work_view(self, task):
+    def work_view(self, task: AgentTask) -> dict[str, Any]:
         projection = self.project_many([task])[0]
         goal = None
         if (task.task_state or {}).get("goal"):
@@ -509,7 +530,7 @@ class WorkReadModel:
                 if len(timeline) == 50:
                     break
 
-        def metadata(model, owner):
+        def metadata(model: type[Metadata], owner: str) -> list[dict[str, Any]]:
             rows = self.reader.filter_children(
                 owner, self.db.query(model).filter_by(task_id=task.id).all()
             )
