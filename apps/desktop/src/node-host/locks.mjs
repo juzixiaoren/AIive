@@ -20,7 +20,7 @@ function within(candidate, root) {
 export function assertTaskScope(request) {
   const scope = request.scope && typeof request.scope === "object" ? request.scope : {};
   const capabilities = new Set(Array.isArray(scope.allowed_capabilities) ? scope.allowed_capabilities : []);
-  if (!capabilities.has(request.capability_id)) throw new Error("scope_capability_denied");
+  if (scope.capability_policy !== "unified" && !capabilities.has(request.capability_id)) throw new Error("scope_capability_denied");
   const roots = (Array.isArray(scope.allowed_roots) ? scope.allowed_roots : []).map(normalized);
   for (const [name, value] of Object.entries(request.params || {})) {
     if (!PATH_FIELDS.has(name) || typeof value !== "string" || !value) continue;

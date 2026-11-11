@@ -32,6 +32,16 @@ def _approval_hash(action: AgentAction, expires_at: datetime, checkpoint_id: str
     return hashlib.sha256(canonical_json(material).encode("utf-8")).hexdigest()
 
 
+def _goal_allows_approval(task: AgentTask) -> bool:
+    if task.task_type != "long_term_goal":
+        return True
+    from aiive.task_runtime.goal_plan import GoalPlan
+    try:
+        return GoalPlan.model_validate((task.task_state or {}).get("goal")).status == "active"
+    except ValueError:
+        return False
+
+
 class TaskApprovalService:
     def __init__(self, db: Session):
         self.db: Session = db
@@ -93,6 +103,8 @@ class TaskApprovalService:
         action = self.db.get(AgentAction, approval.action_id)
         if task is None or action is None:
             raise ValueError("approval_owner_missing")
+        if not _goal_allows_approval(task):
+            raise ValueError("goal_not_active")
         if task.status != TaskStatus.BLOCKED_APPROVAL.value:
             raise ValueError(f"task_not_waiting_approval:{task.status}")
         if action.status != ActionStatus.AWAITING_APPROVAL.value:
@@ -194,6 +206,8 @@ class TaskApprovalService:
         for approval in approvals:
             task = self.repo.get_task(str(approval.task_id), for_update=True)
             action = self.db.get(AgentAction, approval.action_id)
+            if task is not None and not _goal_allows_approval(task):
+                continue
             if (
                 task is not None
                 and action is not None

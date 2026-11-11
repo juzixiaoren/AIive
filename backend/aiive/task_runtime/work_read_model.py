@@ -333,8 +333,6 @@ class WorkReadModel:
             created_at = kwargs.pop("created_at", task.updated_at)
             expires_at = kwargs.pop("expires_at", None)
             # These hints never grant permission; write services validate independently.
-            if kind == "goal_question" and not kwargs.get("question_id"):
-                allowed = ["send_input"]
             items.append(
                 asdict(
                     WorkAttentionItem(

@@ -129,7 +129,7 @@ def test_conversation_task_events_broadcast_only_after_commit(db_session, monkey
 
     committed = _task(db_session, _thread(db_session))
     db_session.commit()
-    assert [(thread_id, event_type) for thread_id, event_type, _payload in broadcasts] == [
+    assert [(thread_id, event_type) for thread_id, event_type, _payload in broadcasts if event_type == "task_event"] == [
         (outer_task.thread_id, "task_event"),
         (nested_task.thread_id, "task_event"),
         (committed.thread_id, "task_event"),

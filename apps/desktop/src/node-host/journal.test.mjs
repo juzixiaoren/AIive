@@ -107,6 +107,9 @@ test("resolved scope rejects a symlink escape", async () => {
   try {
     assertTaskScope(request);
     await assert.rejects(() => assertResolvedPathScope(request, fs), /scope_resolved_path_denied/);
+    const unified = { ...request, scope: { ...request.scope, capability_policy: "unified", allowed_capabilities: [] } };
+    assertTaskScope(unified);
+    await assert.rejects(() => assertResolvedPathScope(unified, fs), /scope_resolved_path_denied/);
   } finally {
     await fs.rm(directory, { recursive: true, force: true });
   }

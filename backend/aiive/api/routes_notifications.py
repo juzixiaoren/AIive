@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from aiive.api.ws_manager import ws_manager
 from aiive.db.base import get_db
-from aiive.db.models import Event
+from aiive.db.models import Event, Task
 from aiive.runtime.task_manager import TaskManager
 
 logger = logging.getLogger(__name__)
@@ -121,6 +121,9 @@ def list_notifications(
                 "title": p.get("title", p.get("content", "")),
                 "message": p.get("message", p.get("content", "")),
                 "event_type": e.event_type,
+                "category": p.get("category", ""),
+                "agent_task_id": p.get("agent_task_id") or (p.get("task_id") if p.get("goal_key") else None),
+                "reminder_task_id": None if p.get("goal_key") or p.get("agent_task_id") else p.get("reminder_task_id"),
                 "status": p.get("status", ""),
                 "thread_id": e.thread_id or "",
                 "created_at": e.created_at.isoformat() if e.created_at else "",
@@ -154,15 +157,19 @@ def delete_notification(notification_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="通知不存在")
 
     payload = dict(event.payload or {})
-    task_id = payload.get("task_id")
+    task_id = None
+    if not payload.get("goal_key") and not payload.get("agent_task_id"):
+        task_id = payload.get("reminder_task_id") or payload.get("task_id")
     payload["dismissed"] = True
     event.payload = payload
 
     task_cancelled = False
-    if task_id:
+    reminder = db.get(Task, str(task_id)) if task_id else None
+    if reminder is not None and reminder.task_type == "reminder":
         cancellation = TaskManager(db).cancel(str(task_id))
         task_cancelled = bool(cancellation.get("task_cancelled"))
 
+    from aiive.task_runtime.repository import queue_notification_refresh
+    queue_notification_refresh(db)
     db.commit()
-    broadcast_pending_count(db)
     return {"ok": True, "task_cancelled": task_cancelled}

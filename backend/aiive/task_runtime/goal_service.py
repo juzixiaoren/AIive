@@ -1180,6 +1180,8 @@ class GoalService:
         inherit_sources(self.db, "goal_plan", task.id, parents)
         task.task_state = self._state_with_plan(task, plan)
         self.db.flush()
+        from aiive.task_runtime.repository import queue_work_changed
+        queue_work_changed(self.db, task)
 
     @staticmethod
     def _state_with_plan(task: AgentTask, plan: GoalPlan) -> dict[str, Any]:
@@ -1232,16 +1234,11 @@ class GoalService:
                 "status": "pending",
                 "category": category,
                 "goal_key": key,
-                "task_id": task.id,
+                "agent_task_id": task.id,
             },
         )
         self.db.add(event)
         self.db.flush()
-        try:
-            from aiive.api.routes_notifications import count_pending_notifications
-            from aiive.api.ws_manager import ws_manager
-
-            ws_manager.broadcast_notification_sync(count_pending_notifications(self.db))
-        except Exception:
-            logger.warning("目标通知角标广播失败（不影响通知落库）", exc_info=True)
+        from aiive.task_runtime.repository import queue_notification_refresh
+        queue_notification_refresh(self.db)
         return event.id

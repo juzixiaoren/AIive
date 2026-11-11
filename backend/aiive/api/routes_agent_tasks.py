@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import PurePath
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
@@ -235,6 +235,69 @@ def get_agent_task_goal(task_id: str, db: Session = Depends(get_db)) -> dict[str
         return GoalService(db).detail(task)
     except ValueError as error:
         raise _goal_http_error(error) from error
+
+
+class AnswerGoalQuestionRequest(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+    step_id: str = Field(min_length=1, max_length=64)
+    question_id: str | None = Field(default=None, min_length=1, max_length=128)
+    answer: str = Field(min_length=1, max_length=2000)
+    intent: Literal["answer", "modify_plan", "reject"] = "answer"
+    plan_changes: dict[str, Any] | None = None
+
+
+@router.post("/{task_id}/goal/questions/answer")
+def answer_goal_step_question(task_id: str, request: AnswerGoalQuestionRequest,
+                              db: Session = Depends(get_db)) -> dict[str, Any]:
+    from aiive.task_runtime.goal_plan import GoalPlan
+    from aiive.task_runtime.goal_questions import load_question, resolve_question
+    from aiive.task_runtime.goal_service import GoalError, GoalService
+    from aiive.task_runtime.read_repository import record_input_source
+
+    try:
+        with db.begin_nested():
+            task = TaskReadRepository(db).get_task(task_id, for_update=True)
+            if task is None or task.task_type != "long_term_goal":
+                raise HTTPException(status_code=404, detail="goal_not_found")
+            try:
+                plan = GoalPlan.model_validate((task.task_state or {}).get("goal"))
+            except ValueError as error:
+                raise HTTPException(status_code=409, detail="goal_not_found") from error
+            step = plan.step(request.step_id)
+            if plan.status != "active" or step is None or step.status != "waiting_user":
+                raise HTTPException(status_code=409, detail="goal_or_step_not_waiting")
+            question = None
+            if request.question_id:
+                question = load_question(db, request.question_id)
+                if not question or not question.is_open or question.task_id != task.id or question.step_id != step.id:
+                    raise HTTPException(status_code=409, detail="question_not_open")
+            else:
+                # The legacy fallback is available only when this step has never
+                # had a recorded question; hidden and closed questions fail closed.
+                recorded = db.query(AgentTaskEvent.id).filter(
+                    AgentTaskEvent.task_id == task.id,
+                    AgentTaskEvent.event_type == "goal_question_asked",
+                    AgentTaskEvent.payload["step_id"].as_string() == step.id,
+                ).first()
+                if recorded or step.kind != "autonomous" or not step.note.strip():
+                    raise HTTPException(status_code=409, detail="question_id_required")
+            text = request.answer.strip()
+            if not text:
+                raise HTTPException(status_code=422, detail="answer_required")
+            user_event_id = record_input_source(db, task, {"answer": text, "intent": request.intent,
+                                                           "plan_changes": request.plan_changes})
+            outcome = GoalService(db).answer_step_question(
+                task.id, step.id, answer=text, question_id=request.question_id or "",
+                user_event_id=user_event_id, intent=request.intent, plan_changes=request.plan_changes,
+            )
+            if question and not resolve_question(db, question=question, user_event_id=user_event_id,
+                    answer=text, intent=request.intent, outcome=outcome):
+                raise HTTPException(status_code=409, detail="question_already_resolved")
+        db.commit()
+        return {"status": "applied", "task_id": task_id, "step_id": request.step_id,
+                "question_id": request.question_id, "user_event_id": user_event_id, **outcome}
+    except GoalError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 @router.post("/{task_id}/goal/confirm")

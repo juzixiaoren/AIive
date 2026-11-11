@@ -56,11 +56,55 @@ def _broadcast_task_events_after_commit(
         return
     try:
         from aiive.api.ws_manager import ws_manager
-
-        for thread_id, payload in pending:
-            ws_manager.broadcast_to_thread_sync(thread_id, "task_event", payload)
     except Exception:
-        logger.exception("commit 后广播 Task 事件失败")
+        logger.exception("commit 后初始化广播失败")
+        return
+
+    work: dict[tuple[str, str], dict[str, Any]] = {}
+    notification = False
+    for entry in pending:
+        if len(entry) == 2:
+            thread_id, payload = entry
+            try:
+                ws_manager.broadcast_to_thread_sync(thread_id, "task_event", payload)
+            except Exception:
+                logger.exception("commit 后广播 Task 事件失败")
+        else:
+            thread_id, event_type, payload = entry
+            if event_type == "notification_refresh":
+                notification = True
+            elif event_type == "work_changed":
+                key = (thread_id, payload["task_id"])
+                old = work.get(key)
+                if old is None:
+                    work[key] = dict(payload)
+                else:
+                    old["event_sequence"] = max(old["event_sequence"], payload["event_sequence"])
+                    old["task_version"] = max(old["task_version"], payload["task_version"])
+    for (thread_id, _), payload in work.items():
+        try:
+            ws_manager.broadcast_to_thread_sync(thread_id, "work_changed", payload)
+        except Exception:
+            logger.exception("commit 后广播工作变更失败")
+    if notification:
+        try:
+            from aiive.api.routes_notifications import count_pending_notifications
+            with Session(bind=session.get_bind()) as fresh:
+                ws_manager.broadcast_notification_sync(count_pending_notifications(fresh))
+        except Exception:
+            logger.exception("commit 后广播通知角标失败")
+
+
+def queue_work_changed(db: Session, task: AgentTask, sequence: int | None = None) -> None:
+    if sequence is None:
+        sequence = int(db.query(func.max(AgentTaskEvent.sequence)).filter_by(task_id=task.id).scalar() or 0)
+    db.info.setdefault(_TASK_BROADCASTS_KEY, []).append((task.thread_id, "work_changed", {
+        "task_id": task.id, "task_version": task.version, "event_sequence": sequence,
+    }))
+
+
+def queue_notification_refresh(db: Session) -> None:
+    db.info.setdefault(_TASK_BROADCASTS_KEY, []).append(("__global__", "notification_refresh", {}))
 
 
 @sa_event.listens_for(Session, "after_rollback")
@@ -229,6 +273,7 @@ class TaskRepository:
             task.completed_at = utcnow()
             task.wake_at = None
         self.db.flush()
+        queue_work_changed(self.db, task)
         if event_type:
             self.append_event(
                 task.id,
@@ -302,6 +347,8 @@ class TaskRepository:
         inherit_sources(self.db, "agent_task_event", event.id, parents)
         persist_sources(self.db, "agent_task_event", event.id, payload or {})
         self.db.flush()
+        if source_task is not None:
+            queue_work_changed(self.db, source_task, sequence)
         if visibility == "conversation" and TaskReadRepository(self.db).visible_child("agent_task_event", event):
             task = self.db.get(AgentTask, task_id)
             if task is not None:
