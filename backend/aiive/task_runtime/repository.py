@@ -95,7 +95,19 @@ def _broadcast_task_events_after_commit(
             logger.exception("commit 后广播通知角标失败")
 
 
-def queue_work_changed(db: Session, task: AgentTask, sequence: int | None = None) -> None:
+def queue_work_changed(
+    db: Session, task: AgentTask, sequence: int | None = None, *,
+    visible: bool | None = None,
+) -> None:
+    try:
+        if visible is None:
+            from aiive.task_runtime.read_repository import TaskReadRepository
+            visible = TaskReadRepository(db).task_visible(task)
+        if not visible:
+            return
+    except Exception:
+        logger.exception("工作变更可见性检查失败，跳过广播: task_id=%s", task.id)
+        return
     if sequence is None:
         sequence = int(db.query(func.max(AgentTaskEvent.sequence)).filter_by(task_id=task.id).scalar() or 0)
     db.info.setdefault(_TASK_BROADCASTS_KEY, []).append((task.thread_id, "work_changed", {
@@ -325,7 +337,8 @@ class TaskRepository:
         ).scalar() or 0) + 1
         from aiive.task_runtime.read_repository import TaskReadRepository
         source_task = self.db.get(AgentTask, task_id)
-        if source_task is not None and not TaskReadRepository(self.db).task_visible(source_task):
+        task_visible = source_task is not None and TaskReadRepository(self.db).task_visible(source_task)
+        if source_task is not None and not task_visible:
             payload = {"source_blocked": True}
         event = AgentTaskEvent(
             task_id=task_id,
@@ -348,7 +361,7 @@ class TaskRepository:
         persist_sources(self.db, "agent_task_event", event.id, payload or {})
         self.db.flush()
         if source_task is not None:
-            queue_work_changed(self.db, source_task, sequence)
+            queue_work_changed(self.db, source_task, sequence, visible=task_visible)
         if visibility == "conversation" and TaskReadRepository(self.db).visible_child("agent_task_event", event):
             task = self.db.get(AgentTask, task_id)
             if task is not None:

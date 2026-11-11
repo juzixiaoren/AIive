@@ -5,6 +5,7 @@ API路由模块：通知管理
 - 支持按类别筛选和删除通知
 """
 import logging
+from typing import cast
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, or_
@@ -112,10 +113,29 @@ def list_notifications(
         query = query.filter(_status_criterion(DONE_STATUSES))
     events = query.order_by(Event.created_at.desc()).limit(50).all()
 
+    # The legacy task_id was shared by multiple task types. Resolve all
+    # candidates together and only expose IDs proven to be reminder tasks.
+    candidate_ids = {
+        value
+        for event in events
+        for payload in [cast(object, event.payload or {})]
+        if isinstance(payload, dict) and not payload.get("goal_key") and not payload.get("agent_task_id")
+        for value in [payload.get("reminder_task_id") or payload.get("task_id")]
+        if isinstance(value, str) and value
+    }
+    reminder_ids = {
+        row[0] for row in db.query(Task.id).filter(
+            Task.id.in_(candidate_ids), Task.task_type == "reminder"
+        ).all()
+    } if candidate_ids else set()
+
     result = []
     for e in events:
         try:
             p = e.payload or {}
+            candidate = p.get("reminder_task_id") or p.get("task_id")
+            reminder_id = candidate if (not p.get("goal_key") and not p.get("agent_task_id")
+                                        and isinstance(candidate, str) and candidate in reminder_ids) else None
             result.append({
                 "id": e.id,
                 "title": p.get("title", p.get("content", "")),
@@ -123,7 +143,7 @@ def list_notifications(
                 "event_type": e.event_type,
                 "category": p.get("category", ""),
                 "agent_task_id": p.get("agent_task_id") or (p.get("task_id") if p.get("goal_key") else None),
-                "reminder_task_id": None if p.get("goal_key") or p.get("agent_task_id") else p.get("reminder_task_id"),
+                "reminder_task_id": reminder_id,
                 "status": p.get("status", ""),
                 "thread_id": e.thread_id or "",
                 "created_at": e.created_at.isoformat() if e.created_at else "",

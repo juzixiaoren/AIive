@@ -134,3 +134,95 @@ def test_real_forget_shield_hides_action_evidence_artifact(db_session):
     view = model.work_view(task)
     assert view["current_activity"] is None
     assert view["evidence"] == [] and view["artifacts"] == []
+
+
+def test_work_changed_respects_real_forget_shield(db_session, monkeypatch):
+    from aiive.api.ws_manager import ws_manager
+    from aiive.task_runtime.goal_service import GoalService
+    from aiive.task_runtime.read_repository import TaskReadRepository
+    from aiive.task_runtime.repository import TaskRepository
+    from tests.integration.backend.test_forget_goal_read_bypasses import forget, goal
+
+    sent = []
+    monkeypatch.setattr(ws_manager, "broadcast_to_thread_sync", lambda *args: sent.append(args))
+    thread, hidden, source = goal(db_session)
+    repo = TaskRepository(db_session)
+    visible = repo.create_task(thread_id=thread.id, goal="visible", enqueue=False)
+    db_session.commit()
+    assert any(e[1] == "work_changed" and e[2]["task_id"] == visible.id for e in sent)
+    plan = GoalService(db_session).load_plan(hidden)
+    assert plan is not None
+    forget(db_session, source)
+    assert not TaskReadRepository(db_session).task_visible(hidden)
+    assert TaskReadRepository(db_session).task_visible(visible)
+    sent.clear()
+    repo.append_event(hidden.id, "hidden_event", {}, visibility="internal")
+    repo.transition_task(hidden, "dispatching")
+    GoalService(db_session)._save(hidden, plan)
+    repo.append_event(visible.id, "visible_event", {}, visibility="internal")
+    db_session.commit()
+    ids = [payload["task_id"] for _, kind, payload in sent if kind == "work_changed"]
+    assert ids == [visible.id]
+
+
+def test_work_changed_fails_closed_on_visibility_errors(db_session, monkeypatch):
+    from aiive.api.ws_manager import ws_manager
+    from aiive.task_runtime.read_repository import TaskReadRepository
+    from aiive.task_runtime.repository import queue_work_changed
+    from tests.integration.backend.test_work_inbox_api import seed
+
+    model = seed(db_session, 1)
+    task = model.reader.get_task("00000")
+    sent = []
+    monkeypatch.setattr(ws_manager, "broadcast_to_thread_sync", lambda *args: sent.append(args))
+    def fail(*args):
+        raise RuntimeError("visibility unavailable")
+    monkeypatch.setattr(TaskReadRepository, "task_visible", fail)
+    queue_work_changed(db_session, task)
+    db_session.commit()
+    assert not [entry for entry in sent if entry[1] == "work_changed"]
+
+
+def test_reminder_id_mapping_is_batched_and_distinguishes_goal(db_session):
+    from sqlalchemy import event as sa_event
+    from aiive.db.models import Event, Task, Thread
+    from aiive.api.routes_notifications import list_notifications
+    from aiive.task_runtime.repository import TaskRepository
+
+    thread = Thread(id="notification-batch")
+    db_session.add(thread)
+    db_session.flush()
+    reminder = Task(id="reminder", task_type="reminder", title="reminder")
+    other = Task(id="other", task_type="routine", title="other")
+    db_session.add_all([reminder, other])
+    db_session.flush()
+    goal = TaskRepository(db_session).create_task(thread_id=thread.id, goal="goal", enqueue=False)
+    payloads = {
+        "old": {"task_id": reminder.id},
+        "new": {"reminder_task_id": reminder.id},
+        "routine": {"task_id": other.id},
+        "agent": {"task_id": goal.id},
+        "goal_old": {"goal_key": "goal:key", "task_id": goal.id},
+        "goal_new": {"agent_task_id": goal.id, "reminder_task_id": reminder.id},
+    }
+    for key, payload in payloads.items():
+        db_session.add(Event(id=key, thread_id=thread.id, trace_id=key,
+                             event_type="notification_created", payload={"status":"pending", **payload}))
+    db_session.flush()
+    queries = []
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if "FROM tasks" in statement:
+            queries.append(statement)
+    conn = db_session.connection()
+    sa_event.listen(conn, "before_cursor_execute", capture)
+    try:
+        rows = {item["id"]: item for item in list_notifications(db=db_session)}
+    finally:
+        sa_event.remove(conn, "before_cursor_execute", capture)
+    assert rows["old"]["reminder_task_id"] == reminder.id
+    assert rows["new"]["reminder_task_id"] == reminder.id
+    for key in ("routine", "agent", "goal_old", "goal_new"):
+        assert rows[key]["reminder_task_id"] is None
+    assert rows["goal_old"]["agent_task_id"] == goal.id
+    assert rows["goal_new"]["agent_task_id"] == goal.id
+    assert len(queries) == 1
