@@ -76,7 +76,9 @@ def test_real_forget_shield_hides_question(db_session):
     assert question_id in str(list_open_questions_for_tasks(db_session, [task.id]))
     forget(db_session, original)
     assert list_open_questions_for_tasks(db_session, [task.id])[task.id] == []
-    assert question_id not in str(WorkReadModel(db_session).work_view(task))
+    view = WorkReadModel(db_session).work_view(task)
+    assert question_id not in str(view)
+    assert "PRIVATE_QUESTION" not in str(view)
 
 
 def test_real_forget_shield_hides_action_evidence_artifact(db_session):

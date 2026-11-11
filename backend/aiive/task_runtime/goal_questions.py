@@ -470,7 +470,7 @@ def list_open_questions_for_tasks(db: Session, task_ids: list[str], *, now: date
     if not task_ids:
         return result
     moment = _as_utc(now) or utcnow()
-    rows = _asked_rows(db, task_ids=task_ids)
+    rows = _asked_rows(db, task_ids=task_ids, since=moment - timedelta(hours=QUESTION_TTL_HOURS))
     ids = [str((event.payload or {}).get("question_id") or "") for event, _ in rows]
     resolved, expired = _resolution_rows(db, ids)
     superseded = _superseded_ids(rows)

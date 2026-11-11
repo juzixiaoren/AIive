@@ -5,12 +5,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, TypeVar
 
-from sqlalchemy import func
+from sqlalchemy import func, tuple_
 from sqlalchemy.orm import Session
 
 from aiive.db.models import (
@@ -50,6 +51,12 @@ class WorkAttentionItem:
     id: str
     kind: str
     text: str
+    title: str
+    description: str
+    resource_id: str
+    created_at: datetime
+    expires_at: datetime | None
+    allowed_actions: list[str]
     question_id: str | None = None
     step_id: str | None = None
     approval_id: str | None = None
@@ -99,6 +106,11 @@ TIMELINE_TITLES = {
     "goal_paused": "目标已暂停",
     "goal_resumed": "目标已恢复",
     "goal_step_completed": "目标步骤已完成",
+    "goal_step_done": "目标步骤已完成",
+    "goal_step_failed": "目标步骤执行失败",
+    "goal_step_running": "目标步骤执行中",
+    "goal_step_started_by_user": "用户已启动步骤",
+    "goal_step_approved": "目标步骤已获批准",
     "task_blocked_node": "等待设备",
     "task_reconciling": "执行核对中",
     "task_cancelled": "任务已取消",
@@ -111,37 +123,126 @@ TIMELINE_TITLES = {
 }
 
 
+# Action events are emitted as action_{status} by transition_action().
+TIMELINE_TITLES.update(
+    {
+        f"action_{status}": title
+        for status, title in {
+            "planned": "操作已规划",
+            "validated": "操作已校验",
+            "awaiting_approval": "操作等待审批",
+            "ready": "操作已就绪",
+            "dispatched": "操作已派发",
+            "running": "操作执行中",
+            "succeeded": "操作执行成功",
+            "failed": "操作执行失败",
+            "cancelled": "操作已取消",
+            "unknown": "操作结果待核对",
+            "invalidated": "操作已失效",
+        }.items()
+    }
+)
+ATTENTION_ACTIONS = {
+    "action_approval": ("审批操作", ["approve", "deny"]),
+    "task_question": ("任务等待回答", ["send_input"]),
+    "goal_confirmation": ("确认目标计划", ["confirm", "modify", "reject"]),
+    "goal_question": ("目标等待回答", ["answer"]),
+    "goal_step_start": ("启动目标步骤", ["start_step"]),
+    "goal_step_approval": ("审批目标步骤", ["approve_step"]),
+    "goal_blocked": ("目标推进受阻", ["modify", "end"]),
+}
+HISTORY_SCAN_LIMIT = 512
+METADATA_LIMIT = 50
+
+
 class WorkReadModel:
     def __init__(self, db: Session) -> None:
         self.db: Session = db
         self.reader: TaskReadRepository = TaskReadRepository(db)
         self._nodes: dict[str, DesktopNode] = {}
+        self._question_steps: set[tuple[str, str]] = set()
 
     def project_many(self, tasks: list[AgentTask]) -> list[dict[str, Any]]:
         ids = [task.id for task in tasks]
         if not ids:
             return []
-        actions = self.reader.filter_children(
-            "agent_action",
-            self.db.query(AgentAction)
-            .filter(AgentAction.task_id.in_(ids))
-            .order_by(AgentAction.sequence.desc())
-            .all(),
+        # Rank in SQL before any Forget checks: historical size must not increase
+        # the number of ORM visibility queries. Each task/status has a fixed budget.
+        action_rank = (
+            self.db.query(
+                AgentAction.id.label("id"),
+                func.row_number()
+                .over(
+                    partition_by=(AgentAction.task_id, AgentAction.status),
+                    order_by=AgentAction.sequence.desc(),
+                )
+                .label("rank"),
+            )
+            .filter(
+                AgentAction.task_id.in_(ids),
+                AgentAction.status.in_(
+                    [
+                        "running",
+                        "dispatched",
+                        "awaiting_approval",
+                        "succeeded",
+                        "failed",
+                        "unknown",
+                    ]
+                ),
+            )
+            .subquery()
         )
-        events = self.reader.filter_children(
-            "agent_task_event",
-            self.db.query(AgentTaskEvent)
+        action_candidates = (
+            self.db.query(AgentAction)
+            .join(action_rank, action_rank.c.id == AgentAction.id)
+            .filter(action_rank.c.rank <= 33)
+            .order_by(AgentAction.sequence.desc())
+            .all()
+        )
+        action_counts: Counter[tuple[str, str]] = Counter()
+        retained_actions = []
+        budget_exceeded: set[str] = set()
+        for action in action_candidates:
+            key = (action.task_id, action.status)
+            action_counts[key] += 1
+            if action_counts[key] <= 32:
+                retained_actions.append(action)
+            else:
+                budget_exceeded.add(action.task_id)
+        actions = self.reader.filter_children("agent_action", retained_actions)
+
+        event_rank = (
+            self.db.query(
+                AgentTaskEvent.id.label("id"),
+                func.row_number()
+                .over(
+                    partition_by=AgentTaskEvent.task_id,
+                    order_by=AgentTaskEvent.sequence.desc(),
+                )
+                .label("rank"),
+            )
             .filter(
                 AgentTaskEvent.task_id.in_(ids),
                 AgentTaskEvent.event_type.in_(["task_blocked_user", "task_watching"]),
             )
+            .subquery()
+        )
+        events = self.reader.filter_children(
+            "agent_task_event",
+            self.db.query(AgentTaskEvent)
+            .join(event_rank, event_rank.c.id == AgentTaskEvent.id)
+            .filter(event_rank.c.rank <= 32)
             .order_by(AgentTaskEvent.sequence.desc())
             .all(),
         )
         approvals = (
             self.db.query(ApprovalRequest)
             .filter(
-                ApprovalRequest.task_id.in_(ids), ApprovalRequest.status == "pending"
+                ApprovalRequest.action_id.in_(
+                    [a.id for a in actions if a.status == "awaiting_approval"]
+                ),
+                ApprovalRequest.status == "pending",
             )
             .all()
         )
@@ -158,6 +259,30 @@ class WorkReadModel:
             if node_ids
             else {}
         )
+        # Existence only: an expired/resolved/forgotten question must not reappear
+        # through the legacy step.note fallback. Restrict to the current plan's steps.
+        pairs: list[tuple[str, str]] = []
+        for task in tasks:
+            try:
+                plan = GoalPlan.model_validate((task.task_state or {}).get("goal"))
+                pairs.extend((task.id, step.id) for step in plan.steps)
+            except ValueError:
+                continue
+        step_key = AgentTaskEvent.payload["step_id"].as_string()
+        self._question_steps = (
+            {
+                (row[0], row[1])
+                for row in self.db.query(AgentTaskEvent.task_id, step_key)
+                .filter(
+                    AgentTaskEvent.event_type == "goal_question_asked",
+                    tuple_(AgentTaskEvent.task_id, step_key).in_(pairs),
+                )
+                .distinct()
+                .all()
+            }
+            if pairs
+            else set()
+        )
         questions = list_open_questions_for_tasks(self.db, ids)
         high = dict(
             self.db.query(AgentTaskEvent.task_id, func.max(AgentTaskEvent.sequence))
@@ -165,7 +290,7 @@ class WorkReadModel:
             .group_by(AgentTaskEvent.task_id)
             .all()
         )
-        return [
+        projections = [
             self.project(
                 task,
                 [a for a in actions if a.task_id == task.id],
@@ -176,6 +301,12 @@ class WorkReadModel:
             )
             for task in tasks
         ]
+        for projection in projections:
+            if projection["task_id"] in budget_exceeded:
+                projection["data_warning"] = (
+                    projection["data_warning"] or "action_history_scan_limit"
+                )
+        return projections
 
     def project(
         self,
@@ -197,8 +328,28 @@ class WorkReadModel:
         items = []
 
         def add(kind: str, identity: str, text: str, **kwargs: Any) -> None:
+            title, allowed = ATTENTION_ACTIONS[kind]
+            resource_id = kwargs.pop("resource_id", identity)
+            created_at = kwargs.pop("created_at", task.updated_at)
+            expires_at = kwargs.pop("expires_at", None)
+            # These hints never grant permission; write services validate independently.
+            if kind == "goal_question" and not kwargs.get("question_id"):
+                allowed = ["send_input"]
             items.append(
-                asdict(WorkAttentionItem(f"{kind}:{identity}", kind, text, **kwargs))
+                asdict(
+                    WorkAttentionItem(
+                        id=f"{kind}:{identity}",
+                        kind=kind,
+                        text=text,
+                        title=title,
+                        description=text,
+                        resource_id=resource_id,
+                        created_at=created_at,
+                        expires_at=expires_at,
+                        allowed_actions=list(allowed),
+                        **kwargs,
+                    )
+                )
             )
 
         terminal = task.status in TERMINAL_TASK_STATES or (
@@ -236,6 +387,8 @@ class WorkReadModel:
                         "等待执行审批",
                         approval_id=approval.id,
                         preview=approval_preview(approval),
+                        created_at=approval.created_at,
+                        expires_at=approval.expires_at,
                     )
             for q in questions:
                 add(
@@ -244,6 +397,8 @@ class WorkReadModel:
                     q.question,
                     question_id=q.question_id,
                     step_id=q.step_id,
+                    created_at=q.created_at,
+                    expires_at=q.expires_at,
                 )
             if plan and plan.status == "active":
                 for step in plan.steps:
@@ -254,8 +409,9 @@ class WorkReadModel:
                         "approval_required": "goal_step_approval",
                         "autonomous": "goal_question",
                     }[step.kind]
-                    if kind == "goal_question" and any(
-                        q.step_id == step.id for q in questions
+                    if kind == "goal_question" and (
+                        any(q.step_id == step.id for q in questions)
+                        or (task.id, step.id) in self._question_steps
                     ):
                         continue
                     add(
@@ -263,6 +419,7 @@ class WorkReadModel:
                         f"{task.id}:{step.id}",
                         step.note or step.title,
                         step_id=step.id,
+                        resource_id=step.id,
                     )
             if (
                 not plan
@@ -272,13 +429,25 @@ class WorkReadModel:
             ):
                 question = (events[0].payload or {}).get("question")
                 if isinstance(question, str) and question.strip():
-                    add("task_question", events[0].id, question)
+                    add(
+                        "task_question",
+                        events[0].id,
+                        question,
+                        created_at=events[0].created_at,
+                    )
         if terminal:
             bucket, reason = "ended", "terminal"
         elif plan and plan.status == "paused":
             bucket, reason = "waiting", "goal_paused"
         elif items:
             bucket, reason = "attention", items[0]["kind"]
+        elif task.status in {
+            "blocked_node",
+            "reconciling",
+            "blocked_approval",
+            "blocked_user",
+        }:
+            bucket, reason = "waiting", task.status
         elif warning:
             bucket, reason = "waiting", "data_warning"
         elif plan:
@@ -333,6 +502,9 @@ class WorkReadModel:
         device = {
             "node_id": node_id,
             "source": source,
+            "relationship": source,
+            "name": node.name if node else None,
+            "platform": node.platform if node else None,
             "online": bool(
                 node_id
                 and node
@@ -366,6 +538,33 @@ class WorkReadModel:
             "updated_at": task.updated_at,
         }
 
+    def project_event(self, event: AgentTaskEvent) -> dict[str, Any] | None:
+        """Shared, fail-closed event projection; never copy arbitrary payload strings."""
+        if (
+            event.visibility == "internal"
+            or event.event_type not in TIMELINE_TITLES
+            or not self.reader.visible_child("agent_task_event", event)
+        ):
+            return None
+        title = TIMELINE_TITLES[event.event_type]
+        scope = (
+            "执行操作"
+            if event.event_type.startswith("action_")
+            else (
+                "目标步骤" if event.event_type.startswith("goal_step_") else "工作任务"
+            )
+        )
+        return {
+            "id": event.id,
+            "sequence": event.sequence,
+            "event_type": event.event_type,
+            "title": title,
+            "summary": f"{scope}状态更新：{title}。",
+            "created_at": event.created_at,
+            "action_id": event.action_id,
+            "run_id": event.run_id,
+        }
+
     def timeline(
         self, task_id: str, after_sequence: int = 0, limit: int = 50
     ) -> dict[str, Any]:
@@ -379,26 +578,9 @@ class WorkReadModel:
             .limit(limit)
             .all()
         )
-        items = []
-        for event in rows:
-            if (
-                event.visibility == "internal"
-                or event.event_type not in TIMELINE_TITLES
-                or not self.reader.visible_child("agent_task_event", event)
-            ):
-                continue
-            items.append(
-                {
-                    "id": event.id,
-                    "sequence": event.sequence,
-                    "event_type": event.event_type,
-                    "title": TIMELINE_TITLES[event.event_type],
-                    "summary": "",
-                    "created_at": event.created_at,
-                    "action_id": event.action_id,
-                    "run_id": event.run_id,
-                }
-            )
+        items = [
+            item for event in rows if (item := self.project_event(event)) is not None
+        ]
         cursor = rows[-1].sequence if rows else after_sequence
         more = (
             self.db.query(AgentTaskEvent.id)
@@ -493,11 +675,6 @@ class WorkReadModel:
                 goal = plan.model_dump(mode="json", exclude={"reminder"})
                 for step in goal["steps"]:
                     step.pop("last_result", None)
-                    step["evidence_refs"] = [
-                        ref
-                        for ref in step["evidence_refs"]
-                        if self.reader.get_evidence(task.id, ref)
-                    ]
                     if step.get("trigger"):
                         step["trigger"].pop("match", None)
             except ValueError:
@@ -506,61 +683,112 @@ class WorkReadModel:
             self.db.query(AgentTaskEvent)
             .filter_by(task_id=task.id)
             .order_by(AgentTaskEvent.sequence.desc())
-            .yield_per(128)
+            .limit(HISTORY_SCAN_LIMIT + 1)
+            .all()
         )
-        timeline = []
-        for e in visible_events:
-            if (
-                e.visibility != "internal"
-                and e.event_type in TIMELINE_TITLES
-                and self.reader.visible_child("agent_task_event", e)
-            ):
-                timeline.append(
-                    {
-                        "id": e.id,
-                        "sequence": e.sequence,
-                        "event_type": e.event_type,
-                        "title": TIMELINE_TITLES[e.event_type],
-                        "summary": "",
-                        "created_at": e.created_at,
-                        "action_id": e.action_id,
-                        "run_id": e.run_id,
-                    }
-                )
-                if len(timeline) == 50:
-                    break
+        projected_events = [
+            item
+            for e in visible_events[:HISTORY_SCAN_LIMIT]
+            if (item := self.project_event(e)) is not None
+        ]
+        timeline = projected_events[:50]
+        truncation: dict[str, bool] = {
+            "timeline": len(visible_events) > HISTORY_SCAN_LIMIT
+            or len(projected_events) > 50
+        }
 
         def metadata(model: type[Metadata], owner: str) -> list[dict[str, Any]]:
-            rows = self.reader.filter_children(
-                owner, self.db.query(model).filter_by(task_id=task.id).all()
+            candidates = (
+                self.db.query(model)
+                .filter_by(task_id=task.id)
+                .order_by(model.created_at.desc(), model.id.desc())
+                .limit(HISTORY_SCAN_LIMIT + 1)
+                .all()
+            )
+            visible = self.reader.filter_children(
+                owner, candidates[:HISTORY_SCAN_LIMIT]
+            )
+            truncation[owner] = (
+                len(candidates) > HISTORY_SCAN_LIMIT or len(visible) > METADATA_LIMIT
+            )
+            fields = (
+                "id",
+                "summary",
+                "mime_type",
+                "content_size",
+                "content_hash",
+                "created_at",
             )
             return [
                 {
                     key: getattr(row, key)
-                    for key in ("id", "mime_type", "content_size", "created_at")
+                    for key in fields
+                    + (
+                        ("name", "artifact_type")
+                        if isinstance(row, TaskArtifact)
+                        else ("kind",)
+                    )
                 }
-                for row in rows
+                for row in visible[:METADATA_LIMIT]
             ]
 
+        artifacts = metadata(TaskArtifact, "task_artifact")
+        evidence = metadata(TaskEvidence, "task_evidence")
+        if goal is not None:
+            visible_evidence_ids = {item["id"] for item in evidence}
+            valid_question_steps = {
+                item["step_id"]
+                for item in projection["attention_items"]
+                if item["question_id"]
+            }
+            for step in goal["steps"]:
+                if (task.id, step["id"]) in self._question_steps and step[
+                    "id"
+                ] not in valid_question_steps:
+                    step["note"] = ""
+                step["evidence_refs"] = [
+                    ref for ref in step["evidence_refs"] if ref in visible_evidence_ids
+                ]
+            goal["progress"] = projection["progress"]
+        task_info = {
+            k: projection[k]
+            for k in (
+                "task_id",
+                "title",
+                "task_type",
+                "task_status",
+                "created_at",
+                "updated_at",
+            )
+        }
+        report_summary = (task.report or {}).get("summary")
+        task_info.update(
+            {
+                "goal": task.goal[:2000],
+                "report": {
+                    "summary": report_summary[:2000]
+                    if isinstance(report_summary, str)
+                    else "执行结果已记录。"
+                }
+                if task.report
+                else None,
+                "last_error": "任务执行遇到错误，请查看执行状态与可见证据。"
+                if task.last_error
+                else None,
+            }
+        )
+
         return {
-            "task": {
-                k: projection[k]
-                for k in (
-                    "task_id",
-                    "title",
-                    "task_type",
-                    "task_status",
-                    "created_at",
-                    "updated_at",
-                )
-            },
+            "task": task_info,
             "bucket": projection["bucket"],
+            "data_warning": projection["data_warning"],
             "attention_items": projection["attention_items"],
             "goal": goal,
             "current_activity": projection["current_activity"],
             "target_device": projection["target_device"],
             "timeline": list(reversed(timeline)),
-            "artifacts": metadata(TaskArtifact, "task_artifact"),
-            "evidence": metadata(TaskEvidence, "task_evidence"),
+            "artifacts": artifacts,
+            "evidence": evidence,
+            "truncated": truncation,
             "last_sequence": projection["last_sequence"],
         }

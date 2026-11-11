@@ -96,7 +96,10 @@ def test_parallel_goal_attention():
 
 def test_task_question_vs_watcher():
     q = Obj(
-        id="event", event_type="task_blocked_user", payload={"question": "question"}
+        id="event",
+        event_type="task_blocked_user",
+        created_at=datetime.now(UTC),
+        payload={"question": "question"},
     )
     w = Obj(id="watch", event_type="task_watching", payload={})
     assert project("blocked_user", events=[q])["bucket"] == "attention"
@@ -147,6 +150,7 @@ def test_approval_requires_consistent_owners_and_expiry(monkeypatch):
     )
     approval = Obj(
         id="approval",
+        created_at=datetime.now(UTC),
         task_id="t",
         thread_id="thread",
         action_id="a",
@@ -183,3 +187,85 @@ def test_approval_requires_consistent_owners_and_expiry(monkeypatch):
         project("running", actions=[action], approvals=[approval])["attention_count"]
         == 0
     )
+
+
+@pytest.mark.parametrize(
+    "status", ["blocked_node", "reconciling", "blocked_approval", "blocked_user"]
+)
+@pytest.mark.parametrize("step_status", ["running", "ready"])
+def test_goal_task_blocking_precedes_ready_step(status, step_status):
+    p = project(
+        status,
+        goal={
+            "status": "active",
+            "steps": [{"id": "s", "title": "s", "status": step_status}],
+        },
+    )
+    assert p["bucket"] == "waiting"
+    assert p["bucket_reason"] == status
+
+
+@pytest.mark.parametrize(
+    "status", ["blocked_node", "reconciling", "blocked_approval", "blocked_user"]
+)
+def test_independent_attention_precedes_task_block(status):
+    p = project(
+        status,
+        goal={
+            "status": "active",
+            "steps": [
+                {"id": "r", "title": "r", "status": "running"},
+                {
+                    "id": "q",
+                    "title": "q",
+                    "kind": "interactive",
+                    "status": "waiting_user",
+                },
+            ],
+        },
+    )
+    assert p["bucket"] == "attention"
+    item = p["attention_items"][0]
+    assert item["title"] and item["description"] and item["resource_id"] == "q"
+    assert item["created_at"] and item["expires_at"] is None
+    assert item["allowed_actions"] == ["start_step"]
+
+
+@pytest.mark.parametrize(
+    "kind", ["goal_confirmation", "goal_blocked", "goal_question", "goal_step_approval"]
+)
+def test_attention_contract_for_goal_kinds(kind):
+    goal = {
+        "status": "proposed"
+        if kind == "goal_confirmation"
+        else "blocked"
+        if kind == "goal_blocked"
+        else "active",
+        "summary": "plan",
+        "blocked_reason": "review",
+        "steps": [
+            {
+                "id": "s",
+                "title": "step",
+                "note": "question",
+                "status": "waiting_user",
+                "kind": "approval_required"
+                if kind == "goal_step_approval"
+                else "autonomous",
+            }
+        ],
+    }
+    item = project(goal=goal)["attention_items"][0]
+    assert item["kind"] == kind
+    assert all(
+        key in item
+        for key in [
+            "title",
+            "description",
+            "resource_id",
+            "created_at",
+            "expires_at",
+            "allowed_actions",
+        ]
+    )
+    assert item["allowed_actions"]

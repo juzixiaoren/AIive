@@ -200,3 +200,218 @@ def test_reads_issue_no_business_writes(db_session):
         event.remove(connection, "before_cursor_execute", capture)
     assert statements and set(statements) <= {"SELECT"}
     assert not db_session.new and not db_session.dirty and not db_session.deleted
+
+
+def test_rich_view_and_shared_timeline(db_session):
+    from aiive.db.models import (
+        AgentAction,
+        AgentRun,
+        DesktopNode,
+        Event,
+        TaskArtifact,
+        TaskEvidence,
+    )
+    from aiive.forget.durable_sources import persist_sources
+    from aiive.task_runtime.goal_plan import GoalPlan
+
+    model = seed(db_session, 1)
+    task = db_session.get(AgentTask, "00000")
+    task.task_state = {
+        "goal": {
+            "status": "active",
+            "steps": [{"id": "s", "title": "s", "status": "done"}],
+        }
+    }
+    task.report = {"summary": "安全结果", "raw": "SECRET"}
+    task.last_error = "SECRET stacktrace"
+    db_session.add(
+        DesktopNode(id="node", name="开发电脑", platform="windows", arch="x64")
+    )
+    db_session.flush()
+    task.target_node_id = "node"
+    origin = Event(
+        id="origin",
+        thread_id="thread",
+        trace_id="test",
+        event_type="user_message",
+        payload={"text": "source"},
+    )
+    db_session.add(origin)
+    db_session.add(AgentRun(id="run", task_id=task.id, run_index=1))
+    db_session.flush()
+    # A report-bearing task requires durable source proof under the existing Forget policy.
+    persist_sources(db_session, "agent_task", task.id, {"source_event_id": "origin"})
+    db_session.add(
+        AgentAction(
+            id="action",
+            task_id=task.id,
+            run_id="run",
+            sequence=1,
+            capability_id="run_shell",
+            arguments_hash="h",
+            descriptor_hash="d",
+            idempotency_key="key",
+            status="succeeded",
+        )
+    )
+    db_session.add(
+        TaskArtifact(
+            id="artifact",
+            task_id=task.id,
+            name="result.txt",
+            artifact_type="file",
+            summary="文件成果",
+            object_bucket="SECRET",
+            object_key="SECRET",
+            content_hash="hash",
+        )
+    )
+    db_session.add(
+        TaskEvidence(
+            id="evidence",
+            task_id=task.id,
+            kind="tool_result",
+            summary="执行证明",
+            content_hash="hash",
+            inline_payload={"secret": "SECRET"},
+        )
+    )
+    db_session.flush()
+    persist_sources(
+        db_session, "task_artifact", "artifact", {"source_event_id": "origin"}
+    )
+    persist_sources(
+        db_session, "task_evidence", "evidence", {"source_event_id": "origin"}
+    )
+    for seq, kind in enumerate(
+        [
+            "goal_step_done",
+            "goal_step_failed",
+            "action_planned",
+            "action_dispatched",
+            "action_running",
+            "action_succeeded",
+            "action_failed",
+        ],
+        1,
+    ):
+        db_session.add(
+            AgentTaskEvent(
+                task_id=task.id,
+                sequence=seq,
+                event_type=kind,
+                action_id="action" if kind.startswith("action_") else None,
+                payload={"command": "SECRET", "summary": "SECRET"},
+            )
+        )
+    db_session.flush()
+    view = model.work_view(task)
+    assert (
+        view["goal"]["progress"]
+        == GoalPlan.model_validate(task.task_state["goal"]).progress()
+    )
+    assert view["target_device"]["name"] == "开发电脑"
+    assert view["target_device"]["platform"] == "windows"
+    assert view["target_device"]["relationship"] == "configured"
+    assert view["artifacts"][0]["name"] == "result.txt"
+    assert view["evidence"][0]["summary"] == "执行证明"
+    assert len(view["timeline"]) == 7 and all(e["summary"] for e in view["timeline"])
+    assert view["timeline"] == model.timeline(task.id)["items"]
+    assert "SECRET" not in str(view)
+
+
+def test_questions_ttl_applied_in_candidate_query(db_session, monkeypatch):
+    from datetime import timedelta
+
+    from aiive.task_runtime import goal_questions
+
+    seed(db_session, 1)
+    old = datetime.now(UTC) - timedelta(hours=73)
+    db_session.add(
+        AgentTaskEvent(
+            task_id="00000",
+            sequence=1,
+            event_type="goal_question_asked",
+            created_at=old,
+            payload={"question_id": "old"},
+        )
+    )
+    db_session.flush()
+    examined = []
+    original = goal_questions._to_question
+
+    def capture(*args, **kwargs):
+        examined.append(args[0].id)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(goal_questions, "_to_question", capture)
+    assert goal_questions.list_open_questions_for_tasks(db_session, ["00000"]) == {
+        "00000": []
+    }
+    assert examined == []
+
+
+def test_history_query_count_is_bounded(db_session):
+    from aiive.db.models import AgentAction, AgentRun
+    from sqlalchemy import event, insert
+
+    model = seed(db_session, 1)
+    db_session.add(AgentRun(id="run", task_id="00000", run_index=1))
+    db_session.flush()
+
+    def add_actions(start, stop):
+        db_session.execute(
+            insert(AgentAction),
+            [
+                {
+                    "id": f"a{i}",
+                    "task_id": "00000",
+                    "run_id": "run",
+                    "sequence": i,
+                    "capability_id": "run_shell",
+                    "arguments_hash": "h",
+                    "descriptor_hash": "d",
+                    "idempotency_key": f"key{i}",
+                    "status": "succeeded",
+                }
+                for i in range(start, stop)
+            ],
+        )
+        db_session.flush()
+
+    def count_reads():
+        statements = []
+
+        def capture(*args):
+            statements.append(args[2])
+
+        connection = db_session.connection()
+        event.listen(connection, "before_cursor_execute", capture)
+        try:
+            model.project_many([db_session.get(AgentTask, "00000")])
+        finally:
+            event.remove(connection, "before_cursor_execute", capture)
+        return len(statements)
+
+    add_actions(1, 101)
+    baseline = count_reads()
+    add_actions(101, 1001)
+    assert count_reads() <= baseline + 1
+
+
+def test_work_view_history_budgets(db_session):
+    model = seed(db_session, 1)
+    for seq in range(1, 601):
+        db_session.add(
+            AgentTaskEvent(
+                task_id="00000",
+                sequence=seq,
+                event_type="unknown",
+                visibility="internal",
+                payload={},
+            )
+        )
+    db_session.flush()
+    view = model.work_view(db_session.get(AgentTask, "00000"))
+    assert view["timeline"] == [] and view["truncated"]["timeline"]
+    assert view["last_sequence"] == 600
