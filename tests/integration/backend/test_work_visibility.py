@@ -128,11 +128,14 @@ def test_real_forget_shield_hides_action_evidence_artifact(db_session):
     model = WorkReadModel(db_session)
     view = model.work_view(task)
     assert view["current_activity"]["action_id"] == "action"
+    assert [a["id"] for a in view["actions"]] == ["action"]
+    assert "arguments" not in view["actions"][0]
     assert view["evidence"][0]["id"] == "evidence"
     assert view["artifacts"][0]["id"] == "artifact"
     forget(db_session, original)
     view = model.work_view(task)
     assert view["current_activity"] is None
+    assert view["actions"] == []
     assert view["evidence"] == [] and view["artifacts"] == []
 
 

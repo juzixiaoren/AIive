@@ -102,6 +102,16 @@ TIMELINE_TITLES = {
     "task_created": "任务已创建",
     "task_completed": "任务已结束",
     "goal_proposed": "目标待确认",
+    "goal_confirmed": "目标已确认",
+    "goal_modified": "目标计划已修改",
+    "goal_rejected": "目标已拒绝",
+    "goal_ended": "目标已结束",
+    "goal_completed": "目标已完成",
+    "goal_blocked": "目标受阻",
+    "goal_step_answered": "目标问题已回答",
+    "approval_granted": "操作已获批准",
+    "approval_denied": "操作审批已拒绝",
+    "approval_expired": "操作审批已过期",
     "goal_waiting": "目标等待中",
     "goal_paused": "目标已暂停",
     "goal_resumed": "目标已恢复",
@@ -146,7 +156,7 @@ ATTENTION_ACTIONS = {
     "action_approval": ("审批操作", ["approve", "deny"]),
     "task_question": ("任务等待回答", ["send_input"]),
     "goal_confirmation": ("确认目标计划", ["confirm", "modify", "reject"]),
-    "goal_question": ("目标等待回答", ["answer"]),
+    "goal_question": ("目标等待回答", ["answer", "modify_plan", "reject"]),
     "goal_step_start": ("启动目标步骤", ["start_step"]),
     "goal_step_approval": ("审批目标步骤", ["approve_step"]),
     "goal_blocked": ("目标推进受阻", ["modify", "end"]),
@@ -302,6 +312,13 @@ class WorkReadModel:
             for task in tasks
         ]
         for projection in projections:
+            projection["actions"] = [
+                {"id": a.id, "sequence": a.sequence, "capability_id": a.capability_id,
+                 "status": a.status, "risk_level": a.risk_level,
+                 "requires_approval": a.requires_approval, "created_at": a.created_at,
+                 "started_at": a.started_at, "completed_at": a.completed_at}
+                for a in actions if a.task_id == projection["task_id"]
+            ]
             if projection["task_id"] in budget_exceeded:
                 projection["data_warning"] = (
                     projection["data_warning"] or "action_history_scan_limit"
@@ -662,6 +679,7 @@ class WorkReadModel:
             ).decode()
         for p in items:
             p.pop("attention_items")
+            p.pop("actions")
         return {"items": items, "next_cursor": token, "has_more": more}
 
     def work_view(self, task: AgentTask) -> dict[str, Any]:
@@ -781,6 +799,7 @@ class WorkReadModel:
             "bucket": projection["bucket"],
             "data_warning": projection["data_warning"],
             "attention_items": projection["attention_items"],
+            "actions": projection["actions"],
             "goal": goal,
             "current_activity": projection["current_activity"],
             "target_device": projection["target_device"],

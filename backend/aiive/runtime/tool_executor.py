@@ -113,6 +113,18 @@ def build_action_cards(
                 },
                 trace_id=record.trace_id,
             ))
+        elif record.name == "delegate_task" and record.status == "completed" and record.result.get("ok"):
+            task_id = str(inner_raw.get("task_id") or "")
+            if task_id:
+                title = str(inner_raw.get("title") or "工作已创建")
+                cards.append(ActionCard(
+                    card_type="agent_task_created", title=title,
+                    summary=str(inner_raw.get("summary") or ""), status="completed",
+                    resource_refs={"task_id": task_id},
+                    payload_preview={"status": str(inner_raw.get("status") or "")},
+                    actions=[ActionCardAction(action="view_work", label="查看工作")],
+                    trace_id=record.trace_id,
+                ))
         elif record.name == "schedule_reminder" and record.status == "completed" and record.result.get("ok"):
             task_id = str(inner_raw.get("task_id", "") or "")
             cards.append(ActionCard(

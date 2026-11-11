@@ -156,6 +156,7 @@ def _delegate_goal(
         return {
             "task_id": task.id,
             "status": "proposed",
+            "title": task.title,
             "summary": "长期目标计划已生成，等待用户确认后开始执行；确认前不会启动任何执行。",
             "plan": summarize(plan),
         }

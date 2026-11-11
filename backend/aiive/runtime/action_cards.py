@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # 操作卡片类型：覆盖记忆、任务、通知、工具、审批、自进化等全部运行时卡片种类
 ActionCardType = Literal[
-    "memory_created", "memory_revised", "memory_superseded", "task_created",
+    "memory_created", "memory_revised", "memory_superseded", "task_created", "agent_task_created",
     "notification", "tool_result", "delete_decision", "knowledge_result",
     "forget_result", "maintenance_report", "mcp_candidates", "mcp_sandbox_result",
     "selfdev_plan", "selfdev_run", "approval_required", "rhythm_summary", "attention_state",
