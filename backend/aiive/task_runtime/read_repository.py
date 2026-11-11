@@ -281,3 +281,13 @@ class TaskReadRepository:
             query.order_by(AgentTask.updated_at.desc(), AgentTask.id).limit(4096).all()
         )
         return [task for task in rows if self.task_visible(task)][:limit]
+
+
+    def task_candidates(self, thread_id: str, before=None, limit: int = 128) -> list[AgentTask]:
+        from sqlalchemy import and_, or_
+        query = self.db.query(AgentTask).filter_by(thread_id=thread_id)
+        if before is not None:
+            stamp, task_id = before
+            query = query.filter(or_(AgentTask.updated_at < stamp,
+                and_(AgentTask.updated_at == stamp, AgentTask.id < task_id)))
+        return query.order_by(AgentTask.updated_at.desc(), AgentTask.id.desc()).limit(min(limit, 128)).all()

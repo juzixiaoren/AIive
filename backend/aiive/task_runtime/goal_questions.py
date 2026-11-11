@@ -154,10 +154,12 @@ def record_question(
 
 
 def _asked_rows(db: Session, *, task_id: str | None = None, thread_id: str | None = None,
-                since: datetime | None = None) -> list[tuple[AgentTaskEvent, AgentTask]]:
+                since: datetime | None = None, task_ids: list[str] | None = None) -> list[tuple[AgentTaskEvent, AgentTask]]:
     query = db.query(AgentTaskEvent, AgentTask).join(
         AgentTask, AgentTask.id == AgentTaskEvent.task_id,
     ).filter(AgentTaskEvent.event_type == QUESTION_ASKED_EVENT)
+    if task_ids is not None:
+        query = query.filter(AgentTaskEvent.task_id.in_(task_ids))
     if task_id:
         query = query.filter(AgentTaskEvent.task_id == task_id)
     if thread_id:
@@ -460,3 +462,28 @@ def render_questions_block(questions: list[PendingQuestion], *, limit_chars: int
     if len(text) > limit_chars:
         text = text[:limit_chars] + "…"
     return text
+
+
+def list_open_questions_for_tasks(db: Session, task_ids: list[str], *, now: datetime | None = None) -> dict[str, list[PendingQuestion]]:
+    """Batch inbox read; retains the chat reader's independent five-question budget."""
+    result = {key: [] for key in task_ids}
+    if not task_ids:
+        return result
+    moment = _as_utc(now) or utcnow()
+    rows = _asked_rows(db, task_ids=task_ids)
+    ids = [str((event.payload or {}).get("question_id") or "") for event, _ in rows]
+    resolved, expired = _resolution_rows(db, ids)
+    superseded = _superseded_ids(rows)
+    snapshots = {}
+    seen = set()
+    for event, task in reversed(rows):
+        if task.id not in snapshots:
+            snapshots[task.id] = _plan_snapshot(db, task)
+        status, steps = snapshots[task.id]
+        question = _to_question(event, task, resolved, expired, moment,
+            plan_status=status, step_statuses=steps, superseded=superseded)
+        key = (task.id, question.step_id)
+        if question.is_open and key not in seen:
+            result[task.id].append(question)
+            seen.add(key)
+    return result
