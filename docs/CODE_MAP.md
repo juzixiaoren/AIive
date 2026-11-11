@@ -1112,3 +1112,13 @@ V62.6.1 测试清理：根 `conftest.py::_cleanup_test_db` / `pytest_sessionfini
 - 完整调用链：TurnExecution._load_context → ContextAssembler（Forget 可见候选 / AUTO 全局候选上限 / 全量工具定义）→ ContextOverflowPacker → TokenCounter → final MemoryAccessTracker / ContextSnapshot → AgentGraph；finalize Event flush → 当前 Segment 统计 → pending_seal → Scheduler → EpochManager freeze → segment_sealing Outbox → Prompt gate → merge / Cover Check / fenced commit。
 - 数据访问上限保留：历史分页/Turn/Event/原始字节；Memory top_k/路由上限；Graph hops/batch/relations；近期摘要数；Core 3 Block；工具结果 Artifact 和 SINGLE_TOOL_RESULT_INLINE_LIMIT；显式 SEARCH/DEEP 独立预算。WorkingState 在收集时复用 safe_boundary_snapshot 的逐项来源可见性检查。
 - 测试导航：`tests/unit/backend/test_context_overflow.py`；`tests/integration/backend/test_context_v641.py`；`tests/integration/pg/test_pg_context_v641.py`；旧 ContextAssembler / Recall / ThreadState 测试已迁移到全局预算契约。结果见 current_phase V64.1。
+
+
+## V64.2 版本索引（2026-11-11）
+
+- `runtime/context_policy.py`：ContextCandidateDecision、POLICY_VERSION、rank_source、eviction_key；无 IO 的字典序规则。
+- `runtime/context_overflow.py`：ContextCandidates.prepare 固定来源排名、T0–T3、Graph 冲突原子组；remove_next 全局淘汰并生成元数据 selection_trace/eviction_order；pack 保留完整 render/recount Hard Gate。
+- `runtime/context_assembler.py`：可见候选收集后提供单项 TokenCounter 估计，最终候选重建 recall_pack/touch，ContextSnapshotData.selection_trace。
+- `runtime/agent_graph.py`：输入/输出 Snapshot 合并传递 trace；`runtime/turn_execution.py::_rotate_snapshot` 写现有 meta.selection_trace。
+- 测试：`test_context_policy.py`、`test_context_overflow.py`；集成 `test_context_v641.py` 的最终 touch / Forget / trace 断言、`test_context_assembler_input_snapshot.py` 的 JSON 持久化断言；PG `test_pg_context_v642.py`。
+- 具体策略和示例见 `docs/architecture/Phase_1.md` V64.2；真实验收结果见 `docs/reports/2026-11-11_V642_context_policy.md`。V64.1 固定来源淘汰顺序被此策略替代，其余预算/密封契约保持。

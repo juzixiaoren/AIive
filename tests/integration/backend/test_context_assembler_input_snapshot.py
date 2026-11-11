@@ -262,6 +262,7 @@ def test_rotate_snapshot_persists_context_items(db) -> None:
         reply="回复", trace_id="trace-1", user_message="消息",
         context_snapshot=ContextSnapshotData(
             stable_prefix_hash="abc123",
+            selection_trace={"policy_version": "v64.2.lexicographic.1", "candidates": [{"candidate_id": "history:old", "selected": False}]},
             items=[
                 ContextSnapshotItem("stable_prefix", "stable_prefix", "system", "trusted", "系统前缀"),
                 ContextSnapshotItem("user_message", "user_message", "user", "trusted", "消息"),
@@ -295,6 +296,7 @@ def test_rotate_snapshot_persists_context_items(db) -> None:
         "stable_prefix", "user_message", "agent_output", "tool_call", "tool_result",
     }
     assert snap.stable_prefix_hash == "abc123"
+    assert snap.meta["selection_trace"] == ag_result.context_snapshot.selection_trace
     assert snap.meta.get("full_contents", {}).get("stable_prefix") == "系统前缀契约全文"
     assert snap.meta.get("full_contents", {}).get("agent_output") == "完整回复"
     assert "参数" in snap.meta.get("full_contents", {}).get("tool_call:0", "")

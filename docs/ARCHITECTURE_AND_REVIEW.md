@@ -259,3 +259,10 @@ high/critical 风险工具送入审批；普通读写保持个人 Agent 的高�
 | P3 | E.1 前端 WebSocket 推送 | 待处理 | 体验 |
 
 > 本报告为静态审查结论。截至 2026-07-17，已完成 P0（B.1 Schema 双轨制、A.2 工具超时线程泄漏）、P1（A.1 / A.4 / A.5 / B.2）、P2（B.3 部分 / B.4 / C.1 / C.2 / C.3）各项修复，全部 187 个测试通过、服务可正常启动。剩余待处理：A.3（记忆信号成本核查）、B.3 剩余（`_execute_graph` 公开化）、C.4（`forget_memory` 迁移确认）、D.1（HMAC fail-fast，用户指定暂缓）、D.3（清空记忆审批核查）、E.1（前端 WebSocket 推送）。每项修复后运行 `python -m pytest tests/ -v` 回归。
+
+
+## V64.2 上下文价值策略（2026-11-11）
+
+ContextAssembler 的全局 Packing 已从固定来源淘汰改为确定性候选策略：T0–T3 保护等级 → 冻结的来源内部 rank_percentile → 同价值时优先释放更多估计 Token → source_type/candidate_id。Retrieval final_score 和 Graph score 仅用于各自来源内排名，不混合原始分数，不调用 LLM 评分。T3 永不淘汰；History 整 Turn 删除，单值冲突 Graph 按主体/谓词/Scope 原子保留或删除。每次删除仍 render 全量 Prompt 并执行 TokenCounter Hard Gate。Memory touch 只作用于最终注入集；Forget 隐藏内容在候选收集前过滤。
+
+ContextSnapshotData.selection_trace 经 AgentGraph 合并、TurnExecution._rotate_snapshot 写入既有 meta.selection_trace，包含版本、候选元数据与实际淘汰顺序；不复制被删除内容、不改变 full_contents 或 RetrievalCandidate.selected 的语义，无 DDL。完整策略、调用链及 JSON 示例见 `docs/architecture/Phase_1.md` V64.2；测试证据见 `docs/reports/2026-11-11_V642_context_policy.md`。

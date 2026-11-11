@@ -1,7 +1,7 @@
 # AIive Phase 1：有界上下文、Epoch 与 Segment
 
-> 版本：V64.1（2026-11-10，全局预算实现）
-> 状态：核心预算章节已按当前源码更新；其余保留原阶段设计记录，冲突处以 V64.1 规则为准
+> 版本：V64.2（2026-11-11，候选价值策略与全局 Packing）
+> 状态：核心预算章节已按当前源码更新；其余保留原阶段设计记录，冲突处以 V64.2 规则为准
 > 前置：Phase 0.5A（TurnRecord、turn_id、ContextBundle）已完成  
 > 前置：Phase 0.5B（Outbox claim/lease/fencing、MemoryIngestionRun）已完成
 
@@ -148,13 +148,27 @@ POST /api/chat
 
 ---
 
-## 5. 完整请求整体计数与来源感知溢出（V64.1）
+## V64.2：候选价值策略与全局 Packing（2026-11-11）
 
-一次收集可见候选后构建完整 messages + tools，并调用真实 TokenCounter。超限时按顺序逐项移除，每次重新渲染并重新计数：最旧完整历史 Turn → 统一 RetrievalHit 中 final_score 最低的 Memory/历史摘要 → score 较低、hop 较远的完整 Graph 关系 → 较旧完整 SegmentSummary → WorkingState Artifact 引用及低优先级 open_loop → 按原角色优先级反向移除完整 Core Block（优先保留 human_identity）。Stable Contract、安全约束、当前消息、目标、关键约束、P0/P1 循环、待审批、未确认副作用及运行中工具状态保留；interrupted_unknown 工具事实整组保护。保留工具调用与结果成对。必要内容仍超限则 ContextBudgetExceededError，不调用模型；不做字符比例截断或即时 LLM 压缩。
+调用链：`TurnExecutionService._load_context()` → `ContextAssembler.assemble()` → 各来源原有 Forget/Scope 可见性检查 → `ContextCandidates.prepare()` → `context_policy.rank_source()` → `ContextOverflowPacker.pack()` → 完整 `render()` / `TokenCounter.count_messages()` → 超限时 `remove_next()` / `eviction_key()` → 重复计数直到 Hard Gate 通过；不可删除候选耗尽则原 `ContextBudgetExceededError`。之后只用最终 Retrieval Memory 重建 recall_pack、执行 AccessTracker.touch，再构造 Snapshot。`AgentGraph._assemble_agent_result()` 合并输入/输出快照时传递 selection_trace，`TurnExecutionService._rotate_snapshot()` 写入现有 `ContextSnapshot.meta.selection_trace`。无新表、字段或迁移，无 LLM 评分调用。
 
-候选保持完整 Turn、RetrievalHit（score/source_id）、GraphRelationView、独立摘要、结构化 WorkingState 与 Core Block。可见性过滤先于收集。`MemoryAccessTracker.touch` 与 snapshot.injected_memory_ids 只依据最终保留的 Memory，失败或被淘汰候选不 touch。PartitionReport 按真实计数记录各来源使用量、裁剪原因，分区 hard_limit 为 None，仅 total 保留全局上限。
+保护等级为整数 T0–T3：T0 是 Artifact 引用、P3 loop、低优先级 Core；T1 是普通 History/Retrieval/Graph/Summary 与 P2 loop；含 open_loops、active_constraints、unresolved_failures、important_tool_results 的 Summary 升 T2；human_identity Core 也为 T2，在 Core 中最后删除。T3 包括 Stable Contract、当前消息、完整 protected Turn，以及 WorkingState 的 current_objective、P0/P1、active_constraints、pending_approvals、verified_tool_states、uncommitted_side_effects、running_tool_state；interrupted_unknown 沿用现有 ThreadState 的 protected 整组工具事实。只删除完整候选，不切割历史工具调用/结果。
 
----
+来源内最佳 rank=1。Retrieval 按 final_score 降序，再 source_type/source_id；Graph 按 score、confidence 降序、hop 升序、relation_id；History 按已有时间序列反向；Summary 按 created_at 新到旧；WorkingState 按保护等级和稳定字段/下标；Core 按既有角色优先级。`rank_percentile=(N-rank)/(N-1)`，单项为 1，排名对最初可见集合冻结。它只表达来源内相对位置，不表示跨来源绝对价值相等，也不混算原始 score。
+
+仅完整 Prompt 超限时按 `(tier 升序, percentile 升序, estimated_tokens 降序, source_type, candidate_id)` 选择。候选 token 估计由现有 TokenCounter 对单个候选渲染计数；不可得为 null，决胜时按 0 处理。估计值包含独立渲染开销，不能代替删除后的完整 Prompt 真实计数。single 且 conflicted 的 Graph 按 subject_entity_id/predicate/scope_type/scope_id 分组，组继承最高保护等级和最高 percentile，token 估计相加；选中整组时每个成员同时删除并单独记录原因，不造成半份冲突证据。
+
+例如 History old/new 的 percentile 为 0/1，Retrieval low/high 的 final_score 为 10/100、percentile 为 0/1，而 Graph 单条的 score 为 0.01、percentile 为 1。即使 Graph 原始分数更低，也不会因此优先被删；先删除 T0，随后在 T1 的 old/low 中按估计释放量和稳定键决胜，再 render/recount。无超限则全部保留，包括 T0。
+
+selection_trace 包含 `policy_version=v64.2.lexicographic.1`、`candidates` 与实际 `eviction_order`。候选字段为 candidate_id、source_type（来源族，如 retrieval）、source_id（真实源 ID）、source_version、retention_tier、native_score、source_rank、rank_percentile、estimated_tokens、selected、exclusion_reason。Retrieval 的真实来源类型另由 candidate_id 中的 memory_record/segment_summary/epoch_checkpoint 标识，避免同 ID 不同源碰撞。被删除候选只保存元数据，绝不复制内容；Forget 隐藏项在收集前过滤，既不入候选也不入 trace。WorkingState 的 version/epoch_id 不是 Prompt 内容，不能伪装成入选项。full_contents 保持现有分区实际内容与后续输出语义；RetrievalCandidate.selected 继续仅表示检索阶段入选。
+
+Snapshot 示例（为展示省略其他候选）：
+
+```json
+{"selection_trace":{"policy_version":"v64.2.lexicographic.1","candidates":[{"candidate_id":"retrieval:memory_record:low","source_type":"retrieval","source_id":"low","source_version":"1","retention_tier":1,"native_score":0.1,"source_rank":2,"rank_percentile":0.0,"estimated_tokens":350,"selected":false,"exclusion_reason":"context_budget_exceeded"}],"eviction_order":["retrieval:memory_record:low"]}}
+```
+
+Attention、Questions、EpochCheckpoint、SealingBridge、Tool Definitions 继续固定装配；全局预算、Hard Gate、安全余量、Sealing、Compaction、检索及 Graph 查询上限、MemoryWrite/Forget/副作用语义均不改。验收证据见 [V64.2 验收报告](../reports/2026-11-11_V642_context_policy.md)。
 
 ## 6. 有界历史读取算法（v3：keyset pagination）
 

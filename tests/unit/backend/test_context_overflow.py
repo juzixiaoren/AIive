@@ -2,10 +2,14 @@
 import json
 from types import SimpleNamespace as NS
 
-from aiive.runtime.context_overflow import ContextCandidates, ContextOverflowPacker, HistoryTurn
-from aiive.runtime.context_assembler import ContextAssembler
-from aiive.runtime.token_models import TokenCount
 from aiive.retrieval.retrieval_types import RetrievalHit
+from aiive.runtime.context_assembler import ContextAssembler
+from aiive.runtime.context_overflow import (
+    ContextCandidates,
+    ContextOverflowPacker,
+    HistoryTurn,
+)
+from aiive.runtime.token_models import TokenCount
 
 
 class CharacterCounter:
@@ -38,19 +42,14 @@ def test_overflow_order_and_protected_state():
         working_state=protected,
         core=[NS(block_name="core.human_identity"), NS(block_name="core.agent_persona")],
     )
-    assert c.remove_next() and c.history[-1].turn_id == "new"
-    assert c.remove_next() and len(c.history) == 1
-    assert c.remove_next() and c.retrieval[0].source_id == "high"
-    assert c.remove_next() and not c.retrieval
-    assert c.remove_next() and c.graph[0].source_memory_id == "near"
-    assert c.remove_next() and not c.graph
-    assert c.remove_next() and c.summaries[0].id == "new-summary"
-    assert c.remove_next() and not c.summaries
-    assert c.remove_next() and not protected["artifact_refs"]
-    assert c.remove_next() and protected["open_loops"] == [{"priority": "P0", "description": "critical"}]
-    assert c.remove_next() and c.core[0].block_name == "core.human_identity"
-    assert c.remove_next() and not c.core
-    assert not c.remove_next()
+    while c.remove_next():
+        pass
+    assert [t.turn_id for t in c.history] == ["uncertain"]
+    assert not any((c.retrieval, c.graph, c.summaries, c.core))
+    assert not protected["artifact_refs"]
+    assert protected["open_loops"] == [{"priority": "P0", "description": "critical"}]
+    trace = c.selection_trace["candidates"]
+    assert next(d for d in trace if d["candidate_id"] == "history:uncertain")["selected"]
     assert protected["current_objective"] == "goal"
     assert all(protected[key] for key in ("pending_approvals", "active_constraints", "uncommitted_side_effects", "running_tool_state"))
 

@@ -1141,3 +1141,15 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - 文档：CODE_MAP、current_phase、architecture/Phase_1、architecture/Phase_3、AIive_核心架构与实现深度分析。
 
 剩余风险：候选完整装配可能增加 CPU 计数/Prompt 大小；现有数据库访问上限保留，所以“完整”指访问边界内的完整结构单元。极小窗口下必要契约/工具/执行事实本身仍可能装不下，此时明确拒绝，不截断或额外调用摘要模型。历史超过资源读取上限时统计仍受有界读取约束；32 Turn 和 15 分钟 Idle 兜底保留。未做真实外部 LLM/Embedding 调用或百万窗口性能压测，配置窗口需与实际模型能力匹配。
+
+
+## V64.2 上下文价值策略与可解释全局 Packing（2026-11-11）
+
+- 基线：main `c30a23e`。状态：实现、文档与离线验收完成；真实 PostgreSQL 验收受 Docker Desktop 启动故障阻塞，未宣称通过。
+- 新增 `runtime/context_policy.py` 的 ContextCandidateDecision、policy_version、来源内百分位与字典序规则；ContextCandidates 固定原始排名，以 T0–T3 / percentile / 估计 Token / 稳定键全局淘汰。Retrieval final_score、Graph score 各自独立排序；History 整 Turn、Summary 重要字段提升 T2、Core 保留 human_identity 最后删除。T3 与既有副作用/工具保护不变。
+- single/conflicted Graph 按主体/谓词/Scope 原子分组，组按最强成员等级/百分位与合计 Token 参与决策。每删一组重新 render 完整 Prompt，真实 TokenCounter Hard Gate；无额外 LLM 评分。
+- ContextSnapshotData.selection_trace 经 AgentGraph._assemble_agent_result 传递，由 _rotate_snapshot 写现有 meta.selection_trace，包含版本、全部可见候选的元数据、最终 selected/exclusion_reason 和 eviction_order。不复制被淘汰内容，不改变 full_contents、RetrievalCandidate.selected、Memory touch 或 Forget 可见性语义；无表/迁移变更。WorkingState version/epoch_id 不作为 Prompt 候选。
+- 相关定向：**35 passed，11.07s**；全量：**1835 passed / 131 skipped / 0 failed，307.02s**（5280 条既有警告）；全量使用 `SHELL_BASH_PATH=E:/git/Git/bin/bash.exe`、`PYTHONUTF8=1`。首轮未设置 Bash 路径的 17 项环境失败在完整复跑中全部消失。
+- Ruff 全 backend `--select F,E9` 通过；策略/Overflow/相关单测与 PG 文件默认规则通过；basedpyright **0 errors / 0 warnings / 0 notes**；git diff --check 通过。
+- PostgreSQL：显式 `AIIVE_PG_TESTS=1 pytest tests/integration/pg -q`，**126 skipped，45.69s**。Docker Desktop 的 Inference manager 在 `AppData/Local/Docker/run/dockerInference` socket 初始化时崩溃，未提供隔离测试 URL；未取得真实 PG 通过证据。新增 `test_pg_context_v642.py` 两项验证最终 touch/trace 和既有 Snapshot JSON 持久化，待环境恢复执行。不改 Docker 配置、不接触生产库。
+- 全量/定向/PG 进程清理报告均为 cleaned、exists_after_cleanup=false。日志：`build/v642-full-final.log`、`v642-final-focused.log`、`v642-pg-final.log`、`v642-ruff-final.log`、`v642-types-final.log`；详细调用链、淘汰例、Snapshot JSON 和覆盖表见 `docs/reports/2026-11-11_V642_context_policy.md`；架构说明已同步 CODE_MAP、Phase_1、ARCHITECTURE_AND_REVIEW。

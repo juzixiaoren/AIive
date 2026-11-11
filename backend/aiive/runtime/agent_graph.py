@@ -1369,6 +1369,7 @@ class AgentGraph:
         result_snapshot = ContextSnapshotData(
             items=[*context_snapshot.items, *post_items],
             full_contents={**context_snapshot.full_contents, **post_full},
+            selection_trace=context_snapshot.selection_trace,
             stable_prefix_hash=context_snapshot.stable_prefix_hash,
             injected_memory_ids=list(context_snapshot.injected_memory_ids),
         )

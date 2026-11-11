@@ -1362,6 +1362,7 @@ class TurnExecutionService:
             meta={
                 "total_tool_calls": len(ag_result.tool_records),
                 "full_contents": dict(snapshot.full_contents),
+                "selection_trace": dict(snapshot.selection_trace),
                 "injected_memory_ids": list(snapshot.injected_memory_ids),
             },
             epoch_id=turn.epoch_id,

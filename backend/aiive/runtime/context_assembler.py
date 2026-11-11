@@ -106,6 +106,7 @@ class ContextSnapshotData:
 
     items: list[ContextSnapshotItem] = field(default_factory=list)
     full_contents: dict[str, str] = field(default_factory=dict)
+    selection_trace: dict[str, Any] = field(default_factory=dict)
     stable_prefix_hash: str = ""
     injected_memory_ids: list[dict[str, str]] = field(default_factory=list)
 
@@ -250,6 +251,7 @@ class ContextAssembler:
             ))),
             working_state=ws_service.context_fields(db, thread_id),
             core=list(agent_ctx.get("core_blocks") or []),
+            fixed={"stable_contract": agent_ctx["stable_contract_text"], "current_message": message},
         )
         epoch_cp_text = self._load_epoch_checkpoint(db, thread_id)
         bridge_text = self._load_sealing_bridge(db, thread_id)
@@ -286,9 +288,27 @@ class ContextAssembler:
                 current_message=message,
             ), tools_schema
 
+        def estimate(source: str, item: Any) -> int | None:
+            if source == "history":
+                msgs = self._dicts_to_chat_messages(item.events)
+            else:
+                if source == "retrieval":
+                    text = (self._render_memory_hits([item]) if item.source_type == "memory_record"
+                            else self._render_history_summary([item]))
+                elif source == "graph":
+                    text, _ = render_expansion_block([item])
+                elif source == "segment_summary":
+                    text = self._render_segment_summary_block(item)
+                elif source == "core":
+                    text = render_core_memory([item])
+                else:
+                    text = item if isinstance(item, str) else _json.dumps(item, ensure_ascii=False, default=str)
+                msgs = [{"role": "system", "content": text}]
+            return self._token_counter.count_messages(self._profile.full_name, msgs).estimated_tokens
+
         messages, tools_schema, total_count, safe = ContextOverflowPacker().pack(
             candidates, render, self._token_counter, self._profile.full_name,
-            self._budget.model_context_window, requested_output,
+            self._budget.model_context_window, requested_output, estimate=estimate,
         )
         report_args = dict(
             stable_contract_text=agent_ctx["stable_contract_text"], core_memory_text=rendered["core"],
@@ -318,6 +338,7 @@ class ContextAssembler:
         snapshot = self._build_input_snapshot(
             **snapshot_args, user_message=message, _source=_source,
         )
+        snapshot.selection_trace = candidates.selection_trace
         snapshot.stable_prefix_hash = _hash_text(rendered["system"])
         snapshot.injected_memory_ids = self._collect_injected_memory_ids(pack)
         agent_ctx["open_questions"] = open_questions

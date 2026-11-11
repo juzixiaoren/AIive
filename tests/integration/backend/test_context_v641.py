@@ -88,6 +88,13 @@ def test_only_final_injected_memories_are_touched(db, monkeypatch):
     assembled = asm.assemble(db, "CURRENT", thread)
     assert [item["memory_id"] for item in assembled.snapshot.injected_memory_ids] == ["high"]
     touched.assert_called_once_with(["high"])
+    trace = assembled.snapshot.selection_trace
+    assert trace["policy_version"] == "v64.2.lexicographic.1"
+    ds = {d["source_id"]: d for d in trace["candidates"]}
+    assert ds["high"]["selected"] and not ds["low"]["selected"]
+    assert ds["low"]["exclusion_reason"] == "context_budget_exceeded"
+    assert "lowlow" not in json.dumps(trace)
+    assert "lowlow" not in json.dumps(assembled.snapshot.full_contents)
     assert "lowlow" not in json.dumps(assembled.messages)
     assert "highhigh" in json.dumps(assembled.messages)
     assert all(report.hard_limit is None for report in assembled.partition_reports if report.name != "total")
@@ -171,6 +178,14 @@ def test_auto_uses_global_candidate_budget_and_complete_visible_sources(db, monk
     db.flush()
     hidden = engine.retrieve(RetrievalRequest(query="project.budget", scope_context=ScopeContext(), token_budget=28000))
     assert not hidden.hits
+    asm = ContextAssembler(CharacterCounter(), ContextBudget(5000, 100))
+    monkeypatch.setattr(asm, "_load_agent_context", lambda *a, **k: {
+        "stable_contract_text": "contract", "core_blocks": [], "recall_pack": None, "retrieval_hits": hidden.hits,
+    })
+    monkeypatch.setattr(asm, "_build_tools_schema_list", lambda *a: [])
+    assembled = asm.assemble(db, "project.budget", new_thread(db))
+    assert record.id not in json.dumps(assembled.snapshot.selection_trace)
+    assert long_text not in json.dumps(assembled.messages)
 
 
 def test_core_blocks_are_complete_and_not_limited_to_600_tokens(db):
