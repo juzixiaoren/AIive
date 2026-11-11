@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from aiive.db.models import CapabilityVersion, MCPInstallRecord
 from aiive.mcp.bootstrap import activate_capability_tools
 from aiive.mcp.builtin import BUILTIN_MCP_ID, ensure_builtin_mcp_capability
+from aiive.mcp import runtime_client
 from aiive.mcp.runtime_client import build_launch_spec
 from aiive.tools.registry import ToolRegistry
 
@@ -37,7 +38,7 @@ def test_builtin_mcp_uses_only_fixed_python_entry_and_registers_tools(db_session
 
     registry = ToolRegistry()
     result = activate_capability_tools(registry, capability)
-    assert result["ok"] is True
+    assert result["ok"] is True, result
     assert set(result["registered"]) == {
         "mcp_aiive_essentials_extract_document_text",
         "mcp_aiive_essentials_web_search",
@@ -59,8 +60,7 @@ def test_generic_search_tool_is_not_mistaken_for_network_access() -> None:
                 "launch": {
                     "runner": "python_builtin",
                     "entry_py": str(
-                        Path(__file__).resolve().parents[3]
-                        / "backend/aiive/mcp/builtin_server.py"
+                        Path(runtime_client.__file__).with_name("builtin_server.py")
                     ),
                     "args": [],
                     "env_keys": [],
@@ -75,7 +75,7 @@ def test_generic_search_tool_is_not_mistaken_for_network_access() -> None:
             },
         ),
     )
-    assert result["ok"] is True
+    assert result["ok"] is True, result
     memory_search = registry.get("mcp_memory_search_nodes")
     assert memory_search is not None
     assert memory_search.safety.uses_network is False

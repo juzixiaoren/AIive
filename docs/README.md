@@ -58,6 +58,7 @@ docs/
 5. `reports/memory_triple_recall_fix_report.md` — 三重召回修复报告
 
 ### 审计与报告
+- [2026-11-11 代码审查与解耦重构](audit/2026-11-11_decoupling_review.md) — 本轮修改、验证与后续优化建议
 - `audit/` — 各阶段审计报告
 - `reports/` — 进度报告与修复总结
 

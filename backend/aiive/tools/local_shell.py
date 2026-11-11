@@ -59,6 +59,11 @@ def resolve_bash() -> str | None:
     if discovered:
         candidates.append(discovered)
     if sys.platform.startswith("win"):
+        # Git 可安装在非系统盘；PATH 通常只包含 Git/cmd，不包含 Bash。
+        git = shutil.which("git")
+        if git:
+            git_root = Path(git).parent.parent
+            candidates.extend(str(git_root / relative) for relative in ("bin/bash.exe", "usr/bin/bash.exe"))
         candidates.extend(_WINDOWS_BASH_CANDIDATES)
     seen: set[str] = set()
     for candidate in candidates:
@@ -67,7 +72,7 @@ def resolve_bash() -> str | None:
         if key in seen:
             continue
         seen.add(key)
-        if path.is_file():
+        if path.is_file() and bash_version(str(path)):
             return str(path)
     return None
 
@@ -79,14 +84,19 @@ def bash_version(path: str) -> str:
         return cached
     try:
         proc = subprocess.run(
-            [path, "--version"], capture_output=True, text=True, timeout=10, check=False,
+            [path, "--version"], capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=3, check=False, stdin=subprocess.DEVNULL,
+            env=isolated_env(),
         )
-        lines = (proc.stdout or proc.stderr or "").splitlines()
+        if proc.returncode != 0:
+            return ""
+        lines = (proc.stdout or "").splitlines()
         version = lines[0].strip() if lines else ""
     except (OSError, subprocess.SubprocessError):
         return ""
-    if version:
-        _VERSION_CACHE[path] = version
+    if "gnu bash" not in version.casefold():
+        return ""
+    _VERSION_CACHE[path] = version
     return version
 
 

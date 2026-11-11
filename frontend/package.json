@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "test:chat": "node --test scripts/test-chat-model.mjs",
     "build": "tsc && vite build",
     "preview": "vite preview"
   },

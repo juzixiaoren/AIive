@@ -408,8 +408,8 @@ class ContextAssembler:
         identity = read_model.resolve_identity()
         policies = read_model.resolve_policies()
 
-        from aiive.runtime.agent_graph import AgentGraph as AG
-        stable_contract = AG._build_stable_contract(identity.to_dict(), policies)  # pyright: ignore[reportPrivateUsage]
+        from aiive.runtime.system_contract import build_stable_contract
+        stable_contract = build_stable_contract(identity.to_dict(), policies)
         core_blocks = load_core_memory(db, config)
 
         scope = build_scope_context(db, None, thread_id)

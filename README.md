@@ -411,3 +411,9 @@ python -m pytest tests/unit -k "tool"
 外部 HTTP 边界（LLM / Embedding）的验证方式为**可控响应替换**：
 保留真实的请求构造、响应解析与错误归一化代码，仅替换传输层，
 见 `tests/unit/backend/test_llm_client.py` 与 `test_embedding_provider.py`。
+
+### 代码维护记录
+
+2026-11-11：提取共享系统契约与工具事件协议，解除上下文组装器对 AgentGraph 的反向依赖；拆分聊天消息存储、状态映射与工具卡片。详见 [审查与验证报告](docs/audit/2026-11-11_decoupling_review.md)，模块定位见 [代码图谱](docs/CODE_MAP.md)。前端聊天数据回归可运行 `cd frontend && npm run test:chat`。
+
+同日测试修复：Bash 候选增加有效性探测及非默认 Git 安装发现；测试数据库独占创建，避免复用同 PID 残留库。验证结果见上述审查报告的跟进记录。

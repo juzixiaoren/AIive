@@ -821,7 +821,7 @@ def enqueue_knowledge_maintenance_job(
 
 def knowledge_needs_maintenance(db: Session) -> bool:
     """轻量 EXISTS 判定：DB 侧是否存在需要清理的知识库不一致。"""
-    from aiive.knowledge.ingestor import ACTIVE_STATUSES, INACTIVE_STATUSES
+    from aiive.knowledge.document_status import ACTIVE_STATUSES, INACTIVE_STATUSES
 
     # 失效文档（superseded / deleted）残留分块：会被错误召回
     if db.query(Chunk.id).join(

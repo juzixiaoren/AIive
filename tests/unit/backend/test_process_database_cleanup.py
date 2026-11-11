@@ -68,12 +68,39 @@ def _run_child(script, directory):
             raise
         result = subprocess.CompletedProcess(args, process.returncode, stdout=output)
     # Windows venv launchers may spawn a different interpreter PID.
-    match = re.search(r"aiive_test_(\d+)\.db", result.stdout)
+    match = re.search(r"(aiive_test_(\d+)_[A-Za-z0-9_-]+\.db)", result.stdout)
     assert match is not None, result.stdout
-    pid = match.group(1)
-    database = Path(tempfile.gettempdir()) / f"aiive_test_{pid}.db"
+    pid = match.group(2)
+    database = Path(tempfile.gettempdir()) / match.group(1)
     path = ROOT / "tests/artifacts/validation/cleanup" / pid / "cleanup_report.json"
     assert path.exists(), result.stdout
     report = json.loads(path.read_text(encoding="utf-8"))
     assert Path(report["process_database"]) == database
     return result, report
+
+
+
+def test_process_database_does_not_reuse_stale_pid_file(tmp_path):
+    script = r"""
+import os
+import tempfile
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+tempfile.gettempdir = lambda: str(root)
+stale = root / f"aiive_test_{os.getpid()}.db"
+stale.write_bytes(b"old schema from an interrupted run")
+import conftest
+fresh = Path(conftest._TEST_DB)
+assert fresh != stale
+assert fresh.exists() and fresh.stat().st_size == 0
+assert stale.read_bytes() == b"old schema from an interrupted run"
+conftest._cleanup_test_db()
+assert not fresh.exists()
+assert stale.exists()
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)], cwd=ROOT,
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

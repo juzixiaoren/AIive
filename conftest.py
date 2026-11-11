@@ -50,9 +50,11 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
-# 文件名带 PID：同一进程内多会话共享同一物理库（backend/tests 的既有设计），
-# 而并行的多个 pytest 进程互不干扰（固定文件名会导致并发 drop_all 假失败）。
-_TEST_DB = os.path.join(tempfile.gettempdir(), f"aiive_test_{os.getpid()}.db")
+# 独占创建并加随机后缀：PID 会复用，不能重用异常退出进程留下的旧 schema。
+# 同进程多会话仍共享同一文件，不同测试进程互不干扰。
+_test_db_fd, _TEST_DB = tempfile.mkstemp(prefix=f"aiive_test_{os.getpid()}_", suffix=".db")
+os.close(_test_db_fd)
+_TEST_DB_NAME = Path(_TEST_DB).name
 _CLEANUP_SUCCEEDED = False
 
 
@@ -65,7 +67,7 @@ def _cleanup_test_db() -> None:
     target = Path(_TEST_DB)
     resolved = target.resolve()
     if (resolved.parent != Path(tempfile.gettempdir()).resolve()
-            or resolved.name != f"aiive_test_{os.getpid()}.db"):
+            or resolved.name != _TEST_DB_NAME):
         raise RuntimeError(f"Unexpected process test database: {target}")
     # 不导入尚未加载的应用模块，防止纯收集/配置失败时初始化其他数据库。
     database = sys.modules.get("aiive.db.base")

@@ -31,16 +31,15 @@ from aiive.storage.object_store import (
     put_content_addressed,
 )
 
+from aiive.knowledge.document_status import (
+    ACTIVE_STATUSES as ACTIVE_STATUSES,
+    RECOVERABLE_STATUSES as RECOVERABLE_STATUSES,
+    INACTIVE_STATUSES as INACTIVE_STATUSES,
+    DOCUMENT_STATUSES as DOCUMENT_STATUSES,
+)
+
 logger = logging.getLogger(__name__)
 KNOWLEDGE_BUCKET = "knowledge-documents"
-
-# 活跃状态：分块参与检索。
-ACTIVE_STATUSES: frozenset[str] = frozenset({"indexed", "index_failed", "source_unavailable"})
-# 可自动修复的活跃状态：原文对象应当仍可读取，允许重建分块
-RECOVERABLE_STATUSES: frozenset[str] = frozenset({"indexed", "index_failed"})
-# 失效状态：分块必须为空，且绝不参与检索。
-INACTIVE_STATUSES: frozenset[str] = frozenset({"superseded", "deleted"})
-DOCUMENT_STATUSES: frozenset[str] = ACTIVE_STATUSES | INACTIVE_STATUSES
 
 
 def _now() -> datetime:

@@ -7,7 +7,7 @@
 > - **路径约定**：均相对项目根（`AIive/`），如 `backend/aiive/main.py`、`frontend/src/pages/ChatPage.tsx`
 > - **行号**：基于建图时的代码版本，仅供快速跳转，以实际代码为准
 > - **维护规则**：见文末第 9 节。**新增/删除/移动文件、改 key 符号行号、改表结构后必须同步更新本文档**
-> - 建图日期：2026-10-21；最近更新：2026-11-10（V64.1 全局上下文预算、来源感知溢出与历史 Token 密封；V63.2 WebSocket 重连历史恢复与聊天错误契约统一；V49 单用户认证、V50 目标步骤触发规则 + 主动消息、V51 工具结果回填预算、V52 后台回填统一 + Bash 流式日志、V53 通用计划事件源扩展、V54 安全边界事件注入 + 协作式主动消息、V55 决策标记全流式防泄漏、V56 收件箱溢出与决策串行化、V57 前后台 LLM 串行化 + 目标决策幂等、V58 主动提问与用户回复关联闭环、V59 待回答问题的状态一致性、V60 记忆检索 pg_search BM25、V61 知识库结构感知递归切分、V61.3 Chunker 兜底拆分正确性）
+> - 建图日期：2026-10-21；最近更新：2026-11-11（V64.1 全局上下文预算、来源感知溢出与历史 Token 密封；V63.2 WebSocket 重连历史恢复与聊天错误契约统一；V49 单用户认证、V50 目标步骤触发规则 + 主动消息、V51 工具结果回填预算、V52 后台回填统一 + Bash 流式日志、V53 通用计划事件源扩展、V54 安全边界事件注入 + 协作式主动消息、V55 决策标记全流式防泄漏、V56 收件箱溢出与决策串行化、V57 前后台 LLM 串行化 + 目标决策幂等、V58 主动提问与用户回复关联闭环、V59 待回答问题的状态一致性、V60 记忆检索 pg_search BM25、V61 知识库结构感知递归切分、V61.3 Chunker 兜底拆分正确性）
 
 ---
 
@@ -81,6 +81,20 @@
 | 注意力 / 节奏 | `runtime/attention_manager.py`、`runtime/rhythm_manager.py` | `api/routes_attention.py` | `test_attention*.py` |
 | WorkingState（运行中状态） | `runtime/working_state.py` | `runtime/agent_graph.py::_tools_node` | `test_working_state*.py` |
 | 主动消息写入时间线（V50） | `runtime/proactive_message.py`（`ProactiveMessageService.post`） | `runtime/epoch_manager.py::peek_next_turn_sequence`、`worker/handlers_goal_triggers.py`、`api/ws_manager.py` | `test_goal_triggers.py` |
+
+### 2.1.1 共享运行时与聊天展示边界（2026-11-11）
+
+| 职责 | 唯一实现 | 消费方 / 兼容入口 |
+|---|---|---|
+| 稳定系统契约与身份文本 | `runtime/system_contract.py::build_stable_contract / build_runtime_identity` | `context_assembler` 直接调用；`AgentGraph._build_stable_contract`、`agent_graph._build_runtime_identity` 保留兼容入口 |
+| 工具流事件配对与回执解析 | `runtime/tool_events.py::StreamToolCallMatcher / ToolExecutionReceipt / parse_tool_execution_receipt` | `agent_graph` 消费并兼容旧导入路径；该模块不加载数据库或 LangGraph |
+| 知识文档生命周期状态 | `knowledge/document_status.py` | 摄取、向量、维护、调度与 API 共用；`ingestor` 保留旧常量导出 |
+| 聊天消息类型 | `frontend/src/features/chat/types.ts` | 页面、存储与工具卡片共享类型 |
+| 缓存恢复与限额 | `frontend/src/features/chat/messageStorage.ts::loadStored / saveStored` | `ChatPage` 负责触发持久化；存储模块负责最多 200 条、工具结果 4000 字符的缓存限制 |
+| 工具状态映射、消息 ID | `frontend/src/features/chat/messageModel.ts` | 未识别状态仍为 `execution_unknown` |
+| 工具结果卡片 | `frontend/src/features/chat/ToolCallCard.tsx` | 独立管理展开状态；页面负责数据与事件编排 |
+
+新增回归入口：`tests/unit/backend/test_runtime_module_boundaries.py`（新进程验证共享模块不导入执行栈）；`cd frontend && npm run test:chat`（状态、缓存兼容、限额与不可用存储）。
 
 ### 2.2 工具与策略
 
@@ -500,7 +514,7 @@
 | 页面 | Tab | 后端 API |
 |---|---|---|
 | `pages/LoginPage.tsx` | —（`/aiive/login`，匿名可访问） | `GET api/auth/status`、`POST api/auth/register`、`POST api/auth/login` |
-| `pages/ChatPage.tsx`（57KB，最复杂） | chat | `POST api/chat/stream`(SSE)、`GET api/threads/{id}/messages`、`POST api/thread/reset`、`POST api/approval/respond`、`POST api/chat/system`；WS `/ws/{threadId}`。含：SSE 打字机、流式纯文本/完成 Markdown 切换、断流恢复、工具状态机 `normalizeToolCallStatus`、`ToolCallCard` L133、reminder/approval/maintenance_report 卡片、`inFlightRef` 防重发、AbortController、离底未读计数、历史分页 |
+| `pages/ChatPage.tsx`（57KB，最复杂） | chat | `POST api/chat/stream`(SSE)、`GET api/threads/{id}/messages`、`POST api/thread/reset`、`POST api/approval/respond`、`POST api/chat/system`；WS `/ws/{threadId}`。含：SSE 打字机、流式纯文本/完成 Markdown 切换、断流恢复、工具状态机与工具卡片委托 `features/chat/messageModel.ts`、`features/chat/ToolCallCard.tsx`、reminder/approval/maintenance_report 卡片、`inFlightRef` 防重发、AbortController、离底未读计数、历史分页 |
 | `pages/TaskCenterPage.tsx` | tasks | agent-tasks 全套 + `evidence/{id}`、`artifacts/{id}`；长期目标面板：`GET {id}/goal` + `POST {id}/goal/{confirm,reject,pause,resume,end}`、`steps/{sid}/{start,approve}`；WS `api/agent-tasks/ws/{id}`；4s 轮询兜底 |
 | `pages/MemoriesPage.tsx` | memories | `api/memories` + `/{id}/{sleep|archive|forget}` |
 | `pages/CapabilitiesPage.tsx` | capabilities | `api/mcp/capabilities`、`api/tools`、`api/skills`、`api/capabilities?state=candidate`、`api/knowledge` |
@@ -1122,3 +1136,12 @@ V62.6.1 测试清理：根 `conftest.py::_cleanup_test_db` / `pytest_sessionfini
 - `runtime/agent_graph.py`：输入/输出 Snapshot 合并传递 trace；`runtime/turn_execution.py::_rotate_snapshot` 写现有 meta.selection_trace。
 - 测试：`test_context_policy.py`、`test_context_overflow.py`；集成 `test_context_v641.py` 的最终 touch / Forget / trace 断言、`test_context_assembler_input_snapshot.py` 的 JSON 持久化断言；PG `test_pg_context_v642.py`。
 - 具体策略和示例见 `docs/architecture/Phase_1.md` V64.2；真实验收结果见 `docs/reports/2026-11-11_V642_context_policy.md`。V64.1 固定来源淘汰顺序被此策略替代，其余预算/密封契约保持。
+
+
+### 2026-11-11 测试问题修复补充
+
+- `tools/local_shell.py::resolve_bash`：按显式配置、PATH、PATH 中 Git 的安装目录、常见 Git Bash 路径查找；每个存在的候选必须通过 `bash_version` 探测。失效 Windows/WSL 启动器不阻断后续候选。
+- `bash_version`：3 秒超时、隔离环境、要求成功退出且 stdout 首行为 GNU Bash；只缓存成功结果。找不到有效 Bash 时继续返回 `shell_unavailable`，不替换执行后端。
+- 根 `conftest.py`：`tempfile.mkstemp` 独占创建 `aiive_test_<pid>_<随机后缀>.db`，防止 PID 复用时继承旧库 schema；清理仍校验临时目录与本进程拥有的精确文件名。
+- `test_local_shell.py` 新增无效候选回退、非默认 Git 安装、非 Bash/失败输出、超时后恢复、成功缓存和探测环境隔离回归；`test_process_database_cleanup.py` 新增 PID 残留库回归。
+- `test_builtin_mcp.py` 用实际加载的 `runtime_client` 定位固定 Python 服务入口，保持生产可信路径校验不变；激活失败断言显示结构化错误。

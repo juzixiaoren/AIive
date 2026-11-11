@@ -25,7 +25,7 @@ from aiive.knowledge.embedding_input import (
     build_embedding_input,
     embedding_input_hash,
 )
-from aiive.knowledge.ingestor import INACTIVE_STATUSES
+from aiive.knowledge.document_status import INACTIVE_STATUSES
 from aiive.memory.embedding_provider import OpenAIEmbeddingProvider
 from aiive.memory.vector_projection import (
     build_embedding_provider,

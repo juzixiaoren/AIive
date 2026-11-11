@@ -15,7 +15,8 @@ from typing import Any
 from aiive.db.base import get_db
 from aiive.db.models import Chunk, Document
 from aiive.knowledge.access import allowed_knowledge_roots, resolve_knowledge_path
-from aiive.knowledge.ingestor import INACTIVE_STATUSES, KnowledgeIngestor, search_chunks
+from aiive.knowledge.document_status import INACTIVE_STATUSES
+from aiive.knowledge.ingestor import KnowledgeIngestor, search_chunks
 from aiive.knowledge.maintenance import (
     DEFAULT_BATCH_LIMIT,
     apply_report,

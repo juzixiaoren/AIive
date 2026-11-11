@@ -317,3 +317,65 @@ def test_msys_style_path_inside_root_is_not_a_violation() -> None:
     assert shell_path_violations(
         "ls /c/Windows", cwd="C:/Windows", allowed_roots=["C:/Windows"],
     ) == ([], False)
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_resolver_skips_unusable_launcher_and_finds_custom_git(tmp_path, monkeypatch, configured):
+    launcher = tmp_path / "system32" / "bash.exe"
+    git = tmp_path / "custom-git" / "cmd" / "git.exe"
+    bash = git.parent.parent / "bin" / "bash.exe"
+    for path in (launcher, git, bash):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    monkeypatch.setattr(settings, "shell_bash_path", str(launcher) if configured else "")
+    monkeypatch.setattr(local_shell.sys, "platform", "win32")
+    monkeypatch.setattr(local_shell.shutil, "which", lambda name: {"bash": str(launcher), "git": str(git)}.get(name))
+    monkeypatch.setattr(local_shell, "_WINDOWS_BASH_CANDIDATES", ())
+    probed = []
+
+    def probe(path):
+        probed.append(path)
+        return "GNU bash, version 5" if path == str(bash) else ""
+
+    monkeypatch.setattr(local_shell, "bash_version", probe)
+    assert resolve_bash() == str(bash)
+    assert probed == [str(launcher), str(bash)]
+
+
+@pytest.mark.parametrize(("returncode", "stdout", "stderr"), [
+    (1, "GNU bash, version 5", "failed"),
+    (0, "unrelated program", ""),
+    (0, "", "GNU bash, version 5"),
+])
+def test_bash_probe_rejects_failed_or_non_bash_programs(monkeypatch, returncode, stdout, stderr):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(local_shell, "_VERSION_CACHE", {})
+    monkeypatch.setattr(local_shell.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
+        returncode=returncode, stdout=stdout, stderr=stderr,
+    ))
+    assert bash_version("fake-launcher") == ""
+    assert not local_shell._VERSION_CACHE
+
+
+def test_bash_probe_timeout_is_retryable_and_success_is_cached(monkeypatch):
+    from types import SimpleNamespace
+    import subprocess
+
+    monkeypatch.setattr(local_shell, "_VERSION_CACHE", {})
+    calls = []
+
+    def run(*args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired("bash", kwargs["timeout"])
+        return SimpleNamespace(returncode=0, stdout="GNU bash, version 5\n", stderr="")
+
+    monkeypatch.setattr(local_shell.subprocess, "run", run)
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-probe")
+    assert bash_version("fake-bash") == ""
+    assert bash_version("fake-bash") == "GNU bash, version 5"
+    assert bash_version("fake-bash") == "GNU bash, version 5"
+    assert len(calls) == 2
+    assert calls[0]["timeout"] == 3
+    assert "OPENAI_API_KEY" not in calls[0]["env"]

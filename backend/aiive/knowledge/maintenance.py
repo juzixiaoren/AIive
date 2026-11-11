@@ -27,13 +27,8 @@ from sqlalchemy.orm import Session
 from aiive.db.models import Chunk, Document, OutboxJob
 from aiive.knowledge.blocks import PARSER_VERSION
 from aiive.knowledge.chunker import CHUNKER_VERSION
-from aiive.knowledge.ingestor import (
-    DOCUMENT_STATUSES,
-    INACTIVE_STATUSES,
-    KNOWLEDGE_BUCKET,
-    RECOVERABLE_STATUSES,
-    KnowledgeIngestor,
-)
+from aiive.knowledge.document_status import DOCUMENT_STATUSES, INACTIVE_STATUSES, RECOVERABLE_STATUSES
+from aiive.knowledge.ingestor import KNOWLEDGE_BUCKET, KnowledgeIngestor
 from aiive.storage import object_store
 from aiive.storage.object_store import ObjectRef
 
