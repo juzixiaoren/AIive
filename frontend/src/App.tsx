@@ -105,6 +105,7 @@ function AppGate() {
 function AuthenticatedApp({ username }: { username: string }) {
   const { logout } = useAuth();
   const [tab, setTab] = useState<Tab>(tabFromLocation);
+  const [workTaskId, setWorkTaskId] = useState("");
   const [inspectTraceId, setInspectTraceId] = useState<string | undefined>();
 
   useEffect(() => {
@@ -124,7 +125,7 @@ function AuthenticatedApp({ username }: { username: string }) {
   // 导航标签配置
   const tabs: { key: Tab; label: string }[] = [
     { key: "chat", label: "对话" },
-    { key: "tasks", label: "任务" },
+    { key: "tasks", label: "工作" },
     { key: "memories", label: "记忆" },
     { key: "capabilities", label: "能力" },
     { key: "events", label: "事件" },
@@ -220,14 +221,16 @@ function AuthenticatedApp({ username }: { username: string }) {
       {/* 主内容区域，按当前选中的 Tab 渲染对应页面 */}
       <main className={`flex-1 min-h-0 w-full mx-auto px-4 flex flex-col ${tab === "tasks" ? "max-w-6xl" : "max-w-3xl"}`}>
         <Suspense fallback={<div className="py-8 text-sm text-muted">加载中…</div>}>
-          {tab === "chat" ? (
-            // 对话页占满可用高度，输入框贴底
-            <ChatPage onInspectTrace={(tid) => { setInspectTraceId(tid); navigate("context"); }} />
-          ) : (
-            // 其余页面在独立可滚动容器中展示
+          <div className={tab === "chat" ? "flex flex-col flex-1 min-h-0" : "hidden"}>
+            {/* 对话持续挂载，切换工作中心不结束 SSE。 */}
+            <ChatPage active={tab === "chat"} onOpenWork={id => { setWorkTaskId(id); navigate("tasks"); }} onInspectTrace={(tid) => { setInspectTraceId(tid); navigate("context"); }} />
+          </div>
+        </Suspense>
+        <Suspense fallback={<div className="py-8 text-sm text-muted">加载中…</div>}>
+          {tab !== "chat" && (
             <div className="flex-1 min-h-0 overflow-y-auto py-6">
               {tab === "memories" && <MemoriesPage />}
-              {tab === "tasks" && <TaskCenterPage />}
+              {tab === "tasks" && <TaskCenterPage key={workTaskId} taskId={workTaskId} />}
               {tab === "capabilities" && <CapabilitiesPage />}
               {tab === "events" && <EventTimeline traceId={inspectTraceId} />}
               {tab === "context" && <ContextInspector traceId={inspectTraceId} />}

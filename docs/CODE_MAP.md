@@ -7,7 +7,7 @@
 > - **路径约定**：均相对项目根（`AIive/`），如 `backend/aiive/main.py`、`frontend/src/pages/ChatPage.tsx`
 > - **行号**：基于建图时的代码版本，仅供快速跳转，以实际代码为准
 > - **维护规则**：见文末第 9 节。**新增/删除/移动文件、改 key 符号行号、改表结构后必须同步更新本文档**
-> - 建图日期：2026-10-21；最近更新：2026-11-11（V64.1 全局上下文预算、来源感知溢出与历史 Token 密封；V63.2 WebSocket 重连历史恢复与聊天错误契约统一；V49 单用户认证、V50 目标步骤触发规则 + 主动消息、V51 工具结果回填预算、V52 后台回填统一 + Bash 流式日志、V53 通用计划事件源扩展、V54 安全边界事件注入 + 协作式主动消息、V55 决策标记全流式防泄漏、V56 收件箱溢出与决策串行化、V57 前后台 LLM 串行化 + 目标决策幂等、V58 主动提问与用户回复关联闭环、V59 待回答问题的状态一致性、V60 记忆检索 pg_search BM25、V61 知识库结构感知递归切分、V61.3 Chunker 兜底拆分正确性）
+> - 建图日期：2026-10-21；最近更新：2026-11-12（P1 统一工作中心）；之前：2026-11-11（V64.1 全局上下文预算、来源感知溢出与历史 Token 密封；V63.2 WebSocket 重连历史恢复与聊天错误契约统一；V49 单用户认证、V50 目标步骤触发规则 + 主动消息、V51 工具结果回填预算、V52 后台回填统一 + Bash 流式日志、V53 通用计划事件源扩展、V54 安全边界事件注入 + 协作式主动消息、V55 决策标记全流式防泄漏、V56 收件箱溢出与决策串行化、V57 前后台 LLM 串行化 + 目标决策幂等、V58 主动提问与用户回复关联闭环、V59 待回答问题的状态一致性、V60 记忆检索 pg_search BM25、V61 知识库结构感知递归切分、V61.3 Chunker 兜底拆分正确性）
 
 ---
 
@@ -185,7 +185,7 @@
 |---|---|---|---|
 | 聊天页（SSE 状态机，最复杂 57KB） | `frontend/src/pages/ChatPage.tsx` | `frontend/src/api/chat.ts`、`frontend/src/components/Markdown.tsx` | — |
 | 前端导航 / 主题 / 角标 | `frontend/src/App.tsx` | `frontend/src/hooks/useNotificationSocket.ts`、`frontend/src/lib/base.ts` | — |
-| 任务中心页 | `frontend/src/pages/TaskCenterPage.tsx` | `frontend/src/api/agentTasks.ts`、`frontend/src/hooks/useTaskEvents.ts` | — |
+| 工作中心 | `frontend/src/pages/TaskCenterPage.tsx` | `shared/work/`、`frontend/src/hooks/useWorkCenter.ts`、`frontend/src/components/WorkDetail.tsx` | — |
 | 新增一个前端页面 | `frontend/src/pages/XxxPage.tsx` + `App.tsx`（lazy + Tab） | `frontend/src/api/` 加客户端函数 | — |
 | 登录 / 认证（V49） | `frontend/src/hooks/useAuth.tsx`、`frontend/src/pages/LoginPage.tsx` | `frontend/src/api/auth.ts`、`frontend/src/api/client.ts`（统一注入 Bearer、401 触发过期事件）、`backend/aiive/auth/` | `test_auth.py`、`test_auth_frontend_contract.py` |
 | 新增受保护接口 | 后端无需额外代码：`auth/guard.py` 默认拦截白名单外全部路径 | 前端一律经 `api/client.ts`，页面与业务模块不得直接 `fetch` | `test_auth_frontend_contract.py` |
@@ -504,9 +504,9 @@
 | API 客户端 | `src/api/auth.ts` | `getAuthStatus`、`register`、`login`、`getMe`；Token 只经 `client.ts` 存取 |
 | 样式 | `src/index.css` | Tailwind + 语义色 CSS 变量（`:root`/`[data-theme=dark]`）+ hljs 代码高亮 token |
 | API 客户端 | `src/api/chat.ts` | `getThreadMessages` L64、`sendMessageStream` L124（SSE）、`resetThread` L272、`respondApproval` L303；`ApiError` L89/`StreamIncompleteError` L104 |
-| API 客户端 | `src/api/agentTasks.ts` | `listAgentTasks` L88、`getAgentTask` L94、`createAgentTask` L98、`cancelAgentTask` L113、`sendAgentTaskInput` L117、`decideTaskApproval` L125；长期目标：`getAgentTaskGoal`、`controlAgentTaskGoal`（confirm/reject/pause/resume/end/modify）、`approveAgentTaskGoalStep`、`startAgentTaskGoalStep` |
+| 工作 API/契约 | `shared/work/client.ts`、`types.ts` | Inbox、WorkView、Timeline 与现有写接口；安全字段类型 |
 | Hooks | `src/hooks/useNotificationSocket.ts` | `useNotificationCount` L70 / `useNotificationListener` L77（单例 WS `/ws/__global__`，3s 重连） |
-| Hooks | `src/hooks/useTaskEvents.ts` | `useTaskEvents` L7（每任务 WS，100ms 去抖 refresh） |
+| 工作同步 | `src/hooks/useWorkCenter.ts`、`shared/work/controller.ts`、`connection.ts` | Thread work_changed 失效、串行刷新、版本/序列去重、前台和重连快照 |
 | 组件 | `src/components/Markdown.tsx` | react-markdown + remark-gfm + rehype-highlight（surface/colored 两变体） |
 
 **页面清单**（均 lazy 加载于 `App.tsx`）：
@@ -515,7 +515,7 @@
 |---|---|---|
 | `pages/LoginPage.tsx` | —（`/aiive/login`，匿名可访问） | `GET api/auth/status`、`POST api/auth/register`、`POST api/auth/login` |
 | `pages/ChatPage.tsx`（57KB，最复杂） | chat | `POST api/chat/stream`(SSE)、`GET api/threads/{id}/messages`、`POST api/thread/reset`、`POST api/approval/respond`、`POST api/chat/system`；WS `/ws/{threadId}`。含：SSE 打字机、流式纯文本/完成 Markdown 切换、断流恢复、工具状态机与工具卡片委托 `features/chat/messageModel.ts`、`features/chat/ToolCallCard.tsx`、reminder/approval/maintenance_report 卡片、`inFlightRef` 防重发、AbortController、离底未读计数、历史分页 |
-| `pages/TaskCenterPage.tsx` | tasks | agent-tasks 全套 + `evidence/{id}`、`artifacts/{id}`；长期目标面板：`GET {id}/goal` + `POST {id}/goal/{confirm,reject,pause,resume,end}`、`steps/{sid}/{start,approve}`；WS `api/agent-tasks/ws/{id}`；4s 轮询兜底 |
+| `pages/TaskCenterPage.tsx` | tasks（工作） | Inbox cursor 分页、WorkView、Timeline；Attention 全部操作；Thread `/ws/{id}`；成果分段校验，无业务轮询 |
 | `pages/MemoriesPage.tsx` | memories | `api/memories` + `/{id}/{sleep|archive|forget}` |
 | `pages/CapabilitiesPage.tsx` | capabilities | `api/mcp/capabilities`、`api/tools`、`api/skills`、`api/capabilities?state=candidate`、`api/knowledge` |
 | `pages/EventTimeline.tsx` | events | `GET api/inspector/events?trace_id=&limit=50` |
@@ -1145,3 +1145,21 @@ V62.6.1 测试清理：根 `conftest.py::_cleanup_test_db` / `pytest_sessionfini
 - 根 `conftest.py`：`tempfile.mkstemp` 独占创建 `aiive_test_<pid>_<随机后缀>.db`，防止 PID 复用时继承旧库 schema；清理仍校验临时目录与本进程拥有的精确文件名。
 - `test_local_shell.py` 新增无效候选回退、非默认 Git 安装、非 Bash/失败输出、超时后恢复、成功缓存和探测环境隔离回归；`test_process_database_cleanup.py` 新增 PID 残留库回归。
 - `test_builtin_mcp.py` 用实际加载的 `runtime_client` 定位固定 Python 服务入口，保持生产可信路径校验不变；激活失败断言显示结构化错误。
+
+
+## P1 跨端工作中心代码定位（2026-11-12）
+
+| 范围 | 文件 | 职责 |
+|---|---|---|
+| 安全后端 | `task_runtime/work_read_model.py`、`api/routes_agent_tasks.py` | 可见性过滤的 Action 摘要、静态 Timeline 投影；部分步骤编辑保留省略字段 |
+| 委派卡片 | `runtime/action_cards.py`、`runtime/tool_executor.py` | delegate_task → agent_task_created；区别提醒 task_created |
+| 公共逻辑 | `shared/work/types.ts`、`client.ts`、`operations.ts` | 安全契约、现有 REST 写接口、Attention 按 kind 分流、计划编辑与依赖校验 |
+| 公共同步 | `shared/work/controller.ts`、`connection.ts` | 失效信号去重、串行快照、选择版本保护、原始 sequence 补齐、重连/前台/网络恢复 |
+| 公共文件 | `shared/work/files.ts` | 1 MiB 有界读取、offset 校验、SHA256、文件名安全、MIME 白名单 |
+| Web | `frontend/src/pages/TaskCenterPage.tsx`、`components/WorkDetail.tsx`、`WorkFile.tsx`、`WorkPlanEditor.tsx` | 工作列表/详情/操作/编辑/校验保存；WorkCenter.css |
+| Android | `apps/android/src/App.tsx`、`src/work/WorkCenter.tsx`、`useWorkCenter.ts`、`PlanEditor.tsx`、`WorkFile.tsx` | 保持 ChatApp 挂载、Thread 订阅互斥、独立单列卡片和详情 |
+| 原生适配 | `apps/android/src/work/nativeFiles.ts` | Filesystem Cache 逐段追加、Documents 复制、Share URI、失败清理 |
+| 测试 | `frontend/scripts/test-work-model.mjs`、`tests/integration/backend/test_p1_work_contract.py` | 生产逻辑 Node 测试与真实后端投影/编辑/历史恢复契约 |
+
+旧 Web `api/agentTasks.ts` 和 `hooks/useTaskEvents.ts` 在调用方检查及验证后清理。
+最终契约、选型优劣和验收结果见 [P1 报告](reports/2026-11-12_P1_work_center.md)。

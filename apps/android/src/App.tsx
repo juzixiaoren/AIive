@@ -1,3 +1,6 @@
+import { App as CapacitorApp } from "@capacitor/app";
+import { workCardsFrom } from "../../../shared/work/types";
+import WorkCenter from "./work/WorkCenter";
 import { useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -41,7 +44,7 @@ function loadChat(): Required<StoredChat> {
     return {
       threadId: value.threadId || "",
       messages: (value.messages || []).filter(
-        (message) => message.content && (message.role === "user" || message.role === "assistant"),
+        (message) => (message.content || message.workCards?.length || message.approvals?.length) && (message.role === "user" || message.role === "assistant"),
       ).slice(-200),
     };
   } catch {
@@ -97,11 +100,12 @@ function historyToMessages(messages: ThreadHistoryMessage[]): ChatMessage[] {
       role: message.role === "user" ? "user" as const : "assistant" as const,
       content: message.content,
       approvals: approvalsFromCards(Array.isArray(message.action_cards) ? message.action_cards : []),
+      workCards: workCardsFrom(Array.isArray(message.action_cards) ? message.action_cards : []),
     }))
-    .filter((message) => message.content || (message.approvals?.length ?? 0) > 0);
+    .filter((message) => message.content || (message.approvals?.length ?? 0) > 0 || (message.workCards?.length ?? 0) > 0);
 }
 
-function ChatApp({ username, onLogout }: { username: string; onLogout: () => void }) {
+export function ChatApp({ username, onLogout, active, onOpenWork }: { username: string; onLogout: () => void; active: boolean; onOpenWork: (id: string) => void }) {
   const [initialChat] = useState(loadChat);
   const [messages, setMessages] = useState<ChatMessage[]>(initialChat.messages);
   // localStorage 仅作为展示缓存：启动阶段 Thread 权威来源是服务器。
@@ -158,7 +162,7 @@ function ChatApp({ username, onLogout }: { username: string; onLogout: () => voi
     try {
       localStorage.setItem(
         appConfig.storageKey,
-        JSON.stringify({ threadId, messages: messages.filter((message) => message.content).slice(-200) }),
+        JSON.stringify({ threadId, messages: messages.filter((message) => message.content || message.workCards?.length || message.approvals?.length).slice(-200) }),
       );
     } catch {
       // Storage exhaustion must never interrupt a conversation.
@@ -216,7 +220,7 @@ function ChatApp({ username, onLogout }: { username: string; onLogout: () => voi
 
   // 订阅线程 WebSocket：其他设备开始执行/结束/取消时同步按钮状态。
   useEffect(() => {
-    if (!configured || !threadId) return;
+    if (!configured || !threadId || !active) return;
     return subscribeThreadEvents(threadId, (status, { initialSnapshot }) => {
       const hadRemoteTurn = remoteTurnActiveRef.current;
       applyStatus(status);
@@ -227,8 +231,13 @@ function ChatApp({ username, onLogout }: { username: string; onLogout: () => voi
           void refreshHistory();
         }
       }
+    }, event => {
+      if (event.type === "new_message" || event.type === "approval_updated") {
+        if (streamingRef.current) historyRefreshPendingRef.current = true;
+        else void refreshHistory();
+      }
     });
-  }, [applyStatus, configured, refreshHistory, threadId]);
+  }, [active, applyStatus, configured, refreshHistory, threadId]);
 
   const resizeTextarea = useCallback(() => {
     const element = textareaRef.current;
@@ -352,7 +361,7 @@ function ChatApp({ username, onLogout }: { username: string; onLogout: () => voi
         setThreadId(result.threadId);
         setMessages((current) => current.map((message) => (
           message.id === replyId
-            ? { ...message, content: result.reply || message.content, approvals: result.approvals }
+            ? { ...message, content: result.reply || message.content, approvals: result.approvals, workCards: result.workCards }
             : message
         )));
       }
@@ -495,6 +504,7 @@ function ChatApp({ username, onLogout }: { username: string; onLogout: () => voi
                     <span className="plain-message">{message.content}</span>
                   )}
                 </div>
+                {message.workCards?.map(card => <section className="mobile-work-card-chat" key={card.taskId}><strong>{card.title}</strong><p>{card.summary}</p><button onClick={() => onOpenWork(card.taskId)}>查看工作</button></section>)}
                 {message.approvals?.map((approval) => {
                   const busy = approval.status === "executing" || approvalBusyId === approval.approvalId;
                   const pending = approval.status === "pending";
@@ -592,6 +602,24 @@ function ChatApp({ username, onLogout }: { username: string; onLogout: () => voi
 }
 
 
+export function MobileShell({ username, onLogout }: { username: string; onLogout: () => void }) {
+  const [tab, setTab] = useState<"chat" | "work">("chat");
+  const [task, setTask] = useState("");
+  useEffect(() => {
+    const subscription = CapacitorApp.addListener("appStateChange", ({ isActive }) => {
+      if (isActive) window.dispatchEvent(new Event("aiive:resume"));
+    });
+    return () => { void subscription.then(listener => listener.remove()); };
+  }, []);
+  return <div className="mobile-tabs-shell">
+    <div className="mobile-chat-container" hidden={tab !== "chat"}>
+      <ChatApp username={username} onLogout={onLogout} active={tab === "chat"} onOpenWork={id => { setTask(id); setTab("work"); }} />
+    </div>
+    {tab === "work" && <WorkCenter key={task} taskId={task} />}
+    <nav className="mobile-tabs" aria-label="底部导航"><button aria-current={tab === "chat"} onClick={() => setTab("chat")}>对话</button><button aria-current={tab === "work"} onClick={() => { setTask(""); setTab("work"); }}>工作</button></nav>
+  </div>;
+}
+
 /**
  * 应用入口（V49）：先确定认证状态，再决定渲染登录界面还是聊天界面。
  * - 未初始化：显示一次性创建所有者账号表单
@@ -659,7 +687,7 @@ export default function App() {
   }
 
   return (
-    <ChatApp
+    <MobileShell
       username={username}
       onLogout={() => {
         logout();

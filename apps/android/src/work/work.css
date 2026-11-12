@@ -1,0 +1,212 @@
+.mobile-tabs-shell {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+.mobile-chat-container {
+  flex: 1;
+  min-height: 0;
+}
+.mobile-chat-container[hidden] {
+  display: none;
+}
+.mobile-tabs {
+  display: flex;
+  justify-content: space-around;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  padding: 6px 12px calc(6px + env(safe-area-inset-bottom));
+  flex-shrink: 0;
+}
+.mobile-tabs button {
+  background: transparent;
+  color: var(--text-secondary);
+  padding: 12px 28px;
+  border-radius: 10px;
+}
+.mobile-tabs button[aria-current="true"] {
+  color: var(--accent);
+  background: var(--surface-muted);
+}
+.mobile-work {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: calc(12px + env(safe-area-inset-top)) 18px 24px;
+}
+.mobile-work-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+.mobile-work h1 {
+  font-size: 24px;
+  margin: 8px 0;
+}
+.mobile-work h2 {
+  font-size: 19px;
+  margin: 12px 0;
+}
+.mobile-work h3 {
+  font-size: 15px;
+  margin: 8px 0;
+}
+.mobile-work p {
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.mobile-work small,
+.mobile-hint {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.mobile-work button {
+  min-height: 44px;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--text);
+}
+.mobile-work button:disabled {
+  opacity: 0.45;
+}
+.mobile-buckets {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin: 18px 0;
+}
+.mobile-buckets [aria-selected="true"] {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.mobile-inbox {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.mobile-work .mobile-work-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: start;
+  text-align: left;
+  padding: 18px;
+  box-shadow: var(--shadow);
+}
+.mobile-detail section {
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 20px;
+  margin-bottom: 20px;
+}
+.mobile-attention {
+  border: 1px solid #c18b3755;
+  background: #c18b370b;
+  padding: 16px;
+  border-radius: 12px;
+  margin: 12px 0;
+}
+.mobile-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+.mobile-work label {
+  display: block;
+  font-size: 14px;
+  margin: 14px 0;
+}
+.mobile-work textarea,
+.mobile-work input:not([type="checkbox"]),
+.mobile-work select {
+  width: 100%;
+  display: block;
+  padding: 12px;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-top: 6px;
+  font: inherit;
+}
+.mobile-work textarea {
+  min-height: 100px;
+}
+.mobile-work fieldset {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  margin: 18px 0;
+  min-width: 0;
+}
+.mobile-work pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  max-height: 360px;
+  overflow: auto;
+  padding: 12px;
+  background: var(--surface-muted);
+  border-radius: 8px;
+}
+.mobile-work img {
+  max-width: 100%;
+  max-height: 400px;
+  object-fit: contain;
+}
+.mobile-file {
+  padding: 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  margin: 12px 0;
+}
+.mobile-timeline,
+.mobile-steps {
+  list-style: none;
+  border-left: 2px solid var(--accent);
+  padding-left: 16px;
+}
+.mobile-timeline li,
+.mobile-steps > li {
+  margin: 18px 0;
+}
+.mobile-timeline small {
+  display: block;
+  margin-top: 6px;
+}
+.mobile-work progress {
+  width: 100%;
+  accent-color: var(--accent);
+}
+.mobile-work [role="alert"] {
+  color: var(--danger);
+}
+.mobile-work-card-chat {
+  padding: 14px;
+  margin-top: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: 12px;
+  max-width: 100%;
+}
+.mobile-work-card-chat p {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.mobile-work-card-chat button {
+  background: var(--accent);
+  color: white;
+  border-radius: 8px;
+  padding: 10px 16px;
+}
+
+.mobile-chat-container .app-shell {
+  min-height: 0;
+}

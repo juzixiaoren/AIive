@@ -18,8 +18,9 @@ Main Agent                        Worker Agent
 
 Main Agent 固定只暴露 `delegate_task`、`get_task_status`、`cancel_task`、
 `send_task_input`。Desktop、文件、Shell 和 Self-Improvement 能力只能由 Task
-Worker 提议，并通过 Capability Broker 执行。Main Conversation 只接收任务受理、
-审批、补充信息和终态报告等高层事件，不保存低层工具 trace。
+Worker 提议，并通过 Capability Broker 执行。Main Conversation 通过
+`agent_task_created` 卡片关联委派工作；普通 Task 事件在工作中心展示，真正的
+ProactiveMessage 仍进入对话。底层工具 trace 不转成聊天消息。
 
 ## 持久化事实模型
 
@@ -121,3 +122,26 @@ Release/Rollback、数据库迁移和 Task Runtime 等受保护路径；promotio
 数小时审批后新 AgentRun、重启恢复、Desktop unknown Journal 对账、TOCTOU invalidation、
 GUI/path lease、Watcher 唤醒、大输出 Evidence range read，以及 Trusted Core 不可变性。
 
+
+
+## P1 用户工作契约（2026-11-12）
+
+用户视角由 WorkReadModel 唯一投影。Web 与 Android 保留独立 React 界面，共享
+`shared/work` 的纯 TypeScript 契约、写操作分流、同步控制器和文件算法；Desktop 使用 Web。
+普通 Task 不展示推测百分比，Goal 使用 `GoalPlan.progress()`。Action 摘要复用有界且
+经过 Forget 可见性过滤的查询，不暴露原始 arguments 或 TaskState。
+
+Attention 的 allowed_actions 仅提示 UI；服务端写接口继续独立授权。Action Approval、
+Goal Step Approval、Task Input 与 Goal Question 使用各自入口。Question 的 reject 跳过
+当前步骤，Goal reject 拒绝整个目标。内容修改失效当前及依赖步骤；API 对已有步骤按 ID
+保留未编辑字段，避免安全视图省略的 trigger.match 被编辑提交意外擦除。执行机制仍由
+现有 GoalService 和 Task Runtime 负责。
+
+Thread `/ws/{thread_id}` 是工作同步入口。work_changed 在事务提交后发出，包含
+ task_id、task_version、event_sequence，仅通知数据失效。客户端刷新 REST Inbox/WorkView，
+使用 Timeline 原始高水位补齐；重连、前台和网络恢复后重新对齐。快照替换旧缓存以遵守
+Forget。聊天保持挂载，与工作页互斥订阅 Thread；没有 Task WebSocket 客户端和业务轮询。
+
+文件读取单次最多 1 MiB；原生 Android 逐段缓存和计算 SHA256，通过后复制 Documents
+或分享 Cache URI；Web 使用有界 Blob。文件名和 MIME 白名单由公共模块处理。
+详见 [Android 流程](../guides/ANDROID_APP.md) 和 [P1 验收报告](../reports/2026-11-12_P1_work_center.md)。

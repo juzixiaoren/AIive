@@ -1,3 +1,5 @@
+import { workCardsFrom, type WorkCard } from "../../../../shared/work/types";
+import { subscribeThread, type Envelope } from "../../../../shared/work/connection";
 import { appConfig } from "../config";
 import { apiFetch, getToken } from "./auth";
 
@@ -6,6 +8,7 @@ export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   approvals?: ApprovalItem[];
+  workCards?: WorkCard[];
 }
 
 export interface ApprovalItem {
@@ -27,6 +30,7 @@ interface StreamResult {
   threadId: string;
   reply: string;
   approvals: ApprovalItem[];
+  workCards: WorkCard[];
   cancelled: boolean;
 }
 
@@ -189,47 +193,15 @@ export async function interruptTurn(
 export function subscribeThreadEvents(
   threadId: string,
   onStatus: (status: ExecutionStatus, metadata: { initialSnapshot: boolean }) => void,
+  onMessage?: (event: Envelope) => void,
 ): () => void {
-  let socket: WebSocket | null = null;
-  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  let disposed = false;
-
-  const connect = () => {
-    if (disposed) return;
-    let receivedInitialStatus = false;
-    const base = appConfig.backendBaseUrl.replace(/^http/i, "ws");
-    socket = new WebSocket(`${base}/ws/${encodeURIComponent(threadId)}`);
-    socket.onopen = () => {
-      socket?.send(JSON.stringify({ type: "auth", access_token: getToken() ?? "" }));
-    };
-    socket.onmessage = (event) => {
-      try {
-        const payload = JSON.parse(String(event.data)) as {
-          type?: string;
-          data?: Record<string, unknown>;
-        };
-        if (payload.type === "execution_status" && payload.data) {
-          const initialSnapshot = !receivedInitialStatus;
-          receivedInitialStatus = true;
-          onStatus(payload.data as unknown as ExecutionStatus, { initialSnapshot });
-        }
-      } catch {
-        // 非 JSON 帧忽略，不打断连接。
-      }
-    };
-    socket.onclose = () => {
-      if (disposed) return;
-      reconnectTimer = setTimeout(connect, 5000);
-    };
-    socket.onerror = () => socket?.close();
-  };
-
-  connect();
-  return () => {
-    disposed = true;
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    socket?.close();
-  };
+  let initial = true;
+  return subscribeThread(`${appConfig.backendBaseUrl.replace(/^http/i, "ws")}/ws/${encodeURIComponent(threadId)}`, getToken, event => {
+    if (event.type === "execution_status" && event.data) {
+      onStatus(event.data as unknown as ExecutionStatus, { initialSnapshot: initial });
+      initial = false;
+    } else onMessage?.(event);
+  }, () => { initial = true; });
 }
 
 export async function streamMessage(
@@ -256,7 +228,7 @@ export async function streamMessage(
   let activeEvent = "";
   let completed = false;
   let cancelled = false;
-  let result: StreamResult = { threadId: threadId ?? "", reply: "", approvals: [], cancelled: false };
+  let result: StreamResult = { threadId: threadId ?? "", reply: "", approvals: [], workCards: [], cancelled: false };
 
   const handleLine = (line: string) => {
     if (line.startsWith("event:")) {
@@ -291,6 +263,7 @@ export async function streamMessage(
         threadId: String(data.thread_id || result.threadId),
         reply: String(data.reply || ""),
         approvals: approvalsFromCards(cards),
+        workCards: workCardsFrom(cards),
         cancelled: false,
       };
     } else if (activeEvent === "error") {

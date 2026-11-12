@@ -1,7 +1,7 @@
 # Current Phase
 
 ## 版本索引
-- 当前工作版本：**V63 单会话闭环修复与跨端状态一致性**（2026-11-09）→ 见文末「### V63 …」；上一版为 V62.6.1 Forget 来源闭包与跨线程执行授权修复。
+- 当前工作：**P1 统一工作中心（Web + Android）**（2026-11-12），详见文末 P1 记录与验收报告；历史版本保留原记录。
 - 历史版本：V62.4 / V62.5 / V62.6.1 依次见文末。
 - 历史阶段：V34 → V54 按时间顺序记录在下方各节；下方 `## Phase` / `## Status` 是 V34 阶段的原始记录，不再代表当前主干。
 
@@ -1153,3 +1153,23 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
 - Ruff 全 backend `--select F,E9` 通过；策略/Overflow/相关单测与 PG 文件默认规则通过；basedpyright **0 errors / 0 warnings / 0 notes**；git diff --check 通过。
 - PostgreSQL：显式 `AIIVE_PG_TESTS=1 pytest tests/integration/pg -q`，**126 skipped，45.69s**。Docker Desktop 的 Inference manager 在 `AppData/Local/Docker/run/dockerInference` socket 初始化时崩溃，未提供隔离测试 URL；未取得真实 PG 通过证据。新增 `test_pg_context_v642.py` 两项验证最终 touch/trace 和既有 Snapshot JSON 持久化，待环境恢复执行。不改 Docker 配置、不接触生产库。
 - 全量/定向/PG 进程清理报告均为 cleaned、exists_after_cleanup=false。日志：`build/v642-full-final.log`、`v642-final-focused.log`、`v642-pg-final.log`、`v642-ruff-final.log`、`v642-types-final.log`；详细调用链、淘汰例、Snapshot JSON 和覆盖表见 `docs/reports/2026-11-11_V642_context_policy.md`；架构说明已同步 CODE_MAP、Phase_1、ARCHITECTURE_AND_REVIEW。
+
+
+## P1 统一工作中心（2026-11-12）
+
+基线 main `8038182`（原探索基线 `5a7e799` 之后的安全契约与委派卡片补充）。
+本轮完成 Backend、Web、Android 的同一业务闭环，不新增表或另一套执行状态。
+
+- Web TaskCenterPage 使用 Inbox/WorkView/Timeline，四分类游标分页、全部既有操作、
+  真实 Goal 进度、设备关系、报告/成果/证据与可折叠 Action 摘要。
+- Android 独立移动 UI，底部对话/工作切换保留 ChatApp 与 SSE，Thread 订阅互斥；
+  官方 Filesystem/Share/App 8.x 完成分段文件、校验保存分享及恢复前台同步。
+- 公共 `shared/work` 模块负责 API、操作语义、刷新竞争与去重、文件名与 MIME 策略；
+  聊天工作卡片与提醒卡片分离，历史恢复复用同一映射，普通 task_event 不生成聊天消息。
+- Backend Timeline 补齐真实 Goal 事件，内部问题账本不进入 Timeline；计划编辑合并
+  未编辑的步骤字段，保留脱敏视图省略的触发条件。所有读取仍受 Forget 校验。
+- 本地全量 Python：1943 passed / 134 skipped / 5280 既有 warnings，440.23 秒。
+  PostgreSQL：116 passed / 13 skipped，301.66 秒，包含 SAVEPOINT；跳过外部 Embedding 项。
+  具体检查、CI 与边界见 [验收报告](../reports/2026-11-12_P1_work_center.md)。
+- CI 在现有前端 Job 加入 Android TypeScript/Vite 与跨端 Node 测试，保持 9 Job。
+  按用户要求不使用浏览器测试、不添加人工三端联调或推送基础设施。

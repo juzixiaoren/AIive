@@ -192,6 +192,29 @@ def _goal_http_error(error: Exception) -> HTTPException:
     return HTTPException(status_code=409, detail=message)
 
 
+def _preserve_unedited_steps(db: Session, task_id: str, changes: dict[str, Any]) -> dict[str, Any]:
+    """The safe view omits trigger match/context; an editor must not erase those fields.
+
+    Existing step IDs accept partial fields. Omitted steps are still removed and
+    explicit field values retain the existing modify API semantics.
+    """
+    if not isinstance(changes.get("steps"), list):
+        return changes
+    from aiive.task_runtime.goal_plan import GoalPlan
+
+    task = TaskReadRepository(db).get_task(task_id, for_update=True)
+    if task is None or not TaskReadRepository(db).plan_visible(task):
+        raise ValueError("goal_not_found")
+    plan = GoalPlan.model_validate((task.task_state or {}).get("goal"))
+    originals = {step.id: step.model_dump(mode="json") for step in plan.steps}
+    steps: list[dict[str, Any]] = []
+    for step in changes["steps"]:
+        if not isinstance(step, dict):
+            raise ValueError("plan_changes_invalid")
+        steps.append({**originals.get(str(step.get("id", "")), {}), **step})
+    return {**changes, "steps": steps}
+
+
 def _goal_call(db: Session, task_id: str, action: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     """统一的 Goal 写入口：成功提交、可预期拒绝回滚并转 4xx。"""
     from aiive.task_runtime.goal_service import GoalService
@@ -209,7 +232,7 @@ def _goal_call(db: Session, task_id: str, action: str, payload: dict[str, Any] |
         elif action == "end":
             result = service.end(task_id, (payload or {}).get("reason", ""))
         elif action == "modify":
-            result = service.modify(task_id, payload or {})
+            result = service.modify(task_id, _preserve_unedited_steps(db, task_id, payload or {}))
         elif action == "start_step":
             result = service.start_step(task_id, str((payload or {}).get("step_id") or ""))
         elif action == "approve_step":
@@ -288,7 +311,9 @@ def answer_goal_step_question(task_id: str, request: AnswerGoalQuestionRequest,
                                                            "plan_changes": request.plan_changes})
             outcome = GoalService(db).answer_step_question(
                 task.id, step.id, answer=text, question_id=request.question_id or "",
-                user_event_id=user_event_id, intent=request.intent, plan_changes=request.plan_changes,
+                user_event_id=user_event_id, intent=request.intent,
+                plan_changes=_preserve_unedited_steps(db, task.id, request.plan_changes)
+                if request.plan_changes is not None else None,
             )
             if question and not resolve_question(db, question=question, user_event_id=user_event_id,
                     answer=text, intent=request.intent, outcome=outcome):

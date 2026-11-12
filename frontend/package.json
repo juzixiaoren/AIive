@@ -6,10 +6,12 @@
   "scripts": {
     "dev": "vite",
     "test:chat": "node --test scripts/test-chat-model.mjs",
+    "test:work": "node --test scripts/test-work-model.mjs",
     "build": "tsc && vite build",
     "preview": "vite preview"
   },
   "dependencies": {
+    "@noble/hashes": "^2.4.0",
     "@tailwindcss/typography": "^0.5.20",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",

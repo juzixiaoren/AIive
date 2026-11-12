@@ -139,8 +139,8 @@ curl http://localhost:8000/health
 ### Android APK
 
 Android 客户端位于 `apps/android/`，使用完全独立的组件与 CSS，不复用 Web
-页面样式。它呈现核心流式对话和高危工具审批卡片，不显示普通工具明细、
-`trace_id`、记忆、能力、事件等 Web 管理功能。
+页面样式。底部「对话 / 工作」连接同一长期 Thread：聊天委派后可查看进展、审批、
+回答问题、修改目标，以及保存和分享成果；切换页面保留聊天 SSE。
 
 首次构建前，在 `apps/android/src/config.ts` 中填写部署后的后端根地址；默认值
 有意保持为空：
@@ -379,6 +379,9 @@ AIive/
 | `/api/knowledge` | 知识库操作 |
 | `/api/skills` | 内置 Skill catalog 与指令详情 |
 | `/api/threads` | 线程管理 |
+| `/api/agent-tasks/inbox` | 工作四分类收件箱与 cursor 分页 |
+| `/api/agent-tasks/{id}/work-view` | 统一安全工作详情 |
+| `/api/agent-tasks/{id}/timeline` | 按原始 sequence 增量读取可见事件 |
 | `/api/ws` | WebSocket 实时通信 |
 
 ## 测试
@@ -417,3 +420,15 @@ python -m pytest tests/unit -k "tool"
 2026-11-11：提取共享系统契约与工具事件协议，解除上下文组装器对 AgentGraph 的反向依赖；拆分聊天消息存储、状态映射与工具卡片。详见 [审查与验证报告](docs/audit/2026-11-11_decoupling_review.md)，模块定位见 [代码图谱](docs/CODE_MAP.md)。前端聊天数据回归可运行 `cd frontend && npm run test:chat`。
 
 同日测试修复：Bash 候选增加有效性探测及非默认 Git 安装发现；测试数据库独占创建，避免复用同 PID 残留库。验证结果见上述审查报告的跟进记录。
+
+
+### P1 统一工作中心（2026-11-12）
+
+Web 与 Android 均支持「聊天委派 → 工作卡片 → 四分类收件箱 → 工作详情 →
+审批/回答/修改 → 实时同步 → 获取成果」。Desktop 继续使用 Web UI。两端共享
+`shared/work/` 的数据契约、操作分流、同步控制器和文件校验逻辑，各自维护界面。
+工作通过 Thread WebSocket 的 `work_changed` 通知失效，再以 REST 快照对齐；普通
+执行事件不再生成聊天消息。Android 下载每段最多 1 MiB，完整 SHA256 校验后才允许
+Documents 保存或系统分享。运行 `cd frontend && npm run test:work` 验证公共逻辑。
+
+实现契约、选型和具体结果见 [P1 验收报告](docs/reports/2026-11-12_P1_work_center.md)。

@@ -205,7 +205,7 @@ export async function sendMessageStream(
                   thread_id: data.thread_id as string,
                   turn_id: data.turn_id as string,
                   turn_record_id: (data.turn_record_id as string) || "",
-                  trace_id: data.trace_id as string,
+                  trace_id: (data.trace_id as string) || "",
                 });
                 break;
               case "token":

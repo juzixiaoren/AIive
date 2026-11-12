@@ -23,13 +23,14 @@ import {
 } from "../api/chat";
 import { BASE_PATH } from "../lib/base";
 import { apiFetch, sendWsAuth } from "../api/client";
+import { workCardsFrom } from "../../../shared/work/types";
 import Markdown from "../components/Markdown";
 import ToolCallCard from "../features/chat/ToolCallCard";
 import type { Message, ToolCallItem } from "../features/chat/types";
 import { loadStored, saveStored } from "../features/chat/messageStorage";
 import { normalizeToolCallStatus, genMessageId } from "../features/chat/messageModel";
 
-export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: string) => void }) {
+export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: { onInspectTrace?: (tid: string) => void; onOpenWork?: (taskId: string) => void; active?: boolean }) {
   // 惰性初始化：只在首次挂载读取 localStorage。若每次渲染都重读，
   // 新线程首条消息流式期间 threadId 持久化会使挂载恢复 effect 重新触发，
   // 服务端历史整体覆盖消息列表，正在流式接收的占位消息被抹掉（回复丢失）。
@@ -259,7 +260,7 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
 
   // WebSocket 连接：接收后端主动推送的事件（提醒触发等）
   useEffect(() => {
-    if (!threadId) return;
+    if (!threadId || !active) return;
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const wsUrl = `${protocol}//${window.location.host}${BASE_PATH}ws/${threadId}`;
     let ws: WebSocket | null = null;
@@ -359,30 +360,7 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
                   : call
               )),
             })));
-          } else if (msg.type === "task_event" && msg.data?.task_id && msg.data?.sequence) {
-            const taskId = String(msg.data.task_id);
-            const sequence = Number(msg.data.sequence);
-            const eventType = String(msg.data.event_type || "task_event");
-            const payload = msg.data.payload || {};
-            const summary = eventType === "task_completed"
-              ? String(payload.summary || "任务已结束")
-              : eventType === "task_blocked_approval"
-                ? `任务需要审批：${String(payload.capability_id || "高风险操作")}`
-                : eventType === "task_blocked_user"
-                  ? String(payload.question || "任务正在等待补充信息")
-                  : eventType === "task_created"
-                    ? `任务已受理：${String(msg.data.title || taskId.slice(0, 8))}`
-                    : `任务状态更新：${String(msg.data.status || eventType)}`;
-            const messageId = `task:${taskId}:${sequence}`;
-            setMessages(prev => prev.some(message => message.id === messageId) ? prev : [...prev, {
-              id: messageId,
-              role: "agent",
-              content: `${summary}\n\n任务 ID：\`${taskId}\``,
-              traceId: taskId,
-              threadId,
-              actionCards: [],
-              toolCalls: [],
-            }]);
+
           }
         } catch {}
       };
@@ -396,13 +374,28 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
       };
     };
 
+    const recover = () => {
+      if (document.hidden || disposed) return;
+      if (inFlightRef.current) historyRefreshPendingRef.current = true;
+      else void loadRemoteMessages(threadId);
+      void getExecutionStatus(threadId).then(applyExecutionStatus).catch(() => undefined);
+      if (ws?.readyState === WebSocket.OPEN) return;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      connect();
+    };
+    window.addEventListener("online", recover);
+    window.addEventListener("focus", recover);
+    document.addEventListener("visibilitychange", recover);
     connect();
     return () => {
+      window.removeEventListener("online", recover);
+      window.removeEventListener("focus", recover);
+      document.removeEventListener("visibilitychange", recover);
       disposed = true;
       ws?.close();
       if (reconnectTimer) clearTimeout(reconnectTimer);
     };
-  }, [applyExecutionStatus, loadRemoteMessages, threadId]);
+  }, [active, applyExecutionStatus, loadRemoteMessages, threadId]);
 
   /** 执行或拒绝服务端冻结的工具调用；客户端永远不回传可篡改的工具参数。 */
   const handleApprovalAction = async (approvalId: string, action: "approve" | "deny") => {
@@ -682,7 +675,7 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
         }
 
         // 流式结束后：用最终结果收敛占位消息（含工具调用的完成状态）
-        if (result.trace_id) {
+        if (result.thread_id) {
           if (!atBottomRef.current && result.reply) {
             setUnreadCount((count) => count + 1);
           }
@@ -737,7 +730,7 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
                 updated[i] = {
                   ...updated[i],
                   content: result.reply || updated[i].content,
-                  traceId: result.trace_id,
+                  traceId: result.trace_id || "",
                   threadId: result.thread_id,
                   actionCards: result.action_cards,
                   toolCalls,
@@ -930,9 +923,16 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
               </div>
             )}
             {/* 操作卡片：展示任务创建、记忆修改等工具执行卡片 */}
+            {workCardsFrom(msg.actionCards || []).map(card => (
+              <section key={card.taskId} className="rounded-xl border border-divider bg-surface p-4 my-3">
+                <strong className="text-sm text-title">{card.title}</strong>
+                <p className="text-xs text-muted mt-1">{card.summary}</p>
+                <button className="mt-3 rounded-lg border border-divider px-3 py-2 text-sm" onClick={() => onOpenWork?.(card.taskId)}>查看工作</button>
+              </section>
+            ))}
             {msg.actionCards && msg.actionCards.length > 0 && (
               <div className="flex flex-col gap-1.5 mt-2">
-                {msg.actionCards.map((card, j) => (
+                {msg.actionCards.filter(card => card.card_type !== "agent_task_created").map((card, j) => (
                   <div key={`${msg.id}-${card.card_type}-${card.reminder_id || j}`}>
                     {/* 提醒卡片：显示确认/延时按钮 */}
                     {card.card_type === "reminder_alert" && (
@@ -1070,7 +1070,7 @@ export default function ChatPage({ onInspectTrace }: { onInspectTrace?: (tid: st
                       );
                     })()}
                     {/* 其他卡片：保持原有 badge 样式 */}
-                    {card.card_type !== "reminder_alert" && card.card_type !== "approval_required" && card.card_type !== "maintenance_report" && (
+                    {card.card_type !== "agent_task_created" && card.card_type !== "reminder_alert" && card.card_type !== "approval_required" && card.card_type !== "maintenance_report" && (
                       <span className={`text-[11px] px-2 py-0.5 rounded-full border ${
                         card.card_type === "task_created" ? "bg-primary-soft text-primary-hover border-primary-border" :
                         card.card_type === "memory_revised" ? "bg-accent-soft text-accent-text border-accent-border" :

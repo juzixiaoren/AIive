@@ -124,6 +124,14 @@ jobs:
         run: npm install
       - name: 构建
         run: npm run build
+      - name: Android 安装依赖
+        working-directory: apps/android
+        run: npm ci
+      - name: Android TypeScript 与 Vite 构建
+        working-directory: apps/android
+        run: npm run build
+      - name: 聊天与跨端工作契约测试
+        run: npm run test:chat && npm run test:work
       - name: Desktop Node Host 测试
         run: node --test ../apps/desktop/src/node-host/locks.test.mjs ../apps/desktop/src/node-host/journal.test.mjs
 
