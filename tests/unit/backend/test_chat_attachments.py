@@ -27,9 +27,28 @@ from aiive.storage import object_store
 
 
 @pytest.fixture
+def db_session(_db_template, tmp_path):
+    # HTTP requests commit and roll back independently; avoid sharing an outer
+    # transaction across SSE threads and failed upload/binding requests.
+    import shutil
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+    from tests.support import set_current_test_session
+    path = tmp_path / "attachments.db"
+    shutil.copyfile(_db_template, path)
+    engine = create_engine(f"sqlite:///{path}")
+    session = Session(engine)
+    set_current_test_session(session)
+    try:
+        yield session
+    finally:
+        set_current_test_session(None)
+        session.close()
+        engine.dispose()
+
+
+@pytest.fixture
 def client(db_session, monkeypatch, tmp_path):
-    # Real request failures roll back only their transaction, preserving earlier committed requests.
-    db_session.join_transaction_mode = "create_savepoint"
     monkeypatch.setattr(settings, "aiive_auth_enabled", False)
     monkeypatch.setattr(object_store, "ROOT", tmp_path / "objects")
     app = create_app()
@@ -343,3 +362,14 @@ def test_gc_preserves_shared_live_object(client, db_session, monkeypatch):
     monkeypatch.setattr(object_store, "delete", forbidden)
     service.cleanup(db_session)
     assert client.get(f"/api/attachments/{second}/content").status_code == 200
+
+
+def test_forget_pending_upload_cannot_resurrect(client, db_session):
+    aid = upload(client).json()["id"]
+    row = db_session.get(Attachment, aid)
+    source = row.event_id
+    execute_phase_a_shield(db_session, mode="everywhere", event_ids=[source])
+    db_session.commit()
+    assert client.get(f"/api/attachments/{aid}/content").status_code == 404
+    with pytest.raises(HTTPException):
+        service.require(db_session, aid, row.thread_id)

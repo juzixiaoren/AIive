@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 from aiive.config import settings
 from aiive.db.base import get_db
-from aiive.db.models import Attachment
+from aiive.db.models import Attachment, Event
 from aiive.runtime.conversation_state import get_current_thread_id
 from aiive.runtime import attachments as service
 from aiive.storage import object_store
@@ -35,7 +35,16 @@ async def upload(request: Request, db: Session = Depends(get_db)):
 
     digest = hashlib.sha256(data).hexdigest()
     key = f"sha256/{digest[:2]}/{digest}"
+    upload_event = Event(
+        thread_id=thread_id,
+        trace_id="",
+        event_type="attachment_uploaded",
+        payload={"sha256": digest},
+    )
+    db.add(upload_event)
+    db.flush()
     row = Attachment(
+        event_id=upload_event.id,
         thread_id=thread_id,
         filename=filename,
         mime=mime,

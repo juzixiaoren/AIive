@@ -259,7 +259,7 @@ class TurnExecutionService:
         message_source: str | MessageSource = MessageSource.USER,
         attachment_ids: list[str] | None = None,
     ):
-        self._has_attachment_context = False
+        self._has_attachment_context: bool = False
         self._attachment_ids: list[str] = list(attachment_ids or [])
         self._llm_client: LLMClient = llm_client or default_llm_client()
         self._message_source: MessageSource = (
@@ -1309,7 +1309,7 @@ class TurnExecutionService:
                         "user_message": getattr(ag_result, 'user_message', ''),
                         "message_source": self._message_source.value,
                         # Attachment-derived replies are chat evidence, never automatic memory input.
-                        "reply": "" if self._has_attachment_context else ag_result.reply,
+                        "reply": "" if getattr(self, "_has_attachment_context", False) else ag_result.reply,
                         "thread_id": turn.thread_id,
                         "source_turn_record_id": turn.id,
                         "source_turn_id": turn.turn_id,
