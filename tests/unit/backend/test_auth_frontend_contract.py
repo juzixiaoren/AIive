@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[3]
 WEB_SRC = ROOT / "frontend" / "src"
 ANDROID_SRC = ROOT / "apps" / "android" / "src"
 DESKTOP_SRC = ROOT / "apps" / "desktop" / "src"
+SHARED_SRC = ROOT / "shared" / "work"
 
 RAW_FETCH = re.compile(r"(?<![A-Za-z0-9_$.])fetch\(")
 
@@ -61,13 +62,21 @@ def test_web_pages_do_not_manage_tokens_themselves() -> None:
 def test_web_websockets_send_auth_frame() -> None:
     """每个 WebSocket 连接都必须在 onopen 时发送首帧认证。"""
     sockets: list[str] = []
-    for path in _sources(WEB_SRC, ("*.ts", "*.tsx")):
+    for path in _sources(WEB_SRC, ("*.ts", "*.tsx")) + _sources(SHARED_SRC, ("*.ts",)):
         text = path.read_text(encoding="utf-8")
         if "new WebSocket(" not in text:
             continue
-        sockets.append(str(path.relative_to(ROOT)))
-        assert "sendWsAuth" in text, f"{path} 建立 WebSocket 但未发送认证帧"
-    assert len(sockets) == 3, f"WebSocket 入口数量变化，请复核认证覆盖: {sockets}"
+        sockets.append(path.relative_to(ROOT).as_posix())
+        if path == SHARED_SRC / "connection.ts":
+            assert 'current.onopen' in text and 'current.send(' in text
+            assert 'type: "auth"' in text and 'access_token: token()' in text
+        else:
+            assert "sendWsAuth" in text, f"{path} 建立 WebSocket 但未发送认证帧"
+    assert set(sockets) == {
+        "frontend/src/hooks/useNotificationSocket.ts",
+        "frontend/src/pages/ChatPage.tsx",
+        "shared/work/connection.ts",
+    }, f"WebSocket 入口变化，请复核认证覆盖: {sockets}"
 
 
 def test_app_gates_private_pages_behind_login() -> None:
@@ -92,7 +101,7 @@ def test_login_page_supports_setup_and_login_modes() -> None:
 def test_no_access_token_in_urls_or_query_strings() -> None:
     """Token 只能走 Authorization 头或 WebSocket 首帧，不得出现在 URL 里。"""
     patterns = ("access_token=", "token=")
-    for base in (WEB_SRC, ANDROID_SRC, DESKTOP_SRC):
+    for base in (WEB_SRC, ANDROID_SRC, DESKTOP_SRC, SHARED_SRC):
         for path in _sources(base, ("*.ts", "*.tsx", "*.mjs", "*.cjs")):
             text = path.read_text(encoding="utf-8")
             for pattern in patterns:
