@@ -3,6 +3,7 @@ import {
   buckets,
   deviceLabel,
   statusLabel,
+  taskTypeLabel,
   type Attention,
   type Bucket,
 } from "../../../../shared/work/types";
@@ -145,7 +146,7 @@ function WorkDetail({
     <div className="mobile-detail">
       <section>
         <small>
-          {goal ? "长期目标" : "委派工作"} · {statusLabel(task.task_status)}
+          {taskTypeLabel(task.task_type)} · {statusLabel(task.task_status)}
         </small>
         <h1>{task.title}</h1>
         <p>{task.goal}</p>

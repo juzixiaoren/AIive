@@ -203,6 +203,8 @@ const statuses: Record<string, string> = {
   pending: "待执行",
   ready: "已就绪",
   waiting_user: "等待你处理",
+  waiting_time: "等待计划时间",
+  missed: "已错过",
   waiting_trigger: "等待触发",
   done: "已完成",
   skipped: "已跳过",
@@ -227,4 +229,14 @@ export function deviceLabel(device: Device): string {
 }
 export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "请求失败，请重试";
+}
+
+export function taskTypeLabel(value: string): string {
+  const types: Record<string, string> = {
+    general: "一般工作", long_term_goal: "长期目标", file_operation: "文件操作",
+    document: "文档处理", research: "调研", web_research: "网络调研",
+    self_improvement: "自进化", shell: "命令执行", development: "开发工作",
+    knowledge: "知识处理", capability_management: "能力管理",
+  };
+  return types[value] || value;
 }

@@ -13,6 +13,7 @@ import {
 import {
   deviceLabel,
   statusLabel,
+  taskTypeLabel,
   type Attention,
 } from "../../../shared/work/types";
 import WorkFile from "./WorkFile";
@@ -140,7 +141,7 @@ export default function WorkDetail({
     <div className="work-detail">
       <header>
         <span className="work-eyebrow">
-          {goal ? "长期目标" : "委派工作"} · {statusLabel(task.task_status)}
+          {taskTypeLabel(task.task_type)} · {statusLabel(task.task_status)}
         </span>
         <h2>{task.title}</h2>
         <p>{task.goal}</p>
