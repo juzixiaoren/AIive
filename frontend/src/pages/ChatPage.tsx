@@ -42,6 +42,7 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [attachmentBlocked, setAttachmentBlocked] = useState(false);
   const attachmentRequestRef = useRef<{ key: string; id: string } | null>(null);
+  const [attachmentRecovery, setAttachmentRecovery] = useState(0);
   const [attachmentKey, setAttachmentKey] = useState(0);
   const attachmentChanged = useCallback((files: Attachment[], blocked: boolean) => { setAttachments(files); setAttachmentBlocked(blocked); }, []);
   const [input, setInput] = useState("");
@@ -598,7 +599,7 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
         // onStarted：Turn 已持久化后立即记录真实线程 ID，供首次对话断流恢复。
         (event) => {
           started = true;
-          setInput(""); setAttachmentKey(key => key + 1); setAttachments([]);
+
           activeStreamThreadIdRef.current = event.thread_id;
           activeTurnRecordIdRef.current = event.turn_record_id || undefined;
           setThreadId(event.thread_id);
@@ -664,6 +665,7 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
         attachmentRequestRef.current.id,
       );
 
+      setInput(""); setAttachmentKey(key => key + 1); setAttachments([]);
       if (result.cancelled) {
         // 服务端已完成取消收口：本轮用户消息不进入历史，本地同步移除并恢复服务器历史。
         setMessages((prev) => prev.filter(
@@ -759,6 +761,10 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
         }
       }
     } catch (e: unknown) {
+      if (e instanceof ApiError && e.draftRecoverable) {
+        setInput(text); setAttachments([]); setAttachmentBlocked(true);
+        setAttachmentRecovery(value => value + 1); attachmentRequestRef.current = null;
+      } else if (started) { setInput(""); setAttachmentKey(key => key + 1); setAttachments([]); }
       const errorCode = e instanceof ApiError ? e.code : "";
       const busyBeforeStart = !started && errorCode === "turn_in_progress";
       const staleBeforeStart = !started && errorCode === "stale_thread_id";
@@ -1175,7 +1181,7 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
           </div>
         )}
 
-        <AttachmentComposer key={attachmentKey} fetcher={attachmentFetch} readCredential={getToken} uploadUrl={new URL("api/attachments", window.location.href).href} disabled={!conversationReady || execState !== "idle"} onChange={attachmentChanged} />
+        <AttachmentComposer key={attachmentKey} recovery={attachmentRecovery} fetcher={attachmentFetch} readCredential={getToken} uploadUrl={new URL("api/attachments", window.location.href).href} disabled={!conversationReady || execState !== "idle"} onChange={attachmentChanged} />
         {/* 输入区域 */}
         <div className="flex gap-2 items-end">
           <textarea

@@ -2255,7 +2255,7 @@ class Attachment(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     thread_id: Mapped[str] = mapped_column(ForeignKey("threads.id"), index=True)
     turn_record_id: Mapped[str | None] = mapped_column(ForeignKey("turn_records.id"), index=True)
-    event_id: Mapped[str | None] = mapped_column(ForeignKey("events.id"))
+    event_id: Mapped[str | None] = mapped_column(ForeignKey("events.id"), index=True)
     filename: Mapped[str] = mapped_column(String(255))
     mime: Mapped[str] = mapped_column(String(128))
     size: Mapped[int] = mapped_column(BigInteger)

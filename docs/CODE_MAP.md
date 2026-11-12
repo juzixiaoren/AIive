@@ -1176,3 +1176,14 @@ V62.6.1 测试清理：根 `conftest.py::_cleanup_test_db` / `pytest_sessionfini
 - `shared/chat/attachments.tsx`：两端共用选择、进度、失败重试、预览、完整性检查及卡片。
 - `apps/android/src/work/chatFiles.ts`：官方 Filesystem / Share 桥接。
 - `tests/unit/backend/test_chat_attachments.py`：格式、安全、真实 SSE 路由、上下文、预算、取消与 Forget。
+
+
+## P1/P2 收尾链路
+
+- shared/work/connection.ts：首帧与执行结束转换共用刷新；controller.ts 独立处理快照分区失败。
+- runtime/attachments.py::LoadedAttachments：统一 Prompt/元数据/来源集合；check_quota 在读取前限制累计资源。
+- forget/content_scrub.py::attachment_ids/scrub_attachments：中央 Scrub/Verify/对象共享引用；不清 memory_only 原件。
+- runtime/attachments.py::retire/reconcile/process_cleanup_actions：事务内解除引用与历史修复，提交后安全删除/失败重试。
+- shared/chat/draft.ts：已知未执行错误保留 File、作废旧上传 ID；两端共用恢复行为。
+- d5e8f102b304：附件 Event 查找索引；历史分页只查询当前页 Event，并批量校验可见性。
+- tests/integration/backend/test_chat_attachment_forget.py 与 pg/test_pg_chat_attachments.py：中央事务与历史补偿契约。

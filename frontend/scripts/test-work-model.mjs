@@ -717,3 +717,76 @@ test("both chat transports submit issued attachment IDs and a stable turn key", 
     assert.deepEqual(sent, [0, 1].map(() => ({ message: "question", thread_id: "thread", attachment_ids: ["issued-id"], turn_id: "stable-key" })));
   } finally { globalThis.fetch = previousFetch; }
 });
+
+
+test("work snapshots isolate inbox/view/timeline failures", async () => {
+  for (const failure of ["view404", "viewNetwork", "inbox", "both", "timeline"]) {
+    const store = new WorkController({
+      inbox: async () => { if (["inbox", "both"].includes(failure)) throw new Error("inbox failed"); return { items: [{ task_id: "fresh" }], next_cursor: null, has_more: false }; },
+      view: async id => { if (["view404", "viewNetwork", "both"].includes(failure)) throw new Error(failure); return view(id); },
+      timeline: async () => { if (failure === "timeline") throw new Error("timeline failed"); return { items: [], has_more: false, next_sequence: 5 }; },
+    });
+    store.state = { ...store.state, items: [{ task_id: "unverified-old" }], view: view("old"), timeline: [{ sequence: 0 }] };
+    store.select("selected");
+    await store.refresh();
+    assert.deepEqual(store.state.items.map(i => i.task_id), ["inbox", "both"].includes(failure) ? [] : ["fresh"]);
+    assert.equal(store.state.view?.task.task_id, ["view404", "viewNetwork", "both"].includes(failure) ? undefined : "selected");
+    assert.equal(store.state.timeline.length, ["view404", "viewNetwork", "both"].includes(failure) ? 0 : 1);
+    assert.ok(store.state.error);
+    store.dispose();
+  }
+});
+
+test("execution completion resnapshots without work_changed and repeated idle is inert", async () => {
+  const original = { WebSocket: globalThis.WebSocket, window: globalThis.window, document: globalThis.document };
+  const sockets = [];
+  class Socket { constructor() { sockets.push(this); } close() {} send() {} frame(state) { this.onmessage({ data: JSON.stringify({ type: "execution_status", data: { state } }) }); } }
+  globalThis.WebSocket = Socket; globalThis.window = new EventTarget(); globalThis.document = new EventTarget(); globalThis.document.hidden = false;
+  let reads = 0, forgotten = false;
+  const store = new WorkController({ inbox: async () => { reads++; return { items: forgotten ? [] : [{ task_id: "old" }], has_more: false, next_cursor: null }; } });
+  const dispose = subscribeThread("ws://test", () => "credential", () => {}, () => { void store.refresh(); });
+  try {
+    sockets[0].frame("running"); await store.refresh(); const baseline = reads;
+    sockets[0].frame("busy"); sockets[0].frame("running"); await tick(); assert.equal(reads, baseline);
+    forgotten = true; sockets[0].frame("idle"); await tick(); await tick(); assert.deepEqual(store.state.items, []); assert.equal(reads, baseline + 1);
+    sockets[0].frame("idle"); await tick(); assert.equal(reads, baseline + 1);
+    sockets[0].frame("busy"); sockets[0].frame("idle"); await tick(); assert.equal(reads, baseline + 2);
+  } finally { dispose(); store.dispose(); Object.assign(globalThis, original); }
+});
+
+test("known context rejection preserves local files and invalidates bound IDs for explicit retry", async () => {
+  const { recoverAttachmentDraft } = await load("../../shared/chat/draft.ts");
+  const file = { name: "large.pdf" };
+  const original = [{ file, progress: 100, attachment: { id: "bound-id" } }];
+  const recovered = recoverAttachmentDraft(original);
+  assert.equal(recovered[0].file, file);
+  assert.equal(recovered[0].attachment, undefined);
+  assert.equal(original[0].attachment.id, "bound-id");
+  const previous = globalThis.fetch;
+  globalThis.fetch = async () => new Response('event: started\ndata: {"thread_id":"thread","turn_record_id":"turn"}\n\nevent: error\ndata: {"code":"context_budget_exceeded","draft_recoverable":true,"status":413}\n\n');
+  const noop = () => {};
+  try {
+    await assert.rejects(webChat.sendMessageStream("draft", "thread", noop, noop, noop, noop, noop), e => e.draftRecoverable === true);
+    await assert.rejects(androidChat.streamMessage("draft", "thread", { onStarted: noop, onToken: noop }, new AbortController().signal), e => e.draftRecoverable === true);
+  } finally { globalThis.fetch = previous; }
+});
+
+
+test("stale pagination rejection cannot replace a newer authoritative snapshot", async () => {
+  let failPage;
+  const blocked = new Promise((_resolve, reject) => { failPage = reject; });
+  let reads = 0;
+  const store = new WorkController({ inbox: async (_bucket, cursor) => {
+    if (cursor) return blocked;
+    reads++;
+    return { items: [{ task_id: `snapshot-${reads}` }], next_cursor: "next", has_more: true };
+  } });
+  await store.refresh();
+  const pagination = store.more();
+  await store.refresh();
+  failPage(new Error("stale page failed"));
+  await pagination;
+  assert.equal(store.state.items[0].task_id, "snapshot-2");
+  assert.equal(store.state.error, "");
+  store.dispose();
+});

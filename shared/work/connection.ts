@@ -23,6 +23,7 @@ export function subscribeThread(
     const current = new WebSocket(url);
     socket = current;
     let ready = false;
+    let executionState: unknown;
     current.onopen = () =>
       current.send(
         JSON.stringify({ type: "auth", access_token: token() || "" }),
@@ -36,10 +37,12 @@ export function subscribeThread(
         return;
       }
       // The server sends an authenticated execution_status snapshot on every connection.
-      if (!ready && envelope.type === "execution_status") {
+      if (envelope.type === "execution_status") {
+        const next = envelope.data?.state;
+        if (!ready || (next === "idle" && (executionState === "running" || executionState === "busy"))) onReady();
         ready = true;
         failures = 0;
-        onReady();
+        executionState = next;
       }
       onEvent(envelope);
     };

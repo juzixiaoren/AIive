@@ -319,12 +319,14 @@ def create_app() -> FastAPI:
             logger.exception("Outbox poll 调度注册失败")
 
         async def attachment_gc():
-            from aiive.runtime.attachments import cleanup
+            from aiive.runtime.attachments import cleanup, reconcile, process_cleanup_actions
             from aiive.db.base import SessionLocal
             def collect():
                 with SessionLocal() as db:
+                    reconcile(db)
                     cleanup(db)
                     db.commit()
+                    process_cleanup_actions(db)
             while True:
                 try:
                     await asyncio.to_thread(collect)

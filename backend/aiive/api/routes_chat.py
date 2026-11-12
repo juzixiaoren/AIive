@@ -67,7 +67,7 @@ def _chat_error_payload(result: dict[str, object]) -> dict[str, object]:
     }
     for key in (
         "safe_tokens", "context_window", "hard_input_limit",
-        "partition_reports", "partial_tool_records",
+        "partition_reports", "partial_tool_records", "draft_recoverable",
     ):
         if key in result:
             payload[key] = result.get(key)

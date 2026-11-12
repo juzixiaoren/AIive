@@ -1,10 +1,12 @@
+import { recoverAttachmentDraft } from "./draft";
 import { useEffect, useRef, useState } from "react";
 export interface Attachment { id: string; filename: string; mime: string; size: number; sha256: string }
 export type AttachmentFetch = (path: string, init?: RequestInit) => Promise<Response>;
 interface Pending { key: string; file: File; progress: number; attachment?: Attachment; error?: string; preview?: string }
 const accept = ".pdf,.docx,.txt,.md,.markdown,.html,.htm,.json,.csv,.tsv,.png,.jpg,.jpeg,.webp";
-export function AttachmentComposer({ fetcher, uploadUrl, readCredential, disabled, onChange }: {
+export function AttachmentComposer({ fetcher, uploadUrl, readCredential, disabled, recovery = 0, onChange }: {
   fetcher: AttachmentFetch; uploadUrl: string; readCredential: () => string | null; disabled: boolean;
+  recovery?: number;
   onChange: (attachments: Attachment[], blocked: boolean) => void;
 }) {
   const [items, setItems] = useState<Pending[]>([]);
@@ -13,6 +15,13 @@ export function AttachmentComposer({ fetcher, uploadUrl, readCredential, disable
   const [error, setError] = useState("");
   useEffect(() => { onChange(items.flatMap(i => i.attachment ? [i.attachment] : []), items.some(i => !i.attachment)); }, [items]);
   useEffect(() => () => { for (const r of requests.current) r.abort(); for (const i of latest.current) if (i.preview) URL.revokeObjectURL(i.preview); }, []);
+  useEffect(() => {
+    if (recovery) {
+      for (const request of requests.current) request.abort();
+      requests.current.clear();
+      setItems(old => recoverAttachmentDraft(old));
+    }
+  }, [recovery]);
   function upload(item: Pending) {
     setItems(old => old.map(i => i.key === item.key ? { ...i, error: undefined, progress: 0 } : i));
     const xhr = new XMLHttpRequest(); requests.current.add(xhr);

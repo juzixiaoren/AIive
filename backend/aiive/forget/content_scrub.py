@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 from aiive.db.forget_models import ForgetAction
 from aiive.db.models import (
     AgentTask,
+    Attachment,
     Document,
     OutboxJob,
     TaskArtifact,
@@ -825,6 +826,8 @@ SCRUBBED_FIELDS: frozenset[str] = frozenset({
     "task_evidence.object_bucket", "task_evidence.object_key",
     "task_artifacts.name", "task_artifacts.summary",
     "task_artifacts.object_bucket", "task_artifacts.object_key",
+    "chat_attachments.filename", "chat_attachments.mime", "chat_attachments.sha256",
+    "chat_attachments.object_key", "chat_attachments.size",
     "documents.status", "documents.title", "documents.object_bucket", "documents.object_key",
     "chunks.content", "knowledge_chunk_vectors.chunk_id",
     "memory_conflict_cases.old_content", "memory_conflict_cases.new_content",
@@ -895,6 +898,8 @@ VERIFIED_FIELDS: frozenset[str] = frozenset({
     "task_evidence.object_bucket", "task_evidence.object_key",
     "task_artifacts.name", "task_artifacts.summary",
     "task_artifacts.object_bucket", "task_artifacts.object_key",
+    "chat_attachments.filename", "chat_attachments.mime", "chat_attachments.sha256",
+    "chat_attachments.object_key", "chat_attachments.size",
     "documents.status", "documents.title", "documents.object_bucket", "documents.object_key",
     "chunks.content", "knowledge_chunk_vectors.chunk_id",
     "memory_conflict_cases.old_content", "memory_conflict_cases.new_content",
@@ -1107,6 +1112,24 @@ def _record_knowledge_chunk_ids(
         return
     action.details = {"chunk_ids": sorted(chunk_ids)}
     db.flush()
+
+
+def attachment_ids(db: Session, scope: ContentScope) -> set[str]:
+    if scope.preserve_raw_history:
+        return set()
+    ids = _thread_or_time_ids(db, "chat_attachments", "created_at", scope)
+    if scope.raw_event_ids:
+        ids |= _ids_from(db, "SELECT id FROM chat_attachments WHERE event_id IN :ids", scope.raw_event_ids)
+    if scope.raw_turn_tokens:
+        ids |= _ids_from(db, "SELECT id FROM chat_attachments WHERE turn_record_id IN :ids", scope.raw_turn_tokens)
+    return ids
+
+
+def scrub_attachments(db: Session, scope: ContentScope) -> tuple[dict[str, int], set[tuple[str, str]]]:
+    ids = attachment_ids(db, scope)
+    refs = {("chat-attachments", key) for (key,) in db.query(Attachment.object_key).filter(Attachment.id.in_(ids)).all() if key}
+    count = _execute_ids(db, "UPDATE chat_attachments SET filename = '[redacted]', mime = '', size = 0, sha256 = '', object_key = '' WHERE id IN :ids", ids)
+    return {"chat_attachments": count}, refs
 
 
 def scrub_knowledge(
@@ -1775,6 +1798,11 @@ def verify_scope(db: Session, scope: ContentScope) -> VerifyReport:
                 set(stored_chunks),
             ))
 
+    attachments = attachment_ids(db, scope)
+    for column in ("filename", "mime", "sha256", "object_key"):
+        report.add(f"chat_attachments.{column}", _count_nonempty_text(db, "chat_attachments", column, attachments))
+    report.add("chat_attachments.size", _sum_in(db, "SELECT COUNT(*) FROM chat_attachments WHERE id IN :ids AND size <> 0", attachments))
+
     # Objects
     actions = pending_object_actions(db, scope.operation_id)
     if actions:
@@ -1823,10 +1851,12 @@ def scrub_all(db: Session, scope: ContentScope) -> dict[str, int]:
     counts.update(task_counts)
     knowledge_counts, doc_refs = scrub_knowledge(db, scope)
     counts.update(knowledge_counts)
+    attachment_counts, attachment_refs = scrub_attachments(db, scope)
+    counts.update(attachment_counts)
     # 仅登记已无任何保留行引用的孤儿对象；共享对象不删除。
     orphan_refs = {
         (bucket, key)
-        for bucket, key in (task_refs | doc_refs)
+        for bucket, key in (task_refs | doc_refs | attachment_refs)
         if verify_object_shared_refs(db, bucket, key) == 0
     }
     counts["objects_queued"] = queue_object_deletions(
@@ -1842,4 +1872,6 @@ def verify_object_shared_refs(db: Session, bucket: str, key: str) -> int:
         total += int(db.execute(sa_text(
             f"SELECT COUNT(*) FROM {table} WHERE object_bucket = :b AND object_key = :k"
         ), {"b": bucket, "k": key}).scalar() or 0)
+    if bucket == "chat-attachments":
+        total += int(db.query(Attachment).filter(Attachment.object_key == key).count())
     return total

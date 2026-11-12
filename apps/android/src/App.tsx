@@ -119,6 +119,7 @@ export function ChatApp({ username, onLogout, active, onOpenWork }: { username: 
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [attachmentBlocked, setAttachmentBlocked] = useState(false);
   const attachmentRequestRef = useRef<{ key: string; id: string } | null>(null);
+  const [attachmentRecovery, setAttachmentRecovery] = useState(0);
   const [attachmentKey, setAttachmentKey] = useState(0);
   const attachmentChanged = useCallback((files: Attachment[], blocked: boolean) => { setAttachments(files); setAttachmentBlocked(blocked); }, []);
   const [input, setInput] = useState("");
@@ -352,7 +353,7 @@ export function ChatApp({ username, onLogout, active, onOpenWork }: { username: 
         {
           onStarted: (nextThreadId, turnRecordId) => {
             started = true;
-            setInput(""); setAttachmentKey(key => key + 1); setAttachments([]);
+
             setThreadId(nextThreadId);
             activeTurnRecordIdRef.current = turnRecordId;
           },
@@ -366,6 +367,7 @@ export function ChatApp({ username, onLogout, active, onOpenWork }: { username: 
         attachments.map(file => file.id),
         attachmentRequestRef.current.id,
       );
+      setInput(""); setAttachmentKey(key => key + 1); setAttachments([]);
       if (result.cancelled) {
         // 服务端已丢弃本轮用户消息：本地移除乐观气泡并恢复服务器历史。
         setMessages((current) => current.filter(
@@ -381,6 +383,10 @@ export function ChatApp({ username, onLogout, active, onOpenWork }: { username: 
         )));
       }
     } catch (cause) {
+      if (cause instanceof ChatApiError && cause.draftRecoverable) {
+        setInput(content); setAttachments([]); setAttachmentBlocked(true);
+        setAttachmentRecovery(value => value + 1); attachmentRequestRef.current = null;
+      } else if (started) { setInput(""); setAttachmentKey(key => key + 1); setAttachments([]); }
       const errorCode = cause instanceof ChatApiError ? cause.code : "";
       const busyBeforeStart = !started && errorCode === "turn_in_progress";
       const staleBeforeStart = !started && errorCode === "stale_thread_id";
@@ -575,7 +581,7 @@ export function ChatApp({ username, onLogout, active, onOpenWork }: { username: 
                 : remoteRunning ? "Agent 正在其他设备回复…" : "Agent 正在回复…"}
             </div>
           )}
-            <AttachmentComposer key={attachmentKey} fetcher={attachmentFetch} readCredential={attachmentToken} uploadUrl={`${appConfig.backendBaseUrl}/api/attachments`} disabled={!conversationReady || execState !== "idle"} onChange={attachmentChanged} />
+            <AttachmentComposer key={attachmentKey} recovery={attachmentRecovery} fetcher={attachmentFetch} readCredential={attachmentToken} uploadUrl={`${appConfig.backendBaseUrl}/api/attachments`} disabled={!conversationReady || execState !== "idle"} onChange={attachmentChanged} />
           <div className={`composer ${streaming ? "is-streaming" : ""}`}>
             <textarea
               ref={textareaRef}

@@ -256,8 +256,9 @@ class ContextAssembler:
         epoch_cp_text = self._load_epoch_checkpoint(db, thread_id)
         bridge_text = self._load_sealing_bridge(db, thread_id)
         rendered: dict[str, Any] = {}
-        from aiive.runtime.attachments import prompt_parts
-        attachment_parts = prompt_parts(db, thread_id)
+        from aiive.runtime.attachments import load_attachments
+        loaded_attachments = load_attachments(db, thread_id)
+        attachment_parts = loaded_attachments.parts
 
 
         def render() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -346,10 +347,7 @@ class ContextAssembler:
             **snapshot_args, user_message=message, _source=_source,
         )
         if attachment_parts:
-            from aiive.db.models import Attachment
-            from aiive.runtime.attachments import metadata, visible
-            refs = [metadata(row) for row in db.query(Attachment).filter(
-                Attachment.thread_id == thread_id, Attachment.turn_record_id.isnot(None)) if visible(db, row)]
+            refs = loaded_attachments.metadata
             snapshot.items.append(ContextSnapshotItem(
                 item_id="attachments", kind="attachment_refs", source="user", trust_level="untrusted",
                 content_preview=_json.dumps(refs, ensure_ascii=False)))
@@ -357,6 +355,7 @@ class ContextAssembler:
         snapshot.selection_trace = candidates.selection_trace
         snapshot.stable_prefix_hash = _hash_text(rendered["system"])
         snapshot.injected_memory_ids = self._collect_injected_memory_ids(pack)
+        agent_ctx["attachment_source_event_ids"] = loaded_attachments.source_event_ids
         agent_ctx["open_questions"] = open_questions
         return AssembledContext(
             messages=messages, tools_schema=tools_schema, partition_reports=reports,

@@ -42,3 +42,32 @@
 - 未发送上传以非消息 attachment_uploaded Event 保留 Forget 来源；关联后使用原用户消息 Event。
 - 未删除旧实现；保留任务附件与知识库原链路，聊天附件与其职责不同。
 - 初始工作区既有 P1 报告与阶段记录改动保持原样，不纳入本 Part 提交。
+
+
+## P1/P2 收尾修复（2026-11-12）
+
+经当前 main 代码核实后修复以下实际缺陷，全程未使用浏览器或浏览器自动化：
+
+- 工作中心公共 Thread 连接首帧、running/busy → idle、重连/网络/前台恢复均触发权威刷新。
+  重复 idle 不刷新，running/busy 切换不误判结束；work_changed 可见性过滤保持不变。
+- Inbox、WorkView、Timeline 的请求失败独立处理；成功数据保留，失败分区清除未经验证旧缓存。
+  generation / snapshot / 选择竞争 / sequence 去重仍有效。
+- Prompt、来源 Event IDs、附件安全快照共用一次附件加载结果；pending 上传不再污染其他 Turn。
+- Chat Attachment 纳入中央 Scrub / Verify 字段覆盖与对象引用计数；清除文件名、MIME、大小、hash 和对象键。
+  Object Store 统一通过持久 ForgetAction(delete_object) 在 COMMIT 后处理，失败保留重试，存在共享引用不删除。
+- 启动及每小时维护执行幂等历史补偿：仅删除 attachment_context 对 attachment_uploaded 的错误来源引用；
+  对既有冻结 Forget selector 补做附件 Scrub，记录修复 Action 并提交后处理对象。合法用户消息来源不删除。
+- started 仅表示 Turn 已创建。已知 Agent 执行前失败通过 draft_recoverable 标记恢复草稿，保留本地 File，
+  作废失败 Turn 的旧附件 ID，由用户主动重传获得新 ID；未知执行结果不自动重试。
+- Thread 累计默认 100 个/100 MiB；pending 默认 10 个/40 MiB，均可用 AIIVE_ATTACHMENT_THREAD_MAX_*
+  与 AIIVE_ATTACHMENT_PENDING_MAX_* 配置。对象读取、Base64 构造之前预检查；Token 预算仍走原全局 Packer。
+- 历史分页只查询本页 Event 的附件，并批量校验可见性；新增 event_id 索引，Alembic head d5e8f102b304。
+- 上传失败、移除和 GC 清理上传 Event 的无引用敏感元数据，保留审计 ID；对象删除遵循提交后执行与共享引用检查。
+
+验证：完整离线回归 1977 passed / 141 skipped / 6162 warnings（391.48 秒）；后续补充历史原件补偿用例已进入
+聚焦测试与 CI（最终附件/Forget 聚焦 35 passed）。Node 聊天 4 项、跨端工作/草稿/传输 19 项；Web/Android TypeScript+Vite 生产构建通过。
+新增真实 PostgreSQL 附件事务/回滚、选择器、共享对象与历史补偿契约，随既有 PostgreSQL Job 运行。
+本机 Docker daemon 未运行，PostgreSQL 证据以最终 GitHub CI 为准；保留现有 9 Job 与测试门禁。
+
+历史生产数据的补偿在运行新版后端维护任务时执行；本次没有直接修改生产数据库或手工删除原件。
+保存/分享原生插件仍使用既有官方插件边界测试，本次不宣称 Android 真机验证，也不新增外部模型或 Agent Evaluation。

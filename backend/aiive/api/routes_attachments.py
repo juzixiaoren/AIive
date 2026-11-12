@@ -18,6 +18,7 @@ async def upload(request: Request, db: Session = Depends(get_db)):
     thread_id = get_current_thread_id(db)
     service.cleanup(db)
     db.commit()
+    service.process_cleanup_actions(db)
     data = bytearray()
     async for chunk in request.stream():
         if len(data) + len(chunk) > settings.aiive_attachment_max_bytes:
@@ -33,6 +34,9 @@ async def upload(request: Request, db: Session = Depends(get_db)):
     # Metadata first: a failed object write never leaves an untracked object.
     import hashlib
 
+    from aiive.db.models import Thread
+    db.query(Thread).filter(Thread.id == thread_id).with_for_update().one()
+    service.check_quota(db, thread_id, incoming=len(data))
     digest = hashlib.sha256(data).hexdigest()
     key = f"sha256/{digest[:2]}/{digest}"
     upload_event = Event(
@@ -57,8 +61,9 @@ async def upload(request: Request, db: Session = Depends(get_db)):
     try:
         object_store.put_content_addressed(service.BUCKET, bytes(data))
     except Exception:
-        db.delete(row)
+        service.retire(db, [row])
         db.commit()
+        service.process_cleanup_actions(db)
         raise HTTPException(503, "附件存储失败，请重试") from None
     return service.metadata(row)
 
@@ -92,10 +97,7 @@ def remove(aid: str, db: Session = Depends(get_db)):
     row = service.require(db, aid, get_current_thread_id(db))
     if row.turn_record_id:
         raise HTTPException(409, "已发送附件请通过 Forget 管理")
-    key = row.object_key
-    db.delete(row)
-    db.flush()
-    if not db.query(Attachment).filter(Attachment.object_key == key).first():
-        object_store.delete(object_store.ObjectRef(service.BUCKET, key))
+    service.retire(db, [row])
     db.commit()
+    service.process_cleanup_actions(db)
     return {"ok": True}

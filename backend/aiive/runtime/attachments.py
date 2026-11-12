@@ -8,6 +8,7 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import PurePosixPath
 from typing import Any
+from dataclasses import dataclass, field
 
 from fastapi import HTTPException
 from PIL import Image
@@ -95,26 +96,74 @@ def validate(data: bytes, filename: str, mime: str) -> str:
     return expected
 
 
-def visible(db: Session, row: Attachment) -> bool:
-    if row.turn_record_id:
-        turn = db.get(TurnRecord, row.turn_record_id)
-        if turn is None or turn.status in {"cancelled", "interrupted_unknown"}:
-            return False
-        if ForgetVisibilityService.blocked_target_ids(
-            db, "turn_record", [(turn.id, turn.created_at)]
-        ):
-            return False
-    if row.event_id:
-        from aiive.db.models import Event
+def visible_rows(db: Session, rows: list[Attachment]) -> list[Attachment]:
+    from aiive.db.models import Event
 
-        event = db.get(Event, row.event_id)
-        if event is None or ForgetVisibilityService.blocked_target_ids(
-            db, "event", [(event.id, event.created_at)]
-        ):
-            return False
-    return not ForgetVisibilityService.is_shielded(
-        db, thread_id=row.thread_id, target_time=row.created_at
+    turns = {
+        turn.id: turn
+        for turn in db.query(TurnRecord)
+        .filter(TurnRecord.id.in_({r.turn_record_id for r in rows if r.turn_record_id}))
+        .all()
+    }
+    events = {
+        event.id: event
+        for event in db.query(Event)
+        .filter(Event.id.in_({r.event_id for r in rows if r.event_id}))
+        .all()
+    }
+    blocked_turns = ForgetVisibilityService.blocked_target_ids(
+        db, "turn_record", [(t.id, t.created_at) for t in turns.values()]
     )
+    blocked_events = ForgetVisibilityService.blocked_target_ids(
+        db, "event", [(e.id, e.created_at) for e in events.values()]
+    )
+    return [
+        r
+        for r in rows
+        if r.object_key
+        and r.event_id in events
+        and r.event_id not in blocked_events
+        and (
+            not r.turn_record_id
+            or (
+                r.turn_record_id in turns
+                and r.turn_record_id not in blocked_turns
+                and turns[r.turn_record_id].status
+                not in {"cancelled", "interrupted_unknown", "failed", "preempted"}
+            )
+        )
+    ]
+
+
+def visible(db: Session, row: Attachment) -> bool:
+    return bool(visible_rows(db, [row]))
+
+
+def check_quota(
+    db: Session, thread_id: str, *, incoming: int = 0, context: bool = False
+) -> None:
+    from sqlalchemy import func
+
+    base = db.query(
+        func.count(Attachment.id), func.coalesce(func.sum(Attachment.size), 0)
+    ).filter(Attachment.thread_id == thread_id, Attachment.object_key != "")
+    if context:
+        base = base.filter(Attachment.turn_record_id.isnot(None))
+    count, size = base.one()
+    if (
+        count + (0 if context else 1) > settings.aiive_attachment_thread_max_count
+        or size + incoming > settings.aiive_attachment_thread_max_bytes
+    ):
+        raise HTTPException(
+            413, "Thread 累计附件超限，请移除未发送附件或遗忘不再需要的附件来源"
+        )
+    if not context:
+        count, size = base.filter(Attachment.turn_record_id.is_(None)).one()
+        if (
+            count + 1 > settings.aiive_attachment_pending_max_count
+            or size + incoming > settings.aiive_attachment_pending_max_bytes
+        ):
+            raise HTTPException(413, "未发送附件配额超限，请先发送或移除附件")
 
 
 def require(db: Session, aid: str, thread_id: str) -> Attachment:
@@ -148,17 +197,30 @@ def bind(db: Session, ids: list[str], turn: TurnRecord, event_id: str) -> None:
         row.turn_record_id, row.event_id = turn.id, event_id
 
 
-def prompt_parts(db: Session, thread_id: str) -> list[dict[str, Any]]:
-    parts: list[dict[str, Any]] = []
-    for row in (
+@dataclass
+class LoadedAttachments:
+    parts: list[dict[str, Any]] = field(default_factory=list)
+    source_event_ids: list[str] = field(default_factory=list)
+    metadata: list[dict[str, Any]] = field(default_factory=list)
+
+
+def load_attachments(db: Session, thread_id: str) -> LoadedAttachments:
+    result = LoadedAttachments()
+    parts = result.parts
+    check_quota(db, thread_id, context=True)
+    rows = (
         db.query(Attachment)
         .filter(
-            Attachment.thread_id == thread_id, Attachment.turn_record_id.isnot(None)
+            Attachment.thread_id == thread_id,
+            Attachment.turn_record_id.isnot(None),
+            Attachment.object_key != "",
         )
         .order_by(Attachment.created_at, Attachment.id)
-    ):
-        if not visible(db, row):
-            continue
+    ).all()
+    for row in visible_rows(db, rows):
+        result.metadata.append(metadata(row))
+        if row.event_id:
+            result.source_event_ids.append(row.event_id)
         try:
             data = object_store.get_verified(
                 object_store.ObjectRef(BUCKET, row.object_key), row.sha256
@@ -189,28 +251,204 @@ def prompt_parts(db: Session, thread_id: str) -> list[dict[str, Any]]:
             if doc.metadata.get("truncated"):
                 raise ValueError("附件未完整提取，请拆分文件")
             parts.append({"type": "text", "text": doc.text})
-    return parts
+    return result
+
+
+def prompt_parts(db: Session, thread_id: str) -> list[dict[str, Any]]:
+    return load_attachments(db, thread_id).parts
+
+
+def _upload_event_unreferenced(db: Session, event_id: str) -> bool:
+    from aiive.db.models import MemoryEvidence, Task
+    from aiive.db.forget_models import ContentProvenanceRef
+
+    return not any(
+        (
+            db.query(Attachment.id).filter(Attachment.event_id == event_id).first(),
+            db.query(ContentProvenanceRef.id)
+            .filter(
+                ContentProvenanceRef.source_type == "event",
+                ContentProvenanceRef.source_id == event_id,
+            )
+            .first(),
+            db.query(MemoryEvidence.id)
+            .filter(MemoryEvidence.source_event_id == event_id)
+            .first(),
+            db.query(TurnRecord.id)
+            .filter(TurnRecord.request_event_id == event_id)
+            .first(),
+            db.query(Task.id).filter(Task.source_event_id == event_id).first(),
+        )
+    )
+
+
+def retire(db: Session, rows: list[Attachment]) -> int:
+    """Detach within caller transaction; durable actions execute ONLY after commit."""
+    from uuid import uuid4
+    from aiive.db.models import Event
+    from aiive.db.forget_models import ForgetOperation
+    from aiive.forget.content_scrub import queue_object_deletions
+
+    if not rows:
+        return 0
+    op = ForgetOperation(
+        id=str(uuid4()),
+        operation_key=f"attachment_gc:{uuid4()}",
+        mode="history_only",
+        selector_type="event_ids",
+        selector_hash="attachment_gc",
+        status="purge_ready",
+        requested_by="attachment_gc",
+    )
+    db.add(op)
+    refs = {(BUCKET, row.object_key) for row in rows if row.object_key}
+    sources = {row.event_id for row in rows if row.event_id}
+    hashes = {row.sha256 for row in rows if row.sha256}
+    for row in rows:
+        db.delete(row)
+    db.flush()
+    from sqlalchemy import or_
+
+    candidates = (
+        db.query(Event)
+        .filter(
+            Event.event_type == "attachment_uploaded",
+            or_(Event.id.in_(sources), Event.payload["sha256"].as_string().in_(hashes)),
+        )
+        .all()
+    )
+    for event in candidates:
+        if _upload_event_unreferenced(db, event.id):
+            # Audit ID remains for FK/provenance; remove sensitive upload metadata.
+            event.payload = {}
+    queue_object_deletions(db, op.id, refs)
+    return len(rows)
 
 
 def cleanup(db: Session) -> int:
-    """Reclaim abandoned uploads after 24h and cancelled turn objects, ref-counted."""
+    from sqlalchemy import or_, and_, cast, String
+
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-    rows = db.query(Attachment).with_for_update(skip_locked=True).all()
-    keys = set()
-    for row in rows:
-        turn = db.get(TurnRecord, row.turn_record_id) if row.turn_record_id else None
-        created = (
-            row.created_at.replace(tzinfo=timezone.utc)
-            if row.created_at.tzinfo is None
-            else row.created_at
+    terminal = db.query(TurnRecord.id).filter(
+        TurnRecord.status.in_(
+            ["cancelled", "interrupted_unknown", "failed", "preempted"]
         )
-        if (not row.turn_record_id and created < cutoff) or (
-            turn and turn.status in {"cancelled", "interrupted_unknown", "failed", "preempted"}
-        ):
-            keys.add(row.object_key)
-            db.delete(row)
-    db.flush()
-    for key in keys:
-        if not db.query(Attachment).filter(Attachment.object_key == key).first():
-            object_store.delete(object_store.ObjectRef(BUCKET, key))
-    return len(keys)
+    )
+    rows = (
+        db.query(Attachment)
+        .filter(
+            or_(
+                and_(
+                    Attachment.turn_record_id.is_(None), Attachment.created_at < cutoff
+                ),
+                Attachment.turn_record_id.in_(terminal),
+            )
+        )
+        .with_for_update(skip_locked=True)
+        .all()
+    )
+    count = retire(db, rows)
+    from aiive.db.models import Event
+    from aiive.db.forget_models import ContentProvenanceRef
+
+    orphan_events = (
+        db.query(Event)
+        .filter(
+            Event.event_type == "attachment_uploaded",
+            Event.created_at < cutoff,
+            cast(Event.payload, String).notin_(["{}", "null"]),
+            ~db.query(Attachment.id).filter(Attachment.event_id == Event.id).exists(),
+            ~db.query(ContentProvenanceRef.id)
+            .filter(
+                ContentProvenanceRef.source_type == "event",
+                ContentProvenanceRef.source_id == Event.id,
+            )
+            .exists(),
+        )
+        .limit(500)
+        .all()
+    )
+    for event in orphan_events:
+        if _upload_event_unreferenced(db, event.id):
+            event.payload = {}
+    return count
+
+
+def reconcile(db: Session) -> dict[str, int]:
+    """Idempotent historical repair, staged in the caller transaction."""
+    from aiive.db.models import Event
+    from aiive.db.forget_models import (
+        ContentProvenanceRef,
+        ForgetOperation,
+        ForgetAction,
+    )
+    from aiive.forget.content_scope import load_scope
+    from aiive.forget.content_scrub import scrub_attachments, queue_object_deletions
+
+    bad_sources = db.query(Event.id).filter(Event.event_type == "attachment_uploaded")
+    removed = (
+        db.query(ContentProvenanceRef)
+        .filter(
+            ContentProvenanceRef.owner_type == "attachment_context",
+            ContentProvenanceRef.source_type == "event",
+            ContentProvenanceRef.source_id.in_(bad_sources),
+        )
+        .delete(synchronize_session=False)
+    )
+    scrubbed = 0
+    # Reapply ONLY attachment scrub to existing frozen selectors, not unrelated data.
+    from sqlalchemy import or_
+
+    for op in (
+        db.query(ForgetOperation)
+        .filter(
+            or_(
+                ForgetOperation.requested_by.is_(None),
+                ForgetOperation.requested_by != "attachment_gc",
+            )
+        )
+        .all()
+    ):
+        repair_key = f"fo:{op.id}:chat_attachments_v2"
+        if db.query(ForgetAction.id).filter_by(idempotency_key=repair_key).first():
+            continue
+        scope = load_scope(db, op.id, op.mode)
+        if scope is None:
+            continue
+        counts, refs = scrub_attachments(db, scope)
+        scrubbed += counts.get("chat_attachments", 0)
+        queue_object_deletions(db, op.id, refs)
+        db.add(
+            ForgetAction(
+                forget_operation_id=op.id,
+                action_type="repair_attachments",
+                batch_no=0,
+                status="done",
+                idempotency_key=repair_key,
+                details={"records": counts.get("chat_attachments", 0)},
+                completed_at=datetime.now(timezone.utc),
+            )
+        )
+    return {"invalid_provenance": removed, "attachments_scrubbed": scrubbed}
+
+
+def process_cleanup_actions(db: Session) -> None:
+    from aiive.db.forget_models import ForgetAction, ForgetOperation
+    from aiive.forget.content_scrub import process_object_deletions
+
+    for (operation_id,) in (
+        db.query(ForgetAction.forget_operation_id)
+        .filter(
+            ForgetAction.action_type == "delete_object",
+            ForgetAction.status.in_(["pending", "failed"]),
+        )
+        .distinct()
+        .all()
+    ):
+        result = process_object_deletions(db, operation_id)
+        operation = db.get(ForgetOperation, operation_id)
+        if operation is not None and operation.requested_by == "attachment_gc":
+            operation.status = "failed_retryable" if result["failed"] else "purged"
+            if not result["failed"]:
+                operation.purged_at = datetime.now(timezone.utc)
+            db.commit()

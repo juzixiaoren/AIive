@@ -391,18 +391,19 @@ class TurnExecutionService:
                 "context_window": e.context_window,
                 "hard_input_limit": e.hard_input_limit,
                 "partition_reports": [report.__dict__ for report in e.partition_reports],
+                "draft_recoverable": True,
             }
             return
         except HTTPException as error:
             heartbeat.stop()
             self._mark_turn_interrupted_safely(turn.id, execution_id, "attachment_unavailable")
-            yield {"type": "error", "error": "attachment_unavailable", "message": str(error.detail), "_status": error.status_code}
+            yield {"type": "error", "error": "attachment_unavailable", "message": str(error.detail), "_status": error.status_code, "draft_recoverable": True}
             return
         except Exception:
             heartbeat.stop()
             self._mark_turn_interrupted_safely(turn.id, execution_id, "context_loading_failed")
             logger.exception("流式 Turn 上下文加载失败: thread_id=%s", turn.thread_id)
-            yield {"type": "error", "error": "internal_error", "trace_id": trace_id}
+            yield {"type": "error", "error": "context_loading_failed", "message": "上下文组装失败，本轮尚未执行，可拆分文件后重新上传", "trace_id": trace_id, "draft_recoverable": True}
             return
 
         # 取消可能在上游（上下文加载）期间到达：进入图执行前先收口。
@@ -1574,9 +1575,10 @@ class TurnExecutionService:
                 db.flush()
 
             from aiive.db.models import Attachment
-            from aiive.runtime.attachments import visible
-            has_images = any(visible(db, row) for row in db.query(Attachment).filter(
-                Attachment.thread_id == turn.thread_id, Attachment.turn_record_id.isnot(None), Attachment.mime.like("image/%")))
+            from aiive.runtime.attachments import check_quota, visible_rows
+            check_quota(db, turn.thread_id, context=True)
+            has_images = bool(visible_rows(db, db.query(Attachment).filter(
+                Attachment.thread_id == turn.thread_id, Attachment.turn_record_id.isnot(None), Attachment.mime.like("image/%"), Attachment.object_key != "").all()))
             if has_images:
                 if settings.aiive_vision_model:
                     self._llm_client = LLMClient(
@@ -1609,8 +1611,7 @@ class TurnExecutionService:
                 current_turn_id=turn.turn_id,
             )
             from aiive.forget.durable_sources import persist_sources
-            source_events = [row.event_id for row in db.query(Attachment).filter(
-                Attachment.thread_id == turn.thread_id, Attachment.event_id.isnot(None)) if visible(db, row)]
+            source_events = assembled.agent_ctx.get("attachment_source_event_ids", [])
             self._has_attachment_context = bool(source_events)
             persist_sources(db, "attachment_context", turn.id, {"source_event_ids": source_events})
             db.commit()

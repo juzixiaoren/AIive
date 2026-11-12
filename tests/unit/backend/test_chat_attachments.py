@@ -27,22 +27,37 @@ from aiive.storage import object_store
 
 
 @pytest.fixture
-def db_session(_db_template, tmp_path):
-    # HTTP requests commit and roll back independently; avoid sharing an outer
-    # transaction across SSE threads and failed upload/binding requests.
+def db_session(_db_template, tmp_path, monkeypatch):
+    # SSE and heartbeat threads must use separate real transactions/sessions.
     import shutil
+    import sys
     from sqlalchemy import create_engine
-    from sqlalchemy.orm import Session
-    from tests.support import set_current_test_session
+    from sqlalchemy.orm import Session, sessionmaker
+    import aiive.db.base as base
+
     path = tmp_path / "attachments.db"
     shutil.copyfile(_db_template, path)
     engine = create_engine(f"sqlite:///{path}")
     session = Session(engine)
-    set_current_test_session(session)
+    factory = sessionmaker(engine)
+    previous = base.SessionLocal
+    for name, module in list(sys.modules.items()):
+        if (
+            name.startswith("aiive.")
+            and module is not None
+            and getattr(module, "SessionLocal", None) is previous
+        ):
+            monkeypatch.setattr(module, "SessionLocal", factory)
     try:
         yield session
     finally:
-        set_current_test_session(None)
+        for name, module in list(sys.modules.items()):
+            if (
+                name.startswith("aiive.")
+                and module is not None
+                and getattr(module, "SessionLocal", None) is factory
+            ):
+                setattr(module, "SessionLocal", previous)
         session.close()
         engine.dispose()
 
@@ -373,3 +388,157 @@ def test_forget_pending_upload_cannot_resurrect(client, db_session):
     assert client.get(f"/api/attachments/{aid}/content").status_code == 404
     with pytest.raises(HTTPException):
         service.require(db_session, aid, row.thread_id)
+
+
+def test_pending_upload_does_not_taint_other_device_turn(
+    client, db_session, monkeypatch
+):
+    from aiive.db.forget_models import ContentProvenanceRef
+
+    calls = []
+    monkeypatch.setattr(
+        "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
+        lambda self: Model(calls),
+    )
+    monkeypatch.setattr(
+        "aiive.api.routes_chat.default_llm_client", lambda: FakeLLMClient()
+    )
+    aid = upload(client).json()["id"]
+    source = db_session.get(Attachment, aid).event_id
+    response = client.post(
+        "/api/chat", json={"message": "remember my ordinary preference"}
+    )
+    assert response.status_code == 200
+    assert "attachment secret evidence" not in str(calls[-1])
+    assert (
+        db_session.query(ContentProvenanceRef)
+        .filter_by(owner_type="attachment_context")
+        .count()
+        == 0
+    )
+    assert any(
+        job.payload.get("reply")
+        for job in db_session.query(OutboxJob).filter_by(job_type="memory_extraction")
+    )
+    execute_phase_a_shield(db_session, mode="everywhere", event_ids=[source])
+    db_session.commit()
+    tid = get_current_thread_id(db_session)
+    assert len(client.get(f"/api/threads/{tid}/messages").json()["messages"]) == 2
+
+
+def test_quotas_reject_before_object_io(client, db_session, monkeypatch):
+    aid = upload(client).json()["id"]
+    monkeypatch.setattr(settings, "aiive_attachment_pending_max_count", 1)
+    assert upload(client, b"second").status_code == 413
+    monkeypatch.setattr(settings, "aiive_attachment_pending_max_count", 10)
+    monkeypatch.setattr(settings, "aiive_attachment_pending_max_bytes", 25)
+    assert upload(client, b"second").status_code == 413
+    monkeypatch.setattr(
+        settings, "aiive_attachment_pending_max_bytes", 40 * 1024 * 1024
+    )
+    monkeypatch.setattr(settings, "aiive_attachment_thread_max_bytes", 25)
+    assert upload(client, b"second").status_code == 413
+    row = db_session.get(Attachment, aid)
+    instance = TurnExecutionService(FakeLLMClient(), attachment_ids=[aid])
+    turn, _, _ = instance._resolve_and_preempt("inspect", None, str(uuid.uuid4()))
+    monkeypatch.setattr(settings, "aiive_attachment_thread_max_bytes", 1)
+
+    def forbidden(*args):
+        raise AssertionError("read before quota")
+
+    monkeypatch.setattr(object_store, "get_verified", forbidden)
+    with pytest.raises(HTTPException) as error:
+        service.prompt_parts(db_session, row.thread_id)
+    assert error.value.status_code == 413
+
+
+def test_context_rejection_can_reupload_draft(client, db_session, monkeypatch):
+    from aiive.runtime.context_budget import ContextBudget
+
+    monkeypatch.setattr(
+        "aiive.api.routes_chat.default_llm_client", lambda: FakeLLMClient()
+    )
+    aid = upload(client).json()["id"]
+    original = TurnExecutionService._load_context
+
+    def too_small(self, *args, **kwargs):
+        self._budget = ContextBudget(100, 10)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(TurnExecutionService, "_load_context", too_small)
+    response = client.post(
+        "/api/chat/stream", json={"message": "draft text", "attachment_ids": [aid]}
+    )
+    assert '"draft_recoverable": true' in response.text
+    assert "context_budget_exceeded" in response.text
+    # The original File is retained by the shared draft model; explicit upload issues a fresh ID.
+    fresh = upload(client).json()["id"]
+    assert fresh != aid
+    monkeypatch.setattr(TurnExecutionService, "_load_context", original)
+    calls = []
+    monkeypatch.setattr(
+        "aiive.runtime.agent_graph.AgentGraph._build_langchain_llm",
+        lambda self: Model(calls),
+    )
+    assert (
+        client.post(
+            "/api/chat", json={"message": "draft text", "attachment_ids": [fresh]}
+        ).status_code
+        == 200
+    )
+
+
+def test_gc_commits_before_retryable_object_delete(client, db_session, monkeypatch):
+    from aiive.db.forget_models import ForgetAction
+
+    aid = upload(client).json()["id"]
+    row = db_session.get(Attachment, aid)
+    source, key = row.event_id, row.object_key
+    from aiive.db.models import Event
+
+    row.created_at = datetime.now(timezone.utc) - timedelta(days=2)
+    db_session.commit()
+    assert service.cleanup(db_session) == 1
+    assert object_store.exists(object_store.ObjectRef(service.BUCKET, key))
+    db_session.rollback()
+    assert db_session.get(Attachment, aid) is not None
+    service.cleanup(db_session)
+    db_session.commit()
+    assert db_session.get(Event, source).payload == {}
+
+    def failure(ref):
+        raise OSError("retry")
+
+    monkeypatch.setattr(object_store, "delete", failure)
+    service.process_cleanup_actions(db_session)
+    assert db_session.query(ForgetAction).filter_by(status="failed").count() == 1
+    assert object_store.exists(object_store.ObjectRef(service.BUCKET, key))
+
+
+def test_history_queries_only_page_attachment_sources(client, db_session, monkeypatch):
+    from aiive.api.routes_threads import ThreadState
+
+    tid = get_current_thread_id(db_session)
+    aid = upload(client).json()["id"]
+    row = db_session.get(Attachment, aid)
+    monkeypatch.setattr(
+        ThreadState,
+        "list_thread_messages_page",
+        lambda *args, **kwargs: {
+            "messages": [{"event_id": "other-event"}],
+            "has_more": False,
+            "next_cursor": None,
+        },
+    )
+    import aiive.runtime.attachments as attachment_service
+
+    original = attachment_service.visible_rows
+    seen = []
+
+    def selected_only(db, rows):
+        seen.extend(rows)
+        return original(db, rows)
+
+    monkeypatch.setattr(attachment_service, "visible_rows", selected_only)
+    assert client.get(f"/api/threads/{tid}/messages").status_code == 200
+    assert not seen

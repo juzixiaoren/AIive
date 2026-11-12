@@ -99,6 +99,7 @@ export class ApiError extends Error {
     public readonly retryable: boolean,
     public readonly traceId?: string,
     public readonly retryAfterSeconds?: number,
+    public readonly draftRecoverable: boolean = false,
   ) {
     super(message);
     this.name = "ApiError";
@@ -249,6 +250,7 @@ export async function sendMessageStream(
                   Boolean(data.retryable),
                   data.trace_id as string | undefined,
                   data.retry_after_seconds as number | undefined,
+                  Boolean(data.draft_recoverable),
                 );
                 onError(error.message);
                 throw error;

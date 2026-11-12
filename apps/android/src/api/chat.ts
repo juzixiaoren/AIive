@@ -44,6 +44,7 @@ export class ChatApiError extends Error {
     public readonly status: number,
     public readonly retryable: boolean,
     public readonly traceId?: string,
+    public readonly draftRecoverable: boolean = false,
   ) {
     super(message);
     this.name = "ChatApiError";
@@ -278,6 +279,7 @@ export async function streamMessage(
         Number(data.status || 500),
         Boolean(data.retryable),
         typeof data.trace_id === "string" ? data.trace_id : undefined,
+        Boolean(data.draft_recoverable),
       );
     }
     // 普通 tool_call / tool_result 暂不展示；审批卡片必须呈现，才能远程放行桌面高危操作。

@@ -82,11 +82,12 @@ def get_thread_messages(
             ).all()
         }
         from aiive.db.models import Attachment
-        from aiive.runtime.attachments import visible, metadata
+        from aiive.runtime.attachments import visible_rows, metadata
         by_event = {}
-        for attachment in db.query(Attachment).filter(Attachment.thread_id == thread_id, Attachment.event_id.isnot(None)):
-            if visible(db, attachment):
-                by_event.setdefault(attachment.event_id, []).append(metadata(attachment))
+        event_ids = [message.get("event_id") for message in page.get("messages", [])]
+        rows = db.query(Attachment).filter(Attachment.thread_id == thread_id, Attachment.event_id.in_(event_ids)).all()
+        for attachment in visible_rows(db, rows):
+            by_event.setdefault(attachment.event_id, []).append(metadata(attachment))
         for message in page.get("messages", []):
             message["attachments"] = by_event.get(message.get("event_id"), [])
             for card in message.get("action_cards", []):

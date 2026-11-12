@@ -129,47 +129,34 @@ export class WorkController {
       this.pending = false;
       const generation = this.generation,
         selected = this.state.selected;
-      try {
-        const [inbox, view] = await Promise.all([
-          this.api.inbox(this.state.bucket),
-          selected ? this.api.view(selected) : Promise.resolve(null),
-        ]);
-        if (generation !== this.generation || this.disposed) continue;
-        // Replace, rather than retain, cached content so Forget also removes old timeline entries.
-        this.snapshot++;
-        this.set({
-          items: inbox.items,
-          cursor: inbox.next_cursor,
-          more: inbox.has_more,
-          view,
-          timeline: view?.timeline || [],
-          historyCursor: 0,
-          historyMore: Boolean(view?.truncated.timeline),
-          error: "",
-        });
-        if (view) {
-          let after = view.last_sequence;
-          // Bound catch-up work under continuously arriving events. Next invalidation resumes from a new snapshot.
+      const [inboxResult, viewResult] = await Promise.allSettled([
+        this.api.inbox(this.state.bucket),
+        selected ? this.api.view(selected) : Promise.resolve(null),
+      ]);
+      if (generation !== this.generation || this.disposed) continue;
+      this.snapshot++;
+      const inbox = inboxResult.status === "fulfilled" ? inboxResult.value : null;
+      const view = viewResult.status === "fulfilled" ? viewResult.value : null;
+      const failures = [inboxResult, viewResult].flatMap(r => r.status === "rejected" ? [errorMessage(r.reason)] : []);
+      this.set({
+        items: inbox?.items || [], cursor: inbox?.next_cursor || null, more: inbox?.has_more || false,
+        view, timeline: view?.timeline || [], historyCursor: 0,
+        historyMore: Boolean(view?.truncated.timeline), error: failures.join("；"),
+      });
+      if (view) {
+        let after = view.last_sequence;
+        try {
           for (let page = 0; page < 5; page++) {
             const delta = await this.api.timeline(selected, after);
             if (generation !== this.generation || this.disposed) break;
-            this.set({
-              timeline: mergeTimeline(this.state.timeline, delta.items),
-            });
+            this.set({ timeline: mergeTimeline(this.state.timeline, delta.items) });
             if (!delta.has_more || delta.next_sequence <= after) break;
             after = delta.next_sequence;
           }
+        } catch (error) {
+          if (generation === this.generation && !this.disposed)
+            this.set({ error: [...failures, errorMessage(error)].join("；") });
         }
-      } catch (error) {
-        if (generation === this.generation)
-          this.set({
-            error: errorMessage(error),
-            view: null,
-            timeline: [],
-            items: [],
-            cursor: null,
-            more: false,
-          });
       }
     }
     this.set({ loading: false });
@@ -192,7 +179,7 @@ export class WorkController {
           more: page.has_more,
         });
     } catch (error) {
-      if (generation === this.generation)
+      if (generation === this.generation && snapshot === this.snapshot && !this.disposed)
         this.set({ error: errorMessage(error) });
     } finally {
       if (!this.runner) this.set({ loading: false });
@@ -215,7 +202,7 @@ export class WorkController {
           historyMore: page.has_more,
         });
     } catch (error) {
-      if (generation === this.generation)
+      if (generation === this.generation && snapshot === this.snapshot && !this.disposed)
         this.set({ error: errorMessage(error) });
     } finally {
       if (!this.runner) this.set({ loading: false });

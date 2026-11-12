@@ -1433,6 +1433,9 @@ def test_every_scrubbed_field_residue_detected(db_session: Session) -> None:
         chunk_id=chunk.id, content_hash="h", embedding_model="m",
         input_version="1", embedding=[0.0] * 512, created_at=_now(),
     ))
+    from aiive.db.models import Attachment
+    attachment = Attachment(id=_id(), thread_id=thread_id, event_id=ev, filename="secret.txt", mime="text/plain", size=1, sha256="h", object_key="")
+    db_session.add(attachment)
     op_id = _op(
         db_session, mode="everywhere", selector_type="time_range",
         payload={"time_from": _at(-120).isoformat(), "time_to": _at(120).isoformat()},
@@ -1449,6 +1452,7 @@ def test_every_scrubbed_field_residue_detected(db_session: Session) -> None:
     assert report.ok, unknown_reference_details(db_session, scope)
 
     rows = {
+        "chat_attachments": attachment.id,
         "events": ev, "turn_records": turn.id, "turn_event_inbox": db_session.query(TurnEventInbox).first().id,
         "memory_records": memory.id, "memory_proposals": proposal.id,
         "memory_maintenance_inputs": maint_in.id, "memory_maintenance_actions": maint_act.id,
@@ -1504,6 +1508,8 @@ def test_every_scrubbed_field_residue_detected(db_session: Session) -> None:
         original = db_session.execute(stmt).scalar()
         if column == "is_searchable" or column == "is_current":
             value: Any = True
+        elif table_name == "chat_attachments" and column == "size":
+            value = 1
         elif column == "status":
             value = "indexed"
         elif column in json_columns:

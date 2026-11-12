@@ -20,6 +20,10 @@ class Settings(BaseSettings):
 
     aiive_attachment_max_bytes: int = Field(default=20 * 1024 * 1024, ge=1, le=20 * 1024 * 1024)
     aiive_attachment_max_count: int = Field(default=5, ge=1, le=5)
+    aiive_attachment_thread_max_count: int = Field(default=100, ge=1)
+    aiive_attachment_thread_max_bytes: int = Field(default=100 * 1024 * 1024, ge=1)
+    aiive_attachment_pending_max_count: int = Field(default=10, ge=1)
+    aiive_attachment_pending_max_bytes: int = Field(default=40 * 1024 * 1024, ge=1)
     aiive_llm_vision_enabled: bool = False
     aiive_vision_model: str = ""
     aiive_vision_base_url: str = ""
