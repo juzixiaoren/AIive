@@ -105,6 +105,28 @@ class ForgetVisibilityService:
 
         return q.first() is not None
 
+    @staticmethod
+    def blocked_attachment_ids(session: Session, ids: list[str]) -> set[str]:
+        """Batch Phase A check against the upload's own timestamp; raw history semantics."""
+        from aiive.db.models import Attachment
+        from sqlalchemy import and_
+        if not ids:
+            return set()
+        try:
+            rows = session.query(Attachment.id).join(ForgetShield, and_(
+                ForgetShield.status == "active",
+                ForgetShield.cutoff_created_at >= Attachment.created_at,
+                or_(ForgetShield.all_user_data.is_(True), ForgetShield.thread_id == Attachment.thread_id,
+                    and_(ForgetShield.selector_type == "time_range",
+                         or_(ForgetShield.time_from.is_(None), ForgetShield.time_from <= Attachment.created_at),
+                         or_(ForgetShield.time_to.is_(None), ForgetShield.time_to >= Attachment.created_at)),
+                    and_(ForgetShield.scope_type == "thread", ForgetShield.scope_id == Attachment.thread_id)),
+            )).join(ForgetOperation, ForgetOperation.id == ForgetShield.forget_operation_id).filter(
+                Attachment.id.in_(ids), ForgetOperation.mode != "memory_only").distinct().all()
+            return {row[0] for row in rows}
+        except Exception:
+            return set(ids)
+
     # ── Tombstone 检查 ──
 
     @staticmethod
@@ -383,7 +405,7 @@ class ForgetVisibilityService:
             if _expand_provenance:
                 blocked.update(
                     ForgetVisibilityService._source_memory_blocked_event_ids(
-                        session, ids, include_tombstones=include_tombstones,
+                        session, ids, include_tombstones=include_tombstones, ignore_memory_only=_ignore_memory_only,
                     )
                 )
 
@@ -661,7 +683,7 @@ class ForgetVisibilityService:
 
     @staticmethod
     def _source_memory_blocked_event_ids(
-        session: Session, event_ids: list[str], *, include_tombstones: bool = True,
+        session: Session, event_ids: list[str], *, include_tombstones: bool = True, ignore_memory_only: bool = False,
     ) -> set[str]:
         """返回「作为被屏蔽 MemoryRecord 来源」的 Event id 集合。
 
@@ -694,7 +716,7 @@ class ForgetVisibilityService:
         blocked_memories = ForgetVisibilityService.blocked_target_ids(
             session, "memory_record", [(m, None) for m in mem_ids],
             include_tombstones=include_tombstones,
-            _expand_provenance=False,
+            _expand_provenance=False, _ignore_memory_only=ignore_memory_only,
         )
         if not blocked_memories:
             return set()

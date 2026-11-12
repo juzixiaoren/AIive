@@ -205,7 +205,7 @@ export function subscribeThreadEvents(
       onStatus(event.data as unknown as ExecutionStatus, { initialSnapshot: initial });
       initial = false;
     } else onMessage?.(event);
-  }, () => { initial = true; });
+  }, reason => { if (reason !== "execution_idle") initial = true; });
 }
 
 export async function streamMessage(

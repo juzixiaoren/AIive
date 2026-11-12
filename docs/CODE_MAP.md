@@ -1187,3 +1187,6 @@ V62.6.1 测试清理：根 `conftest.py::_cleanup_test_db` / `pytest_sessionfini
 - shared/chat/draft.ts：已知未执行错误保留 File、作废旧上传 ID；两端共用恢复行为。
 - d5e8f102b304：附件 Event 查找索引；历史分页只查询当前页 Event，并批量校验可见性。
 - tests/integration/backend/test_chat_attachment_forget.py 与 pg/test_pg_chat_attachments.py：中央事务与历史补偿契约。
+
+最终收尾：ForgetVisibilityService.blocked_attachment_ids 批量检查上传时间 Shield；
+process_cleanup_actions 经 VerifyReport/共享引用复查后设置 GC verified_at，交回正常 Retention。

@@ -790,3 +790,18 @@ test("stale pagination rejection cannot replace a newer authoritative snapshot",
   assert.equal(store.state.error, "");
   store.dispose();
 });
+
+
+test("execution idle refresh does not relabel Android chat status as a connection snapshot", () => {
+  const original = { WebSocket: globalThis.WebSocket, window: globalThis.window, document: globalThis.document, localStorage: globalThis.localStorage };
+  let socket;
+  class Socket { constructor() { socket = this; } send() {} close() {} frame(state) { this.onmessage({ data: JSON.stringify({ type: "execution_status", data: { state } }) }); } }
+  globalThis.WebSocket = Socket; globalThis.window = new EventTarget(); globalThis.document = new EventTarget(); globalThis.document.hidden = false;
+  globalThis.localStorage = { getItem: () => "test-credential" };
+  const flags = [];
+  const dispose = androidChat.subscribeThreadEvents("thread", (_status, metadata) => flags.push(metadata.initialSnapshot));
+  try {
+    socket.frame("running"); socket.frame("idle"); socket.frame("idle");
+    assert.deepEqual(flags, [true, false, false]);
+  } finally { dispose(); Object.assign(globalThis, original); }
+});

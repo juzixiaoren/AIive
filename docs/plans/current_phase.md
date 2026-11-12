@@ -1187,3 +1187,16 @@ Backend / Web / Android 同一 Part 实现：内容寻址上传、认证下载�
 修复 execution_status 完成时刷新、刷新分区失败隔离、附件实际来源、中央 Forget Scrub/Verify、
 提交后对象删除、历史幂等补偿、安全草稿恢复、累计配额、历史有界查询与上传 Event 清理。
 没有使用浏览器测试。验证结果见 P1/P2 报告新增收尾章节；原有功能与 CI 门禁保留。
+
+
+## P1/P2 最终两项验收
+
+批量 Shield 检查现在以附件自身 Thread/上传时间匹配 thread、time_range、all_user_data 和 cutoff；
+查询异常关闭读取。原 Event/Turn/Tombstone 校验保留，原始附件读取排除 memory_only 屏蔽。
+GC 内部 Operation 通过真实 VerifyReport 与删除/共享引用复查后才填写 verified_at 并收口；
+无对象 Action 和旧的 purged-but-unverified Operation 同样可以验证收口，失败保留重试。
+普通用户 Forget 异步机制不变，无新表或产品功能。
+
+附件/GC 聚焦 42 passed；中央字段覆盖测试保留；Node 工作/传输 20 项、聊天 4 项通过，
+Web/Android 生产构建通过，Ruff 和 basedpyright 通过。新增 PostgreSQL GC/Retention 契约。
+未使用浏览器测试。完成最终提交的 9 项 CI 后关闭 P1/P2，不继续扩展阶段范围。

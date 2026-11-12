@@ -112,15 +112,17 @@ def visible_rows(db: Session, rows: list[Attachment]) -> list[Attachment]:
         .all()
     }
     blocked_turns = ForgetVisibilityService.blocked_target_ids(
-        db, "turn_record", [(t.id, t.created_at) for t in turns.values()]
+        db, "turn_record", [(t.id, t.created_at) for t in turns.values()], _ignore_memory_only=True
     )
     blocked_events = ForgetVisibilityService.blocked_target_ids(
-        db, "event", [(e.id, e.created_at) for e in events.values()]
+        db, "event", [(e.id, e.created_at) for e in events.values()], _ignore_memory_only=True
     )
+    blocked_uploads = ForgetVisibilityService.blocked_attachment_ids(db, [r.id for r in rows])
     return [
         r
         for r in rows
-        if r.object_key
+        if r.id not in blocked_uploads
+        and r.object_key
         and r.event_id in events
         and r.event_id not in blocked_events
         and (
@@ -434,21 +436,28 @@ def reconcile(db: Session) -> dict[str, int]:
 
 def process_cleanup_actions(db: Session) -> None:
     from aiive.db.forget_models import ForgetAction, ForgetOperation
-    from aiive.forget.content_scrub import process_object_deletions
-
-    for (operation_id,) in (
-        db.query(ForgetAction.forget_operation_id)
-        .filter(
-            ForgetAction.action_type == "delete_object",
-            ForgetAction.status.in_(["pending", "failed"]),
-        )
-        .distinct()
-        .all()
-    ):
-        result = process_object_deletions(db, operation_id)
+    from aiive.forget.content_scrub import process_object_deletions, verify_scope, verify_object_shared_refs
+    from aiive.forget.content_scope import ContentScope
+    operation_ids = {r[0] for r in db.query(ForgetAction.forget_operation_id).filter(
+        ForgetAction.action_type == "delete_object", ForgetAction.status.in_(["pending", "failed"])).distinct().all()}
+    operation_ids.update(r[0] for r in db.query(ForgetOperation.id).filter(
+        ForgetOperation.requested_by == "attachment_gc", ForgetOperation.verified_at.is_(None)).all())
+    for operation_id in operation_ids:
+        process_object_deletions(db, operation_id)
         operation = db.get(ForgetOperation, operation_id)
-        if operation is not None and operation.requested_by == "attachment_gc":
-            operation.status = "failed_retryable" if result["failed"] else "purged"
-            if not result["failed"]:
-                operation.purged_at = datetime.now(timezone.utc)
-            db.commit()
+        if operation is None or operation.requested_by != "attachment_gc":
+            continue
+        report = verify_scope(db, ContentScope(operation_id=operation_id, mode="history_only", selector_type="event_ids", cutoff=datetime.now(timezone.utc)))
+        for action in db.query(ForgetAction).filter_by(forget_operation_id=operation_id, action_type="delete_object"):
+            details = action.details or {}
+            bucket, key = str(details.get("bucket") or ""), str(details.get("key") or "")
+            if action.status != "done" or not bucket or not key:
+                report.failures.append("incomplete object deletion")
+            elif details.get("skipped_shared") and verify_object_shared_refs(db, bucket, key) == 0 and object_store.exists(object_store.ObjectRef(bucket, key)):
+                # A shared reference disappeared after the original skip: retry deletion.
+                action.status = "pending"
+                report.failures.append("shared object needs recheck")
+        operation.status = "purged" if report.ok else "failed_retryable"
+        operation.verified_at = datetime.now(timezone.utc) if report.ok else None
+        operation.purged_at = operation.verified_at
+        db.commit()

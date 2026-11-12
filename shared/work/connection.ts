@@ -7,7 +7,7 @@ export function subscribeThread(
   url: string,
   token: () => string | null,
   onEvent: (event: Envelope) => void,
-  onReady: () => void,
+  onReady: (reason: "connected" | "recovered" | "execution_idle") => void,
 ): () => void {
   let disposed = false;
   let socket: WebSocket | undefined;
@@ -39,7 +39,8 @@ export function subscribeThread(
       // The server sends an authenticated execution_status snapshot on every connection.
       if (envelope.type === "execution_status") {
         const next = envelope.data?.state;
-        if (!ready || (next === "idle" && (executionState === "running" || executionState === "busy"))) onReady();
+        if (!ready) onReady("connected");
+        else if (next === "idle" && (executionState === "running" || executionState === "busy")) onReady("execution_idle");
         ready = true;
         failures = 0;
         executionState = next;
@@ -63,7 +64,7 @@ export function subscribeThread(
   };
   const recover = () => {
     if (!document.hidden) {
-      onReady();
+      onReady("recovered");
       connect();
     }
   };

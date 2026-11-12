@@ -176,3 +176,31 @@ def test_legacy_forgotten_original_is_compensated_and_verified(db_session):
     count = db_session.query(ForgetAction).count()
     attachments.reconcile(db_session); db_session.commit()
     assert db_session.query(ForgetAction).count() == count
+
+
+@pytest.mark.parametrize("kind", ["normal", "empty", "shared", "retry"])
+def test_gc_operation_verified_for_retention(db_session, monkeypatch, kind):
+    from aiive.db.forget_models import ForgetOperation
+    from aiive.retention.safety_predicates import is_forget_operation_clearable
+    row, ref = seed(db_session)
+    if kind == "shared": seed(db_session)
+    if kind == "empty": row.object_key = ""
+    db_session.commit()
+    attachments.retire(db_session, [row]); db_session.commit()
+    op = db_session.query(ForgetOperation).filter_by(requested_by="attachment_gc").one()
+    assert not is_forget_operation_clearable(db_session, op.id)
+    delete = object_store.delete
+    if kind == "retry":
+        def fail(ref): raise OSError("disk unavailable")
+        monkeypatch.setattr(object_store, "delete", fail)
+        attachments.process_cleanup_actions(db_session)
+        db_session.refresh(op)
+        assert op.status == "failed_retryable" and op.verified_at is None
+        assert not is_forget_operation_clearable(db_session, op.id)
+        monkeypatch.setattr(object_store, "delete", delete)
+    attachments.process_cleanup_actions(db_session)
+    db_session.refresh(op)
+    assert op.status == "purged" and op.verified_at is not None
+    assert is_forget_operation_clearable(db_session, op.id)
+    if kind == "shared": assert object_store.exists(ref)
+    if kind in {"normal", "retry"}: assert not object_store.exists(ref)

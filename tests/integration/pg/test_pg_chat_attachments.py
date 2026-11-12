@@ -3,6 +3,7 @@
 import pytest
 from tests.integration.backend.test_chat_attachment_forget import (
     test_attachment_scrub_verify_and_post_commit_delete as _scrub_case,
+    test_gc_operation_verified_for_retention as _gc_case,
     test_shared_object_and_memory_only as _shared_case,
     test_legacy_forgotten_original_is_compensated_and_verified as _compensate_case,
     test_legacy_pending_provenance_repair_and_forgotten_object_compensation as _repair_case,
@@ -29,3 +30,8 @@ def test_pg_attachment_historical_repair(pg_session):
 
 def test_pg_attachment_compensated_original(pg_session):
     _compensate_case(pg_session)
+
+
+@pytest.mark.parametrize("kind", ["normal", "empty", "shared", "retry"])
+def test_pg_gc_verified_for_retention(pg_session, monkeypatch, kind):
+    _gc_case(pg_session, monkeypatch, kind)

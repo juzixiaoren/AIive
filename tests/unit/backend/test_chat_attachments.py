@@ -542,3 +542,39 @@ def test_history_queries_only_page_attachment_sources(client, db_session, monkey
     monkeypatch.setattr(attachment_service, "visible_rows", selected_only)
     assert client.get(f"/api/threads/{tid}/messages").status_code == 200
     assert not seen
+
+
+@pytest.mark.parametrize("mode", ["everywhere", "memory_only"])
+def test_upload_time_shield_precedes_scrub(client, db_session, monkeypatch, mode):
+    calls = []
+    monkeypatch.setattr("aiive.runtime.agent_graph.AgentGraph._build_langchain_llm", lambda self: Model(calls))
+    monkeypatch.setattr("aiive.api.routes_chat.default_llm_client", lambda: FakeLLMClient())
+    aid = upload(client).json()["id"]
+    assert client.post("/api/chat", json={"message": "read", "attachment_ids": [aid]}).status_code == 200
+    row = db_session.get(Attachment, aid)
+    old = datetime.now(timezone.utc) - timedelta(days=2)
+    row.created_at = old
+    db_session.commit()
+    if mode == "memory_only":
+        from tests.integration.backend.test_forget_content_coverage import _op
+        from aiive.db.forget_models import ForgetShield
+        op = _op(db_session, mode=mode, selector_type="scope", payload={"scope_type": "thread", "scope_id": row.thread_id})
+        db_session.add(ForgetShield(forget_operation_id=op, selector_type="scope", scope_type="thread", scope_id=row.thread_id,
+                                   target_type="event", target_id=row.event_id, cutoff_created_at=datetime.now(timezone.utc), status="active"))
+    else:
+        execute_phase_a_shield(db_session, mode=mode, time_from=old-timedelta(hours=1), time_to=old+timedelta(hours=1))
+    db_session.commit()
+    expected = 200 if mode == "memory_only" else 404
+    assert client.get(f"/api/attachments/{aid}").status_code == expected
+    assert client.get(f"/api/attachments/{aid}/content").status_code == expected
+    assert bool(service.load_attachments(db_session, row.thread_id).parts) == (mode == "memory_only")
+    fresh = upload(client, b"new after cutoff").json()["id"]
+    assert client.get(f"/api/attachments/{fresh}/content").status_code == 200
+
+
+def test_attachment_shield_query_failure_is_closed():
+    from unittest.mock import MagicMock
+    from aiive.forget.visibility_service import ForgetVisibilityService
+    session = MagicMock()
+    session.query.side_effect = RuntimeError("database unavailable")
+    assert ForgetVisibilityService.blocked_attachment_ids(session, ["one", "two"]) == {"one", "two"}
