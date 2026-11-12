@@ -1,7 +1,7 @@
 # Current Phase
 
 ## 版本索引
-- 当前工作：**P1 统一工作中心（Web + Android）**（2026-11-12），详见文末 P1 记录与验收报告；历史版本保留原记录。
+- 当前工作：**P2 跨端聊天附件（Web + Android + Desktop）**（2026-11-12），详见文末 P1 记录与验收报告；历史版本保留原记录。
 - 历史版本：V62.4 / V62.5 / V62.6.1 依次见文末。
 - 历史阶段：V34 → V54 按时间顺序记录在下方各节；下方 `## Phase` / `## Status` 是 V34 阶段的原始记录，不再代表当前主干。
 
@@ -1173,3 +1173,10 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
   具体检查、CI 与边界见 [验收报告](../reports/2026-11-12_P1_work_center.md)。
 - CI 在现有前端 Job 加入 Android TypeScript/Vite 与跨端 Node 测试，保持 9 Job。
   按用户要求不使用浏览器测试、不添加人工三端联调或推送基础设施。
+
+
+## P2 跨端聊天附件（2026-11-12）
+
+Backend / Web / Android 同一 Part 实现：内容寻址上传、认证下载、原消息关联、
+全局预算、多模态模型配置、历史附件、Forget 来源、取消/TTL 清理。
+验证进度及限制见 `docs/reports/2026-11-12_P2_chat_attachments.md`。

@@ -1,3 +1,7 @@
+import { AttachmentComposer, AttachmentCards, type Attachment } from "../../../shared/chat/attachments";
+import { saveChatAttachment } from "./work/chatFiles";
+import { apiFetch as attachmentApiFetch, getToken as attachmentToken } from "./api/auth";
+const attachmentFetch = (path: string, init?: RequestInit) => attachmentApiFetch(path, init);
 import { App as CapacitorApp } from "@capacitor/app";
 import { workCardsFrom } from "../../../shared/work/types";
 import WorkCenter from "./work/WorkCenter";
@@ -99,6 +103,7 @@ function historyToMessages(messages: ThreadHistoryMessage[]): ChatMessage[] {
       id: message.event_id || messageId(),
       role: message.role === "user" ? "user" as const : "assistant" as const,
       content: message.content,
+      attachments: message.attachments,
       approvals: approvalsFromCards(Array.isArray(message.action_cards) ? message.action_cards : []),
       workCards: workCardsFrom(Array.isArray(message.action_cards) ? message.action_cards : []),
     }))
@@ -111,6 +116,11 @@ export function ChatApp({ username, onLogout, active, onOpenWork }: { username: 
   // localStorage 仅作为展示缓存：启动阶段 Thread 权威来源是服务器。
   const [threadId, setThreadId] = useState("");
   const [conversationReady, setConversationReady] = useState(false);
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [attachmentBlocked, setAttachmentBlocked] = useState(false);
+  const attachmentRequestRef = useRef<{ key: string; id: string } | null>(null);
+  const [attachmentKey, setAttachmentKey] = useState(0);
+  const attachmentChanged = useCallback((files: Attachment[], blocked: boolean) => { setAttachments(files); setAttachmentBlocked(blocked); }, []);
   const [input, setInput] = useState("");
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [streaming, setStreaming] = useState(false);
@@ -307,7 +317,8 @@ export function ChatApp({ username, onLogout, active, onOpenWork }: { username: 
   };
 
   const send = async () => {
-    const content = input.trim();
+    const content = input.trim() || (attachments.length ? "请阅读附件。" : "");
+    if (attachmentBlocked) return;
     if (!content || streaming || !configured || !conversationReady) return;
     if (execState !== "idle") {
       // 忙状态下的消息不排队、不落库。
@@ -315,12 +326,13 @@ export function ChatApp({ username, onLogout, active, onOpenWork }: { username: 
       return;
     }
 
-    const userMessage: ChatMessage = { id: messageId(), role: "user", content };
+    const draftKey = JSON.stringify([content, attachments.map(file => file.id).sort()]);
+    if (attachmentRequestRef.current?.key !== draftKey) attachmentRequestRef.current = { key: draftKey, id: crypto.randomUUID() };
+    const userMessage: ChatMessage = { id: messageId(), role: "user", content, attachments };
     const replyId = messageId();
     const replyPlaceholder: ChatMessage = { id: replyId, role: "assistant", content: "" };
     const controller = new AbortController();
     abortRef.current = controller;
-    setInput("");
     setError("");
     setExecState("running");
     setRemoteRunning(false);
@@ -340,6 +352,7 @@ export function ChatApp({ username, onLogout, active, onOpenWork }: { username: 
         {
           onStarted: (nextThreadId, turnRecordId) => {
             started = true;
+            setInput(""); setAttachmentKey(key => key + 1); setAttachments([]);
             setThreadId(nextThreadId);
             activeTurnRecordIdRef.current = turnRecordId;
           },
@@ -350,6 +363,8 @@ export function ChatApp({ username, onLogout, active, onOpenWork }: { username: 
           },
         },
         controller.signal,
+        attachments.map(file => file.id),
+        attachmentRequestRef.current.id,
       );
       if (result.cancelled) {
         // 服务端已丢弃本轮用户消息：本地移除乐观气泡并恢复服务器历史。
@@ -492,6 +507,7 @@ export function ChatApp({ username, onLogout, active, onOpenWork }: { username: 
               )}
               <div className={`message-stack ${message.role}`}>
                 <div className={`message-bubble ${message.role}`}>
+                  <AttachmentCards attachments={message.attachments} fetcher={attachmentFetch} nativeSave={saveChatAttachment} />
                   {message.role === "assistant" && !message.content && streaming ? (
                     <span className="typing" aria-label="正在回复">
                       <i /><i /><i />
@@ -559,6 +575,7 @@ export function ChatApp({ username, onLogout, active, onOpenWork }: { username: 
                 : remoteRunning ? "Agent 正在其他设备回复…" : "Agent 正在回复…"}
             </div>
           )}
+            <AttachmentComposer key={attachmentKey} fetcher={attachmentFetch} readCredential={attachmentToken} uploadUrl={`${appConfig.backendBaseUrl}/api/attachments`} disabled={!conversationReady || execState !== "idle"} onChange={attachmentChanged} />
           <div className={`composer ${streaming ? "is-streaming" : ""}`}>
             <textarea
               ref={textareaRef}
@@ -585,7 +602,7 @@ export function ChatApp({ username, onLogout, active, onOpenWork }: { username: 
                 !conversationReady
                 || execState === "busy"
                 || stopping
-                || (execState === "idle" && (!input.trim() || !configured))
+                || (execState === "idle" && (attachmentBlocked || (!input.trim() && !attachments.length) || !configured))
               }
               aria-label={
                 execState === "running" ? "停止生成" : execState === "busy" ? "处理中" : "发送消息"

@@ -432,3 +432,39 @@ Web 与 Android 均支持「聊天委派 → 工作卡片 → 四分类收件箱
 Documents 保存或系统分享。运行 `cd frontend && npm run test:work` 验证公共逻辑。
 
 实现契约、选型和具体结果见 [P1 验收报告](docs/reports/2026-11-12_P1_work_center.md)。
+
+
+## P2 聊天附件（2026-11-12）
+
+Web、Desktop 和 Android 使用同一 `/api/attachments` 与聊天 `attachment_ids` 契约。
+支持 PDF、DOCX、TXT、Markdown、HTML、JSON、CSV/TSV，以及 PNG/JPEG/WebP。
+文件通过文件选择器上传，图片可预览；单文件默认 20 MiB、单条消息最多 5 个。
+上传失败保留输入并可重试，附件卡片随用户消息恢复；原件下载需登录并校验 SHA256。
+Android 使用官方 Capacitor Filesystem/Share 保存与分享，Desktop 复用 Web。
+
+配置（`.env`）：
+
+```dotenv
+AIIVE_ATTACHMENT_MAX_BYTES=20971520
+AIIVE_ATTACHMENT_MAX_COUNT=5
+# 仅当主模型确实支持视觉输入时开启
+AIIVE_LLM_VISION_ENABLED=false
+# 主模型无视觉能力时配置支持图像和 tool calling 的 OpenAI-compatible 模型
+AIIVE_VISION_MODEL=
+AIIVE_VISION_BASE_URL=
+AIIVE_VISION_API_KEY=
+AIIVE_VISION_CONTEXT_WINDOW=32768
+```
+
+未配置视觉能力时图片上传明确拒绝。独立视觉模型接管包含图片的整轮 Agent 请求，
+直接接收多模态输入，避免把不完整图片描述当作原图；需要支持现有工具调用协议。
+附件使用现有文档解析器和内容寻址 Object Store，不自动导入知识库。
+所有可见聊天附件在后续对话中按原件完整重载，作为不可静默截断的输入进入现有
+全局 ContextOverflowPacker；总量超窗会明确报错，请拆分文件或 Forget 不再需要的来源。
+这保留完整阅读语义，代价是长对话中反复读取大附件会增加延迟和 Token 成本。
+
+附件记录关联原始 Turn/Event；Forget 立即阻断原件、历史、上下文及读过附件的派生轮次。
+被取消的 Turn 附件不再可见。未发送上传 24 小时后、取消附件由每小时任务及上传入口回收，
+共享 SHA256 对象按引用计数回收并遵循现有 safe_delete 回收站策略。
+原始字节仅在 Object Store 与临时模型请求中存在，不写普通事件/快照/Prompt 日志。
+数据库升级使用新增 Alembic head `c4d7e9f1a203`。

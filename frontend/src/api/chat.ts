@@ -1,3 +1,4 @@
+import type { Attachment } from "../../../shared/chat/attachments";
 import { apiFetch } from "./client";
 /**
  * 聊天 API 接口层
@@ -47,6 +48,7 @@ export interface ToolExecution {
 }
 
 export interface ThreadHistoryMessage {
+  attachments?: Attachment[];
   role: "user" | "assistant";
   content: string;
   event_id: string;
@@ -133,6 +135,8 @@ export async function sendMessageStream(
   onToolResult: (toolCallId: string, name: string, result: unknown, status?: string) => void,
   onError: (msg: string) => void,
   signal?: AbortSignal,
+  attachmentIds: string[] = [],
+  turnId?: string,
 ): Promise<{
   thread_id: string;
   trace_id: string;
@@ -146,7 +150,7 @@ export async function sendMessageStream(
   const res = await apiFetch("api/chat/stream", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message, thread_id: threadId ?? null }),
+    body: JSON.stringify({ message, thread_id: threadId ?? null, attachment_ids: attachmentIds, turn_id: turnId }),
     signal,
   });
 

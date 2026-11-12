@@ -102,6 +102,7 @@ class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1)
     thread_id: str | None = None
     turn_id: str | None = None
+    attachment_ids: list[str] = Field(default_factory=list, max_length=5)
 
 
 class SystemChatRequest(BaseModel):
@@ -119,7 +120,7 @@ class SystemChatRequest(BaseModel):
 def chat(request: ChatRequest) -> ChatResponse:
     """同步聊天接口，通过 TurnExecutionService 执行。"""
     client = default_llm_client()
-    service = TurnExecutionService(client, message_source="user")
+    service = TurnExecutionService(client, message_source="user", attachment_ids=request.attachment_ids)
     try:
         result = service.execute_turn(
             message=request.message,
@@ -166,7 +167,7 @@ def chat_system(request: SystemChatRequest) -> ChatResponse:
 async def chat_stream(request: ChatRequest):
     """流式聊天接口，通过 TurnExecutionService 执行。"""
     client = default_llm_client()
-    service = TurnExecutionService(client, message_source="user")
+    service = TurnExecutionService(client, message_source="user", attachment_ids=request.attachment_ids)
 
     async def generate():
         try:
@@ -209,6 +210,8 @@ async def chat_stream(request: ChatRequest):
                 "error": result.get("error"),
             })
             yield f"event: done\ndata: {response.model_dump_json(exclude_none=True)}\n\n"
+        except HTTPException as error:
+            yield f"event: error\ndata: {json.dumps({'code': 'attachment_error', 'message': str(error.detail), 'status': error.status_code, 'retryable': False}, ensure_ascii=False)}\n\n"
         except TurnConflictError as error:
             message = str(error)
             payload = {"code": message, "message": message,

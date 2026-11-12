@@ -701,3 +701,19 @@ test("changing Thread subscription leaves both production chat SSE streams runni
     Object.assign(globalThis, original);
   }
 });
+
+
+test("both chat transports submit issued attachment IDs and a stable turn key", async () => {
+  const previousFetch = globalThis.fetch;
+  const sent = [];
+  globalThis.fetch = async (_url, init) => {
+    sent.push(JSON.parse(init.body));
+    return new Response('event: done\ndata: {"reply":"ok","thread_id":"thread","trace_id":"trace"}\n\n', { headers: { "Content-Type": "text/event-stream" } });
+  };
+  try {
+    const noop = () => {};
+    await webChat.sendMessageStream("question", "thread", noop, noop, noop, noop, noop, undefined, ["issued-id"], "stable-key");
+    await androidChat.streamMessage("question", "thread", { onStarted: noop, onToken: noop }, new AbortController().signal, ["issued-id"], "stable-key");
+    assert.deepEqual(sent, [0, 1].map(() => ({ message: "question", thread_id: "thread", attachment_ids: ["issued-id"], turn_id: "stable-key" })));
+  } finally { globalThis.fetch = previousFetch; }
+});

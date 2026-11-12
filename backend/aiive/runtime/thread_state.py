@@ -299,7 +299,11 @@ class ThreadState:
                 .order_by(Event.turn_event_index.asc(), Event.created_at.asc(), Event.id.asc())
                 .all()
             )
-            messages.extend(self._events_to_display_messages(events, turn.status, turn.source))
+            from aiive.forget.visibility_service import ForgetVisibilityService
+            blocked = ForgetVisibilityService.blocked_target_ids(
+                self._db, "event", [(event.id, event.created_at) for event in events])
+            messages.extend(self._events_to_display_messages(
+                [event for event in events if event.id not in blocked], turn.status, turn.source))
 
         # 到达新 Turn 历史末端时，继续拼接旧版 turn_id=NULL 事件。
         if not has_more:
@@ -459,6 +463,10 @@ class ThreadState:
         )
         if not events:
             return []
+        from aiive.forget.visibility_service import ForgetVisibilityService
+        blocked = ForgetVisibilityService.blocked_target_ids(
+            self._db, "event", [(event.id, event.created_at) for event in events])
+        events = [event for event in events if event.id not in blocked]
 
         groups: list[list[Event]] = []
         current: list[Event] = []

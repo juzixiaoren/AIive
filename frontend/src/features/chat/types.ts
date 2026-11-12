@@ -1,3 +1,4 @@
+import type { Attachment } from "../../../../shared/chat/attachments";
 import type { ActionCard } from "../../api/chat";
 
 /** 单条工具调用的展示模型，状态随流推进并保留无法确认的真实终态 */
@@ -11,6 +12,7 @@ export interface ToolCallItem {
 
 /** 消息数据结构 */
 export interface Message {
+  attachments?: Attachment[];
   /** 稳定唯一标识：后端历史取 event_id，本地消息取 crypto.randomUUID */
   id: string;
   role: "user" | "agent" | "action";

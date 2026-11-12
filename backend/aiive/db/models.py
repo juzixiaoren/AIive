@@ -2247,3 +2247,18 @@ class AuthOwner(Base):
     last_login_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+
+class Attachment(Base):
+    """Chat-only attachment; bytes live exclusively in Object Store."""
+    __tablename__: str = "chat_attachments"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    thread_id: Mapped[str] = mapped_column(ForeignKey("threads.id"), index=True)
+    turn_record_id: Mapped[str | None] = mapped_column(ForeignKey("turn_records.id"), index=True)
+    event_id: Mapped[str | None] = mapped_column(ForeignKey("events.id"))
+    filename: Mapped[str] = mapped_column(String(255))
+    mime: Mapped[str] = mapped_column(String(128))
+    size: Mapped[int] = mapped_column(BigInteger)
+    sha256: Mapped[str] = mapped_column(String(64))
+    object_key: Mapped[str] = mapped_column(String(512))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

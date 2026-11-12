@@ -18,6 +18,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -256,7 +257,10 @@ class TurnExecutionService:
         self,
         llm_client: LLMClient | None = None,
         message_source: str | MessageSource = MessageSource.USER,
+        attachment_ids: list[str] | None = None,
     ):
+        self._has_attachment_context = False
+        self._attachment_ids: list[str] = list(attachment_ids or [])
         self._llm_client: LLMClient = llm_client or default_llm_client()
         self._message_source: MessageSource = (
             message_source
@@ -388,6 +392,11 @@ class TurnExecutionService:
                 "hard_input_limit": e.hard_input_limit,
                 "partition_reports": [report.__dict__ for report in e.partition_reports],
             }
+            return
+        except HTTPException as error:
+            heartbeat.stop()
+            self._mark_turn_interrupted_safely(turn.id, execution_id, "attachment_unavailable")
+            yield {"type": "error", "error": "attachment_unavailable", "message": str(error.detail), "_status": error.status_code}
             return
         except Exception:
             heartbeat.stop()
@@ -579,10 +588,15 @@ class TurnExecutionService:
             thread_id = current_tid
         # 内部来源（system_command / runtime_event）保持原有行为：缺省时由
         # ensure_committed_thread 负责创建，且不受唯一 Thread 约束。
+        if len(self._attachment_ids) > settings.aiive_attachment_max_count or len(set(self._attachment_ids)) != len(self._attachment_ids):
+            from fastapi import HTTPException
+            raise HTTPException(400, "附件数量超限或重复")
         committed_tid = ThreadBootstrapService.ensure_committed_thread(thread_id)
         # 指纹必须用解析后的线程计算：同一 turn_id 在不同入口（缺省/显式
         # thread_id）重试时才能命中幂等，不会误判为 idempotency_key_mismatch。
         fingerprint = _compute_request_fingerprint(message, committed_tid)
+        if self._attachment_ids:
+            fingerprint = hashlib.sha256((fingerprint + _json.dumps(sorted(self._attachment_ids))).encode()).hexdigest()[:16]
         execution_id = str(_uuid.uuid4())
         # 预生成主键：租约 owner_id 必须先于任何持久化确定下来，才能保证
         # “占用成功 → 写 Turn/消息”之间没有第三条路径插入。
@@ -764,6 +778,10 @@ class TurnExecutionService:
             db.add(event)
             db.flush()
             turn.request_event_id = event.id
+            if self._attachment_ids:
+                from aiive.runtime.attachments import bind
+                bind(db, self._attachment_ids, turn, event.id)
+                event.payload = {**event.payload, "attachment_ids": self._attachment_ids}
             # 记忆冲突待确认：若该 Thread 有未决冲突，把本轮用户消息作为
             # "对澄清问题的回复"入队后台解析（与用户消息事件同事务提交）。
             # 取消收口时必须一并撤销这些任务（见 _finalize_cancelled_turn）。
@@ -1290,7 +1308,8 @@ class TurnExecutionService:
                     payload={
                         "user_message": getattr(ag_result, 'user_message', ''),
                         "message_source": self._message_source.value,
-                        "reply": ag_result.reply,
+                        # Attachment-derived replies are chat evidence, never automatic memory input.
+                        "reply": "" if self._has_attachment_context else ag_result.reply,
                         "thread_id": turn.thread_id,
                         "source_turn_record_id": turn.id,
                         "source_turn_id": turn.turn_id,
@@ -1554,6 +1573,25 @@ class TurnExecutionService:
                 db.add(thread)
                 db.flush()
 
+            from aiive.db.models import Attachment
+            from aiive.runtime.attachments import visible
+            has_images = any(visible(db, row) for row in db.query(Attachment).filter(
+                Attachment.thread_id == turn.thread_id, Attachment.turn_record_id.isnot(None), Attachment.mime.like("image/%")))
+            if has_images:
+                if settings.aiive_vision_model:
+                    self._llm_client = LLMClient(
+                        base_url=settings.aiive_vision_base_url or settings.aiive_llm_base_url,
+                        api_key=settings.aiive_vision_api_key or settings.aiive_llm_api_key,
+                        default_model=settings.aiive_vision_model,
+                        timeout_seconds=settings.aiive_llm_timeout_seconds)
+                    from dataclasses import replace
+                    self._profile = replace(_shared_profile(settings.aiive_vision_model), provider="openai", full_name=f"openai/{settings.aiive_vision_model}", context_window=settings.aiive_vision_context_window)
+                    self._token_counter = _shared_token_counter(settings.aiive_vision_model)
+                    self._normalizer = _shared_normalizer(settings.aiive_vision_model)
+                    self._budget = ContextBudget(settings.aiive_vision_context_window, settings.aiive_llm_max_output_tokens)
+                elif not settings.aiive_llm_vision_enabled:
+                    from fastapi import HTTPException
+                    raise HTTPException(422, "当前未配置视觉模型，不支持图片理解")
             assembler = ContextAssembler(
                 token_counter=self._token_counter,
                 budget=self._budget,
@@ -1570,6 +1608,11 @@ class TurnExecutionService:
                 trace_id=exec_ctx.trace_id,
                 current_turn_id=turn.turn_id,
             )
+            from aiive.forget.durable_sources import persist_sources
+            source_events = [row.event_id for row in db.query(Attachment).filter(
+                Attachment.thread_id == turn.thread_id, Attachment.event_id.isnot(None)) if visible(db, row)]
+            self._has_attachment_context = bool(source_events)
+            persist_sources(db, "attachment_context", turn.id, {"source_event_ids": source_events})
             db.commit()
 
             return ContextBundle(assembled_ctx=assembled)

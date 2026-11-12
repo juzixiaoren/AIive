@@ -6,7 +6,7 @@
 """
 from typing import ClassVar, Literal
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,6 +17,15 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    aiive_attachment_max_bytes: int = Field(default=20 * 1024 * 1024, ge=1, le=20 * 1024 * 1024)
+    aiive_attachment_max_count: int = Field(default=5, ge=1, le=5)
+    aiive_llm_vision_enabled: bool = False
+    aiive_vision_model: str = ""
+    aiive_vision_base_url: str = ""
+    aiive_vision_api_key: str = ""
+    # Separate vision endpoints must declare their actual context window.
+    aiive_vision_context_window: int = 32768
 
     # LLM 大模型配置（兼容 OpenAI 接口）
     aiive_llm_api_key: str = ""

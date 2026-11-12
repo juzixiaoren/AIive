@@ -14,6 +14,7 @@ const base = process.env.AIIVE_BASE_PATH || "/aiive/";
 export default defineConfig({
   base,
   plugins: [react()],
+  resolve: { dedupe: ["react", "react-dom"] },
   server: {
     port: 5173,
     // 代理配置：将 /api、/health 和 /ws 请求转发到后端服务。

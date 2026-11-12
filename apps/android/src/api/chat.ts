@@ -1,3 +1,4 @@
+import type { Attachment } from "../../../../shared/chat/attachments";
 import { workCardsFrom, type WorkCard } from "../../../../shared/work/types";
 import { subscribeThread, type Envelope } from "../../../../shared/work/connection";
 import { appConfig } from "../config";
@@ -7,6 +8,7 @@ export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
+  attachments?: Attachment[];
   approvals?: ApprovalItem[];
   workCards?: WorkCard[];
 }
@@ -75,6 +77,7 @@ export interface ExecutionStatus {
 export interface ThreadHistoryMessage {
   role: "user" | "assistant";
   content: string;
+  attachments?: Attachment[];
   event_id: string;
   trace_id?: string;
   action_cards?: unknown[];
@@ -209,6 +212,8 @@ export async function streamMessage(
   threadId: string | undefined,
   callbacks: StreamCallbacks,
   signal: AbortSignal,
+  attachmentIds: string[] = [],
+  turnId?: string,
 ): Promise<StreamResult> {
   const response = await apiFetch("chat/stream", {
     method: "POST",
@@ -216,7 +221,7 @@ export async function streamMessage(
       Accept: "text/event-stream",
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ message, thread_id: threadId ?? null }),
+    body: JSON.stringify({ message, thread_id: threadId ?? null, attachment_ids: attachmentIds, turn_id: turnId }),
     signal,
   });
   if (!response.ok) throw await chatResponseError(response);

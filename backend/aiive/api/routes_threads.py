@@ -81,7 +81,14 @@ def get_thread_messages(
                 ApprovalRequest.thread_id == thread_id,
             ).all()
         }
+        from aiive.db.models import Attachment
+        from aiive.runtime.attachments import visible, metadata
+        by_event = {}
+        for attachment in db.query(Attachment).filter(Attachment.thread_id == thread_id, Attachment.event_id.isnot(None)):
+            if visible(db, attachment):
+                by_event.setdefault(attachment.event_id, []).append(metadata(attachment))
         for message in page.get("messages", []):
+            message["attachments"] = by_event.get(message.get("event_id"), [])
             for card in message.get("action_cards", []):
                 if card.get("card_type") != "approval_required":
                     continue

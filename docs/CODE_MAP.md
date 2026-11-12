@@ -1163,3 +1163,16 @@ V62.6.1 测试清理：根 `conftest.py::_cleanup_test_db` / `pytest_sessionfini
 
 旧 Web `api/agentTasks.ts` 和 `hooks/useTaskEvents.ts` 在调用方检查及验证后清理。
 最终契约、选型优劣和验收结果见 [P1 报告](reports/2026-11-12_P1_work_center.md)。
+
+
+## P2 聊天附件链路
+
+- `api/routes_attachments.py`：认证中间件保护的有界 raw-body 上传、元数据、下载、未发送删除。
+- `runtime/attachments.py`：MIME/签名/像素/解压限制、复用 document_reader、可见性、关联与 GC。
+- `db/models.py::Attachment` / `c4d7e9f1a203`：只保存安全元数据、SHA256、对象键及 Thread/Turn/Event 关联。
+- `runtime/turn_execution.py`：同事务附件关联，指纹包含附件 ID 集合，按视觉配置选择模型。
+- `runtime/context_assembler.py`：临时资料注入，原有全局打包与预算；快照仅附件元数据。
+- `forget/visibility_service.py`：attachment_context 来源依赖关闭原件与派生轮次；ThreadState 历史读过滤。
+- `shared/chat/attachments.tsx`：两端共用选择、进度、失败重试、预览、完整性检查及卡片。
+- `apps/android/src/work/chatFiles.ts`：官方 Filesystem / Share 桥接。
+- `tests/unit/backend/test_chat_attachments.py`：格式、安全、真实 SSE 路由、上下文、预算、取消与 Forget。

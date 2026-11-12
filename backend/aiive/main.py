@@ -318,7 +318,27 @@ def create_app() -> FastAPI:
         except Exception:
             logger.exception("Outbox poll 调度注册失败")
 
-        yield
+        async def attachment_gc():
+            from aiive.runtime.attachments import cleanup
+            from aiive.db.base import SessionLocal
+            def collect():
+                with SessionLocal() as db:
+                    cleanup(db)
+                    db.commit()
+            while True:
+                try:
+                    await asyncio.to_thread(collect)
+                except Exception:
+                    logger.exception("Attachment cleanup failed")
+                await asyncio.sleep(3600)
+        gc_task = asyncio.create_task(attachment_gc())
+        try:
+            yield
+        finally:
+            gc_task.cancel()
+            import contextlib
+            with contextlib.suppress(asyncio.CancelledError):
+                await gc_task
 
         # 关闭：先 wait_active 结束在途 poll/调度任务，再停止租约心跳
         try:
@@ -374,6 +394,8 @@ def create_app() -> FastAPI:
     # 注册所有 API 路由
     app.include_router(health_router)
     app.include_router(auth_router)
+    from aiive.api.routes_attachments import router as attachments_router
+    app.include_router(attachments_router)
     app.include_router(chat_router)
     app.include_router(conversation_router)
     app.include_router(debug_router)

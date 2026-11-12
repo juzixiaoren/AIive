@@ -1,3 +1,6 @@
+import { AttachmentComposer, AttachmentCards, type Attachment } from "../../../shared/chat/attachments";
+import { getToken } from "../api/client";
+const attachmentFetch = (path: string, init?: RequestInit) => apiFetch(`api/${path}`, init);
 /**
  * 聊天页面
  * - 核心对话界面，支持流式多 token 打字机效果
@@ -36,6 +39,11 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
   // 服务端历史整体覆盖消息列表，正在流式接收的占位消息被抹掉（回复丢失）。
   const [stored] = useState(loadStored);
   const [messages, setMessages] = useState<Message[]>(stored.messages);
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [attachmentBlocked, setAttachmentBlocked] = useState(false);
+  const attachmentRequestRef = useRef<{ key: string; id: string } | null>(null);
+  const [attachmentKey, setAttachmentKey] = useState(0);
+  const attachmentChanged = useCallback((files: Attachment[], blocked: boolean) => { setAttachments(files); setAttachmentBlocked(blocked); }, []);
   const [input, setInput] = useState("");
   // localStorage 只提供展示缓存：Thread 权威来源是服务器，启动阶段不信任本地 ID。
   const [threadId, setThreadId] = useState<string | undefined>(undefined);
@@ -166,6 +174,7 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
         id: message.event_id || genMessageId(),
         role: message.role === "user" ? "user" : "agent",
         content: message.content,
+        attachments: message.attachments,
         traceId: message.trace_id || "",
         threadId: tid,
         actionCards: message.action_cards || [],
@@ -228,6 +237,7 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
         id: message.event_id || genMessageId(),
         role: message.role === "user" ? "user" : "agent",
         content: message.content,
+        attachments: message.attachments,
         traceId: message.trace_id || "",
         threadId,
         actionCards: message.action_cards || [],
@@ -534,7 +544,8 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
 
   /** 发送消息并处理流式响应 */
   const handleSend = async () => {
-    const text = input.trim();
+    const text = input.trim() || (attachments.length ? "请阅读附件。" : "");
+    if (attachmentBlocked) return;
     if (!text || inFlightRef.current || !conversationReady) return;
     if (execState !== "idle") {
       // 忙状态下的消息不排队、不落库：明确提示，保留用户输入。
@@ -542,8 +553,9 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
       return;
     }
 
+    const draftKey = JSON.stringify([text, attachments.map(file => file.id).sort()]);
+    if (attachmentRequestRef.current?.key !== draftKey) attachmentRequestRef.current = { key: draftKey, id: crypto.randomUUID() };
     inFlightRef.current = true;
-    setInput("");
     setError(null);
     setLoading(true);
     setExecState("running");
@@ -555,6 +567,7 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
       id: genMessageId(),
       role: "user",
       content: text,
+      attachments,
       traceId: "",
       threadId: threadId ?? "(new)",
     };
@@ -585,6 +598,7 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
         // onStarted：Turn 已持久化后立即记录真实线程 ID，供首次对话断流恢复。
         (event) => {
           started = true;
+          setInput(""); setAttachmentKey(key => key + 1); setAttachments([]);
           activeStreamThreadIdRef.current = event.thread_id;
           activeTurnRecordIdRef.current = event.turn_record_id || undefined;
           setThreadId(event.thread_id);
@@ -646,6 +660,8 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
         // onError：设置错误信息
         (msg) => { setError(msg); },
         ac.signal,
+        attachments.map(file => file.id),
+        attachmentRequestRef.current.id,
       );
 
       if (result.cancelled) {
@@ -894,6 +910,7 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
                   : "bg-surface text-content rounded-bl-md border border-divider"
             }`}>
               {/* 流式加载中时显示“正在分析”跳动省略号（即时反馈） */}
+              <AttachmentCards attachments={msg.attachments} fetcher={attachmentFetch} />
               {msg.role === "agent" && msg.content === "" && loading ? (
                 <span className="inline-flex items-center gap-1 text-faint text-xs">
                   <span className="w-1.5 h-1.5 rounded-full bg-primary animate-thinking" style={{ animationDelay: "0ms" }} />
@@ -1158,6 +1175,7 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
           </div>
         )}
 
+        <AttachmentComposer key={attachmentKey} fetcher={attachmentFetch} readCredential={getToken} uploadUrl={new URL("api/attachments", window.location.href).href} disabled={!conversationReady || execState !== "idle"} onChange={attachmentChanged} />
         {/* 输入区域 */}
         <div className="flex gap-2 items-end">
           <textarea
@@ -1190,7 +1208,7 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
           ) : (
             <button
               onClick={handleSend}
-              disabled={!conversationReady || !input.trim()}
+              disabled={!conversationReady || attachmentBlocked || (!input.trim() && !attachments.length)}
               className="rounded-xl bg-primary px-6 py-2.5 text-sm font-medium text-on-primary hover:bg-primary-hover active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed transition-all shadow-sm"
             >
               发送

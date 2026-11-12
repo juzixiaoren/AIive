@@ -256,6 +256,9 @@ class ContextAssembler:
         epoch_cp_text = self._load_epoch_checkpoint(db, thread_id)
         bridge_text = self._load_sealing_bridge(db, thread_id)
         rendered: dict[str, Any] = {}
+        from aiive.runtime.attachments import prompt_parts
+        attachment_parts = prompt_parts(db, thread_id)
+
 
         def render() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
             core_text = render_core_memory(candidates.core)
@@ -278,7 +281,7 @@ class ContextAssembler:
                 system=system_content, core=core_text, history=history_msgs, working=working_text,
                 summaries=seg_text, retrieved=recall_text, graph=graph_text, history_summary=history_text,
             )
-            return self._compose_prompt_messages(
+            prompt_messages = self._compose_prompt_messages(
                 system_content=system_content, epoch_checkpoint_text=epoch_cp_text,
                 segment_summary_text=seg_text, history_messages=history_msgs,
                 attention_text=attention_text, working_state_text=working_text,
@@ -286,7 +289,11 @@ class ContextAssembler:
                 recall_messages=recall_messages, questions_text=questions_text,
                 current_role="user" if _source in (None, "user") else "system",
                 current_message=message,
-            ), tools_schema
+            )
+            # Hydrate only the transient provider request. Snapshot and events retain references.
+            if attachment_parts:
+                prompt_messages[-1]["content"] = [{"type": "text", "text": message}, *attachment_parts]
+            return prompt_messages, tools_schema
 
         def estimate(source: str, item: Any) -> int | None:
             if source == "history":
@@ -338,6 +345,15 @@ class ContextAssembler:
         snapshot = self._build_input_snapshot(
             **snapshot_args, user_message=message, _source=_source,
         )
+        if attachment_parts:
+            from aiive.db.models import Attachment
+            from aiive.runtime.attachments import metadata, visible
+            refs = [metadata(row) for row in db.query(Attachment).filter(
+                Attachment.thread_id == thread_id, Attachment.turn_record_id.isnot(None)) if visible(db, row)]
+            snapshot.items.append(ContextSnapshotItem(
+                item_id="attachments", kind="attachment_refs", source="user", trust_level="untrusted",
+                content_preview=_json.dumps(refs, ensure_ascii=False)))
+            snapshot.full_contents["attachments"] = _json.dumps(refs, ensure_ascii=False)
         snapshot.selection_trace = candidates.selection_trace
         snapshot.stable_prefix_hash = _hash_text(rendered["system"])
         snapshot.injected_memory_ids = self._collect_injected_memory_ids(pack)

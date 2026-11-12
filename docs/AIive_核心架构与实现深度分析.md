@@ -2341,3 +2341,48 @@ Maintenance 在读取候选、冻结正文与执行旧计划三个时点检查�
 每项须有可追溯来源，已遗忘项剔除，新项保留，未知来源阻止新快照。
 使用既有 Provenance/Manifest/授权模块，无新表、新迁移或独立 Forget 机制。
 详见 [验收报告](audit/v6261_acceptance.md)。
+
+
+## P2 聊天附件（2026-11-12）
+
+Web、Desktop 和 Android 使用同一 `/api/attachments` 与聊天 `attachment_ids` 契约。
+支持 PDF、DOCX、TXT、Markdown、HTML、JSON、CSV/TSV，以及 PNG/JPEG/WebP。
+文件通过文件选择器上传，图片可预览；单文件默认 20 MiB、单条消息最多 5 个。
+上传失败保留输入并可重试，附件卡片随用户消息恢复；原件下载需登录并校验 SHA256。
+Android 使用官方 Capacitor Filesystem/Share 保存与分享，Desktop 复用 Web。
+
+配置（`.env`）：
+
+```dotenv
+AIIVE_ATTACHMENT_MAX_BYTES=20971520
+AIIVE_ATTACHMENT_MAX_COUNT=5
+# 仅当主模型确实支持视觉输入时开启
+AIIVE_LLM_VISION_ENABLED=false
+# 主模型无视觉能力时配置支持图像和 tool calling 的 OpenAI-compatible 模型
+AIIVE_VISION_MODEL=
+AIIVE_VISION_BASE_URL=
+AIIVE_VISION_API_KEY=
+AIIVE_VISION_CONTEXT_WINDOW=32768
+```
+
+未配置视觉能力时图片上传明确拒绝。独立视觉模型接管包含图片的整轮 Agent 请求，
+直接接收多模态输入，避免把不完整图片描述当作原图；需要支持现有工具调用协议。
+附件使用现有文档解析器和内容寻址 Object Store，不自动导入知识库。
+所有可见聊天附件在后续对话中按原件完整重载，作为不可静默截断的输入进入现有
+全局 ContextOverflowPacker；总量超窗会明确报错，请拆分文件或 Forget 不再需要的来源。
+这保留完整阅读语义，代价是长对话中反复读取大附件会增加延迟和 Token 成本。
+
+附件记录关联原始 Turn/Event；Forget 立即阻断原件、历史、上下文及读过附件的派生轮次。
+被取消的 Turn 附件不再可见。未发送上传 24 小时后、取消附件由每小时任务及上传入口回收，
+共享 SHA256 对象按引用计数回收并遵循现有 safe_delete 回收站策略。
+原始字节仅在 Object Store 与临时模型请求中存在，不写普通事件/快照/Prompt 日志。
+数据库升级使用新增 Alembic head `c4d7e9f1a203`。
+
+
+实现取舍：使用 raw-body 加编码文件名头，无 multipart 依赖，服务器按块实施大小限制；
+同一个单用户账号共享唯一 Thread，因此授权边界复用认证和当前 Thread 校验。
+数据库先记录待关联引用，再写内容寻址对象，避免对象成功但元数据未创建造成永久孤儿。
+旧消息事件中只有附件 ID，附件不是隐藏消息，也不引入新会话。
+后续轮次对附件来源持久记录 attachment_context Provenance，中央可见性服务在来源遗忘后关闭派生轮次。
+当前范围不提供 OCR：无文本层 PDF 明确拒绝，应转换为图片交由视觉模型或先提取文本。
+格式验证与惰性文档读取不执行脚本/宏，并拒绝解压超限 DOCX；这不是通用杀毒扫描器。

@@ -348,6 +348,27 @@ class ForgetVisibilityService:
         #   改由读取侧经 Provenance + 选择器 Shield 即时判定。
         #   Provenance 侧复用 blocked_target_ids("memory_record", ...)，其内部
         #   仅在 target_type == "event" 时做本扩展，故不会递归。
+        if _expand_provenance and target_type in {"event", "turn_record"}:
+            from aiive.db.models import Event, TurnRecord
+            if target_type == "turn_record":
+                owners = {token: token for token in ids}
+            else:
+                owners = {event.id: turn.id for event, turn in session.query(Event, TurnRecord).join(
+                    TurnRecord, (TurnRecord.thread_id == Event.thread_id) & (TurnRecord.turn_id == Event.turn_id)
+                ).filter(Event.id.in_(ids)).all()}
+            refs = session.query(ContentProvenanceRef).filter(
+                ContentProvenanceRef.owner_type == "attachment_context",
+                ContentProvenanceRef.owner_id.in_(set(owners.values())),
+                ContentProvenanceRef.source_type == "event",
+            ).all()
+            source_ids = {r.source_id for r in refs}
+            if source_ids:
+                source_blocked = ForgetVisibilityService.blocked_target_ids(
+                    session, "event", [(i, None) for i in source_ids],
+                    include_tombstones=include_tombstones, _expand_provenance=False,
+                    _ignore_memory_only=_ignore_memory_only)
+                blocked_owners = {r.owner_id for r in refs if r.source_id in source_blocked}
+                blocked.update(token for token, owner in owners.items() if owner in blocked_owners)
         if target_type == "memory_record" and _expand_provenance:
             blocked.update(ForgetVisibilityService._source_event_blocked_memory_ids(
                 session, ids, include_tombstones=include_tombstones,
