@@ -10,7 +10,6 @@ from __future__ import annotations
 import os
 import secrets
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 import jwt
@@ -44,7 +43,10 @@ class AuthError(Exception):
 def signing_secret() -> str:
     """返回 HS256 签名密钥；未配置时生成一次并持久化到文件。"""
     configured = settings.aiive_auth_secret.strip()
-    cache_key = (configured, settings.aiive_auth_secret_file)
+    from aiive.storage.data_paths import resolve_configured_data_path
+
+    path = resolve_configured_data_path(settings.aiive_auth_secret_file, "auth_secret")
+    cache_key = (configured, str(path))
     cached = _secret_cache.get(cache_key)
     if cached:
         return cached
@@ -52,7 +54,6 @@ def signing_secret() -> str:
         _secret_cache[cache_key] = configured
         return configured
 
-    path = Path(settings.aiive_auth_secret_file)
     if path.exists():
         stored = path.read_text(encoding="utf-8").strip()
         if stored:

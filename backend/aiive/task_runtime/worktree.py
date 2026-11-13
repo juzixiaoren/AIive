@@ -44,7 +44,9 @@ class WorktreeIsolation:
 
     def path_for(self, task_id: str) -> Path:
         safe = self._safe_task_id(task_id)
-        return self.repo_root / ".data" / "task-worktrees" / safe
+        from aiive.storage.data_paths import data_path
+
+        return data_path("task-worktrees", safe)
 
     def _is_registered_worktree(self, destination: Path) -> bool:
         if not destination.is_dir():

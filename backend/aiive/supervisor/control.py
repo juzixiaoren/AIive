@@ -25,8 +25,9 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_RUNTIME_DIR = _REPO_ROOT / "runtime" / "supervisor"
+from aiive.storage.data_paths import data_path
+
+DEFAULT_RUNTIME_DIR = data_path("runtime", "supervisor")
 
 # 超过该时长未更新且持有者已死亡的锁视为陈旧。
 _LOCK_STALE_SECONDS = 300
@@ -149,7 +150,7 @@ class ControlPaths:
             configured = str(getattr(settings, "supervisor_state_dir", "") or "").strip()
         except Exception:  # pragma: no cover - 配置不可用时退回仓库默认目录
             configured = ""
-        return cls(Path(configured) if configured else DEFAULT_RUNTIME_DIR)
+        return cls(Path(configured).expanduser().resolve() if configured else data_path("runtime", "supervisor"))
 
 
 def read_json(path: Path) -> dict[str, Any]:

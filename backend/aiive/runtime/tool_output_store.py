@@ -25,11 +25,9 @@ _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 def tool_output_root() -> Path:
     """返回本功能专用目录的绝对路径（不创建）。"""
-    raw = (settings.tool_output_dir or "").strip() or ".data/tool_outputs"
-    root = Path(raw).expanduser()
-    if not root.is_absolute():
-        root = Path.cwd() / root
-    return root.resolve()
+    from aiive.storage.data_paths import resolve_configured_data_path
+
+    return resolve_configured_data_path(settings.tool_output_dir, "tool_outputs")
 
 
 def ensure_tool_output_root() -> Path:

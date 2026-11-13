@@ -34,9 +34,9 @@ _EXACT_SEMVER_RE = re.compile(
 )
 
 # 仓库根目录：backend/aiive/mcp/installer.py 向上 3 级
-_REPO_ROOT = Path(__file__).resolve().parents[3]
+from aiive.storage.data_paths import data_path
 # 沙箱根目录（跨平台，不用 /tmp）
-SANDBOX_ROOT = _REPO_ROOT / ".data" / "mcp_sandbox"
+SANDBOX_ROOT = data_path("mcp_sandbox")
 
 # 描述符指纹刻意排除的易变键：launch 含安装路径（重装会变），lifecycle 随
 # 启停/验证时间戳变化。二者都不属于"能力定义"本身，不应让旧审批失效。

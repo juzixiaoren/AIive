@@ -64,6 +64,7 @@ services:
     environment:
       # 覆盖 .env 中面向本机的默认值，指向容器网络
       HOST: "0.0.0.0"
+      AIIVE_DATA_DIR: /app/.data
       PORT: "8000"
       DATABASE_URL: "postgresql+psycopg://aiive:aiive_dev@postgres:5432/aiive"
       # BM25 稀疏召回（pg_search）：postgres 服务由上面的镜像提供扩展。

@@ -896,12 +896,11 @@ def handle_memory_markdown_project(claimed: ClaimedJob) -> HandlerResult:
 
     db = SessionLocal()
     try:
-        from pathlib import Path
-
+        from aiive.storage.data_paths import resolve_configured_data_path
         from aiive.memory.projection import MemoryProjection
 
         result = MemoryProjection(db).write_projection(
-            Path(settings.aiive_memory_file_projection_dir),
+            resolve_configured_data_path(settings.aiive_memory_file_projection_dir, "memory_projection"),
         )
         db.rollback()
         return HandlerResult(

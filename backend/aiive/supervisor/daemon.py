@@ -698,7 +698,7 @@ def _supervisor_status(paths: ControlPaths) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="AIive Supervisor：A/B 槽位进程托管")
-    parser.add_argument("--state-dir", default="", help="Supervisor 运行目录（默认 runtime/supervisor）")
+    parser.add_argument("--state-dir", default="", help="Supervisor 运行目录（默认 AIIVE_DATA_DIR/runtime/supervisor）")
     parser.add_argument("--port", type=int, default=None, help="被托管应用监听端口")
     parser.add_argument("--once", action="store_true", help="恢复并执行一次循环后退出（运维/测试）")
     parser.add_argument("--status", action="store_true", help="打印当前状态与最近事件")

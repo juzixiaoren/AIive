@@ -189,6 +189,15 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         """应用生命周期管理：启动时执行初始化，关闭时执行清理。"""
+        from aiive.storage.data_paths import ensure_data_root
+
+        try:
+            root = ensure_data_root()
+        except Exception:
+            logger.exception("运行数据目录校验失败，阻断启动")
+            raise
+        logger.info("AIIVE_DATA_DIR=%s", root)
+
         import asyncio
         import os
         import uuid as _uuid

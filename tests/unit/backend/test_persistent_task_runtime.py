@@ -797,7 +797,10 @@ def test_self_improvement_trusted_core_is_immutable() -> None:
     ]) == []
 
 
-def test_explicit_git_worktree_isolation_rewrites_task_scope(db_session, tmp_path) -> None:
+def test_explicit_git_worktree_isolation_rewrites_task_scope(db_session, tmp_path, monkeypatch) -> None:
+    from aiive.config import settings
+
+    monkeypatch.setattr(settings, "aiive_data_dir", str(tmp_path / "data"))
     repository = tmp_path / "repository"
     repository.mkdir()
     subprocess.run(["git", "init"], cwd=repository, check=True, capture_output=True)
@@ -829,7 +832,7 @@ def test_explicit_git_worktree_isolation_rewrites_task_scope(db_session, tmp_pat
 
     assert result["status"] == TaskStatus.SUCCEEDED.value
     assert task.task_brief["scope"]["allowed_roots"] == [workspace]
-    assert (tmp_path / "repository" / ".data" / "task-worktrees" / task.id).resolve() == Path(workspace).resolve()
+    assert (tmp_path / "data" / "task-worktrees" / task.id).resolve() == Path(workspace).resolve()
     assert (Path(workspace) / "README.md").exists()
     isolation = WorktreeIsolation(repository)
     isolation.remove(task.id)

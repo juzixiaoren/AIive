@@ -44,9 +44,9 @@ class SafeDeleteScopeRegistry:
         return self._scopes.get(scope_id)
 
 
-# 项目根目录：本文件位于 backend/aiive/tools/safe_delete.py
-# __file__.parents[3] = backend/aiive/tools -> aiive -> backend -> AIive(仓库根)
-REPO_ROOT = Path(__file__).resolve().parents[3]
+# 应用工作目录：源码启动脚本进入仓库根，容器 WORKDIR 为 /app。
+# 与 Python 包安装目录和用户任务仓库分别处理。
+REPO_ROOT = Path.cwd().resolve()
 
 
 def _build_default_registry() -> SafeDeleteScopeRegistry:
@@ -62,7 +62,9 @@ def _build_default_registry() -> SafeDeleteScopeRegistry:
     registry.register("test_sandbox", REPO_ROOT / "tests" / "artifacts")
     registry.register("test_artifacts", REPO_ROOT / "tests" / "artifacts")
     registry.register("inactive_slot_placeholder", REPO_ROOT / "tests" / "artifacts" / "slot_placeholder")
-    registry.register("object_store", REPO_ROOT / ".data" / "object_store")
+    from aiive.storage.object_store import ROOT
+
+    registry.register("object_store", ROOT)
     return registry
 
 

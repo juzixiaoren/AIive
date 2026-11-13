@@ -6,7 +6,7 @@ from pathlib import Path
 
 from aiive.config import settings
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
+from aiive.storage.data_paths import data_path
 
 
 def allowed_knowledge_roots() -> tuple[Path, ...]:
@@ -22,7 +22,7 @@ def allowed_knowledge_roots() -> tuple[Path, ...]:
     # 开箱即用地支持用户文档，同时保留应用自己的导入投递目录。
     return (
         (Path.home() / "Documents").resolve(),
-        (_REPO_ROOT / ".data" / "knowledge").resolve(),
+        data_path("knowledge"),
     )
 
 

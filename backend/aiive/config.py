@@ -18,6 +18,8 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    aiive_data_dir: str = ".data"
+
     aiive_attachment_max_bytes: int = Field(default=20 * 1024 * 1024, ge=1, le=20 * 1024 * 1024)
     aiive_attachment_max_count: int = Field(default=5, ge=1, le=5)
     aiive_attachment_thread_max_count: int = Field(default=100, ge=1)

@@ -15,7 +15,9 @@ from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
-ROOT = Path(__file__).resolve().parents[3] / ".data" / "object_store"
+from aiive.storage.data_paths import data_path
+
+ROOT = data_path("object_store")
 
 
 @dataclass

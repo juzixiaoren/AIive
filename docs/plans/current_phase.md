@@ -1214,3 +1214,52 @@ Web/Android 生产构建通过，Ruff 和 basedpyright 通过。新增 PostgreSQ
 Task 改用显式 attachment_ids 授权与创建时来源入库；Worker 三附件工具共用名单和 Skill 门禁，Main 保持 Thread 读取范围。Vision 网络请求移到事务外并双重验证 Forget revision；文档解析使用 16 MiB / 16 项 / 单项 4 MiB 的进程内 LRU。零相关性 query 与顺序 EOF 明确返回。新增 21 项离线专项和 2 项真实 PG 锁竞态测试。完整证据见附件专项报告的收尾章节。
 
 实现提交 `410d9cf` 的 GitHub CI #99（43386265325）9/9 Job 成功；175 文件隔离通过，PG 104 passed / 39 skipped，新增两项 Vision 锁竞态实际通过。完整证据见附件专项验收报告。
+
+
+## V1 运行数据持久化
+
+Backend 统一通过 `storage/data_paths.py` 读取 `AIIVE_DATA_DIR`，不依赖包安装位置。
+源码默认 `.data` 相对进程 CWD；`scripts/start.sh` 进入仓库根目录，因此已有数据继续可用。
+Docker Compose 明确设为 `/app/.data`，由命名卷 `aiive_data:/app/.data` 持久化。
+绝对路径保持用户指定位置；历史 `.data/foo` 映射到数据根下 `foo`；其他相对配置仍相对 CWD。
+启动在迁移和 Worker 前执行目录创建及临时文件写入、读取、删除校验，失败阻断启动。
+
+```text
+/app/.data/
+├── object_store/
+├── mcp_sandbox/
+├── knowledge/
+├── tool_outputs/
+├── memory_projection/
+├── auth_secret
+├── task-worktrees/
+└── runtime/
+    └── supervisor/
+```
+
+| 状态 | 旧默认路径 | 新默认路径（相对数据根） |
+| --- | --- | --- |
+| 原始附件和其他对象 | 包位置推导的 `.data/object_store` | `object_store/` |
+| MCP npm 安装产物 | 包位置推导的 `.data/mcp_sandbox` | `mcp_sandbox/` |
+| 知识导入目录 | 包位置推导的 `.data/knowledge` | `knowledge/` |
+| 工具输出 | CWD `.data/tool_outputs` | `tool_outputs/` |
+| 记忆投影 | CWD `.data/memory_projection` | `memory_projection/` |
+| JWT 密钥 | CWD `.data/auth_secret` | `auth_secret` |
+| Task 工作树 | 用户仓库 `.data/task-worktrees/<task-id>` | `task-worktrees/<task-id>` |
+| Supervisor | 应用仓库 `runtime/supervisor` | `runtime/supervisor/` |
+
+PostgreSQL 继续使用独立的 `pgdata` Volume。Object Store 保存原始附件及其他对象。
+Auth Secret 丢失会导致已有 JWT 失效；Memory Projection 是可重建派生数据；Tool Output 保留独立 Retention。
+MCP Sandbox 及数据库记录的 sandbox_path 必须跨容器重建保留。`~/Documents` 和用户显式配置的知识目录继续受原有权限边界约束，外部知识目录需要自行挂载持久卷。
+可选 TEI 的 `AIIVE_LOCAL_EMBEDDING_CACHE_DIR`（默认宿主机 `.data/models/embeddings`）是宿主机 bind mount 到 TEI `/data` 的缓存，不是 Backend 容器内部路径；不随 Backend 数据根重定位。
+
+升级前请备份旧容器和卷。在删除旧 Backend 容器前检查 `/usr/local/lib/python3.12/.data` 是否有遗留数据：
+用 `docker cp <旧容器>:/usr/local/lib/python3.12/.data ./aiive-legacy-backup` 导出，再将内容合并到挂载 `aiive_data` 的 `/app/.data`。
+合并前停止写入并备份目标卷，遇到同名文件应人工比对，禁止覆盖密钥或清空卷。
+旧数据库 MCP launch / sandbox_path 可能仍引用旧绝对路径，需在备份后人工修正为 `/app/.data/mcp_sandbox/...` 并核验启动入口。
+源码的旧 Supervisor 状态和用户仓库 Task 工作树也不自动移动：活动任务结束后再切换，保留旧目录备份。
+本实现不扫描、不删除、不自动迁移旧数据。
+
+CI `scripts/smoke/compose_persistence.py` 写入确定性对象并记录 ObjectRef、SHA256 和密钥摘要，
+执行 `docker compose up -d --force-recreate backend`，等待健康后用原引用读取并核对摘要。
+只有 CI 的一次性测试栈最终执行 `docker compose down -v`；生产升级不要删除卷。
