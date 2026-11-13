@@ -2437,3 +2437,7 @@ Worker 的 list/read/progress 共用 attachment_access 门禁，并保留 TaskRe
 文档原件仅在解析缓存未命中时经 SHA256 校验并使用原有 parser/chunker。缓存保留不可变 ChunkDraft 元组，键包含 attachment_id、SHA256、parser_version、chunker_version，另外包括对象 key、文件名、Object Store 根及切块配置。单进程 LRU 计费上限 16 MiB、最多 16 条，单条目上限 4 MiB；递归计算可达对象内存并保守预留每条目 512 字节，超大结果正常读取但不缓存。RLock 串行 miss 解析并保护命中和淘汰，避免并发重复解析堆积；不保存原件字节或持久化索引。每次读在查缓存之前重新验证权限和 Forget，因此缓存不授予访问权。顺序读取越界报 invalid_chunk_index，空白 query 归一化为顺序模式，关键词全零返回 matched=false 和空 chunks。
 
 Vision 第一个短事务中执行归属、授权、Forget、原件/SHA 校验及来源持久化，记录 revision 并提交关闭；模型网络调用只有原始字节和标量参数。返回后新事务取得共享锁，再核对 revision、绑定、SHA、references_visible 和 Task 可见性，变化时丢弃分析。真实 PG 测试在模型 callback 中由另一个 Session 使用 2 秒 lock_timeout 获取 Forget 排他锁并提交 Shield，以证明网络期间没有遗留读事务锁，同时验证结果拒绝返回。
+
+## V1 本地灾备边界（2026-11-13）
+
+Compose Backend 与 Frontend 停写后，以运行中的 PostgreSQL 逻辑 dump 和完整 aiive_data 卷构造同一业务时间点快照，Restic 在卷外本地仓库加密去重。新快照全量读取与 SHA256 复核成功后才清理旧快照；恢复只允许新项目、新卷，启动前对比数据库行摘要与文件 SHA256。无 WAL、PITR、云存储或新增常驻服务。实现与限制见 [操作手册](operations/local-backup.md)，已通过 Ubuntu 容器真实备份恢复测试，见 [验收报告](reports/2026-11-14_local_backup_restore.md)；systemd 仍需实际服务器部署验证。

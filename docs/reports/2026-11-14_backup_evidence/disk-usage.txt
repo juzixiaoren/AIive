@@ -1,0 +1,4 @@
+repository_apparent_bytes=88592
+repository_allocated_bytes=1208320
+first_database_dump_bytes=240852
+first_data_tar_bytes=20480

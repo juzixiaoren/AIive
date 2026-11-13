@@ -1255,3 +1255,11 @@ MCP Sandbox 及数据库记录的 sandbox_path 必须跨容器重建保留。`~/
 CI `scripts/smoke/compose_persistence.py` 写入确定性对象并记录 ObjectRef、SHA256 和密钥摘要，
 执行 `docker compose up -d --force-recreate backend`，等待健康后用原引用读取并核对摘要。
 只有 CI 的一次性测试栈最终执行 `docker compose down -v`；生产升级不要删除卷。
+
+## V1 本地备份（2026-11-13）
+
+- `scripts/backup/`：backup / restore / verify、完整性审计、隔离恢复测试。
+- `deploy/systemd/aiive-backup.*`：root oneshot 与每日 03:00 timer。
+- [恢复手册](operations/local-backup.md)：密码、容量、保留、故障与验收边界。
+
+- `scripts/backup/fixture.py`：真实业务模型夹具、恢复后认证/消息/附件 HTTP 校验；[2026-11-14 验收证据](reports/2026-11-14_local_backup_restore.md)。

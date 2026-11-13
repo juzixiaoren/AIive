@@ -517,3 +517,7 @@ MCP Sandbox 及数据库记录的 sandbox_path 必须跨容器重建保留。`~/
 CI `scripts/smoke/compose_persistence.py` 写入确定性对象并记录 ObjectRef、SHA256 和密钥摘要，
 执行 `docker compose up -d --force-recreate backend`，等待健康后用原引用读取并核对摘要。
 只有 CI 的一次性测试栈最终执行 `docker compose down -v`；生产升级不要删除卷。
+
+## 本地备份与恢复
+
+V1 Restic 本机加密备份、每天 03:00 systemd 调度、独立项目恢复演练，见 [操作手册](docs/operations/local-backup.md)。已通过 Ubuntu 容器真实删卷恢复演练，见 [验收报告](docs/reports/2026-11-14_local_backup_restore.md)；systemd 需在服务器部署。

@@ -1,0 +1,3 @@
+exit=0
+project=aiive-restore-test-1794588438-12822
+restored_project=aiive-restore-test-1794588438-12822-new

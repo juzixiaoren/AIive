@@ -1,0 +1,15 @@
+ Container aiive-restore-test-1794588438-12822-frontend-1  Stopping
+ Container aiive-restore-test-1794588438-12822-backend-1  Stopping
+ Container aiive-restore-test-1794588438-12822-frontend-1  Stopped
+ Container aiive-restore-test-1794588438-12822-backend-1  Stopped
+ Container aiive-restore-test-1794588438-12822-frontend-1  Starting
+ Container aiive-restore-test-1794588438-12822-backend-1  Starting
+ Container aiive-restore-test-1794588438-12822-frontend-1  Started
+ Container aiive-restore-test-1794588438-12822-backend-1  Started
+ Container aiive-restore-test-1794588438-12822-frontend-1  Running
+ Container aiive-restore-test-1794588438-12822-backend-1  Running
+ Container aiive-restore-test-1794588438-12822-backend-1  Waiting
+ Container aiive-restore-test-1794588438-12822-frontend-1  Waiting
+ Container aiive-restore-test-1794588438-12822-frontend-1  Healthy
+ Container aiive-restore-test-1794588438-12822-backend-1  Healthy
+2026-11-13T16:48:18Z result=143 snapshot=none commit=58bf27fd2acd5f5c3446fc58b12cb27c2f8d0ec0 elapsed_seconds=18

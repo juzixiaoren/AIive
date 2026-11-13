@@ -1,0 +1,24 @@
+Snapshot files and SHA256 verified
+Snapshot files and SHA256 verified
+using temporary cache in /tmp/restic-check-cache-2522332604
+create exclusive lock for repository
+load indexes
+check all packs
+check snapshots, trees and blobs
+[0:00] 100.00%  1 / 1 snapshots
+
+read all data
+[0:00] 100.00%  2 / 2 packs
+
+no errors were found
+Snapshot files and SHA256 verified
+Applying Policy: keep 7 daily snapshots
+keep 1 snapshots:
+ID        Time                 Host                                 Tags        Reasons         Paths
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+c52df86a  2026-11-13 16:47:39  aiive-restore-test-1794588438-12822  aiive-v1    daily snapshot  /var/tmp/aiive-backup-test.i74kyIjW/backup/stage.F2XtGlHy
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+1 snapshots
+
+2026-11-13T16:47:42Z backup verified snapshot=c52df86a4cc2dfa2d47d973c5301996fe54299daf5ee66621fa294a2bef20119 repository_bytes=46699
+2026-11-13T16:47:49Z result=0 snapshot=c52df86a4cc2dfa2d47d973c5301996fe54299daf5ee66621fa294a2bef20119 commit=58bf27fd2acd5f5c3446fc58b12cb27c2f8d0ec0 elapsed_seconds=19

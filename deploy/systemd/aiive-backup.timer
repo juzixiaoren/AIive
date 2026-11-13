@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily AIive backup at 03:00 server local time
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+Unit=aiive-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,238 @@
+ Network aiive-restore-test-1794588438-12822_default  Creating
+ Network aiive-restore-test-1794588438-12822_default  Created
+ Volume aiive-restore-test-1794588438-12822_pgdata  Creating
+ Volume aiive-restore-test-1794588438-12822_pgdata  Created
+ Container aiive-restore-test-1794588438-12822-postgres-1  Creating
+ Container aiive-restore-test-1794588438-12822-postgres-1  Created
+ Container aiive-restore-test-1794588438-12822-postgres-1  Starting
+ Container aiive-restore-test-1794588438-12822-postgres-1  Started
+ Container aiive-restore-test-1794588438-12822-postgres-1  Waiting
+ Container aiive-restore-test-1794588438-12822-postgres-1  Healthy
+ Volume aiive-restore-test-1794588438-12822_aiive_data  Creating
+ Volume aiive-restore-test-1794588438-12822_aiive_data  Created
+ Container aiive-restore-test-1794588438-12822-backend-1  Creating
+ Container aiive-restore-test-1794588438-12822-frontend-1  Creating
+ Container aiive-restore-test-1794588438-12822-backend-1  Created
+ Container aiive-restore-test-1794588438-12822-frontend-1  Created
+ Container aiive-restore-test-1794588438-12822-backend-1  Starting
+ Container aiive-restore-test-1794588438-12822-frontend-1  Starting
+ Container aiive-restore-test-1794588438-12822-backend-1  Started
+ Container aiive-restore-test-1794588438-12822-frontend-1  Started
+ Container aiive-restore-test-1794588438-12822-frontend-1  Waiting
+ Container aiive-restore-test-1794588438-12822-backend-1  Waiting
+ Container aiive-restore-test-1794588438-12822-frontend-1  Healthy
+ Container aiive-restore-test-1794588438-12822-backend-1  Healthy
+ Container aiive-restore-test-1794588438-12822-frontend-1  Stopping
+ Container aiive-restore-test-1794588438-12822-backend-1  Stopping
+ Container aiive-restore-test-1794588438-12822-frontend-1  Stopped
+ Container aiive-restore-test-1794588438-12822-backend-1  Stopped
+Snapshot files and SHA256 verified
+Snapshot files and SHA256 verified
+using temporary cache in /tmp/restic-check-cache-2522332604
+create exclusive lock for repository
+load indexes
+check all packs
+check snapshots, trees and blobs
+[0:00] 100.00%  1 / 1 snapshots
+
+read all data
+[0:00] 100.00%  2 / 2 packs
+
+no errors were found
+Snapshot files and SHA256 verified
+Applying Policy: keep 7 daily snapshots
+keep 1 snapshots:
+ID        Time                 Host                                 Tags        Reasons         Paths
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+c52df86a  2026-11-13 16:47:39  aiive-restore-test-1794588438-12822  aiive-v1    daily snapshot  /var/tmp/aiive-backup-test.i74kyIjW/backup/stage.F2XtGlHy
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+1 snapshots
+
+2026-11-13T16:47:42Z backup verified snapshot=c52df86a4cc2dfa2d47d973c5301996fe54299daf5ee66621fa294a2bef20119 repository_bytes=46699
+ Container aiive-restore-test-1794588438-12822-frontend-1  Starting
+ Container aiive-restore-test-1794588438-12822-backend-1  Starting
+ Container aiive-restore-test-1794588438-12822-frontend-1  Started
+ Container aiive-restore-test-1794588438-12822-backend-1  Started
+ Container aiive-restore-test-1794588438-12822-frontend-1  Running
+ Container aiive-restore-test-1794588438-12822-backend-1  Running
+ Container aiive-restore-test-1794588438-12822-frontend-1  Waiting
+ Container aiive-restore-test-1794588438-12822-backend-1  Waiting
+ Container aiive-restore-test-1794588438-12822-frontend-1  Healthy
+ Container aiive-restore-test-1794588438-12822-backend-1  Healthy
+2026-11-13T16:47:49Z result=0 snapshot=c52df86a4cc2dfa2d47d973c5301996fe54299daf5ee66621fa294a2bef20119 commit=58bf27fd2acd5f5c3446fc58b12cb27c2f8d0ec0 elapsed_seconds=19
+Fatal: wrong password or no key found
+Fatal: wrong password or no key found
+2026-11-13T16:47:53Z ERROR line=40 exit=1
+2026-11-13T16:47:53Z result=1 snapshot=none commit=58bf27fd2acd5f5c3446fc58b12cb27c2f8d0ec0 elapsed_seconds=3
+Another backup/restore/verify is running
+2026-11-13T16:48:00Z ERROR insufficient disk space
+2026-11-13T16:48:00Z ERROR line=38 exit=4
+2026-11-13T16:48:00Z result=4 snapshot=none commit=58bf27fd2acd5f5c3446fc58b12cb27c2f8d0ec0 elapsed_seconds=2
+{"ok":true,"service":"AIive","version":"0.1.0"}{"ok":true,"service":"AIive","version":"0.1.0"}using temporary cache in /tmp/restic-check-cache-246903440
+create exclusive lock for repository
+load indexes
+check all packs
+check snapshots, trees and blobs
+[0:00] 100.00%  1 / 1 snapshots
+
+read all data
+[0:00] 100.00%  2 / 2 packs
+
+no errors were found
+Snapshot files and SHA256 verified
+2026-11-13T16:48:20Z verified snapshot=c52df86a4cc2dfa2d47d973c5301996fe54299daf5ee66621fa294a2bef20119
+ Container aiive-restore-test-1794588438-12822-frontend-1  Stopping
+ Container aiive-restore-test-1794588438-12822-backend-1  Stopping
+ Container aiive-restore-test-1794588438-12822-frontend-1  Stopped
+ Container aiive-restore-test-1794588438-12822-backend-1  Stopped
+Snapshot files and SHA256 verified
+Snapshot files and SHA256 verified
+using temporary cache in /tmp/restic-check-cache-3114110248
+create exclusive lock for repository
+load indexes
+check all packs
+check snapshots, trees and blobs
+[0:00] 100.00%  10 / 10 snapshots
+
+read all data
+[0:00] 100.00%  5 / 5 packs
+
+no errors were found
+Snapshot files and SHA256 verified
+Applying Policy: keep 7 daily snapshots
+keep 7 snapshots:
+ID        Time                 Host                                 Tags        Reasons         Paths
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+a45bdb54  2026-11-07 16:48:23  aiive-restore-test-1794588438-12822  aiive-v1    daily snapshot  /var/tmp/aiive-backup-test.i74kyIjW/retention-fixture
+b2917798  2026-11-08 16:48:24  aiive-restore-test-1794588438-12822  aiive-v1    daily snapshot  /var/tmp/aiive-backup-test.i74kyIjW/retention-fixture
+86f40d15  2026-11-09 16:48:25  aiive-restore-test-1794588438-12822  aiive-v1    daily snapshot  /var/tmp/aiive-backup-test.i74kyIjW/retention-fixture
+8c575919  2026-11-10 16:48:25  aiive-restore-test-1794588438-12822  aiive-v1    daily snapshot  /var/tmp/aiive-backup-test.i74kyIjW/retention-fixture
+d58dbe22  2026-11-11 16:48:26  aiive-restore-test-1794588438-12822  aiive-v1    daily snapshot  /var/tmp/aiive-backup-test.i74kyIjW/retention-fixture
+662c9eaa  2026-11-12 16:48:27  aiive-restore-test-1794588438-12822  aiive-v1    daily snapshot  /var/tmp/aiive-backup-test.i74kyIjW/retention-fixture
+0cbb52cf  2026-11-13 16:48:35  aiive-restore-test-1794588438-12822  aiive-v1    daily snapshot  /var/tmp/aiive-backup-test.i74kyIjW/backup/stage.zzoHifrj
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+7 snapshots
+
+remove 3 snapshots:
+ID        Time                 Host                                 Tags        Paths
+-----------------------------------------------------------------------------------------------------------------------------------------
+10770b79  2026-11-05 16:48:22  aiive-restore-test-1794588438-12822  aiive-v1    /var/tmp/aiive-backup-test.i74kyIjW/retention-fixture
+fa74ccc2  2026-11-06 16:48:22  aiive-restore-test-1794588438-12822  aiive-v1    /var/tmp/aiive-backup-test.i74kyIjW/retention-fixture
+c52df86a  2026-11-13 16:47:39  aiive-restore-test-1794588438-12822  aiive-v1    /var/tmp/aiive-backup-test.i74kyIjW/backup/stage.F2XtGlHy
+-----------------------------------------------------------------------------------------------------------------------------------------
+3 snapshots
+
+[0:00] 100.00%  3 / 3 files deleted
+
+3 snapshots have been removed, running prune
+loading indexes...
+loading all snapshots...
+finding data that is still in use for 7 snapshots
+[0:00] 100.00%  7 / 7 snapshots
+
+searching used packs...
+collecting packs for deletion and repacking
+[0:00] 100.00%  5 / 5 packs processed
+
+
+to repack:             0 blobs / 0 B
+this removes:          0 blobs / 0 B
+to delete:             5 blobs / 1.872 KiB
+total prune:           5 blobs / 1.872 KiB
+remaining:            23 blobs / 81.336 KiB
+unused size after prune: 0 B (0.00% of remaining size)
+
+rebuilding index
+[0:00] 100.00%  4 / 4 packs processed
+
+deleting obsolete index files
+[0:00] 100.00%  3 / 3 files deleted
+
+removing 1 old packs
+[0:00] 100.00%  1 / 1 files deleted
+
+done
+2026-11-13T16:48:38Z backup verified snapshot=0cbb52cf8e3c42a34a72346920f258750949fbbab55f401e7e649e2fe73753cc repository_bytes=88592
+ Container aiive-restore-test-1794588438-12822-backend-1  Starting
+ Container aiive-restore-test-1794588438-12822-frontend-1  Starting
+ Container aiive-restore-test-1794588438-12822-backend-1  Started
+ Container aiive-restore-test-1794588438-12822-frontend-1  Started
+ Container aiive-restore-test-1794588438-12822-frontend-1  Running
+ Container aiive-restore-test-1794588438-12822-backend-1  Running
+ Container aiive-restore-test-1794588438-12822-backend-1  Waiting
+ Container aiive-restore-test-1794588438-12822-frontend-1  Waiting
+ Container aiive-restore-test-1794588438-12822-frontend-1  Healthy
+ Container aiive-restore-test-1794588438-12822-backend-1  Healthy
+2026-11-13T16:48:45Z result=0 snapshot=0cbb52cf8e3c42a34a72346920f258750949fbbab55f401e7e649e2fe73753cc commit=58bf27fd2acd5f5c3446fc58b12cb27c2f8d0ec0 elapsed_seconds=17
+ Container aiive-restore-test-1794588438-12822-postgres-1  Stopping
+ Container aiive-restore-test-1794588438-12822-frontend-1  Stopping
+ Container aiive-restore-test-1794588438-12822-backend-1  Stopping
+ Container aiive-restore-test-1794588438-12822-frontend-1  Stopped
+ Container aiive-restore-test-1794588438-12822-frontend-1  Removing
+ Container aiive-restore-test-1794588438-12822-frontend-1  Removed
+ Container aiive-restore-test-1794588438-12822-postgres-1  Stopped
+ Container aiive-restore-test-1794588438-12822-postgres-1  Removing
+ Container aiive-restore-test-1794588438-12822-postgres-1  Removed
+ Container aiive-restore-test-1794588438-12822-backend-1  Stopped
+ Container aiive-restore-test-1794588438-12822-backend-1  Removing
+ Container aiive-restore-test-1794588438-12822-backend-1  Removed
+ Volume aiive-restore-test-1794588438-12822_pgdata  Removing
+ Network aiive-restore-test-1794588438-12822_default  Removing
+ Volume aiive-restore-test-1794588438-12822_aiive_data  Removing
+ Volume aiive-restore-test-1794588438-12822_pgdata  Removed
+ Volume aiive-restore-test-1794588438-12822_aiive_data  Removed
+ Network aiive-restore-test-1794588438-12822_default  Removed
+Restore into NEW project aiive-restore-test-1794588438-12822-new, directory /var/tmp/aiive-backup-test.i74kyIjW/recovered, volumes aiive-restore-test-1794588438-12822-new_aiive_data and aiive-restore-test-1794588438-12822-new_pgdata.
+using temporary cache in /tmp/restic-check-cache-1470161764
+create exclusive lock for repository
+load indexes
+check all packs
+check snapshots, trees and blobs
+[0:00] 100.00%  7 / 7 snapshots
+
+read all data
+[0:00] 100.00%  4 / 4 packs
+
+no errors were found
+Snapshot files and SHA256 verified
+ Network aiive-restore-test-1794588438-12822-new_default  Creating
+ Network aiive-restore-test-1794588438-12822-new_default  Created
+time="2026-11-13T16:48:50Z" level=warning msg="volume \"aiive-restore-test-1794588438-12822-new_pgdata\" already exists but was not created by Docker Compose. Use `external: true` to use an existing volume"
+ Container aiive-restore-test-1794588438-12822-new-postgres-1  Creating
+ Container aiive-restore-test-1794588438-12822-new-postgres-1  Created
+ Container aiive-restore-test-1794588438-12822-new-postgres-1  Starting
+ Container aiive-restore-test-1794588438-12822-new-postgres-1  Started
+ Container aiive-restore-test-1794588438-12822-new-postgres-1  Waiting
+ Container aiive-restore-test-1794588438-12822-new-postgres-1  Healthy
+time="2026-11-13T16:48:55Z" level=warning msg="volume \"aiive-restore-test-1794588438-12822-new_aiive_data\" already exists but was not created by Docker Compose. Use `external: true` to use an existing volume"
+time="2026-11-13T16:48:57Z" level=warning msg="volume \"aiive-restore-test-1794588438-12822-new_aiive_data\" already exists but was not created by Docker Compose. Use `external: true` to use an existing volume"
+ Container aiive-restore-test-1794588438-12822-new-backend-1  Creating
+ Container aiive-restore-test-1794588438-12822-new-backend-1  Created
+ Container aiive-restore-test-1794588438-12822-new-backend-1  Starting
+ Container aiive-restore-test-1794588438-12822-new-backend-1  Started
+ Container aiive-restore-test-1794588438-12822-new-backend-1  Waiting
+ Container aiive-restore-test-1794588438-12822-new-backend-1  Healthy
+ Container aiive-restore-test-1794588438-12822-new-frontend-1  Creating
+ Container aiive-restore-test-1794588438-12822-new-frontend-1  Created
+ Container aiive-restore-test-1794588438-12822-new-frontend-1  Starting
+ Container aiive-restore-test-1794588438-12822-new-frontend-1  Started
+2026-11-13T16:49:05Z restore complete snapshot=0cbb52cf8e3c42a34a72346920f258750949fbbab55f401e7e649e2fe73753cc project=aiive-restore-test-1794588438-12822-new target=/var/tmp/aiive-backup-test.i74kyIjW/recovered; ports intentionally unpublished; validate before switching traffic
+PASS real Thread/Event/Attachment/Task, ObjectRef, bytes, SHA256, Auth Secret, sandbox/worktree
+2026-11-13T16:49:06Z ERROR target must be a new directory
+using temporary cache in /tmp/restic-check-cache-3483623538
+create exclusive lock for repository
+load indexes
+check all packs
+check snapshots, trees and blobs
+error for tree 52e74cca:
+  decrypting blob 52e74ccabddb17e2f64581db4076c39b954b41586f70ffccf7019402fc258fa7 failed: ciphertext verification failed
+[0:00] 100.00%  7 / 7 snapshots
+
+read all data
+Pack ID does not match, want 31a48fc07d8926e241cbcb2e055049e8dfb59419af0d90c7ec570526b021db0e, got aa3bb3a2e0d9d84f57b34f26199a27903c309d3ddfb33115216026023d0cf748
+[0:00] 100.00%  4 / 4 packs
+
+Fatal: repository contains errors
+88592	/var/tmp/aiive-backup-test.i74kyIjW/backup/repository
+PASS recovery, wrong password, insufficient space, corrupt repository
+Evidence retained: /var/tmp/aiive-backup-test.i74kyIjW

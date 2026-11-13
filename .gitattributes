@@ -1,3 +1,6 @@
 # shell 脚本必须保持 LF：镜像内以 shebang 直接执行，CRLF 会导致
 # "bad interpreter: No such file or directory"。
 deploy/pg/*.sh text eol=lf
+
+scripts/backup/*.sh text eol=lf
+deploy/systemd/* text eol=lf
