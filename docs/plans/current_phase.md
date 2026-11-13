@@ -1212,3 +1212,5 @@ Web/Android 生产构建通过，Ruff 和 basedpyright 通过。新增 PostgreSQ
 ### V1 聊天附件授权隔离与读取性能收尾（2026-11-13）
 
 Task 改用显式 attachment_ids 授权与创建时来源入库；Worker 三附件工具共用名单和 Skill 门禁，Main 保持 Thread 读取范围。Vision 网络请求移到事务外并双重验证 Forget revision；文档解析使用 16 MiB / 16 项 / 单项 4 MiB 的进程内 LRU。零相关性 query 与顺序 EOF 明确返回。新增 21 项离线专项和 2 项真实 PG 锁竞态测试。完整证据见附件专项报告的收尾章节。
+
+实现提交 `410d9cf` 的 GitHub CI #99（43386265325）9/9 Job 成功；175 文件隔离通过，PG 104 passed / 39 skipped，新增两项 Vision 锁竞态实际通过。完整证据见附件专项验收报告。

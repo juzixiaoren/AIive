@@ -88,4 +88,23 @@ Worker 的 `_session` 先检查 Task Thread、task_visible、Skill 及 initial_i
 - 新专项 `test_attachment_isolation.py` 本地 21 passed；涵盖 A/B 隔离、list/read/progress、无授权、错误 Skill、多授权文件、创建时原子拒绝、来源提前登记及 Forget 停止、Main 不限名单、中文目标的结构化全文判定、零命中、空白 query、EOF、SHA/版本失效、并发单次解析、内存淘汰和 Vision 事务边界。
 - 原附件/Task/Forget 定向回归 85 passed，原断点恢复测试已使用显式 attachment_ids。
 - Ruff（F,E9）与 basedpyright 均零错误、零警告；Web/Android 构建成功，前端 chat 4、work 20、Desktop Node Host 8 项通过。
-- 本地全量 Python 2017 passed / 146 skipped / 6160 warnings，393.81 秒；之后新增的多附件完成门禁与 PG 竞态用例通过 21 项专项回归（本地 PG 14 skipped）。GitHub CI 结果在交付时汇总；日志前缀为 `build/attachment-isolation-*`。GitHub CI 按本次提交 SHA 验证，覆盖 pytest、单文件隔离、Ruff、basedpyright、前端/Android、Alembic、integration、postgres-contract 和 docker-smoke 共 9 Job。
+- 本地全量 Python 2017 passed / 146 skipped / 6160 warnings，393.81 秒；之后新增的多附件完成门禁与 PG 竞态用例通过 21 项专项回归（本地 PG 14 skipped）。GitHub CI 已完成，详见下表；日志前缀为 `build/attachment-isolation-*`。GitHub CI 按本次提交 SHA 验证，覆盖 pytest、单文件隔离、Ruff、basedpyright、前端/Android、Alembic、integration、postgres-contract 和 docker-smoke 共 9 Job。
+
+
+### 实现提交的完整 GitHub CI 结果
+
+实现提交：`410d9cfc4b308ac657c54377d1fe6fcd50bd38a8`。运行：[CI #99](https://github.com/juzixiaoren/AIive/actions/runs/43386265325)，最终 conclusion=success，9/9 Job 通过。
+
+| Job | 结果 |
+|---|---|
+| 单元与关键流程 pytest | 1380 passed / 1 skipped，162.98 秒 |
+| 本地集成 pytest | 643 passed / 143 skipped，75.96 秒；PG 专项在独立 Job 执行 |
+| 单文件隔离 | 全部 175 个文件通过 |
+| PostgreSQL 核心契约 | 104 passed / 39 skipped，53.96 秒；新增 Main/Worker Vision 锁竞态两项均 PASSED |
+| Ruff | success |
+| basedpyright | success |
+| 前端与 Android 构建、跨端契约 | success |
+| Alembic 空库升级与 metadata check | success |
+| Docker Compose smoke | success |
+
+PG Job 的 39 项跳过来自可选 pg_search 镜像与外部 Embedding 环境条件，不包含新增 Vision 锁竞态用例。以上是实现提交的 CI 证据；后续仅补充验收文档，不修改已验证的实现。
