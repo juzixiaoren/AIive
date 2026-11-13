@@ -41,7 +41,7 @@ Main 选择 document_processing，将附件 ID 放入 delegate_task 目标。服
 
 最终沿用 TaskReport/Artifact。所需文件尚无进度或进度未到末尾时，即使模型声明 succeeded，也强制 partial。预算耗尽沿用现有 partial 门禁。测试包含真实 Runtime 的读取、进度 Action、租约过期恢复和最终报告，并验证提前结束被降为 partial。
 
-## 测试证据
+## 首版 V1 测试证据（c982d67）
 
 日志保存在本地 `build/attachment-*.log`（构建目录不提交）。
 
@@ -59,3 +59,33 @@ Main 选择 document_processing，将附件 ID 放入 delegate_task 目标。服
 本地执行了可用的 pytest、Ruff、basedpyright、前端/Android 构建和前端/Desktop 契约门禁。Docker info 失败：Docker Desktop Linux Engine 命名管道不存在，因而 PostgreSQL 服务、Alembic PostgreSQL 空库验证、PG 并发契约和 Compose smoke 未执行。默认全量套件会明确跳过需 PG/POSIX 的测试。
 
 按用户要求提交并推送，不查看或等待远端 GitHub Actions；push 可能自动触发工作流，不能把本地验证描述为远端 CI 全绿；全仓库单文件隔离门禁已完成：174 passed、0 failed（每文件独立 pytest 进程、并发 2），见 `build/attachment-isolation.log` 和 `build/attachment-isolated/`。现有 CI 配置不变，新测试由现有 pytest job 自动收集。
+
+
+## V1 权限隔离与读取性能收尾
+
+本次基线为 `c982d67ed3526fac846c37051df3d4d81d951fc6`，一个 Part 完成。保留上传、历史恢复、Forget、GC、Memory、本地路径文档和 Knowledge Base 实现。Task 附件范围改为结构化显式授权，不兼容旧的目标文本隐式授权；缺少授权的旧任务拒绝读取，需显式传 attachment_ids 创建新任务。
+
+### 授权执行链
+
+`delegate_task(attachment_ids=[...], skill_id="document_processing")` → initial_input.attachment_ids → TaskRepository 在共享 Forget 锁内调用 validate_task_attachments → require/visible_rows、真实 user Event 与 Turn 同 Thread 绑定、references_visible → required_attachment_ids 精确名单及 agent_task ContentProvenanceRef → 初始 Checkpoint。
+
+Worker 的 `_session` 先检查 Task Thread、task_visible、Skill 及 initial_input/required 名单一致性。list 在 SQL 中先限定授权名单，read/progress 在任何原件或缓存访问前拒绝未授权 ID。空名单不能访问任何聊天附件；非 document_processing Skill 的 Worker 附件工具调用被拒绝。Main 无 task_id 时保持 Thread 全部可见附件访问能力。全文完成遍历 required_attachment_ids，各文件必须具备完整 total/next/processed 进度；不再分析目标文本字符串。
+
+### Vision 事务与竞态
+
+预检事务中完成权限、原件/SHA256、来源入库和 Forget revision 读取，提交并关闭后才调用 Vision。结束后重新开事务取得共享锁，核对 revision、来源可见性、绑定、SHA 和 Task 可见性；任何不确定或变化均拒绝结果。Base64 只存在于瞬时模型请求。
+
+新增 SQLite 测试在模型 callback 断言 Session.in_transaction=false，并模拟 Forget 和 revision 变化。新增 PG Main/Worker 两用例在 callback 的另一 Session 执行 Forget Phase A（lock_timeout=2s）；旧跨网络持锁实现会阻塞并失败，新实现应获得排他锁并在复检拒绝分析。
+
+### 缓存约束
+
+进程内不可变解析 Chunk LRU：总计费上限 16 MiB、最多 16 项、单项最多 4 MiB。键至少包含 attachment_id、sha256、PARSER_VERSION、CHUNKER_VERSION，另含 object_key、filename、Object Store 根、350/450 切块配置。递归计费所有可达 Python 对象，额外预留每项 512 字节；过大结果不缓存，正常返回当前页。RLock 保护读取、LRU 淘汰及 miss 解析，同一文件并发 miss 只解析一次。原始字节不常驻缓存，不增加表、索引、Embedding 或外部服务。
+
+每次缓存访问前重新执行 Thread、绑定、Task 授权和 Forget 可见性检查。SHA 或 parser/chunker 版本变化使用新键，绝不复用旧结果。被遗忘内容即使命中缓存也不能返回。正常 Chunk 翻页在命中后不再读取、校验和解析整个原件。query strip 后为空使用顺序读取；所有相关性分数为 0 时返回空 chunks 和 matched=false；chunk_index >= total_chunks 报 invalid_chunk_index。
+
+### 新增证据与 CI
+
+- 新专项 `test_attachment_isolation.py` 本地 21 passed；涵盖 A/B 隔离、list/read/progress、无授权、错误 Skill、多授权文件、创建时原子拒绝、来源提前登记及 Forget 停止、Main 不限名单、中文目标的结构化全文判定、零命中、空白 query、EOF、SHA/版本失效、并发单次解析、内存淘汰和 Vision 事务边界。
+- 原附件/Task/Forget 定向回归 85 passed，原断点恢复测试已使用显式 attachment_ids。
+- Ruff（F,E9）与 basedpyright 均零错误、零警告；Web/Android 构建成功，前端 chat 4、work 20、Desktop Node Host 8 项通过。
+- 本地全量 Python 2017 passed / 146 skipped / 6160 warnings，393.81 秒；之后新增的多附件完成门禁与 PG 竞态用例通过 21 项专项回归（本地 PG 14 skipped）。GitHub CI 结果在交付时汇总；日志前缀为 `build/attachment-isolation-*`。GitHub CI 按本次提交 SHA 验证，覆盖 pytest、单文件隔离、Ruff、basedpyright、前端/Android、Alembic、integration、postgres-contract 和 docker-smoke 共 9 Job。

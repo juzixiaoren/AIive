@@ -472,11 +472,13 @@ class PersistentTaskRuntime:
     ) -> dict[str, Any]:
         task = self.db.get(AgentTask, task.id) or task
         progress = (task.task_state or {}).get("attachment_processing") or {}
-        initial = (task.task_brief or {}).get("initial_input") or {}
-        if status == "succeeded" and initial.get("skill_id") == "document_processing" and (
-            ("attachment" in task.goal and not progress)
-            or any(aid not in progress for aid in (task.task_state or {}).get("required_attachment_ids", []))
-            or any(p.get("next_chunk_index", 0) < p.get("total_chunks", 0) for p in progress.values())
+        required = (task.task_state or {}).get("required_attachment_ids", [])
+        if status == "succeeded" and any(
+            not isinstance(progress.get(aid), dict)
+            or int(progress[aid].get("total_chunks", 0)) <= 0
+            or progress[aid].get("next_chunk_index") != progress[aid].get("total_chunks")
+            or progress[aid].get("processed_chunk_count") != progress[aid].get("total_chunks")
+            for aid in required
         ):
             status = "partial"
             summary = "附件全文处理尚未完成。" + summary

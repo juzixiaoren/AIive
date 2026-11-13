@@ -34,10 +34,13 @@ def _delegate_task(
     target_node_id: str = "",
     budgets: dict[str, Any] | None = None,
     goal_plan: dict[str, Any] | None = None,
+    attachment_ids: list[str] | None = None,
     ctx: RunContext | None = None,
 ) -> dict[str, Any]:
     run_ctx = _require_context(ctx)
     if goal_plan is not None:
+        if attachment_ids:
+            raise ValueError("goal_plan_attachment_authorization_not_supported")
         return _delegate_goal(
             run_ctx,
             goal=goal,
@@ -82,6 +85,7 @@ def _delegate_task(
             "isolation_mode": isolation_mode,
         },
         "initial_input": {
+            "attachment_ids": attachment_ids if attachment_ids is not None else [],
             **({"skill_id": selected_skill.skill_id} if selected_skill else {}),
             **({"deterministic_action": deterministic_action} if deterministic_action else {}),
         },
@@ -274,6 +278,7 @@ def build_main_agent_registry() -> ToolRegistry:
                 "description": "可选内置 Skill ID；先用 list_skills 查询。",
                 "enum": ["", "document_processing", "web_research", "knowledge_base", "mcp_management"],
             },
+            "attachment_ids": {"type": "list", "description": "聊天附件任务的明确授权 ID 列表，仅用于 document_processing；目标文本不授予附件权限。"},
             "title": {"type": "str"},
             "acceptance_criteria": {"type": "list"},
             "constraints": {"type": "list"},

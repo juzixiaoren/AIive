@@ -7,6 +7,7 @@ import re
 from contextlib import contextmanager
 from collections.abc import Callable
 from sqlalchemy.orm import Session
+from sqlalchemy import true
 from dataclasses import asdict
 from typing import Any
 
@@ -14,9 +15,10 @@ from aiive.config import settings
 from aiive.context.run_context import RunContext
 from aiive.db.base import SessionLocal
 from aiive.db.models import Attachment, Event, AgentTask
-from aiive.forget.concurrency import acquire_forget_shared_lock
+from aiive.forget.concurrency import acquire_forget_shared_lock, forget_revision
 from aiive.forget.durable_sources import persist_sources, references_visible
-from aiive.runtime.attachments import BUCKET, require, visible_rows
+from aiive.runtime.attachments import BUCKET, visible_rows
+from aiive.runtime.attachment_access import bound_user_attachment, worker_attachment_ids
 from aiive.storage import object_store
 from aiive.tools.registry import CapabilitySafetySchema, ToolRegistration, ToolRegistry
 
@@ -39,8 +41,19 @@ def _session(ctx: RunContext | None):
                 or not TaskReadRepository(db).task_visible(task)
             ):
                 raise ValueError("task_unavailable")
+            worker_attachment_ids(task)
         yield db, ctx
         db.commit()
+
+
+def _authorized_attachment(
+    db: Session, run: RunContext, attachment_id: str
+) -> Attachment:
+    if run.task_id:
+        task = db.get(AgentTask, run.task_id)
+        if task is None or attachment_id not in worker_attachment_ids(task):
+            raise ValueError("attachment_not_authorized")
+    return bound_user_attachment(db, attachment_id, run.thread_id)
 
 
 def _sources(db: Session, ctx: RunContext, ids: list[str]) -> None:
@@ -56,14 +69,20 @@ def _sources(db: Session, ctx: RunContext, ids: list[str]) -> None:
 def list_thread_attachments(
     query: str = "", limit: int = 20, offset: int = 0, ctx: RunContext | None = None
 ) -> dict[str, Any]:
+    query = query.strip()
     limit, offset = max(1, min(limit, 50)), max(0, offset)
     with _session(ctx) as (db, run):
+        allowed = None
+        if run.task_id:
+            task = db.get(AgentTask, run.task_id)
+            allowed = worker_attachment_ids(task) if task is not None else []
         rows = visible_rows(
             db,
             db.query(Attachment)
             .filter(
                 Attachment.thread_id == run.thread_id,
                 Attachment.turn_record_id.isnot(None),
+                Attachment.id.in_(allowed) if allowed is not None else true(),
             )
             .order_by(Attachment.created_at, Attachment.id)
             .all(),
@@ -108,6 +127,46 @@ def list_thread_attachments(
         }
 
 
+def _vision_analysis(
+    data: bytes, mime: str, query: str, trace_id: str
+) -> tuple[str, str]:
+    """No database session or ORM object crosses this network boundary."""
+    if not settings.aiive_vision_model and not settings.aiive_llm_vision_enabled:
+        raise ValueError("vision_not_configured")
+    from aiive.core.llm_client import LLMClient
+
+    client = LLMClient(
+        base_url=(settings.aiive_vision_base_url or settings.aiive_llm_base_url)
+        if settings.aiive_vision_model
+        else settings.aiive_llm_base_url,
+        api_key=(settings.aiive_vision_api_key or settings.aiive_llm_api_key)
+        if settings.aiive_vision_model
+        else settings.aiive_llm_api_key,
+        default_model=settings.aiive_vision_model or settings.aiive_llm_model,
+        timeout_seconds=settings.aiive_llm_timeout_seconds,
+    )
+    response = client.chat(
+        [
+            {"role": "system", "content": UNTRUSTED},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": query or "请描述这张图片。"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime};base64,"
+                            + base64.b64encode(data).decode()
+                        },
+                    },
+                ],
+            },
+        ],
+        trace_id=trace_id,
+    )
+    return response.content[:6000], response.model
+
+
 def read_attachment(
     attachment_id: str,
     query: str = "",
@@ -115,84 +174,49 @@ def read_attachment(
     max_chunks: int = 1,
     ctx: RunContext | None = None,
 ) -> dict[str, Any]:
+    query = query.strip()
     if chunk_index < 0:
         raise ValueError("invalid_chunk_index")
     with _session(ctx) as (db, run):
-        row = require(db, attachment_id, run.thread_id)
-        if not row.turn_record_id or not row.event_id:
+        row = _authorized_attachment(db, run, attachment_id)
+        source_id = row.event_id
+        if not source_id:
             raise ValueError("attachment_not_bound")
-        _sources(db, run, [row.event_id])
-        if run.task_id and not query:
-            task = db.get(AgentTask, run.task_id)
-            if (
-                task is not None
-                and ((task.task_brief or {}).get("initial_input") or {}).get("skill_id")
-                == "document_processing"
-            ):
-                progress = (
-                    (task.task_state or {}).get("attachment_processing") or {}
-                ).get(row.id, {})
-                expected = int(progress.get("next_chunk_index", 0))
-                if chunk_index != expected:
-                    raise ValueError(f"attachment_resume_at_chunk:{expected}")
-        try:
-            data = object_store.get_verified(
-                object_store.ObjectRef(BUCKET, row.object_key), row.sha256
-            )
-        except (OSError, ValueError) as exc:
-            raise ValueError("attachment_bytes_unavailable") from exc
+        _sources(db, run, [source_id])
         result: dict[str, Any] = {
             "attachment_id": row.id,
             "filename": row.filename,
-            "source_event_id": row.event_id,
+            "source_event_id": source_id,
             "untrusted": UNTRUSTED,
         }
         if row.mime.startswith("image/"):
-            if (
-                not settings.aiive_vision_model
-                and not settings.aiive_llm_vision_enabled
-            ):
-                raise ValueError("vision_not_configured")
-            from aiive.core.llm_client import LLMClient
-
-            client = LLMClient(
-                base_url=(settings.aiive_vision_base_url or settings.aiive_llm_base_url)
-                if settings.aiive_vision_model
-                else settings.aiive_llm_base_url,
-                api_key=(settings.aiive_vision_api_key or settings.aiive_llm_api_key)
-                if settings.aiive_vision_model
-                else settings.aiive_llm_api_key,
-                default_model=settings.aiive_vision_model or settings.aiive_llm_model,
-                timeout_seconds=settings.aiive_llm_timeout_seconds,
-            )
-            response = client.chat(
-                [
-                    {"role": "system", "content": UNTRUSTED},
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": query or "请描述这张图片。"},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:{row.mime};base64,"
-                                    + base64.b64encode(data).decode()
-                                },
-                            },
-                        ],
-                    },
-                ],
-                trace_id=run.trace_id,
-            )
-            result.update(analysis=response.content[:6000], model=response.model)
+            try:
+                data = object_store.get_verified(
+                    object_store.ObjectRef(BUCKET, row.object_key), row.sha256
+                )
+            except (OSError, ValueError) as exc:
+                raise ValueError("attachment_bytes_unavailable") from exc
+            mime, sha256 = row.mime, row.sha256
+            revision = forget_revision(db)
+            trace_id = run.trace_id
         else:
-            from aiive.knowledge.blocks import parse_document_blocks
-            from aiive.knowledge.chunker import ChunkConfig, chunk_blocks
+            from aiive.runtime.attachment_cache import document_chunks
 
-            chunks = chunk_blocks(
-                parse_document_blocks(data, row.filename),
-                ChunkConfig(target_chunk_tokens=350, max_chunk_tokens=450),
-            )
+            chunks = document_chunks(row.id, row.sha256, row.object_key, row.filename)
+            if not query and chunk_index >= len(chunks):
+                raise ValueError("invalid_chunk_index")
+            if run.task_id and not query:
+                task = db.get(AgentTask, run.task_id)
+                progress = (
+                    ((task.task_state or {}).get("attachment_processing") or {}).get(
+                        row.id, {}
+                    )
+                    if task
+                    else {}
+                )
+                expected = int(progress.get("next_chunk_index", 0))
+                if chunk_index != expected:
+                    raise ValueError(f"attachment_resume_at_chunk:{expected}")
             if query:
                 terms = set(re.findall(r"[\w]+", query.casefold()))
                 terms.update(
@@ -200,33 +224,34 @@ def read_attachment(
                     for i in range(len(query) - 1)
                     if "\u4e00" <= query[i] <= "\u9fff"
                 )
-                ranked = sorted(
-                    chunks,
-                    key=lambda c: (
-                        -sum(
+                scores = [
+                    (
+                        sum(
                             c.content.casefold().count(t)
                             + c.heading_text.casefold().count(t)
                             for t in terms
                         ),
-                        c.chunk_index,
-                    ),
+                        c,
+                    )
+                    for c in chunks
+                ]
+                ranked = sorted(
+                    ((score, c) for score, c in scores if score > 0),
+                    key=lambda item: (-item[0], item[1].chunk_index),
                 )
-                selected = ranked[: max(1, min(max_chunks, 2))]
+                selected = [c for _, c in ranked[: max(1, min(max_chunks, 2))]]
             else:
-                if chunk_index > len(chunks):
-                    raise ValueError("invalid_chunk_index")
                 selected = chunks[chunk_index : chunk_index + 1]
             result.update(
                 chunks=[
                     {k: v for k, v in asdict(c).items() if k != "parts"}
                     for c in selected
                 ],
+                matched=bool(selected),
                 total_chunks=len(chunks),
-                next_chunk_index=(
-                    chunk_index + 1
-                    if not query and chunk_index + 1 < len(chunks)
-                    else None
-                ),
+                next_chunk_index=chunk_index + 1
+                if not query and chunk_index + 1 < len(chunks)
+                else None,
             )
             if run.task_id and not query:
                 task = (
@@ -241,9 +266,22 @@ def read_attachment(
                     "chunk_index": chunk_index,
                     "total_chunks": len(chunks),
                 }
-                state["attachment_read_receipts"] = receipts
-                task.task_state = state
-        return result
+                task.task_state = {**state, "attachment_read_receipts": receipts}
+            return result
+    # The first session is committed and closed before making the Vision request.
+    analysis, model = _vision_analysis(data, mime, query, trace_id)
+    with _session(ctx) as (db, run):
+        if forget_revision(db) != revision:
+            raise ValueError("attachment_source_changed")
+        row = _authorized_attachment(db, run, attachment_id)
+        if (
+            row.event_id != source_id
+            or row.sha256 != sha256
+            or not references_visible(db, {"event": [source_id]})
+        ):
+            raise ValueError("attachment_source_changed")
+    result.update(analysis=analysis, model=model)
+    return result
 
 
 def record_attachment_progress(
@@ -256,7 +294,7 @@ def record_attachment_progress(
     with _session(ctx) as (db, run):
         if not run.task_id:
             raise ValueError("attachment_progress_requires_worker")
-        row = require(db, attachment_id, run.thread_id)
+        row = _authorized_attachment(db, run, attachment_id)
         if not row.event_id:
             raise ValueError("attachment_not_bound")
         _sources(db, run, [row.event_id])

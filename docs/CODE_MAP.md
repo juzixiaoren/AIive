@@ -1198,3 +1198,11 @@ process_cleanup_actions 经 VerifyReport/共享引用复查后设置 GC verified
 - `tools/attachment_tools.py`：Main/Worker 共享 list/read 注册；Thread 来自 RunContext，原件只在 read 时校验 SHA256 并解析。
 - `task_runtime`：Worker 专用 record_attachment_progress、JSON task_state、Checkpoint 恢复与全文完成门禁；结构化有界读取结果保留在 Evidence 摘要和下一次 Worker Context。
 - 详细调用链、权限、来源与验证见 `docs/reports/2026-11-13_V1_attachment_on_demand.md`。
+
+
+## V1 附件授权与读取性能收尾（2026-11-13）
+
+- `runtime/attachment_access.py`：真实 user Event/Turn 绑定校验、结构化 Task 授权名单和 Skill 门禁；Repository 创建时验证，Worker 三工具逐次核对。
+- `runtime/attachment_cache.py`：16 MiB / 16 条目进程内 LRU，单条目最多 4 MiB；SHA、PARSER_VERSION、CHUNKER_VERSION 等组成键，权限检查在缓存之前。
+- `tools/attachment_tools.py`：Vision 的短事务预检与提交、事务外模型请求、短事务 revision/来源/Task 复检；query 零命中与顺序 EOF 明确处理。
+- 新验收：`tests/unit/backend/test_attachment_isolation.py`；真实 advisory lock 竞态：`tests/integration/pg/test_pg_chat_attachments.py::test_pg_vision_releases_forget_lock_and_rejects_race`。

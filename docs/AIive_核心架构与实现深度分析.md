@@ -2426,3 +2426,14 @@ Main 的 list_thread_attachments/read_attachment 只接受当前 RunContext Thre
 实际注入引用以及 list/read 返回的 Event 进入 attachment_context；Worker 同时扩展 agent_task 来源，后续 TaskReadRepository 与 Worker 来源门禁阻断被遗忘资料。自动 Memory 只在本轮调用读取工具后屏蔽附件派生回复，元信息引用不关闭普通 Memory。
 
 全文任务选择 document_processing 并委派。每块读取产生服务端 receipt，record_attachment_progress 验证连续推进并幂等记录累计摘要、next_chunk_index、total_chunks、processed_chunk_count，事务内写 Checkpoint。重启复用原有租约恢复与 task_state，下一次 Worker Context 保留有界 Chunk 结果；未遍历完毕不能返回 succeeded，预算耗尽沿用 partial。
+
+
+## V1 附件授权隔离与有界缓存（2026-11-13）
+
+聊天附件的 Worker 授权是显式 `delegate_task.attachment_ids`，存入 `task_brief.initial_input.attachment_ids`。TaskRepository 在 Forget 共享锁内逐项验证同 Thread、真实 user Event/Turn 绑定、可见性和来源证明；将精确名单存入 required_attachment_ids，并在首次 Checkpoint 前 persist_sources 到 agent_task。Task 目标文本没有授权语义。无名单和非 document_processing Skill 无法使用 Worker 附件读取；Main 无 task_id 时继续访问整个 Thread 的可见聊天附件。本地路径文档和 Knowledge 能力保持原有权限机制。
+
+Worker 的 list/read/progress 共用 attachment_access 门禁，并保留 TaskReadRepository.task_visible、references_visible 和 Forget 共享锁。全文完成仅核对结构化 required_attachment_ids 的每个进度，避免目标文本语言影响结果。旧任务缺少结构化授权时默认拒绝读取，用户需要通过显式附件参数创建获授权任务。
+
+文档原件仅在解析缓存未命中时经 SHA256 校验并使用原有 parser/chunker。缓存保留不可变 ChunkDraft 元组，键包含 attachment_id、SHA256、parser_version、chunker_version，另外包括对象 key、文件名、Object Store 根及切块配置。单进程 LRU 计费上限 16 MiB、最多 16 条，单条目上限 4 MiB；递归计算可达对象内存并保守预留每条目 512 字节，超大结果正常读取但不缓存。RLock 串行 miss 解析并保护命中和淘汰，避免并发重复解析堆积；不保存原件字节或持久化索引。每次读在查缓存之前重新验证权限和 Forget，因此缓存不授予访问权。顺序读取越界报 invalid_chunk_index，空白 query 归一化为顺序模式，关键词全零返回 matched=false 和空 chunks。
+
+Vision 第一个短事务中执行归属、授权、Forget、原件/SHA 校验及来源持久化，记录 revision 并提交关闭；模型网络调用只有原始字节和标量参数。返回后新事务取得共享锁，再核对 revision、绑定、SHA、references_visible 和 Task 可见性，变化时丢弃分析。真实 PG 测试在模型 callback 中由另一个 Session 使用 2 秒 lock_timeout 获取 Forget 排他锁并提交 Shield，以证明网络期间没有遗留读事务锁，同时验证结果拒绝返回。

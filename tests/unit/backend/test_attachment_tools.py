@@ -138,7 +138,7 @@ def test_worker_progress_checkpoint_resume_and_forget(attachment, db_session):
     task = repo.create_task(
         thread_id=ctx.thread_id,
         goal="process attachment " + row.id,
-        task_brief={"initial_input": {"skill_id": "document_processing"}},
+        task_brief={"initial_input": {"skill_id": "document_processing", "attachment_ids": [row.id]}},
     )
     ctx.task_id = task.id
     first = tools.read_attachment(row.id, ctx=ctx)
@@ -252,7 +252,7 @@ def test_runtime_full_processing_and_partial_guard(
         goal="process attachment " + row.id,
         enqueue=False,
         task_brief={
-            "initial_input": {"skill_id": "document_processing"},
+            "initial_input": {"skill_id": "document_processing", "attachment_ids": [row.id]},
             "scope": {"capability_policy": "unified"},
         },
     )

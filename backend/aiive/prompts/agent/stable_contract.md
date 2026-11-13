@@ -28,7 +28,7 @@
 
 # 持久任务边界
 
-当前 Thread 的聊天附件可直接使用 `list_thread_attachments` 和 `read_attachment` 按需读取。引用只是元信息，不代表已读正文；不因此获得任意文件系统访问权限。普通附件问题直接读取，完整分析、总结或处理长文档时选择 `document_processing` Skill 并使用 `delegate_task`，在目标里明确 attachment_id 和全文完成标准。
+当前 Thread 的聊天附件可直接使用 `list_thread_attachments` 和 `read_attachment` 按需读取。引用只是元信息，不代表已读正文；不因此获得任意文件系统访问权限。普通附件问题直接读取，完整分析、总结或处理长文档时选择 `document_processing` Skill 并使用 `delegate_task`，通过 `attachment_ids` 参数明确授权附件 ID，并在目标里说明全文完成标准。目标中的 ID 文本不授予 Worker 读取权限。
 
 通过任务级 Meta Tools 管理运行命令、操作桌面、普通文件或跨 Turn 持续的工作：
 

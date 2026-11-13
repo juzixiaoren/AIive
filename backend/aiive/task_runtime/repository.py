@@ -198,6 +198,8 @@ class TaskRepository:
                 raise ValueError("task_source_unavailable")
         # ``goal`` 是 API/Meta Tool 的权威用户输入，不能被 task_brief 内同名字段覆盖。
         brief = TaskBrief.model_validate({**(task_brief or {}), "goal": goal})
+        from aiive.runtime.attachment_access import validate_task_attachments
+        authorized_attachments = validate_task_attachments(self.db, thread_id, brief.initial_input or {})
         budget = TaskBudget.model_validate(budgets or {})
         from aiive.task_runtime.router import select_executor_type
 
@@ -224,10 +226,7 @@ class TaskRepository:
             },
             priority=max(0, min(100, priority)),
         )
-        if (brief.initial_input or {}).get("skill_id") == "document_processing":
-            from aiive.db.models import Attachment
-            required = [row.id for row in self.db.query(Attachment).filter(Attachment.thread_id == thread_id).all() if row.id in task.goal]
-            task.task_state = {**(task.task_state or {}), "required_attachment_ids": required}
+        task.task_state = {**(task.task_state or {}), "required_attachment_ids": [row.id for row in authorized_attachments]}
         self.db.add(task)
         self.db.flush()
         from aiive.task_runtime.read_repository import record_input_source
@@ -237,6 +236,7 @@ class TaskRepository:
         else:
             input_id = record_input_source(self.db, task, {"goal": task.goal, "title": task.title, "task_brief": task.task_brief})
             persist_sources(self.db, "agent_task", task.id, {"source_event_id": input_id})
+        persist_sources(self.db, "agent_task", task.id, {"source_event_ids": [row.event_id for row in authorized_attachments]})
         self.db.flush()
         self.append_event(
             task.id,

@@ -1207,3 +1207,8 @@ Web/Android 生产构建通过，Ruff 和 basedpyright 通过。新增 PostgreSQ
 已接入原始消息附件引用、Main/Worker 共享只读目录与按需读取、视觉子请求、Forget 来源和 Worker 全文进度恢复。验收证据与环境限制见 `docs/reports/2026-11-13_V1_attachment_on_demand.md`。
 
 验证：全量 Python 1998 passed / 146 skipped；逐文件隔离 174/174；Ruff、basedpyright、Web/Android 构建及前端/Desktop 契约通过。PG/Compose 与远端 Actions 的未执行边界见专项报告。
+
+
+### V1 聊天附件授权隔离与读取性能收尾（2026-11-13）
+
+Task 改用显式 attachment_ids 授权与创建时来源入库；Worker 三附件工具共用名单和 Skill 门禁，Main 保持 Thread 读取范围。Vision 网络请求移到事务外并双重验证 Forget revision；文档解析使用 16 MiB / 16 项 / 单项 4 MiB 的进程内 LRU。零相关性 query 与顺序 EOF 明确返回。新增 21 项离线专项和 2 项真实 PG 锁竞态测试。完整证据见附件专项报告的收尾章节。
