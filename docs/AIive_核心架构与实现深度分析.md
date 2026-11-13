@@ -2415,3 +2415,14 @@ AIIVE_VISION_CONTEXT_WINDOW=32768
 
 历史生产数据的补偿在运行新版后端维护任务时执行；本次没有直接修改生产数据库或手工删除原件。
 保存/分享原生插件仍使用既有官方插件边界测试，本次不宣称 Android 真机验证，也不新增外部模型或 Agent Evaluation。
+
+
+## V1 原生消息附件与持久全文处理（2026-11-13）
+
+附件仍沿用 Attachment/Event/Object Store，没有新表、迁移或索引。ThreadState 按来源 Event 查询 visible_rows 元信息，在 user message 中渲染；当前消息使用同样路径。ContextOverflowPacker 以 Turn 为单位淘汰，目录工具可在历史消失后重新发现文件。普通上下文组装不再读取原始字节或因历史图片切换模型。
+
+Main 的 list_thread_attachments/read_attachment 只接受当前 RunContext Thread；read 使用 require、Forget 共享锁、references_visible、get_verified，文档复用 parse_document_blocks/chunk_blocks，350/450 Token、查询至多两块、顺序一块。图片通过专用 Vision 配置或显式开启的主模型进行多模态请求，只持久化文字观察。工具结果均为不可信资料。
+
+实际注入引用以及 list/read 返回的 Event 进入 attachment_context；Worker 同时扩展 agent_task 来源，后续 TaskReadRepository 与 Worker 来源门禁阻断被遗忘资料。自动 Memory 只在本轮调用读取工具后屏蔽附件派生回复，元信息引用不关闭普通 Memory。
+
+全文任务选择 document_processing 并委派。每块读取产生服务端 receipt，record_attachment_progress 验证连续推进并幂等记录累计摘要、next_chunk_index、total_chunks、processed_chunk_count，事务内写 Checkpoint。重启复用原有租约恢复与 task_state，下一次 Worker Context 保留有界 Chunk 结果；未遍历完毕不能返回 succeeded，预算耗尽沿用 partial。

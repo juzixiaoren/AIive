@@ -471,6 +471,16 @@ class PersistentTaskRuntime:
         token_usage: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         task = self.db.get(AgentTask, task.id) or task
+        progress = (task.task_state or {}).get("attachment_processing") or {}
+        initial = (task.task_brief or {}).get("initial_input") or {}
+        if status == "succeeded" and initial.get("skill_id") == "document_processing" and (
+            ("attachment" in task.goal and not progress)
+            or any(aid not in progress for aid in (task.task_state or {}).get("required_attachment_ids", []))
+            or any(p.get("next_chunk_index", 0) < p.get("total_chunks", 0) for p in progress.values())
+        ):
+            status = "partial"
+            summary = "附件全文处理尚未完成。" + summary
+            unresolved = [*(unresolved or []), "attachment_processing_incomplete"]
         if task.status == TaskStatus.QUEUED.value:
             self.repo.transition_task(task, TaskStatus.DISPATCHING.value)
             self.repo.transition_task(task, TaskStatus.RUNNING.value)

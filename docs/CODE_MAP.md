@@ -1190,3 +1190,11 @@ V62.6.1 测试清理：根 `conftest.py::_cleanup_test_db` / `pytest_sessionfini
 
 最终收尾：ForgetVisibilityService.blocked_attachment_ids 批量检查上传时间 Shield；
 process_cleanup_actions 经 VerifyReport/共享引用复查后设置 GC verified_at，交回正常 Retention。
+
+
+## V1 聊天附件按需读取（2026-11-13）
+
+- `runtime/attachments.py::event_attachment_refs/render_attachment_refs`：批量可见元信息，跟随原始消息参与 Token 统计与 Turn 裁剪。
+- `tools/attachment_tools.py`：Main/Worker 共享 list/read 注册；Thread 来自 RunContext，原件只在 read 时校验 SHA256 并解析。
+- `task_runtime`：Worker 专用 record_attachment_progress、JSON task_state、Checkpoint 恢复与全文完成门禁；结构化有界读取结果保留在 Evidence 摘要和下一次 Worker Context。
+- 详细调用链、权限、来源与验证见 `docs/reports/2026-11-13_V1_attachment_on_demand.md`。

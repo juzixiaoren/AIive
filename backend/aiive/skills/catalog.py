@@ -41,6 +41,7 @@ _DEFINITIONS: tuple[dict[str, Any], ...] = (
         "default_task_type": "document",
         "capabilities": (
             "read_document", "ingest_document", "search_knowledge", "reindex_document",
+            "list_thread_attachments", "read_attachment", "record_attachment_progress",
         ),
         "supported_formats": (
             "txt", "md", "markdown", "html", "htm", "json", "csv", "tsv", "docx", "pdf",

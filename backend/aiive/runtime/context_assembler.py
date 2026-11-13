@@ -256,9 +256,12 @@ class ContextAssembler:
         epoch_cp_text = self._load_epoch_checkpoint(db, thread_id)
         bridge_text = self._load_sealing_bridge(db, thread_id)
         rendered: dict[str, Any] = {}
-        from aiive.runtime.attachments import load_attachments
-        loaded_attachments = load_attachments(db, thread_id)
-        attachment_parts = loaded_attachments.parts
+        from aiive.db.models import Event
+        from aiive.runtime.attachments import event_attachment_refs, render_attachment_refs
+        current_events = db.query(Event).filter(Event.thread_id == thread_id, Event.turn_id == current_turn_id, Event.event_type == "user_message").all() if current_turn_id else []
+        current_refs = event_attachment_refs(db, [e.id for e in current_events])
+        message = render_attachment_refs(message, [r for refs in current_refs.values() for r in refs])
+        candidates.fixed["current_message"] = message
 
 
         def render() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -291,9 +294,6 @@ class ContextAssembler:
                 current_role="user" if _source in (None, "user") else "system",
                 current_message=message,
             )
-            # Hydrate only the transient provider request. Snapshot and events retain references.
-            if attachment_parts:
-                prompt_messages[-1]["content"] = [{"type": "text", "text": message}, *attachment_parts]
             return prompt_messages, tools_schema
 
         def estimate(source: str, item: Any) -> int | None:
@@ -343,19 +343,21 @@ class ContextAssembler:
         self._touch_injected_memory(pack)
         snapshot_args = {key: value for key, value in report_args.items() if key != "graph_text"}
         snapshot_args["recall_text"] = "\n".join(filter(None, (rendered["retrieved"], rendered["graph"])))
+        snapshot_args["history_msgs"] = [
+            {**msg, "content": "[附件读取结果：请使用 read_attachment 按引用重新读取]"}
+            if msg.get("name") == "read_attachment" else msg
+            for msg in rendered["history"]
+        ]
         snapshot = self._build_input_snapshot(
             **snapshot_args, user_message=message, _source=_source,
         )
-        if attachment_parts:
-            refs = loaded_attachments.metadata
-            snapshot.items.append(ContextSnapshotItem(
-                item_id="attachments", kind="attachment_refs", source="user", trust_level="untrusted",
-                content_preview=_json.dumps(refs, ensure_ascii=False)))
-            snapshot.full_contents["attachments"] = _json.dumps(refs, ensure_ascii=False)
         snapshot.selection_trace = candidates.selection_trace
         snapshot.stable_prefix_hash = _hash_text(rendered["system"])
         snapshot.injected_memory_ids = self._collect_injected_memory_ids(pack)
-        agent_ctx["attachment_source_event_ids"] = loaded_attachments.source_event_ids
+        agent_ctx["attachment_source_event_ids"] = list(dict.fromkeys([
+            *current_refs,
+            *(event["event_id"] for turn in candidates.history for event in turn.events if event.get("attachments")),
+        ]))
         agent_ctx["open_questions"] = open_questions
         return AssembledContext(
             messages=messages, tools_schema=tools_schema, partition_reports=reports,
@@ -977,7 +979,8 @@ class ContextAssembler:
             etype = item.get("type", "")
             if etype == "user":
                 _flush_pending()
-                content = item.get("content", "")
+                from aiive.runtime.attachments import render_attachment_refs
+                content = render_attachment_refs(item.get("content", ""), item.get("attachments", []))
                 if content:
                     result.append({"role": "user", "content": content})
             elif etype == "system":

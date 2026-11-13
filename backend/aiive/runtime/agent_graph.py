@@ -497,6 +497,9 @@ class AgentGraph:
 
             # 工具结果
             result_id = f"tool_result:{i}"
+            if name == "read_attachment":
+                # Snapshot retains the read reference, never an attachment body.
+                result = {"attachment_id": params.get("attachment_id"), "query": params.get("query", ""), "chunk_index": params.get("chunk_index", 0), "body_omitted": True}
             result_text = _json.dumps(result, ensure_ascii=False)
             preview = f"[{status}] {_truncate(result_text, 20)}"
             items.append(ContextSnapshotItem(

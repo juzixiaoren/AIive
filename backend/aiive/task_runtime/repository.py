@@ -224,6 +224,10 @@ class TaskRepository:
             },
             priority=max(0, min(100, priority)),
         )
+        if (brief.initial_input or {}).get("skill_id") == "document_processing":
+            from aiive.db.models import Attachment
+            required = [row.id for row in self.db.query(Attachment).filter(Attachment.thread_id == thread_id).all() if row.id in task.goal]
+            task.task_state = {**(task.task_state or {}), "required_attachment_ids": required}
         self.db.add(task)
         self.db.flush()
         from aiive.task_runtime.read_repository import record_input_source

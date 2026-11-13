@@ -48,6 +48,7 @@ class TaskContextAssembler:
         checkpoint = TaskRepository(self.db).latest_checkpoint(task.id)
         actions = reader.actions(task.id)
         evidence = list(reversed(reader.evidence(task.id)[-20:]))
+        attachment_actions = {a.id for a in actions if a.capability_id == "read_attachment"}
         artifacts = reader.artifacts(task.id)
         events = reader.signals(task.id, ["user_input_received", "watch_triggered", "approval_denied",
             "task_recovered", "action_invalidated"])
@@ -81,7 +82,7 @@ class TaskContextAssembler:
                 for item in reversed(actions)
             ],
             "evidence": [
-                {"id": item.id, "action_id": item.action_id, "kind": item.kind, "summary": item.summary[:1600]}
+                {"id": item.id, "action_id": item.action_id, "kind": item.kind, "summary": item.summary if item.action_id in attachment_actions and len(item.summary) <= 32000 else item.summary[:1600]}
                 for item in reversed(evidence)
             ],
             "artifacts": [
@@ -224,4 +225,12 @@ def _compact_task_state(state: dict[str, Any]) -> dict[str, Any]:
     for key in ("plan", "last_decision"):
         if key in compact:
             compact[key] = _bounded_value(compact[key], 6000)
-    return _bounded_value(compact, 32_000)
+    # Progress cursors are recovery state, never hide them inside a JSON preview.
+    progress = compact.pop("attachment_processing", None)
+    required = compact.pop("required_attachment_ids", None)
+    result = _bounded_value(compact, 32_000)
+    if progress is not None:
+        result["attachment_processing"] = progress
+    if required is not None:
+        result["required_attachment_ids"] = required
+    return result

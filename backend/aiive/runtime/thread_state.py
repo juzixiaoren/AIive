@@ -232,7 +232,8 @@ class ThreadState:
         msgs: list[dict[str, Any]] = []
         for d in turn_dicts:
             etype = d.get("type", "")
-            content = d.get("content", "")
+            from aiive.runtime.attachments import render_attachment_refs
+            content = render_attachment_refs(d.get("content", ""), d.get("attachments", []))
             if etype == "user" and content:
                 msgs.append({"role": "user", "content": content})
             elif etype == "system" and content:
@@ -492,16 +493,20 @@ class ThreadState:
         events: list[Event],
         turn_source: str | None = None,
     ) -> list[dict[str, Any]]:
+        from sqlalchemy.orm import object_session
+        from aiive.runtime.attachments import event_attachment_refs
+        db = object_session(events[0]) if events else None
+        refs = event_attachment_refs(db, [e.id for e in events if e.event_type == "user_message"]) if db is not None else {}
         messages: list[dict[str, Any]] = []
         for event in events:
             p = event.payload or {}
             etype = event.event_type
             if etype == "user_message":
                 content = p.get("content", "")
-                if content:
+                if content or refs.get(event.id):
                     source_val = turn_source or p.get("message_source")
                     msg_type = "user" if source_val in (None, "user") else "system"
-                    messages.append({"type": msg_type, "content": content, "event_id": event.id, "trace_id": event.trace_id, "turn_id": event.turn_id})
+                    messages.append({"type": msg_type, "content": content, "attachments": refs.get(event.id, []), "event_id": event.id, "trace_id": event.trace_id, "turn_id": event.turn_id})
             elif etype == "tool_call":
                 # turn_id 供 stable_tool_call_id 在缺失 tool_call_id 时构造两侧一致的回退键
                 messages.append({"type": "tool_call", "tool_name": p.get("name", ""), "tool_params": p.get("params", {}), "event_id": event.id, "trace_id": event.trace_id, "tool_call_id": p.get("tool_call_id", ""), "batch_index": p.get("batch_index", 0), "turn_id": event.turn_id})

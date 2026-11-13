@@ -255,7 +255,7 @@ def _list_skills() -> dict[str, Any]:
 
 
 def build_main_agent_registry() -> ToolRegistry:
-    """返回 Main Agent 固定能力面；不包含 Desktop、文件或 selfdev 执行工具。"""
+    """Main 固定能力：任务管理与当前 Thread 附件；不含任意文件/桌面执行。"""
     registry = ToolRegistry()
     registry.register(_registration(
         "list_skills",
@@ -265,7 +265,7 @@ def build_main_agent_registry() -> ToolRegistry:
     ))
     registry.register(_registration(
         "delegate_task",
-        "创建可跨会话、审批和重启持续执行的任务。复杂或需要工具的工作必须委托为任务。",
+        "创建可跨会话、审批和重启持续执行的任务。复杂、全文文档或跨轮工作委托为任务；普通聊天附件问题可直接使用 read_attachment。",
         {
             "goal": {"type": "str", "required": True, "minLength": 1},
             "task_type": {"type": "str", "default": "general"},
@@ -323,4 +323,6 @@ def build_main_agent_registry() -> ToolRegistry:
         },
         _send_task_input,
     ))
+    from aiive.tools.attachment_tools import register_attachment_tools
+    register_attachment_tools(registry)
     return registry

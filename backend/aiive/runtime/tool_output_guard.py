@@ -79,6 +79,10 @@ def guard_tool_output(
     """
     if not content:
         return GuardedOutput(content=content)
+    # Attachment tools enforce token/chunk limits at their source. Preserve the
+    # complete structured page so the next Worker invocation can process it.
+    if tool_name in {"read_attachment", "list_thread_attachments", "record_attachment_progress"} and len(content) <= 32000:
+        return GuardedOutput(content=content)
     header = _log_header(tool_name, thread_id, trace_id, tool_call_id)
     limit = max_chars if max_chars and max_chars > 0 else INLINE_CHAR_LIMIT
     try:

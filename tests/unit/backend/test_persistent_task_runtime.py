@@ -86,6 +86,7 @@ def test_main_agent_only_has_task_meta_tools() -> None:
     registry = build_main_agent_registry()
     assert {item["capability_id"] for item in registry.list_all()} == {
         "list_skills", "delegate_task", "get_task_status", "cancel_task", "send_task_input",
+        "list_thread_attachments", "read_attachment",
     }
     assert registry.get("desktop_fs_read_text") is None
     assert registry.get("safe_delete") is None

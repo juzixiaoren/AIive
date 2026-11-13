@@ -230,9 +230,10 @@ def test_real_sse_history_followup_idempotency_forget(client, db_session, monkey
     }
     result = client.post("/api/chat/stream", json=request)
     assert "event: done" in result.text, result.text
-    assert "attachment secret evidence" in str(calls[0])
+    assert aid in str(calls[0])
+    assert "attachment secret evidence" not in str(calls[0])
     assert all(
-        not job.payload.get("reply")
+        job.payload.get("reply")
         for job in db_session.query(OutboxJob).filter(
             OutboxJob.job_type == "memory_extraction"
         )
@@ -244,8 +245,14 @@ def test_real_sse_history_followup_idempotency_forget(client, db_session, monkey
     history = client.get(f"/api/threads/{tid}/messages").json()["messages"]
     assert history[0]["attachments"][0]["id"] == aid
     assert history[0]["content"] == "summarize"
+    original_read = object_store.get_verified
+    def unexpected_read(*args, **kwargs):
+        pytest.fail("normal T2 chat must not read any original attachment")
+    monkeypatch.setattr(object_store, "get_verified", unexpected_read)
     assert client.post("/api/chat", json={"message": "follow up"}).status_code == 200
-    assert "attachment secret evidence" in str(calls[-1])
+    monkeypatch.setattr(object_store, "get_verified", original_read)
+    assert aid in str(calls[-1])
+    assert "attachment secret evidence" not in str(calls[-1])
     assert (
         client.post("/api/chat", json={**request, "message": "changed"}).status_code
         == 409
@@ -260,7 +267,7 @@ def test_real_sse_history_followup_idempotency_forget(client, db_session, monkey
     execute_phase_a_shield(db_session, mode="everywhere", turn_ids=[row.turn_record_id])
     db_session.commit()
     assert client.get(f"/api/attachments/{aid}/content").status_code == 404
-    assert not service.prompt_parts(db_session, tid)
+    assert not service.event_attachment_refs(db_session, [row.event_id])
     history = client.get(f"/api/threads/{tid}/messages").json()["messages"]
     assert not history
 
@@ -289,7 +296,8 @@ def test_images_and_budget(client, db_session, monkeypatch):
             json={"message": "image?", "attachment_ids": [result.json()["id"]]},
         )
         assert response.status_code == 200, response.text
-    assert "image_url" in str(calls[-1]) and "base64," in str(calls[-1])
+    assert "base64," not in str(calls[-1])
+    assert result.json()["id"] in str(calls[-1])
     from aiive.runtime.context_budget import ContextBudget
     from aiive.runtime.context_assembler import ContextBudgetExceededError
 
@@ -447,9 +455,10 @@ def test_quotas_reject_before_object_io(client, db_session, monkeypatch):
         raise AssertionError("read before quota")
 
     monkeypatch.setattr(object_store, "get_verified", forbidden)
-    with pytest.raises(HTTPException) as error:
-        service.prompt_parts(db_session, row.thread_id)
-    assert error.value.status_code == 413
+    # Binding happened in another real transaction; refresh the upload row.
+    db_session.refresh(row)
+    # Context metadata is independent of the upload quota and reads no bytes.
+    assert service.event_attachment_refs(db_session, [row.event_id])
 
 
 def test_context_rejection_can_reupload_draft(client, db_session, monkeypatch):
@@ -567,7 +576,7 @@ def test_upload_time_shield_precedes_scrub(client, db_session, monkeypatch, mode
     expected = 200 if mode == "memory_only" else 404
     assert client.get(f"/api/attachments/{aid}").status_code == expected
     assert client.get(f"/api/attachments/{aid}/content").status_code == expected
-    assert bool(service.load_attachments(db_session, row.thread_id).parts) == (mode == "memory_only")
+    assert bool(service.event_attachment_refs(db_session, [row.event_id])) == (mode == "memory_only")
     fresh = upload(client, b"new after cutoff").json()["id"]
     assert client.get(f"/api/attachments/{fresh}/content").status_code == 200
 
@@ -578,3 +587,28 @@ def test_attachment_shield_query_failure_is_closed():
     session = MagicMock()
     session.query.side_effect = RuntimeError("database unavailable")
     assert ForgetVisibilityService.blocked_attachment_ids(session, ["one", "two"]) == {"one", "two"}
+
+
+def test_main_reads_attachment_on_demand_and_protects_memory(client, db_session, monkeypatch):
+    aid = upload(client).json()['id']
+    calls = []
+    monkeypatch.setattr('aiive.api.routes_chat.default_llm_client', lambda: FakeLLMClient())
+    monkeypatch.setattr('aiive.runtime.agent_graph.AgentGraph._build_langchain_llm', lambda self: Model(calls))
+    assert client.post('/api/chat', json={'message': 'save reference', 'attachment_ids': [aid]}).status_code == 200
+    db_session.query(OutboxJob).filter(OutboxJob.job_type == 'memory_extraction').delete()
+    db_session.commit()
+    class ReadModel(Model):
+        def bind_tools(self, tools):
+            def reply(messages):
+                calls.append(messages)
+                if messages[-1].type == 'tool':
+                    assert 'attachment secret evidence' in messages[-1].content
+                    return AIMessage(content='attachment analysis')
+                return AIMessage(content='', tool_calls=[{'name': 'read_attachment', 'args': {'attachment_id': aid}, 'id': 'attachment-read-1'}])
+            return RunnableLambda(reply)
+    monkeypatch.setattr('aiive.runtime.agent_graph.AgentGraph._build_langchain_llm', lambda self: ReadModel(calls))
+    result = client.post('/api/chat', json={'message': 'read original'})
+    assert result.status_code == 200, result.text
+    assert 'attachment analysis' in result.text
+    assert 'attachment secret evidence' not in str([s.meta for s in db_session.query(ContextSnapshot)])
+    assert all(not job.payload.get('reply') for job in db_session.query(OutboxJob).filter(OutboxJob.job_type == 'memory_extraction'))

@@ -181,6 +181,8 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
     参数:
         registry: 目标 ToolRegistry 实例
     """
+    from aiive.tools.attachment_tools import register_attachment_tools
+    register_attachment_tools(registry, worker=True)
     tools = [
         # 基础工具
         ("echo", _handle_echo, "回显输入消息", {"message": "str"}, "low", False, False),

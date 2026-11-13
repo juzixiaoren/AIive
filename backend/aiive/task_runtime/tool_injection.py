@@ -10,6 +10,9 @@ from aiive.tools.registry import ToolRegistry
 # 任务管理。常驻只代表入口始终可见，不代表执行授权——网络、路径、密钥、
 # 审批与策略仍由 CapabilityBroker / TaskPolicyEngine 判定。
 WORKER_RESIDENT_CAPABILITIES: tuple[str, ...] = (
+    "list_thread_attachments",
+    "read_attachment",
+    "record_attachment_progress",
     "memory_search",
     "memory_timeline",
     "memory_event_log",

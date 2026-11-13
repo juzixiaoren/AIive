@@ -60,7 +60,7 @@ class TaskAgentExecutor:
             proposal=proposal,
             model=response.model,
             token_usage=response.usage,
-            input_snapshot=snapshot,
+            input_snapshot=attachment_reference_snapshot(snapshot),
             prompt_refs=prompt_refs,
         )
 
@@ -77,3 +77,17 @@ class TaskAgentExecutor:
         except json.JSONDecodeError:
             payload = json.loads(repair_json(text))
         return ActionProposal.model_validate(payload)
+
+
+def attachment_reference_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Audit snapshots keep evidence IDs; transient Worker messages keep the page."""
+    from copy import deepcopy
+    result = deepcopy(snapshot)
+    reads = {a["id"] for a in result.get("actions", []) if a.get("capability_id") == "read_attachment"}
+    for action in result.get("actions", []):
+        if action.get("id") in reads:
+            action["result_summary"] = {"body_omitted": True}
+    for evidence in result.get("evidence", []):
+        if evidence.get("action_id") in reads:
+            evidence["summary"] = "[附件读取结果仅按 evidence id 引用；正文未复制到快照]"
+    return result

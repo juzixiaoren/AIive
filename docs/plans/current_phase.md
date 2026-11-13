@@ -1200,3 +1200,10 @@ GC 内部 Operation 通过真实 VerifyReport 与删除/共享引用复查后才
 附件/GC 聚焦 42 passed；中央字段覆盖测试保留；Node 工作/传输 20 项、聊天 4 项通过，
 Web/Android 生产构建通过，Ruff 和 basedpyright 通过。新增 PostgreSQL GC/Retention 契约。
 未使用浏览器测试。完成最终提交的 9 项 CI 后关闭 P1/P2，不继续扩展阶段范围。
+
+
+### V1 聊天附件消息原生化（2026-11-13，一个 Part）
+
+已接入原始消息附件引用、Main/Worker 共享只读目录与按需读取、视觉子请求、Forget 来源和 Worker 全文进度恢复。验收证据与环境限制见 `docs/reports/2026-11-13_V1_attachment_on_demand.md`。
+
+验证：全量 Python 1998 passed / 146 skipped；逐文件隔离 174/174；Ruff、basedpyright、Web/Android 构建及前端/Desktop 契约通过。PG/Compose 与远端 Actions 的未执行边界见专项报告。

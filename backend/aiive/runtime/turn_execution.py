@@ -259,7 +259,6 @@ class TurnExecutionService:
         message_source: str | MessageSource = MessageSource.USER,
         attachment_ids: list[str] | None = None,
     ):
-        self._has_attachment_context: bool = False
         self._attachment_ids: list[str] = list(attachment_ids or [])
         self._llm_client: LLMClient = llm_client or default_llm_client()
         self._message_source: MessageSource = (
@@ -1310,7 +1309,10 @@ class TurnExecutionService:
                         "user_message": getattr(ag_result, 'user_message', ''),
                         "message_source": self._message_source.value,
                         # Attachment-derived replies are chat evidence, never automatic memory input.
-                        "reply": "" if getattr(self, "_has_attachment_context", False) else ag_result.reply,
+                        "reply": "" if any(
+                            (e.payload or {}).get("name") == "read_attachment"
+                            for e in db.query(Event).filter(Event.thread_id == turn.thread_id, Event.turn_id == turn.turn_id, Event.event_type == "tool_result").all()
+                        ) else ag_result.reply,
                         "thread_id": turn.thread_id,
                         "source_turn_record_id": turn.id,
                         "source_turn_id": turn.turn_id,
@@ -1574,26 +1576,6 @@ class TurnExecutionService:
                 db.add(thread)
                 db.flush()
 
-            from aiive.db.models import Attachment
-            from aiive.runtime.attachments import check_quota, visible_rows
-            check_quota(db, turn.thread_id, context=True)
-            has_images = bool(visible_rows(db, db.query(Attachment).filter(
-                Attachment.thread_id == turn.thread_id, Attachment.turn_record_id.isnot(None), Attachment.mime.like("image/%"), Attachment.object_key != "").all()))
-            if has_images:
-                if settings.aiive_vision_model:
-                    self._llm_client = LLMClient(
-                        base_url=settings.aiive_vision_base_url or settings.aiive_llm_base_url,
-                        api_key=settings.aiive_vision_api_key or settings.aiive_llm_api_key,
-                        default_model=settings.aiive_vision_model,
-                        timeout_seconds=settings.aiive_llm_timeout_seconds)
-                    from dataclasses import replace
-                    self._profile = replace(_shared_profile(settings.aiive_vision_model), provider="openai", full_name=f"openai/{settings.aiive_vision_model}", context_window=settings.aiive_vision_context_window)
-                    self._token_counter = _shared_token_counter(settings.aiive_vision_model)
-                    self._normalizer = _shared_normalizer(settings.aiive_vision_model)
-                    self._budget = ContextBudget(settings.aiive_vision_context_window, settings.aiive_llm_max_output_tokens)
-                elif not settings.aiive_llm_vision_enabled:
-                    from fastapi import HTTPException
-                    raise HTTPException(422, "当前未配置视觉模型，不支持图片理解")
             assembler = ContextAssembler(
                 token_counter=self._token_counter,
                 budget=self._budget,
@@ -1606,13 +1588,17 @@ class TurnExecutionService:
                 message=message,
                 thread=thread,
                 _source=exec_ctx.message_source.value,
-                upper_bound_sequence=(turn.turn_sequence or 1) - 1,
+                upper_bound_sequence=turn.turn_sequence or 1,
                 trace_id=exec_ctx.trace_id,
                 current_turn_id=turn.turn_id,
             )
             from aiive.forget.durable_sources import persist_sources
             source_events = assembled.agent_ctx.get("attachment_source_event_ids", [])
-            self._has_attachment_context = bool(source_events)
+            from aiive.forget.concurrency import acquire_forget_shared_lock
+            from aiive.forget.durable_sources import references_visible
+            acquire_forget_shared_lock(db)
+            if not references_visible(db, {"event": source_events}):
+                raise ValueError("attachment_source_unavailable")
             persist_sources(db, "attachment_context", turn.id, {"source_event_ids": source_events})
             db.commit()
 
