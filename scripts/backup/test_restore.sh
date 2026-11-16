@@ -83,16 +83,16 @@ grep -qE '^[0-9TZ:-]+ result=143 ' "$root/interrupted.log"
 c exec -T backend curl -fsS http://localhost:8000/health
 bash "$here/verify.sh" "$snapshot"
 restic -r "$root/backup/repository" --password-file "$root/password" snapshots --json | python3 -c 'import json,sys; assert len(json.load(sys.stdin))==1, "Failure changed snapshot retention"'
-# Exercise seven-daily retention using explicit historical test timestamps.
+# Exercise three-daily retention using explicit historical test timestamps.
 mkdir "$root/retention-fixture"
 restic -r "$root/backup/repository" --password-file "$root/password" restore "$snapshot" --target "$root/retention-fixture" >/dev/null
-for days in {8..1}; do
+for days in {4..1}; do
  timestamp=$(date -u -d "$days days ago" '+%Y-%m-%d %H:%M:%S')
  (cd "$root/retention-fixture"; restic -r "$root/backup/repository" --password-file "$root/password" backup . --tag aiive-v1 --host "$project" --time "$timestamp" --quiet)
 done
 bash "$here/backup.sh" | tee "$root/retention.log"
 restic -r "$root/backup/repository" --password-file "$root/password" snapshots --json > "$root/snapshots.json"
-snapshot=$(python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); assert len(s)==7; print(s[-1]["id"])' "$root/snapshots.json")
+snapshot=$(python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); assert len(s)==3; print(s[-1]["id"])' "$root/snapshots.json")
 # Delete ONLY this disposable project's original volumes before restoring.
 c down -v
 printf 'RESTORE %s\n' "$restored" | bash "$here/restore.sh" "$snapshot" "$restored" "$root/recovered" | tee "$root/restore.log"

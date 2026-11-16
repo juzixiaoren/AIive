@@ -3,5 +3,5 @@ APP_DIR=/opt/aiive
 COMPOSE_PROJECT=aiive
 BACKUP_ROOT=/var/backups/aiive
 RESTIC_PASSWORD_FILE=/etc/aiive/restic-password
-KEEP_DAILY=7
+KEEP_DAILY=3
 MIN_FREE_BYTES=1073741824

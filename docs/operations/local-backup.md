@@ -30,7 +30,7 @@ sudo systemctl list-timers aiive-backup.timer
 
 空间预检要求可用空间 >= 3 ×（卷大小 + 数据库逻辑大小）+ MIN_FREE_BYTES（默认 1GiB）；这是保守估算，不能保证写入过程中永不耗尽。空间不足在停写前退出。运行中失败仍尝试恢复服务，原卷不修改。Restic 自身可能留下未引用 pack，可由管理员检查，不自动删除旧生产数据。
 
-需求中的“最近 3 个每日快照”与明确执行参数 `--keep-daily 7` 冲突；本实现默认 **7 个每日快照**，可设 `KEEP_DAILY=3`。只有新快照写入、`restic check --read-data`、重新恢复并核对全部 SHA256 都成功后，才执行带 host/tag 分组的 forget/prune。失败快照不会触发旧快照删除。全量读取校验期间仍停写，大数据集会产生较长维护窗口。日志记录退出码、快照 ID、Commit、耗时、仓库实际字节；具体失败命令的 stderr 进入 journald。
+默认保留最近 **3 个每日快照**（`KEEP_DAILY=3`）。已有部署若在 `/etc/aiive/backup.conf` 显式设置了 `KEEP_DAILY=7`，需手动改为 `KEEP_DAILY=3`；升级代码不会覆盖现有 root-only 配置。只有新快照写入、`restic check --read-data`、重新恢复并核对全部 SHA256 都成功后，才执行带 host/tag 分组的 forget/prune。失败快照不会触发旧快照删除。全量读取校验期间仍停写，大数据集会产生较长维护窗口。日志记录退出码、快照 ID、Commit、耗时、仓库实际字节；具体失败命令的 stderr 进入 journald。
 
 systemd timer 在**服务器本地时区**每天 03:00 执行，Persistent=true 补跑错过任务；请确认服务器时区。服务无超时上限，journald 收集 stdout/stderr。`KillMode=mixed` 给主进程 TERM 后等待 trap；超过 300 秒强制终止仍可能需要人工恢复。禁止人为同时运行多份配置指向同一应用的不同仓库。
 
@@ -59,5 +59,7 @@ sudo AIIVE_TEST_BACKEND_IMAGE=aiive-backend:test \
 ```
 
 集成测试生成独立 `aiive-restore-test-*` 项目和临时配置，不读生产 `.env`；写入 PostgreSQL 测试记录、真实 Object Store ObjectRef 与原始字节、Auth Secret；备份后删除**仅测试项目**旧卷，恢复到新项目，比较数据和文件摘要及启动健康。另测错误密码、空间不足、dump 期间 TERM 与恢复服务、独立复制仓库的数据损坏。测试直接写入真实 Thread/Event/Attachment/Task 模型，恢复后验证认证 Token、历史消息及附件下载 API；不调用外部 LLM。结束仅清理测试容器/卷，证据目录保留 root-only 密钥、日志、审计与磁盘字节，分享前脱敏。
+
+当前默认策略于 2026-11-16 调整为 3 个每日快照；以下保留当时 7 日策略的历史实测结果。
 
 2026-11-14 已在 Docker Desktop Linux Engine + Ubuntu 24.04 一次性容器完成真实集成演练，退出码 0：新快照、7 每日保留、删旧卷后新卷恢复、历史消息/附件/认证 API，以及错误密码、并发、空间不足、中断、仓库损坏均通过。仓库逻辑字节 88,592，分配字节 1,208,320。完整证据及缓存镜像构建限制见 [验收报告](../reports/2026-11-14_local_backup_restore.md)。systemd timer/journald 尚未在实际 Ubuntu 部署宿主机运行验证。

@@ -1266,4 +1266,4 @@ CI `scripts/smoke/compose_persistence.py` 写入确定性对象并记录 ObjectR
 
 ## V1 本地备份与完整恢复（2026-11-13，同一 Part）
 
-基于 main `534932e630ad39495b67b87cac5099165800c1a6` 添加本地 Restic 备份、隔离恢复、完整性校验、systemd 与测试入口。默认保留按明确流程参数 7 个每日快照，可配置为 3。当前状态：2026-11-14 在 Docker Linux Engine + Ubuntu 24.04 完成真实备份、7 每日保留、删卷恢复和失败路径演练，退出码 0。历史消息/附件/认证 API 校验通过；systemd 仍需实际服务器部署。证据见 [验收报告](../reports/2026-11-14_local_backup_restore.md)。证据与限制见 [操作手册](../operations/local-backup.md)。
+基于 main `534932e630ad39495b67b87cac5099165800c1a6` 添加本地 Restic 备份、隔离恢复、完整性校验、systemd 与测试入口。默认保留 3 个每日快照（2026-11-16 调整），可通过 `KEEP_DAILY` 配置。当前状态：2026-11-14 在 Docker Linux Engine + Ubuntu 24.04 完成真实备份、7 每日保留、删卷恢复和失败路径演练，退出码 0。历史消息/附件/认证 API 校验通过；systemd 仍需实际服务器部署。证据见 [验收报告](../reports/2026-11-14_local_backup_restore.md)。证据与限制见 [操作手册](../operations/local-backup.md)。

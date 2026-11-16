@@ -16,7 +16,7 @@ password_path=$(realpath "$RESTIC_PASSWORD_FILE")
 [[ $password_path != "$BACKUP_ROOT" && $password_path != "$BACKUP_ROOT/"* && $password_path != "$APP_DIR/.env" ]] || { echo 'Password must be outside repository and .env' >&2; exit 2; }
 [[ $(realpath -m "$RESTIC_REPOSITORY") == "$RESTIC_REPOSITORY" ]] || { echo 'Repository symlink is not allowed' >&2; exit 2; }
 export RESTIC_REPOSITORY RESTIC_PASSWORD_FILE
-KEEP_DAILY=${KEEP_DAILY:-7}
+KEEP_DAILY=${KEEP_DAILY:-3}
 [[ $KEEP_DAILY =~ ^[1-9][0-9]*$ ]] || exit 2
 for tool in docker restic python3 flock git sha256sum; do command -v "$tool" >/dev/null; done
 [[ $BACKUP_ROOT != /var/lib/docker* && $BACKUP_ROOT != "$APP_DIR"/.data* ]] || exit 2
