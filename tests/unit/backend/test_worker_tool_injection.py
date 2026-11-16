@@ -192,8 +192,11 @@ def test_worker_prompt_uses_discovery_mode_and_hides_non_resident_tools(db_sessi
     assert "search_capabilities" in messages[0]["content"]
     content = messages[1]["content"]
     assert "safe_delete" not in content
-    # 只有常驻能力带完整 Schema；其余工具不注入参数定义。
-    assert content.count('"input_schema"') == len(resident)
+    # Schemas go exclusively through native Function Calling, using this snapshot.
+    from aiive.task_runtime.function_decisions import WorkerFunctions
+    functions = WorkerFunctions(snapshot["tools"])
+    assert '"input_schema"' not in content
+    assert set(functions.capabilities.values()) == resident_ids
 
 
 def test_small_catalog_injects_full_schemas(db_session) -> None:
@@ -206,7 +209,11 @@ def test_small_catalog_injects_full_schemas(db_session) -> None:
     assert snapshot["tools"]["mode"] == "full"
     available_ids = {item["capability_id"] for item in snapshot["tools"]["available"]}
     assert available_ids == {"echo", "get_current_time"}
-    assert '"input_schema"' in messages[1]["content"]
+    assert '"input_schema"' not in messages[1]["content"]
+    from aiive.task_runtime.function_decisions import WorkerFunctions
+    functions = WorkerFunctions(snapshot["tools"])
+    assert set(functions.capabilities.values()) == available_ids
+    assert all(function["function"]["parameters"]["type"] == "object" for function in functions.definitions())
 
 
 def test_runtime_discovery_creates_no_action_and_injects_results(db_session) -> None:

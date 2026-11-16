@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +16,7 @@ from aiive.db.models import AgentAction, AgentRun, AgentTask, TaskArtifact, Task
 from aiive.task_runtime.agent_executor import TaskAgentExecutor
 from aiive.task_runtime.errors import AgentOutputValidationError
 from aiive.tools.tool_validation import validate_tool_params
+from aiive.core.function_calling import correction_allowed, CallValidation
 from aiive.task_runtime.evidence import EvidenceStore
 from aiive.task_runtime.goal_service import GoalService
 from aiive.task_runtime.repository import TaskRepository, utcnow
@@ -147,6 +149,7 @@ class PersistentTaskRuntime:
                 self.db.commit()
                 return {"status": task.status, "task_id": task.id}
 
+            decision = None
             deterministic = self._deterministic_proposal(task)
             if deterministic is not None:
                 proposal = deterministic
@@ -193,9 +196,9 @@ class PersistentTaskRuntime:
                     run.token_usage = run_tokens
                     run.model = last_model
                     correction_failures += 1
-                    if correction_failures >= 3 or self._budget_issue(task, budget, before_model=True):
+                    if not correction_allowed(correction_failures) or self._budget_issue(task, budget, before_model=True):
                         return self._validation_failed(task, run, run_tokens, last_model)
-                    task.task_state = {**(task.task_state or {}), "validation_feedback": error.payload(), "validation_failures": correction_failures}
+                    task.task_state = {**(task.task_state or {}), "validation_feedback": error.payload(), "validation_failures": correction_failures, "validation_messages": error.feedback}
                     self.db.commit()
                     continue
                 self.repo.renew_run(run, lease_seconds=180)
@@ -216,9 +219,16 @@ class PersistentTaskRuntime:
                     validation = validate_tool_params(registration, proposal.arguments)
                     if not validation.ok:
                         correction_failures += 1
-                        if task.executor_type == "deterministic" or correction_failures >= 3 or self._budget_issue(task, budget, before_model=True):
+                        if task.executor_type == "deterministic" or not correction_allowed(correction_failures) or self._budget_issue(task, budget, before_model=True):
                             return self._validation_failed(task, run, run_tokens, last_model)
-                        task.task_state = {**(task.task_state or {}), "validation_feedback": validation.error_payload(proposal.capability_id), "validation_failures": correction_failures}
+                        payload = validation.error_payload(proposal.capability_id)
+                        from langchain_core.messages import HumanMessage, message_to_dict
+                        repair = [message_to_dict(HumanMessage(content=json.dumps(payload, ensure_ascii=False)))]
+                        if decision is not None and decision.call_message is not None:
+                            call_id = str(decision.call_message.tool_calls[0]["id"])
+                            repair = CallValidation({call_id: payload}).retry_turn(decision.call_message)
+                        task.task_state = {**(task.task_state or {}), "validation_feedback": payload,
+                                           "validation_failures": correction_failures, "validation_messages": repair}
                         self.db.commit()
                         continue
                     proposal.arguments = validation.validated_params
@@ -226,6 +236,7 @@ class PersistentTaskRuntime:
             state = dict(task.task_state or {})
             state.pop("validation_feedback", None)
             state.pop("validation_failures", None)
+            state.pop("validation_messages", None)
             state["last_decision"] = proposal.model_dump(mode="json")
             task.task_state = state
             self.repo.append_event(

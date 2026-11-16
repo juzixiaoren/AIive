@@ -82,7 +82,7 @@ class TaskBrief(BaseModel):
 
 
 class ActionProposal(BaseModel):
-    """Worker LLM 每次只能提出一个 Action 或结束/等待决策。"""
+    """服务端内部标准化决策 DTO；由已校验 Function Calling 转换，不直接暴露给模型。"""
 
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 

@@ -41,14 +41,13 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
-from pydantic import SecretStr
 from sqlalchemy.orm import Session
 from typing_extensions import TypedDict
 
-from aiive.config import settings
 from aiive.context.run_context import RunContext
 from aiive.core.action_planner import ActionPlanner, MemorySignalDecision
 from aiive.core.llm_client import normalize_llm_error
+from aiive.core.function_calling import build_chat_model, normalize_calls, validate_calls, correction_allowed
 from aiive.core.llm_client import LLMClient
 from aiive.memory.extraction_policy import MemoryExtractionPolicy, MemorySignalAction
 from aiive.runtime.context_assembler import ContextSnapshotData, ContextSnapshotItem
@@ -360,15 +359,7 @@ class AgentGraph:
 
     def _build_langchain_llm(self) -> ChatOpenAI:
         """使用 AIive LLMClient 配置构建 LangChain ChatOpenAI 实例。"""
-        return ChatOpenAI(
-            model=self._llm_client.default_model,
-            api_key=SecretStr(self._llm_client.api_key),
-            base_url=self._llm_client.base_url,
-            temperature=0,
-            timeout=self._llm_client.timeout_seconds,
-            streaming=True,
-            stream_usage=settings.aiive_llm_stream_usage,
-        )
+        return build_chat_model(self._llm_client, streaming=True)
 
     @staticmethod
     def _collect_llm_usage(messages: list[Any]) -> LLMUsageStats:
@@ -540,8 +531,6 @@ class AgentGraph:
         tool_records: list[dict[str, Any]] = []
         _pending_approval_list: list[dict[str, Any]] = []
         args_by_id: dict[str, dict[str, Any]] = {}
-        from aiive.config import settings
-        from aiive.tools.tool_validation import validate_tool_params
 
         def _ensure_not_cancelled() -> None:
             """节点边界检查持久化取消信号：同步/流式两条链路都在下一节点前停止。"""
@@ -645,7 +634,7 @@ class AgentGraph:
             from aiive.forget.concurrency import forget_revision
             if context_forget_revision is not None and forget_revision(self._db) != context_forget_revision:
                 return {"messages": [AIMessage(content="上下文因遗忘操作失效，本轮已停止。请重新发送消息。")]}
-            resp = llm_with_tools.invoke(call_messages)
+            resp = normalize_calls(llm_with_tools.invoke(call_messages))
             tc_count = len(getattr(resp, "tool_calls", None) or [])
             content_len = len(str(resp.content or ""))
             logger.info("[TRACE:graph] ASSISTANT(ns) tool_calls=%d content_len=%d", tc_count, content_len)
@@ -698,12 +687,16 @@ class AgentGraph:
             if not isinstance(last_msg, AIMessage) or not last_msg.tool_calls:
                 logger.info("[TRACE:graph] POLICY_CHECK(ns): no tool_calls → finalize")
                 return "finalize"
+            if last_msg.additional_kwargs.get("aiive_call_errors"):
+                return "continue"  # No dispatch/approval for malformed calls; repair the whole batch.
             tool_calls_raw = [
                 {"name": tc["name"], "args": tc.get("args", {}), "id": tc.get("id", "")}
                 for tc in last_msg.tool_calls
             ]
             logger.info("[TRACE:graph] POLICY_CHECK(ns): %d tool_calls=%s", len(tool_calls_raw), [tc["name"] for tc in tool_calls_raw])
             result = check_tool_calls(tool_calls_raw, registry)
+            if result.action == PolicyAction.CONFIRM and registry is not None and not validate_calls(last_msg, registry).ok:
+                return "continue"  # Invalid parameters must be repaired before creating an approval.
             if result.action == PolicyAction.CONFIRM:
                 _pending_approval_list[:] = [
                     {"name": tc["name"], "args": tc.get("args", {}), "id": tc.get("id", ""),
@@ -756,16 +749,8 @@ class AgentGraph:
                     "tool_validation_records": [],
                 }
 
-            results: dict[str, Any] = {}
-            has_invalid = False
-            for tc in last_msg.tool_calls:
-                name = str(tc.get("name", "") or "")
-                reg = registry.get(name)
-                if reg is None:
-                    continue  # 未注册工具已由 policy_check 拦截
-                result = validate_tool_params(reg, tc.get("args", {}))
-                results[str(tc.get("id", "") or "")] = result
-                has_invalid = has_invalid or not result.ok
+            validation = validate_calls(last_msg, registry)
+            has_invalid = not validation.ok
 
             if not has_invalid:
                 return {
@@ -779,30 +764,14 @@ class AgentGraph:
                 0,
                 sum(1 for message in msgs if isinstance(message, AIMessage) and message.tool_calls) - 1,
             )
-            feedback: list[ToolMessage] = []
+            feedback = validation.feedback(last_msg)
             validation_records: list[dict[str, Any]] = []
             for tc in last_msg.tool_calls:
                 call_id = str(tc.get("id", "") or "")
                 name = str(tc.get("name", "") or "")
-                validation = results.get(call_id)
-                if validation is not None and not validation.ok:
-                    payload = validation.error_payload(name)
-                    reason = "工具参数本地校验失败"
-                else:
-                    payload = {
-                        "ok": False,
-                        "error_type": "batch_aborted_due_to_invalid_arguments",
-                        "retryable": True,
-                        "tool_name": name,
-                        "instruction": "同批其他工具参数无效，本批未执行；请重新生成完整工具调用批次。",
-                    }
-                    reason = "同批参数校验失败，工具未执行"
+                payload = validation.errors[call_id]
+                reason = "工具参数本地校验失败" if payload.get("error_type") != "batch_aborted_due_to_invalid_arguments" else "同批参数校验失败，工具未执行"
                 content = _json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-                feedback.append(ToolMessage(
-                    content=content,
-                    tool_call_id=call_id,
-                    name=name,
-                ))
                 record = {
                     "name": name,
                     "params": tc.get("args", {}),
@@ -834,7 +803,7 @@ class AgentGraph:
             if state.get("tool_validation_ok", True):
                 return "tools"
             attempts = int(state.get("tool_validation_attempts", 0) or 0)
-            if attempts > settings.tool_argument_max_retries:
+            if not correction_allowed(attempts):
                 return "validation_abort"
             return "assistant"
 

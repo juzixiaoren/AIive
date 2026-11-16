@@ -41,7 +41,7 @@ def _seed_approval(db, approval_id: str = "approval-1") -> ApprovalRequest:
         tool_args_hash=hashlib.sha256(json.dumps(
             {"value": "server-value"}, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         ).encode("utf-8")).hexdigest(),
-        descriptor_hash="descriptor-1",
+        descriptor_hash=_registry([]).get("dangerous_tool").safety.descriptor_hash,
         risk_snapshot={"risk_level": "high"},
         status="pending",
         created_at=datetime.now(timezone.utc),
@@ -209,6 +209,7 @@ def test_descriptor_change_invalidates_approval(db, monkeypatch) -> None:
             descriptor_hash="descriptor-2",
         ),
         handler=registered.handler,
+        description="changed effective tool definition",
     ))
     monkeypatch.setattr(routes_approval, "get_tool_registry", lambda: registry)
 

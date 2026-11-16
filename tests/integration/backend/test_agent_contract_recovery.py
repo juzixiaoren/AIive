@@ -1,13 +1,15 @@
 """Canonical contracts and real Outbox handler recovery (offline LLM boundary)."""
 from datetime import timedelta
-from types import SimpleNamespace
+import json
+from langchain_core.messages import AIMessage
+from aiive.task_runtime.function_decisions import WorkerFunctions, proposal_function_name
+from aiive.core.function_calling import normalize_calls, validate_calls
 import uuid
 
 import pytest
 
 from aiive.db.models import AgentAction, AgentRun, AgentTask, AgentTaskEvent, Thread
 from aiive.task_runtime.agent_executor import TaskAgentExecutor
-from aiive.task_runtime.errors import AgentOutputValidationError
 from aiive.task_runtime.repository import TaskRepository, utcnow
 from aiive.task_runtime.schemas import TaskBudget
 from aiive.task_runtime.tools import build_main_agent_registry
@@ -97,18 +99,40 @@ class Model:
         self.outputs = iter(outputs)
         self.messages = []
 
-    def chat(self, messages, **kwargs):
+    def bind_tools(self, definitions, **kwargs):
+        self.definitions = definitions
+        assert kwargs == {"tool_choice": "required", "parallel_tool_calls": False}
+        return self
+
+    def invoke(self, messages, **kwargs):
         self.messages.append(messages)
         output = next(self.outputs)
         if isinstance(output, Exception):
             raise output
-        assert "ActionProposal JSON Schema" in messages[0]["content"]
-        return SimpleNamespace(content=output, model="offline", usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
+        assert "ActionProposal JSON Schema" not in messages[0].content
+        assert "input_schema" not in messages[1].content
+        if isinstance(output, AIMessage):
+            return output
+        # Existing recovery scenarios now exercise native function calls. JSON
+        # fixture notation is converted only in this test boundary, never production.
+        decision = json.loads(output)
+        kind = decision.pop("decision")
+        if kind == "action":
+            name = proposal_function_name(decision.pop("capability_id"))
+            decision.setdefault("arguments", {})
+        else:
+            name = {"finish": "task_finish", "ask_user": "task_ask_user", "watch": "task_watch",
+                    "search_capabilities": "task_search_capabilities", "describe_capability": "task_describe_capability"}.get(kind, "task_unknown")
+            if kind == "finish":
+                decision.setdefault("summary", "")
+        return AIMessage(content="", tool_calls=[{"id": "decision_call", "name": name, "args": decision}],
+                         response_metadata={"model_name": "offline"},
+                         usage_metadata={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15})
 
 
 def wire_model(monkeypatch, outputs):
     model = Model(outputs)
-    monkeypatch.setattr("aiive.task_runtime.agent_executor.default_llm_client", lambda: model)
+    monkeypatch.setattr("aiive.task_runtime.agent_executor.build_chat_model", lambda _: model)
     return model
 
 
@@ -131,7 +155,7 @@ def test_structural_exhaustion_real_handler(durable_db, monkeypatch, limit):
     assert run.token_usage["total_tokens"] == calls * 15
     assert durable_db.query(AgentAction).filter_by(task_id=task_id).count() == 0
     if calls > 1:
-        assert "agent_output_validation_error" in model.messages[1][-1]["content"]
+        assert "agent_output_validation_error" in model.messages[1][-1].content
 
 
 def test_structure_then_arguments_corrected_before_action(durable_db, monkeypatch):
@@ -145,7 +169,7 @@ def test_structure_then_arguments_corrected_before_action(durable_db, monkeypatc
     assert durable_db.get(AgentTask, task_id).status == "succeeded"
     actions = durable_db.query(AgentAction).filter_by(task_id=task_id).all()
     assert len(actions) == 1 and actions[0].status == "succeeded"
-    assert "max_steps" in model.messages[2][-1]["content"]
+    assert "max_steps" in model.messages[2][-1].content
     assert durable_db.get(AgentTask, task_id).usage["model_calls"] == 4
 
 
@@ -180,12 +204,19 @@ def test_duplicate_running_real_handler(durable_db, monkeypatch, expired):
     assert model.messages == []
 
 
-def test_parse_strict_and_repair():
-    assert TaskAgentExecutor.parse('{"decision":"finish",}').decision == "finish"
-    with pytest.raises(AgentOutputValidationError) as caught:
-        TaskAgentExecutor.parse('{"decision":"finish", "summary": 1}')
-    assert caught.value.issues[0]["path"] == "summary"
-    assert caught.value.issues[0]["received"] == "int"
+def test_function_arguments_strict_and_invalid_json_not_repaired():
+    functions = WorkerFunctions({})
+    message = normalize_calls(AIMessage(content="", tool_calls=[{
+        "id": "strict", "name": "task_finish", "args": {"summary": 1},
+    }]))
+    validation = validate_calls(message, functions.registry, require_one=True)
+    assert not validation.ok
+    assert validation.errors["strict"]["issues"][0]["path"] == "summary"
+    assert validation.errors["strict"]["issues"][0]["received"] == "int"
+    malformed = normalize_calls(AIMessage(content="", invalid_tool_calls=[{
+        "id": "bad-json", "name": "task_finish", "args": '{"summary":', "error": "invalid json",
+    }]))
+    assert not validate_calls(malformed, functions.registry, require_one=True).ok
 
 
 def test_bad_parameters_exhaust_without_action(durable_db, monkeypatch):
@@ -196,7 +227,7 @@ def test_bad_parameters_exhaust_without_action(durable_db, monkeypatch):
     assert durable_db.get(AgentTask, task_id).status == "failed"
     assert durable_db.query(AgentAction).filter_by(task_id=task_id).count() == 0
     assert len(model.messages) == 3
-    assert "max_steps" in model.messages[1][-1]["content"]
+    assert "max_steps" in model.messages[1][-1].content
 
 
 def test_exhaustion_after_progress_is_partial(durable_db, monkeypatch):
@@ -303,3 +334,63 @@ def test_infrastructure_retry_does_not_reset_corrections(durable_db, monkeypatch
     assert task.status == "failed"
     assert task.usage["model_calls"] == 4
     assert len(model.messages) == 2
+
+
+@pytest.mark.parametrize("kind", ["text", "empty", "multi", "malformed", "unknown"])
+def test_native_fc_protocol_errors_exhaust_without_actions(durable_db, monkeypatch, kind):
+    task_id, claimed = setup_job(durable_db)
+    kwargs = {"content": "plain answer" if kind == "text" else ""}
+    if kind == "multi":
+        kwargs["tool_calls"] = [{"id": f"call{i}", "name": "task_finish", "args": {"summary": "done"}} for i in range(2)]
+    if kind == "malformed":
+        kwargs["invalid_tool_calls"] = [{"id": "broken", "name": "task_finish", "args": '{"summary":', "error": "parse"}]
+    if kind == "unknown":
+        kwargs["tool_calls"] = [{"id": "unknown", "name": "not_bound", "args": {}}]
+    kwargs["usage_metadata"] = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+    model = wire_model(monkeypatch, [AIMessage(**kwargs)] * 3)
+    assert handle_agent_task_run(claimed).outcome == HandlerOutcome.COMPLETED
+    durable_db.expire_all()
+    task = durable_db.get(AgentTask, task_id)
+    assert task.status == "failed" and task.usage["model_calls"] == 3
+    assert task.usage["prompt_tokens"] == 30
+    assert durable_db.get(AgentRun, task.current_run_id).token_usage["total_tokens"] == 45
+    assert durable_db.query(AgentAction).filter_by(task_id=task_id).count() == 0
+    assert len(model.messages) == 3
+    assert "agent_output_validation_error" in model.messages[1][-1].content
+
+
+def test_native_fc_invalid_arguments_repair_messages_are_paired(durable_db, monkeypatch):
+    from langchain_core.messages import ToolMessage
+    task_id, claimed = setup_job(durable_db)
+    malformed = AIMessage(content="", invalid_tool_calls=[{"id": "original_bad_id", "name": "task_finish",
+        "args": '{"summary":', "error": "parser"}], usage_metadata={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15})
+    model = wire_model(monkeypatch, [malformed, '{"decision":"finish","summary":"fixed"}'])
+    assert handle_agent_task_run(claimed).outcome == HandlerOutcome.COMPLETED
+    repair = model.messages[1]
+    assert isinstance(repair[-1], ToolMessage) and repair[-1].tool_call_id == "original_bad_id"
+    assert repair[-2].tool_calls[0]["id"] == "original_bad_id"
+    assert durable_db.get(AgentTask, task_id).status == "succeeded"
+
+
+def test_discovery_via_control_functions_creates_no_actions(durable_db, monkeypatch):
+    task_id, claimed = setup_job(durable_db)
+    wire_model(monkeypatch, [
+        '{"decision":"search_capabilities","query":"current time"}',
+        '{"decision":"describe_capability","capability_id":"get_current_time"}',
+        '{"decision":"finish","summary":"discovered"}',
+    ])
+    assert handle_agent_task_run(claimed).outcome == HandlerOutcome.COMPLETED
+    durable_db.expire_all()
+    task = durable_db.get(AgentTask, task_id)
+    assert task.status == "succeeded" and task.usage["discovery_steps"] == 2
+    assert durable_db.query(AgentAction).filter_by(task_id=task_id).count() == 0
+
+
+def test_model_boundary_preserves_content_unavailable(durable_db, monkeypatch):
+    from aiive.task_runtime.read_repository import TaskContentUnavailable
+    task_id, claimed = setup_job(durable_db)
+    wire_model(monkeypatch, [TaskContentUnavailable("task_context_source_changed")])
+    result = handle_agent_task_run(claimed)
+    assert result.outcome == HandlerOutcome.COMPLETED
+    assert "task_content_unavailable" in result.reason
+    assert durable_db.query(AgentAction).filter_by(task_id=task_id).count() == 0

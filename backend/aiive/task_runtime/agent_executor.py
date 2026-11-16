@@ -1,16 +1,18 @@
 """一次有界 Worker LLM 决策；不直接执行 capability。"""
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from typing import Any
 
-from json_repair import repair_json
 from pydantic import ValidationError
+from langchain_core.messages import AIMessage, BaseMessage, convert_to_messages, messages_from_dict
+from langchain_core.runnables import Runnable
+from aiive.core.function_calling import build_chat_model, normalize_calls, validate_calls, response_usage
+from aiive.task_runtime.function_decisions import WorkerFunctions
 from aiive.task_runtime.errors import AgentOutputValidationError
 from sqlalchemy.orm import Session
 
-from aiive.core.llm_client import LLMClient, default_llm_client
+from aiive.core.llm_client import LLMClient, default_llm_client, normalize_llm_error
 from aiive.db.models import AgentTask
 from aiive.task_runtime.context_assembler import TaskContextAssembler
 from aiive.task_runtime.schemas import ActionProposal
@@ -23,12 +25,14 @@ class AgentDecision:
     token_usage: dict[str, int]
     input_snapshot: dict[str, Any]
     prompt_refs: list[str]
+    call_message: AIMessage | None = None
 
 
 class TaskAgentExecutor:
-    def __init__(self, db: Session, llm_client: LLMClient | None = None):
+    def __init__(self, db: Session, llm_client: LLMClient | None = None, *, chat_model: Runnable[Any, AIMessage] | None = None):
         self.db: Session = db
         self.llm: LLMClient = llm_client or default_llm_client()
+        self.chat_model: Any = chat_model
 
     def decide(self, task: AgentTask, capabilities: list[dict[str, Any]]) -> AgentDecision:
         from aiive.forget.concurrency import forget_revision
@@ -49,58 +53,51 @@ class TaskAgentExecutor:
         if forget_revision(self.db) != revision or not TaskReadRepository(self.db).task_visible(task):
             raise TaskContentUnavailable("task_context_source_changed")
         self.db.commit()
-        feedback = (task.task_state or {}).get("validation_feedback")
+        functions = WorkerFunctions(snapshot["tools"])
+        call_messages: list[BaseMessage] = convert_to_messages(messages)
+        feedback = (task.task_state or {}).get("validation_messages")
         if feedback:
-            messages.append({"role": "user", "content": json.dumps(feedback, ensure_ascii=False)})
-        response = self.llm.chat(
-            messages,
-            temperature=0.1,
-            trace_id=task_id,
-            json_mode=True,
-        )
+            call_messages.extend(messages_from_dict(feedback))
+        model = self.chat_model if self.chat_model is not None else build_chat_model(self.llm)
+        try:
+            response = model.bind_tools(functions.definitions(), tool_choice="required", parallel_tool_calls=False).invoke(
+                call_messages, config={"metadata": {"task_id": task_id}, "run_name": "task_decision"},
+            )
+        except TaskContentUnavailable:
+            raise
+        except Exception as error:
+            raise normalize_llm_error(error, trace_id=task_id) from error
         if forget_revision(self.db) != revision or not TaskReadRepository(self.db).task_visible(task):
             raise TaskContentUnavailable("task_context_source_changed")
+        response = normalize_calls(response)
+        usage = response_usage(response)
+        actual_model = str(response.response_metadata.get("model_name") or self.llm.default_model)
+        validation = validate_calls(response, functions.registry, require_one=True)
+        if not validation.ok:
+            for call in response.tool_calls:
+                payload = validation.errors.get(str(call["id"]))
+                if payload is not None and call["name"] in functions.capabilities:
+                    payload["capability_id"] = functions.capabilities[call["name"]]
+            payload = next(iter(validation.errors.values()))
+            raise AgentOutputValidationError(payload.get("issues", []), token_usage=usage, model=actual_model,
+                                             payload=payload, feedback=validation.retry_turn(response))
+        call = response.tool_calls[0]
         try:
-            proposal = self.parse(response.content)
-        except AgentOutputValidationError as error:
-            error.token_usage = response.usage
-            error.model = response.model
-            raise
-        return AgentDecision(
-            proposal=proposal,
-            model=response.model,
-            token_usage=response.usage,
-            input_snapshot=attachment_reference_snapshot(snapshot),
-            prompt_refs=prompt_refs,
-        )
-
-    @staticmethod
-    def parse(raw: str) -> ActionProposal:
-        text = raw.strip()
-        if text.startswith("```"):
-            lines = text.splitlines()[1:]
-            if lines and lines[-1].strip() == "```":
-                lines.pop()
-            text = "\n".join(lines)
-        try:
-            try:
-                payload = json.loads(text)
-            except json.JSONDecodeError:
-                payload = json.loads(repair_json(text))
-            return ActionProposal.model_validate(payload, strict=True)
+            proposal = functions.proposal(call["name"], call["args"])
         except ValidationError as error:
-            raise AgentOutputValidationError([
-                {"path": ".".join(map(str, item["loc"])) or "$",
-                 "code": item["type"], "message": item["msg"][:240],
-                 "expected": str(item.get("ctx", {}).get("expected", item["type"])),
-                 "received": type(item.get("input")).__name__}
-                for item in error.errors(include_url=False)
-            ]) from error
-        except (json.JSONDecodeError, TypeError) as error:
-            raise AgentOutputValidationError([{
-                "path": "$", "code": "json_parse", "message": "Invalid JSON output",
-                "expected": "JSON object", "received": type(raw).__name__,
-            }]) from error
+            # Domain DTO invariants (e.g. whitespace-only question) remain strict.
+            from aiive.core.function_calling import CallValidation, output_error
+            issues = [{"path": ".".join(map(str, item["loc"])) or "$", "code": item["type"],
+                       "message": item["msg"][:240], "expected": "valid decision fields",
+                       "received": type(item.get("input")).__name__} for item in error.errors(include_url=False)]
+            payload = output_error("decision_payload")
+            payload["issues"] = issues
+            validation = CallValidation({str(call["id"]): payload})
+            raise AgentOutputValidationError(issues, token_usage=usage, model=actual_model,
+                                             payload=payload, feedback=validation.retry_turn(response)) from error
+        snapshot["model_tool_call"] = {"id": call["id"], "name": call["name"], "capability_id": proposal.capability_id}
+        return AgentDecision(proposal=proposal, model=actual_model, token_usage=usage,
+                             input_snapshot=attachment_reference_snapshot(snapshot), prompt_refs=prompt_refs, call_message=response)
 
 
 

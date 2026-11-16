@@ -113,8 +113,7 @@ class TaskContextAssembler:
         prompts = get_prompt_registry()
         system = prompts.render("task_runtime.worker_system")
         skill = self._active_skill(task)
-        from aiive.task_runtime.schemas import ActionProposal
-        system_content = system.content + "\nActionProposal JSON Schema (JSON mode only ensures syntax):\n" + json.dumps(ActionProposal.model_json_schema(), ensure_ascii=False)
+        system_content = system.content
         if skill is not None:
             system_content += f"\n\n# Active Skill: {skill.name}\n\n{skill.instructions}"
         goal = snapshot.get("goal")
@@ -127,9 +126,16 @@ class TaskContextAssembler:
                 "- 自主步骤完成前必须留下可验证 Evidence，不能只凭口头结论宣布完成。\n"
                 "- 不要替其他步骤执行 Action，也不要修改目标计划。\n"
             )
+        from copy import deepcopy
+        prompt_snapshot = deepcopy(snapshot)
+        for group in ("resident", "available", "loaded"):
+            for definition in prompt_snapshot["tools"].get(group, []):
+                definition.pop("parameters", None)
+                definition.pop("input_schema", None)
+        # Binding and prompt metadata share the same exact selection snapshot.
         user = prompts.render(
             "task_runtime.task_context",
-            task_context=json.dumps(snapshot, ensure_ascii=False, default=str),
+            task_context=json.dumps(prompt_snapshot, ensure_ascii=False, default=str),
         )
         return (
             [{"role": system.role, "content": system_content}, {"role": user.role, "content": user.content}],
@@ -216,6 +222,8 @@ def _compact_task_state(state: dict[str, Any]) -> dict[str, Any]:
     compact = dict(state)
     # 工具发现状态已在 snapshot.tools 中按当前注册表重建，这里不重复注入原始记录。
     compact.pop("tool_discovery", None)
+    compact.pop("validation_feedback", None)
+    compact.pop("validation_messages", None)
     inputs = state.get("inputs")
     if isinstance(inputs, list):
         compact["inputs"] = [

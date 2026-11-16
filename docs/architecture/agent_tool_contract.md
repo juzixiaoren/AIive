@@ -1,31 +1,49 @@
-# Agent 工具契约与有界恢复
+# Agent Function Calling 与持久任务执行边界
 
-ToolRegistry 是有效工具契约的唯一入口。注册时生成并保存 Canonical JSON Schema；明确提供的 `input_schema`（包括 MCP/Desktop 原始定义）具有最高优先级，不再叠加另一份 parameters 校验。没有显式 Schema 时，复用现有严格 Pydantic 参数模型：handler 类型注解、默认值及 parameters 元数据共同生成定义；嵌套 `schema` 元数据可直接复用领域模型的 `model_json_schema()`。嵌套模型的 `$defs` 提升到根节点，引用保持有效。
+Main Chat Agent 与 Persistent Task Worker 共用 LangChain Function Calling。`core/function_calling.py` 提供模型工厂、Function Schema 定义、调用归一化、参数验证、错误 ToolMessage、纠错策略和 Usage 归一化。共享组件不执行工具、不提交数据库事务、不在内部循环调用模型。
 
-`delegate_task.budgets` 使用 TaskBudget 的完整 Schema，保留 extra forbid、数值边界和默认值。`max_steps` 不存在，也没有别名转换。goal_plan、deterministic_action 同样复用已有领域契约。任意 JSON 数据字段（例如 Action arguments、用户扩展 payload）保留显式开放对象语义；固定结构字段声明 properties/items。
+## 契约来源
 
-注册时 descriptor_hash 总是重新计算，覆盖完整有效 Schema、描述、安全属性和执行节点。传入的旧指纹不能遮蔽契约变化。Registry 对外完整定义中的 input_schema 与 parameters properties 来自同一契约；catalog 继续只返回轻量目录。
+ToolRegistry 是有效工具契约的唯一入口。显式 `input_schema`（包括 MCP/Desktop 原始定义）优先；否则从已有 Pydantic 参数模型、handler 类型注解和 parameters 元数据派生 Canonical JSON Schema。领域模型的 `model_json_schema()` 可作为嵌套字段来源，本地 `$defs` 引用随包装提升到根节点。
 
-Main Chat 继续 Function Calling。LangChain StructuredTool 直接接收 Canonical JSON Schema 字典，不另造参数模型；适配器单独传递真实 ToolCall ID，不把身份注入业务 Schema。LangChain 供应商转换可以去除 title 这类展示注释，但必须保留所有有效约束。AgentGraph 保留现有三次总尝试的本地校验和 ToolMessage 反馈。执行结果继续携带 error_type、execution_status、operation_id，额外保留 retryable/issues；执行失败不会自动进入参数纠错重放。
+`delegate_task.budgets` 复用 TaskBudget，保留额外字段禁止、类型、默认值和约束；没有 `max_steps` 别名。注册时保存有效契约并重新计算 descriptor_hash，覆盖完整 Schema、描述、安全属性与执行节点。注入、发现、参数校验使用同一份契约。
 
-统一的 validate_tool_params 使用 JSON Schema Draft 2020-12 校验，支持嵌套对象、数组、组合类型、本地引用、枚举与约束。integer 使用严格 JSON/Python 整数检查，不转换字符串或把 bool/float 当成整数。失败只反馈路径、约束、错误类别和实际值类型，不复制实际敏感内容。default 是 Schema 注释，省略参数仍由 handler/领域模型应用既有默认值。
+统一 `validate_tool_params` 使用 Draft 2020-12；整数严格检查，不转换字符串，也不把 bool/float 当成整数。错误只返回路径、期望约束和实际值类型。default 是 Schema 注释，handler 与领域模型继续应用原有默认值。
 
-Worker System Prompt 注入 ActionProposal.model_json_schema()。JSON mode 只确保语法；JSON Repair 后仍执行 Pydantic strict=True 校验。解析/结构错误统一为 AgentOutputValidationError，与 TaskNotRunnableError、TaskTerminalError、TaskNotFoundError 分离。
+## 两个适配器
 
-Worker 决策流程：
+Main 的 `build_langchain_tools` 从共享 `function_definition` 获取 Schema，生成 StructuredTool。模型返回的有效调用经过本地校验与策略处理后，继续由既有 ToolNode/Registry 执行。普通文本回答合法；批量参数无效时整批不执行。真实 ToolCall ID 与业务参数分离，执行结果保留 error_type、execution_status、operation_id、retryable 和 issues。
 
-1. 检查任务预算；每次模型调用前持久化 model_calls 并续租。
-2. 解析 ActionProposal；保存成功或最终失败响应的 Token Usage。
-3. action 决策查找当前完整注册定义，先 validate_tool_params。
-4. 参数正确才进入 Broker Scope/Policy、创建 AgentAction、审批/READY 和 Dispatch。
-5. execute_brokered 再检查定义指纹和参数，然后才调用 handler。
+Worker 的 `WorkerFunctions` 只从当前 TaskContext 选中的 resident/available/ready-loaded 定义生成提案函数，没有绑定任何真实 handler。所有提案注册项只有拒绝执行的防御 stub；模型只接收原生函数定义字典，Worker 不使用 ToolNode 或 Registry.execute。
 
-结构错误和参数错误共享连续三次总尝试（初次 + 两次纠正）；纠错计数写入 Task state，跨基础设施重试保留；每次反馈真实结构化错误，下一次重新生成 Proposal，不创建失败参数对应的 Action。max_model_calls、Token、时限预算可以更早终止。有效决策清除旧反馈。Scope 拒绝不属于参数纠错，不会扩大权限。纠错耗尽时，无进度任务 FAILED，已有成功 Action 的任务 PARTIAL，当前 Run FAILED 且清除 Lease。
+每个能力有一个稳定的 `propose_<能力前缀>_<哈希>` 函数，函数描述包含真实 capability_id。其参数为 `{arguments: 原始完整工具Schema, preconditions, effects, summary}`，包装层禁止额外字段。真实参数与决策元数据隔离，不维护第二份工具定义。函数名限定于供应商允许的字符与长度，并检查映射冲突。
 
-工具注入按完整定义控制字符预算。超限删除整个工具定义并切换 discovery，记录 omitted_capability_ids；TaskContextAssembler 不再对工具 JSON 做字符截断。单个工具定义超过预算时也不会注入残缺 Schema。
+Worker 控制函数为 `task_finish`、`task_ask_user`、`task_watch`、`task_search_capabilities`、`task_describe_capability`。控制字段从 ActionProposal 的字段 Schema 派生；watch 具有额外结构契约。函数调用只生成内部 ActionProposal DTO，具体完成、提问、观察与发现操作仍由 Runtime 处理。
 
-Outbox Handler 对有效 current_run、RUNNING 状态和未过期 Lease 安全去重；过期运行复用 recover_stale_tasks，生成恢复事件/Checkpoint 和下一次唤醒。在调用后续模型/派发前，续租重新读取 Run 与 current_run，避免旧 Worker 继续使用被替换的运行。
+ActionProposal 不再是模型输出协议。Worker 不使用 JSON mode、文本 JSON 解析或 JSON Repair，不保留旧 JSON 协议回退。模型必须支持 Function Calling；协议不合法时给出结构化纠错，耗尽后安全收敛。
 
-意外异常回滚后重新锁定可见 Task，并确认 current_run 仍是本次创建的 Run（旧 Worker 不得回收新 owner）：Run FAILED；无在途 Action 时 Task QUEUED，写 run_failed、Checkpoint 并提交，由已有 Outbox 有界重试处理。存在 dispatched/running/unknown Action 时改为 UNKNOWN + RECONCILING，禁止自动重放。LLM 超时/限流保留基础设施重试语义。Forget 的 TaskContentUnavailable 分支与执行授权保持原有边界，不读取或恢复已隐藏任务。未增加数据库字段或迁移。
+## 校验与有界纠错
 
-验收包含真实 handle_agent_task_run（真实数据库事务、有效 Outbox claim，只有 LLM 边界离线替换），覆盖纠错、预算、Token、恢复、重投、Scope 和未知副作用。SQLite 验证逻辑状态收敛；生产 PostgreSQL 的并发锁保证仍由现有专项测试负责。
+共享 `normalize_calls` 处理 LangChain tool_calls 和 invalid_tool_calls。损坏的参数字符串转为不可执行诊断，原始损坏文本不复制到错误或修复记录。缺失/重复调用 ID 归一化为可配对 ID，同时标记错误，不能进入执行。
+
+共享 `validate_calls` 校验函数、参数和调用数量。Main 允许文本及批量调用；Worker 每次必须且只能有一个有效函数调用。Worker 的纯文本、空调用、多调用、未知函数、损坏参数和 DTO 结构错误均归一化为 AgentOutputValidationError。有效的参数错误反馈仍保留 argument_validation_error 的详细路径与约束。
+
+修复使用原生 AIMessage + 对应 ToolMessage；无函数调用时使用结构化 HumanMessage 说明缺失调用。多调用错误为每个调用返回一个匹配 ID 的 ToolMessage，整批不执行。Worker 只保存最近一次修复交换到既有 task_state，并保留现有 Forget 派生来源边界；TaskContext 不重复注入这些消息。
+
+纠错上限共用 `tool_argument_max_retries`（默认 2，即初次 + 两次修正）。Graph 与 Runtime 分别驱动下一次调用，预算与持久化由宿主负责。Worker 的失败计数跨 Outbox 重试保存；每次调用均经过 max_model_calls、Token、时限等预算检查。LangChain 模型工厂显式 `max_retries=0`，网络重试由现有宿主/Outbox 负责，不叠加隐藏 SDK 重试。
+
+每次响应（包括最终失败的响应）记录模型与 Token Usage；网络异常无响应时不伪造 Token。纠错只针对尚未执行的调用，不自动重放已执行或结果未知的副作用。
+
+## Runtime 与恢复
+
+Worker 执行链：Function Calling → 共享参数校验 → 内部 ActionProposal → Runtime 参数复核 → Broker Scope/Policy → AgentAction → Approval/READY → Dispatch → 执行前指纹/参数复核 → handler → Evidence/Checkpoint。
+
+提案生成不等于 Action 已接受或工具已成功。Runtime 继续管理授权、Approval、资源锁、Trusted Core、Forget、Lease、Action 审计、Evidence、Checkpoint、Outbox、UNKNOWN 与 Reconciliation。纠错耗尽时，无成功 Action 的 Task FAILED，有进度的 Task PARTIAL，当前 Run FAILED。
+
+异常回收只处理本次拥有的 current_run：Run FAILED；无在途 Action 时 Task QUEUED，并提交 run_failed 事件与 Checkpoint。未知副作用转 UNKNOWN/RECONCILING，不自动重放。有效 Lease 的重复投递安全去重；过期运行复用既有恢复机制。旧 Worker 不回收新 owner 的 Run。TaskContentUnavailable 继续走 Forget 安全分支。
+
+## 上下文与发现
+
+工具选择按完整定义进行预算控制，超限省略整个定义并切换 discovery。绑定函数与上下文元数据从同一个 snapshot 构建；完整参数 Schema 只通过 Function Calling 传递，System/User Prompt 不再重复注入 Schema 或 ActionProposal 输出契约。TaskContext 内仍保留 in_scope、指纹、发现状态等选择信息。定义变化或卸载会使旧 loaded 定义失效。
+
+没有新增数据库字段或迁移。对外 Task API、ActionProposal 内部字段、事件和执行审计语义保持兼容。验收采用离线 LangChain AIMessage、真实数据库事务与真实 handle_agent_task_run；生产 PostgreSQL 并发锁及在线模型/MCP/Desktop 执行仍由既有专项验证覆盖。

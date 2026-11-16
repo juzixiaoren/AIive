@@ -15,7 +15,7 @@ from langchain_core.tools import StructuredTool
 
 from aiive.context.run_context import RunContext
 from aiive.tools.registry import ToolRegistry
-from aiive.tools.tool_validation import canonical_tool_schema
+from aiive.core.function_calling import function_definition
 
 
 class CanonicalStructuredTool(StructuredTool):
@@ -121,7 +121,7 @@ def build_langchain_tools(
         if safety.risk_level in ("high", "critical"):
             desc += f" (risk: {safety.risk_level})"
 
-        args_model = canonical_tool_schema(reg)
+        args_model = function_definition(reg)["parameters"]
         tool = CanonicalStructuredTool.from_function(
             func=_make_handler(registry, cap_id, run_context),
             name=cap_id,
