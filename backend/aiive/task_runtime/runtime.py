@@ -13,6 +13,8 @@ from aiive.control.approval_service import TaskApprovalService
 from aiive.control.capability_broker import CapabilityBroker
 from aiive.db.models import AgentAction, AgentRun, AgentTask, TaskArtifact, TaskEvidence
 from aiive.task_runtime.agent_executor import TaskAgentExecutor
+from aiive.task_runtime.errors import AgentOutputValidationError
+from aiive.tools.tool_validation import validate_tool_params
 from aiive.task_runtime.evidence import EvidenceStore
 from aiive.task_runtime.goal_service import GoalService
 from aiive.task_runtime.repository import TaskRepository, utcnow
@@ -47,9 +49,12 @@ class PersistentTaskRuntime:
         self.repo: TaskRepository = TaskRepository(db)
         self.agent: TaskAgentExecutor = agent_executor or TaskAgentExecutor(db)
         self.evidence: EvidenceStore = evidence_store or EvidenceStore()
+        self.active_run_id: str | None = None
 
     def run(self, task_id: str, *, trigger: str = "dispatch") -> dict[str, Any]:
         task, run = self.repo.start_run(task_id, trigger=trigger)
+        self.active_run_id = run.id
+        self.db.commit()
         self._ensure_isolation(task, run)
         self.db.commit()
         budget = TaskBudget.model_validate(task.budgets or {})
@@ -76,6 +81,7 @@ class PersistentTaskRuntime:
             return {"status": task.status, "task_id": task.id, "goal": "waiting"}
         self.db.commit()
 
+        correction_failures = int((task.task_state or {}).get("validation_failures", 0))
         completed_this_run = 0
         last_model: str | None = None
         run_tokens: dict[str, int] = {}
@@ -114,6 +120,8 @@ class PersistentTaskRuntime:
 
             budget_issue = self._budget_issue(task, budget, before_model=True)
             if budget_issue:
+                if correction_failures:
+                    return self._validation_failed(task, run, run_tokens, last_model)
                 return self._complete(
                     task, run, status="partial",
                     summary="任务预算已耗尽。",
@@ -175,16 +183,49 @@ class PersistentTaskRuntime:
                 task.usage = usage
                 self.repo.renew_run(run, lease_seconds=180)
                 self.db.commit()
-                decision = self.agent.decide(task, resident)
+                try:
+                    decision = self.agent.decide(task, resident)
+                except AgentOutputValidationError as error:
+                    last_model = error.model
+                    run_tokens = self._merge_usage(run_tokens, error.token_usage)
+                    self.repo.renew_run(run, lease_seconds=180)
+                    self._record_tokens(task, error.token_usage)
+                    run.token_usage = run_tokens
+                    run.model = last_model
+                    correction_failures += 1
+                    if correction_failures >= 3 or self._budget_issue(task, budget, before_model=True):
+                        return self._validation_failed(task, run, run_tokens, last_model)
+                    task.task_state = {**(task.task_state or {}), "validation_feedback": error.payload(), "validation_failures": correction_failures}
+                    self.db.commit()
+                    continue
+                self.repo.renew_run(run, lease_seconds=180)
                 last_model = decision.model
                 run_tokens = self._merge_usage(run_tokens, decision.token_usage)
                 self._record_tokens(task, decision.token_usage)
+                run.token_usage = run_tokens
+                run.model = last_model
+                self.db.commit()
                 run.input_snapshot = {
                     **decision.input_snapshot,
                     "prompt_refs": decision.prompt_refs,
                 }
                 proposal = decision.proposal
+            if proposal.decision == "action":
+                registration = available.get(proposal.capability_id)
+                if registration is not None:
+                    validation = validate_tool_params(registration, proposal.arguments)
+                    if not validation.ok:
+                        correction_failures += 1
+                        if task.executor_type == "deterministic" or correction_failures >= 3 or self._budget_issue(task, budget, before_model=True):
+                            return self._validation_failed(task, run, run_tokens, last_model)
+                        task.task_state = {**(task.task_state or {}), "validation_feedback": validation.error_payload(proposal.capability_id), "validation_failures": correction_failures}
+                        self.db.commit()
+                        continue
+                    proposal.arguments = validation.validated_params
+            correction_failures = 0
             state = dict(task.task_state or {})
+            state.pop("validation_feedback", None)
+            state.pop("validation_failures", None)
             state["last_decision"] = proposal.model_dump(mode="json")
             task.task_state = state
             self.repo.append_event(
@@ -330,6 +371,12 @@ class PersistentTaskRuntime:
         self.db.commit()
         return {"status": task.status, "task_id": task.id, "continued": True}
 
+    def _validation_failed(self, task: AgentTask, run: AgentRun, tokens: dict[str, int], model: str | None) -> dict[str, Any]:
+        progress = self.db.query(AgentAction).filter_by(task_id=task.id, status=ActionStatus.SUCCEEDED.value).count()
+        return self._complete(task, run, status="partial" if progress else "failed",
+                               summary="模型输出或工具参数校验纠错已耗尽。",
+                               unresolved=["agent_validation_exhausted"], token_usage=tokens, model=model, failed_run=True)
+
     def _record_discovery(
         self,
         task: AgentTask,
@@ -469,6 +516,7 @@ class PersistentTaskRuntime:
         unresolved: list[str] | None = None,
         model: str | None = None,
         token_usage: dict[str, int] | None = None,
+        failed_run: bool = False,
     ) -> dict[str, Any]:
         task = self.db.get(AgentTask, task.id) or task
         progress = (task.task_state or {}).get("attachment_processing") or {}
@@ -547,11 +595,11 @@ class PersistentTaskRuntime:
         )
         self.repo.finish_run(
             run,
-            status=RunStatus.FAILED.value if status == "failed" else RunStatus.COMPLETED.value,
+            status=RunStatus.FAILED.value if status == "failed" or failed_run else RunStatus.COMPLETED.value,
             summary=report,
             token_usage=token_usage,
             model=model,
-            error=summary if status == "failed" else None,
+            error=summary if status == "failed" or failed_run else None,
         )
         self.repo.checkpoint(task.id, reason=f"completed_{status}")
         self.db.commit()

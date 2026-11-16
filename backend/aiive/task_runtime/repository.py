@@ -25,6 +25,7 @@ from aiive.db.models import (
 )
 from aiive.task_runtime.schemas import ActionStatus, RunStatus, TaskBrief, TaskBudget, TaskStatus
 from aiive.task_runtime.state_machine import ensure_transition
+from aiive.task_runtime.errors import TaskNotFoundError, TaskTerminalError, TaskNotRunnableError
 
 
 logger = logging.getLogger(__name__)
@@ -391,7 +392,7 @@ class TaskRepository:
         acquire_forget_shared_lock(self.db)
         task = self.get_task(task_id, for_update=True)
         if task is None:
-            raise ValueError("task_not_found")
+            raise TaskNotFoundError("task_not_found")
         version = int(self.db.query(func.max(AgentTaskCheckpoint.version)).filter(
             AgentTaskCheckpoint.task_id == task_id,
         ).scalar() or 0) + 1
@@ -453,11 +454,11 @@ class TaskRepository:
     def start_run(self, task_id: str, *, trigger: str, lease_seconds: int = 120) -> tuple[AgentTask, AgentRun]:
         task = self.get_task(task_id, for_update=True)
         if task is None:
-            raise ValueError("task_not_found")
+            raise TaskNotFoundError("task_not_found")
         if task.status in TERMINAL_TASK_STATES:
-            raise ValueError("task_terminal")
+            raise TaskTerminalError("task_terminal")
         if task.status != TaskStatus.QUEUED.value:
-            raise ValueError(f"task_not_runnable:{task.status}")
+            raise TaskNotRunnableError(f"task_not_runnable:{task.status}")
         self.transition_task(task, TaskStatus.DISPATCHING.value)
         checkpoint = self.latest_checkpoint(task.id)
         run_index = int(self.db.query(func.max(AgentRun.run_index)).filter(
@@ -522,8 +523,10 @@ class TaskRepository:
         self.db.flush()
 
     def renew_run(self, run: AgentRun, *, lease_seconds: int = 180) -> None:
-        if run.status != RunStatus.RUNNING.value:
-            raise ValueError(f"run_not_active:{run.status}")
+        self.db.refresh(run)
+        task = self.get_task(run.task_id, for_update=True)
+        if run.status != RunStatus.RUNNING.value or task is None or task.current_run_id != run.id:
+            raise TaskNotRunnableError(f"run_not_active:{run.status}")
         run.lease_expires_at = utcnow() + timedelta(seconds=lease_seconds)
         self.db.flush()
 
@@ -632,7 +635,7 @@ class TaskRepository:
     def cancel_task(self, task_id: str, *, reason: str = "user_cancelled") -> AgentTask:
         task = self.get_task(task_id, for_update=True)
         if task is None:
-            raise ValueError("task_not_found")
+            raise TaskNotFoundError("task_not_found")
         if task.status in TERMINAL_TASK_STATES:
             return task
         self.transition_task(
@@ -671,9 +674,9 @@ class TaskRepository:
     def send_input(self, task_id: str, content: str, *, user_event_id: str = "") -> AgentTask:
         task = self.get_task(task_id, for_update=True)
         if task is None:
-            raise ValueError("task_not_found")
+            raise TaskNotFoundError("task_not_found")
         if task.status in TERMINAL_TASK_STATES:
-            raise ValueError("task_terminal")
+            raise TaskTerminalError("task_terminal")
         from aiive.task_runtime.read_repository import record_input_source
         from aiive.forget.durable_sources import persist_sources
         source_id = record_input_source(self.db, task, {"content": content}, user_event_id)

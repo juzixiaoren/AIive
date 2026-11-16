@@ -8,6 +8,8 @@ from aiive.context.run_context import RunContext
 from aiive.db.base import SessionLocal
 from aiive.task_runtime.repository import TaskRepository
 from aiive.task_runtime.router import normalize_task_brief
+from aiive.task_runtime.schemas import TaskBudget, ActionProposal
+from aiive.task_runtime.goal_plan import GoalPlan
 from aiive.tools.registry import CapabilitySafetySchema, ToolRegistration, ToolRegistry
 
 
@@ -261,6 +263,10 @@ def _list_skills() -> dict[str, Any]:
 def build_main_agent_registry() -> ToolRegistry:
     """Main 固定能力：任务管理与当前 Thread 附件；不含任意文件/桌面执行。"""
     registry = ToolRegistry()
+    deterministic_schema = ActionProposal.model_json_schema()
+    deterministic_schema["properties"] = {key: value for key, value in deterministic_schema["properties"].items()
+                                          if key in {"capability_id", "arguments", "preconditions", "effects", "summary"}}
+    deterministic_schema["required"] = ["capability_id"]
     registry.register(_registration(
         "list_skills",
         "列出可用于持久任务的内置 Skill、能力范围和联网要求。",
@@ -292,12 +298,14 @@ def build_main_agent_registry() -> ToolRegistry:
                 "description": "代码任务可显式要求独立 Git worktree",
             },
             "deterministic_action": {
+                "schema": deterministic_schema,
                 "type": "dict",
                 "description": "可选；目标已完全确定时直接给出 capability_id/arguments/preconditions/effects，仍经过 Broker 与审批",
             },
             "target_node_id": {"type": "str"},
-            "budgets": {"type": "dict"},
+            "budgets": {"type": "dict", "schema": TaskBudget.model_json_schema()},
             "goal_plan": {
+                "schema": GoalPlan.model_json_schema(),
                 "type": "dict",
                 "description": (
                     "长期目标计划（自然语言里的跨周/跨月目标用这个）："

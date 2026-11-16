@@ -4,11 +4,12 @@ from __future__ import annotations
 import logging
 
 from aiive.db.base import SessionLocal
-from aiive.db.models import AgentRun
-from aiive.task_runtime.repository import TaskRepository
+from aiive.db.models import AgentRun, AgentAction
+from aiive.task_runtime.repository import TaskRepository, recover_stale_tasks
+from aiive.task_runtime.errors import TaskNotRunnableError, TaskTerminalError, TaskNotFoundError
 from aiive.task_runtime.read_repository import TaskContentUnavailable
 from aiive.task_runtime.runtime import PersistentTaskRuntime
-from aiive.task_runtime.schemas import RunStatus, TaskStatus
+from aiive.task_runtime.schemas import ActionStatus, RunStatus, TaskStatus
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome, HandlerResult
 from aiive.worker.job_source_guard import BLOCKED_REASON, guard_job_sources_visible
 from aiive.worker.outbox_execution_auth import (
@@ -35,6 +36,7 @@ def handle_agent_task_run(claimed: ClaimedJob) -> HandlerResult:
             terminal_reason="invalid_payload",
         )
     db = SessionLocal()
+    runtime: PersistentTaskRuntime | None = None
     try:
         task = TaskRepository(db).get_task(task_id)
         if task is None:
@@ -50,7 +52,14 @@ def handle_agent_task_run(claimed: ClaimedJob) -> HandlerResult:
             TaskStatus.BLOCKED_NODE.value, TaskStatus.RECONCILING.value,
         }:
             return HandlerResult(HandlerOutcome.COMPLETED, reason=f"task_{task.status}")
-        PersistentTaskRuntime(db).run(task_id, trigger=trigger)
+        if task.status in {TaskStatus.RUNNING.value, TaskStatus.DISPATCHING.value}:
+            # Recovery checks current_run + run status + lease, and routes unknown effects
+            # to reconciliation. A valid owner is deduplicated without Outbox retries.
+            recover_stale_tasks(db)
+            db.commit()
+            return HandlerResult(HandlerOutcome.COMPLETED, reason="task_run_deduplicated_or_recovered")
+        runtime = PersistentTaskRuntime(db)
+        runtime.run(task_id, trigger=trigger)
         # 本次运行可能嵌套 Forget：提交后重新获取共享执行授权
         if not resume_execution_authorization():
             raise RuntimeError("execution_authorization_restore_failed")
@@ -64,23 +73,39 @@ def handle_agent_task_run(claimed: ClaimedJob) -> HandlerResult:
             HandlerOutcome.COMPLETED,
             reason=f"{BLOCKED_REASON}:task_content_unavailable",
         )
-    except ValueError as error:
-        if str(error) in {"task_terminal", "task_not_found"}:
-            return HandlerResult(HandlerOutcome.COMPLETED, reason=str(error))
-        logger.warning("Agent Task 状态冲突: task_id=%s error=%s", task_id, error)
-        return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, reason=str(error))
+    except (TaskTerminalError, TaskNotFoundError) as error:
+        db.rollback()
+        return HandlerResult(HandlerOutcome.COMPLETED, reason=str(error))
+    except TaskNotRunnableError as error:
+        db.rollback()
+        recover_stale_tasks(db)
+        db.commit()
+        return HandlerResult(HandlerOutcome.COMPLETED, reason=str(error))
     except Exception as error:
         logger.exception("Agent Task Run 失败: task_id=%s", task_id)
         db.rollback()
         try:
             repo = TaskRepository(db)
             task = repo.get_task(task_id, for_update=True)
-            if task is not None and task.status in {TaskStatus.DISPATCHING.value, TaskStatus.RUNNING.value}:
+            if (task is not None and runtime is not None
+                    and task.current_run_id == runtime.active_run_id
+                    and task.status in {TaskStatus.DISPATCHING.value, TaskStatus.RUNNING.value}):
                 run = db.get(AgentRun, task.current_run_id) if task.current_run_id else None
                 if run is not None and run.status == RunStatus.RUNNING.value:
-                    repo.finish_run(run, status=RunStatus.FAILED.value, error=str(error))
-                if task.status == TaskStatus.DISPATCHING.value:
-                    repo.transition_task(task, TaskStatus.QUEUED.value)
+                    repo.finish_run(run, status=RunStatus.FAILED.value, error=str(error),
+                                    token_usage=run.token_usage, model=run.model)
+                uncertain = db.query(AgentAction).filter(
+                    AgentAction.task_id == task.id,
+                    AgentAction.status.in_([ActionStatus.DISPATCHED.value, ActionStatus.RUNNING.value, ActionStatus.UNKNOWN.value]),
+                ).all()
+                if uncertain:
+                    for action in uncertain:
+                        if action.status != ActionStatus.UNKNOWN.value:
+                            repo.transition_action(action, ActionStatus.UNKNOWN.value, error="run_failed")
+                    if task.status == TaskStatus.DISPATCHING.value:
+                        repo.transition_task(task, TaskStatus.RUNNING.value)
+                    repo.transition_task(task, TaskStatus.RECONCILING.value)
+                    repo.append_event(task.id, "task_reconciliation_required", {"action_ids": [a.id for a in uncertain]})
                 else:
                     repo.transition_task(task, TaskStatus.QUEUED.value)
                 repo.append_event(task.id, "run_failed", {"error": str(error)[:1000]})

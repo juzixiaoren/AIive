@@ -25,7 +25,8 @@ def _remember_tool():
 def test_remember_tool_schema_carries_identity_guidance():
     """content / memory_key 的字段描述必须包含身份键纯值与关系键的约束。"""
     rem = _remember_tool()
-    schema = rem.args_schema.model_json_schema()
+    from langchain_core.utils.function_calling import convert_to_openai_tool
+    schema = convert_to_openai_tool(rem)["function"]["parameters"]
     props = schema["properties"]
 
     assert "纯值" in props["content"]["description"]

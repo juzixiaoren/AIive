@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from json_repair import repair_json
+from pydantic import ValidationError
+from aiive.task_runtime.errors import AgentOutputValidationError
 from sqlalchemy.orm import Session
 
 from aiive.core.llm_client import LLMClient, default_llm_client
@@ -47,6 +49,9 @@ class TaskAgentExecutor:
         if forget_revision(self.db) != revision or not TaskReadRepository(self.db).task_visible(task):
             raise TaskContentUnavailable("task_context_source_changed")
         self.db.commit()
+        feedback = (task.task_state or {}).get("validation_feedback")
+        if feedback:
+            messages.append({"role": "user", "content": json.dumps(feedback, ensure_ascii=False)})
         response = self.llm.chat(
             messages,
             temperature=0.1,
@@ -55,7 +60,12 @@ class TaskAgentExecutor:
         )
         if forget_revision(self.db) != revision or not TaskReadRepository(self.db).task_visible(task):
             raise TaskContentUnavailable("task_context_source_changed")
-        proposal = self.parse(response.content)
+        try:
+            proposal = self.parse(response.content)
+        except AgentOutputValidationError as error:
+            error.token_usage = response.usage
+            error.model = response.model
+            raise
         return AgentDecision(
             proposal=proposal,
             model=response.model,
@@ -73,10 +83,25 @@ class TaskAgentExecutor:
                 lines.pop()
             text = "\n".join(lines)
         try:
-            payload = json.loads(text)
-        except json.JSONDecodeError:
-            payload = json.loads(repair_json(text))
-        return ActionProposal.model_validate(payload)
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                payload = json.loads(repair_json(text))
+            return ActionProposal.model_validate(payload, strict=True)
+        except ValidationError as error:
+            raise AgentOutputValidationError([
+                {"path": ".".join(map(str, item["loc"])) or "$",
+                 "code": item["type"], "message": item["msg"][:240],
+                 "expected": str(item.get("ctx", {}).get("expected", item["type"])),
+                 "received": type(item.get("input")).__name__}
+                for item in error.errors(include_url=False)
+            ]) from error
+        except (json.JSONDecodeError, TypeError) as error:
+            raise AgentOutputValidationError([{
+                "path": "$", "code": "json_parse", "message": "Invalid JSON output",
+                "expected": "JSON object", "received": type(raw).__name__,
+            }]) from error
+
 
 
 def attachment_reference_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:

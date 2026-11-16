@@ -393,6 +393,12 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
          {"operations": {
              "type": "list",
              "description": "补丁操作列表，来自 create_selfdev_plan 返回的 plan.operations",
+             "items": {"type": "object", "required": ["target_file"],
+                       "properties": {"operation": {"type": "string", "enum": ["add_file", "modify_file", "delete_file"], "default": "add_file"},
+                                      "target_file": {"type": "string", "minLength": 1},
+                                      "content": {"type": "string"},
+                                      "not_allowed_yet": {"type": "boolean"}},
+                       "additionalProperties": True},
              "required": True,
          }}, "high", True, False),
         ("promote_slot", _handle_promote_slot, "健康检查通过后提升非活跃槽位为活跃", {}, "high", True, False),
@@ -424,7 +430,9 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                  "description": "add / remove / update；current_objective 忽略此参数",
                  "enum": ["add", "remove", "update"],
              },
-             "payload": {"type": "dict", "description": "字段内容。open_loops/active_constraints 单项需带 id；current_objective 为 {'value': '...'}"},
+             "payload": {"type": "dict", "properties": {"id": {"type": "string"}, "value": {"type": "string"}},
+                         "additionalProperties": True,
+                         "description": "字段内容。open_loops/active_constraints 单项需带 id；current_objective 为 {'value': '...'}"},
              "idempotency_key": {"type": "str", "description": "可选，重复提交保护"},
          }, "low", True, False),
     ]

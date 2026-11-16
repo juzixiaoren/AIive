@@ -99,12 +99,17 @@ class ToolRegistration:
     description: str = ""
     # None 表示旧式无显式契约（兼容测试/扩展）；{} 表示明确不接受业务参数。
     parameters: dict[str, Any] | None = None
-    # MCP 工具保留服务端原始 inputSchema，仅用于本地执行前校验。
+    # 显式 input_schema 优先于 parameters；注册后保存有效 Canonical Schema。
     input_schema: dict[str, Any] | None = None
     # local 为后端进程内 handler；desktop_node 为绑定到单个在线 Electron 节点的
     # 远端 handler。后者由 Desktop WebSocket 调度，不进入服务端 Outbox 执行器。
     executor_kind: str = "local"
     executor_node_id: str = ""
+
+
+def canonical_schema(reg: ToolRegistration) -> dict[str, Any]:
+    from aiive.tools.tool_validation import canonical_tool_schema
+    return canonical_tool_schema(reg)
 
 
 _CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
@@ -199,39 +204,40 @@ class ToolRegistry:
         self._tools: dict[str, ToolRegistration] = {}
 
     def register(self, reg: ToolRegistration) -> None:
-        """注册工具，并为缺失的安全描述指纹生成稳定值。
+        """注册工具，保存规范契约并重新计算完整定义指纹。
 
         参数:
             reg: 工具注册条目
         """
-        if not reg.safety.descriptor_hash:
-            safety_payload = {
-                "capability_id": reg.safety.capability_id,
-                "definition_source": reg.safety.definition_source,
-                "definition_trust_level": reg.safety.definition_trust_level,
-                "risk_level": reg.safety.risk_level,
-                "requires_confirmation": reg.safety.requires_confirmation,
-                "writes_external_world": reg.safety.writes_external_world,
-                "can_access_secret": reg.safety.can_access_secret,
-                "can_delete": reg.safety.can_delete,
-                "uses_network": reg.safety.uses_network,
-                "allowed_instruction_sources": reg.safety.allowed_instruction_sources,
-                "tool_description_is_instruction": reg.safety.tool_description_is_instruction,
-                "timeout_seconds": reg.safety.timeout_seconds,
-                "effect_mode": reg.safety.effect_mode,
-                "description": reg.description,
-                "parameters": reg.parameters,
-                "input_schema": reg.input_schema,
-                "executor_kind": reg.executor_kind,
-                "executor_node_id": reg.executor_node_id,
-            }
-            reg = replace(
-                reg,
-                safety=replace(
-                    reg.safety,
-                    descriptor_hash=compute_descriptor_hash(safety_payload),
-                ),
-            )
+        from aiive.tools.tool_validation import canonical_tool_schema
+        effective_schema = canonical_tool_schema(reg)
+        safety_payload = {
+            "capability_id": reg.safety.capability_id,
+            "definition_source": reg.safety.definition_source,
+            "definition_trust_level": reg.safety.definition_trust_level,
+            "risk_level": reg.safety.risk_level,
+            "requires_confirmation": reg.safety.requires_confirmation,
+            "writes_external_world": reg.safety.writes_external_world,
+            "can_access_secret": reg.safety.can_access_secret,
+            "can_delete": reg.safety.can_delete,
+            "uses_network": reg.safety.uses_network,
+            "allowed_instruction_sources": reg.safety.allowed_instruction_sources,
+            "tool_description_is_instruction": reg.safety.tool_description_is_instruction,
+            "timeout_seconds": reg.safety.timeout_seconds,
+            "effect_mode": reg.safety.effect_mode,
+            "description": reg.description,
+            "input_schema": effective_schema,
+            "executor_kind": reg.executor_kind,
+            "executor_node_id": reg.executor_node_id,
+        }
+        reg = replace(
+            reg,
+            input_schema=effective_schema,
+            safety=replace(
+                reg.safety,
+                descriptor_hash=compute_descriptor_hash(safety_payload),
+            ),
+        )
         self._tools[reg.safety.capability_id] = reg
 
     def get(self, capability_id: str) -> ToolRegistration | None:
@@ -289,8 +295,8 @@ class ToolRegistry:
                 "descriptor_hash": r.safety.descriptor_hash,
                 "executor_kind": r.executor_kind,
                 "executor_node_id": r.executor_node_id,
-                "parameters": r.parameters,
-                "input_schema": r.input_schema,
+                "parameters": canonical_schema(r).get("properties", {}),
+                "input_schema": canonical_schema(r),
             }
             for r in self._tools.values()
         ]
@@ -346,8 +352,8 @@ class ToolRegistry:
             **self._catalog_entry(reg),
             "definition_trust_level": reg.safety.definition_trust_level,
             "timeout_seconds": reg.safety.timeout_seconds,
-            "parameters": reg.parameters,
-            "input_schema": reg.input_schema,
+            "parameters": canonical_schema(reg).get("properties", {}),
+            "input_schema": canonical_schema(reg),
         }
 
     @staticmethod

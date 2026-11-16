@@ -93,7 +93,7 @@ class TaskContextAssembler:
                 {"id": item.id, "event_type": item.event_type, "payload": _bounded_value(item.payload, 4000)}
                 for item in reversed(events)
             ],
-            "tools": _bounded_value(tool_view, 24_000),
+            "tools": tool_view,
             "skill": skill.as_dict() if skill else None,
             # 长期目标：只注入当前步骤与进度，避免整份计划挤占工具定义预算。
             "goal": self._goal_context(task),
@@ -113,7 +113,8 @@ class TaskContextAssembler:
         prompts = get_prompt_registry()
         system = prompts.render("task_runtime.worker_system")
         skill = self._active_skill(task)
-        system_content = system.content
+        from aiive.task_runtime.schemas import ActionProposal
+        system_content = system.content + "\nActionProposal JSON Schema (JSON mode only ensures syntax):\n" + json.dumps(ActionProposal.model_json_schema(), ensure_ascii=False)
         if skill is not None:
             system_content += f"\n\n# Active Skill: {skill.name}\n\n{skill.instructions}"
         goal = snapshot.get("goal")

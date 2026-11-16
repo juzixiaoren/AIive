@@ -9,11 +9,24 @@ RunContext 通过 _make_handler 闭包捕获，经由 registry.execute() 注入 
 
 from __future__ import annotations
 
+from typing import Any, override
+
 from langchain_core.tools import StructuredTool
 
 from aiive.context.run_context import RunContext
 from aiive.tools.registry import ToolRegistry
-from aiive.tools.tool_validation import build_tool_args_model
+from aiive.tools.tool_validation import canonical_tool_schema
+
+
+class CanonicalStructuredTool(StructuredTool):
+    @override
+    def _parse_input(self, tool_input: str | dict[str, Any], tool_call_id: str | None) -> str | dict[str, Any]:
+        parsed = super()._parse_input(tool_input, tool_call_id)
+        if isinstance(parsed, dict) and tool_call_id:
+            # Transport identity stays outside the business contract. Registry owns
+            # strict validation; no competing Pydantic model or coercion is used.
+            return {**parsed, "tool_call_id": tool_call_id}
+        return parsed
 
 
 def _make_handler(registry: ToolRegistry, capability_id: str, run_context: RunContext | None):
@@ -51,6 +64,8 @@ def _make_handler(registry: ToolRegistry, capability_id: str, run_context: RunCo
                     "error_type": result.get("error_type", "execution_failed"),
                     "execution_status": result.get("execution_status", "failed"),
                     "operation_id": result.get("operation_id", ""),
+                    "retryable": result.get("retryable", False),
+                    "issues": result.get("issues", []),
                 },
                 ensure_ascii=False,
             )
@@ -106,13 +121,12 @@ def build_langchain_tools(
         if safety.risk_level in ("high", "critical"):
             desc += f" (risk: {safety.risk_level})"
 
-        tool = StructuredTool.from_function(
+        args_model = canonical_tool_schema(reg)
+        tool = CanonicalStructuredTool.from_function(
             func=_make_handler(registry, cap_id, run_context),
             name=cap_id,
             description=desc,
-            args_schema=build_tool_args_model(
-                reg, include_injected_tool_call_id=True,
-            ),
+            args_schema=args_model,
             return_direct=False,
         )
         tools.append(tool)

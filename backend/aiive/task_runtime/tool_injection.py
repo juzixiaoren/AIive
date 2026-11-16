@@ -126,13 +126,21 @@ def build_tool_view(
                 available.append(definition)
     discovery_registry = discovery_registry or execution
     discovery_catalog = {entry["capability_id"]: entry for entry in discovery_registry.catalog()}
-    return {
+    view: dict[str, Any] = {
         "mode": mode,
         "resident": resident,
         "available": available,
         "discovered": _resolve_queries(discovery, discovery_catalog, executable_ids),
         "loaded": _resolve_loaded(discovery, discovery_registry, executable_ids),
     }
+    # Remove entire definitions, never truncate their JSON structure.
+    omitted = []
+    for key in ("available", "resident", "loaded"):
+        while view[key] and len(json.dumps(view, ensure_ascii=False)) > FULL_INJECTION_MAX_CHARS:
+            omitted.append(view[key].pop()["capability_id"])
+            view["mode"] = "discovery"
+    view["omitted_capability_ids"] = omitted
+    return view
 
 
 def _injection_mode(registry: ToolRegistry, catalog: list[dict[str, Any]]) -> str:

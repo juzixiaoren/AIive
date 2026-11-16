@@ -1,8 +1,8 @@
 """工具参数的本地、供应商无关校验。
 
 模型侧只使用普通 Function Calling；本模块以 handler 签名和工具注册元数据
-构建严格 Pydantic 模型，并在所有执行入口前验证参数。MCP 工具额外保留并
-校验服务端提供的 inputSchema，避免注册转换时丢失嵌套约束。
+派生 Canonical JSON Schema，并在所有执行入口前严格校验。显式 MCP/Desktop
+inputSchema 优先，模型注入与服务端校验共享同一份完整定义。
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from functools import reduce
 from typing import Annotated, Any, get_args, get_origin
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
+from pydantic import BaseModel, ConfigDict, Field, create_model
 
 
 @dataclass(frozen=True)
@@ -56,6 +56,7 @@ class ToolValidationResult:
             "error_type": "argument_validation_error",
             "retryable": True,
             "tool_name": tool_name,
+            "capability_id": tool_name,
             "issues": [issue.as_dict() for issue in self.issues[:12]],
             "instruction": (
                 "请只修正上述参数后重新调用工具；不要声称工具已经执行。"
@@ -219,124 +220,6 @@ def build_tool_args_model(
     )
 
 
-def _pydantic_issues(error: ValidationError) -> list[ToolArgumentIssue]:
-    issues: list[ToolArgumentIssue] = []
-    for item in error.errors(include_url=False, include_context=False):
-        location = ".".join(str(part) for part in item.get("loc", ())) or "$"
-        received = type(item.get("input")).__name__ if "input" in item else ""
-        issues.append(
-            ToolArgumentIssue(
-                path=location,
-                code=str(item.get("type", "validation_error")),
-                message=str(item.get("msg", "参数不合法"))[:240],
-                received=received,
-            )
-        )
-    return issues
-
-
-def _json_type_matches(value: Any, expected: Any) -> bool:
-    expected_types = expected if isinstance(expected, list) else [expected]
-    for expected_type in expected_types:
-        if expected_type == "null" and value is None:
-            return True
-        if expected_type == "string" and isinstance(value, str):
-            return True
-        if expected_type == "boolean" and isinstance(value, bool):
-            return True
-        if expected_type == "integer" and isinstance(value, int) and not isinstance(value, bool):
-            return True
-        if expected_type == "number" and isinstance(value, (int, float)) and not isinstance(value, bool):
-            return True
-        if expected_type == "array" and isinstance(value, list):
-            return True
-        if expected_type == "object" and isinstance(value, dict):
-            return True
-    return False
-
-
-def _validate_json_schema(
-    value: Any,
-    schema: dict[str, Any],
-    path: str = "$",
-) -> list[ToolArgumentIssue]:
-    """校验 MCP inputSchema 的常用、确定性子集。"""
-    issues: list[ToolArgumentIssue] = []
-    expected_type = schema.get("type")
-    if expected_type is not None and not _json_type_matches(value, expected_type):
-        return [
-            ToolArgumentIssue(
-                path=path,
-                code="json_type",
-                message="参数类型不符合工具契约",
-                expected=str(expected_type),
-                received=type(value).__name__,
-            )
-        ]
-
-    enum_values = schema.get("enum")
-    if isinstance(enum_values, list) and value not in enum_values:
-        issues.append(
-            ToolArgumentIssue(
-                path=path,
-                code="enum",
-                message="参数不在允许值范围内",
-                expected=", ".join(str(item) for item in enum_values[:12]),
-                received=type(value).__name__,
-            )
-        )
-
-    if isinstance(value, dict):
-        properties = schema.get("properties")
-        properties = properties if isinstance(properties, dict) else {}
-        required = schema.get("required")
-        for name in required if isinstance(required, list) else []:
-            if name not in value:
-                issues.append(
-                    ToolArgumentIssue(
-                        path=f"{path}.{name}",
-                        code="missing",
-                        message="缺少必填参数",
-                    )
-                )
-        if schema.get("additionalProperties") is False:
-            for name in value:
-                if name not in properties:
-                    issues.append(
-                        ToolArgumentIssue(
-                            path=f"{path}.{name}",
-                            code="extra_forbidden",
-                            message="不允许的额外参数",
-                        )
-                    )
-        for name, child in value.items():
-            child_schema = properties.get(name)
-            if isinstance(child_schema, dict):
-                issues.extend(_validate_json_schema(child, child_schema, f"{path}.{name}"))
-
-    if isinstance(value, list) and isinstance(schema.get("items"), dict):
-        item_schema = schema["items"]
-        for index, item in enumerate(value):
-            issues.extend(_validate_json_schema(item, item_schema, f"{path}[{index}]"))
-
-    if isinstance(value, str):
-        min_length = schema.get("minLength")
-        max_length = schema.get("maxLength")
-        if isinstance(min_length, int) and len(value) < min_length:
-            issues.append(ToolArgumentIssue(path, "min_length", "字符串过短", str(min_length)))
-        if isinstance(max_length, int) and len(value) > max_length:
-            issues.append(ToolArgumentIssue(path, "max_length", "字符串过长", str(max_length)))
-
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        minimum = schema.get("minimum")
-        maximum = schema.get("maximum")
-        if isinstance(minimum, (int, float)) and value < minimum:
-            issues.append(ToolArgumentIssue(path, "minimum", "数值低于允许下限", str(minimum)))
-        if isinstance(maximum, (int, float)) and value > maximum:
-            issues.append(ToolArgumentIssue(path, "maximum", "数值高于允许上限", str(maximum)))
-    return issues
-
-
 def validate_tool_params(registration: Any, params: object) -> ToolValidationResult:
     """严格验证并规范化一次工具调用参数。"""
     if not isinstance(params, dict):
@@ -353,39 +236,78 @@ def validate_tool_params(registration: Any, params: object) -> ToolValidationRes
             ],
         )
 
-    input_schema = registration.input_schema
-    if isinstance(input_schema, dict) and input_schema:
-        schema_issues = _validate_json_schema(params, input_schema)
-        if schema_issues:
-            return ToolValidationResult(ok=False, issues=schema_issues)
+    from jsonschema import Draft202012Validator, validators
+    def strict_integer(_checker: Any, value: Any) -> bool:
+        return type(value) is int
+    strict_validator = validators.extend(Draft202012Validator, type_checker=Draft202012Validator.TYPE_CHECKER.redefine("integer", strict_integer))
 
+    schema = canonical_tool_schema(registration)
+    issues = []
+    def error_sort_key(error: Any) -> str:
+        return str(list(error.path))
+    for error in sorted(strict_validator(schema).iter_errors(params), key=error_sort_key):
+        path = ".".join(str(part) for part in error.absolute_path)
+        if error.validator == "additionalProperties" and isinstance(error.instance, dict):
+            extras = set(error.instance) - set(error.schema.get("properties", {}))
+            for name in sorted(extras):
+                issues.append(ToolArgumentIssue(
+                    path=".".join(filter(None, [path, name])), code="extra_forbidden",
+                    message="不允许的额外参数", expected="no additional properties",
+                    received=type(error.instance[name]).__name__,
+                ))
+            continue
+        if error.validator == "required":
+            for name in error.validator_value:
+                if name not in error.instance:
+                    issues.append(ToolArgumentIssue(
+                        path=".".join(filter(None, [path, name])), code="missing",
+                        message="缺少必填参数", expected=str(error.schema.get("properties", {}).get(name, {})),
+                        received="missing",
+                    ))
+            continue
+        issues.append(ToolArgumentIssue(
+            path=path or "$", code=str(error.validator), message="参数不符合工具契约",
+            expected=str(error.validator_value)[:240], received=type(error.instance).__name__,
+        ))
+    return ToolValidationResult(ok=not issues, validated_params=dict(params) if not issues else {}, issues=issues)
+
+
+def canonical_tool_schema(registration: Any) -> dict[str, Any]:
+    """Explicit input_schema wins; otherwise derive annotations then overlay declared metadata.
+
+    The returned copy is the sole effective contract for injection, validation and hashing.
+    """
+    from copy import deepcopy
+    if registration.input_schema is not None:
+        return deepcopy(registration.input_schema)
     model = build_tool_args_model(registration)
     if model is None:
-        return ToolValidationResult(ok=True, validated_params=dict(params))
-    try:
-        validated = model.model_validate(params)
-    except ValidationError as error:
-        return ToolValidationResult(ok=False, issues=_pydantic_issues(error))
-
-    enum_issues: list[ToolArgumentIssue] = []
-    for name, raw_definition in (registration.parameters or {}).items():
-        if name not in params or not isinstance(raw_definition, dict):
+        signature = _handler_signature(registration.handler)
+        parameters = {
+            name: {} for name, parameter in signature.parameters.items()
+            if name not in {"ctx", "db", "tool_call_id"}
+            and parameter.kind not in {inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL}
+        }
+        from dataclasses import replace
+        model = build_tool_args_model(replace(registration, parameters=parameters))
+    schema: dict[str, Any] = model.model_json_schema() if model else {"type": "object", "properties": {}}
+    for name, metadata in (registration.parameters or {}).items():
+        if not isinstance(metadata, dict):
             continue
-        enum_values = raw_definition.get("enum")
-        if isinstance(enum_values, list) and params[name] not in enum_values:
-            enum_issues.append(
-                ToolArgumentIssue(
-                    path=str(name),
-                    code="enum",
-                    message="参数不在允许值范围内",
-                    expected=", ".join(str(item) for item in enum_values[:12]),
-                    received=type(params[name]).__name__,
-                )
-            )
-    if enum_issues:
-        return ToolValidationResult(ok=False, issues=enum_issues)
-
-    return ToolValidationResult(
-        ok=True,
-        validated_params=validated.model_dump(exclude_unset=True),
-    )
+        child = schema["properties"][name]
+        # Types come from annotations. Explicit nested JSON Schema is authoritative.
+        if "schema" in metadata:
+            nested = deepcopy(metadata["schema"])
+            if any(branch.get("type") == "null" for branch in child.get("anyOf", [])) and isinstance(nested.get("type"), str):
+                nested["type"] = [nested["type"], "null"]
+            if "default" in child:
+                nested.setdefault("default", child["default"])
+            definitions = nested.pop("$defs", {})
+            if definitions:
+                schema.setdefault("$defs", {}).update(definitions)
+            schema["properties"][name] = nested
+            continue
+        for key, value in metadata.items():
+            if key not in {"type", "required"}:
+                child[key] = deepcopy(value)
+    return schema

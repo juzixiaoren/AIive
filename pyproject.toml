@@ -17,6 +17,7 @@ dependencies = [
     "langchain-openai>=0.3",
     "langgraph-prebuilt>=1.0",
     "json-repair>=0.30.0",
+    "jsonschema>=4.23",
     "apscheduler>=3.10",
     "litellm>=1.50.0,<2.0.0",
     # FastMCP 1.x provides mcp.server.fastmcp used by the bundled stdio server.
