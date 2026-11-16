@@ -1168,7 +1168,7 @@ project_plan_v35 - Model Router 与上下文装配统一评分（P1）；或 sup
   聊天工作卡片与提醒卡片分离，历史恢复复用同一映射，普通 task_event 不生成聊天消息。
 - Backend Timeline 补齐真实 Goal 事件，内部问题账本不进入 Timeline；计划编辑合并
   未编辑的步骤字段，保留脱敏视图省略的触发条件。所有读取仍受 Forget 校验。
-- 本地全量 Python：1943 passed / 134 skipped / 5280 既有 warnings，440.23 秒。
+- 本地全量 Python：1943 passed / 134 skipped / 5280 既有 warnings，最终清理后复跑 346.69 秒。
   PostgreSQL：116 passed / 13 skipped，301.66 秒，包含 SAVEPOINT；跳过外部 Embedding 项。
   具体检查、CI 与边界见 [验收报告](../reports/2026-11-12_P1_work_center.md)。
 - CI 在现有前端 Job 加入 Android TypeScript/Vite 与跨端 Node 测试，保持 9 Job。

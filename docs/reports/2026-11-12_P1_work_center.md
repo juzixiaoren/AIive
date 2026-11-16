@@ -57,8 +57,9 @@ Web 和 Android 的 ChatApp 保持挂载；工作页激活时暂停聊天 Thread
 
 | 检查 | 真实结果 |
 |---|---|
-| 完整 Python：`pytest tests -q` | 1943 passed、134 skipped、5280 既有 warnings，440.23 秒 |
+| 完整 Python：`pytest tests -q` | 1943 passed、134 skipped、5280 既有 warnings，346.69 秒（最终清理后复跑） |
 | 真实 PostgreSQL：`AIIVE_PG_TESTS=1 pytest tests/integration/pg -q` | 116 passed、13 skipped，301.66 秒；包含 SAVEPOINT/事务广播 |
+| 客户端认证守卫 | 11 passed；覆盖公共 Thread 通道首帧认证和 Token 不进入 URL |
 | 新增 P1 后端契约文件 | 19 passed，9.13 秒；覆盖真实 Goal 事件、Question allowed_actions、脱敏编辑与 Forget、Timeline 安全、持久历史卡片、CORS |
 | 聊天 Node 逻辑 | 4 passed |
 | Desktop Node Host | 8 passed（locks + journal） |
