@@ -27,7 +27,12 @@ def build_chat_model(client: LLMClient, *, streaming: bool = False) -> ChatOpenA
 
 
 def function_definition(registration: ToolRegistration) -> dict[str, Any]:
-    return {"name": registration.safety.capability_id, "description": registration.description,
+    description = registration.description
+    if registration.safety.writes_external_world:
+        description += " (side_effect: true)"
+    if registration.safety.risk_level in ("high", "critical"):
+        description += f" (risk: {registration.safety.risk_level})"
+    return {"name": registration.safety.capability_id, "description": description,
             "parameters": canonical_tool_schema(registration)}
 
 

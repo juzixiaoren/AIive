@@ -108,19 +108,12 @@ def build_langchain_tools(
         if visible is not None and cap_id not in visible:
             continue
 
-        desc = reg.description
-        safety = reg.safety
-        if safety.writes_external_world:
-            desc += " (side_effect: true)"
-        if safety.risk_level in ("high", "critical"):
-            desc += f" (risk: {safety.risk_level})"
-
-        args_model = function_definition(reg)["parameters"]
+        definition = function_definition(reg)
         tool = CanonicalStructuredTool.from_function(
             func=_make_handler(registry, cap_id, run_context),
             name=cap_id,
-            description=desc,
-            args_schema=args_model,
+            description=definition["description"],
+            args_schema=definition["parameters"],
             return_direct=False,
         )
         tools.append(tool)

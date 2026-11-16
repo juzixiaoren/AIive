@@ -298,7 +298,7 @@ export function ChatApp({ username, onLogout, active, onOpenWork }: { username: 
               ...approval,
               status: response.action,
               result: response.tool_result,
-              error: response.error,
+              error: response.error ?? undefined,
             }
             : approval
         )),

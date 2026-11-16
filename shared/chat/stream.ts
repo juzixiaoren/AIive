@@ -43,12 +43,13 @@ export async function readChatEventStream(
     for (;;) {
       const chunk = await reader.read();
       if (chunk.done) break;
-      buffer += decoder.decode(chunk.value, { stream: true }).replace(/\r\n/g, "\n");
+      buffer += decoder.decode(chunk.value, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
-      for (const line of lines) handleLine(line);
+      for (const line of lines) handleLine(line.replace(/\r$/, ""));
     }
-    if (buffer) handleLine(buffer);
+    buffer += decoder.decode();
+    if (buffer) handleLine(buffer.replace(/\r$/, ""));
   } finally {
     reader.releaseLock();
   }

@@ -1,3 +1,6 @@
+import type { ExecutionStatus } from "../../../shared/chat/session";
+import type { ApprovalResponse } from "../../../shared/chat/approval";
+export type { ExecutionStatus, ApprovalResponse };
 import { apiFetch } from "./client";
 import { readChatEventStream } from "../../../shared/chat/stream";
 import {
@@ -186,21 +189,6 @@ export async function sendMessageStream(
   return result;
 }
 
-/** 服务端唯一长期对话的执行状态（由线程级租约派生）。 */
-export interface ExecutionStatus {
-  thread_id: string;
-  state: "idle" | "running" | "busy";
-  cancellable: boolean;
-  interrupting: boolean;
-  owner_kind: string | null;
-  active_turn: {
-    turn_record_id: string | null;
-    turn_id: string | null;
-    started_at: string | null;
-    cancel_requested_at: string | null;
-  } | null;
-}
-
 /** 获取或初始化唯一长期对话的 Thread ID（后端是唯一事实来源）。 */
 export async function getCurrentConversation(): Promise<{ thread_id: string }> {
   const res = await apiFetch("api/conversation/current");
@@ -244,20 +232,6 @@ export async function resetThread(threadId?: string): Promise<void> {
     body: JSON.stringify({ thread_id: threadId ?? null }),
   });
   if (!res.ok) throw await chatApiErrorFromResponse(res);
-}
-
-/**
- * 审批响应接口，用于确认或拒绝需要审批的工具调用
- */
-export interface ApprovalResponse {
-  ok: boolean;
-  action: "succeeded" | "denied" | "failed" | "interrupted_unknown";
-  approval_id: string;
-  tool_name?: string;
-  tool_result?: unknown;
-  trace_id?: string;
-  error?: string;
-  idempotent_replay: boolean;
 }
 
 /**

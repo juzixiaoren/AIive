@@ -146,27 +146,41 @@ class TaskManager:
         }
 
     def cancel(self, task_id: str) -> dict[str, Any]:
-        """取消尚未完成的任务，并终止未领取的提醒投递。"""
+        """只取消 pending/dispatching；终态重试无副作用，事务由调用方提交。
+
+        ok 表示请求成功，task_cancelled 表示最终状态，changed 表示本次迁移。
+        events_cancelled 只统计本次同步处理的 reminder_created 事件。
+        """
         task = (
             self._db.query(Task)
             .filter(Task.id == task_id)
             .with_for_update()
             .first()
         )
+        result = {
+            "ok": False,
+            "task_id": task_id,
+            "task_cancelled": False,
+            "changed": False,
+            "status": task.status if task is not None else "not_found",
+            "events_cancelled": 0,
+        }
         if task is None:
-            return {"ok": False, "status": "not_found", "error": "任务不存在"}
+            return {**result, "error": "任务不存在"}
+        if task.status == "cancelled":
+            return {**result, "ok": True, "task_cancelled": True}
+        if task.status not in {"pending", "dispatching"}:
+            return {**result, "error": "任务当前状态不允许取消"}
 
-        cancelled = task.status in {"pending", "dispatching"}
-        if cancelled:
-            task.status = "cancelled"
-            self._db.query(OutboxJob).filter(
-                OutboxJob.operation_id == reminder_operation_id(task.id),
-                OutboxJob.status == "pending",
-            ).update({
-                OutboxJob.status: "cancelled",
-                OutboxJob.terminal_reason: "task_cancelled",
-                OutboxJob.terminal_at: func.now(),
-            }, synchronize_session=False)
+        task.status = "cancelled"
+        self._db.query(OutboxJob).filter(
+            OutboxJob.operation_id == reminder_operation_id(task.id),
+            OutboxJob.status == "pending",
+        ).update({
+            OutboxJob.status: "cancelled",
+            OutboxJob.terminal_reason: "task_cancelled",
+            OutboxJob.terminal_at: func.now(),
+        }, synchronize_session=False)
 
         related = (
             self._db.query(Event)
@@ -186,7 +200,8 @@ class TaskManager:
             "ok": True,
             "task_id": task.id,
             "status": task.status,
-            "task_cancelled": cancelled,
+            "task_cancelled": True,
+            "changed": True,
             "events_cancelled": len(related),
         }
 

@@ -106,3 +106,77 @@ test('http and sse failures share the same structured parsing', async () => {
   assert.equal(text.retryable, false);
   assert.match(text.message, /500/);
 });
+
+const { readChatEventStream } = await import(moduleUrl('../../shared/chat/stream.ts'));
+const encoder = new TextEncoder();
+function streamResponse(chunks) {
+  return new Response(new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(typeof chunk === 'string' ? encoder.encode(chunk) : chunk);
+      controller.close();
+    },
+  }));
+}
+async function eventsFrom(chunks) {
+  const events = [];
+  await readChatEventStream(streamResponse(chunks), event => events.push(event));
+  return events;
+}
+
+test('shared SSE parses a single event', async () => {
+  assert.deepEqual(await eventsFrom(['event: token\ndata: {"text":"hello"}\n\n']), [
+    { event: 'token', data: { text: 'hello' } },
+  ]);
+});
+
+test('shared SSE preserves consecutive event order', async () => {
+  assert.deepEqual(await eventsFrom(['event: token\ndata: {"i":1}\n\nevent: done\ndata: {"i":2}\n\n']), [
+    { event: 'token', data: { i: 1 } }, { event: 'done', data: { i: 2 } },
+  ]);
+});
+
+test('shared SSE handles CRLF split across chunks at every byte boundary', async () => {
+  const bytes = encoder.encode('event: token\r\ndata: {"text":"你好🍊"}\r\n\r\n');
+  const expected = [{ event: 'token', data: { text: '你好🍊' } }];
+  for (let i = 1; i < bytes.length; i++) {
+    assert.deepEqual(await eventsFrom([bytes.slice(0, i), bytes.slice(i)]), expected);
+  }
+});
+
+test('shared SSE decodes UTF-8 characters across one-byte chunks', async () => {
+  const bytes = encoder.encode('event: token\ndata: {"text":"你好🍊"}\n');
+  assert.deepEqual(await eventsFrom([...bytes].map(byte => Uint8Array.of(byte))), [
+    { event: 'token', data: { text: '你好🍊' } },
+  ]);
+});
+
+test('shared SSE skips invalid JSON and continues with valid events', async () => {
+  assert.deepEqual(await eventsFrom(['event: bad\ndata: {broken}\n\nevent: done\ndata: {}\n']), [
+    { event: 'done', data: {} },
+  ]);
+});
+
+test('shared SSE ignores empty data lines', async () => {
+  assert.deepEqual(await eventsFrom(['event: token\ndata:\ndata:   \ndata: {}\n']), [
+    { event: 'token', data: {} },
+  ]);
+});
+
+test('shared SSE emits the final event without a trailing newline', async () => {
+  assert.deepEqual(await eventsFrom(['event: done\ndata: {"ok":true}']), [
+    { event: 'done', data: { ok: true } },
+  ]);
+});
+
+test('shared SSE propagates callback errors and releases the reader', async () => {
+  for (const ending of ['\n\n', '']) {
+    const response = streamResponse(['event: done\ndata: {}' + ending]);
+    const error = new Error('callback failure');
+    await assert.rejects(readChatEventStream(response, () => { throw error; }), e => e === error);
+    assert.equal(response.body.locked, false);
+  }
+});
+
+test('shared SSE rejects a response without a body', async () => {
+  await assert.rejects(readChatEventStream(new Response(null), () => {}), /服务器没有返回流式响应/);
+});

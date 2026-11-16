@@ -243,13 +243,10 @@ def handle_cancel_task(db: Session, task_id: str):
     """
     from aiive.runtime.task_manager import TaskManager
     result = TaskManager(db).cancel(task_id)
-    if not result.get("ok"):
-        return {"cancelled": False, "error": result.get("error", "not found")}
     return {
-        "cancelled": True,
-        "task_id": result["task_id"],
+        **result,
+        "cancelled": result["task_cancelled"],
         "events_updated": result["events_cancelled"] > 0,
-        "events_cancelled": result["events_cancelled"],
     }
 
 

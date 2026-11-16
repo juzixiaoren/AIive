@@ -179,3 +179,29 @@ def test_main_invalid_high_risk_arguments_repair_before_approval():
     compiled.invoke({"messages": [HumanMessage(content="probe")], "tool_records": []})
     assert assistant.count == 3 and approvals == []
     handler.assert_not_called()
+
+
+@pytest.mark.parametrize("risk", ["high", "critical"])
+def test_context_function_and_langchain_export_identical_safety_contract(db_session, monkeypatch, risk):
+    from dataclasses import replace
+    from aiive.db.models import Thread
+    from aiive.runtime.context_assembler import ContextAssembler
+    from tests.unit.backend.test_context_assembler import _FakeTokenCounter
+
+    registered = registry()
+    original = replace(registered.get("probe"), input_schema={
+        "type": "object", "properties": {"count": {"type": "integer", "minimum": 1}},
+        "required": ["count"], "additionalProperties": False})
+    registered.register(replace(original, description="Probe rows", safety=replace(
+        original.safety, risk_level=risk, writes_external_world=True)))
+    monkeypatch.setattr("aiive.runtime.turn_tool_surface.build_turn_tool_registry", lambda _: registered)
+    thread = Thread(id="safety-description-thread", title="contract")
+    db_session.add(thread)
+    db_session.flush()
+    context = ContextAssembler(_FakeTokenCounter()).assemble(db_session, "probe", thread)
+    definition = function_definition(registered.get("probe"))
+    bound = convert_to_openai_tool(build_langchain_tools(registered)[0])["function"]
+    exported = context.tools_schema[0]["function"]
+    assert exported == definition == bound
+    assert definition["description"] == f"Probe rows (side_effect: true) (risk: {risk})"
+    assert definition["parameters"] == original.input_schema

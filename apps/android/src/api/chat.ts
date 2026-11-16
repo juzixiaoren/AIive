@@ -1,3 +1,6 @@
+import type { ExecutionStatus } from "../../../../shared/chat/session";
+import type { ApprovalResponse } from "../../../../shared/chat/approval";
+export type { ExecutionStatus, ApprovalResponse };
 import type { Attachment } from "../../../../shared/chat/attachments";
 import { workCardsFrom, type WorkCard } from "../../../../shared/work/types";
 import { subscribeThread, type Envelope } from "../../../../shared/work/connection";
@@ -47,30 +50,6 @@ interface StreamResult {
   approvals: ApprovalItem[];
   workCards: WorkCard[];
   cancelled: boolean;
-}
-
-export interface ApprovalResponse {
-  ok: boolean;
-  action: "succeeded" | "denied" | "failed" | "interrupted_unknown";
-  approval_id: string;
-  tool_name?: string;
-  tool_result?: unknown;
-  error?: string;
-}
-
-/** 服务端唯一长期对话的执行状态（由线程级租约派生）。 */
-export interface ExecutionStatus {
-  thread_id: string;
-  state: "idle" | "running" | "busy";
-  cancellable: boolean;
-  interrupting: boolean;
-  owner_kind: string | null;
-  active_turn: {
-    turn_record_id: string | null;
-    turn_id: string | null;
-    started_at: string | null;
-    cancel_requested_at: string | null;
-  } | null;
 }
 
 export function hasBackendConfig(): boolean {

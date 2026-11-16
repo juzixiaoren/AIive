@@ -423,7 +423,7 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
             ? "execution_unknown"
             : "failed";
       const serializedResult = response.tool_result === undefined
-        ? response.error
+        ? response.error ?? undefined
         : typeof response.tool_result === "string"
           ? response.tool_result
           : JSON.stringify(response.tool_result);

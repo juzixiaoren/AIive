@@ -245,3 +245,96 @@ class TestDueTaskEnqueue:
 
         assert results == []
         assert db_session.query(OutboxJob).count() == 0
+
+
+@pytest.mark.parametrize("status", ["pending", "dispatching", "completed", "failed", "cancelled", "not_found"])
+@pytest.mark.parametrize("entry", ["manager", "tool"])
+def test_cancellation_contract_and_atomicity(db_session, status, entry):
+    from aiive.db.models import OutboxJob
+    from aiive.tools.builtin_reminders import handle_cancel_task
+
+    task = Task(task_type="reminder", title="contract", status=status)
+    db_session.add(task)
+    db_session.flush()
+    task_id = task.id
+    event = Event(event_type="reminder_created", thread_id="thread-1", trace_id=task_id,
+                  payload={"task_id": task_id, "status": "alerting"})
+    unrelated = Event(event_type="reminder_created", thread_id="thread-1", trace_id="unrelated",
+                      payload={"task_id": "unrelated", "status": "pending"})
+    job = OutboxJob(operation_id=f"reminder_delivery:{task_id}", job_type="reminder_delivery",
+                    status="pending", payload={"task_id": task_id})
+    db_session.add_all([event, unrelated, job])
+    db_session.flush()
+    if status == "not_found":
+        db_session.delete(task)
+        db_session.flush()
+    cancel = TaskManager(db_session).cancel if entry == "manager" else lambda tid: handle_cancel_task._aiive_db_handler(db_session, tid)
+    can_cancel = status in {"pending", "dispatching"}
+    snapshot = dict(event.payload)
+    with db_session.begin_nested() as transaction:
+        result = cancel(task_id)
+        db_session.flush()
+        db_session.refresh(job)
+        assert result["ok"] is (can_cancel or status == "cancelled")
+        assert result["task_cancelled"] is (can_cancel or status == "cancelled")
+        assert result["changed"] is can_cancel
+        assert result["status"] == ("cancelled" if can_cancel else status)
+        assert result["events_cancelled"] == int(can_cancel)
+        if entry == "tool":
+            assert result["cancelled"] is result["task_cancelled"]
+        if not result["ok"]:
+            assert result["error"]
+        assert event.payload == ({**snapshot, "status": "cancelled", "dismissed": True} if can_cancel else snapshot)
+        assert job.status == ("cancelled" if can_cancel else "pending")
+        assert job.terminal_reason == ("task_cancelled" if can_cancel else None)
+        assert (job.terminal_at is not None) is can_cancel
+        if status != "not_found":
+            assert task.status == result["status"]
+        assert unrelated.payload == {"task_id": "unrelated", "status": "pending"}
+        if can_cancel or status == "cancelled":
+            replay = cancel(task_id)
+            assert replay["ok"] and replay["task_cancelled"]
+            assert not replay["changed"] and replay["events_cancelled"] == 0
+        transaction.rollback()
+    # Bulk Outbox updates require reloading the identity map after rollback.
+    db_session.expire_all()
+    # The caller owns the transaction, including all three model changes.
+    assert event.payload == snapshot
+    assert job.status == "pending"
+    if status != "not_found":
+        assert task.status == status
+
+
+@pytest.mark.parametrize("job_status", ["running", "completed", "failed", "cancelled"])
+def test_cancel_never_modifies_claimed_or_terminal_outbox(db_session, job_status):
+    from aiive.db.models import OutboxJob
+    task = Task(task_type="reminder", title="claimed", status="dispatching")
+    db_session.add(task)
+    db_session.flush()
+    job = OutboxJob(operation_id=f"reminder_delivery:{task.id}", job_type="reminder_delivery",
+                    status=job_status, payload={"task_id": task.id})
+    db_session.add(job)
+    db_session.flush()
+    assert TaskManager(db_session).cancel(task.id)["task_cancelled"]
+    db_session.refresh(job)
+    assert job.status == job_status and job.terminal_reason is None
+
+
+@pytest.mark.parametrize("status", ["completed", "failed"])
+def test_hide_terminal_reminder_only_changes_selected_notification(db_session, status):
+    from aiive.db.models import OutboxJob
+    task = Task(task_type="reminder", title="terminal", status=status)
+    db_session.add(task)
+    db_session.flush()
+    events = [Event(event_type="reminder_created", thread_id="thread-1", trace_id=task.id,
+                    payload={"task_id": task.id, "status": "alerting"}) for _ in range(2)]
+    job = OutboxJob(operation_id=f"reminder_delivery:{task.id}", job_type="reminder_delivery",
+                    status="pending", payload={"task_id": task.id})
+    db_session.add_all([*events, job])
+    db_session.flush()
+    result = delete_notification(events[0].id, db_session)
+    db_session.expire_all()
+    assert result == {"ok": True, "task_cancelled": False}
+    assert task.status == status and job.status == "pending"
+    assert events[0].payload == {"task_id": task.id, "status": "alerting", "dismissed": True}
+    assert events[1].payload == {"task_id": task.id, "status": "alerting"}

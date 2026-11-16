@@ -156,7 +156,7 @@ def list_notifications(
 
 @router.delete("/notifications/{notification_id}")
 def delete_notification(notification_id: str, db: Session = Depends(get_db)):
-    """删除指定通知，并同步取消关联的定时任务，避免提醒再次弹出。
+    """隐藏指定通知；独立尝试取消仍可取消的关联提醒任务。
 
     Args:
         notification_id: 通知 ID（即 Event.id）
@@ -180,14 +180,14 @@ def delete_notification(notification_id: str, db: Session = Depends(get_db)):
     task_id = None
     if not payload.get("goal_key") and not payload.get("agent_task_id"):
         task_id = payload.get("reminder_task_id") or payload.get("task_id")
-    payload["dismissed"] = True
-    event.payload = payload
-
     task_cancelled = False
     reminder = db.get(Task, str(task_id)) if task_id else None
     if reminder is not None and reminder.task_type == "reminder":
         cancellation = TaskManager(db).cancel(str(task_id))
         task_cancelled = bool(cancellation.get("task_cancelled"))
+
+    # Re-read after cancellation: it may have updated this reminder event.
+    event.payload = {**(event.payload or {}), "dismissed": True}
 
     from aiive.task_runtime.repository import queue_notification_refresh
     queue_notification_refresh(db)
