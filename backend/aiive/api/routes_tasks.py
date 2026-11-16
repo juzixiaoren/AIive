@@ -17,8 +17,12 @@ router = APIRouter(prefix="/api")
 
 
 class CreateTaskRequest(BaseModel):
-    """创建任务请求体"""
-    task_type: str = Field(...)
+    """创建任务请求体。
+
+    Task 表只承载可自动投递的提醒（reminder）；周期性与条件性需求由
+    Persistent Task Runtime 的 Watcher / Goal Trigger 承担。
+    """
+    task_type: str = Field(..., description="仅支持 reminder")
     title: str = Field(..., min_length=1)
     description: str = ""
     condition: str | None = None
@@ -35,6 +39,11 @@ def create_task(request: CreateTaskRequest, db: Session = Depends(get_db)):
     Returns:
         新创建任务的 id、title、status 和 task_type
     """
+    if request.task_type != "reminder":
+        raise HTTPException(
+            status_code=422,
+            detail="仅支持 reminder 任务；周期性或条件性任务请使用持久任务 Watcher 或长期目标",
+        )
     try:
         mgr = TaskManager(db)
         from datetime import datetime, timezone

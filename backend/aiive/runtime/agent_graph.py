@@ -57,10 +57,7 @@ from aiive.runtime.thread_state import ThreadState
 from aiive.runtime.action_cards import ActionCard, PendingOperation
 from aiive.runtime.tool_executor import ToolCallRecord, build_action_cards, build_pending_operations
 from aiive.runtime.trace import Trace
-from aiive.runtime.system_contract import (
-    build_runtime_identity,
-    build_stable_contract,
-)
+from aiive.runtime.system_contract import build_runtime_identity
 from aiive.runtime.tool_events import (
     StreamToolCallMatcher as _StreamToolCallMatcher,
     ToolExecutionReceipt as ToolExecutionReceipt,
@@ -73,11 +70,6 @@ from aiive.runtime.tool_output_guard import guard_tool_output
 from aiive.runtime.token_counter import LiteLLMTokenCounter
 from aiive.runtime.working_state import WorkingStateService
 from aiive.runtime.message_normalizer import normalize_tool_call, normalize_tool_result
-from aiive.runtime.proactive_tool import NOTIFY_USER_TOOL_ID, register_notify_user
-from aiive.runtime.question_tool import (
-    ANSWER_QUESTION_TOOL_ID,
-    register_answer_goal_question,
-)
 from aiive.runtime.turn_events import (
     INTERNAL_CONTEXT_HEADER,
     DecisionMarkerStreamFilter as _DecisionMarkerStreamFilter,
@@ -106,59 +98,6 @@ def _tool_calls_paired(messages: list[Any]) -> bool:
         elif isinstance(message, ToolMessage):
             pending.discard(str(message.tool_call_id or ""))
     return not pending
-
-
-def _notify_user_schema() -> dict[str, Any]:
-    """notify_user 的展示用 schema（实际绑定由 build_langchain_tools 生成）。"""
-    return {
-        "type": "function",
-        "function": {
-            "name": NOTIFY_USER_TOOL_ID,
-            "description": (
-                "在当前任务执行过程中主动给用户发一条独立聊天消息（不结束任务）。"
-                "仅在内部事件上下文要求时调用。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "content": {"type": "string", "description": "提醒正文"},
-                    "event_id": {"type": "string", "description": "内部事件 id"},
-                },
-                "required": ["content"],
-            },
-        },
-    }
-
-
-def _answer_question_schema() -> dict[str, Any]:
-    """answer_goal_question 的展示用 schema（实际绑定由 build_langchain_tools 生成）。"""
-    return {
-        "type": "function",
-        "function": {
-            "name": ANSWER_QUESTION_TOOL_ID,
-            "description": (
-                "把用户这条消息关联到此前主动提出的问题，并推进对应目标步骤。"
-                "仅在上下文列出待回答问题、且用户确实在回答/修改/拒绝时调用。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "answer": {"type": "string", "description": "用户回答原文摘要"},
-                    "question_id": {"type": "string", "description": "待回答问题的 id"},
-                    "intent": {
-                        "type": "string",
-                        "enum": ["answer", "modify_plan", "reject"],
-                        "description": "回答/修改计划/拒绝",
-                    },
-                    "plan_changes": {
-                        "type": "object",
-                        "description": "intent=modify_plan 时的计划字段",
-                    },
-                },
-                "required": ["answer"],
-            },
-        },
-    }
 
 
 def _ws_commit(mutate: "Callable[[Session], None]") -> None:
@@ -434,14 +373,6 @@ class AgentGraph:
     # ------------------------------------------------------------------
     # 系统提示构建
     # ------------------------------------------------------------------
-
-    # 保留旧调用入口；实现由上下文层与图编排层共享。
-    @staticmethod
-    def _build_stable_contract(
-        runtime_identity: dict[str, str] | None = None,
-        policies: list[dict[str, Any]] | None = None,
-    ) -> str:
-        return build_stable_contract(runtime_identity, policies)
 
     @staticmethod
     def _build_post_context_items(
@@ -1047,29 +978,20 @@ class AgentGraph:
             raise RuntimeError("execute_turn 必须通过 ContextAssembler 提供 assembled_ctx")
 
         chat_messages = assembled_ctx.messages
-        tool_schemas = assembled_ctx.tools_schema
         initial_messages = self._dicts_to_langchain_messages(chat_messages)
         context_snapshot = assembled_ctx.snapshot
 
         langchain_llm = self._build_langchain_llm()
-        # AssembledContext.tool_registry 的默认值就是 None（见 context_assembler），
-        # 因此「属性缺失」与「显式 None」语义一致：都表示未注入注册表，回落到默认注册表。
+        # 工具面由 ContextAssembler 通过 runtime.turn_tool_surface 统一构建
+        # （固定元工具 + 通知工具 + 本轮条件工具），Schema 与 Token 预算同源；
+        # 图只消费这一份注册表，不再自行注册工具或拼装展示用 Schema。
         registry = getattr(assembled_ctx, "tool_registry", None)
         if registry is None:
-            from aiive.task_runtime.tools import build_main_agent_registry
+            from aiive.runtime.turn_tool_surface import build_turn_tool_registry
 
-            registry = build_main_agent_registry()
-        # 单 Turn 快照：notify_user 只在本 Turn 内可见，不改变主 Agent 固定工具面
-        # （build_main_agent_registry 的工具集合仍由测试与契约锁定）。
-        registry = registry.snapshot()
-        register_notify_user(registry)
-        # 待回答问题（V58）：只有本轮确有未关闭问题时才绑定回答工具。
-        # 普通聊天不出现该工具，从源头避免把闲聊误判成回答。
-        open_questions = list(
-            getattr(assembled_ctx, "agent_ctx", {}).get("open_questions") or [],
-        )
-        if open_questions:
-            register_answer_goal_question(registry)
+            registry = build_turn_tool_registry(
+                list(getattr(assembled_ctx, "agent_ctx", {}).get("open_questions") or []),
+            )
         run_ctx_exec = RunContext(
             thread_id=thread.id,
             trace_id=trace.trace_id,
@@ -1078,20 +1000,8 @@ class AgentGraph:
             turn_record_id=exec_ctx.turn_record_id,
         )
         tools = build_langchain_tools(registry, run_context=run_ctx_exec)
-        if tool_schemas is not None:
-            allowed = {s.get("function", {}).get("name") for s in tool_schemas}
-            allowed.add(NOTIFY_USER_TOOL_ID)
-            if open_questions:
-                allowed.add(ANSWER_QUESTION_TOOL_ID)
-            tools = [t for t in tools if getattr(t, "name", None) in allowed]
-            tool_schemas = [*tool_schemas, _notify_user_schema()]
-            if open_questions:
-                tool_schemas = [*tool_schemas, _answer_question_schema()]
         if not tools:
-            logger.warning(
-                "[TRACE:graph] 工具列表为空（tool_schemas=%s），LLM 将无工具可用",
-                "present" if tool_schemas else "none",
-            )
+            logger.warning("[TRACE:graph] 工具列表为空，LLM 将无工具可用")
         llm_with_tools = langchain_llm.bind_tools(tools)
 
         compiled, _records_raw, pending_approvals = self._build_graph(

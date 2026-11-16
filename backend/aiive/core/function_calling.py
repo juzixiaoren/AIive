@@ -31,6 +31,14 @@ def function_definition(registration: ToolRegistration) -> dict[str, Any]:
             "parameters": canonical_tool_schema(registration)}
 
 
+def function_definitions(registry: ToolRegistry) -> list[dict[str, Any]]:
+    """导出 OpenAI function 定义列表：模型可见工具 Schema 的唯一来源。"""
+    return [
+        {"type": "function", "function": function_definition(registration)}
+        for registration in registry.registrations()
+    ]
+
+
 def correction_allowed(failures: int) -> bool:
     return failures <= settings.tool_argument_max_retries
 

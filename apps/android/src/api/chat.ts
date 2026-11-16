@@ -3,6 +3,7 @@ import { workCardsFrom, type WorkCard } from "../../../../shared/work/types";
 import { subscribeThread, type Envelope } from "../../../../shared/work/connection";
 import { appConfig } from "../config";
 import { apiFetch, getToken } from "./auth";
+import { readChatEventStream } from "../../../../shared/chat/stream";
 
 export interface ChatMessage {
   id: string;
@@ -228,41 +229,24 @@ export async function streamMessage(
   if (!response.ok) throw await chatResponseError(response);
   if (!response.body) throw new Error("服务器没有返回流式响应");
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let activeEvent = "";
   let completed = false;
   let cancelled = false;
   let result: StreamResult = { threadId: threadId ?? "", reply: "", approvals: [], workCards: [], cancelled: false };
 
-  const handleLine = (line: string) => {
-    if (line.startsWith("event:")) {
-      activeEvent = line.slice(6).trim();
-      return;
-    }
-    if (!line.startsWith("data:")) return;
-
-    let data: Record<string, unknown>;
-    try {
-      data = JSON.parse(line.slice(5).trim()) as Record<string, unknown>;
-    } catch {
-      return;
-    }
-
-    if (activeEvent === "started") {
+  await readChatEventStream(response, ({ event, data }) => {
+    if (event === "started") {
       const nextThreadId = String(data.thread_id || "");
       const turnRecordId = String(data.turn_record_id || "");
       if (nextThreadId) {
         result.threadId = nextThreadId;
         callbacks.onStarted(nextThreadId, turnRecordId);
       }
-    } else if (activeEvent === "token") {
+    } else if (event === "token") {
       callbacks.onToken(String(data.text || ""));
-    } else if (activeEvent === "cancelled") {
+    } else if (event === "cancelled") {
       // 服务端已完成取消收口：本轮用户消息不再进入历史。
       cancelled = true;
-    } else if (activeEvent === "done") {
+    } else if (event === "done") {
       completed = true;
       const cards = Array.isArray(data.action_cards) ? data.action_cards : [];
       result = {
@@ -272,7 +256,7 @@ export async function streamMessage(
         workCards: workCardsFrom(cards),
         cancelled: false,
       };
-    } else if (activeEvent === "error") {
+    } else if (event === "error") {
       throw new ChatApiError(
         String(data.message || data.code || "对话请求失败"),
         String(data.code || "chat_stream_failed"),
@@ -283,21 +267,7 @@ export async function streamMessage(
       );
     }
     // 普通 tool_call / tool_result 暂不展示；审批卡片必须呈现，才能远程放行桌面高危操作。
-  };
-
-  try {
-    while (true) {
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      buffer += decoder.decode(chunk.value, { stream: true }).replace(/\r\n/g, "\n");
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-      lines.forEach(handleLine);
-    }
-    if (buffer) handleLine(buffer);
-  } finally {
-    reader.releaseLock();
-  }
+  });
 
   if (cancelled) {
     return { ...result, cancelled: true };

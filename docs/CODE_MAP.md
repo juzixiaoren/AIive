@@ -7,7 +7,7 @@
 > - **路径约定**：均相对项目根（`AIive/`），如 `backend/aiive/main.py`、`frontend/src/pages/ChatPage.tsx`
 > - **行号**：基于建图时的代码版本，仅供快速跳转，以实际代码为准
 > - **维护规则**：见文末第 9 节。**新增/删除/移动文件、改 key 符号行号、改表结构后必须同步更新本文档**
-> - 建图日期：2026-10-21；最近更新：2026-11-12（P1 统一工作中心）；之前：2026-11-11（V64.1 全局上下文预算、来源感知溢出与历史 Token 密封；V63.2 WebSocket 重连历史恢复与聊天错误契约统一；V49 单用户认证、V50 目标步骤触发规则 + 主动消息、V51 工具结果回填预算、V52 后台回填统一 + Bash 流式日志、V53 通用计划事件源扩展、V54 安全边界事件注入 + 协作式主动消息、V55 决策标记全流式防泄漏、V56 收件箱溢出与决策串行化、V57 前后台 LLM 串行化 + 目标决策幂等、V58 主动提问与用户回复关联闭环、V59 待回答问题的状态一致性、V60 记忆检索 pg_search BM25、V61 知识库结构感知递归切分、V61.3 Chunker 兜底拆分正确性）
+> - 建图日期：2026-10-21；最近更新：2026-11-16（重复实现收敛：提醒投递单一入口、Main Agent 工具面单一来源、Web/Android 共享 SSE 与 WorkCenter Hook）；之前：2026-11-11（V64.1 全局上下文预算、来源感知溢出与历史 Token 密封；V63.2 WebSocket 重连历史恢复与聊天错误契约统一；V49 单用户认证、V50 目标步骤触发规则 + 主动消息、V51 工具结果回填预算、V52 后台回填统一 + Bash 流式日志、V53 通用计划事件源扩展、V54 安全边界事件注入 + 协作式主动消息、V55 决策标记全流式防泄漏、V56 收件箱溢出与决策串行化、V57 前后台 LLM 串行化 + 目标决策幂等、V58 主动提问与用户回复关联闭环、V59 待回答问题的状态一致性、V60 记忆检索 pg_search BM25、V61 知识库结构感知递归切分、V61.3 Chunker 兜底拆分正确性）
 
 ---
 
@@ -111,7 +111,7 @@
 | 工具结果回填预算（V51/V52，大结果→临时日志 + 有界回填） | `runtime/tool_output_guard.py`（唯一入口 `guard_tool_output`）、`runtime/tool_output_store.py`（`StreamingLog` 落盘/清理） | 三个入口：`runtime/agent_graph.py::_tools_node`（聊天）、`task_runtime/evidence.py::_summary`（后台任务 Evidence）、`runtime/context_assembler.py::_messages_from_events`（聊天历史回放）；另有 `tools/builtin_files.py::handle_read_text_file`、`worker/scheduler_daemon.py::_tool_output_cleanup_job`、`config.py` | `test_tool_output_guard.py`（26 例）、`test_shell_output_capture.py`（9 例）、`test_worker_tool_result_backfill.py`（6 例） |
 | 工具注入方案（分层/tool_plan/检索选型分析） | `docs/architecture/工具注入方案分析.md` | 下述注入面实证 | — |
 
-**工具注入面（改绑定/可见性前必读）**：对话 Agent 每轮**只绑定 5 个任务元工具**（`task_runtime/tools.py::build_main_agent_registry`，`context_assembler.py:256` 固定注入，`tool_definitions` 分区 4000/6000 token 前缀截断），架构不变。持久任务 Worker 采用**分层注入 + 自主发现**（`task_runtime/tool_injection.py`）：L0 常驻能力（长期记忆读取、基础搜索、本机 `run_shell`、`desktop_exec`、任务管理）始终注入完整定义；其余能力由 Worker 通过 `search_capabilities` / `describe_capability` 两个只读决策按需发现，`TaskContextAssembler` 只注入 `tools.resident / available / discovered / loaded`，**不再整段注入 `list_all()` 清单**；目录 ≤12 个工具时直接全量注入 Schema，超过则转为发现模式。发现范围覆盖全部可用能力（内置 + 在线桌面 + MCP + 自进化），**不受 task_type / Skill Profile 收窄**（`TaskScope.capability_policy=unified`）；执行仍由 `CapabilityBroker` 的授权视图 + `TaskPolicyEngine` + 审批 + 资源锁 + `descriptor_hash` 裁决，发现不扩大权限。方案与实施记录见 `docs/architecture/工具注入方案分析.md`。
+**工具注入面（改绑定/可见性前必读）**：对话 Agent 每轮绑定 Main Agent 单 Turn 工具面（`runtime/turn_tool_surface.py::build_turn_tool_registry`）：5 个任务元工具 + 附件工具 + notify_user，仅在有未关闭问题时追加 answer_goal_question；Schema 由 `core/function_calling.py::function_definitions` 从 Canonical 契约导出，与 Token 预算同源，无前缀截断。持久任务 Worker 采用**分层注入 + 自主发现**（`task_runtime/tool_injection.py`）：L0 常驻能力（长期记忆读取、基础搜索、本机 `run_shell`、`desktop_exec`、任务管理）始终注入完整定义；其余能力由 Worker 通过 `search_capabilities` / `describe_capability` 两个只读决策按需发现，`TaskContextAssembler` 只注入 `tools.resident / available / discovered / loaded`，**不再整段注入 `list_all()` 清单**；目录 ≤12 个工具时直接全量注入 Schema，超过则转为发现模式。发现范围覆盖全部可用能力（内置 + 在线桌面 + MCP + 自进化），**不受 task_type / Skill Profile 收窄**（`TaskScope.capability_policy=unified`）；执行仍由 `CapabilityBroker` 的授权视图 + `TaskPolicyEngine` + 审批 + 资源锁 + `descriptor_hash` 裁决，发现不扩大权限。模型可见 Schema 的导出统一走 `core/function_calling.py::function_definitions`（Canonical 契约，已排除 ctx/db/tool_call_id），ContextInspector、Token 预算与 LangChain 绑定同源。方案与实施记录见 `docs/architecture/工具注入方案分析.md`。
 
 ### 2.3 记忆系统
 
@@ -170,7 +170,7 @@
 | 决策标记全流式防泄漏（V55） | runtime/turn_events.py（`DecisionMarkerStreamFilter`/`scan_decision_marker`/`remove_decision_markers`：标记协议唯一事实源，有界前缀状态机 + 与最终清洗一致的 lstrip 规则） | runtime/agent_graph.py::_execute_graph_stream（token 级过滤，仅注入事件协议生效时启用）、runtime/agent_graph.py::_assistant（最终文本清洗） | tests/unit/backend/test_decision_marker_stream.py（24 例） |
 | 主动提问与用户回复关联闭环（V58） | `task_runtime/goal_questions.py`（待回答问题生命周期：稳定 question_id、asked/resolved/expired 事件、72h 有效期、状态推导）、`runtime/question_tool.py`（`answer_goal_question` 工具：多候选必须显式绑定、审批步骤拒绝、幂等关闭） | `task_runtime/goal_decision.py::apply`（ask_user/wait_user 登记问题）、`task_runtime/goal_service.py::answer_step_question`（解除等待/修改计划/记录拒绝）、`runtime/context_assembler.py`（只注入 open 问题块 + `agent_ctx[open_questions]`）、`runtime/agent_graph.py`（按轮次条件绑定工具） | `tests/unit/backend/test_goal_question_answer.py`（11 例） |
 | 待回答问题的状态一致性（V59） | `task_runtime/goal_questions.py`（`_plan_snapshot` 读目标/步骤状态、`_invalid_reason` 派生失效原因、`_superseded_ids` 收敛同步骤旧提问） | `task_runtime/goal_service.py::answer_step_question`（旧 question_id 服务端复核）、`runtime/question_tool.py`（`question_stale` + reason）、`runtime/context_assembler.py`（只注入仍可回答的问题）、`runtime/agent_graph.py`（按 open 列表绑定工具） | `tests/unit/backend/test_goal_question_state_consistency.py`（10 例） |
-| 提醒 / 条件任务 | `runtime/task_manager.py` | `worker/task_worker.py`、`tools/builtin_tools.py`（schedule_reminder 等） | `test_reminder*.py`、`test_task_manager*.py` |
+| 提醒（Task 唯一职责） | `runtime/reminder_outbox.py`（operation_id / payload / 幂等 / 终态收敛 / 到期查询唯一实现）、`runtime/task_manager.py`（CRUD、取消、手动单条入队） | `worker/task_worker.py`（SKIP LOCKED 批量认领）、`tools/builtin_reminders.py`（取消委托 TaskManager）、`worker/outbox_handlers.py::handle_reminder_delivery`；routine / condition_watch 由 `task_runtime/watchers.py` 与 Goal Trigger 承担 | `test_reminder*.py`、`test_notification*.py` |
 | 通知 | `api/routes_notifications.py` | `worker/outbox_handlers.py`、`frontend/src/pages/NotificationsPage.tsx` | `test_notification*.py` |
 | 桌面节点服务端 | `desktop/node_service.py`、`desktop/connection_manager.py`、`desktop/protocol.py` | `api/routes_desktop.py`、`desktop/registry_overlay.py` | `test_desktop*.py` |
 | 桌面节点客户端（Electron） | `apps/desktop/src/node-host/client.mjs` | `apps/desktop/src/node-host/locks.mjs`、`journal.mjs` | `apps/desktop/src/node-host/journal.test.mjs` |
@@ -282,8 +282,8 @@
 | `tool_output_guard.py` | V51/V52 统一回填预算（三个入口共用：聊天 `_tools_node`、后台 `EvidenceStore._summary`、聊天历史回放 `_messages_from_events`）：`INLINE_CHAR_LIMIT=1000`，可选 `max_chars` 供后台任务用更紧预算；`guard_tool_output(tool_name, content)` 按工具分流——`run_shell` 走 `_guard_shell`（两种模式：**>1000 行 → 必回填前 50 + 后 50 行**，单行裁剪到 200 字符，`omitted_lines=[50,total-50]`；≤1000 行但单段 >4000 字符 → `char_budget` 前缀预算，不重复首尾；两种模式都落盘 + `mode`/`total_lines`/`omitted_lines`/`log_path`），`read_text_file`/`read_document` 走 `_guard_file_read`（>1000 字符只回填 path/total_chars/total_lines/hint），其余（含 MCP）走 `_guard_payload`/`_guard_text`（完整结果落盘 + 摘要 + 类型 + 长度 + 日志）。保留 `ok`/`error`/`error_type`/`exit_code`/`operation_id`/`execution_status`；落盘失败降级为有界预览并标 `offload_error`；回填内容一律标注不可信。V52 增补：`run_shell` 结果带 `stdout_log`/`stderr_log` 时走 `bash_streamed_log`（只回填预览 + `*_meta`，不二次落盘）；`_is_guarded_payload`（`truncated` + 不可信 `note`）保证重复处理幂等；`_fit_budget` 对超出调用方预算的摘要做结构保留收口（先裁长文本、再按重要性丢字段，绝不输出半截 JSON）。 |
 | `tool_output_store.py` | V51 落盘与生命周期：`tool_output_root`/`ensure_tool_output_root`（`settings.tool_output_dir`，默认 `.data/tool_outputs`）、`is_managed_path`（目录包含关系校验，供读取授权）、`StreamingLog`（流式写入：`.tmp-*` → `os.replace` 原子收尾、`max_bytes` 容量上限 + `capture_truncated`、`write()` 不缓存完整内容）、`save_tool_output`（同一实现的字符串入口：时间戳 + uuid 唯一名）、`cleanup_expired_tool_outputs`（只删本目录一层 `.log`/残留 `.tmp-*`，超 `tool_output_retention_hours` 默认 10h）。 |
 | `token_counter.py` / `token_models.py` | LiteLLM token 计数；`TokenCount`/`ModelProfile` |
-| `task_manager.py` | `TaskManager`：提醒/条件监视/例行任务 CRUD 与 Outbox 原子入队 |
-| `rhythm_manager.py` / `thread_bootstrap.py` / `context_inspector.py` | 节奏摘要；Thread 行独立短事务；离线上下文导出（debug） |
+| `task_manager.py` / `reminder_outbox.py` | `TaskManager`：提醒 CRUD、取消、手动单条入队；`reminder_outbox`：提醒投递 operation_id、payload、幂等判断、终态收敛与到期查询的唯一实现（Task 只承载 reminder） |
+| `rhythm_manager.py` / `thread_bootstrap.py` / `context_inspector.py` / `turn_tool_surface.py` | 节奏摘要；Thread 行独立短事务；离线上下文导出（展示 Main Agent 实际工具面）；Main Agent 单 Turn 工具面唯一注册入口（notify_user 常驻、answer_goal_question 仅在有未关闭问题时注册） |
 | `event_logger.py` / `trace.py` / `execution_context.py` / `message_normalizer.py` | Event 写入；trace_id；`TurnExecutionContext`（单一事实源）；工具消息字段规范化 |
 
 ### 3.5 `memory/` + `retrieval/` + `forget/` + `retention/` — 记忆系统
@@ -399,7 +399,7 @@
 | `handlers_improvement.py` | `handle_improvement_discovery`：改进候选发现的 Outbox 入口（`discovery` 参数仅供测试注入）；模型调用在事务外，`llm_failed` 返回 RETRYABLE_ERROR 且不推进水位，非法输出记 COMPLETED 不重试 |
 | `handlers_conflict.py` | 冲突闭环两个 Handler，均按"短事务读快照 → 事务外 LLM → 短事务落库"：`handle_memory_conflict_question`（生成澄清问题并写 `notification_created`，状态 pending→asking）、`handle_memory_conflict_reply`（解析回复后调 `MemoryConflictService.apply_decision`） |
 | `scheduler_daemon.py`（27KB） | 模块级 `scheduler` L33；`start_daemon` L90（11 个周期 job；含 `improvement_discovery_scanner` 6h 窗口、V51 `tool_output_cleanup` 每 5h 清理过期工具日志）；`schedule_outbox_poll` L149；`_poll_tool_operations` L193（独立线程防饿死）；`_agent_task_scanner_job` L216（stale run 恢复/锁过期/watcher/审批过期；V50 追加 `GoalService.scan_due_reminders()` + `GoalTriggerService(db).scan()` 确定性触发扫描）；`_idle_scanner_job` L263；`_forget_reconcile_scanner_job` L423；`_conflict_expiry_scanner_job`（冲突案例 TTL 清扫，`enqueue_conflict_cleanup_job` 按小时窗口幂等入队）；`enqueue_maintenance_job` L453、`enqueue_retention_job` L509、`enqueue_knowledge_maintenance_job`、`knowledge_needs_maintenance`、`_knowledge_maintenance_scanner_job`（在途判定只认 pending/running；DB 侧不一致即时入队 + 每日对象对账；终态任务不阻塞，补跑分配 `#n` 后缀 operation_id） |
-| `outbox_heartbeat.py` / `job_types.py` / `task_worker.py` | 租约续期线程 + `ActiveClaimRegistry`；`ENABLED_OUTBOX_JOB_TYPES` allowlist（`GOAL_TRIGGER_JOB_TYPES` = `goal_trigger_decision` + `goal_event_dispatch`）；到期提醒原子入队 `reminder_delivery`（FOR UPDATE SKIP LOCKED） |
+| `outbox_heartbeat.py` / `job_types.py` / `task_worker.py` | 租约续期线程 + `ActiveClaimRegistry`；`ENABLED_OUTBOX_JOB_TYPES` allowlist（`GOAL_TRIGGER_JOB_TYPES` = `goal_trigger_decision` + `goal_event_dispatch`）；到期提醒原子入队 `reminder_delivery`（SKIP LOCKED 选行；投递构造、幂等与状态推进统一走 `runtime/reminder_outbox`） |
 
 ### 3.9 `task_runtime/` + `control/` — 持久任务与执行边界
 
@@ -506,7 +506,7 @@
 | API 客户端 | `src/api/chat.ts` | `getThreadMessages` L64、`sendMessageStream` L124（SSE）、`resetThread` L272、`respondApproval` L303；`ApiError` L89/`StreamIncompleteError` L104 |
 | 工作 API/契约 | `shared/work/client.ts`、`types.ts` | Inbox、WorkView、Timeline 与现有写接口；安全字段类型 |
 | Hooks | `src/hooks/useNotificationSocket.ts` | `useNotificationCount` L70 / `useNotificationListener` L77（单例 WS `/ws/__global__`，3s 重连） |
-| 工作同步 | `src/hooks/useWorkCenter.ts`、`shared/work/controller.ts`、`connection.ts` | Thread work_changed 失效、串行刷新、版本/序列去重、前台和重连快照 |
+| 工作同步 | `shared/work/useWorkCenter.ts`（唯一 Hook 实现）、`src/hooks/useWorkCenter.ts`（仅传输层包装）、`shared/work/controller.ts`、`connection.ts` | Thread work_changed 失效、串行刷新、版本/序列去重、前台和重连快照 |
 | 组件 | `src/components/Markdown.tsx` | react-markdown + remark-gfm + rehype-highlight（surface/colored 两变体） |
 
 **页面清单**（均 lazy 加载于 `App.tsx`）：
@@ -1185,6 +1185,7 @@ V62.6.1 测试清理：根 `conftest.py::_cleanup_test_db` / `pytest_sessionfini
 - forget/content_scrub.py::attachment_ids/scrub_attachments：中央 Scrub/Verify/对象共享引用；不清 memory_only 原件。
 - runtime/attachments.py::retire/reconcile/process_cleanup_actions：事务内解除引用与历史修复，提交后安全删除/失败重试。
 - shared/chat/draft.ts：已知未执行错误保留 File、作废旧上传 ID；两端共用恢复行为。
+- shared/chat/stream.ts：Web 与 Android 共用的 SSE 帧解析（CRLF 归一、event/data 行、JSON 容错），两端只保留各自事件语义映射。
 - d5e8f102b304：附件 Event 查找索引；历史分页只查询当前页 Event，并批量校验可见性。
 - tests/integration/backend/test_chat_attachment_forget.py 与 pg/test_pg_chat_attachments.py：中央事务与历史补偿契约。
 

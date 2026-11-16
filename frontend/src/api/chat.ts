@@ -1,5 +1,6 @@
 import type { Attachment } from "../../../shared/chat/attachments";
 import { apiFetch } from "./client";
+import { readChatEventStream } from "../../../shared/chat/stream";
 /**
  * 聊天 API 接口层
  * - 定义前端与后端聊天接口的数据结构（ActionCard、ChatResponse、StreamEvent）
@@ -160,12 +161,6 @@ export async function sendMessageStream(
     throw new Error(`Stream API error ${res.status}: ${text}`);
   }
 
-  const reader = res.body?.getReader();
-  if (!reader) throw new Error("No response body");
-
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let currentEvent = "";
   let seenDone = false;
   let seenCancelled = false;
   let result = {
@@ -179,90 +174,67 @@ export async function sendMessageStream(
   };
 
   try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      // 保留未完成的行到缓冲区，供下次拼接
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        // 解析 SSE 事件类型行
-        if (line.startsWith("event: ")) {
-          currentEvent = line.slice(7).trim();
-        } else if (line.startsWith("data: ")) {
-          // 解析 SSE 数据行
-          const dataStr = line.slice(6);
-          // JSON 解析与回调分发分开 try：解析失败才可静默跳过，
-          // 回调内的异常必须记录，否则事件（如 tool_result）会无声丢失
-          let data: Record<string, unknown>;
-          try {
-            data = JSON.parse(dataStr);
-          } catch {
-            continue; // 跳过格式错误的 JSON 数据
-          }
-          try {
-            switch (currentEvent) {
-              case "started":
-                onStarted({
-                  thread_id: data.thread_id as string,
-                  turn_id: data.turn_id as string,
-                  turn_record_id: (data.turn_record_id as string) || "",
-                  trace_id: (data.trace_id as string) || "",
-                });
-                break;
-              case "token":
-                // 逐 token 回调，用于打字机效果
-                onToken(data.text as string);
-                break;
-              case "tool_call":
-                // 工具调用开始
-                onToolCall(data.tool_call_id as string || "", data.name as string, data.params as Record<string, unknown>);
-                break;
-              case "tool_result":
-                // 工具执行结果（含状态：completed / failed）
-                onToolResult(data.tool_call_id as string || "", data.name as string, data.result, data.status as string);
-                break;
-              case "cancelled":
-                // 服务端已完成取消收口：本轮用户消息不再进入历史。
-                seenCancelled = true;
-                break;
-              case "done":
-                // 流式传输完成，收集最终结果
-                seenDone = true;
-                result = {
-                  thread_id: data.thread_id as string,
-                  trace_id: data.trace_id as string,
-                  reply: data.reply as string,
-                  action_cards: (data.action_cards || []) as ActionCard[],
-                  pending_operations: (data.pending_operations || []) as PendingOperation[],
-                  tool_calls: (data.tool_calls || []) as Array<{ tool_call_id: string; name: string; params?: Record<string, unknown>; status?: string }>,
-                  tool_results: (data.tool_results || []) as Array<{ tool_call_id: string; name: string; params?: Record<string, unknown>; result?: unknown; status?: string }>,
-                };
-                break;
-              case "error": {
-                const error = new ApiError(
-                  (data.message as string) || "聊天请求失败",
-                  (data.code as string) || "chat_stream_failed",
-                  (data.status as number) || 500,
-                  Boolean(data.retryable),
-                  data.trace_id as string | undefined,
-                  data.retry_after_seconds as number | undefined,
-                  Boolean(data.draft_recoverable),
-                );
-                onError(error.message);
-                throw error;
-              }
-            }
-          } catch (error) {
-            if (error instanceof ApiError) throw error;
-            console.error("SSE 事件回调处理失败:", currentEvent, error);
+    await readChatEventStream(res, ({ event, data }) => {
+      // JSON 解析失败已在共享解析器中静默跳过；回调内异常必须记录，
+      // 否则事件（如 tool_result）会无声丢失。
+      try {
+        switch (event) {
+          case "started":
+            onStarted({
+              thread_id: data.thread_id as string,
+              turn_id: data.turn_id as string,
+              turn_record_id: (data.turn_record_id as string) || "",
+              trace_id: (data.trace_id as string) || "",
+            });
+            break;
+          case "token":
+            // 逐 token 回调，用于打字机效果
+            onToken(data.text as string);
+            break;
+          case "tool_call":
+            // 工具调用开始
+            onToolCall(data.tool_call_id as string || "", data.name as string, data.params as Record<string, unknown>);
+            break;
+          case "tool_result":
+            // 工具执行结果（含状态：completed / failed）
+            onToolResult(data.tool_call_id as string || "", data.name as string, data.result, data.status as string);
+            break;
+          case "cancelled":
+            // 服务端已完成取消收口：本轮用户消息不再进入历史。
+            seenCancelled = true;
+            break;
+          case "done":
+            // 流式传输完成，收集最终结果
+            seenDone = true;
+            result = {
+              thread_id: data.thread_id as string,
+              trace_id: data.trace_id as string,
+              reply: data.reply as string,
+              action_cards: (data.action_cards || []) as ActionCard[],
+              pending_operations: (data.pending_operations || []) as PendingOperation[],
+              tool_calls: (data.tool_calls || []) as Array<{ tool_call_id: string; name: string; params?: Record<string, unknown>; status?: string }>,
+              tool_results: (data.tool_results || []) as Array<{ tool_call_id: string; name: string; params?: Record<string, unknown>; result?: unknown; status?: string }>,
+            };
+            break;
+          case "error": {
+            const error = new ApiError(
+              (data.message as string) || "聊天请求失败",
+              (data.code as string) || "chat_stream_failed",
+              (data.status as number) || 500,
+              Boolean(data.retryable),
+              data.trace_id as string | undefined,
+              data.retry_after_seconds as number | undefined,
+              Boolean(data.draft_recoverable),
+            );
+            onError(error.message);
+            throw error;
           }
         }
+      } catch (error) {
+        if (error instanceof ApiError) throw error;
+        console.error("SSE 事件回调处理失败:", event, error);
       }
-    }
+    });
   } catch (err) {
     // 用户主动中断（AbortSignal）时正常结束，不抛出错误
     if (signal?.aborted || (err instanceof Error && err.name === "AbortError")) {
@@ -270,8 +242,6 @@ export async function sendMessageStream(
     } else {
       throw err;
     }
-  } finally {
-    reader.releaseLock();
   }
 
   if (seenCancelled) {

@@ -9,7 +9,7 @@ import json as _json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -223,12 +223,12 @@ class ContextAssembler:
             logger.warning("注意力状态计算失败，跳过本轮注意力上下文", exc_info=True)
 
         # Collect once, after each source's existing Forget visibility filtering.
-        from aiive.task_runtime.tools import build_main_agent_registry
         from aiive.memory.context_assembly import render_core_memory
         from aiive.memory.graph_expansion import render_expansion_block
         from aiive.retrieval.unified_retriever import UnifiedRetriever
+        from aiive.runtime.turn_tool_surface import build_turn_tool_registry
 
-        tool_registry = build_main_agent_registry()
+        tool_registry = build_turn_tool_registry(open_questions)
         tools_schema = self._build_tools_schema_list(db, thread_id, tool_registry)
         events = self._load_history_bounded(
             db, thread_state, thread_id,
@@ -889,62 +889,18 @@ class ContextAssembler:
             lines.append(_json.dumps({"type": e.event_type, "payload": e.payload or {}}, ensure_ascii=False, default=str))
         return "\n".join(lines)
 
-    # 注入型参数（LangChain InjectedToolCallId 等）由运行时注入，不会出现在
-    # 发送给 LLM 的工具 schema 中，token 计数前剔除以免虚高。
-    _INJECTED_TOOL_PARAMS: ClassVar[tuple[str, ...]] = ("tool_call_id",)
-
-    @classmethod
-    def _strip_injected_params(cls, schema: dict[str, Any]) -> dict[str, Any]:
-        """从 JSON schema 中剔除运行时注入参数（不改变原对象）。"""
-        props = schema.get("properties")
-        if not isinstance(props, dict):
-            return schema
-        if not any(name in props for name in cls._INJECTED_TOOL_PARAMS):
-            return schema
-        cleaned = dict(schema)
-        cleaned["properties"] = {
-            k: v for k, v in props.items() if k not in cls._INJECTED_TOOL_PARAMS
-        }
-        required = schema.get("required")
-        if isinstance(required, list):
-            cleaned["required"] = [r for r in required if r not in cls._INJECTED_TOOL_PARAMS]
-        return cleaned
-
     def _build_tools_schema_list(
-        self, _db: Session, thread_id: str, registry: Any = None,
+        self, _db: Session, _thread_id: str, registry: Any = None,
     ) -> list[dict[str, Any]]:
-        """构建工具 schema 列表，按预算限制。
+        """导出本轮真实工具定义（Schema 唯一来源）。
 
-        超预算时按注册顺序连续截断（保留前缀，遇到装不下的工具即停止），
-        保证截断结果与 token 预算单调相关。
+        工具名单由 build_turn_tool_surface 决定，Schema 由 Canonical 契约导出，
+        因此 ContextInspector、Token 预算和 LangChain 绑定看到的是同一份定义。
         """
-        from aiive.task_runtime.tools import build_main_agent_registry
-        from aiive.tools.langchain_adapter import build_langchain_tools
-        from aiive.context.run_context import RunContext, RUN_CTX_USER_CHAT
+        from aiive.core.function_calling import function_definitions
+        from aiive.runtime.turn_tool_surface import build_turn_tool_registry
 
-        registry = registry or build_main_agent_registry()
-        run_ctx = RunContext(thread_id=thread_id, trace_id="assembler", source=RUN_CTX_USER_CHAT)
-        langchain_tools = build_langchain_tools(registry, run_context=run_ctx)
-
-        schemas: list[dict[str, Any]] = []
-        for t in langchain_tools:
-            schema: dict[str, Any] = {}
-            args_schema: Any = t.args_schema
-            if args_schema:
-                if isinstance(args_schema, dict):
-                    schema = args_schema
-                else:
-                    schema = args_schema.model_json_schema()
-            schemas.append({
-                "type": "function",
-                "function": {
-                    "name": getattr(t, "name", ""),
-                    "description": getattr(t, "description", ""),
-                    "parameters": self._strip_injected_params(schema),
-                },
-            })
-
-        return schemas
+        return function_definitions(registry if registry is not None else build_turn_tool_registry())
 
     @staticmethod
     def _dicts_to_chat_messages(events: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -145,7 +145,7 @@ POST /api/chat                                                          [routes_
             │
             ├─ 1. 上下文构建（V2 分层读取架构）
             │   _build_agent_context(message, thread, trace_id)
-            │     ├─ Kernel Contract: _build_stable_contract()
+            │     ├─ Kernel Contract: system_contract.build_stable_contract()
             │     │   ├─ resolve_identity()
             │     │   │   └─ store.get_by_context_roles(["runtime_identity"])
             │     │   │       精确 key 查询: agent.display_name, user.display_name,

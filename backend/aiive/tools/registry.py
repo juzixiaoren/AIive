@@ -251,6 +251,14 @@ class ToolRegistry:
         """
         return self._tools.get(capability_id)
 
+    def registrations(self) -> list[ToolRegistration]:
+        """按注册顺序返回全部注册项（只读）。
+
+        供 Schema 导出与 LangChain 绑定共用同一份完整契约，避免再从
+        list_all() 的摘要字典反查注册项。
+        """
+        return list(self._tools.values())
+
     def snapshot(self) -> "ToolRegistry":
         """复制当前注册映射，供单个 Turn 叠加动态节点工具。
 

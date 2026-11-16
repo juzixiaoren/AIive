@@ -523,7 +523,8 @@ def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
     thread_id = str(payload.get("thread_id", ""))
     title = str(payload.get("title", ""))
     content = str(payload.get("content", "")) or title
-    operation_id = str(payload.get("operation_id", "")) or f"reminder_delivery:{task_id}"
+    from aiive.runtime.reminder_outbox import reminder_operation_id
+    operation_id = str(payload.get("operation_id", "")) or reminder_operation_id(task_id)
     if not task_id or not thread_id or not title:
         return HandlerResult(
             HandlerOutcome.NON_RETRYABLE,

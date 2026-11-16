@@ -233,7 +233,7 @@ def handle_list_tasks(db: Session, ctx: RunContext | None, status: str = "", thr
 
 @db_handler
 def handle_cancel_task(db: Session, task_id: str):
-    """按 ID 取消一个任务，同时将关联的 reminder_created 事件标记为 cancelled。
+    """按 ID 取消任务，委托 TaskManager.cancel 的唯一取消规则。
 
     参数:
         task_id: 要取消的任务 ID
@@ -241,30 +241,17 @@ def handle_cancel_task(db: Session, task_id: str):
     返回:
         包含 cancelled 标志的字典
     """
-    from aiive.db.models import Event, Task
-    task = db.get(Task, task_id)
-    if not task:
-        return {"cancelled": False, "error": "not found"}
+    from aiive.runtime.task_manager import TaskManager
+    result = TaskManager(db).cancel(task_id)
+    if not result.get("ok"):
+        return {"cancelled": False, "error": result.get("error", "not found")}
+    return {
+        "cancelled": True,
+        "task_id": result["task_id"],
+        "events_updated": result["events_cancelled"] > 0,
+        "events_cancelled": result["events_cancelled"],
+    }
 
-    task.status = "cancelled"
-
-    # 同步取消关联的 reminder_created 事件（通知也会消失）。
-    # 不用 limit(50) + 内存过滤（会漏掉较旧事件）；为避免 JSON 查询方言差异，
-    # 按 event_type 全量查询后在 Python 侧按 payload.task_id 过滤。
-    related_events = (
-        db.query(Event)
-        .filter(Event.event_type == "reminder_created")
-        .all()
-    )
-    updated = 0
-    for e in related_events:
-        if (e.payload or {}).get("task_id") == task_id:
-            p = dict(e.payload or {})
-            p["status"] = "cancelled"
-            e.payload = p
-            updated += 1
-
-    return {"cancelled": True, "task_id": task_id, "events_updated": updated > 0, "events_cancelled": updated}
 
 @db_handler
 def handle_dismiss_notifications(db: Session, ctx: RunContext | None, scope: str = "thread"):

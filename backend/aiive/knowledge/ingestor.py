@@ -31,12 +31,7 @@ from aiive.storage.object_store import (
     put_content_addressed,
 )
 
-from aiive.knowledge.document_status import (
-    ACTIVE_STATUSES as ACTIVE_STATUSES,
-    RECOVERABLE_STATUSES as RECOVERABLE_STATUSES,
-    INACTIVE_STATUSES as INACTIVE_STATUSES,
-    DOCUMENT_STATUSES as DOCUMENT_STATUSES,
-)
+from aiive.knowledge.document_status import ACTIVE_STATUSES, INACTIVE_STATUSES
 
 logger = logging.getLogger(__name__)
 KNOWLEDGE_BUCKET = "knowledge-documents"

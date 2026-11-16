@@ -1,8 +1,12 @@
 """
 运行时层 - 任务管理器。
 
-负责 Agent 定时任务的全生命周期管理：创建、查询、到期检查。
-支持提醒（reminder）、条件监视（condition_watch）和例行任务（routine）三种类型。
+负责提醒（reminder）的创建、查询、取消与入队。提醒投递的 operation_id、
+payload、幂等与终态收敛统一由 runtime/reminder_outbox 实现，本模块只保留
+Task 侧的锁定与调用编排。
+
+condition_watch / routine 已不再由生产入口创建：周期与条件性需求由
+Persistent Task Runtime 的 Watcher 与 Goal Trigger 承担。
 """
 from datetime import datetime, timedelta, timezone
 from collections.abc import Sequence
@@ -12,6 +16,11 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from aiive.db.models import Event, OutboxJob, Task
+from aiive.runtime.reminder_outbox import (
+    claim_reminder_delivery,
+    due_reminder_tasks,
+    reminder_operation_id,
+)
 
 
 class TaskManager:
@@ -71,40 +80,37 @@ class TaskManager:
         return q.limit(50).all()
 
     def get_due(self, now: datetime | None = None) -> list[Task]:
-        """获取所有已到期的待处理任务。
+        """只读列出当前到期的提醒（兼容入口）。
 
-        Args:
-            now: 当前时间（可选，默认 UTC 当前时间）
-
-        Returns:
-            已到期且状态为 pending 的 Task 列表
+        权威定义在 runtime.reminder_outbox.due_reminder_tasks；本方法不包含
+        独立筛选逻辑，也不再返回无法自动执行的旧任务类型。
         """
-        now = now or datetime.now(timezone.utc)
-        return (
-            self._db.query(Task)
-            .filter(
-                Task.status == "pending",
-                Task.next_check_at <= now,
-            )
-            .all()
-        )
+        return due_reminder_tasks(self._db, now or datetime.now(timezone.utc))
 
     def next_due_at(self) -> datetime | None:
-        """获取最早待处理任务的到期时间，用于精确调度。
+        """获取最早可自动投递的提醒到期时间，用于精确调度。
 
-        Returns:
-            最早到期时间，无待处理任务时返回 None
+        只有 reminder 会被扫描器自动入队；condition_watch / routine 等
+        无法自动执行的任务不得参与调度，否则过期时间会让轮询空转到 1s。
         """
         task = (
             self._db.query(Task)
-            .filter(Task.status == "pending")
+            .filter(
+                Task.status == "pending",
+                Task.task_type == "reminder",
+                Task.next_check_at.is_not(None),
+            )
             .order_by(Task.next_check_at.asc())
             .first()
         )
         return task.next_check_at if task else None
 
     def enqueue_reminder_now(self, task_id: str) -> dict[str, Any]:
-        """按任务 ID 原子入队提醒，不扫描其他任务。"""
+        """按任务 ID 原子入队提醒，不扫描其他任务。
+
+        与批量扫描共用 runtime/reminder_outbox 的唯一投递构造、operation_id、
+        幂等判断与终态收敛；本入口只负责按 ID 锁定单行。
+        """
         task = (
             self._db.query(Task)
             .filter(Task.id == task_id)
@@ -122,43 +128,22 @@ class TaskManager:
         if task.status in {"cancelled", "failed"}:
             return {"ok": False, "status": task.status, "error": f"提醒任务已处于 {task.status} 状态"}
 
-        now = datetime.now(timezone.utc)
-        operation_id = f"reminder_delivery:{task.id}"
-        existing = (
-            self._db.query(OutboxJob)
-            .filter(OutboxJob.operation_id == operation_id)
-            .with_for_update()
-            .first()
-        )
-        if existing is not None:
-            if existing.status in {"pending", "running"}:
-                task.status = "dispatching"
-                task.last_checked_at = now
-                return {"ok": True, "status": "already_dispatching", "task_id": task.id, "title": task.title}
-            return {"ok": False, "status": "stale_job", "error": "提醒任务已有终态投递记录，不能复活原任务"}
-
-        task.next_check_at = now
-        task.status = "dispatching"
-        task.last_checked_at = now
-        self._db.add(OutboxJob(
-            operation_id=operation_id,
-            job_type="reminder_delivery",
-            status="pending",
-            payload={
-                "schema_version": 1,
-                "operation_id": operation_id,
+        outcome = claim_reminder_delivery(self._db, task, datetime.now(timezone.utc))
+        if outcome == "converged":
+            return {
+                "ok": False,
+                "status": "stale_job",
+                "error": "提醒任务已有终态投递记录，已按投递终态收敛任务状态",
                 "task_id": task.id,
-                "task_type": task.task_type,
-                "thread_id": task.thread_id or "system",
-                "title": task.title,
-                "content": task.title,
-                "scheduled_at": task.next_check_at.isoformat() if task.next_check_at else None,
-            },
-            trace_id=task.id,
-            max_retries=3,
-        ))
-        self._db.flush()
-        return {"ok": True, "status": "enqueued", "task_id": task.id, "title": task.title, "operation_id": operation_id}
+                "task_status": task.status,
+            }
+        return {
+            "ok": True,
+            "status": outcome,
+            "task_id": task.id,
+            "title": task.title,
+            "operation_id": reminder_operation_id(task.id),
+        }
 
     def cancel(self, task_id: str) -> dict[str, Any]:
         """取消尚未完成的任务，并终止未领取的提醒投递。"""
@@ -175,7 +160,7 @@ class TaskManager:
         if cancelled:
             task.status = "cancelled"
             self._db.query(OutboxJob).filter(
-                OutboxJob.operation_id == f"reminder_delivery:{task.id}",
+                OutboxJob.operation_id == reminder_operation_id(task.id),
                 OutboxJob.status == "pending",
             ).update({
                 OutboxJob.status: "cancelled",
@@ -202,6 +187,7 @@ class TaskManager:
             "task_id": task.id,
             "status": task.status,
             "task_cancelled": cancelled,
+            "events_cancelled": len(related),
         }
 
     def check_now(self, task_id: str) -> dict[str, Any]:
@@ -209,8 +195,10 @@ class TaskManager:
 
         根据任务类型执行不同逻辑：
         - reminder：仅返回需要入队的动作，不提前完成任务
-        - condition_watch：检查条件，满足则完成，否则保持待处理
-        - routine：根据间隔重新调度下一次检查
+        - condition_watch / routine：遗留兼容分支。生产入口已不再创建这两类
+          Task（POST /api/tasks 只接受 reminder），其调度职责由 Persistent
+          Task Runtime 的 Watcher 与 Goal Trigger 承担；这里只保留对历史数据
+          与既有测试语义的最小支持，不参与到期扫描。
 
         Args:
             task_id: 任务 ID

@@ -101,17 +101,11 @@ def build_langchain_tools(
         StructuredTool 列表，可直接用于 llm.bind_tools()
     """
     tools: list[StructuredTool] = []
-    all_regs = registry.list_all()
-
     visible = set(visible_tool_ids) if visible_tool_ids else None
 
-    for reg_info in all_regs:
-        cap_id = reg_info["capability_id"]
+    for reg in registry.registrations():
+        cap_id = reg.safety.capability_id
         if visible is not None and cap_id not in visible:
-            continue
-
-        reg = registry.get(cap_id)
-        if reg is None:
             continue
 
         desc = reg.description

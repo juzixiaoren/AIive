@@ -14,14 +14,13 @@
   · runtime identity / active policies 的实时值；
   · history / attention / recall / segment summary / epoch checkpoint /
     sealing bridge / current message 的实时值。
-- 工具定义（Tools Schema）虽在运行时按 token 预算截断，但其来源是纯静态的
-  ToolRegistry 配置，离线即可真实渲染，归类为静态。
+- 工具定义（Tools Schema）来自 Main Agent 单 Turn 工具面（固定任务元工具 +
+  附件工具 + notify_user），与运行时同一注册入口，离线即可真实渲染，归类为静态。
 """
 from __future__ import annotations
 
 import datetime as _dt
 from dataclasses import dataclass, field
-from typing import Any
 
 from aiive.memory.memory_key_registry import get_memory_key_registry
 from aiive.prompts.registry import get_prompt_registry
@@ -105,7 +104,7 @@ def get_runtime_identity_placeholder() -> ContextSection:
         "- relationship_style: {relationship_style}  # 来自 agent.persona.relationship，不在 Core Memory 投影键"
     )
     body = (
-        "【渲染模板（真实，来自 agent_graph._build_runtime_identity）】\n"
+        "【渲染模板（真实，来自 runtime/system_contract.py:build_runtime_identity）】\n"
         f"{spec}\n\n"
         "【实时值占位 —— 需 DB：MemoryReadModel.resolve_identity()】\n"
         "{runtime_identity}"
@@ -126,7 +125,7 @@ def get_runtime_identity_placeholder() -> ContextSection:
 def get_active_policies_placeholder() -> ContextSection:
     """Active Policies 的渲染模板（真实结构）+ 实时值占位。"""
     body = (
-        "【渲染模板（真实，来自 agent_graph._build_stable_contract）】\n"
+        "【渲染模板（真实，来自 runtime/system_contract.py:build_stable_contract）】\n"
         "## Active Policies (user-defined rules — instructions, not memory)\n"
         "- {policy_content}\n\n"
         "【实时值占位 —— 需 DB：MemoryReadModel.resolve_policies()】\n"
@@ -142,69 +141,45 @@ def get_active_policies_placeholder() -> ContextSection:
     )
 
 
-# 注入型参数（LangChain InjectedToolCallId）由运行时注入，不出现在发送给 LLM 的 schema 中。
-_INJECTED_TOOL_PARAMS: tuple[str, ...] = ("tool_call_id",)
-
-
-def _strip_injected_params(schema: dict[str, Any]) -> dict[str, Any]:
-    """剔除工具 JSON schema 中运行时会注入的参数，返回副本。"""
-    props = schema.get("properties")
-    if not isinstance(props, dict) or not any(
-        name in props for name in _INJECTED_TOOL_PARAMS
-    ):
-        return schema
-    cleaned = dict(schema)
-    cleaned["properties"] = {
-        k: v for k, v in props.items() if k not in _INJECTED_TOOL_PARAMS
-    }
-    required = schema.get("required")
-    if isinstance(required, list):
-        cleaned["required"] = [r for r in required if r not in _INJECTED_TOOL_PARAMS]
-    return cleaned
-
-
 def get_tools_schema_static() -> ContextSection:
-    """离线枚举工具注册表，真实渲染全部工具 schema（不连接 DB、不依赖会话）。
+    """离线渲染 Main Agent 单 Turn 工具面（与运行时同一注册入口）。
 
-    工具定义来自 ToolRegistry（纯静态代码/配置），只按 token 预算做前缀截断，
-    因此离线即可拿到完整真实文本。这里直接列出 name + description + 参数 schema，
-    便于审查「工具是否过多、schema 是否臃肿」。
+    名单来自 runtime.turn_tool_surface.build_turn_tool_registry：固定任务元工具、
+    附件工具与 notify_user；answer_goal_question 仅在有未关闭问题时注册，离线
+    没有会话，因此只在说明中标注。Schema 由 Canonical 契约导出，与 Token 预算
+    和 LangChain 绑定同源。
     """
-    from aiive.tools.registry import get_tool_registry
-    from aiive.tools.langchain_adapter import build_langchain_tools
-    from aiive.context.run_context import RunContext, RUN_CTX_USER_CHAT
+    from aiive.core.function_calling import function_definitions
+    from aiive.runtime.turn_tool_surface import build_turn_tool_registry
 
-    registry = get_tool_registry()
-    run_ctx = RunContext(thread_id="offline-inspect", trace_id="inspector", source=RUN_CTX_USER_CHAT)
-    langchain_tools = build_langchain_tools(registry, run_context=run_ctx)
-
-    blocks: list[str] = [f"工具总数：{len(langchain_tools)}", ""]
-    for idx, t in enumerate(langchain_tools, 1):
-        schema: dict[str, Any] = {}
-        args_schema = getattr(t, "args_schema", None)
-        if args_schema:
-            schema = args_schema if isinstance(args_schema, dict) else args_schema.model_json_schema()
-            schema = _strip_injected_params(schema)
-        blocks.append(f"{idx}. `{getattr(t, 'name', '')}`")
-        desc = getattr(t, "description", "") or "（无描述）"
-        blocks.append(f"   描述：{desc}")
-        params = schema.get("properties", {})
+    definitions = function_definitions(build_turn_tool_registry())
+    blocks: list[str] = [f"工具总数：{len(definitions)}", ""]
+    for idx, definition in enumerate(definitions, 1):
+        function = definition.get("function", {})
+        schema = function.get("parameters", {})
+        blocks.append(f"{idx}. {function.get('name', '')}")
+        blocks.append(f"   描述：{function.get('description') or '（无描述）'}")
+        params = schema.get("properties", {}) if isinstance(schema, dict) else {}
+        required = set(schema.get("required", [])) if isinstance(schema, dict) else set()
         if params:
             blocks.append("   参数：")
             for pname, pinfo in params.items():
                 ptype = pinfo.get("type", pinfo.get("anyOf", "any"))
-                required = pname in schema.get("required", [])
-                req_tag = "必填" if required else "可选"
+                req_tag = "必填" if pname in required else "可选"
                 blocks.append(f"     - {pname} ({ptype}, {req_tag})：{pinfo.get('description', '')}")
         blocks.append("")
+    blocks.append("说明：answer_goal_question 仅当本轮存在未关闭问题时注册，离线不展示。")
 
     return ContextSection(
         key="tools_schema",
-        title="Tools Schema（工具定义）",
+        title="Tools Schema（Main Agent 单轮工具面）",
         kind="static",
         content="\n".join(blocks).rstrip(),
-        source="tools/registry.py + tools/langchain_adapter.py:build_langchain_tools",
-        note="纯静态配置，离线即可真实渲染；运行时仅按 token 预算做前缀截断。",
+        source=(
+            "runtime/turn_tool_surface.py:build_turn_tool_registry + "
+            "core/function_calling.py:function_definitions"
+        ),
+        note="Main Agent 实际工具面；全部计入运行时 Token 预算。",
     )
 
 

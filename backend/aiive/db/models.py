@@ -700,7 +700,7 @@ class ToolOperation(Base):
 class Document(Base):
     """知识文档模型：持久化原文对象引用、来源信息和索引状态。
 
-    status 取值见 `aiive.knowledge.ingestor.DOCUMENT_STATUSES`：
+    status 取值见 `aiive.knowledge.document_status.DOCUMENT_STATUSES`：
     - indexed / index_failed / source_unavailable：活跃文档（参与检索）
     - superseded：同一 source_path 的旧版本，分块已失效，不参与检索
     - deleted：用户已删除，分块与对象已释放，仅保留墓碑记录
@@ -976,7 +976,11 @@ class MemoryLineage(Base):
 
 
 class Task(Base):
-    """任务模型：记录定时任务、提醒、条件检查等异步任务。"""
+    """任务模型：记录定时提醒及其投递状态。
+
+    生产入口只创建 reminder；routine / condition_watch 已由 Persistent Task
+    Runtime 的 Watcher 与 Goal Trigger 承担，仅保留对历史行的读取兼容。
+    """
     __tablename__: str = "tasks"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
