@@ -179,7 +179,7 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
         traceId: message.trace_id || "",
         threadId: tid,
         actionCards: message.action_cards || [],
-        toolCalls: message.tool_calls.map((call) => ({
+        toolCalls: (message.tool_calls ?? []).map((call) => ({
           id: call.tool_call_id,
           name: call.name,
           params: call.params || {},
@@ -242,7 +242,7 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
         traceId: message.trace_id || "",
         threadId,
         actionCards: message.action_cards || [],
-        toolCalls: message.tool_calls.map((call) => ({
+        toolCalls: (message.tool_calls ?? []).map((call) => ({
           id: call.tool_call_id,
           name: call.name,
           params: call.params || {},
@@ -1104,7 +1104,7 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
                     {card.trace_id && (
                       <button
                         type="button"
-                        onClick={() => onInspectTrace?.(card.trace_id)}
+                        onClick={() => onInspectTrace?.(card.trace_id ?? "")}
                         className="block mt-1 px-1 text-[11px] font-mono text-faint underline hover:text-primary transition-colors"
                       >
                         trace:{card.trace_id.slice(0, 8)}

@@ -126,13 +126,13 @@ def test_assemble_populates_input_snapshot(db, monkeypatch) -> None:
         {"role": "user", "content": "上一条用户消息"},
         {"role": "assistant", "content": "上一条模型回复"},
     ]
-    assembler._dicts_to_chat_messages = lambda events: list(events)
+    assembler._dicts_to_prompt_messages = lambda events: list(events)
     assembler._load_epoch_checkpoint = lambda *a, **k: "纪元检查点摘要"
     assembler._recent_visible_segment_summaries = lambda *a, **k: [SegmentSummary(id="summary", goal="分段摘要内容")]
     assembler._load_sealing_bridge = lambda *a, **k: ""
-    assembler._build_tools_schema_list = lambda *a, **k: [
+    monkeypatch.setattr("aiive.runtime.context_assembler.function_definitions", lambda *a, **k: [
         {"type": "function", "function": {"name": "search_memory", "parameters": {}}},
-    ]
+    ])
     assembler._touch_injected_memory = lambda *a, **k: None
     monkeypatch.setattr(ca_mod, "WorkingStateService", _StubWorkingStateService)
 
@@ -186,11 +186,11 @@ def test_attention_failure_is_fail_open(db, monkeypatch) -> None:
         "core_memory_text": "", "recall_text": "",
     }
     assembler._load_history_bounded = lambda *a, **k: []
-    assembler._dicts_to_chat_messages = lambda events: list(events)
+    assembler._dicts_to_prompt_messages = lambda events: list(events)
     assembler._load_epoch_checkpoint = lambda *a, **k: ""
     assembler._load_segment_summaries = lambda *a, **k: ""
     assembler._load_sealing_bridge = lambda *a, **k: ""
-    assembler._build_tools_schema_list = lambda *a, **k: []
+    monkeypatch.setattr("aiive.runtime.context_assembler.function_definitions", lambda *a, **k: [])
     assembler._touch_injected_memory = lambda *a, **k: None
     monkeypatch.setattr(ca_mod, "WorkingStateService", _StubWorkingStateService)
     monkeypatch.setattr(
@@ -221,11 +221,11 @@ def test_input_snapshot_skips_empty_partitions(db, monkeypatch) -> None:
         "core_memory_text": "", "recall_text": "",
     }
     assembler._load_history_bounded = lambda *a, **k: []
-    assembler._dicts_to_chat_messages = lambda events: list(events)
+    assembler._dicts_to_prompt_messages = lambda events: list(events)
     assembler._load_epoch_checkpoint = lambda *a, **k: ""
     assembler._load_segment_summaries = lambda *a, **k: ""
     assembler._load_sealing_bridge = lambda *a, **k: ""
-    assembler._build_tools_schema_list = lambda *a, **k: []
+    monkeypatch.setattr("aiive.runtime.context_assembler.function_definitions", lambda *a, **k: [])
     assembler._touch_injected_memory = lambda *a, **k: None
     monkeypatch.setattr(ca_mod, "WorkingStateService", _StubWorkingStateService)
 

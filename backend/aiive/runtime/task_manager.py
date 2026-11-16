@@ -5,10 +5,11 @@
 payload、幂等与终态收敛统一由 runtime/reminder_outbox 实现，本模块只保留
 Task 侧的锁定与调用编排。
 
-condition_watch / routine 已不再由生产入口创建：周期与条件性需求由
+condition_watch / routine 已退役：生产入口不再创建，也不存在执行分支；
+历史行保留可查询、可取消，但不会被解释为可执行任务。周期与条件性需求由
 Persistent Task Runtime 的 Watcher 与 Goal Trigger 承担。
 """
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from collections.abc import Sequence
 from typing import Any
 
@@ -18,9 +19,10 @@ from sqlalchemy.orm import Session
 from aiive.db.models import Event, OutboxJob, Task
 from aiive.runtime.reminder_outbox import (
     claim_reminder_delivery,
-    due_reminder_tasks,
     reminder_operation_id,
 )
+
+REMINDER_TASK_TYPE = "reminder"
 
 
 class TaskManager:
@@ -29,6 +31,7 @@ class TaskManager:
     Attributes:
         _db: SQLAlchemy 数据库会话
     """
+
     def __init__(self, db: Session):
         self._db: Session = db
 
@@ -43,15 +46,20 @@ class TaskManager:
         """创建一个新任务。
 
         Args:
-            task_type: 任务类型（reminder / condition_watch / routine）
+            task_type: 任务类型；Task 只承载 reminder
             title: 任务标题
             description: 任务描述
-            condition: 触发条件（提醒时间字符串 / 条件表达式 / 间隔分钟数）
+            condition: 仅供历史数据兼容，新建提醒不使用
             next_check_at: 下次检查时间
 
         Returns:
             新创建的 Task 对象
+
+        Raises:
+            ValueError: task_type 不是 reminder（历史旧类型不再允许新建）
         """
+        if task_type != REMINDER_TASK_TYPE:
+            raise ValueError("unsupported_task_type")
         task = Task(
             task_type=task_type,
             title=title,
@@ -79,25 +87,17 @@ class TaskManager:
             q = q.filter(Task.thread_id == thread_id)
         return q.limit(50).all()
 
-    def get_due(self, now: datetime | None = None) -> list[Task]:
-        """只读列出当前到期的提醒（兼容入口）。
-
-        权威定义在 runtime.reminder_outbox.due_reminder_tasks；本方法不包含
-        独立筛选逻辑，也不再返回无法自动执行的旧任务类型。
-        """
-        return due_reminder_tasks(self._db, now or datetime.now(timezone.utc))
-
     def next_due_at(self) -> datetime | None:
         """获取最早可自动投递的提醒到期时间，用于精确调度。
 
-        只有 reminder 会被扫描器自动入队；condition_watch / routine 等
-        无法自动执行的任务不得参与调度，否则过期时间会让轮询空转到 1s。
+        只有 reminder 会被扫描器自动入队；历史旧类型与空时间不参与调度，
+        否则过期时间会让轮询空转到 1s。
         """
         task = (
             self._db.query(Task)
             .filter(
                 Task.status == "pending",
-                Task.task_type == "reminder",
+                Task.task_type == REMINDER_TASK_TYPE,
                 Task.next_check_at.is_not(None),
             )
             .order_by(Task.next_check_at.asc())
@@ -119,7 +119,7 @@ class TaskManager:
         )
         if task is None:
             return {"ok": False, "status": "not_found", "error": "Task not found"}
-        if task.task_type != "reminder":
+        if task.task_type != REMINDER_TASK_TYPE:
             return {"ok": False, "status": "invalid_type", "error": "Task is not a reminder"}
         if task.status == "dispatching":
             return {"ok": True, "status": "already_dispatching", "task_id": task.id, "title": task.title}
@@ -191,48 +191,27 @@ class TaskManager:
         }
 
     def check_now(self, task_id: str) -> dict[str, Any]:
-        """立即检查并处理指定任务。
+        """立即处理指定任务。
 
-        根据任务类型执行不同逻辑：
-        - reminder：仅返回需要入队的动作，不提前完成任务
-        - condition_watch / routine：遗留兼容分支。生产入口已不再创建这两类
-          Task（POST /api/tasks 只接受 reminder），其调度职责由 Persistent
-          Task Runtime 的 Watcher 与 Goal Trigger 承担；这里只保留对历史数据
-          与既有测试语义的最小支持，不参与到期扫描。
+        Task 只承载可自动投递的提醒（reminder）：
+        - reminder：按 ID 原子入队投递，不提前完成任务；
+        - condition_watch / routine 等历史类型：明确拒绝，不改状态、不伪造通知。
 
         Args:
             task_id: 任务 ID
 
         Returns:
-            包含 ok、action、title 等字段的结果字典
+            包含 ok、status、title 等字段的结果字典
         """
         task = self._db.get(Task, task_id)
         if not task:
-            return {"ok": False, "error": "Task not found"}
-        if task.task_type == "reminder":
-            return self.enqueue_reminder_now(task_id)
-
-        now = datetime.now(timezone.utc)
-        task.last_checked_at = now
-
-        if task.task_type == "condition_watch":
-            # 简单条件判断：条件为 "true" 时触发
-            condition_met = task.condition and task.condition.lower() == "true"
-            task.status = "completed" if condition_met else "pending"
-            if condition_met:
-                return {"ok": True, "action": "notify", "title": task.title}
-            return {"ok": True, "action": "skip", "reason": "condition not met"}
-
-        elif task.task_type == "routine":
-            if task.condition:
-                try:
-                    interval_minutes = int(task.condition)
-                    task.next_check_at = now + timedelta(minutes=interval_minutes)
-                    task.status = "pending"
-                except ValueError:
-                    task.status = "completed"
-            else:
-                task.status = "completed"
-            return {"ok": True, "action": "notify", "title": task.title}
-
-        return {"ok": True, "action": "checked"}
+            return {"ok": False, "status": "not_found", "error": "Task not found"}
+        if task.task_type != REMINDER_TASK_TYPE:
+            return {
+                "ok": False,
+                "status": "unsupported_task_type",
+                "task_id": task.id,
+                "task_type": task.task_type,
+                "error": "历史任务类型不再支持立即执行",
+            }
+        return self.enqueue_reminder_now(task_id)

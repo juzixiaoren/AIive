@@ -57,7 +57,6 @@ from aiive.runtime.thread_state import ThreadState
 from aiive.runtime.action_cards import ActionCard, PendingOperation
 from aiive.runtime.tool_executor import ToolCallRecord, build_action_cards, build_pending_operations
 from aiive.runtime.trace import Trace
-from aiive.runtime.system_contract import build_runtime_identity
 from aiive.runtime.tool_events import (
     StreamToolCallMatcher as _StreamToolCallMatcher,
     ToolExecutionReceipt as ToolExecutionReceipt,
@@ -79,8 +78,6 @@ from aiive.runtime.turn_events import (
     set_decisions,
 )
 
-
-_build_runtime_identity = build_runtime_identity  # 兼容旧导入路径
 
 def _tool_calls_paired(messages: list[Any]) -> bool:
     """工具调用与 ToolMessage 是否全部配对。

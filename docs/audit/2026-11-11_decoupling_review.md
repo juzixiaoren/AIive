@@ -10,7 +10,7 @@
 
 ### 共享运行时契约
 
-原链路为 `agent_graph → context_assembler → agent_graph.AgentGraph._build_stable_contract`，上下文层通过私有静态方法依赖图编排实现。现在两层均使用 `runtime/system_contract.py`。身份文本和系统契约渲染内容保持一致；旧静态方法和 `_build_runtime_identity` 导入保留兼容入口。
+原链路为 `agent_graph → context_assembler → agent_graph.AgentGraph._build_stable_contract`，上下文层通过私有静态方法依赖图编排实现。现在两层均使用 `runtime/system_contract.py`。身份文本和系统契约渲染内容保持一致。2026-11-16 第二轮收敛已删除旧静态方法与 `_build_runtime_identity` 私有别名，调用者直接导入 `runtime/system_contract.py`。
 
 工具流事件匹配和执行回执解析移至 `runtime/tool_events.py`，该模块仅使用标准库。`agent_graph` 保留 `_StreamToolCallMatcher`、`ToolExecutionReceipt` 和 `parse_tool_execution_receipt` 的旧导入路径，避免破坏现有使用方。新实现可独立测试，无需初始化数据库、LangGraph 或模型客户端。
 

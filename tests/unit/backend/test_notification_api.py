@@ -231,13 +231,17 @@ class TestDueTaskEnqueue:
 
         assert len(results) == 0
 
-    def test_condition_not_met_no_notification(self, db_session):
-        """条件未满足时不应产生通知。"""
-        mgr = TaskManager(db_session)
+    def test_legacy_condition_task_never_auto_executed(self, db_session):
+        """历史 condition_watch 行不参与扫描，也不会产生通知。"""
+        from aiive.db.models import OutboxJob
+
         past = datetime.now(timezone.utc) - timedelta(minutes=1)
-        mgr.create("condition_watch", "条件检查", condition="false", next_check_at=past)
+        db_session.add(Task(
+            task_type="condition_watch", title="条件检查", condition="false", next_check_at=past,
+        ))
         db_session.flush()
 
         results = enqueue_due_tasks(db_session)
 
-        assert len(results) == 0
+        assert results == []
+        assert db_session.query(OutboxJob).count() == 0

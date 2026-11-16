@@ -62,7 +62,7 @@ def test_packer_recounts_complete_turns_and_preserves_tool_pairs():
                 {"turn_id": tid, "type": "assistant", "content": "done"}]
     c = ContextCandidates(history=[HistoryTurn("old", events("old", "x" * 500)), HistoryTurn("new", events("new", "y"))])
     def render():
-        history = ContextAssembler._dicts_to_chat_messages([e for turn in c.history for e in turn.events])
+        history = ContextAssembler._dicts_to_prompt_messages([e for turn in c.history for e in turn.events])
         return [{"role": "system", "content": "contract"}, *history, {"role": "user", "content": "CURRENT"}], []
     counter = CharacterCounter()
     msgs, _, count, safe = ContextOverflowPacker().pack(c, render, counter, "test", 600, 20)

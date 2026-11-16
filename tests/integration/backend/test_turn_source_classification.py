@@ -4,7 +4,7 @@
 - 前端展示（list_thread_messages_page / _events_to_display_messages）：
   system 类来源隐藏输入、展示 agent 回复。
 - LLM 上下文（load_recent_messages_bounded / _events_to_dicts +
-  ContextAssembler._dicts_to_chat_messages）：system 类输入以 system 角色注入。
+  ContextAssembler._dicts_to_prompt_messages）：system 类输入以 system 角色注入。
 
 同时验证 turn_id 前缀约定已废除（不再参与过滤）。
 """
@@ -85,7 +85,7 @@ def test_context_injects_system_role_for_system_source(db) -> None:
         db, thread.id, token_budget=10_000_000,
         token_counter=_FakeTokenCounter(), model="deepseek-chat",
     )
-    msgs = ContextAssembler._dicts_to_chat_messages(result)
+    msgs = ContextAssembler._dicts_to_prompt_messages(result)
 
     roles = [(m["role"], m["content"]) for m in msgs]
     assert ("system", "系统指令") in roles
@@ -105,7 +105,7 @@ def test_runtime_event_source_classified_as_system(db) -> None:
         db, thread.id, token_budget=10_000_000,
         token_counter=_FakeTokenCounter(), model="deepseek-chat",
     )
-    msgs = ContextAssembler._dicts_to_chat_messages(result)
+    msgs = ContextAssembler._dicts_to_prompt_messages(result)
     assert ("system", "[Reminder triggered]") in [(m["role"], m["content"]) for m in msgs]
 
     page = ThreadState(db).list_thread_messages_page(thread.id, page_size=10)

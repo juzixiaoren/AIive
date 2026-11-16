@@ -4,6 +4,18 @@ import { subscribeThread, type Envelope } from "../../../../shared/work/connecti
 import { appConfig } from "../config";
 import { apiFetch, getToken } from "./auth";
 import { readChatEventStream } from "../../../../shared/chat/stream";
+import {
+  ChatApiError,
+  chatApiErrorFromPayload,
+  chatApiErrorFromResponse,
+} from "../../../../shared/chat/errors";
+import type {
+  ThreadHistoryMessage,
+  ThreadHistoryPage,
+} from "../../../../shared/chat/history";
+
+export { ChatApiError };
+export type { ThreadHistoryMessage, ThreadHistoryPage };
 
 export interface ChatMessage {
   id: string;
@@ -37,21 +49,6 @@ interface StreamResult {
   cancelled: boolean;
 }
 
-/** 结构化聊天错误：保留服务端 code / status / retryable，供 UI 精确回滚。 */
-export class ChatApiError extends Error {
-  constructor(
-    message: string,
-    public readonly code: string,
-    public readonly status: number,
-    public readonly retryable: boolean,
-    public readonly traceId?: string,
-    public readonly draftRecoverable: boolean = false,
-  ) {
-    super(message);
-    this.name = "ChatApiError";
-  }
-}
-
 export interface ApprovalResponse {
   ok: boolean;
   action: "succeeded" | "denied" | "failed" | "interrupted_unknown";
@@ -74,49 +71,6 @@ export interface ExecutionStatus {
     started_at: string | null;
     cancel_requested_at: string | null;
   } | null;
-}
-
-export interface ThreadHistoryMessage {
-  role: "user" | "assistant";
-  content: string;
-  attachments?: Attachment[];
-  event_id: string;
-  trace_id?: string;
-  action_cards?: unknown[];
-}
-
-export interface ThreadHistoryPage {
-  messages: ThreadHistoryMessage[];
-  next_cursor: number | null;
-  has_more: boolean;
-}
-
-async function responseError(response: Response): Promise<Error> {
-  const detail = await response.text();
-  return new Error(`服务器请求失败 (${response.status})${detail ? `：${detail}` : ""}`);
-}
-
-/** 把非 2xx 响应解析为结构化错误（detail 为 FastAPI 包装层）。 */
-async function chatResponseError(response: Response): Promise<ChatApiError> {
-  const text = await response.text();
-  try {
-    const body = JSON.parse(text) as { detail?: Record<string, unknown> };
-    const detail = (body.detail ?? body) as Record<string, unknown>;
-    return new ChatApiError(
-      String(detail.message || detail.code || "对话请求失败"),
-      String(detail.code || "chat_stream_failed"),
-      Number(detail.status || response.status),
-      Boolean(detail.retryable),
-      typeof detail.trace_id === "string" ? detail.trace_id : undefined,
-    );
-  } catch {
-    return new ChatApiError(
-      `服务器请求失败 (${response.status})${text ? `：${text}` : ""}`,
-      "chat_stream_failed",
-      response.status,
-      false,
-    );
-  }
 }
 
 export function hasBackendConfig(): boolean {
@@ -152,7 +106,7 @@ export function approvalsFromCards(cards: unknown[]): ApprovalItem[] {
 /** 后端是 Thread ID 唯一事实来源：启动时获取（服务端负责初始化）。 */
 export async function getCurrentConversation(): Promise<string> {
   const response = await apiFetch("conversation/current");
-  if (!response.ok) throw await responseError(response);
+  if (!response.ok) throw await chatApiErrorFromResponse(response);
   const payload = (await response.json()) as { thread_id?: string };
   return String(payload.thread_id || "");
 }
@@ -166,14 +120,14 @@ export async function getThreadMessages(
   const response = await apiFetch(
     `threads/${encodeURIComponent(threadId)}/messages?${query.toString()}`,
   );
-  if (!response.ok) throw await responseError(response);
+  if (!response.ok) throw await chatApiErrorFromResponse(response);
   return response.json() as Promise<ThreadHistoryPage>;
 }
 
 export async function getExecutionStatus(threadId?: string): Promise<ExecutionStatus> {
   const query = threadId ? `?thread_id=${encodeURIComponent(threadId)}` : "";
   const response = await apiFetch(`conversation/status${query}`);
-  if (!response.ok) throw await responseError(response);
+  if (!response.ok) throw await chatApiErrorFromResponse(response);
   return response.json() as Promise<ExecutionStatus>;
 }
 
@@ -187,7 +141,7 @@ export async function interruptTurn(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ thread_id: threadId, turn_record_id: turnRecordId ?? null }),
   });
-  if (!response.ok) throw await responseError(response);
+  if (!response.ok) throw await chatApiErrorFromResponse(response);
   return response.json() as Promise<{ ok: boolean; status: string; turn_record_id: string | null }>;
 }
 
@@ -226,7 +180,7 @@ export async function streamMessage(
     body: JSON.stringify({ message, thread_id: threadId ?? null, attachment_ids: attachmentIds, turn_id: turnId }),
     signal,
   });
-  if (!response.ok) throw await chatResponseError(response);
+  if (!response.ok) throw await chatApiErrorFromResponse(response);
   if (!response.body) throw new Error("服务器没有返回流式响应");
 
   let completed = false;
@@ -257,14 +211,7 @@ export async function streamMessage(
         cancelled: false,
       };
     } else if (event === "error") {
-      throw new ChatApiError(
-        String(data.message || data.code || "对话请求失败"),
-        String(data.code || "chat_stream_failed"),
-        Number(data.status || 500),
-        Boolean(data.retryable),
-        typeof data.trace_id === "string" ? data.trace_id : undefined,
-        Boolean(data.draft_recoverable),
-      );
+      throw chatApiErrorFromPayload(data);
     }
     // 普通 tool_call / tool_result 暂不展示；审批卡片必须呈现，才能远程放行桌面高危操作。
   });
@@ -285,7 +232,7 @@ export async function resetConversation(threadId?: string): Promise<void> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ thread_id: threadId }),
   });
-  if (!response.ok) throw await responseError(response);
+  if (!response.ok) throw await chatApiErrorFromResponse(response);
 }
 
 export async function respondApproval(
@@ -297,6 +244,6 @@ export async function respondApproval(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ approval_id: approvalId, action }),
   });
-  if (!response.ok) throw await responseError(response);
+  if (!response.ok) throw await chatApiErrorFromResponse(response);
   return response.json() as Promise<ApprovalResponse>;
 }

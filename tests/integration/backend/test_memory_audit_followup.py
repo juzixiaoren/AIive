@@ -269,7 +269,7 @@ def test_model_decision_sources_survive_a_new_engine(db_session, forget_before_a
 def test_identity_unset_is_independent_and_can_be_set_again(db_session):
     from aiive.memory.memory_read_model import MemoryReadModel
     from aiive.memory.memory_store import MemoryStore
-    from aiive.runtime.agent_graph import _build_runtime_identity
+    from aiive.runtime.system_contract import build_runtime_identity as _build_runtime_identity
 
     db = db_session
     _, _, e1 = source(db)

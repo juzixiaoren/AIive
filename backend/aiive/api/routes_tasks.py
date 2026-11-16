@@ -1,7 +1,7 @@
 """
 API路由模块：任务管理
-- 提供任务的创建、查询和立即执行接口
-- 支持定时任务和条件触发任务
+- 提供提醒（reminder）的创建、查询、取消与立即执行接口
+- 历史 condition_watch / routine 行只能查询与取消；check-now 明确返回 unsupported_task_type
 """
 import logging
 

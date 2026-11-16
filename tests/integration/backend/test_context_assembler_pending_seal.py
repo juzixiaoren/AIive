@@ -69,7 +69,7 @@ def test_large_prompt_does_not_mark_history_pending_seal(db, monkeypatch) -> Non
     assembler._load_epoch_checkpoint = lambda *a, **k: ""
     assembler._load_segment_summaries = lambda *a, **k: ""
     assembler._load_sealing_bridge = lambda *a, **k: ""
-    assembler._build_tools_schema_list = lambda *a, **k: []
+    monkeypatch.setattr("aiive.runtime.context_assembler.function_definitions", lambda *a, **k: [])
     assembler._touch_injected_memory = lambda *a, **k: None
     monkeypatch.setattr(ca_mod, "WorkingStateService", _StubWorkingStateService)
 

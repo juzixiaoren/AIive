@@ -515,7 +515,7 @@ class ContextBudget:
         return self.model_context_window - self.reserved_output_tokens
 ```
 
-`default()` / `from_env()` 为统一入口，不再提供 PartitionBudget、soft_input_limit 或分区覆盖。小窗口只要求输出预留小于模型窗口，不因固定分区总额而无法启动。
+`default()` 为唯一预算入口，不再提供 PartitionBudget、soft_input_limit 或分区覆盖。小窗口只要求输出预留小于模型窗口，不因固定分区总额而无法启动。
 
 
 ---

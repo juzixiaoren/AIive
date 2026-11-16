@@ -9,7 +9,7 @@
 """
 import pytest
 
-from aiive.runtime.agent_graph import _build_runtime_identity
+from aiive.runtime.system_contract import build_runtime_identity as _build_runtime_identity
 from aiive.tools.builtin_tools import register_builtin_tools
 from aiive.tools.langchain_adapter import build_langchain_tools
 from aiive.tools.registry import ToolRegistry

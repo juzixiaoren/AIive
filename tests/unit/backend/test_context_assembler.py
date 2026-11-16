@@ -4,13 +4,14 @@
 - 历史重建时 assistant tool_calls 与 tool 结果的 tool_call_id 配对（审查项 10）
 - 分区级 token 统计报告（审查项 3）
 - pending_seal 语义（软阈值触发，而非"发生过裁剪"）
-- ContextBudget.from_env 配置覆盖
+- ContextBudget 默认配置入口
 """
 import pytest
 
 from aiive.runtime.context_assembler import ContextAssembler
 from aiive.db.models import Epoch, Segment, SegmentSummary, Thread
 from aiive.runtime.context_budget import ContextBudget
+from aiive.runtime.thread_state import ThreadState
 from aiive.runtime.token_models import TokenCount
 
 
@@ -57,7 +58,7 @@ def _events_with_tool_call_id(tool_call_id: str = "call_abc"):
 def test_tool_call_id_pairing_matches():
     """审查项 10: assistant tool_calls 与 tool 结果的 tool_call_id 必须一致。"""
     events = _events_with_tool_call_id("call_abc")
-    msgs = ContextAssembler._dicts_to_chat_messages(events)
+    msgs = ContextAssembler._dicts_to_prompt_messages(events)
 
     assistant = next(m for m in msgs if m.get("role") == "assistant" and m.get("tool_calls"))
     tool_msg = next(m for m in msgs if m.get("role") == "tool")
@@ -75,13 +76,32 @@ def test_multiple_tool_call_ids_each_paired():
         {"type": "tool_result", "tool_name": "a", "tool_result": "ra", "tool_call_id": "c1", "event_id": "e3"},
         {"type": "tool_result", "tool_name": "b", "tool_result": "rb", "tool_call_id": "c2", "event_id": "e4"},
     ]
-    msgs = ContextAssembler._dicts_to_chat_messages(events)
+    msgs = ContextAssembler._dicts_to_prompt_messages(events)
     assistant = next(m for m in msgs if m.get("tool_calls"))
     tool_msgs = [m for m in msgs if m.get("role") == "tool"]
     aid_ids = [tc["id"] for tc in assistant["tool_calls"]]
     tid_ids = [m["tool_call_id"] for m in tool_msgs]
     assert set(aid_ids) == {"c1", "c2"}
     assert set(tid_ids) == {"c1", "c2"}
+
+
+def test_prompt_and_token_count_conversions_keep_distinct_semantics():
+    """两种转换职责不同：prompt 合批 tool_calls，Token 估算逐条保留事件。"""
+    events = [
+        {"type": "tool_call", "tool_name": "a", "tool_params": {}, "tool_call_id": "c1", "event_id": "e1"},
+        {"type": "tool_call", "tool_name": "b", "tool_params": {}, "tool_call_id": "c2", "event_id": "e2"},
+        {"type": "tool_result", "tool_name": "a", "tool_result": "ra", "tool_call_id": "c1", "event_id": "e3"},
+        {"type": "tool_result", "tool_name": "b", "tool_result": "rb", "tool_call_id": "c2", "event_id": "e4"},
+    ]
+
+    prompt = ContextAssembler._dicts_to_prompt_messages(events)
+    token_count = ThreadState._dicts_to_token_count_messages(events)
+
+    # prompt 转换把同批 tool_call 合并进一条 assistant 消息（模型协议要求）。
+    prompt_calls = [m for m in prompt if m.get("tool_calls")]
+    assert len(prompt_calls) == 1 and len(prompt_calls[0]["tool_calls"]) == 2
+    # Token 估算保持事件粒度，不合并、不做回填守卫。
+    assert [len(m["tool_calls"]) for m in token_count if m.get("tool_calls")] == [1, 1]
 
 
 def test_collect_hot_history_ids_includes_sealing_bridge_summary(db_session):
@@ -114,7 +134,7 @@ def test_collect_hot_history_ids_includes_sealing_bridge_summary(db_session):
 
 def test_message_normalization_accepts_new_and_legacy_tool_formats():
     """共享规范化应让新旧工具格式生成相同的稳定消息契约。"""
-    legacy = ContextAssembler._dicts_to_chat_messages([
+    legacy = ContextAssembler._dicts_to_prompt_messages([
         {
             "type": "tool_call", "tool_name": "search", "tool_params": {"q": "x"},
             "tool_call_id": "call-1", "event_id": "event-1",
@@ -124,7 +144,7 @@ def test_message_normalization_accepts_new_and_legacy_tool_formats():
             "tool_call_id": "call-1", "event_id": "event-2",
         },
     ])
-    modern = ContextAssembler._dicts_to_chat_messages([
+    modern = ContextAssembler._dicts_to_prompt_messages([
         {
             "type": "tool_call",
             "id": "call-1",
@@ -225,12 +245,17 @@ def test_prompt_messages_keep_stable_layers_before_history_and_dynamic_layers_af
     ]
 
 
-def test_context_budget_from_env_default_without_env(monkeypatch):
-    """P1-7: 未设置环境变量时 from_env 回退到默认预算。"""
-    monkeypatch.delenv("AIIVE_CONTEXT_BUDGET_JSON", raising=False)
-    budget = ContextBudget.from_env()
-    assert budget.model_context_window == ContextBudget.default().model_context_window
-    assert budget.hard_input_limit == ContextBudget.default().hard_input_limit
+def test_context_budget_default_reads_global_settings(monkeypatch):
+    """默认预算只由全局模型窗口与预留输出决定。"""
+    from aiive.config import settings
+
+    monkeypatch.setattr(settings, "aiive_llm_context_window", 64000)
+    monkeypatch.setattr(settings, "aiive_llm_max_output_tokens", 2048)
+
+    budget = ContextBudget.default()
+
+    assert budget.model_context_window == 64000
+    assert budget.hard_input_limit == 64000 - 2048
 
 
 @pytest.mark.parametrize("raw", [
@@ -238,10 +263,18 @@ def test_context_budget_from_env_default_without_env(monkeypatch):
     '{"tool_results": {"hard_limit_tokens": "invalid"}}',
     '{"tool_results": {"hard_limit_tokens": 999999}}', 'not-json', '',
 ])
-def test_context_budget_ignores_deprecated_overrides(monkeypatch, caplog, raw):
+def test_deprecated_budget_override_warns_once_at_startup(monkeypatch, caplog, raw):
+    from aiive.runtime import context_budget
+
     monkeypatch.setenv("AIIVE_CONTEXT_BUDGET_JSON", raw)
-    assert ContextBudget.from_env() == ContextBudget.default()
-    assert "deprecated and ignored" in caplog.text
+    monkeypatch.setattr(context_budget, "_warned_deprecated_override", False)
+
+    with caplog.at_level("WARNING"):
+        context_budget.warn_deprecated_budget_override()
+        context_budget.warn_deprecated_budget_override()
+
+    assert caplog.text.count("deprecated and ignored") == 1
+    assert ContextBudget.default() == ContextBudget.default()
 
 
 @pytest.mark.parametrize("window", [32000, 50000, 256000, 1000000])
@@ -249,5 +282,5 @@ def test_global_budget_windows(monkeypatch, window):
     from aiive.config import settings
     monkeypatch.setattr(settings, "aiive_llm_context_window", window)
     monkeypatch.setattr(settings, "aiive_llm_max_output_tokens", 4096)
-    budget = ContextBudget.from_env()
+    budget = ContextBudget.default()
     assert budget.hard_input_limit == window - 4096

@@ -979,7 +979,8 @@ class Task(Base):
     """任务模型：记录定时提醒及其投递状态。
 
     生产入口只创建 reminder；routine / condition_watch 已由 Persistent Task
-    Runtime 的 Watcher 与 Goal Trigger 承担，仅保留对历史行的读取兼容。
+    Runtime 的 Watcher 与 Goal Trigger 承担。历史行只保留查询/取消能力，
+    check_now 明确拒绝执行，不得伪造通知或改状态。
     """
     __tablename__: str = "tasks"
 

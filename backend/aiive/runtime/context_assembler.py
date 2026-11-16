@@ -42,6 +42,7 @@ from aiive.runtime.token_models import (
     TokenCount,
 )
 from aiive.runtime.token_counter import TokenCounter
+from aiive.core.function_calling import function_definitions
 from aiive.runtime.tool_normalizer import ToolResultNormalizer
 from aiive.runtime.working_state import WorkingStateService
 from aiive.runtime.message_normalizer import normalize_tool_call, normalize_tool_result
@@ -159,7 +160,7 @@ class ContextAssembler:
         normalizer: ToolResultNormalizer | None = None,
     ):
         self._token_counter: TokenCounter = token_counter
-        self._budget: ContextBudget = budget if budget is not None else ContextBudget.from_env()
+        self._budget: ContextBudget = budget if budget is not None else ContextBudget.default()
         self._profile: ModelProfile = profile or ModelProfile.from_config("deepseek", "deepseek-v4-flash")
         self._normalizer: ToolResultNormalizer | None = normalizer
 
@@ -229,7 +230,7 @@ class ContextAssembler:
         from aiive.runtime.turn_tool_surface import build_turn_tool_registry
 
         tool_registry = build_turn_tool_registry(open_questions)
-        tools_schema = self._build_tools_schema_list(db, thread_id, tool_registry)
+        tools_schema = function_definitions(tool_registry)
         events = self._load_history_bounded(
             db, thread_state, thread_id,
             upper_bound=upper_bound_sequence,
@@ -267,7 +268,7 @@ class ContextAssembler:
         def render() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
             core_text = render_core_memory(candidates.core)
             system_content = assemble_system_content(agent_ctx["stable_contract_text"], candidates.core, None)
-            history_msgs = self._dicts_to_chat_messages([
+            history_msgs = self._dicts_to_prompt_messages([
                 event for turn in candidates.history for event in turn.events
             ])
             working_text = ws_service.render_context_fields(candidates.working_state)
@@ -298,7 +299,7 @@ class ContextAssembler:
 
         def estimate(source: str, item: Any) -> int | None:
             if source == "history":
-                msgs = self._dicts_to_chat_messages(item.events)
+                msgs = self._dicts_to_prompt_messages(item.events)
             else:
                 if source == "retrieval":
                     text = (self._render_memory_hits([item]) if item.source_type == "memory_record"
@@ -889,21 +890,8 @@ class ContextAssembler:
             lines.append(_json.dumps({"type": e.event_type, "payload": e.payload or {}}, ensure_ascii=False, default=str))
         return "\n".join(lines)
 
-    def _build_tools_schema_list(
-        self, _db: Session, _thread_id: str, registry: Any = None,
-    ) -> list[dict[str, Any]]:
-        """导出本轮真实工具定义（Schema 唯一来源）。
-
-        工具名单由 build_turn_tool_surface 决定，Schema 由 Canonical 契约导出，
-        因此 ContextInspector、Token 预算和 LangChain 绑定看到的是同一份定义。
-        """
-        from aiive.core.function_calling import function_definitions
-        from aiive.runtime.turn_tool_surface import build_turn_tool_registry
-
-        return function_definitions(registry if registry is not None else build_turn_tool_registry())
-
     @staticmethod
-    def _dicts_to_chat_messages(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _dicts_to_prompt_messages(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """将 ThreadState dicts 转换为 OpenAI chat messages 格式。
 
         使用事件自身保存的 tool_call_id 配对 assistant tool_calls 与 tool 结果，

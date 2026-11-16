@@ -144,13 +144,13 @@ class ThreadState:
                     if not turn_dicts:
                         continue
 
-                turn_msgs = self._dicts_to_chat_messages(turn_dicts)
+                turn_msgs = self._dicts_to_token_count_messages(turn_dicts)
                 tc = token_counter.count_messages(model, turn_msgs)
                 if token_budget is not None and current_tokens + tc.safe_tokens > token_budget:
                     if normalizer is not None:
                         turn_dicts_sparse = normalizer.normalize_turn_sparse(turn_dicts)
                         if turn_dicts_sparse != turn_dicts:
-                            turn_msgs = self._dicts_to_chat_messages(turn_dicts_sparse)
+                            turn_msgs = self._dicts_to_token_count_messages(turn_dicts_sparse)
                             tc = token_counter.count_messages(model, turn_msgs)
                             if current_tokens + tc.safe_tokens > token_budget:
                                 stopped_by = "token_budget"
@@ -180,7 +180,7 @@ class ThreadState:
             total_events=total_events,
             total_bytes=total_bytes,
             estimated_tokens=(token_counter.count_messages(
-                model, self._dicts_to_chat_messages(result),
+                model, self._dicts_to_token_count_messages(result),
             ).estimated_tokens if result else 0),
             stopped_by=stopped_by,
         )
@@ -227,7 +227,7 @@ class ThreadState:
                  "turn_id": turn_dicts[0].get("turn_id"), "protected": True}]
 
     @staticmethod
-    def _dicts_to_chat_messages(turn_dicts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _dicts_to_token_count_messages(turn_dicts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Quick conversion for token counting only."""
         msgs: list[dict[str, Any]] = []
         for d in turn_dicts:

@@ -467,11 +467,11 @@ def _stub_assembler(monkeypatch):
         "recall_text": "",
     }
     assembler._load_history_bounded = lambda *a, **k: []
-    assembler._dicts_to_chat_messages = lambda events: list(events)
+    assembler._dicts_to_prompt_messages = lambda events: list(events)
     assembler._load_epoch_checkpoint = lambda *a, **k: ""
     assembler._load_segment_summaries = lambda *a, **k: ""
     assembler._load_sealing_bridge = lambda *a, **k: ""
-    assembler._build_tools_schema_list = lambda *a, **k: []
+    monkeypatch.setattr("aiive.runtime.context_assembler.function_definitions", lambda *a, **k: [])
     assembler._touch_injected_memory = lambda *a, **k: None
     monkeypatch.setattr(ca_mod, "WorkingStateService", _StubWorkingState)
     return assembler

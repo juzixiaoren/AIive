@@ -66,7 +66,7 @@ def test_thread_events_all_carry_turn_id_and_bounded_count(db):
     events, stats = ThreadState(db).load_recent_messages_bounded(db, thread.id, None, counter, "test")
     assert {e["type"] for e in events} == {"system", "tool_call", "tool_result", "assistant"}
     assert all(e["turn_id"] == turn.turn_id for e in events)
-    assert stats.estimated_tokens == counter.count_messages("test", ThreadState._dicts_to_chat_messages(events)).estimated_tokens
+    assert stats.estimated_tokens == counter.count_messages("test", ThreadState._dicts_to_token_count_messages(events)).estimated_tokens
     events, stats = ThreadState(db).load_recent_messages_bounded(db, thread.id, None, counter, "test", max_events=2)
     assert not events and stats.stopped_by == "max_events"
 
@@ -81,7 +81,7 @@ def test_only_final_injected_memories_are_touched(db, monkeypatch):
     monkeypatch.setattr(asm, "_load_agent_context", lambda *a, **k: {
         "stable_contract_text": "contract", "core_blocks": [], "recall_pack": pack, "retrieval_hits": hits,
     })
-    monkeypatch.setattr(asm, "_build_tools_schema_list", lambda *a: [])
+    monkeypatch.setattr("aiive.runtime.context_assembler.function_definitions", lambda *a: [])
     monkeypatch.setattr("aiive.runtime.context_assembler.AttentionManager.resolve_for_turn", lambda *a, **k: {})
     touched = Mock()
     monkeypatch.setattr("aiive.memory.memory_access_tracker.MemoryAccessTracker.touch", touched)
@@ -182,7 +182,7 @@ def test_auto_uses_global_candidate_budget_and_complete_visible_sources(db, monk
     monkeypatch.setattr(asm, "_load_agent_context", lambda *a, **k: {
         "stable_contract_text": "contract", "core_blocks": [], "recall_pack": None, "retrieval_hits": hidden.hits,
     })
-    monkeypatch.setattr(asm, "_build_tools_schema_list", lambda *a: [])
+    monkeypatch.setattr("aiive.runtime.context_assembler.function_definitions", lambda *a: [])
     assembled = asm.assemble(db, "project.budget", new_thread(db))
     assert record.id not in json.dumps(assembled.snapshot.selection_trace)
     assert long_text not in json.dumps(assembled.messages)

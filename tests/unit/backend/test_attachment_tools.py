@@ -119,8 +119,8 @@ def test_original_message_references_and_token_conversion(
     assert messages[0]["attachments"][0]["id"] == row.id
     assert not messages[1]["attachments"]
     for convert in (
-        ThreadState._dicts_to_chat_messages,
-        ContextAssembler._dicts_to_chat_messages,
+        ThreadState._dicts_to_token_count_messages,
+        ContextAssembler._dicts_to_prompt_messages,
     ):
         result = convert(messages)
         assert row.id in result[0]["content"]
@@ -314,7 +314,7 @@ def test_packer_evicts_reference_with_turn_directory_survives(attachment, db_ses
     candidates = ContextCandidates(history=[HistoryTurn("T1", original)])
 
     def render():
-        return ThreadState._dicts_to_chat_messages(
+        return ThreadState._dicts_to_token_count_messages(
             [e for t in candidates.history for e in t.events]
         ) + [{"role": "user", "content": "T2"}], []
 

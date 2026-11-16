@@ -1,78 +1,37 @@
-import type { Attachment } from "../../../shared/chat/attachments";
 import { apiFetch } from "./client";
 import { readChatEventStream } from "../../../shared/chat/stream";
+import {
+  ChatApiError,
+  chatApiErrorFromPayload,
+  chatApiErrorFromResponse,
+} from "../../../shared/chat/errors";
+import type {
+  ActionCardDTO,
+  PendingOperationDTO,
+  ThreadHistoryMessage,
+  ThreadHistoryPage,
+  ToolExecutionDTO,
+} from "../../../shared/chat/history";
+
 /**
  * 聊天 API 接口层
- * - 定义前端与后端聊天接口的数据结构（ActionCard、ChatResponse、StreamEvent）
+ * - 服务端数据结构统一来自 shared/chat/history（Web 与 Android 同一份传输契约）
  * - 提供 sendMessageStream：SSE 流式发送消息，支持逐 token 回调
  * - 提供 resetThread：重置对话线程
  */
-
-/** 操作卡片，用于在聊天界面中展示工具执行结果 */
-export interface ActionCard {
-  card_type: string;
-  title: string;
-  summary: string;
-  trace_id: string;
-  event_ids: string[];
-  status: string;
-  resource_refs: Record<string, string>;
-  payload_preview: Record<string, unknown>;
-  reminder_id: string;
-  actions: Array<{ action: string; approval_id: string; label: string }>;
-}
-
-export interface PendingOperation {
-  operation_id: string;
-  operation_type: string;
-  status: "pending";
-  trace_id: string;
-  resource_refs: Record<string, string>;
-  payload_preview: Record<string, unknown>;
-}
-
-/** 聊天响应体，包含模型回复、线程 ID、追踪 ID及结构化运行结果 */
-export interface ChatResponse {
-  reply: string;
-  thread_id: string;
-  trace_id: string;
-  action_cards: ActionCard[];
-  pending_operations: PendingOperation[];
-}
-
-export interface ToolExecution {
-  tool_call_id: string;
-  name: string;
-  params: Record<string, unknown>;
-  status: string;
-  result?: unknown;
-}
-
-export interface ThreadHistoryMessage {
-  attachments?: Attachment[];
-  role: "user" | "assistant";
-  content: string;
-  event_id: string;
-  trace_id: string;
-  action_cards: ActionCard[];
-  pending_operations: PendingOperation[];
-  tool_calls: ToolExecution[];
-}
-
-export interface ThreadHistoryPage {
-  messages: ThreadHistoryMessage[];
-  next_cursor: number | null;
-  has_more: boolean;
-}
+export { ChatApiError as ApiError };
+export type {
+  ThreadHistoryMessage,
+  ThreadHistoryPage,
+  ToolExecutionDTO,
+};
+export type { ActionCardDTO as ActionCard, PendingOperationDTO as PendingOperation };
 
 export async function getThreadMessages(threadId: string, beforeSequence?: number): Promise<ThreadHistoryPage> {
   const query = new URLSearchParams({ page_size: "50" });
   if (beforeSequence !== undefined) query.set("before_sequence", String(beforeSequence));
   const res = await apiFetch(`api/threads/${encodeURIComponent(threadId)}/messages?${query.toString()}`);
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`历史消息加载失败 ${res.status}: ${text}`);
-  }
+  if (!res.ok) throw await chatApiErrorFromResponse(res);
   return res.json();
 }
 
@@ -89,22 +48,6 @@ export interface StreamStartedEvent {
   /** 服务端 TurnRecord 主键：中断接口必须携带，防止旧停止请求误伤新 Turn。 */
   turn_record_id: string;
   trace_id: string;
-}
-
-/** 后端返回的结构化 API 错误 */
-export class ApiError extends Error {
-  constructor(
-    message: string,
-    public readonly code: string,
-    public readonly status: number,
-    public readonly retryable: boolean,
-    public readonly traceId?: string,
-    public readonly retryAfterSeconds?: number,
-    public readonly draftRecoverable: boolean = false,
-  ) {
-    super(message);
-    this.name = "ApiError";
-  }
 }
 
 /** 流式连接未收到服务端完成事件时抛出，用于触发历史恢复。 */
@@ -143,10 +86,10 @@ export async function sendMessageStream(
   thread_id: string;
   trace_id: string;
   reply: string;
-  action_cards: ActionCard[];
-  pending_operations: PendingOperation[];
-  tool_calls?: Array<{ tool_call_id: string; name: string; params?: Record<string, unknown>; status?: string }>;
-  tool_results?: Array<{ tool_call_id: string; name: string; params?: Record<string, unknown>; result?: unknown; status?: string }>;
+  action_cards: ActionCardDTO[];
+  pending_operations: PendingOperationDTO[];
+  tool_calls?: ToolExecutionDTO[];
+  tool_results?: ToolExecutionDTO[];
   cancelled?: boolean;
 }> {
   const res = await apiFetch("api/chat/stream", {
@@ -156,10 +99,7 @@ export async function sendMessageStream(
     signal,
   });
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Stream API error ${res.status}: ${text}`);
-  }
+  if (!res.ok) throw await chatApiErrorFromResponse(res);
 
   let seenDone = false;
   let seenCancelled = false;
@@ -167,10 +107,10 @@ export async function sendMessageStream(
     thread_id: "",
     trace_id: "",
     reply: "",
-    action_cards: [] as ActionCard[],
-    pending_operations: [] as PendingOperation[],
-    tool_calls: [] as Array<{ tool_call_id: string; name: string; params?: Record<string, unknown>; status?: string }>,
-    tool_results: [] as Array<{ tool_call_id: string; name: string; params?: Record<string, unknown>; result?: unknown; status?: string }>,
+    action_cards: [] as ActionCardDTO[],
+    pending_operations: [] as PendingOperationDTO[],
+    tool_calls: [] as ToolExecutionDTO[],
+    tool_results: [] as ToolExecutionDTO[],
   };
 
   try {
@@ -210,28 +150,20 @@ export async function sendMessageStream(
               thread_id: data.thread_id as string,
               trace_id: data.trace_id as string,
               reply: data.reply as string,
-              action_cards: (data.action_cards || []) as ActionCard[],
-              pending_operations: (data.pending_operations || []) as PendingOperation[],
-              tool_calls: (data.tool_calls || []) as Array<{ tool_call_id: string; name: string; params?: Record<string, unknown>; status?: string }>,
-              tool_results: (data.tool_results || []) as Array<{ tool_call_id: string; name: string; params?: Record<string, unknown>; result?: unknown; status?: string }>,
+              action_cards: (data.action_cards || []) as ActionCardDTO[],
+              pending_operations: (data.pending_operations || []) as PendingOperationDTO[],
+              tool_calls: (data.tool_calls || []) as ToolExecutionDTO[],
+              tool_results: (data.tool_results || []) as ToolExecutionDTO[],
             };
             break;
           case "error": {
-            const error = new ApiError(
-              (data.message as string) || "聊天请求失败",
-              (data.code as string) || "chat_stream_failed",
-              (data.status as number) || 500,
-              Boolean(data.retryable),
-              data.trace_id as string | undefined,
-              data.retry_after_seconds as number | undefined,
-              Boolean(data.draft_recoverable),
-            );
+            const error = chatApiErrorFromPayload(data);
             onError(error.message);
             throw error;
           }
         }
       } catch (error) {
-        if (error instanceof ApiError) throw error;
+        if (error instanceof ChatApiError) throw error;
         console.error("SSE 事件回调处理失败:", event, error);
       }
     });
@@ -272,10 +204,7 @@ export interface ExecutionStatus {
 /** 获取或初始化唯一长期对话的 Thread ID（后端是唯一事实来源）。 */
 export async function getCurrentConversation(): Promise<{ thread_id: string }> {
   const res = await apiFetch("api/conversation/current");
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`当前对话获取失败 ${res.status}: ${text}`);
-  }
+  if (!res.ok) throw await chatApiErrorFromResponse(res);
   return res.json();
 }
 
@@ -283,10 +212,7 @@ export async function getCurrentConversation(): Promise<{ thread_id: string }> {
 export async function getExecutionStatus(threadId?: string): Promise<ExecutionStatus> {
   const query = threadId ? `?thread_id=${encodeURIComponent(threadId)}` : "";
   const res = await apiFetch(`api/conversation/status${query}`);
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`执行状态获取失败 ${res.status}: ${text}`);
-  }
+  if (!res.ok) throw await chatApiErrorFromResponse(res);
   return res.json();
 }
 
@@ -303,10 +229,7 @@ export async function interruptTurn(
       turn_record_id: turnRecordId ?? null,
     }),
   });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`中断请求失败 ${res.status}: ${text}`);
-  }
+  if (!res.ok) throw await chatApiErrorFromResponse(res);
   return res.json();
 }
 
@@ -320,10 +243,7 @@ export async function resetThread(threadId?: string): Promise<void> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ thread_id: threadId ?? null }),
   });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`重置上下文失败 ${res.status}: ${text}`);
-  }
+  if (!res.ok) throw await chatApiErrorFromResponse(res);
 }
 
 /**
@@ -354,9 +274,6 @@ export async function respondApproval(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ approval_id: approvalId, action }),
   });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Approval API error ${res.status}: ${text}`);
-  }
+  if (!res.ok) throw await chatApiErrorFromResponse(res);
   return res.json();
 }

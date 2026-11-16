@@ -147,11 +147,11 @@ def _stub_loader(assembler: ContextAssembler, relations: list[GraphRelationView]
 
     assembler._load_agent_context = _load  # type: ignore[method-assign]
     assembler._load_history_bounded = lambda *a, **k: []  # type: ignore[method-assign]
-    assembler._dicts_to_chat_messages = lambda events: []  # type: ignore[method-assign]
+    assembler._dicts_to_prompt_messages = lambda events: []  # type: ignore[method-assign]
     assembler._load_epoch_checkpoint = lambda *a, **k: ""  # type: ignore[method-assign]
     assembler._load_segment_summaries = lambda *a, **k: ""  # type: ignore[method-assign]
     assembler._load_sealing_bridge = lambda *a, **k: ""  # type: ignore[method-assign]
-    assembler._build_tools_schema_list = lambda *a, **k: []  # type: ignore[method-assign]
+    monkeypatch.setattr("aiive.runtime.context_assembler.function_definitions", lambda *a, **k: [])
     assembler._touch_injected_memory = lambda *a, **k: None  # type: ignore[method-assign]
     monkeypatch.setattr(ca_mod, "WorkingStateService", _StubWorkingStateService)
 

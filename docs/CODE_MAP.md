@@ -7,7 +7,7 @@
 > - **路径约定**：均相对项目根（`AIive/`），如 `backend/aiive/main.py`、`frontend/src/pages/ChatPage.tsx`
 > - **行号**：基于建图时的代码版本，仅供快速跳转，以实际代码为准
 > - **维护规则**：见文末第 9 节。**新增/删除/移动文件、改 key 符号行号、改表结构后必须同步更新本文档**
-> - 建图日期：2026-10-21；最近更新：2026-11-16（重复实现收敛：提醒投递单一入口、Main Agent 工具面单一来源、Web/Android 共享 SSE 与 WorkCenter Hook）；之前：2026-11-11（V64.1 全局上下文预算、来源感知溢出与历史 Token 密封；V63.2 WebSocket 重连历史恢复与聊天错误契约统一；V49 单用户认证、V50 目标步骤触发规则 + 主动消息、V51 工具结果回填预算、V52 后台回填统一 + Bash 流式日志、V53 通用计划事件源扩展、V54 安全边界事件注入 + 协作式主动消息、V55 决策标记全流式防泄漏、V56 收件箱溢出与决策串行化、V57 前后台 LLM 串行化 + 目标决策幂等、V58 主动提问与用户回复关联闭环、V59 待回答问题的状态一致性、V60 记忆检索 pg_search BM25、V61 知识库结构感知递归切分、V61.3 Chunker 兜底拆分正确性）
+> - 建图日期：2026-10-21；最近更新：2026-11-16 第二轮（退役旧任务分支、共享历史 DTO 与聊天错误契约、删除兼容包装）；同日第一轮（提醒投递单一入口、Main Agent 工具面单一来源、Web/Android 共享 SSE 与 WorkCenter Hook）；之前：2026-11-11（V64.1 全局上下文预算、来源感知溢出与历史 Token 密封；V63.2 WebSocket 重连历史恢复与聊天错误契约统一；V49 单用户认证、V50 目标步骤触发规则 + 主动消息、V51 工具结果回填预算、V52 后台回填统一 + Bash 流式日志、V53 通用计划事件源扩展、V54 安全边界事件注入 + 协作式主动消息、V55 决策标记全流式防泄漏、V56 收件箱溢出与决策串行化、V57 前后台 LLM 串行化 + 目标决策幂等、V58 主动提问与用户回复关联闭环、V59 待回答问题的状态一致性、V60 记忆检索 pg_search BM25、V61 知识库结构感知递归切分、V61.3 Chunker 兜底拆分正确性）
 
 ---
 
@@ -86,13 +86,16 @@
 
 | 职责 | 唯一实现 | 消费方 / 兼容入口 |
 |---|---|---|
-| 稳定系统契约与身份文本 | `runtime/system_contract.py::build_stable_contract / build_runtime_identity` | `context_assembler` 直接调用；`AgentGraph._build_stable_contract`、`agent_graph._build_runtime_identity` 保留兼容入口 |
+| 稳定系统契约与身份文本 | `runtime/system_contract.py::build_stable_contract / build_runtime_identity` | `context_assembler`、`agent_graph` 与测试均直接导入；旧私有方法与别名已删除 |
 | 工具流事件配对与回执解析 | `runtime/tool_events.py::StreamToolCallMatcher / ToolExecutionReceipt / parse_tool_execution_receipt` | `agent_graph` 消费并兼容旧导入路径；该模块不加载数据库或 LangGraph |
-| 知识文档生命周期状态 | `knowledge/document_status.py` | 摄取、向量、维护、调度与 API 共用；`ingestor` 保留旧常量导出 |
+| 知识文档生命周期状态 | `knowledge/document_status.py` | 摄取、向量、维护、调度与 API 共用；`ingestor` 的旧常量再导出已删除 |
 | 聊天消息类型 | `frontend/src/features/chat/types.ts` | 页面、存储与工具卡片共享类型 |
 | 缓存恢复与限额 | `frontend/src/features/chat/messageStorage.ts::loadStored / saveStored` | `ChatPage` 负责触发持久化；存储模块负责最多 200 条、工具结果 4000 字符的缓存限制 |
 | 工具状态映射、消息 ID | `frontend/src/features/chat/messageModel.ts` | 未识别状态仍为 `execution_unknown` |
 | 工具结果卡片 | `frontend/src/features/chat/ToolCallCard.tsx` | 独立管理展开状态；页面负责数据与事件编排 |
+| 聊天历史传输 DTO | `shared/chat/history.ts` | Web 与 Android 的 API 层直接引用；Web Message/ToolCallItem 与 Android ChatMessage/ApprovalItem 仍各自映射 |
+| 聊天错误契约 | `shared/chat/errors.ts`（`ChatApiError` / `chatApiErrorFromResponse` / `chatApiErrorFromPayload`） | Web 以 `ApiError` 别名导出；Android 使用同一类；HTTP 非 2xx 与 SSE error 同一载荷 |
+| 历史消息转换职责 | `ThreadState._dicts_to_token_count_messages`（事件粒度、无回填守卫）与 `ContextAssembler._dicts_to_prompt_messages`（合批 tool_calls、配对修复、输出守卫） | 两者职责不同，不合并；测试显式验证差异 |
 
 新增回归入口：`tests/unit/backend/test_runtime_module_boundaries.py`（新进程验证共享模块不导入执行栈）；`cd frontend && npm run test:chat`（状态、缓存兼容、限额与不可用存储）。
 
@@ -170,7 +173,7 @@
 | 决策标记全流式防泄漏（V55） | runtime/turn_events.py（`DecisionMarkerStreamFilter`/`scan_decision_marker`/`remove_decision_markers`：标记协议唯一事实源，有界前缀状态机 + 与最终清洗一致的 lstrip 规则） | runtime/agent_graph.py::_execute_graph_stream（token 级过滤，仅注入事件协议生效时启用）、runtime/agent_graph.py::_assistant（最终文本清洗） | tests/unit/backend/test_decision_marker_stream.py（24 例） |
 | 主动提问与用户回复关联闭环（V58） | `task_runtime/goal_questions.py`（待回答问题生命周期：稳定 question_id、asked/resolved/expired 事件、72h 有效期、状态推导）、`runtime/question_tool.py`（`answer_goal_question` 工具：多候选必须显式绑定、审批步骤拒绝、幂等关闭） | `task_runtime/goal_decision.py::apply`（ask_user/wait_user 登记问题）、`task_runtime/goal_service.py::answer_step_question`（解除等待/修改计划/记录拒绝）、`runtime/context_assembler.py`（只注入 open 问题块 + `agent_ctx[open_questions]`）、`runtime/agent_graph.py`（按轮次条件绑定工具） | `tests/unit/backend/test_goal_question_answer.py`（11 例） |
 | 待回答问题的状态一致性（V59） | `task_runtime/goal_questions.py`（`_plan_snapshot` 读目标/步骤状态、`_invalid_reason` 派生失效原因、`_superseded_ids` 收敛同步骤旧提问） | `task_runtime/goal_service.py::answer_step_question`（旧 question_id 服务端复核）、`runtime/question_tool.py`（`question_stale` + reason）、`runtime/context_assembler.py`（只注入仍可回答的问题）、`runtime/agent_graph.py`（按 open 列表绑定工具） | `tests/unit/backend/test_goal_question_state_consistency.py`（10 例） |
-| 提醒（Task 唯一职责） | `runtime/reminder_outbox.py`（operation_id / payload / 幂等 / 终态收敛 / 到期查询唯一实现）、`runtime/task_manager.py`（CRUD、取消、手动单条入队） | `worker/task_worker.py`（SKIP LOCKED 批量认领）、`tools/builtin_reminders.py`（取消委托 TaskManager）、`worker/outbox_handlers.py::handle_reminder_delivery`；routine / condition_watch 由 `task_runtime/watchers.py` 与 Goal Trigger 承担 | `test_reminder*.py`、`test_notification*.py` |
+| 提醒（Task 唯一职责） | `runtime/reminder_outbox.py`（operation_id / payload / 幂等 / 终态收敛 / 到期查询唯一实现）、`runtime/task_manager.py`（CRUD、取消、手动单条入队；create 只接受 reminder，check_now 对历史旧类型返回 unsupported_task_type 且不改状态，get_due 已删除） | `worker/task_worker.py`（SKIP LOCKED 批量认领）、`tools/builtin_reminders.py`（取消委托 TaskManager）、`worker/outbox_handlers.py::handle_reminder_delivery`；routine / condition_watch 已退役，由 `task_runtime/watchers.py` 与 Goal Trigger 承担 | `test_tasks.py`、`test_retired_task_types.py`、`test_notification*.py`、`test_reminder*.py` |
 | 通知 | `api/routes_notifications.py` | `worker/outbox_handlers.py`、`frontend/src/pages/NotificationsPage.tsx` | `test_notification*.py` |
 | 桌面节点服务端 | `desktop/node_service.py`、`desktop/connection_manager.py`、`desktop/protocol.py` | `api/routes_desktop.py`、`desktop/registry_overlay.py` | `test_desktop*.py` |
 | 桌面节点客户端（Electron） | `apps/desktop/src/node-host/client.mjs` | `apps/desktop/src/node-host/locks.mjs`、`journal.mjs` | `apps/desktop/src/node-host/journal.test.mjs` |
@@ -229,7 +232,7 @@
 | `routes_knowledge.py` | `/api/knowledge/ingest`、`/knowledge`、`/knowledge/maintenance`（GET 报告 / POST 清理）、`DELETE /knowledge/{id}`、`/{id}/source`、`/{id}/reindex`、`/search` |
 | `routes_epochs.py` | `/api/epochs/{thread_id}`、`/{id}/seal-segment|rollover` |
 | `routes_inspector.py` | `/api/context-runs/{trace_id}`（+`/items/{id}`）、检索运行查询 |
-| `routes_tasks.py` | `/api/tasks` 条件任务 CRUD + `/{id}/cancel|check-now` |
+| `routes_tasks.py` | `/api/tasks` 提醒 CRUD + `/{id}/cancel|check-now`（create 仅 reminder；历史旧类型只可查询/取消，check-now 返回 unsupported_task_type） |
 | `routes_notifications.py` | `/api/notifications` |
 | `routes_attention.py` | `/api/attention/current`、`/rhythm/daily|weekly` |
 | `routes_threads.py` | `POST /api/thread/reset`、`GET /threads/{id}/messages` |
@@ -272,7 +275,7 @@
 | `agent_graph.py` | LangGraph `AgentGraph` L324；`_build_graph` L521 六节点：`_assistant` L546（bind_tools）→`_policy_check` L569→`_validate_tools` L619→`_tools_node` L766⇄assistant / `_confirm_node` L733；编译 L911；同步 `_execute_graph` L1110 / 流式 `_execute_graph_stream` L1178（`astream_events(v2)`）。第一轮重构后，同步与流式共享四个提取方法：上下文与图装配 `_prepare_execution` L919、`_extract_reply` L995（最终回复提取）、`_classify_memory_signal` L1012（记忆信号分类，流式经 `asyncio.to_thread` 包裹）、`_assemble_agent_result` L1036（统一 ToolRecord 转换 + blocked 合并 + approval 卡片 + 上下文快照）；纯数据 DTO `AgentGraphResult` L304、`ToolRecord` L262 契约不变。 |
 | `context_assembler.py` | `ContextAssembler.assemble`：一次收集可见候选 → ContextOverflowPacker → 完整输入真实 Token 门禁 → 最终 Memory touch / Snapshot；无分区配额或 Prompt 软阈值密封 |
 | `context_overflow.py` | `ContextCandidates` / `HistoryTurn` / `ContextOverflowPacker.pack`：纯逻辑，完整 Turn→统一 RetrievalHit→Graph→旧摘要→WorkingState 可选项→Core Block；每次淘汰重计数 |
-| `context_budget.py` | `ContextBudget`：model_context_window / reserved_output_tokens；hard_input_limit 为两者之差；from_env 弃用旧 JSON 配额 |
+| `context_budget.py` | `ContextBudget`：model_context_window / reserved_output_tokens；hard_input_limit 为两者之差；default 为唯一入口，启动期一次性提示废弃的 AIIVE_CONTEXT_BUDGET_JSON |
 | `attention_manager.py` | `AttentionManager` L28；`resolve_for_turn` L46；空闲切换阈值 4h/12h |
 | `policy_engine.py` | `check_tool_calls`；`PolicyAction` L17（ALLOW/BLOCK/CONFIRM），基于 ToolRegistry 元数据 |
 | `working_state.py` | `WorkingStateService`：有界结构化工作状态（运行中工具/未提交副作用/待审批） |
@@ -282,7 +285,7 @@
 | `tool_output_guard.py` | V51/V52 统一回填预算（三个入口共用：聊天 `_tools_node`、后台 `EvidenceStore._summary`、聊天历史回放 `_messages_from_events`）：`INLINE_CHAR_LIMIT=1000`，可选 `max_chars` 供后台任务用更紧预算；`guard_tool_output(tool_name, content)` 按工具分流——`run_shell` 走 `_guard_shell`（两种模式：**>1000 行 → 必回填前 50 + 后 50 行**，单行裁剪到 200 字符，`omitted_lines=[50,total-50]`；≤1000 行但单段 >4000 字符 → `char_budget` 前缀预算，不重复首尾；两种模式都落盘 + `mode`/`total_lines`/`omitted_lines`/`log_path`），`read_text_file`/`read_document` 走 `_guard_file_read`（>1000 字符只回填 path/total_chars/total_lines/hint），其余（含 MCP）走 `_guard_payload`/`_guard_text`（完整结果落盘 + 摘要 + 类型 + 长度 + 日志）。保留 `ok`/`error`/`error_type`/`exit_code`/`operation_id`/`execution_status`；落盘失败降级为有界预览并标 `offload_error`；回填内容一律标注不可信。V52 增补：`run_shell` 结果带 `stdout_log`/`stderr_log` 时走 `bash_streamed_log`（只回填预览 + `*_meta`，不二次落盘）；`_is_guarded_payload`（`truncated` + 不可信 `note`）保证重复处理幂等；`_fit_budget` 对超出调用方预算的摘要做结构保留收口（先裁长文本、再按重要性丢字段，绝不输出半截 JSON）。 |
 | `tool_output_store.py` | V51 落盘与生命周期：`tool_output_root`/`ensure_tool_output_root`（`settings.tool_output_dir`，默认 `.data/tool_outputs`）、`is_managed_path`（目录包含关系校验，供读取授权）、`StreamingLog`（流式写入：`.tmp-*` → `os.replace` 原子收尾、`max_bytes` 容量上限 + `capture_truncated`、`write()` 不缓存完整内容）、`save_tool_output`（同一实现的字符串入口：时间戳 + uuid 唯一名）、`cleanup_expired_tool_outputs`（只删本目录一层 `.log`/残留 `.tmp-*`，超 `tool_output_retention_hours` 默认 10h）。 |
 | `token_counter.py` / `token_models.py` | LiteLLM token 计数；`TokenCount`/`ModelProfile` |
-| `task_manager.py` / `reminder_outbox.py` | `TaskManager`：提醒 CRUD、取消、手动单条入队；`reminder_outbox`：提醒投递 operation_id、payload、幂等判断、终态收敛与到期查询的唯一实现（Task 只承载 reminder） |
+| `task_manager.py` / `reminder_outbox.py` | `TaskManager`：提醒 CRUD、取消、手动单条入队（create 仅 reminder；check_now 拒绝历史旧类型）；`reminder_outbox`：投递 operation_id、payload、幂等、终态收敛与到期查询的唯一实现 |
 | `rhythm_manager.py` / `thread_bootstrap.py` / `context_inspector.py` / `turn_tool_surface.py` | 节奏摘要；Thread 行独立短事务；离线上下文导出（展示 Main Agent 实际工具面）；Main Agent 单 Turn 工具面唯一注册入口（notify_user 常驻、answer_goal_question 仅在有未关闭问题时注册） |
 | `event_logger.py` / `trace.py` / `execution_context.py` / `message_normalizer.py` | Event 写入；trace_id；`TurnExecutionContext`（单一事实源）；工具消息字段规范化 |
 
@@ -1186,6 +1189,8 @@ V62.6.1 测试清理：根 `conftest.py::_cleanup_test_db` / `pytest_sessionfini
 - runtime/attachments.py::retire/reconcile/process_cleanup_actions：事务内解除引用与历史修复，提交后安全删除/失败重试。
 - shared/chat/draft.ts：已知未执行错误保留 File、作废旧上传 ID；两端共用恢复行为。
 - shared/chat/stream.ts：Web 与 Android 共用的 SSE 帧解析（CRLF 归一、event/data 行、JSON 容错），两端只保留各自事件语义映射。
+- shared/chat/history.ts：后端历史消息 DTO 的唯一声明（ActionCard / PendingOperation / ToolExecution / ThreadHistoryMessage / Page），两端 API 层直接引用。
+- shared/chat/errors.ts：ChatApiError 与 HTTP/SSE 统一错误载荷解析；Web 以 ApiError 别名导出。
 - d5e8f102b304：附件 Event 查找索引；历史分页只查询当前页 Event，并批量校验可见性。
 - tests/integration/backend/test_chat_attachment_forget.py 与 pg/test_pg_chat_attachments.py：中央事务与历史补偿契约。
 

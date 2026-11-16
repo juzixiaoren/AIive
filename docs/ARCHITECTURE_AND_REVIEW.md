@@ -134,7 +134,7 @@ _finalize_turn  ── 事务化落库
 **处理**：新增 `.env` 可配置项 `AIIVE_LLM_CONTEXT_WINDOW`（默认 256000）与 `AIIVE_LLM_MAX_OUTPUT_TOKENS`；`ContextBudget.default()` 与 `ModelProfile` 均从配置读取窗口，`recent_messages` 分区**弹性吸收**扣除固定分区后的剩余空间（`hard = window - 固定分区和`），使 `sum(hard)` 恒等于窗口、`validate()` 恒通过。已验证 128K/256K/1M 三档均自洽，用户改一个 .env 值即整体自适应。
 
 **A.6 ContextBudget 双来源与前端流占位竞态 — ✅ 已修复（2026-07-22）**
-- `ContextBudget.from_env()` 现为预算加载与校验的统一入口：模块默认实例、`TurnExecutionService` 共享缓存、`ContextAssembler` 缺省构造和应用启动校验均复用该入口。非法 token 类型或分区 hard 总额超限会在加载阶段明确失败；环境配置属于启动期配置，运行中修改需重启进程。
+- `ContextBudget.default()` 是唯一预算入口，启动期一次性提示废弃的 `AIIVE_CONTEXT_BUDGET_JSON`：模块默认实例、`TurnExecutionService` 共享缓存、`ContextAssembler` 缺省构造和应用启动校验均复用该入口。非法 token 类型或分区 hard 总额超限会在加载阶段明确失败；环境配置属于启动期配置，运行中修改需重启进程。
 - Chat 流式 token、工具调用、工具结果、完成、中断和错误清理均按本次请求创建的占位消息 ID 精确更新，不再依赖闭包中的 `messages.length` 或“最后一条空 Agent 消息”。同步 `inFlightRef` 在 React 状态提交前阻止重复发送。
 - 提醒按钮继续遵循 `/api/chat/system → TurnExecutionService → ToolRegistry` 统一执行链。`confirm_reminder` / `snooze_reminder` 在事务内锁定目标 Event，校验 `reminder_created` 类型与 `alerting` 前置状态；重复确认或延期返回已有确定性结果，延期目标写回原事件，避免不同 tool call 创建多个后续提醒。前端成功后移除原提醒操作卡片。
 - `remember_or_update` 继续作为 `writes_external_world=True` 的事务型副作用工具走 ToolOperation/Outbox；新增真实 Worker 集成测试，验证记忆、提案与 committed receipt 的落库闭环，不改成同步旁路。

@@ -224,12 +224,12 @@ class ContextBundle:
 
 # 无状态共享组件缓存（卡点 4 方案 B）：
 #   token_counter / budget / profile / safety / normalizer 均为纯计算、
-#   不持有 per-request 状态，可跨请求复用，避免每次请求重建（尤其
-#   ContextBudget.from_env() 每次读环境变量）。按 model 名缓存以支持
-#   不同模型。WorkingStateService / EpochManager 仍每请求新建（见 __init__）。
+#   不持有 per-request 状态，可跨请求复用，避免每次请求重建。
+#   按 model 名缓存以支持不同模型。WorkingStateService / EpochManager
+#   仍每请求新建（见 __init__）。
 @lru_cache(maxsize=8)
 def _shared_budget() -> ContextBudget:
-    return ContextBudget.from_env()
+    return ContextBudget.default()
 
 
 _SHARED_SAFETY: TokenSafetyConfig = TokenSafetyConfig()

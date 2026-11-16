@@ -34,8 +34,8 @@ def due_reminder_tasks(
 ) -> list[Task]:
     """到期提醒的唯一查询定义。
 
-    批量扫描用 skip_locked=True 原子认领；只读兼容入口（TaskManager.get_due）
-    用默认行锁语义，二者共享同一筛选与排序条件。
+    批量扫描用 skip_locked=True 原子认领；只读列出用默认行锁语义。
+    筛选与排序只在这里定义，不得在调用方重复实现。
     """
     query = (
         db.query(Task)
