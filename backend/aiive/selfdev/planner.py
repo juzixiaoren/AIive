@@ -14,14 +14,12 @@ from json_repair import repair_json
 
 from aiive.core.llm_client import LLMClient, LLMResponse
 from aiive.prompts import get_prompt_registry
-from aiive.selfdev.trusted_core import TRUSTED_CORE_PREFIXES, protected_reason
+from aiive.selfdev.trusted_core import protected_reason
 
 logger = logging.getLogger(__name__)
 
 # 允许的操作类型白名单
 ALLOWED_OPERATIONS = {"add_file", "modify_file", "delete_file"}
-# 兼容旧导入名称；实际判定统一由 Trusted Core 策略完成。
-FORBIDDEN_PATHS = set(TRUSTED_CORE_PREFIXES)
 
 
 class SelfDevPlanner:
