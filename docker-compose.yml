@@ -10,7 +10,7 @@ services:
     image: ${AIIVE_PG_IMAGE:-aiive-postgres-bm25:pg16}
     environment:
       POSTGRES_USER: aiive
-      POSTGRES_PASSWORD: aiive_dev
+      POSTGRES_PASSWORD: ${AIIVE_POSTGRES_PASSWORD:?Set AIIVE_POSTGRES_PASSWORD in .env}
       POSTGRES_DB: aiive
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -66,7 +66,7 @@ services:
       HOST: "0.0.0.0"
       AIIVE_DATA_DIR: /app/.data
       PORT: "8000"
-      DATABASE_URL: "postgresql+psycopg://aiive:aiive_dev@postgres:5432/aiive"
+      DATABASE_URL: "postgresql+psycopg://aiive:${AIIVE_POSTGRES_PASSWORD:?Set AIIVE_POSTGRES_PASSWORD in .env}@postgres:5432/aiive"
       # BM25 稀疏召回（pg_search）：postgres 服务由上面的镜像提供扩展。
       # 置 false 时召回退化为词法路由（route=lexical），不再标记 degraded。
       AIIVE_MEMORY_BM25_ENABLED: "${AIIVE_MEMORY_BM25_ENABLED:-true}"
