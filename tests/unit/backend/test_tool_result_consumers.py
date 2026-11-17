@@ -197,4 +197,3 @@ def test_desktop_disconnect_keeps_unknown_outcome(monkeypatch) -> None:
     assert payload["error_type"] == "execution_unknown"
     assert payload["outcome_known"] is False
     assert payload["side_effect_started"] is True
-
