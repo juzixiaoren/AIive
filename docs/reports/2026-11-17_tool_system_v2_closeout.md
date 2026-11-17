@@ -111,3 +111,39 @@ DesktopAdapter / execute_direct: DesktopDispatchError.phase → NOT_SUBMITTED �
 - `run_shell` 自身超时仍返回 `error_type="timeout"`（确定性失败）：只读命令
   超时是可重试的常见场景，执行器级超时对写外部世界的工具仍判 UNKNOWN。
 - 非取消任务的基础设施异常仍返回 RETRYABLE_ERROR，行为不变。
+
+
+## 7. 补充：Shell 超时副作用与 Desktop pending 生命周期
+
+### 7.1 Shell 超时
+
+`run_bash` 超时后终止进程树并返回 `ok=False, error_type="timeout",
+timed_out=True`，但最初没有声明副作用状态，归一化后默认 `side_effect_started=False`。
+超时前命令可能已经写成文件或发出请求，这个事实被丢掉了。
+
+现在超时分支显式返回 `outcome_known=True` 与 `side_effect_started=True`；
+`error_type` 保持 `timeout`（不改成 execution_unknown），stdout/stderr、
+exit_code、timed_out 与进程树终止行为不变。启动前失败（`_failure`：bash 缺失、
+cwd 不存在）显式声明 `outcome_known=True, side_effect_started=False`；普通非零
+退出不声明副作用（确定性结果，按既有契约默认 False）。
+
+验证：真实 bash 执行 `echo "partial" > partial.txt; sleep 30`（1s 超时）后
+`partial.txt` 内容正确，且返回/归一化/Operation 回执三层都保留
+`True/True`。
+
+### 7.2 Desktop pending 生命周期
+
+`dispatch_sync` 与 `dispatch_action_sync` 原先先写入 `_pending` 再调用
+`_submit_to_loop`，而这一步在 try/finally 之外：主循环关闭时抛
+`NOT_SUBMITTED`，pending 残留，同一 action_id 的重派被误判为
+`desktop_action_already_in_flight`（进而报成 UNKNOWN）。
+
+现在 pending 的创建/提交/发送/等待都在同一个 try/finally 内，收尾用
+`_discard_pending` 按对象身份删除：未提交 → 清掉且请求确实没发出（确定性失败，
+可安全重派）；已提交但发送失败/等待超时 → 仍然 SUBMITTED / UNKNOWN，清理等待器
+不改变阶段；旧请求的收尾不会误删同 request_id 下新建的 pending。action_id、
+request_id、fencing_token、Journal 与幂等回放语义未变。
+
+验证：`test_desktop_dispatch_phase.py` 16 例，覆盖无循环、无连接、提交前循环
+关闭（两条路径）、发送失败、等待超时、超时后同 id 重派成功、旧收尾不误删新
+pending、Node 终态正常返回。

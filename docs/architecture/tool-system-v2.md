@@ -83,6 +83,14 @@ Attachment 的 Vision 前后事务、Forget Phase A 的授权交接，以及运�
 `False`；显式值优先。终态只由契约决定，`side_effect_started` 不参与推导
 成功/失败/UNKNOWN。
 
+| 场景 | outcome_known | side_effect_started |
+| --- | --- | --- |
+| 参数校验失败 / 启动前失败（bash 缺失、cwd 不存在） | True | False |
+| 确定性失败但已写出一部分（写了一半文件） | True | True |
+| Shell 超时（进程树已终止，超时前可能已改文件/发请求） | True | True |
+| 外部调用超时 / 断连（已发出） | False | True |
+| 无法确认请求是否发出 | False | False |
+
 ## Desktop 发送边界
 
 `DesktopDispatchError.phase`（`desktop/protocol.py::DesktopDispatchPhase`）
@@ -99,6 +107,13 @@ Attachment 的 Vision 前后事务、Forget Phase A 的授权交接，以及运�
 
 写 socket 失败按 UNKNOWN 处理：本机没有 ACK 不能证明对端没有收到请求。取消
 投递失败不改变本次派发结论；UNKNOWN 保留资源锁并等待 Journal 对账。
+
+pending 记录的生命周期与派发阶段绑定：创建、协程提交、发送和等待都在同一个
+`try/finally` 内。协程没有提交（主循环关闭）时请求一定没有发出，收尾时按对象
+身份删除本次创建的 pending——不会留下"虚假的在途记录"阻塞同一 action_id 的
+重派；已经提交的请求即使发送失败或等待超时，也保持 SUBMITTED / UNKNOWN，清理
+等待器不改变这个结论。按身份删除保证旧请求的收尾不会误删同 request_id 下新建
+的 pending。
 Task 路径（`DesktopAdapter`）与聊天路径（`DesktopTool._run`）共用
 `desktop_dispatch_result` 的阶段映射。
 
@@ -160,7 +175,9 @@ failed，保留审计原因；降级不会恢复被取消的工作。
 - `test_tool_result_consumers.py`：LangChain ToolMessage、回执解析、MCP、Desktop。
 - `test_task_action_result_contract.py`：Action 终态与事件中的副作用事实。
 - `test_desktop_dispatch_phase.py`：真实连接管理器 + 模拟 WebSocket 的发送
-  前后失败分类。
+  前后失败分类、pending 生命周期（未提交不残留、超时后可重派、按身份清理）。
+- `test_local_shell.py` / `test_tool_operation_execution.py`：真实 Shell 超时
+  后文件已写出、结果确定且副作用已开始，Operation 回执持久化同样的事实。
 - `test_task_cancelled_execution_recovery.py`、`test_agent_contract_recovery.py`：
   取消恢复幂等与 Outbox 返回值。
 - `test_tool_and_cancel_recovery_pg.py`：PostgreSQL 上的结构化失败回滚与

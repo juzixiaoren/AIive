@@ -262,3 +262,118 @@ def test_chat_path_keeps_phase_semantics(monkeypatch):
     assert payload["ok"] is False
     assert payload["error_type"] == "execution_failed"
     assert payload["outcome_known"] is True
+
+
+def test_closed_loop_before_submit_leaves_no_pending():
+    """初始检查通过但协程提交前循环关闭：请求没发出，不能留下 pending。"""
+    manager = DesktopConnectionManager()
+    closed = asyncio.new_event_loop()
+    closed.close()
+    manager.set_main_loop(closed)
+    manager.attach(NODE_ID, FakeSocket())
+
+    with pytest.raises(DesktopDispatchError) as raised:
+        _dispatch(manager)
+
+    assert raised.value.phase is DesktopDispatchPhase.NOT_SUBMITTED
+    assert "main_loop_unavailable" in str(raised.value)
+    assert manager._pending == {}
+
+
+def test_dispatch_sync_closed_loop_leaves_no_pending():
+    """v1 派发路径同样不能遗留 pending。"""
+    manager = DesktopConnectionManager()
+    closed = asyncio.new_event_loop()
+    closed.close()
+    manager.set_main_loop(closed)
+    manager.attach(NODE_ID, FakeSocket())
+
+    with pytest.raises(DesktopDispatchError) as raised:
+        manager.dispatch_sync(NODE_ID, "desktop_fs_stat", {"path": "/tmp/x"})
+
+    assert raised.value.phase is DesktopDispatchPhase.NOT_SUBMITTED
+    assert manager._pending == {}
+
+
+def test_submitted_failure_cleans_pending_but_stays_unknown(loop_thread):
+    manager = _manager(loop_thread)
+    manager.attach(NODE_ID, FakeSocket(fail=True))
+
+    with pytest.raises(DesktopDispatchError) as raised:
+        _dispatch(manager)
+
+    # 清理 pending 只是回收等待器，不改变"请求已发出、结果未知"的结论。
+    assert raised.value.phase is DesktopDispatchPhase.SUBMITTED
+    assert "desktop_send_failed" in str(raised.value)
+    assert manager._pending == {}
+
+
+def test_timeout_cleanup_allows_retry_with_same_action_id(loop_thread):
+    manager = _manager(loop_thread)
+    socket = FakeSocket()
+    manager.attach(NODE_ID, socket)
+
+    with pytest.raises(DesktopDispatchError) as raised:
+        _dispatch(manager, timeout_seconds=1)
+
+    assert raised.value.phase is DesktopDispatchPhase.SUBMITTED
+    assert manager._pending == {}
+
+    def on_send(payload: dict) -> None:
+        data = payload["data"]
+        manager.resolve_result(
+            data["request_id"], node_id=NODE_ID, action_id=data["action_id"],
+            ok=True, result={"content": "done"},
+        )
+
+    socket.on_send = on_send
+    result = _dispatch(manager)
+
+    assert result["ok"] is True
+    assert result["result"] == {"content": "done"}
+    assert manager._pending == {}
+
+
+def test_not_submitted_failure_allows_retry_with_same_action_id(loop_thread):
+    manager = DesktopConnectionManager()
+    socket = FakeSocket()
+    manager.attach(NODE_ID, socket)
+    closed = asyncio.new_event_loop()
+    closed.close()
+    manager.set_main_loop(closed)
+
+    with pytest.raises(DesktopDispatchError) as raised:
+        _dispatch(manager)
+    assert raised.value.phase is DesktopDispatchPhase.NOT_SUBMITTED
+    assert manager._pending == {}
+
+    def on_send(payload: dict) -> None:
+        data = payload["data"]
+        manager.resolve_result(
+            data["request_id"], node_id=NODE_ID, action_id=data["action_id"],
+            ok=True, result={"content": "done"},
+        )
+
+    socket.on_send = on_send
+    manager.set_main_loop(loop_thread)
+
+    # 同一个 action_id 可以安全重派：没有遗留 pending 造成 already_in_flight。
+    result = _dispatch(manager)
+
+    assert result["ok"] is True
+    assert manager._pending == {}
+
+
+def test_stale_cleanup_never_removes_newer_pending():
+    from aiive.desktop.connection_manager import _PendingDispatch
+
+    manager = DesktopConnectionManager()
+    old = _PendingDispatch(node_id=NODE_ID, action_id="action-1")
+    newer = _PendingDispatch(node_id=NODE_ID, action_id="action-1")
+    manager._pending["action-1"] = newer
+
+    manager._discard_pending("action-1", old)
+
+    assert manager._pending["action-1"] is newer
+    manager._discard_pending("action-1", newer)
+    assert "action-1" not in manager._pending

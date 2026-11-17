@@ -78,6 +78,8 @@ def test_run_shell_reports_nonzero_exit(tmp_path) -> None:
     assert result["ok"] is False
     assert result["exit_code"] == 7
     assert "bad" in result["stderr"]
+    # 普通非零退出是确定性结果，不能凭空标记"已经产生副作用"。
+    assert result.get("side_effect_started") is None or result["side_effect_started"] is False
 
 
 def test_run_shell_respects_cwd(tmp_path) -> None:
@@ -97,6 +99,20 @@ def test_run_shell_timeout_terminates_process_tree(tmp_path) -> None:
     assert result["exit_code"] is None
     assert result["error_type"] == "timeout"
     assert result["duration_ms"] < 15_000
+
+
+def test_run_shell_timeout_records_partial_side_effects(tmp_path) -> None:
+    """超时前已经写出的文件是真实副作用：结果确定，但副作用已经开始。"""
+    _require_bash()
+    script = "echo \"partial\" > partial.txt; sleep 30"
+    result = run_bash(script, cwd=str(tmp_path), timeout_seconds=1)
+
+    assert (tmp_path / "partial.txt").read_text(encoding="utf-8").strip() == "partial"
+    assert result["ok"] is False
+    assert result["error_type"] == "timeout"
+    assert result["timed_out"] is True
+    assert result["outcome_known"] is True
+    assert result["side_effect_started"] is True
 
 
 def test_run_shell_truncates_large_output(tmp_path, monkeypatch) -> None:
@@ -129,6 +145,9 @@ def test_run_shell_missing_cwd_returns_structured_error(tmp_path) -> None:
     assert result["ok"] is False
     assert result["error_type"] == "cwd_not_found"
     assert result["exit_code"] is None
+    # 启动前失败：命令没有执行，不能标记已经产生副作用。
+    assert result["outcome_known"] is True
+    assert result["side_effect_started"] is False
 
 
 def test_run_shell_never_falls_back_when_bash_missing(tmp_path, monkeypatch) -> None:

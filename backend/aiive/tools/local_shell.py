@@ -234,10 +234,21 @@ def run_bash(command: str, *, cwd: str, timeout_seconds: float | None = None, ca
     if out_capture.log_error or err_capture.log_error:
         result["log_error"] = out_capture.log_error or err_capture.log_error
     if cancelled:
-        result.update(ok=False, error_type="execution_unknown", error="Process stopped after cancellation; partial effects require reconciliation", cancelled=True)
+        result.update(
+            ok=False,
+            error_type="execution_unknown",
+            error="Process stopped after cancellation; partial effects require reconciliation",
+            cancelled=True,
+            outcome_known=False,
+            side_effect_started=True,
+        )
     if timed_out:
         result["error_type"] = "timeout"
         result["error"] = f"命令在 {timeout:.0f}s 内未结束，已终止进程树。"
+        # 终止进程树只保证"不再继续"，不能证明超时前没有改过文件或发出请求：
+        # 结果确定（已终止）但副作用可能已经开始，两个事实分别记录。
+        result["outcome_known"] = True
+        result["side_effect_started"] = True
     return result
 
 
@@ -359,10 +370,13 @@ class _Capture:
 
 
 def _failure(error_type: str, message: str, started: float) -> dict[str, Any]:
+    # 启动前失败：命令一定没有执行，显式声明没有产生外部副作用。
     return {
         "ok": False,
         "error_type": error_type,
         "error": message,
+        "outcome_known": True,
+        "side_effect_started": False,
         "exit_code": None,
         "stdout": "",
         "stderr": "",

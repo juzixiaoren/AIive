@@ -345,3 +345,45 @@ def test_external_failure_persists_side_effect_receipt(operation_session_factory
         }
     finally:
         db.close()
+
+
+def test_run_shell_timeout_persists_partial_side_effect_receipt(
+    operation_session_factory, tmp_path,
+):
+    """真实 Shell 超时：文件已写出，Operation 回执必须记录已产生副作用。"""
+    context = _source_context(operation_session_factory)
+    registry = get_tool_registry()
+    registration = registry.get("run_shell")
+    assert registration is not None
+    operation = enqueue_tool_operation(
+        "run_shell",
+        {
+            "command": 'echo "partial" > partial.txt; sleep 30',
+            "cwd": str(tmp_path),
+            "timeout_seconds": 1,
+        },
+        registration.safety.descriptor_hash, registration.safety.effect_mode,
+        context, "call-shell-timeout",
+    )
+
+    assert _worker().poll(max_jobs=1) == 1
+
+    assert (tmp_path / "partial.txt").read_text(encoding="utf-8").strip() == "partial"
+    db = operation_session_factory()
+    try:
+        persisted = db.get(ToolOperation, operation.id)
+        assert persisted is not None
+        assert persisted.status == "failed"
+        assert persisted.effect_receipt == {
+            "outcome_known": True, "side_effect_started": True,
+        }
+        terminals = db.query(Event).filter(
+            Event.event_type == "tool_operation_terminal",
+        ).all()
+        terminal = next(
+            event for event in terminals
+            if event.payload.get("operation_id") == operation.id
+        )
+        assert terminal.payload["status"] == "failed"
+    finally:
+        db.close()

@@ -176,7 +176,33 @@ def test_run_shell_missing_cwd_is_a_real_failure(tmp_path) -> None:
     assert payload["ok"] is False
     assert payload["error_type"] == "cwd_not_found"
     assert payload["outcome_known"] is True
+    # 启动前失败：命令没有执行，不能标记已经产生副作用。
+    assert payload["side_effect_started"] is False
     assert payload["details"]["exit_code"] is None
+
+
+def test_run_shell_timeout_keeps_partial_side_effect(tmp_path) -> None:
+    """超时被终止的命令可能已经产生了外部副作用，契约必须保留这个事实。"""
+    tool = get_tool_registry().get("run_shell")
+    assert tool is not None
+
+    payload = ToolExecutor.execute_direct(
+        tool,
+        ToolExecutionContext("run_shell"),
+        {
+            "command": 'echo "partial" > partial.txt; sleep 30',
+            "cwd": str(tmp_path),
+            "timeout_seconds": 1,
+        },
+        10,
+    )
+
+    assert (tmp_path / "partial.txt").read_text(encoding="utf-8").strip() == "partial"
+    assert payload["ok"] is False
+    assert payload["error_type"] == "timeout"
+    assert payload["execution_status"] == "failed"
+    assert payload["outcome_known"] is True
+    assert payload["side_effect_started"] is True
 
 
 @pytest.fixture

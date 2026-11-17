@@ -114,6 +114,16 @@ class DesktopConnectionManager:
                 f"desktop_send_failed: {error}", phase=DesktopDispatchPhase.SUBMITTED,
             ) from error
 
+    def _discard_pending(self, request_id: str, pending: _PendingDispatch) -> None:
+        """按对象身份移除本次创建的 pending。
+
+        同 request_id 可能已经有新的 pending（重试或新的派发），旧请求的收尾
+        不能误删它；也不改变本次已经判定的执行阶段。
+        """
+        with self._lock:
+            if self._pending.get(request_id) is pending:
+                self._pending.pop(request_id, None)
+
     def _submit_to_loop(self, coroutine: Any) -> Any:
         """投递协程到主事件循环；循环不可用时请求尚未发出。"""
         loop = self._main_loop
@@ -147,21 +157,22 @@ class DesktopConnectionManager:
             )
         request_id = str(uuid.uuid4())
         pending = _PendingDispatch(node_id=node_id)
+        timeout = timeout_seconds or settings.aiive_desktop_dispatch_timeout_seconds
         with self._lock:
             self._pending[request_id] = pending
-        timeout = timeout_seconds or settings.aiive_desktop_dispatch_timeout_seconds
-        future = self._submit_to_loop(
-            self._send(node_id, {
-                "type": "operation.request",
-                "data": {
-                    "request_id": request_id,
-                    "capability_id": capability_id,
-                    "params": params,
-                    "timeout_seconds": timeout,
-                },
-            })
-        )
         try:
+            # 协程提交也在保护范围内：循环不可用时请求没有发出，必须清掉 pending。
+            future = self._submit_to_loop(
+                self._send(node_id, {
+                    "type": "operation.request",
+                    "data": {
+                        "request_id": request_id,
+                        "capability_id": capability_id,
+                        "params": params,
+                        "timeout_seconds": timeout,
+                    },
+                })
+            )
             future.result(timeout=min(5.0, timeout))
             if not pending.event.wait(timeout=timeout):
                 raise DesktopDispatchError(
@@ -181,8 +192,7 @@ class DesktopConnectionManager:
                 str(error), phase=DesktopDispatchPhase.SUBMITTED,
             ) from error
         finally:
-            with self._lock:
-                self._pending.pop(request_id, None)
+            self._discard_pending(request_id, pending)
 
     def dispatch_action_sync(
         self,
@@ -246,14 +256,15 @@ class DesktopConnectionManager:
                     phase=DesktopDispatchPhase.SUBMITTED,
                 )
             self._pending[request_id] = pending
-        future = self._submit_to_loop(
-            self._send(node_id, {
-                "type": "operation.request",
-                "protocol_version": DESKTOP_PROTOCOL_VERSION,
-                "data": envelope.model_dump(mode="json"),
-            })
-        )
         try:
+            # 协程提交也在保护范围内：循环不可用时请求没有发出，必须清掉 pending。
+            future = self._submit_to_loop(
+                self._send(node_id, {
+                    "type": "operation.request",
+                    "protocol_version": DESKTOP_PROTOCOL_VERSION,
+                    "data": envelope.model_dump(mode="json"),
+                })
+            )
             future.result(timeout=min(5.0, timeout))
             deadline = time.monotonic() + timeout
             cancel_sent = False
@@ -292,8 +303,7 @@ class DesktopConnectionManager:
                 str(error), phase=DesktopDispatchPhase.SUBMITTED,
             ) from error
         finally:
-            with self._lock:
-                self._pending.pop(request_id, None)
+            self._discard_pending(request_id, pending)
 
     def cancel_action_sync(self, node_id: str, action_id: str, request_id: str, fencing_token: str) -> None:
         from aiive.desktop.protocol import DesktopCancelEnvelope, DESKTOP_PROTOCOL_VERSION
