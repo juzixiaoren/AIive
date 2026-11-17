@@ -1,4 +1,8 @@
 """Shared Function Calling contract, repair pairing and proposal-only adapters."""
+
+from tests.tool_helpers import invoke_test_tool, tool_method
+
+from aiive.tools.base import BaseTool, DatabaseTool
 from copy import deepcopy
 from unittest.mock import Mock
 
@@ -11,17 +15,17 @@ from aiive.core.function_calling import (
 )
 from aiive.core.llm_client import FakeLLMClient
 from aiive.task_runtime.function_decisions import WorkerFunctions, proposal_function_name
-from aiive.tools.registry import ToolRegistration, CapabilitySafetySchema, ToolRegistry
+from aiive.tools.registry import ToolDefinition, CapabilitySafetySchema, ToolRegistry
 from aiive.tools.langchain_adapter import build_langchain_tools
 
 
 def registry(handler=None):
     result = ToolRegistry()
-    result.register(ToolRegistration(CapabilitySafetySchema("probe", "local_builtin", "trusted", "low"),
-        handler or Mock(), input_schema={"type": "object", "additionalProperties": False,
-            "$defs": {"Row": {"type": "object", "additionalProperties": False,
-                "required": ["count"], "properties": {"count": {"type": "integer", "minimum": 1}}}},
-            "properties": {"rows": {"type": "array", "items": {"$ref": "#/$defs/Row"}}}, "required": ["rows"]}))
+    class FakeTool9(BaseTool):
+
+        def _run(self, **arguments):
+            return (handler or Mock())(**arguments)
+    result.register(FakeTool9(ToolDefinition(CapabilitySafetySchema('probe', 'local_builtin', 'trusted', 'low'), input_schema={'type': 'object', 'additionalProperties': False, '$defs': {'Row': {'type': 'object', 'additionalProperties': False, 'required': ['count'], 'properties': {'count': {'type': 'integer', 'minimum': 1}}}}, 'properties': {'rows': {'type': 'array', 'items': {'$ref': '#/$defs/Row'}}}, 'required': ['rows']})))
     return result
 
 
@@ -56,8 +60,8 @@ def test_main_and_worker_derive_one_effective_contract_without_execution():
     proposal = functions.proposal(name, call.tool_calls[0]["args"])
     assert proposal.capability_id == "probe" and proposal.arguments == {"rows": [{"count": 2}]}
     handler.assert_not_called()
-    with pytest.raises(RuntimeError, match="not_executable"):
-        functions.registry.get(name).handler(arguments={"rows": []})
+    assert not hasattr(functions.registry.get(name), "execute")
+    assert not hasattr(functions.registry.get(name), "_run")
     assert len(name) <= 64
 
 
@@ -168,7 +172,7 @@ def test_main_invalid_high_risk_arguments_repair_before_approval():
     handler = Mock()
     registered = registry(handler)
     original = registered.get("probe")
-    registered.register(replace(original, safety=replace(original.safety, risk_level="high", requires_confirmation=True)))
+    registered.register(original.with_definition(replace(original.definition, safety=replace(original.safety, risk_level='high', requires_confirmation=True))))
     class Assistant:
         count = 0
         def invoke(self, messages):
@@ -189,11 +193,8 @@ def test_context_function_and_langchain_export_identical_safety_contract(db_sess
     from tests.unit.backend.test_context_assembler import _FakeTokenCounter
 
     registered = registry()
-    original = replace(registered.get("probe"), input_schema={
-        "type": "object", "properties": {"count": {"type": "integer", "minimum": 1}},
-        "required": ["count"], "additionalProperties": False})
-    registered.register(replace(original, description="Probe rows", safety=replace(
-        original.safety, risk_level=risk, writes_external_world=True)))
+    original = registered.get('probe').with_definition(replace(registered.get('probe').definition, input_schema={'type': 'object', 'properties': {'count': {'type': 'integer', 'minimum': 1}}, 'required': ['count'], 'additionalProperties': False}))
+    registered.register(original.with_definition(replace(original.definition, description='Probe rows', safety=replace(original.safety, risk_level=risk, writes_external_world=True))))
     monkeypatch.setattr("aiive.runtime.turn_tool_surface.build_turn_tool_registry", lambda _: registered)
     thread = Thread(id="safety-description-thread", title="contract")
     db_session.add(thread)

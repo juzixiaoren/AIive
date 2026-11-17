@@ -6,6 +6,8 @@
 - query_attention 工具默认当前线程、只读且不再污染 focus_topic；
 - repair_attention_noise 清理脚本删除污染记录与连续重复记录。
 """
+
+from tests.tool_helpers import invoke_test_tool, tool_method
 from datetime import datetime, timedelta, timezone
 
 from aiive.context.run_context import RunContext
@@ -85,7 +87,7 @@ def test_inspect_excludes_current_turn_for_idle(db):
 
 
 def test_query_attention_tool_is_readonly_and_defaults_to_ctx_thread(db):
-    from aiive.tools.builtin_tools import _handle_query_attention
+    from aiive.tools.builtin_tools import QueryAttentionTool as _handle_query_attention
 
     thread = _make_thread(db)
     _add_user_message(db, thread.id, "话题A", hours_ago=1, turn_id="turn-1")
@@ -96,7 +98,7 @@ def test_query_attention_tool_is_readonly_and_defaults_to_ctx_thread(db):
     db.commit()
 
     ctx = RunContext(thread_id=thread.id, trace_id="trace-attn", turn_id="turn-2")
-    result = _handle_query_attention(ctx=ctx)
+    result = invoke_test_tool(_handle_query_attention, ctx=ctx)
 
     assert result["thread_id"] == thread.id
     assert result["focus_topic"] == "话题A"

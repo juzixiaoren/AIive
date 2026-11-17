@@ -644,6 +644,11 @@ class TaskRepository:
             event_payload={"reason": reason},
             visibility="conversation",
         )
+        self.db.query(AgentAction).filter(
+            AgentAction.task_id == task.id,
+            AgentAction.status.in_([ActionStatus.DISPATCHED.value, ActionStatus.RUNNING.value]),
+            AgentAction.cancel_requested_at.is_(None),
+        ).update({AgentAction.cancel_requested_at: utcnow()}, synchronize_session=False)
         pending_actions = self.db.query(AgentAction).filter(
             AgentAction.task_id == task.id,
             AgentAction.status.in_([

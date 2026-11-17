@@ -1,4 +1,6 @@
 """Canonical contracts and real Outbox handler recovery (offline LLM boundary)."""
+
+from aiive.tools.base import BaseTool, DatabaseTool
 from datetime import timedelta
 import json
 from langchain_core.messages import AIMessage
@@ -14,7 +16,7 @@ from aiive.task_runtime.repository import TaskRepository, utcnow
 from aiive.task_runtime.schemas import TaskBudget
 from aiive.task_runtime.tools import build_main_agent_registry
 from aiive.tools.langchain_adapter import build_langchain_tools
-from aiive.tools.registry import ToolRegistry, ToolRegistration, CapabilitySafetySchema
+from aiive.tools.registry import ToolRegistry, ToolDefinition, CapabilitySafetySchema
 from aiive.tools.tool_validation import canonical_tool_schema, validate_tool_params
 from aiive.worker.handlers_agent_tasks import handle_agent_task_run
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome
@@ -65,8 +67,11 @@ def test_explicit_nested_contract_is_authoritative(source):
                   "required": ["count", "mode"], "additionalProperties": False,
                   "properties": {"count": {"type": "integer", "minimum": 1, "maximum": 3, "default": 2},
                                  "mode": {"type": "string", "enum": ["a", "b"], "minLength": 1, "maxLength": 2}}}}}}
-    reg = ToolRegistration(CapabilitySafetySchema("nested", source, "trusted", "low"),
-                           lambda **kwargs: kwargs, parameters={"wrong": "str"}, input_schema=schema)
+    class FakeTool1(BaseTool):
+
+        def _run(self, **kwargs):
+            return kwargs
+    reg = FakeTool1(ToolDefinition(CapabilitySafetySchema('nested', source, 'trusted', 'low'), parameters={'wrong': 'str'}, input_schema=schema))
     registry = ToolRegistry()
     registry.register(reg)
     assert registry.definition("nested")["input_schema"] == schema
@@ -313,9 +318,11 @@ def test_old_worker_failure_cannot_fail_new_owner(durable_db, monkeypatch):
 def test_tool_budget_never_truncates_schema():
     from aiive.task_runtime.tool_injection import build_tool_view
     registry = ToolRegistry()
-    registry.register(ToolRegistration(CapabilitySafetySchema("large", "remote_mcp", "trusted", "low"),
-        lambda **kwargs: kwargs, input_schema={"type": "object", "properties": {
-            "text": {"type": "string", "description": "x" * 30000}}, "additionalProperties": False}))
+    class FakeTool2(BaseTool):
+
+        def _run(self, **kwargs):
+            return kwargs
+    registry.register(FakeTool2(ToolDefinition(CapabilitySafetySchema('large', 'remote_mcp', 'trusted', 'low'), input_schema={'type': 'object', 'properties': {'text': {'type': 'string', 'description': 'x' * 30000}}, 'additionalProperties': False})))
     view = build_tool_view(registry, [registry.definition("large")], {})
     assert view["mode"] == "discovery"
     assert view["resident"] == [] and view["available"] == []

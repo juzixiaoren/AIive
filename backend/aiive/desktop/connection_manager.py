@@ -6,6 +6,8 @@ import json
 import logging
 import threading
 import uuid
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -134,6 +136,7 @@ class DesktopConnectionManager:
         scope: dict[str, Any],
         fencing_token: str,
         timeout_seconds: float,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         """投递 v2 持久 Action；request_id=action_id，重试时 Node journal 幂等回放。"""
         if self._main_loop is None or not self.is_connected(node_id):
@@ -172,11 +175,18 @@ class DesktopConnectionManager:
         )
         try:
             future.result(timeout=min(5.0, timeout))
-            if not pending.event.wait(timeout=timeout):
-                raise DesktopDispatchError("desktop_operation_timeout")
+            deadline = time.monotonic() + timeout
+            cancel_sent = False
+            while not pending.event.wait(timeout=min(0.1, max(0, deadline-time.monotonic()))):
+                if time.monotonic() >= deadline:
+                    raise DesktopDispatchError("desktop_operation_timeout")
+                if not cancel_sent and cancel_check is not None and cancel_check():
+                    self.cancel_action_sync(node_id, action_id, request_id, fencing_token)
+                    cancel_sent = True
             if pending.error:
                 error_type = (
-                    "precondition_failed" if pending.error.startswith("precondition_")
+                    "cancelled" if pending.error == "cancelled_before_start"
+                    else "precondition_failed" if pending.error.startswith("precondition_")
                     else "execution_unknown" if "unknown" in pending.error
                     else "execution_failed"
                 )
@@ -194,6 +204,17 @@ class DesktopConnectionManager:
         finally:
             with self._lock:
                 self._pending.pop(request_id, None)
+
+    def cancel_action_sync(self, node_id: str, action_id: str, request_id: str, fencing_token: str) -> None:
+        from aiive.desktop.protocol import DesktopCancelEnvelope, DESKTOP_PROTOCOL_VERSION
+        if self._main_loop is None:
+            raise DesktopDispatchError("desktop_node_offline")
+        envelope = DesktopCancelEnvelope(action_id=action_id, request_id=request_id, fencing_token=fencing_token)
+        future = asyncio.run_coroutine_threadsafe(self._send(node_id, {
+            "type": "operation.cancel", "protocol_version": DESKTOP_PROTOCOL_VERSION,
+            "data": envelope.model_dump(),
+        }), self._main_loop)
+        future.result(timeout=5)
 
     def resolve_ack(self, request_id: str, action_id: str) -> bool:
         with self._lock:

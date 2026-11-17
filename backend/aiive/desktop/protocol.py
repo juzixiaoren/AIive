@@ -176,7 +176,7 @@ class DesktopJournalEntry(BaseModel):
     action_id: str
     idempotency_key: str
     arguments_hash: str
-    status: Literal["received", "started", "committed", "failed", "unknown"]
+    status: Literal["received", "started", "committed", "failed", "cancelled", "unknown"]
     result_hash: str = ""
     result: Any = None
     error: str = ""
@@ -189,3 +189,10 @@ class DesktopJournalEntry(BaseModel):
         ):
             raise ValueError("committed desktop journal entry requires SHA-256 result_hash")
         return self
+
+
+class DesktopCancelEnvelope(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+    action_id: str
+    request_id: str
+    fencing_token: str

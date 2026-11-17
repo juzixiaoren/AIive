@@ -677,6 +677,7 @@ class ToolOperation(Base):
     terminal_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     trace_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -687,7 +688,7 @@ class ToolOperation(Base):
         UniqueConstraint("turn_record_id", "tool_call_id", name="uq_tool_operation_turn_call"),
         Index("ix_tool_operation_thread_status", "thread_id", "status"),
         CheckConstraint(
-            "status IN ('queued','running','committed','failed','execution_unknown')",
+            "status IN ('queued','running','committed','failed','cancelled','execution_unknown')",
             name="ck_tool_operation_status",
         ),
         CheckConstraint(
@@ -1859,6 +1860,7 @@ class AgentAction(Base):
     execution_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -2071,7 +2073,7 @@ class DesktopActionReceipt(Base):
         UniqueConstraint("node_id", "idempotency_key", name="uq_desktop_receipt_node_idempotency"),
         Index("ix_desktop_receipts_node_status", "node_id", "status"),
         CheckConstraint(
-            "status IN ('received','started','committed','failed','unknown')",
+            "status IN ('received','started','committed','failed','cancelled','unknown')",
             name="ck_desktop_receipt_status",
         ),
     )

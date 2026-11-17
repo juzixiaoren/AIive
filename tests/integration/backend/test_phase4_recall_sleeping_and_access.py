@@ -13,6 +13,8 @@ G3 — MemoryWriteService.promote / execute_maintenance 委托 MemoryLifecycleSe
 """
 from __future__ import annotations
 
+from tests.tool_helpers import invoke_test_tool, tool_method
+
 import uuid
 from datetime import datetime, timezone
 
@@ -25,7 +27,7 @@ from aiive.memory.memory_types import LifecycleState, LineageOperation
 from aiive.memory.memory_write_service import MemoryWriteService
 from aiive.memory.recall_config import RecallConfig
 from aiive.memory.recall_models import MemoryRecallItem, MemoryRecallPack, MemoryRecallRequest, ScopeContext
-from aiive.tools.builtin_tools import _handle_memory_search
+from aiive.tools.builtin_tools import MemorySearchTool as _handle_memory_search
 
 
 def _now():
@@ -183,7 +185,7 @@ def test_memory_search_touches_returned_memory_ids(db, monkeypatch):
     monkeypatch.setattr(MemoryAccessTracker, "touch", _spy)
 
     ctx = RunContext(thread_id="t1", trace_id="tr1")
-    result = _handle_memory_search(ctx=ctx, query="量子计算")
+    result = invoke_test_tool(_handle_memory_search, ctx=ctx, query="量子计算")
     returned_ids = {r["memory_id"] for r in result.get("results", [])}
 
     assert captured, "memory_search 未调用 AccessTracker.touch"
@@ -205,7 +207,7 @@ def test_memory_search_wakes_returned_sleeping_memory(db):
     db.commit()
 
     ctx = RunContext(thread_id="t1", trace_id="tr1")
-    _handle_memory_search(ctx=ctx, query="量子计算")
+    invoke_test_tool(_handle_memory_search, ctx=ctx, query="量子计算")
 
     s = SessionLocal()
     try:

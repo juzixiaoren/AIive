@@ -3,9 +3,11 @@
 覆盖工具注册、查询、权限执行及描述符哈希计算。
 """
 
+from aiive.tools.base import BaseTool, DatabaseTool
+
 from aiive.tools.registry import (
     CapabilitySafetySchema,
-    ToolRegistration,
+    ToolDefinition,
     ToolRegistry,
     compute_descriptor_hash,
     get_tool_registry,
@@ -59,7 +61,11 @@ class TestToolRegistry:
             definition_trust_level="trusted",
             risk_level="low",
         )
-        registry.register(ToolRegistration(safety=schema, handler=handler, description="Echo tool"))
+        class FakeTool12(BaseTool):
+
+            def _run(self, **kwargs):
+                return 'done'
+        registry.register(FakeTool12(ToolDefinition(safety=schema, description='Echo tool')))
         reg = registry.get("echo")
         assert reg is not None
         assert reg.safety.capability_id == "echo"
@@ -71,14 +77,16 @@ class TestToolRegistry:
         def h(**kw):
             return None
 
-        registry.register(ToolRegistration(
-            safety=CapabilitySafetySchema("t1", "local_builtin", "trusted", "low"),
-            handler=h,
-        ))
-        registry.register(ToolRegistration(
-            safety=CapabilitySafetySchema("t2", "local_builtin", "trusted", "medium"),
-            handler=h,
-        ))
+        class FakeTool13(BaseTool):
+
+            def _run(self, **kw):
+                return None
+        registry.register(FakeTool13(ToolDefinition(safety=CapabilitySafetySchema('t1', 'local_builtin', 'trusted', 'low'))))
+        class FakeTool14(BaseTool):
+
+            def _run(self, **kw):
+                return None
+        registry.register(FakeTool14(ToolDefinition(safety=CapabilitySafetySchema('t2', 'local_builtin', 'trusted', 'medium'))))
         tools = registry.list_all()
         assert len(tools) == 2
         assert {t["capability_id"] for t in tools} == {"t1", "t2"}
@@ -86,12 +94,11 @@ class TestToolRegistry:
     def test_register_generates_missing_descriptor_hash(self):
         """注册表应为缺失的 descriptor hash 生成稳定非空值。"""
         registry = ToolRegistry()
-        registration = ToolRegistration(
-            safety=CapabilitySafetySchema("generated", "local_builtin", "trusted", "low"),
-            handler=lambda **kwargs: "ok",
-            description="测试工具",
-            parameters={"value": "str"},
-        )
+        class FakeTool11(BaseTool):
+
+            def _run(self, **kwargs):
+                return 'ok'
+        registration = FakeTool11(ToolDefinition(safety=CapabilitySafetySchema('generated', 'local_builtin', 'trusted', 'low'), description='测试工具', parameters={'value': 'str'}))
         registry.register(registration)
         first = registry.get("generated")
         assert first is not None
@@ -115,10 +122,11 @@ class TestToolRegistry:
         def handler(ctx=None, **kw):
             return "executed"
 
-        registry.register(ToolRegistration(
-            safety=CapabilitySafetySchema("t1", "local_builtin", "trusted", "low"),
-            handler=handler,
-        ))
+        class FakeTool15(BaseTool):
+
+            def _run(self, ctx=None, **kw):
+                return 'executed'
+        registry.register(FakeTool15(ToolDefinition(safety=CapabilitySafetySchema('t1', 'local_builtin', 'trusted', 'low'))))
         result = registry.execute("t1", {}, "untrusted_external_content")
         assert result["ok"] is False
         assert "not authorized" in result["error"].lower()
@@ -130,13 +138,11 @@ class TestToolRegistry:
         def handler(ctx=None, **kw):
             return "executed"
 
-        registry.register(ToolRegistration(
-            safety=CapabilitySafetySchema(
-                "risky", "local_builtin", "trusted", "medium",
-                requires_confirmation=True,
-            ),
-            handler=handler,
-        ))
+        class FakeTool16(BaseTool):
+
+            def _run(self, ctx=None, **kw):
+                return 'executed'
+        registry.register(FakeTool16(ToolDefinition(safety=CapabilitySafetySchema('risky', 'local_builtin', 'trusted', 'medium', requires_confirmation=True))))
         result = registry.execute("risky", {}, "trusted_user_command")
         assert result["ok"] is True
         assert result["result"] == "executed"
@@ -148,10 +154,11 @@ class TestToolRegistry:
         def handler(ctx=None, message: str = "") -> str:
             return f"echo: {message}"
 
-        registry.register(ToolRegistration(
-            safety=CapabilitySafetySchema("echo", "local_builtin", "trusted", "low"),
-            handler=handler,
-        ))
+        class FakeTool17(BaseTool):
+
+            def _run(self, ctx=None, message: str='') -> str:
+                return f'echo: {message}'
+        registry.register(FakeTool17(ToolDefinition(safety=CapabilitySafetySchema('echo', 'local_builtin', 'trusted', 'low'))))
         result = registry.execute("echo", {"message": "hello"}, "trusted_user_command")
         assert result["ok"] is True
         assert result["result"] == "echo: hello"
@@ -163,11 +170,11 @@ class TestToolRegistry:
         def handler(message: str) -> str:
             return message
 
-        registry.register(ToolRegistration(
-            safety=CapabilitySafetySchema("required", "local_builtin", "trusted", "low"),
-            handler=handler,
-            parameters={"message": "str"},
-        ))
+        class FakeTool18(BaseTool):
+
+            def _run(self, message: str) -> str:
+                return message
+        registry.register(FakeTool18(ToolDefinition(safety=CapabilitySafetySchema('required', 'local_builtin', 'trusted', 'low'), parameters={'message': 'str'})))
         result = registry.execute("required", {}, "trusted_user_command")
         assert result["ok"] is False
         assert result["error_type"] == "argument_validation_error"
@@ -180,11 +187,11 @@ class TestToolRegistry:
         def handler(count: int = 1) -> int:
             return count
 
-        registry.register(ToolRegistration(
-            safety=CapabilitySafetySchema("strict", "local_builtin", "trusted", "low"),
-            handler=handler,
-            parameters={"count": "int"},
-        ))
+        class FakeTool19(BaseTool):
+
+            def _run(self, count: int=1) -> int:
+                return count
+        registry.register(FakeTool19(ToolDefinition(safety=CapabilitySafetySchema('strict', 'local_builtin', 'trusted', 'low'), parameters={'count': 'int'})))
         coerced = registry.execute("strict", {"count": "2"}, "trusted_user_command")
         extra = registry.execute("strict", {"count": 2, "other": True}, "trusted_user_command")
         assert coerced["error_type"] == "argument_validation_error"
@@ -196,11 +203,11 @@ class TestToolRegistry:
         def handler(mode: str = "safe") -> str:
             return mode
 
-        registry.register(ToolRegistration(
-            safety=CapabilitySafetySchema("enum_tool", "local_builtin", "trusted", "low"),
-            handler=handler,
-            parameters={"mode": {"type": "str", "enum": ["safe", "fast"]}},
-        ))
+        class FakeTool20(BaseTool):
+
+            def _run(self, mode: str='safe') -> str:
+                return mode
+        registry.register(FakeTool20(ToolDefinition(safety=CapabilitySafetySchema('enum_tool', 'local_builtin', 'trusted', 'low'), parameters={'mode': {'type': 'str', 'enum': ['safe', 'fast']}})))
         result = registry.execute("enum_tool", {"mode": "dangerous"}, "trusted_user_command")
         assert result["ok"] is False
         assert result["issues"][0]["code"] == "enum"
@@ -212,28 +219,11 @@ class TestToolRegistry:
         def handler(**params):
             return params
 
-        registry.register(ToolRegistration(
-            safety=CapabilitySafetySchema("mcp_nested", "remote_mcp", "untrusted", "low"),
-            handler=handler,
-            parameters={
-                "request": {"type": "dict", "required": True},
-            },
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "request": {
-                        "type": "object",
-                        "properties": {
-                            "limit": {"type": "integer", "minimum": 1},
-                        },
-                        "required": ["limit"],
-                        "additionalProperties": False,
-                    },
-                },
-                "required": ["request"],
-                "additionalProperties": False,
-            },
-        ))
+        class FakeTool21(BaseTool):
+
+            def _run(self, **params):
+                return params
+        registry.register(FakeTool21(ToolDefinition(safety=CapabilitySafetySchema('mcp_nested', 'remote_mcp', 'untrusted', 'low'), parameters={'request': {'type': 'dict', 'required': True}}, input_schema={'type': 'object', 'properties': {'request': {'type': 'object', 'properties': {'limit': {'type': 'integer', 'minimum': 1}}, 'required': ['limit'], 'additionalProperties': False}}, 'required': ['request'], 'additionalProperties': False})))
         missing = registry.execute(
             "mcp_nested", {"request": {}}, "trusted_user_command",
         )

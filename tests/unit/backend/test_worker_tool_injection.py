@@ -1,6 +1,8 @@
 """工具注册、发现与分层注入契约测试（离线，无外部 API）。"""
 from __future__ import annotations
 
+from aiive.tools.base import BaseTool, DatabaseTool
+
 import pytest
 from pydantic import ValidationError
 
@@ -21,7 +23,7 @@ from aiive.task_runtime.tool_injection import (
 )
 from aiive.tools.registry import (
     CapabilitySafetySchema,
-    ToolRegistration,
+    ToolDefinition,
     ToolRegistry,
     get_tool_registry,
 )
@@ -58,18 +60,12 @@ def _task(db_session, scope: dict, goal: str = "发现并使用工具"):
     )
 
 
-def _probe_registration(description: str = "probe tool") -> ToolRegistration:
-    return ToolRegistration(
-        safety=CapabilitySafetySchema(
-            capability_id="probe_tool",
-            definition_source="local_builtin",
-            definition_trust_level="trusted",
-            risk_level="low",
-        ),
-        handler=lambda **_: {"ok": True},
-        description=description,
-        parameters={"query": {"type": "str", "required": True}},
-    )
+def _probe_registration(description: str = "probe tool") -> ToolDefinition:
+    class FakeTool24(BaseTool):
+
+        def _run(self, **_):
+            return {'ok': True}
+    return FakeTool24(ToolDefinition(safety=CapabilitySafetySchema(capability_id='probe_tool', definition_source='local_builtin', definition_trust_level='trusted', risk_level='low'), description=description, parameters={'query': {'type': 'str', 'required': True}}))
 
 
 def test_catalog_is_lightweight_and_definition_is_complete() -> None:

@@ -12,10 +12,12 @@ from aiive.desktop.protocol import definition_for
 from aiive.desktop.schemas import DesktopCapability
 from aiive.tools.registry import (
     CapabilitySafetySchema,
-    ToolRegistration,
+    ToolDefinition,
     ToolRegistry,
     get_tool_registry,
 )
+
+from aiive.tools.base import BaseTool, CancellationPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -51,16 +53,10 @@ def _schema_parameters(schema: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _proxy_handler(node_id: str, capability: DesktopCapability):
-    def handler(**params: Any) -> Any:
-        return desktop_connection_manager.dispatch_sync(
-            node_id,
-            capability.name,
-            params,
-            capability.timeout_seconds,
-        )
-
-    return handler
+class DesktopTool(BaseTool):
+    def _run(self, **params: Any) -> Any:
+        return desktop_connection_manager.dispatch_sync(self.executor_node_id, self.safety.capability_id,
+                                                        params, self.safety.timeout_seconds)
 
 
 def build_registry_for_thread(
@@ -89,7 +85,7 @@ def build_registry_for_thread(
                 node.id, capability.name,
             )
             continue
-        registry.register(ToolRegistration(
+        registry.register(DesktopTool(ToolDefinition(
             safety=CapabilitySafetySchema(
                 capability_id=capability.name,
                 definition_source="desktop_node",
@@ -105,11 +101,12 @@ def build_registry_for_thread(
                 timeout_seconds=definition.timeout_seconds,
                 effect_mode=definition.effect_mode,
             ),
-            handler=_proxy_handler(node.id, capability),
             description=f"[桌面:{node.name}] {definition.description}",
             parameters=_schema_parameters(definition.input_schema or {}),
             input_schema=definition.input_schema or {},
             executor_kind="desktop_node",
             executor_node_id=node.id,
-        ))
+            cancellation_policy=CancellationPolicy.REMOTE if capability.name == "desktop_exec" and capability.cancellation_policy == "remote" else CancellationPolicy.NONE,
+            supports_reconciliation=True,
+        )))
     return registry

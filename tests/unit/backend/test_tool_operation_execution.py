@@ -34,6 +34,7 @@ def operation_session_factory(tmp_path, monkeypatch):
     )
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
+    monkeypatch.setattr("aiive.db.base.SessionLocal", factory)
     monkeypatch.setattr("aiive.tools.operation_executor.SessionLocal", factory)
     monkeypatch.setattr("aiive.worker.outbox_worker.SessionLocal", factory)
     monkeypatch.setattr("aiive.tools.builtin_tools.SessionLocal", factory)

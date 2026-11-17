@@ -25,6 +25,9 @@ from aiive.mcp.runtime_client import (
     get_runtime_client,
 )
 
+from aiive.tools.base import BaseTool
+from aiive.tools.registry import ToolDefinition
+
 logger = logging.getLogger(__name__)
 
 # 注册进 ToolRegistry 的 MCP 工具的单次调用超时（秒）
@@ -97,25 +100,16 @@ def _input_schema_to_parameters(input_schema: dict[str, Any]) -> dict[str, Any]:
     return parameters
 
 
-def _make_tool_handler(db_capability_id: str, tool_name: str):
-    """构造调用真实 MCP 运行时的工具 handler 闭包。
+class MCPTool(BaseTool):
+    def __init__(self, definition: ToolDefinition, db_capability_id: str, tool_name: str):
+        super().__init__(definition)
+        self.db_capability_id = db_capability_id
+        self.tool_name = tool_name
 
-    返回值统一包一层 untrusted 标记；失败时不抛异常，如实返回 ok=False。
-    """
-
-    def _handler(**params: Any) -> dict[str, Any]:
-        client = get_runtime_client()
-        result: MCPToolResult = client.call_tool(
-            db_capability_id, tool_name, params, timeout=MCP_TOOL_TIMEOUT_SECONDS,
-        )
-        return {
-            "ok": result.ok,
-            "result": result.result,
-            "error": result.error,
-            "untrusted": True,
-        }
-
-    return _handler
+    def _run(self, **params: Any) -> dict[str, Any]:
+        result: MCPToolResult = get_runtime_client().call_tool(
+            self.db_capability_id, self.tool_name, params, timeout=MCP_TOOL_TIMEOUT_SECONDS)
+        return {"ok": result.ok, "result": result.result, "error": result.error, "untrusted": True}
 
 
 def register_capability_tools(
@@ -140,7 +134,7 @@ def register_capability_tools(
     返回:
         注册的 capability_id 列表
     """
-    from aiive.tools.registry import CapabilitySafetySchema, ToolRegistration
+    from aiive.tools.registry import CapabilitySafetySchema
 
     registered: list[str] = []
     for tool in tools:
@@ -176,15 +170,14 @@ def register_capability_tools(
         description = (
             f"[MCP:{capability_name}] {str(tool.get('description', '')).strip()}"
         ).strip()
-        registry.register(ToolRegistration(
+        registry.register(MCPTool(ToolDefinition(
             safety=safety,
-            handler=_make_tool_handler(db_capability_id, tool_name),
             description=description,
             parameters=_input_schema_to_parameters(
                 tool.get("input_schema") or {},
             ),
             input_schema=tool.get("input_schema") or {},
-        ))
+        ), db_capability_id, tool_name))
         registered.append(cap_id)
     logger.info(
         "MCP 能力已注册进 ToolRegistry: %s tools=%d", capability_name, len(registered),

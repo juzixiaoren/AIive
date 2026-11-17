@@ -4,6 +4,8 @@
 使用 SQLite 内存数据库 + 独立 session，测试后自动清理。
 """
 
+from tests.tool_helpers import invoke_test_tool, tool_method
+
 import tempfile
 import shutil
 import uuid
@@ -2516,16 +2518,16 @@ def test_api_and_tool_use_same_mode_selector_rules():
     from pydantic import ValidationError
 
     from aiive.api.routes_forget import ForgetRequest
-    from aiive.tools.forget_tool import handle_forget
+    from aiive.tools.forget_tool import ForgetTool as handle_forget
 
     with pytest.raises(ValidationError):
         ForgetRequest(mode="memory_only", thread_id="t")
     with pytest.raises(ValidationError):
         ForgetRequest(mode="everywhere", memory_ids=["m"], thread_id="t")
 
-    out = handle_forget(mode="memory_only", thread_id="t")
+    out = invoke_test_tool(handle_forget, mode="memory_only", thread_id="t")
     assert out["ok"] is False
-    out2 = handle_forget(mode="history_only", memory_ids=["m"])
+    out2 = invoke_test_tool(handle_forget, mode="history_only", memory_ids=["m"])
     assert out2["ok"] is False
 
 

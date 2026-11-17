@@ -9,6 +9,8 @@
 6. 相同输入产生一致的路由（稳定性）
 """
 
+from aiive.tools.base import BaseTool, DatabaseTool
+
 import os
 import sys
 import json
@@ -431,7 +433,7 @@ class TestLocalToolArgumentRetry:
     @staticmethod
     def _registry_and_tools(calls: list[int]):
         from aiive.tools.langchain_adapter import build_langchain_tools
-        from aiive.tools.registry import CapabilitySafetySchema, ToolRegistration, ToolRegistry
+        from aiive.tools.registry import CapabilitySafetySchema, ToolDefinition, ToolRegistry
 
         registry = ToolRegistry()
 
@@ -439,14 +441,12 @@ class TestLocalToolArgumentRetry:
             calls.append(count)
             return str(count)
 
-        registry.register(ToolRegistration(
-            safety=CapabilitySafetySchema(
-                "count_items", "local_builtin", "trusted", "low",
-            ),
-            handler=count_items,
-            description="Count items",
-            parameters={"count": "int"},
-        ))
+        class FakeTool7(BaseTool):
+
+            def _run(self, count: int) -> str:
+                calls.append(count)
+                return str(count)
+        registry.register(FakeTool7(ToolDefinition(safety=CapabilitySafetySchema('count_items', 'local_builtin', 'trusted', 'low'), description='Count items', parameters={'count': 'int'})))
         return registry, build_langchain_tools(registry)
 
     def test_invalid_arguments_are_corrected_before_execution(self):

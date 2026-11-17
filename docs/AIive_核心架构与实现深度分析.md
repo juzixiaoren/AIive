@@ -6,6 +6,12 @@
 
 > 阅读约定：本文把“源码明确实现”“由源码可推导的行为”“静态审计风险”“未能证明的能力”分开。描述配置默认值时，不把“代码支持”混同为“当前部署已开启”；源码链接以符号名为准，行号会随提交变化。本文是源码静态分析结论，不是生产环境端到端验收报告。
 
+## 2026-11-17 工具执行架构更新
+
+所有可执行能力迁移为 BaseTool / DatabaseTool 类；ToolRegistry 仅保存工具实例与完整有效定义，普通、审批和 Broker 执行统一进入 ToolExecutor。Direct、TurnOperation、Desktop 适配器保留各自事务与持久化边界；Task 继续由 CapabilityBroker 强制 Scope、审批和资源锁。模型控制协议使用不可执行的 FunctionSpec。
+
+取消意图与结果分离：Turn / Action 的持久取消请求传入独立执行 Context，数据库写入在提交前确认取消并回滚；正在执行的外部工具只能在确认停止后取消，部分副作用与远端不确定结果保持 UNKNOWN / Journal 对账。Forget 的授权交接继续在线程内完成。完整接口、迁移与恢复说明见 [Tool System V2](architecture/tool-system-v2.md)。
+
 ## 阅读导航
 
 - 第一至三部分：全局运行模型、上下文组装与裁剪、Segment/Epoch 持久化压缩。

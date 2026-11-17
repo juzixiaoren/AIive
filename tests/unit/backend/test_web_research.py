@@ -1,13 +1,15 @@
 """公开网页研究工具的 SSRF、解析和 Task Scope 测试。"""
 from __future__ import annotations
 
+from aiive.tools.base import BaseTool, DatabaseTool
+
 import httpx
 import pytest
 
 from aiive.config import settings
 from aiive.control.scope import TaskScope
 from aiive.control.task_policy import TaskPolicyEngine
-from aiive.tools.registry import CapabilitySafetySchema, ToolRegistration
+from aiive.tools.registry import CapabilitySafetySchema, ToolDefinition
 from aiive.web import client as web_client
 from aiive.web.client import WebAccessError, fetch_web_page, search_web
 
@@ -64,12 +66,11 @@ def test_duckduckgo_search_parses_and_unwraps_results(monkeypatch) -> None:
 
 
 def test_network_capability_requires_scope_and_url_host_allowlist() -> None:
-    registration = ToolRegistration(
-        safety=CapabilitySafetySchema(
-            "fetch_web_page", "local_builtin", "trusted", "low", uses_network=True,
-        ),
-        handler=lambda **_kwargs: None,
-    )
+    class FakeTool23(BaseTool):
+
+        def _run(self, **_kwargs):
+            return None
+    registration = FakeTool23(ToolDefinition(safety=CapabilitySafetySchema('fetch_web_page', 'local_builtin', 'trusted', 'low', uses_network=True)))
     denied_scope = TaskScope(
         allowed_capabilities=frozenset({"fetch_web_page"}), allowed_roots=(),
         allowed_hosts=frozenset(), allow_network=False,

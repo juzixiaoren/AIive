@@ -14,6 +14,8 @@
 """
 from __future__ import annotations
 
+from tests.tool_helpers import invoke_test_tool, tool_method
+
 import uuid
 from datetime import timedelta
 from typing import Any
@@ -23,7 +25,7 @@ from sqlalchemy.orm import Session
 
 from aiive.context.run_context import RunContext
 from aiive.db.models import AgentTask, AgentTaskEvent, Event, Thread
-from aiive.runtime.question_tool import answer_goal_question
+from aiive.runtime.question_tool import AnswerGoalQuestionTool as answer_goal_question
 from aiive.task_runtime.goal_decision import GoalDecision, GoalDecisionEngine
 from aiive.task_runtime.goal_plan import GoalStatus, GoalStepStatus
 from aiive.task_runtime.goal_questions import (
@@ -135,7 +137,7 @@ def _open(db: Session, thread_id: str):
 
 def _reply(db: Session, thread_id: str, question_id: str, text: str, turn_id: str) -> dict[str, Any]:
     user_event_id = _user_event(db, thread_id, turn_id, text)
-    return answer_goal_question(
+    return invoke_test_tool(answer_goal_question,
         answer=text,
         question_id=question_id,
         intent="answer",

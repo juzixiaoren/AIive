@@ -3,8 +3,10 @@
 删除、高风险和显式确认工具进入审批；未知工具混入批次时阻止整批次。
 """
 
+from aiive.tools.base import BaseTool, DatabaseTool
+
 from aiive.runtime.policy_engine import PolicyAction, check_tool_calls
-from aiive.tools.registry import CapabilitySafetySchema, ToolRegistration, ToolRegistry
+from aiive.tools.registry import CapabilitySafetySchema, ToolDefinition, ToolRegistry
 
 
 def _register(registry: ToolRegistry, name: str, **safety_kwargs) -> None:
@@ -15,7 +17,11 @@ def _register(registry: ToolRegistry, name: str, **safety_kwargs) -> None:
         definition_trust_level="trusted",
         **safety_kwargs,
     )
-    registry.register(ToolRegistration(safety=schema, handler=lambda **kwargs: "ok"))
+    class FakeTool10(BaseTool):
+
+        def _run(self, **kwargs):
+            return 'ok'
+    registry.register(FakeTool10(ToolDefinition(safety=schema)))
 
 
 class TestPolicyBatchBlocking:

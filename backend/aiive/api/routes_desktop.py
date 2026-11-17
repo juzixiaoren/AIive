@@ -162,7 +162,7 @@ async def desktop_node_socket(websocket: WebSocket, node_id: str) -> None:
                     terminal_status = result.status or ("committed" if result.ok else "failed")
                     accepted = (
                         result.request_id == result.action_id
-                        and terminal_status in {"committed", "failed", "unknown"}
+                        and terminal_status in {"committed", "failed", "cancelled", "unknown"}
                         and (terminal_status == "committed") == result.ok
                     )
                     result_db = SessionLocal()

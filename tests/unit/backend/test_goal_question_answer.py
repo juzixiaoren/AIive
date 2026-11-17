@@ -16,6 +16,8 @@
 """
 from __future__ import annotations
 
+from tests.tool_helpers import invoke_test_tool, tool_method
+
 import uuid
 from datetime import timedelta
 from typing import Any
@@ -24,7 +26,7 @@ from sqlalchemy.orm import Session
 
 from aiive.context.run_context import RunContext
 from aiive.db.models import AgentTask, AgentTaskEvent, Event, Thread
-from aiive.runtime.question_tool import answer_goal_question
+from aiive.runtime.question_tool import AnswerGoalQuestionTool as answer_goal_question
 from aiive.task_runtime.goal_decision import GoalDecision, GoalDecisionEngine
 from aiive.task_runtime.goal_plan import GoalStepStatus
 from aiive.task_runtime.goal_questions import (
@@ -153,7 +155,7 @@ def test_single_pending_question_answer_resumes_step(db_session) -> None:
     assert open_questions[0].message_event_id  # 与真实聊天消息关联
 
     user_event_id = _user_event(db_session, thread_id, "turn-1", "周三下午吧")
-    result = answer_goal_question(
+    result = invoke_test_tool(answer_goal_question,
         answer="周三下午",
         question_id=question_id,
         intent="answer",
@@ -196,7 +198,7 @@ def test_answer_requires_explicit_binding_when_multiple_questions(db_session) ->
     assert {first, second} == {item.question_id for item in _open(db_session, thread_id)}
 
     user_event_id = _user_event(db_session, thread_id, "turn-2", "就按第二个来吧")
-    ambiguous = answer_goal_question(
+    ambiguous = invoke_test_tool(answer_goal_question,
         answer="就按第二个来吧", ctx=_ctx(thread_id, "turn-2", user_event_id),
     )
     assert ambiguous["status"] == "clarification_required"
@@ -207,7 +209,7 @@ def test_answer_requires_explicit_binding_when_multiple_questions(db_session) ->
     assert len(_open(db_session, thread_id)) == 2
 
     # 模型明确指定后才绑定，且只解除对应步骤。
-    bound = answer_goal_question(
+    bound = invoke_test_tool(answer_goal_question,
         answer="B 从下周一上午开始",
         question_id=second,
         intent="answer",
@@ -227,7 +229,7 @@ def test_plain_chat_does_not_link_anything(db_session) -> None:
 
     # 没有待回答问题时的普通聊天：即使模型误调用，也不改任何状态。
     user_event_id = _user_event(db_session, thread_id, "turn-3", "今天天气不错")
-    result = answer_goal_question(
+    result = invoke_test_tool(answer_goal_question,
         answer="今天天气不错", ctx=_ctx(thread_id, "turn-3", user_event_id),
     )
     assert result["status"] == "no_pending_question"
@@ -252,7 +254,7 @@ def test_modify_plan_intent_reuses_goal_service(db_session) -> None:
     revision = _plan(db_session, task_id).revision
 
     user_event_id = _user_event(db_session, thread_id, "turn-4", "改成线上面试吧")
-    result = answer_goal_question(
+    result = invoke_test_tool(answer_goal_question,
         answer="改成线上面试",
         question_id=question_id,
         intent="modify_plan",
@@ -276,7 +278,7 @@ def test_reject_intent_records_refusal_and_skips_step(db_session) -> None:
     question_id = _ask(db_session, task_id, "interview", "你希望周几面试？")["question_id"]
 
     user_event_id = _user_event(db_session, thread_id, "turn-5", "这一步先不做了")
-    result = answer_goal_question(
+    result = invoke_test_tool(answer_goal_question,
         answer="这一步先不做了",
         question_id=question_id,
         intent="reject",
@@ -307,7 +309,7 @@ def test_approval_step_cannot_be_answered_in_chat(db_session) -> None:
     revision = _plan(db_session, task_id).revision
 
     user_event_id = _user_event(db_session, thread_id, "turn-6", "确认")
-    result = answer_goal_question(
+    result = invoke_test_tool(answer_goal_question,
         answer="确认", question_id=question_id, ctx=_ctx(thread_id, "turn-6", user_event_id),
     )
     assert result["status"] == "rejected"
@@ -342,7 +344,7 @@ def test_expired_question_never_modifies_goal(db_session) -> None:
     assert load_question(db_session, question_id).status == "expired"
 
     user_event_id = _user_event(db_session, thread_id, "turn-7", "周三吧")
-    result = answer_goal_question(
+    result = invoke_test_tool(answer_goal_question,
         answer="周三", question_id=question_id, ctx=_ctx(thread_id, "turn-7", user_event_id),
     )
     assert result["status"] == "question_expired"
@@ -361,14 +363,14 @@ def test_duplicate_user_event_does_not_reapply(db_session) -> None:
     question_id = _ask(db_session, task_id, "interview", "你希望周几面试？")["question_id"]
     user_event_id = _user_event(db_session, thread_id, "turn-8", "周三下午")
 
-    first = answer_goal_question(
+    first = invoke_test_tool(answer_goal_question,
         answer="周三下午", question_id=question_id, ctx=_ctx(thread_id, "turn-8", user_event_id),
     )
     assert first["status"] == "applied"
     revision = _plan(db_session, task_id).revision
 
     # 同一 user_event_id 重投（Outbox 重试 / 前端重发）：只回报已处理。
-    second = answer_goal_question(
+    second = invoke_test_tool(answer_goal_question,
         answer="周三下午", question_id=question_id, ctx=_ctx(thread_id, "turn-8", user_event_id),
     )
     assert second["status"] == "already_answered"
@@ -404,14 +406,14 @@ def test_question_survives_restart_and_replay(db_session) -> None:
     assert [item.question_id for item in recovered] == [question_id]
 
     user_event_id = _user_event(db_session, thread_id, "turn-9", "周五上午")
-    result = answer_goal_question(
+    result = invoke_test_tool(answer_goal_question,
         answer="周五上午", question_id=question_id, ctx=_ctx(thread_id, "turn-9", user_event_id),
     )
     assert result["status"] == "applied"
 
     # 已关闭的问题在重启后仍不可重复应用。
     db_session.expire_all()
-    again = answer_goal_question(
+    again = invoke_test_tool(answer_goal_question,
         answer="周五上午", question_id=question_id, ctx=_ctx(thread_id, "turn-9", user_event_id),
     )
     assert again["status"] == "already_answered"

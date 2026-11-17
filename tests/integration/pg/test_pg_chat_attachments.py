@@ -1,5 +1,7 @@
 """Attachment Forget uses real PostgreSQL commit/rollback and shared-reference checks."""
 
+from tests.tool_helpers import invoke_test_tool
+
 import pytest
 from tests.integration.backend.test_chat_attachment_forget import (
     test_attachment_scrub_verify_and_post_commit_delete as _scrub_case,
@@ -122,5 +124,5 @@ def test_pg_vision_releases_forget_lock_and_rejects_race(
 
     monkeypatch.setattr(LLMClient, "chat", chat)
     with pytest.raises(ValueError, match="attachment_source_changed|task_unavailable"):
-        attachment_tools.read_attachment(aid, ctx=ctx)
+        invoke_test_tool(attachment_tools.ReadAttachmentTool, aid, ctx=ctx)
     assert called == [True]

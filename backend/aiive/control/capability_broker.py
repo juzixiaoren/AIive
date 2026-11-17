@@ -16,12 +16,13 @@ from aiive.db.models import AgentAction, AgentRun, AgentTask, TaskEvidence
 from aiive.desktop.registry_overlay import build_registry_for_thread
 from aiive.mcp.bootstrap import registered_tool_ids
 from aiive.task_runtime.resource_locks import ResourceBusyError, ResourceLockService
-from aiive.tools.registry import ToolRegistration, ToolRegistry
+from aiive.tools.base import BaseTool
+from aiive.tools.registry import ToolRegistry
 
 
 @dataclass(frozen=True)
 class PreparedCapability:
-    registration: ToolRegistration | None
+    registration: BaseTool | None
     decision: ActionPolicyDecision
 
 
@@ -235,46 +236,20 @@ class CapabilityBroker:
 
         release_grant = True
         try:
-            if registration.executor_kind == "desktop_node":
-                from aiive.desktop.connection_manager import DesktopDispatchError, desktop_connection_manager
-
-                try:
-                    return desktop_connection_manager.dispatch_action_sync(
-                        node_id=registration.executor_node_id,
-                        task_id=task.id,
-                        run_id=run.id,
-                        action_id=action.id,
-                        idempotency_key=action.idempotency_key,
-                        arguments_hash=action.arguments_hash,
-                        capability_id=action.capability_id,
-                        params=action.arguments or {},
-                        preconditions=action.preconditions or {},
-                        scope=scope.as_envelope(),
-                        fencing_token=action.execution_token or str(uuid.uuid4()),
-                        timeout_seconds=registration.safety.timeout_seconds or 30,
-                    )
-                except DesktopDispatchError as error:
-                    # ACK/终态可能仍在路上。保留数据库锁直到 Journal 对账或租约
-                    # 到期，不能让另一 Task 立即并发触碰同一资源。
-                    release_grant = False
-                    return {
-                        "ok": False,
-                        "error": str(error),
-                        "error_type": "execution_unknown",
-                        "execution_status": "execution_unknown",
-                    }
-            result = registry.execute_brokered(
-                action.capability_id,
-                action.arguments or {},
-                action.descriptor_hash,
-                RunContext(
-                    thread_id=task.thread_id,
-                    trace_id=task.id,
-                    source="task_runtime",
-                    task_id=task.id,
-                    agent_run_id=run.id,
-                    action_id=action.id,
-                ),
+            from aiive.tools.executor import ToolExecutor
+            result = ToolExecutor(registry).execute(
+                action.capability_id, action.arguments or {}, "task_runtime",
+                RunContext(thread_id=task.thread_id, trace_id=task.id, source="task_runtime",
+                           task_id=task.id, agent_run_id=run.id, action_id=action.id),
+                expected_descriptor_hash=action.descriptor_hash, channel="task_action",
+                authorization={
+                    "node_id": registration.executor_node_id, "task_id": task.id, "run_id": run.id,
+                    "action_id": action.id, "idempotency_key": action.idempotency_key,
+                    "arguments_hash": action.arguments_hash, "capability_id": action.capability_id,
+                    "params": action.arguments or {}, "preconditions": action.preconditions or {},
+                    "scope": scope.as_envelope(), "fencing_token": action.execution_token or str(uuid.uuid4()),
+                    "timeout_seconds": registration.safety.timeout_seconds or 30,
+                },
             )
             if result.get("error_type") == "execution_unknown":
                 release_grant = False

@@ -1,4 +1,8 @@
 """工具审批安全链路回归测试。"""
+
+from tests.tool_helpers import invoke_test_tool, tool_method
+
+from aiive.tools.base import BaseTool, DatabaseTool
 import hashlib
 import json
 from datetime import datetime, timezone
@@ -11,7 +15,7 @@ from aiive.api.routes_approval import ApprovalRespondRequest
 from aiive.db.models import ApprovalRequest, Event, Thread, TurnRecord
 from aiive.runtime.policy_engine import PolicyAction, check_tool_calls
 from aiive.runtime.working_state import WorkingStateService
-from aiive.tools.registry import CapabilitySafetySchema, ToolRegistration, ToolRegistry
+from aiive.tools.registry import CapabilitySafetySchema, ToolDefinition, ToolRegistry
 
 
 def _seed_approval(db, approval_id: str = "approval-1") -> ApprovalRequest:
@@ -64,18 +68,12 @@ def _registry(calls: list[dict[str, str]]) -> ToolRegistry:
         calls.append({"value": value})
         return {"value": value}
 
-    registry.register(ToolRegistration(
-        safety=CapabilitySafetySchema(
-            capability_id="dangerous_tool",
-            definition_source="local_builtin",
-            definition_trust_level="trusted",
-            risk_level="high",
-            requires_confirmation=True,
-            allowed_instruction_sources=["trusted_user_command"],
-            descriptor_hash="descriptor-1",
-        ),
-        handler=handler,
-    ))
+    class FakeTool3(BaseTool):
+
+        def _run(self, value: str) -> dict[str, str]:
+            calls.append({'value': value})
+            return {'value': value}
+    registry.register(FakeTool3(ToolDefinition(safety=CapabilitySafetySchema(capability_id='dangerous_tool', definition_source='local_builtin', definition_trust_level='trusted', risk_level='high', requires_confirmation=True, allowed_instruction_sources=['trusted_user_command'], descriptor_hash='descriptor-1'))))
     return registry
 
 
@@ -198,19 +196,11 @@ def test_descriptor_change_invalidates_approval(db, monkeypatch) -> None:
     registry = _registry(calls)
     registered = registry.get("dangerous_tool")
     assert registered is not None
-    registry.register(ToolRegistration(
-        safety=CapabilitySafetySchema(
-            capability_id="dangerous_tool",
-            definition_source="local_builtin",
-            definition_trust_level="trusted",
-            risk_level="high",
-            requires_confirmation=True,
-            allowed_instruction_sources=["trusted_user_command"],
-            descriptor_hash="descriptor-2",
-        ),
-        handler=registered.handler,
-        description="changed effective tool definition",
-    ))
+    class FakeTool4(BaseTool):
+
+        def _run(self, **arguments):
+            return tool_method(registered)(**arguments)
+    registry.register(FakeTool4(ToolDefinition(safety=CapabilitySafetySchema(capability_id='dangerous_tool', definition_source='local_builtin', definition_trust_level='trusted', risk_level='high', requires_confirmation=True, allowed_instruction_sources=['trusted_user_command'], descriptor_hash='descriptor-2'), description='changed effective tool definition')))
     monkeypatch.setattr(routes_approval, "get_tool_registry", lambda: registry)
 
     response = routes_approval.respond_approval(ApprovalRespondRequest(

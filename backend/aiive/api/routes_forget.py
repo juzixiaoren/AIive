@@ -13,7 +13,12 @@ from aiive.forget.selector_normalizer import (
     MAX_INLINE_SHIELD_TARGETS,
     validate_selector_combination,
 )
-from aiive.tools.forget_tool import handle_forget, handle_forget_status
+from aiive.tools.forget_tool import ForgetTool, ForgetStatusTool
+from aiive.tools.base import ToolExecutionContext
+from aiive.tools.registry import ToolDefinition, CapabilitySafetySchema
+
+def _api_tool(tool_type, name):
+    return tool_type(ToolDefinition(CapabilitySafetySchema(name, "api", "trusted", "high")))
 
 router = APIRouter(prefix="/api/forget", tags=["forget"])
 
@@ -56,7 +61,7 @@ class ForgetRequest(BaseModel):
 @router.post("")
 def forget_endpoint(request: ForgetRequest):
     """执行 Phase 6A Forget Saga；Phase A 成功后才返回。"""
-    result = handle_forget(
+    result = _api_tool(ForgetTool, "forget").execute(ToolExecutionContext("forget"), dict(
         mode=request.mode,
         memory_ids=request.memory_ids or None,
         turn_ids=request.turn_ids or None,
@@ -70,7 +75,7 @@ def forget_endpoint(request: ForgetRequest):
         time_to=request.time_to,
         reason=request.reason,
         requested_by=str(uuid.uuid4()),
-    )
+    ))
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error", "forget failed"))
     return result
@@ -79,7 +84,7 @@ def forget_endpoint(request: ForgetRequest):
 @router.get("/{operation_key}/status")
 def forget_status_endpoint(operation_key: str):
     """查询 forget Operation 的各阶段进度。"""
-    result = handle_forget_status(operation_key=operation_key)
+    result = _api_tool(ForgetStatusTool, "forget_status").execute(ToolExecutionContext("forget_status"), {"operation_key": operation_key})
     if not result.get("ok"):
         raise HTTPException(status_code=404, detail=result.get("error", "not found"))
     return result

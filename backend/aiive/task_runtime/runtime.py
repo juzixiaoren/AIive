@@ -445,6 +445,15 @@ class PersistentTaskRuntime:
             )
             self.db.commit()
             return "continue"
+        # Serialize dispatch intent with cancellation using Task -> Action lock order.
+        locked_task = self.repo.get_task(task.id, for_update=True)
+        if locked_task is None:
+            raise RuntimeError("task_missing")
+        task = locked_task
+        self.db.refresh(action)
+        if task.status == TaskStatus.CANCELLED.value or action.status == ActionStatus.CANCELLED.value:
+            self.db.commit()
+            return "terminal"
         action.execution_run_id = run.id
         action.execution_token = str(uuid.uuid4())
         self.repo.transition_action(action, ActionStatus.DISPATCHED.value)
@@ -455,6 +464,8 @@ class PersistentTaskRuntime:
         refreshed_action = self.db.get(AgentAction, action.id)
         if refreshed_task is None or refreshed_action is None:
             raise RuntimeError("task_or_action_disappeared_after_dispatch")
+        self.db.refresh(refreshed_task)
+        self.db.refresh(refreshed_action)
         task = refreshed_task
         action = refreshed_action
         error_type = str(result.get("error_type", ""))
@@ -495,7 +506,9 @@ class PersistentTaskRuntime:
             self.repo.checkpoint(task.id, reason="execution_unknown", pending_action_refs=[action.id])
             self.db.commit()
             return "blocked"
-        if error_type == "precondition_failed":
+        if error_type == "cancelled":
+            self.repo.transition_action(action, ActionStatus.CANCELLED.value, error="execution_cancelled")
+        elif error_type == "precondition_failed":
             self.repo.transition_action(
                 action, ActionStatus.INVALIDATED.value,
                 error=str(result.get("error", "precondition_failed")),

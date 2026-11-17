@@ -7,7 +7,7 @@
 > - **路径约定**：均相对项目根（`AIive/`），如 `backend/aiive/main.py`、`frontend/src/pages/ChatPage.tsx`
 > - **行号**：基于建图时的代码版本，仅供快速跳转，以实际代码为准
 > - **维护规则**：见文末第 9 节。**新增/删除/移动文件、改 key 符号行号、改表结构后必须同步更新本文档**
-> - 建图日期：2026-10-21；最近更新：2026-11-17（提醒取消终态契约与投递竞态保护、安全描述统一、共享执行/审批 DTO、SSE 生产解析器回归）；2026-11-16 第二轮（退役旧任务分支、共享历史 DTO 与聊天错误契约、删除兼容包装）；同日第一轮（提醒投递单一入口、Main Agent 工具面单一来源、Web/Android 共享 SSE 与 WorkCenter Hook）；之前：2026-11-11（V64.1 全局上下文预算、来源感知溢出与历史 Token 密封；V63.2 WebSocket 重连历史恢复与聊天错误契约统一；V49 单用户认证、V50 目标步骤触发规则 + 主动消息、V51 工具结果回填预算、V52 后台回填统一 + Bash 流式日志、V53 通用计划事件源扩展、V54 安全边界事件注入 + 协作式主动消息、V55 决策标记全流式防泄漏、V56 收件箱溢出与决策串行化、V57 前后台 LLM 串行化 + 目标决策幂等、V58 主动提问与用户回复关联闭环、V59 待回答问题的状态一致性、V60 记忆检索 pg_search BM25、V61 知识库结构感知递归切分、V61.3 Chunker 兜底拆分正确性）
+> - 建图日期：2026-10-21；最近更新：2026-11-17（Tool System V2 类化执行与取消；提醒取消终态契约与投递竞态保护、安全描述统一、共享执行/审批 DTO、SSE 生产解析器回归）；2026-11-16 第二轮（退役旧任务分支、共享历史 DTO 与聊天错误契约、删除兼容包装）；同日第一轮（提醒投递单一入口、Main Agent 工具面单一来源、Web/Android 共享 SSE 与 WorkCenter Hook）；之前：2026-11-11（V64.1 全局上下文预算、来源感知溢出与历史 Token 密封；V63.2 WebSocket 重连历史恢复与聊天错误契约统一；V49 单用户认证、V50 目标步骤触发规则 + 主动消息、V51 工具结果回填预算、V52 后台回填统一 + Bash 流式日志、V53 通用计划事件源扩展、V54 安全边界事件注入 + 协作式主动消息、V55 决策标记全流式防泄漏、V56 收件箱溢出与决策串行化、V57 前后台 LLM 串行化 + 目标决策幂等、V58 主动提问与用户回复关联闭环、V59 待回答问题的状态一致性、V60 记忆检索 pg_search BM25、V61 知识库结构感知递归切分、V61.3 Chunker 兜底拆分正确性）
 
 ---
 
@@ -105,7 +105,7 @@
 | 功能 | 核心文件 | 关联文件 | 测试 |
 |---|---|---|---|
 | 工具注册表 / 安全元数据 / 三态执行入口 | `tools/registry.py` | `tools/builtin_tools.py`、`tools/tool_validation.py` | `test_tool_registry*.py` |
-| 新增/修改内置工具 | `tools/builtin_tools.py`（统一注册入口 + 共享 `_build_safety`/`db_handler`/`require_ctx`；实际 handler 实现见 `builtin_*.py` 领域模块的 `handle_*`） | `tools/registry.py::_build_safety`、`prompts/`（工具说明） | `test_builtin_tools*.py`、`test_builtin_mcp*.py` |
+| 新增/修改内置工具 | `tools/base.py` 的 BaseTool / DatabaseTool 与 `builtin_*.py` 的工具类 | `builtin_tools.py` 注册定义；`executor.py` 统一生命周期 | `test_tool_registry.py`、`test_tool_execution_cancellation.py` |
 | 工具参数校验（Pydantic 动态模型） | `tools/tool_validation.py` | `tools/registry.py::execute` | `test_tool_validation*.py` |
 | 工具策略门控（ALLOW/BLOCK/CONFIRM） | `runtime/policy_engine.py` | `runtime/agent_graph.py::_policy_check`、`control/approval_service.py` | `test_policy*.py` |
 | 审批流（人工确认） | `control/approval_service.py` | `api/routes_approval.py`、`runtime/agent_graph.py::_confirm_node` | `test_approval*.py` |
@@ -348,10 +348,12 @@
 
 ### 3.6 `tools/` — 工具注册表与执行层（核心枢纽）
 
+V2 新增：`base.py`（统一类/Context/取消/结果）、`executor.py`（协调与环境适配器）、`core/function_spec.py`（非执行控制契约）。数据库迁移 `e6f90123b405`；Node 取消实现 `apps/desktop/src/node-host/cancellation.mjs`。
+
 | 文件 | 职责 / 关键符号 |
 |---|---|
-| `registry.py` | `CapabilitySafetySchema` L36（definition_source/trust_level/risk_level/requires_confirmation/writes_external_world/can_delete/uses_network/allowed_instruction_sources/timeout/effect_mode）；`ToolRegistration` L86；`compute_descriptor_hash` L71；`ToolRegistry` L135：`register` L150、`unregister`（卸载，目录即时一致）、`catalog`（轻量目录，不含 Schema）、`search`（本地关键词检索，确定性打分）、`definition`（单工具完整定义）、`snapshot` L197、`scoped` L207、**`execute` L244**（指令来源授权→参数校验→副作用入队/直接执行）、**`execute_approved` L368**（审批后，强制指纹一致）、**`execute_brokered` L436**（Task Action 经 CapabilityBroker）、`_execute_direct` L319（线程池+超时）；单例 `get_tool_registry` L469 |
-| `builtin_tools.py` | 内置工具**注册与组合入口** + 共享机制（第一轮架构重构后）：`register_builtin_tools` L141（统一注册全部 37 工具，逐项 cap_id/handler/desc/params/risk/writes_ext/can_del + effect_mode 映射）；共享机制（_build_safety / db_handler / require_ctx）定义在本模块（单一实现，领域模块复用，不复制装饰器）；其中 SessionLocal 与 db_handler 必须同处 builtin_tools 命名空间——测试与 tests/support.py 会 monkeypatch aiive.tools.builtin_tools.SessionLocal 把会话重定向到隔离测试库。register_builtin_tools 统一注册全部 37 工具；11 个领域模块用公开名 handle_* 实现，本模块以私有别名 _handle_* re-export（见下表），保持对 aiive.tools.builtin_tools 的导入契约完全不变；forget/forget_status 由 forget_tool.py 提供并同样 re-export。依赖方向：领域模块 → builtin_tools（仅 import db_handler/require_ctx），builtin_tools 末尾再 import 领域模块做 re-export；共享符号先于 re-export 定义，故为可安全导入的惰性环（详见 §10）。 |
+| `registry.py` | ToolDefinition、CapabilitySafetySchema；仅注册 BaseTool；catalog/search/definition/snapshot/scoped；execute/execute_approved/execute_brokered 仅转交 ToolExecutor；完整定义指纹包含取消能力、幂等/对账与有效超时 |
+| `builtin_tools.py` | register_builtin_tools 组合全部领域工具类；_build_safety/require_ctx；DatabaseTool 通过执行适配器获得实际执行线程内事务；无 db_handler 或函数 Handler 注册 |
 | `builtin_shell.py` / `local_shell.py` | 本机 Bash（`run_shell`，常驻核心）：`handle_run_shell` → `run_bash`（真实 bash 子进程，`resolve_bash` 按 配置→PATH→Git Bash 路径 探测，找不到返回 `shell_unavailable` 且不回退 cmd/powershell）；stdout/stderr 由 `_pump` 线程边读边写 `StreamingLog`（容量 `shell_max_log_bytes`，默认 8 MiB），内存只留 `shell_output_preview_chars` 预览（输出未超过预览长度时不保留日志文件），结果含 `stdout_bytes`/`capture_truncated`/`stdout_log`/`next_offset`/`next_char_offset`，日志不可用时退化为有界内存并标 `log_error`；超时 `_terminate_tree`（POSIX 进程组 / Windows `taskkill /T`）；`isolated_env` 仅透传白名单变量 |
 | `shell_policy.py` | `classify_shell_command`（只读白名单 + 复合操作符拦截 + git 子命令细分 + 网络命令识别）→ `ShellVerdict(read_only, uses_network, reason)`；`shell_path_violations`（命令内路径须落在 `allowed_roots`，越界 block；`$VAR` 等动态路径降级审批）；供 `control/task_policy.py` 与 `runtime/policy_engine.py` 决定放行/审批/联网拒绝 |
 | `tool_validation.py` | `build_tool_args_model` L150（`create_model(strict=True, extra="forbid")`）；`validate_tool_params` L340 返回可重试 `error_payload()` |
@@ -376,7 +378,7 @@
 | `builtin_runtime_state.py` | `query_rhythm`、`query_attention`、`update_working_state` |
 | `forget_tool.py`（同属内置工具实现，非 `builtin_*` 命名） | `forget`、`forget_status` |
 
-**工具执行三入口**（改执行语义必读）：`execute`（正常 LLM 调用）/ `execute_approved`（人工审批后）/ `execute_brokered`（Task Action 独立执行边界）。读操作直接线程池执行；写外部效应入 Outbox；`executor_kind=desktop_node` 走 `DesktopConnectionManager.dispatch_sync`。
+**统一执行**：三个入口共享 ToolExecutor 校验与执行。DirectAdapter、TurnOperationAdapter、DesktopAdapter 保留实际环境边界；Task 仍先经 CapabilityBroker / Scope / Approval / Resource Lock。取消与迁移见 [Tool System V2](architecture/tool-system-v2.md)。
 
 **38 个内置工具清单**（注册于 `builtin_tools.py::register_builtin_tools` L141 起；handler 实现分布于上表 `builtin_*.py` 领域模块，经 `builtin_tools.py` 末尾 re-export 保持导入契约不变）：
 基础：`echo`、`get_current_time`；本机 Shell：`run_shell`；提醒/任务：`schedule_reminder`、`remind_alert`、`confirm_reminder`、`snooze_reminder`、`list_tasks`、`cancel_task`、`show_notifications`、`dismiss_notifications`；记忆写入：`remember_or_update`、`forget`、`forget_status`、`run_memory_maintenance`；记忆召回：`memory_search`、`memory_timeline`、`memory_event_log`、`history_search`；文件：`safe_delete`、`read_text_file`、`read_document`；知识库：`ingest_document`、`reindex_document`、`search_knowledge`；联网：`web_search`、`fetch_web_page`；MCP：`search_mcp`、`install_mcp_sandbox`、`plan_capability`；自进化：`create_selfdev_plan`、`apply_patch_to_inactive_slot`、`promote_slot`、`rollback_slot`、`run_selfdev_repair`；节奏/注意力：`query_rhythm`、`query_attention`；WorkingState：`update_working_state`。
@@ -957,10 +959,10 @@ POST /api/auth/login（失败统一 invalid_credentials；同 (client, username)
 - 同时实跑 import + register_builtin_tools：成功注册 36 个工具，无 ImportError，证明所有静态环均为惰性（lazy）延迟导入，加载期可安全解析。
 
 ### 10.2 依赖方向（允许方向）
-- 共享机制 _build_safety / db_handler / require_ctx 定义在 tools/builtin_tools.py（单一实现，领域模块复用，不复制装饰器）。
-- 领域模块 builtin_*.py → builtin_tools（仅取 db_handler / require_ctx）。
+- 工具业务实现在 BaseTool / DatabaseTool 类方法中；_build_safety / require_ctx 仅提供注册与上下文辅助。
+- 领域模块按需引用 require_ctx；数据库 Session 由执行适配器在实际线程创建。
 - builtin_tools.py → 领域模块（末尾 re-export）+ 共享机制（本模块定义）。
-- 关键约束：SessionLocal 与 db_handler 必须同处 builtin_tools 命名空间——测试与 tests/support.py 会 monkeypatch aiive.tools.builtin_tools.SessionLocal 把会话重定向到隔离测试库。因此曾尝试的「下沉到独立 _shared 叶子模块」方案已回退（会破坏该 monkeypatch 契约）。
+- SessionLocal 的测试重定向保持在 builtin_tools；生产工具不再通过隐式装饰器属性转交事务。
 - tools/registry.py 仅在 get_tool_registry() 内部延迟 import builtin_tools，不构成加载期环。
 - eval/ 安全门包是纯消费方：eval.replay → tools.registry（仅模块导入）、eval.gate → eval.contracts/replay/models；
   selfdev/promote_rollback 与 supervisor/release_manager → eval.gate（顶层导入，已实测无加载期环）。

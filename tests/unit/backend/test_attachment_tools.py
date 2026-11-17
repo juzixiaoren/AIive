@@ -1,3 +1,5 @@
+
+from tests.tool_helpers import invoke_test_tool
 import uuid
 from contextlib import contextmanager
 
@@ -59,27 +61,27 @@ def attachment(db_session, tmp_path, monkeypatch):
 
 def test_read_directory_scope_integrity_forget(attachment, db_session, monkeypatch):
     row, ctx = attachment
-    listing = tools.list_thread_attachments(query="source contract", ctx=ctx)
+    listing = invoke_test_tool(tools.ListThreadAttachmentsTool, query="source contract", ctx=ctx)
     assert listing["attachments"][0]["attachment_id"] == row.id
-    result = tools.read_attachment(row.id, ctx=ctx)
+    result = invoke_test_tool(tools.ReadAttachmentTool, row.id, ctx=ctx)
     assert result["total_chunks"] > 2
     assert len(result["chunks"]) == 1 and result["chunks"][0]["token_count"] <= 450
     assert result["chunks"][0]["heading_path"] == ("Contract",)
     assert result["next_chunk_index"] == 1
-    query = tools.read_attachment(row.id, query="payment", max_chunks=50, ctx=ctx)
+    query = invoke_test_tool(tools.ReadAttachmentTool, row.id, query="payment", max_chunks=50, ctx=ctx)
     assert len(query["chunks"]) == 2
     with pytest.raises(HTTPException):
-        tools.read_attachment(row.id, ctx=RunContext(thread_id="other", trace_id="x"))
+        invoke_test_tool(tools.ReadAttachmentTool, row.id, ctx=RunContext(thread_id="other", trace_id="x"))
     with pytest.raises(HTTPException):
-        tools.read_attachment("invalid", ctx=ctx)
+        invoke_test_tool(tools.ReadAttachmentTool, "invalid", ctx=ctx)
     row.sha256 = "0" * 64
     with pytest.raises(ValueError, match="bytes_unavailable"):
-        tools.read_attachment(row.id, ctx=ctx)
+        invoke_test_tool(tools.ReadAttachmentTool, row.id, ctx=ctx)
     execute_phase_a_shield(db_session, mode="everywhere", turn_ids=[row.turn_record_id])
     db_session.flush()
-    assert not tools.list_thread_attachments(ctx=ctx)["attachments"]
+    assert not invoke_test_tool(tools.ListThreadAttachmentsTool, ctx=ctx)["attachments"]
     with pytest.raises(HTTPException):
-        tools.read_attachment(row.id, ctx=ctx)
+        invoke_test_tool(tools.ReadAttachmentTool, row.id, ctx=ctx)
 
 
 def test_registration_boundaries():
@@ -125,7 +127,7 @@ def test_original_message_references_and_token_conversion(
         result = convert(messages)
         assert row.id in result[0]["content"]
         assert row.id not in result[1]["content"]
-    assert tools.list_thread_attachments(ctx=ctx)["total"] == 1
+    assert invoke_test_tool(tools.ListThreadAttachmentsTool, ctx=ctx)["total"] == 1
 
 
 def test_worker_progress_checkpoint_resume_and_forget(attachment, db_session):
@@ -141,14 +143,14 @@ def test_worker_progress_checkpoint_resume_and_forget(attachment, db_session):
         task_brief={"initial_input": {"skill_id": "document_processing", "attachment_ids": [row.id]}},
     )
     ctx.task_id = task.id
-    first = tools.read_attachment(row.id, ctx=ctx)
+    first = invoke_test_tool(tools.ReadAttachmentTool, row.id, ctx=ctx)
     total = first["total_chunks"]
     with pytest.raises(ValueError, match="invalid_attachment_progress"):
-        tools.record_attachment_progress(row.id, 2, total, "skip", ctx)
-    saved = tools.record_attachment_progress(
+        invoke_test_tool(tools.RecordAttachmentProgressTool, row.id, 2, total, "skip", ctx)
+    saved = invoke_test_tool(tools.RecordAttachmentProgressTool,
         row.id, 1, total, "section Contract, lines 1 onwards", ctx
     )
-    assert tools.record_attachment_progress(row.id, 1, total, "duplicate", ctx) == saved
+    assert invoke_test_tool(tools.RecordAttachmentProgressTool, row.id, 1, total, "duplicate", ctx) == saved
     assert (
         repo.latest_checkpoint(task.id).state["task_state"]["attachment_processing"][
             row.id
@@ -163,9 +165,9 @@ def test_worker_progress_checkpoint_resume_and_forget(attachment, db_session):
         == 1
     )
     for i in range(1, total):
-        page = tools.read_attachment(row.id, chunk_index=i, ctx=ctx)
+        page = invoke_test_tool(tools.ReadAttachmentTool, row.id, chunk_index=i, ctx=ctx)
         assert page["chunks"][0]["chunk_index"] == i
-        tools.record_attachment_progress(
+        invoke_test_tool(tools.RecordAttachmentProgressTool,
             row.id, i + 1, total, f"processed through {i}", ctx
         )
     assert (
@@ -176,7 +178,7 @@ def test_worker_progress_checkpoint_resume_and_forget(attachment, db_session):
     db_session.flush()
     assert not TaskReadRepository(db_session).task_visible(task)
     with pytest.raises(ValueError, match="task_unavailable"):
-        tools.read_attachment(row.id, ctx=ctx)
+        invoke_test_tool(tools.ReadAttachmentTool, row.id, ctx=ctx)
 
 
 def test_image_calls_vision_without_persisting_base64(
@@ -204,7 +206,7 @@ def test_image_calls_vision_without_persisting_base64(
         return SimpleNamespace(content="red square", model="test-vision")
 
     monkeypatch.setattr(LLMClient, "chat", chat)
-    result = tools.read_attachment(row.id, query="what color?", ctx=ctx)
+    result = invoke_test_tool(tools.ReadAttachmentTool, row.id, query="what color?", ctx=ctx)
     assert "base64," in str(seen) and "what color?" in str(seen)
     assert result["analysis"] == "red square"
     assert "base64" not in str(result)
@@ -212,7 +214,7 @@ def test_image_calls_vision_without_persisting_base64(
     monkeypatch.setattr(settings, "aiive_vision_model", "")
     monkeypatch.setattr(settings, "aiive_llm_vision_enabled", False)
     with pytest.raises(ValueError, match="vision_not_configured"):
-        tools.read_attachment(row.id, ctx=ctx)
+        invoke_test_tool(tools.ReadAttachmentTool, row.id, ctx=ctx)
 
 
 def test_chunk_evidence_remains_available_to_worker(attachment, db_session):
@@ -221,7 +223,7 @@ def test_chunk_evidence_remains_available_to_worker(attachment, db_session):
     import json
 
     row, ctx = attachment
-    result = tools.read_attachment(row.id, query="legal", max_chunks=2, ctx=ctx)
+    result = invoke_test_tool(tools.ReadAttachmentTool, row.id, query="legal", max_chunks=2, ctx=ctx)
     text = json.dumps(result)
     assert len(text) > 1200
     assert guard_tool_output("read_attachment", text).content == text
@@ -257,9 +259,9 @@ def test_runtime_full_processing_and_partial_guard(
         },
     )
     ctx.task_id = task.id
-    page = tools.read_attachment(row.id, ctx=ctx)
+    page = invoke_test_tool(tools.ReadAttachmentTool, row.id, ctx=ctx)
     assert page["total_chunks"] == 2
-    tools.record_attachment_progress(row.id, 1, 2, "First: payment, lines 3", ctx)
+    invoke_test_tool(tools.RecordAttachmentProgressTool, row.id, 1, 2, "First: payment, lines 3", ctx)
     # Simulate a crashed worker and recover through the actual lease reconciler.
     _, run = repo.start_run(task.id, trigger="test")
     run.lease_expires_at = utcnow() - timedelta(minutes=5)
@@ -329,7 +331,7 @@ def test_packer_evicts_reference_with_turn_directory_survives(attachment, db_ses
     assert safe and not candidates.history
     assert row.id not in str(messages)
     assert (
-        tools.list_thread_attachments(ctx=ctx)["attachments"][0]["attachment_id"]
+        invoke_test_tool(tools.ListThreadAttachmentsTool, ctx=ctx)["attachments"][0]["attachment_id"]
         == row.id
     )
 
@@ -364,7 +366,7 @@ def test_query_ranks_sections_and_preserves_pdf_pages(attachment, db_session):
     ref, digest = object_store.put_content_addressed("chat-attachments", data, {})
     row.object_key, row.sha256, row.size = ref.key, digest, len(data)
     row.filename, row.mime = "contract.pdf", "application/pdf"
-    result = tools.read_attachment(row.id, query="liability", ctx=ctx)
+    result = invoke_test_tool(tools.ReadAttachmentTool, row.id, query="liability", ctx=ctx)
     assert result["chunks"][0]["page_start"] == 2
     assert "liability" in result["chunks"][0]["content"]
 

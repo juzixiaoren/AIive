@@ -11,6 +11,8 @@
 """
 from __future__ import annotations
 
+from aiive.tools.base import BaseTool
+
 import logging
 from typing import Any
 
@@ -35,7 +37,7 @@ from aiive.task_runtime.goal_questions import (
     resolve_question,
 )
 from aiive.task_runtime.goal_service import GoalError, GoalService
-from aiive.tools.registry import CapabilitySafetySchema, ToolRegistration, ToolRegistry
+from aiive.tools.registry import CapabilitySafetySchema, ToolDefinition, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -146,127 +148,129 @@ def _closed_result(db: Session, question: PendingQuestion) -> dict[str, Any]:
     }
 
 
-def answer_goal_question(
-    answer: str,
-    question_id: str = "",
-    intent: str = "answer",
-    plan_changes: dict[str, Any] | None = None,
-    ctx: RunContext | None = None,
-) -> dict[str, Any]:
-    if ctx is None or not ctx.thread_id:
-        raise ValueError("answer_goal_question_requires_thread_context")
-    text = (answer or "").strip()
-    if not text:
-        raise ValueError("empty_answer")
-    text = text[:MAX_ANSWER_CHARS]
-    normalized_intent = (intent or "answer").strip() or "answer"
-    if normalized_intent not in {"answer", "modify_plan", "reject"}:
-        return {"status": "rejected", "reason": "intent_invalid"}
+class AnswerGoalQuestionTool(BaseTool):
+    def _run(self,
+        answer: str,
+        question_id: str = "",
+        intent: str = "answer",
+        plan_changes: dict[str, Any] | None = None,
+        ctx: RunContext | None = None,
+    ) -> dict[str, Any]:
+        if ctx is None or not ctx.thread_id:
+            raise ValueError("answer_goal_question_requires_thread_context")
+        text = (answer or "").strip()
+        if not text:
+            raise ValueError("empty_answer")
+        text = text[:MAX_ANSWER_CHARS]
+        normalized_intent = (intent or "answer").strip() or "answer"
+        if normalized_intent not in {"answer", "modify_plan", "reject"}:
+            return {"status": "rejected", "reason": "intent_invalid"}
 
-    db = SessionLocal()
-    try:
-        open_questions = list_open_questions(db, ctx.thread_id)
-        target = None
-        if question_id:
-            target = next(
-                (item for item in open_questions if item.question_id == question_id), None,
-            )
-            if target is None:
-                # 已关闭/已失效的问题：重复投递、目标暂停或步骤被改动后的一律不改计划，
-                # 只回报既有状态（服务端推导，模型无法绕过）。
-                closed = load_question(db, question_id)
-                if closed is not None:
-                    return _closed_result(db, closed)
-                return {
-                    "status": "question_not_open",
-                    "candidates": [_candidate(item) for item in open_questions],
-                    "hint": "给定的 question_id 不在待回答列表中，请核对上下文里的候选。",
-                }
-        elif not open_questions:
-            return {
-                "status": "no_pending_question",
-                "hint": "当前没有待回答的问题：正常回答用户即可，不要强行关联。",
-            }
-        elif len(open_questions) == 1:
-            target = open_questions[0]
-        else:
-            # 多候选且未指明：绝不猜测绑定。
-            return {
-                "status": "clarification_required",
-                "candidates": [_candidate(item) for item in open_questions],
-                "hint": (
-                    "有多个待回答的问题，且当前消息没有指明回答哪一个："
-                    "请先用一句话向用户确认，不要猜测绑定。"
-                ),
-            }
-
-        # target 一定来自 open 列表：失效/过期/已回答的问题在上面的分支就已返回。
-        user_event_id = _user_event_id(db, ctx)
-        # 拒绝路径只回滚本工具自己的写入（保存点），不影响调用方事务。
-        savepoint = db.begin_nested()
+        db = SessionLocal()
         try:
-            outcome = GoalService(db).answer_step_question(
-                target.task_id,
-                target.step_id,
-                answer=text,
-                question_id=target.question_id,
-                user_event_id=user_event_id,
-                intent=normalized_intent,
-                plan_changes=dict(plan_changes or {}) if plan_changes else None,
-            )
-        except GoalError as error:
-            savepoint.rollback()
-            reason = str(error)
-            if reason.startswith("question_"):
-                # 服务端复核发现问题已失效（并发暂停/修改）：只回报状态，不改目标。
-                closed = load_question(db, target.question_id)
-                if closed is not None and not closed.is_open:
-                    return _closed_result(db, closed)
-                detail = reason.split(":", 1)[1] if ":" in reason else reason
+            open_questions = list_open_questions(db, ctx.thread_id)
+            target = None
+            if question_id:
+                target = next(
+                    (item for item in open_questions if item.question_id == question_id), None,
+                )
+                if target is None:
+                    # 已关闭/已失效的问题：重复投递、目标暂停或步骤被改动后的一律不改计划，
+                    # 只回报既有状态（服务端推导，模型无法绕过）。
+                    closed = load_question(db, question_id)
+                    if closed is not None:
+                        return _closed_result(db, closed)
+                    return {
+                        "status": "question_not_open",
+                        "candidates": [_candidate(item) for item in open_questions],
+                        "hint": "给定的 question_id 不在待回答列表中，请核对上下文里的候选。",
+                    }
+            elif not open_questions:
                 return {
-                    "status": "question_stale",
-                    "question_id": target.question_id,
-                    "reason": detail,
-                    "hint": _stale_hint(detail),
+                    "status": "no_pending_question",
+                    "hint": "当前没有待回答的问题：正常回答用户即可，不要强行关联。",
                 }
-            hint = "目标或步骤状态已变化，本次回答没有改动计划。"
-            if reason == "step_requires_approval":
-                hint = "该步骤需要人工审批，请在任务中心走原有审批流程。"
-            return {"status": "rejected", "reason": reason, "hint": hint}
-        except Exception:
-            savepoint.rollback()
-            raise
+            elif len(open_questions) == 1:
+                target = open_questions[0]
+            else:
+                # 多候选且未指明：绝不猜测绑定。
+                return {
+                    "status": "clarification_required",
+                    "candidates": [_candidate(item) for item in open_questions],
+                    "hint": (
+                        "有多个待回答的问题，且当前消息没有指明回答哪一个："
+                        "请先用一句话向用户确认，不要猜测绑定。"
+                    ),
+                }
 
-        created = resolve_question(
-            db,
-            question=target,
-            user_event_id=user_event_id,
-            answer=text,
-            intent=normalized_intent,
-            outcome=outcome,
-        )
-        db.commit()
-        return {
-            "status": "applied" if created else "already_answered",
-            "question_id": target.question_id,
-            "task_id": target.task_id,
-            "step_id": target.step_id,
-            "intent": normalized_intent,
-            "action": outcome.get("action", ""),
-            "user_event_id": user_event_id,
-        }
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
+            # target 一定来自 open 列表：失效/过期/已回答的问题在上面的分支就已返回。
+            user_event_id = _user_event_id(db, ctx)
+            # 拒绝路径只回滚本工具自己的写入（保存点），不影响调用方事务。
+            savepoint = db.begin_nested()
+            try:
+                outcome = GoalService(db).answer_step_question(
+                    target.task_id,
+                    target.step_id,
+                    answer=text,
+                    question_id=target.question_id,
+                    user_event_id=user_event_id,
+                    intent=normalized_intent,
+                    plan_changes=dict(plan_changes or {}) if plan_changes else None,
+                )
+            except GoalError as error:
+                savepoint.rollback()
+                reason = str(error)
+                if reason.startswith("question_"):
+                    # 服务端复核发现问题已失效（并发暂停/修改）：只回报状态，不改目标。
+                    closed = load_question(db, target.question_id)
+                    if closed is not None and not closed.is_open:
+                        return _closed_result(db, closed)
+                    detail = reason.split(":", 1)[1] if ":" in reason else reason
+                    return {
+                        "status": "question_stale",
+                        "question_id": target.question_id,
+                        "reason": detail,
+                        "hint": _stale_hint(detail),
+                    }
+                hint = "目标或步骤状态已变化，本次回答没有改动计划。"
+                if reason == "step_requires_approval":
+                    hint = "该步骤需要人工审批，请在任务中心走原有审批流程。"
+                return {"status": "rejected", "reason": reason, "hint": hint}
+            except Exception:
+                savepoint.rollback()
+                raise
+
+            created = resolve_question(
+                db,
+                question=target,
+                user_event_id=user_event_id,
+                answer=text,
+                intent=normalized_intent,
+                outcome=outcome,
+            )
+            db.commit()
+            return {
+                "status": "applied" if created else "already_answered",
+                "question_id": target.question_id,
+                "task_id": target.task_id,
+                "step_id": target.step_id,
+                "intent": normalized_intent,
+                "action": outcome.get("action", ""),
+                "user_event_id": user_event_id,
+            }
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
 
 
 def register_answer_goal_question(registry: ToolRegistry) -> None:
     """把 answer_goal_question 注册到单 Turn 快照（不改变主 Agent 固定工具面）。"""
     if registry.get(ANSWER_QUESTION_TOOL_ID) is not None:
         return
-    registry.register(ToolRegistration(
+    registry.register(AnswerGoalQuestionTool(ToolDefinition(
         safety=CapabilitySafetySchema(
             capability_id=ANSWER_QUESTION_TOOL_ID,
             definition_source="runtime",
@@ -280,7 +284,6 @@ def register_answer_goal_question(registry: ToolRegistry) -> None:
             allowed_instruction_sources=["trusted_user_command"],
             effect_mode="db_transactional",
         ),
-        handler=answer_goal_question,
         description=ANSWER_QUESTION_DESCRIPTION,
         parameters=ANSWER_QUESTION_PARAMETERS,
-    ))
+    )))

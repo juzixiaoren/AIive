@@ -6,6 +6,10 @@ Trace 完整性，以及内部提示词不进入普通聊天界面。
 """
 from __future__ import annotations
 
+from tests.tool_helpers import invoke_test_tool, tool_method
+
+from aiive.tools.base import BaseTool, DatabaseTool
+
 import uuid
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -22,7 +26,7 @@ from aiive.db.models import (
     TurnRecord,
 )
 from aiive.runtime.agent_graph import AgentGraph, AgentGraphResult, _tool_calls_paired
-from aiive.runtime.proactive_tool import NOTIFY_USER_TOOL_ID, _notify_user, register_notify_user
+from aiive.runtime.proactive_tool import NOTIFY_USER_TOOL_ID, NotifyUserTool as _notify_user, register_notify_user
 from aiive.runtime.thread_state import ThreadState
 from aiive.runtime.turn_events import (
     INTERNAL_CONTEXT_HEADER,
@@ -32,7 +36,7 @@ from aiive.runtime.turn_execution import TurnExecutionService, TurnHeartbeat
 from aiive.task_runtime.goal_service import GoalService
 from aiive.task_runtime.repository import TaskRepository
 from aiive.tools.langchain_adapter import build_langchain_tools
-from aiive.tools.registry import CapabilitySafetySchema, ToolRegistration, ToolRegistry
+from aiive.tools.registry import CapabilitySafetySchema, ToolDefinition, ToolRegistry
 from aiive.worker.handlers_goal_triggers import handle_goal_trigger_decision
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome
 
@@ -73,18 +77,13 @@ def _registry(thread_id: str, turn: TurnRecord, on_echo=None):
         return {"ok": True, "echo": text}
 
     registry = ToolRegistry()
-    registry.register(ToolRegistration(
-        safety=CapabilitySafetySchema(
-            capability_id="echo",
-            definition_source="test",
-            definition_trust_level="trusted_core",
-            risk_level="low",
-            effect_mode="db_transactional",
-        ),
-        handler=echo,
-        description="原任务使用的工具",
-        parameters={"text": {"type": "str", "required": True}},
-    ))
+    class FakeTool22(BaseTool):
+
+        def _run(self, text: str, ctx: RunContext | None=None) -> dict:
+            if on_echo is not None:
+                on_echo()
+            return {'ok': True, 'echo': text}
+    registry.register(FakeTool22(ToolDefinition(safety=CapabilitySafetySchema(capability_id='echo', definition_source='test', definition_trust_level='trusted_core', risk_level='low', effect_mode='db_transactional'), description='原任务使用的工具', parameters={'text': {'type': 'str', 'required': True}})))
     register_notify_user(registry)
     tools = build_langchain_tools(
         registry,
@@ -340,7 +339,7 @@ def test_notify_user_persists_single_message_and_resumes_task(db_session, monkey
 
     # 重复调用同一事件：不得重复写消息。
     db_session.commit()
-    duplicate = _notify_user(
+    duplicate = invoke_test_tool(_notify_user,
         content="资料已经整理到一半，需要你看一下。",
         event_id=row_id,
         ctx=RunContext(

@@ -16,6 +16,8 @@
 """
 from __future__ import annotations
 
+from tests.tool_helpers import invoke_test_tool, tool_method
+
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -32,7 +34,7 @@ from aiive.db.models import (
 )
 from aiive.memory.memory_types import LifecycleState
 from aiive.context.run_context import RunContext
-from aiive.tools.builtin_tools import _handle_run_memory_maintenance
+from aiive.tools.builtin_tools import RunMemoryMaintenanceTool as _handle_run_memory_maintenance
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome
 from aiive.worker.outbox_handlers import handle_memory_maintenance
 from aiive.runtime.thread_state import ThreadState
@@ -231,7 +233,7 @@ def test_tool_run_memory_maintenance_enqueues(db):
         turn_id="turn-maintenance",
         turn_record_id="turn-record-maintenance",
     )
-    original = getattr(_handle_run_memory_maintenance, "_aiive_db_handler")
+    original = tool_method(_handle_run_memory_maintenance)
     result = original(db, ctx)
     assert result["enqueued"] is True
     assert result["maintenance_operation_id"] is not None

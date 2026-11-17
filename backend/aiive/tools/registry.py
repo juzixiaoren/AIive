@@ -4,18 +4,19 @@
 
 核心组件:
 - CapabilitySafetySchema: 工具的安全元数据（风险等级、来源、权限等）
-- ToolRegistration: 工具注册条目，包含安全配置和处理函数
+- BaseTool: 无执行状态的工具类实例
 - ToolRegistry: 工具注册表，管理注册、查询、schema 渲染和执行
 """
 
 import concurrent.futures
 import hashlib
-import inspect
 import json
 import logging
 import re
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable
+from typing import Any
+
+from aiive.tools.base import BaseTool, CancellationPolicy
 
 from aiive.config import settings
 from aiive.context.run_context import RunContext
@@ -84,20 +85,18 @@ def compute_descriptor_hash(schema: dict[str, Any]) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-@dataclass
-class ToolRegistration:
-    """工具注册条目，将安全配置与处理函数绑定。
+@dataclass(frozen=True)
+class ToolDefinition:
+    """工具的完整有效定义；注册表不保存可调用 Handler。
 
     属性:
         safety: 安全配置 schema
-        handler: 工具处理函数（可调用对象）
         description: 工具功能描述
         parameters: 参数定义，格式为 {参数名: 类型字符串}
     """
     safety: CapabilitySafetySchema
-    handler: Callable[..., Any]
     description: str = ""
-    # None 表示旧式无显式契约（兼容测试/扩展）；{} 表示明确不接受业务参数。
+    # None 从工具业务方法派生参数模型；{} 明确不接受业务参数。
     parameters: dict[str, Any] | None = None
     # 显式 input_schema 优先于 parameters；注册后保存有效 Canonical Schema。
     input_schema: dict[str, Any] | None = None
@@ -105,9 +104,12 @@ class ToolRegistration:
     # 远端 handler。后者由 Desktop WebSocket 调度，不进入服务端 Outbox 执行器。
     executor_kind: str = "local"
     executor_node_id: str = ""
+    cancellation_policy: CancellationPolicy = CancellationPolicy.NONE
+    idempotent: bool = False
+    supports_reconciliation: bool = False
 
 
-def canonical_schema(reg: ToolRegistration) -> dict[str, Any]:
+def canonical_schema(reg: BaseTool) -> dict[str, Any]:
     from aiive.tools.tool_validation import canonical_tool_schema
     return canonical_tool_schema(reg)
 
@@ -132,7 +134,7 @@ def _search_tokens(query: str) -> list[str]:
     return unique
 
 
-def _parameter_names(reg: ToolRegistration) -> list[str]:
+def _parameter_names(reg: BaseTool) -> list[str]:
     """收集参数名，供检索命中参数维度（不返回任何 Schema 内容）。"""
     names: list[str] = []
     if isinstance(reg.parameters, dict):
@@ -143,7 +145,7 @@ def _parameter_names(reg: ToolRegistration) -> list[str]:
     return names
 
 
-def _score_registration(reg: ToolRegistration, tokens: list[str]) -> int:
+def _score_registration(reg: BaseTool, tokens: list[str]) -> int:
     """确定性的本地相关性打分：id > 描述 > 参数名。"""
     capability_id = reg.safety.capability_id.casefold()
     description = (reg.description or "").casefold()
@@ -166,28 +168,6 @@ def _score_registration(reg: ToolRegistration, tokens: list[str]) -> int:
 # 工具调用辅助函数（在独立线程中执行，支持超时中断）
 # ---------------------------------------------------------------------------
 
-def _invoke_handler(
-    handler: Callable[..., Any],
-    has_ctx: bool,
-    run_context: RunContext | None,
-    params: dict[str, Any],
-) -> Any:
-    """在独立线程中调用工具 handler，隔离超时控制。
-
-    Args:
-        handler: 工具处理函数
-        has_ctx: handler 是否接受 ctx 参数
-        run_context: 运行时上下文
-        params: 工具调用参数
-
-    Returns:
-        handler 的返回值
-    """
-    if has_ctx:
-        return handler(ctx=run_context, **params)
-    return handler(**params)
-
-
 class ToolRegistry:
     """工具注册表：管理所有工具能力的注册、查询和执行。
 
@@ -201,14 +181,17 @@ class ToolRegistry:
 
     def __init__(self):
         """初始化空的工具注册表。"""
-        self._tools: dict[str, ToolRegistration] = {}
+        self._tools: dict[str, BaseTool] = {}
 
-    def register(self, reg: ToolRegistration) -> None:
+    def register(self, reg: BaseTool) -> None:
         """注册工具，保存规范契约并重新计算完整定义指纹。
 
         参数:
             reg: 工具注册条目
         """
+        if not isinstance(reg, BaseTool):
+            raise TypeError("ToolRegistry only accepts BaseTool instances")
+        reg = reg.with_definition(replace(reg.definition, safety=replace(reg.safety, timeout_seconds=reg.safety.timeout_seconds or DEFAULT_TOOL_TIMEOUT)))
         from aiive.tools.tool_validation import canonical_tool_schema
         effective_schema = canonical_tool_schema(reg)
         safety_payload = {
@@ -229,29 +212,33 @@ class ToolRegistry:
             "input_schema": effective_schema,
             "executor_kind": reg.executor_kind,
             "executor_node_id": reg.executor_node_id,
+            "cancellation_policy": reg.definition.cancellation_policy,
+            "idempotent": reg.definition.idempotent,
+            "supports_reconciliation": reg.definition.supports_reconciliation,
         }
-        reg = replace(
-            reg,
+        reg = reg.with_definition(replace(
+            reg.definition,
             input_schema=effective_schema,
             safety=replace(
                 reg.safety,
                 descriptor_hash=compute_descriptor_hash(safety_payload),
             ),
         )
+        )
         self._tools[reg.safety.capability_id] = reg
 
-    def get(self, capability_id: str) -> ToolRegistration | None:
+    def get(self, capability_id: str) -> BaseTool | None:
         """按 ID 查询已注册工具。
 
         参数:
             capability_id: 工具能力标识符
 
         返回:
-            ToolRegistration 或 None
+            BaseTool 或 None
         """
         return self._tools.get(capability_id)
 
-    def registrations(self) -> list[ToolRegistration]:
+    def registrations(self) -> list[BaseTool]:
         """按注册顺序返回全部注册项（只读）。
 
         供 Schema 导出与 LangChain 绑定共用同一份完整契约，避免再从
@@ -262,7 +249,7 @@ class ToolRegistry:
     def snapshot(self) -> "ToolRegistry":
         """复制当前注册映射，供单个 Turn 叠加动态节点工具。
 
-        ToolRegistration 与安全 schema 均视为不可变定义，浅复制映射即可；后续在
+        BaseTool 与安全 schema 均视为不可变定义，浅复制映射即可；后续在
         快照注册或覆盖工具不会影响进程级基础注册表。
         """
         cloned = ToolRegistry()
@@ -336,7 +323,7 @@ class ToolRegistry:
         tokens = _search_tokens(query)
         if not tokens or limit <= 0:
             return []
-        scored: list[tuple[int, str, ToolRegistration]] = []
+        scored: list[tuple[int, str, BaseTool]] = []
         for reg in self._tools.values():
             score = _score_registration(reg, tokens)
             if score > 0:
@@ -365,7 +352,7 @@ class ToolRegistry:
         }
 
     @staticmethod
-    def _catalog_entry(reg: ToolRegistration) -> dict[str, Any]:
+    def _catalog_entry(reg: BaseTool) -> dict[str, Any]:
         """目录条目的唯一定义处，避免各查询接口字段漂移。"""
         return {
             "capability_id": reg.safety.capability_id,
@@ -380,233 +367,27 @@ class ToolRegistry:
             "descriptor_hash": reg.safety.descriptor_hash,
             "executor_kind": reg.executor_kind,
             "executor_node_id": reg.executor_node_id,
+            "cancellation_policy": reg.definition.cancellation_policy,
+            "idempotent": reg.definition.idempotent,
+            "supports_reconciliation": reg.definition.supports_reconciliation,
         }
 
-    def execute(
-        self,
-        capability_id: str,
-        params: dict[str, Any],
-        instruction_source: str,
-        run_context: RunContext | None = None,
-        tool_call_id: str = "",
-    ) -> dict[str, Any]:
-        """执行工具调用，保留来源授权、执行身份和超时守卫。
+    def execute(self, capability_id: str, params: dict[str, Any], instruction_source: str,
+                run_context: RunContext | None = None, tool_call_id: str = "") -> dict[str, Any]:
+        from aiive.tools.executor import ToolExecutor
+        return ToolExecutor(self).execute(capability_id, params, instruction_source, run_context, tool_call_id=tool_call_id)
 
-        AgentGraph 在进入此方法前按安全元数据完成阻止或审批分流。这里继续强制
-        指令来源授权；本地副作用工具还需持久化执行身份并进入 operation 执行链，
-        Desktop Node 工具则由节点 WebSocket 代理执行。
+    def execute_approved(self, capability_id: str, params: dict[str, Any], expected_descriptor_hash: str,
+                         run_context: RunContext, tool_call_id: str = "") -> dict[str, Any]:
+        from aiive.tools.executor import ToolExecutor
+        return ToolExecutor(self).execute(capability_id, params, "trusted_user_command", run_context,
+                                          tool_call_id=tool_call_id, expected_descriptor_hash=expected_descriptor_hash)
 
-        Args:
-            capability_id: 工具能力标识符
-            params: 调用参数
-            instruction_source: 指令来源（如 trusted_user_command）
-            run_context: 运行时上下文（RunContext），注入到 handler 的 ctx 参数
-
-        Returns:
-            包含 ok、result（或 error/timeout）的字典
-        """
-        logger.info("[TRACE:registry] EXECUTE tool=%s params=%s source=%s", capability_id, params, instruction_source)
-        reg = self.get(capability_id)
-        if not reg:
-            logger.warning("[TRACE:registry] UNKNOWN tool=%s", capability_id)
-            return {"ok": False, "error": f"Unknown tool: {capability_id}"}
-
-        if instruction_source not in reg.safety.allowed_instruction_sources:
-            logger.warning("[TRACE:registry] UNAUTHORIZED tool=%s source=%s", capability_id, instruction_source)
-            return {
-                "ok": False,
-                "error": "Instruction source not authorized for this tool",
-                "source": instruction_source,
-                "allowed": reg.safety.allowed_instruction_sources,
-            }
-
-        from aiive.tools.tool_validation import validate_tool_params
-
-        validation = validate_tool_params(reg, params)
-        if not validation.ok:
-            logger.warning(
-                "[TRACE:registry] INVALID_ARGS tool=%s issues=%s",
-                capability_id,
-                [issue.as_dict() for issue in validation.issues],
-            )
-            return validation.error_payload(capability_id)
-        params = validation.validated_params
-
-        timeout = reg.safety.timeout_seconds or DEFAULT_TOOL_TIMEOUT
-        if reg.executor_kind == "desktop_node":
-            return self._execute_direct(reg, params, run_context, timeout, capability_id)
-
-        if reg.safety.writes_external_world or reg.safety.can_delete:
-            if run_context is None or not run_context.turn_record_id or not tool_call_id:
-                return {
-                    "ok": False,
-                    "error_type": "missing_execution_identity",
-                    "error": "副作用工具缺少持久化执行身份，已拒绝执行",
-                }
-            from aiive.tools.operation_executor import enqueue_tool_operation, wait_for_tool_operation
-
-            operation = enqueue_tool_operation(
-                capability_id=capability_id,
-                params=params,
-                descriptor_hash=reg.safety.descriptor_hash,
-                effect_mode=reg.safety.effect_mode,
-                run_context=run_context,
-                tool_call_id=tool_call_id,
-            )
-            return wait_for_tool_operation(operation.id, timeout)
-
-        return self._execute_direct(reg, params, run_context, timeout, capability_id)
-
-    @staticmethod
-    def _execute_direct(
-        reg: ToolRegistration,
-        params: dict[str, Any],
-        run_context: RunContext | None,
-        timeout: float,
-        capability_id: str,
-    ) -> dict[str, Any]:
-        """在线程池执行本地或 Desktop WebSocket 代理 handler。"""
-        has_ctx = "ctx" in inspect.signature(reg.handler).parameters
-        from aiive.worker.outbox_execution_auth import execute_in_tool_thread
-
-        try:
-            result = execute_in_tool_thread(
-                _tool_executor,
-                lambda: _invoke_handler(reg.handler, has_ctx, run_context, params),
-                timeout,
-            )
-            logger.info("[TRACE:registry] SUCCESS tool=%s result_type=%s", capability_id, type(result).__name__)
-            return {"ok": True, "result": result}
-        except concurrent.futures.TimeoutError:
-            # Forget 尚未进入 Phase A 时撤销其启动许可；已进入则等待确定终态。
-            logger.error(
-                "[TRACE:registry] TIMEOUT tool=%s after %.0fs params=%s",
-                capability_id, timeout, params,
-            )
-            remote_unknown = reg.executor_kind == "desktop_node"
-            return {
-                "ok": False,
-                "error": (
-                    f"Desktop tool '{capability_id}' timed out after {timeout:.0f}s; final state is unknown"
-                    if remote_unknown
-                    else f"Tool '{capability_id}' timed out after {timeout:.0f}s"
-                ),
-                "error_type": "execution_unknown" if remote_unknown else "timeout",
-                "execution_status": "execution_unknown" if remote_unknown else "failed",
-                "timeout_seconds": timeout,
-            }
-        except Exception as e:
-            from aiive.worker.outbox_execution_auth import require_execution_authorization
-
-            require_execution_authorization()
-            logger.exception("[TRACE:registry] FAILED tool=%s error=%s", capability_id, e)
-            if reg.executor_kind == "desktop_node" and str(e) in {
-                "desktop_node_disconnected",
-                "desktop_operation_timeout",
-            }:
-                return {
-                    "ok": False,
-                    "error": str(e),
-                    "error_type": "execution_unknown",
-                    "execution_status": "execution_unknown",
-                }
-            return {"ok": False, "error": str(e), "error_type": "execution_failed"}
-
-    def execute_approved(
-        self,
-        capability_id: str,
-        params: dict[str, Any],
-        expected_descriptor_hash: str,
-        run_context: RunContext,
-        tool_call_id: str = "",
-    ) -> dict[str, Any]:
-        """执行已经由服务端审批记录授权的工具调用。
-
-        该入口只跳过重复确认守卫；工具存在性、原始指令来源授权、工具定义
-        指纹和超时保护仍然强制校验。调用方必须先原子领取持久化审批记录。
-        """
-        reg = self.get(capability_id)
-        if reg is None:
-            return {"ok": False, "error": f"未知工具: {capability_id}", "error_type": "unknown_tool"}
-        if "trusted_user_command" not in reg.safety.allowed_instruction_sources:
-            return {
-                "ok": False,
-                "error": "原始用户指令无权调用该工具",
-                "error_type": "unauthorized_source",
-            }
-        if not reg.safety.descriptor_hash or not expected_descriptor_hash:
-            return {
-                "ok": False,
-                "error": "工具审批缺少有效的定义指纹",
-                "error_type": "missing_descriptor_hash",
-            }
-        if reg.safety.descriptor_hash != expected_descriptor_hash:
-            return {
-                "ok": False,
-                "error": "工具定义在审批后发生变化，原审批已失效",
-                "error_type": "descriptor_changed",
-            }
-
-        from aiive.tools.tool_validation import validate_tool_params
-
-        validation = validate_tool_params(reg, params)
-        if not validation.ok:
-            return validation.error_payload(capability_id)
-        params = validation.validated_params
-
-        logger.info("[TRACE:registry] EXECUTE_APPROVED tool=%s", capability_id)
-        timeout = reg.safety.timeout_seconds or DEFAULT_TOOL_TIMEOUT
-        if reg.executor_kind == "desktop_node":
-            return self._execute_direct(reg, params, run_context, timeout, capability_id)
-
-        if reg.safety.writes_external_world or reg.safety.can_delete:
-            if not run_context.turn_record_id or not tool_call_id:
-                return {
-                    "ok": False,
-                    "error_type": "missing_execution_identity",
-                    "error": "审批副作用缺少持久化执行身份，已拒绝执行",
-                }
-            from aiive.tools.operation_executor import enqueue_tool_operation, wait_for_tool_operation
-
-            operation = enqueue_tool_operation(
-                capability_id=capability_id,
-                params=params,
-                descriptor_hash=reg.safety.descriptor_hash,
-                effect_mode=reg.safety.effect_mode,
-                run_context=run_context,
-                tool_call_id=tool_call_id,
-            )
-            return wait_for_tool_operation(operation.id, timeout)
-
-        return self._execute_direct(reg, params, run_context, timeout, capability_id)
-
-    def execute_brokered(
-        self,
-        capability_id: str,
-        params: dict[str, Any],
-        expected_descriptor_hash: str,
-        run_context: RunContext,
-    ) -> dict[str, Any]:
-        """执行已经由 CapabilityBroker 完成 scope/policy 校验的 Task Action。
-
-        此入口不接受模型直接调用，也不复用 Turn-bound ToolOperation 身份；Task
-        Action 自身就是持久化幂等单元。仍强制工具定义指纹和参数 schema，防止
-        审批后工具定义变化或参数漂移。
-        """
-        reg = self.get(capability_id)
-        if reg is None:
-            return {"ok": False, "error": "unknown_capability", "error_type": "unknown_tool"}
-        if not expected_descriptor_hash or reg.safety.descriptor_hash != expected_descriptor_hash:
-            return {"ok": False, "error": "descriptor_changed", "error_type": "descriptor_changed"}
-        from aiive.tools.tool_validation import validate_tool_params
-
-        validation = validate_tool_params(reg, params)
-        if not validation.ok:
-            return validation.error_payload(capability_id)
-        timeout = reg.safety.timeout_seconds or DEFAULT_TOOL_TIMEOUT
-        return self._execute_direct(
-            reg, validation.validated_params, run_context, timeout, capability_id,
-        )
+    def execute_brokered(self, capability_id: str, params: dict[str, Any], expected_descriptor_hash: str,
+                         run_context: RunContext) -> dict[str, Any]:
+        from aiive.tools.executor import ToolExecutor
+        return ToolExecutor(self).execute(capability_id, params, "task_runtime", run_context,
+                                          expected_descriptor_hash=expected_descriptor_hash, channel="task_action")
 
 
 # 全局单例

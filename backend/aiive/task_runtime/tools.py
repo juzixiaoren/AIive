@@ -1,7 +1,8 @@
 """Main Agent 唯一可见的 Persistent Task 元工具。"""
 from __future__ import annotations
 
-from collections.abc import Callable
+from aiive.tools.base import BaseTool
+
 from typing import Any
 
 from aiive.context.run_context import RunContext
@@ -10,7 +11,7 @@ from aiive.task_runtime.repository import TaskRepository
 from aiive.task_runtime.router import normalize_task_brief
 from aiive.task_runtime.schemas import TaskBudget, ActionProposal
 from aiive.task_runtime.goal_plan import GoalPlan
-from aiive.tools.registry import CapabilitySafetySchema, ToolRegistration, ToolRegistry
+from aiive.tools.registry import CapabilitySafetySchema, ToolDefinition, ToolRegistry
 
 
 def _require_context(ctx: RunContext | None) -> RunContext:
@@ -19,105 +20,107 @@ def _require_context(ctx: RunContext | None) -> RunContext:
     return ctx
 
 
-def _delegate_task(
-    goal: str,
-    task_type: str = "general",
-    skill_id: str = "",
-    title: str = "",
-    acceptance_criteria: list[str] | None = None,
-    constraints: list[str] | None = None,
-    allowed_roots: list[str] | None = None,
-    allowed_capabilities: list[str] | None = None,
-    allowed_hosts: list[str] | None = None,
-    allow_network: bool = False,
-    allow_secrets: bool = False,
-    isolation_mode: str = "shared",
-    deterministic_action: dict[str, Any] | None = None,
-    target_node_id: str = "",
-    budgets: dict[str, Any] | None = None,
-    goal_plan: dict[str, Any] | None = None,
-    attachment_ids: list[str] | None = None,
-    ctx: RunContext | None = None,
-) -> dict[str, Any]:
-    run_ctx = _require_context(ctx)
-    if goal_plan is not None:
-        if attachment_ids:
-            raise ValueError("goal_plan_attachment_authorization_not_supported")
-        return _delegate_goal(
-            run_ctx,
-            goal=goal,
-            title=title,
-            raw_plan=goal_plan,
-            acceptance_criteria=acceptance_criteria or [],
-            constraints=constraints or [],
-            budgets=budgets,
-        )
-    selected_skill = None
-    if skill_id:
-        from aiive.skills import get_skill
+class DelegateTaskTool(BaseTool):
+    def _run(self,
+        goal: str,
+        task_type: str = "general",
+        skill_id: str = "",
+        title: str = "",
+        acceptance_criteria: list[str] | None = None,
+        constraints: list[str] | None = None,
+        allowed_roots: list[str] | None = None,
+        allowed_capabilities: list[str] | None = None,
+        allowed_hosts: list[str] | None = None,
+        allow_network: bool = False,
+        allow_secrets: bool = False,
+        isolation_mode: str = "shared",
+        deterministic_action: dict[str, Any] | None = None,
+        target_node_id: str = "",
+        budgets: dict[str, Any] | None = None,
+        goal_plan: dict[str, Any] | None = None,
+        attachment_ids: list[str] | None = None,
+        ctx: RunContext | None = None,
+    ) -> dict[str, Any]:
+        run_ctx = _require_context(ctx)
+        if goal_plan is not None:
+            if attachment_ids:
+                raise ValueError("goal_plan_attachment_authorization_not_supported")
+            return _delegate_goal(
+                run_ctx,
+                goal=goal,
+                title=title,
+                raw_plan=goal_plan,
+                acceptance_criteria=acceptance_criteria or [],
+                constraints=constraints or [],
+                budgets=budgets,
+            )
+        selected_skill = None
+        if skill_id:
+            from aiive.skills import get_skill
 
-        selected_skill = get_skill(skill_id)
-        if selected_skill is None:
-            raise ValueError("skill_not_found")
-    effective_task_type = (
-        selected_skill.default_task_type
-        if selected_skill is not None and task_type == "general"
-        else task_type
-    )
-    if allowed_capabilities:
-        # 调用方显式给出的能力列表是真实授权约束，保持 restricted。
-        effective_capabilities = list(allowed_capabilities)
-        capability_policy = "restricted"
-    else:
-        # Skill 只提供指令与网络需求，不再用技能 profile 缩小可发现能力面。
-        effective_capabilities = list(selected_skill.capabilities) if selected_skill is not None else []
-        capability_policy = "unified"
-    raw_brief = {
-        "acceptance_criteria": acceptance_criteria or [],
-        "constraints": constraints or [],
-        "scope": {
-            "allowed_roots": allowed_roots or [],
-            "allowed_capabilities": effective_capabilities,
-            "capability_policy": capability_policy,
-            "allowed_hosts": allowed_hosts or [],
-            "allow_network": allow_network or bool(
-                selected_skill and selected_skill.requires_network
-            ),
-            "allow_secrets": allow_secrets,
-            "isolation_mode": isolation_mode,
-        },
-        "initial_input": {
-            "attachment_ids": attachment_ids if attachment_ids is not None else [],
-            **({"skill_id": selected_skill.skill_id} if selected_skill else {}),
-            **({"deterministic_action": deterministic_action} if deterministic_action else {}),
-        },
-    }
-    brief = normalize_task_brief(effective_task_type, raw_brief)
-    db = SessionLocal()
-    try:
-        task = TaskRepository(db).create_task(
-            thread_id=run_ctx.thread_id,
-            source_turn_record_id=run_ctx.turn_record_id or None,
-            goal=goal,
-            title=title or None,
-            task_type=effective_task_type,
-            task_brief=brief,
-            budgets=budgets,
-            target_node_id=target_node_id or None,
+            selected_skill = get_skill(skill_id)
+            if selected_skill is None:
+                raise ValueError("skill_not_found")
+        effective_task_type = (
+            selected_skill.default_task_type
+            if selected_skill is not None and task_type == "general"
+            else task_type
         )
-        db.commit()
-        return {
-            "task_id": task.id,
-            "status": task.status,
-            "title": task.title,
-            "skill_id": selected_skill.skill_id if selected_skill else None,
-            "summary": "任务已进入持久执行队列；后续状态、审批和产物可在任务中心查看。",
+        if allowed_capabilities:
+            # 调用方显式给出的能力列表是真实授权约束，保持 restricted。
+            effective_capabilities = list(allowed_capabilities)
+            capability_policy = "restricted"
+        else:
+            # Skill 只提供指令与网络需求，不再用技能 profile 缩小可发现能力面。
+            effective_capabilities = list(selected_skill.capabilities) if selected_skill is not None else []
+            capability_policy = "unified"
+        raw_brief = {
+            "acceptance_criteria": acceptance_criteria or [],
+            "constraints": constraints or [],
+            "scope": {
+                "allowed_roots": allowed_roots or [],
+                "allowed_capabilities": effective_capabilities,
+                "capability_policy": capability_policy,
+                "allowed_hosts": allowed_hosts or [],
+                "allow_network": allow_network or bool(
+                    selected_skill and selected_skill.requires_network
+                ),
+                "allow_secrets": allow_secrets,
+                "isolation_mode": isolation_mode,
+            },
+            "initial_input": {
+                "attachment_ids": attachment_ids if attachment_ids is not None else [],
+                **({"skill_id": selected_skill.skill_id} if selected_skill else {}),
+                **({"deterministic_action": deterministic_action} if deterministic_action else {}),
+            },
         }
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
+        brief = normalize_task_brief(effective_task_type, raw_brief)
+        db = SessionLocal()
+        try:
+            task = TaskRepository(db).create_task(
+                thread_id=run_ctx.thread_id,
+                source_turn_record_id=run_ctx.turn_record_id or None,
+                goal=goal,
+                title=title or None,
+                task_type=effective_task_type,
+                task_brief=brief,
+                budgets=budgets,
+                target_node_id=target_node_id or None,
+            )
+            db.commit()
+            return {
+                "task_id": task.id,
+                "status": task.status,
+                "title": task.title,
+                "skill_id": selected_skill.skill_id if selected_skill else None,
+                "summary": "任务已进入持久执行队列；后续状态、审批和产物可在任务中心查看。",
+            }
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
 
 
 def _delegate_goal(
@@ -172,71 +175,77 @@ def _delegate_goal(
     finally:
         db.close()
 
-def _get_task_status(task_id: str, ctx: RunContext | None = None) -> dict[str, Any]:
-    run_ctx = _require_context(ctx)
-    db = SessionLocal()
-    try:
-        repo = TaskRepository(db)
-        task = repo.get_task(task_id)
-        if task is None or task.thread_id != run_ctx.thread_id:
-            raise ValueError("task_not_found")
-        detail = repo.detail(task, include_events=False)
-        return {
-            "task_id": task.id,
-            "title": task.title,
-            "status": task.status,
-            "usage": task.usage or {},
-            "report": task.report,
-            "pending_approvals": [item for item in detail["approvals"] if item["status"] == "pending"],
-            "artifact_count": len(detail["artifacts"]),
-        }
-    finally:
-        db.close()
+class GetTaskStatusTool(BaseTool):
+    def _run(self, task_id: str, ctx: RunContext | None = None) -> dict[str, Any]:
+        run_ctx = _require_context(ctx)
+        db = SessionLocal()
+        try:
+            repo = TaskRepository(db)
+            task = repo.get_task(task_id)
+            if task is None or task.thread_id != run_ctx.thread_id:
+                raise ValueError("task_not_found")
+            detail = repo.detail(task, include_events=False)
+            return {
+                "task_id": task.id,
+                "title": task.title,
+                "status": task.status,
+                "usage": task.usage or {},
+                "report": task.report,
+                "pending_approvals": [item for item in detail["approvals"] if item["status"] == "pending"],
+                "artifact_count": len(detail["artifacts"]),
+            }
+        finally:
+            db.close()
 
 
-def _cancel_task(task_id: str, ctx: RunContext | None = None) -> dict[str, Any]:
-    run_ctx = _require_context(ctx)
-    db = SessionLocal()
-    try:
-        repo = TaskRepository(db)
-        task = repo.get_task(task_id)
-        if task is None or task.thread_id != run_ctx.thread_id:
-            raise ValueError("task_not_found")
-        task = repo.cancel_task(task_id)
-        db.commit()
-        return {"task_id": task.id, "status": task.status}
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
+
+class CancelTaskTool(BaseTool):
+    def _run(self, task_id: str, ctx: RunContext | None = None) -> dict[str, Any]:
+        run_ctx = _require_context(ctx)
+        db = SessionLocal()
+        try:
+            repo = TaskRepository(db)
+            task = repo.get_task(task_id)
+            if task is None or task.thread_id != run_ctx.thread_id:
+                raise ValueError("task_not_found")
+            task = repo.cancel_task(task_id)
+            db.commit()
+            return {"task_id": task.id, "status": task.status}
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
 
-def _send_task_input(task_id: str, content: str, ctx: RunContext | None = None) -> dict[str, Any]:
-    run_ctx = _require_context(ctx)
-    db = SessionLocal()
-    try:
-        repo = TaskRepository(db)
-        task = repo.get_task(task_id)
-        if task is None or task.thread_id != run_ctx.thread_id:
-            raise ValueError("task_not_found")
-        task = repo.send_input(task_id, content)
-        db.commit()
-        return {"task_id": task.id, "status": task.status, "input_accepted": True}
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
+
+class SendTaskInputTool(BaseTool):
+    def _run(self, task_id: str, content: str, ctx: RunContext | None = None) -> dict[str, Any]:
+        run_ctx = _require_context(ctx)
+        db = SessionLocal()
+        try:
+            repo = TaskRepository(db)
+            task = repo.get_task(task_id)
+            if task is None or task.thread_id != run_ctx.thread_id:
+                raise ValueError("task_not_found")
+            task = repo.send_input(task_id, content)
+            db.commit()
+            return {"task_id": task.id, "status": task.status, "input_accepted": True}
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
 
 
 def _registration(
     capability_id: str,
     description: str,
     parameters: dict[str, Any],
-    handler: Callable[..., Any],
-) -> ToolRegistration:
-    return ToolRegistration(
+    tool_type: type[BaseTool],
+) -> BaseTool:
+    return tool_type(ToolDefinition(
         safety=CapabilitySafetySchema(
             capability_id=capability_id,
             definition_source="task_runtime",
@@ -245,19 +254,20 @@ def _registration(
             allowed_instruction_sources=["trusted_user_command"],
             effect_mode="db_transactional",
         ),
-        handler=handler,
         description=description,
         parameters=parameters,
-    )
+    ))
 
 
-def _list_skills() -> dict[str, Any]:
-    from aiive.skills import list_skills
+class ListSkillsTool(BaseTool):
+    def _run(self) -> dict[str, Any]:
+        from aiive.skills import list_skills
 
-    return {
-        "skills": [skill.as_dict() for skill in list_skills()],
-        "hint": "将选中的 skill_id 传给 delegate_task，服务端会应用最小 capability profile。",
-    }
+        return {
+            "skills": [skill.as_dict() for skill in list_skills()],
+            "hint": "将选中的 skill_id 传给 delegate_task，服务端会应用最小 capability profile。",
+        }
+
 
 
 def build_main_agent_registry() -> ToolRegistry:
@@ -271,7 +281,7 @@ def build_main_agent_registry() -> ToolRegistry:
         "list_skills",
         "列出可用于持久任务的内置 Skill、能力范围和联网要求。",
         {},
-        _list_skills,
+        ListSkillsTool,
     ))
     registry.register(_registration(
         "delegate_task",
@@ -316,17 +326,17 @@ def build_main_agent_registry() -> ToolRegistry:
                 ),
             },
         },
-        _delegate_task,
+        DelegateTaskTool,
     ))
     registry.register(_registration(
         "get_task_status", "查询当前对话所属持久任务的高层状态和报告。",
         {"task_id": {"type": "str", "required": True, "minLength": 1}},
-        _get_task_status,
+        GetTaskStatusTool,
     ))
     registry.register(_registration(
         "cancel_task", "取消当前对话所属的持久任务；不会重复执行已经在途的未知外部副作用。",
         {"task_id": {"type": "str", "required": True, "minLength": 1}},
-        _cancel_task,
+        CancelTaskTool,
     ))
     registry.register(_registration(
         "send_task_input", "向等待用户信息的持久任务追加输入并唤醒它。",
@@ -334,7 +344,7 @@ def build_main_agent_registry() -> ToolRegistry:
             "task_id": {"type": "str", "required": True, "minLength": 1},
             "content": {"type": "str", "required": True, "minLength": 1},
         },
-        _send_task_input,
+        SendTaskInputTool,
     ))
     from aiive.tools.attachment_tools import register_attachment_tools
     register_attachment_tools(registry)

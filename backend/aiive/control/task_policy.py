@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from aiive.control.scope import TaskScope
-from aiive.tools.registry import ToolRegistration
+from aiive.tools.base import BaseTool
 from aiive.tools.shell_policy import (
     SHELL_CAPABILITY_ID,
     classify_shell_command,
@@ -28,7 +28,7 @@ ALWAYS_APPROVE = frozenset({
 class TaskPolicyEngine:
     def decide(
         self,
-        registration: ToolRegistration | None,
+        registration: BaseTool | None,
         scope: TaskScope,
         capability_id: str,
         arguments: dict[str, Any],

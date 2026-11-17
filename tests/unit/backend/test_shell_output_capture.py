@@ -1,6 +1,8 @@
 """Bash 输出流式落盘：完整性、容量上限、续读位置与降级路径（离线，真实 bash）。"""
 from __future__ import annotations
 
+from tests.tool_helpers import invoke_test_tool, tool_method
+
 import json
 from pathlib import Path
 
@@ -10,7 +12,7 @@ from aiive.config import settings
 from aiive.runtime.tool_output_guard import guard_tool_output
 from aiive.runtime.tool_output_store import is_managed_path
 from aiive.tools import local_shell
-from aiive.tools.builtin_files import handle_read_text_file
+from aiive.tools.builtin_files import ReadTextFileTool as handle_read_text_file
 from aiive.tools.local_shell import resolve_bash, run_bash
 
 
@@ -55,7 +57,7 @@ def test_preview_position_continues_with_read_text_file(output_dir, tmp_path) ->
     _require_bash()
     result = run_bash("seq 1 4000", cwd=str(tmp_path), timeout_seconds=60)
     log_path = result["stdout_log"]
-    page = handle_read_text_file(
+    page = invoke_test_tool(handle_read_text_file,
         log_path,
         offset=result["stdout_next_offset"],
         limit=50,

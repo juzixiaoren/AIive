@@ -1,6 +1,8 @@
 """长期目标（Goal）生命周期与事件驱动推进的验收测试（全离线，Fake LLM）。"""
 from __future__ import annotations
 
+from tests.tool_helpers import invoke_test_tool, tool_method
+
 import uuid
 from datetime import datetime, timedelta
 
@@ -539,7 +541,7 @@ def test_delegate_task_accepts_goal_plan_and_keeps_tool_surface(db_session) -> N
         "list_thread_attachments", "read_attachment",
     }
     thread = _thread(db_session)
-    handler = registry.get("delegate_task").handler
+    handler = tool_method(registry.get('delegate_task'))
     result = handler(
         goal="三个月后开始求职，每周三模拟面试",
         goal_plan=_plan(),

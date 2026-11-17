@@ -3,6 +3,8 @@
 验证从任务创建到 Worker 轮询再产生通知事件的完整流程。
 """
 
+from tests.tool_helpers import invoke_test_tool, tool_method
+
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -10,7 +12,7 @@ import pytest
 from aiive.api.routes_notifications import delete_notification, list_notifications
 from aiive.context.run_context import RunContext
 from aiive.db.models import Event, Task, Thread
-from aiive.tools.builtin_tools import _handle_schedule_reminder
+from aiive.tools.builtin_tools import ScheduleReminderTool as _handle_schedule_reminder
 from aiive.runtime.task_manager import TaskManager
 from aiive.worker.task_worker import enqueue_due_tasks
 
@@ -27,7 +29,7 @@ class TestReminderNotificationInbox:
         db_session.flush()
         monkeypatch.setattr(notifications, "broadcast_pending_count", lambda db: None)
 
-        result = _handle_schedule_reminder._aiive_db_handler(
+        result = tool_method(_handle_schedule_reminder)(
             db_session,
             RunContext(thread_id=thread.id, trace_id="notification-trace", source="test"),
             content="喝水",
@@ -251,7 +253,7 @@ class TestDueTaskEnqueue:
 @pytest.mark.parametrize("entry", ["manager", "tool"])
 def test_cancellation_contract_and_atomicity(db_session, status, entry):
     from aiive.db.models import OutboxJob
-    from aiive.tools.builtin_reminders import handle_cancel_task
+    from aiive.tools.builtin_reminders import CancelTaskTool as handle_cancel_task
 
     task = Task(task_type="reminder", title="contract", status=status)
     db_session.add(task)
@@ -268,7 +270,7 @@ def test_cancellation_contract_and_atomicity(db_session, status, entry):
     if status == "not_found":
         db_session.delete(task)
         db_session.flush()
-    cancel = TaskManager(db_session).cancel if entry == "manager" else lambda tid: handle_cancel_task._aiive_db_handler(db_session, tid)
+    cancel = TaskManager(db_session).cancel if entry == "manager" else lambda tid: tool_method(handle_cancel_task)(db_session, tid)
     can_cancel = status in {"pending", "dispatching"}
     snapshot = dict(event.payload)
     with db_session.begin_nested() as transaction:

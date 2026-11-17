@@ -10,6 +10,8 @@ AUTO 摘要去重、SQLite 冲突不回滚整个事务。
 """
 from __future__ import annotations
 
+from tests.tool_helpers import invoke_test_tool, tool_method
+
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -865,10 +867,10 @@ def test_memory_search_uses_unified_retriever_consistent(db):
     db.commit()  # commit 数据，使工具 handler 内的独立 session 可见
 
     # 经 memory_search 工具（_db_handler 装饰器自动开启新 session）
-    from aiive.tools.builtin_tools import _handle_memory_search
+    from aiive.tools.builtin_tools import MemorySearchTool as _handle_memory_search
     from aiive.context.run_context import RunContext
     ctx = RunContext(thread_id="t1", trace_id="tr1")
-    tool_res = _handle_memory_search(ctx=ctx, query="Python", top_k=20)
+    tool_res = invoke_test_tool(_handle_memory_search, ctx=ctx, query="Python", top_k=20)
     assert tool_res["ok"] is True
     result_ids = {r["memory_id"] for r in tool_res["results"]}
     assert mem.id in result_ids, "memory_search 应经 UnifiedRetriever 返回已索引 memory"
@@ -1579,5 +1581,3 @@ def test_rebuild_failure_attempt_count_increments(db):
     run = db.get(RetrievalIndexRun, run_id)
     assert run.status == "failed"
     assert run.failure_attempt_count == 2
-
-

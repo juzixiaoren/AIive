@@ -128,6 +128,9 @@ def interrupt_turn(
         TurnRecord.cancel_requested_at: now,
         TurnRecord.updated_at: now,
     }, synchronize_session=False)
+    if affected == 1:
+        from aiive.tools.operation_executor import request_turn_cancellation
+        request_turn_cancellation(db, turn.id, now)
     db.commit()
     if affected != 1:
         current = db.get(TurnRecord, turn.id)

@@ -22,6 +22,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from collections.abc import Callable
 
 from aiive.config import settings
 from aiive.runtime.tool_output_store import StreamingLog
@@ -115,7 +116,7 @@ def isolated_env() -> dict[str, str]:
     return env
 
 
-def run_bash(command: str, *, cwd: str, timeout_seconds: float | None = None) -> dict[str, Any]:
+def run_bash(command: str, *, cwd: str, timeout_seconds: float | None = None, cancel_check: Callable[[], bool] | None = None) -> dict[str, Any]:
     """在真实 bash 中执行单条命令并返回结构化结果。"""
     started = time.monotonic()
     bash = resolve_bash()
@@ -148,6 +149,7 @@ def run_bash(command: str, *, cwd: str, timeout_seconds: float | None = None) ->
         keep_bytes=preview_chars,
     )
     timed_out = False
+    cancelled = False
     try:
         proc = subprocess.Popen(
             argv,
@@ -170,7 +172,20 @@ def run_bash(command: str, *, cwd: str, timeout_seconds: float | None = None) ->
         for pump in pumps:
             pump.start()
         try:
-            proc.wait(timeout=timeout)
+            deadline = time.monotonic() + timeout
+            while proc.poll() is None:
+                if cancel_check is not None and cancel_check():
+                    cancelled = True
+                    _terminate_tree(proc)
+                    proc.wait(timeout=5)
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                try:
+                    proc.wait(timeout=min(0.1, remaining))
+                except subprocess.TimeoutExpired:
+                    continue
         except subprocess.TimeoutExpired:
             timed_out = True
             _terminate_tree(proc)
@@ -218,6 +233,8 @@ def run_bash(command: str, *, cwd: str, timeout_seconds: float | None = None) ->
     }
     if out_capture.log_error or err_capture.log_error:
         result["log_error"] = out_capture.log_error or err_capture.log_error
+    if cancelled:
+        result.update(ok=False, error_type="execution_unknown", error="Process stopped after cancellation; partial effects require reconciliation", cancelled=True)
     if timed_out:
         result["error_type"] = "timeout"
         result["error"] = f"命令在 {timeout:.0f}s 内未结束，已终止进程树。"
@@ -386,4 +403,3 @@ def _terminate_tree(proc: subprocess.Popen[bytes]) -> None:
             proc.kill()
         except OSError:
             pass
-

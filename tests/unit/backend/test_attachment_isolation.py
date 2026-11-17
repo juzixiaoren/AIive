@@ -1,5 +1,7 @@
 """Explicit Worker grants, cache correctness and the real Vision transaction boundary."""
 
+from tests.tool_helpers import invoke_test_tool
+
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -88,21 +90,21 @@ def test_explicit_allowlist_list_read_progress_and_main(files, db_session):
     assert task.task_brief["initial_input"]["attachment_ids"] == [a.id]
     assert [
         r["attachment_id"]
-        for r in tools.list_thread_attachments(ctx=worker)["attachments"]
+        for r in invoke_test_tool(tools.ListThreadAttachmentsTool, ctx=worker)["attachments"]
     ] == [a.id]
     with pytest.raises(ValueError, match="attachment_not_authorized"):
-        tools.read_attachment(b.id, ctx=worker)
+        invoke_test_tool(tools.ReadAttachmentTool, b.id, ctx=worker)
     with pytest.raises(ValueError, match="attachment_not_authorized"):
-        tools.record_attachment_progress(b.id, 1, 1, "not allowed", ctx=worker)
-    page = tools.read_attachment(a.id, ctx=worker)
-    tools.record_attachment_progress(
+        invoke_test_tool(tools.RecordAttachmentProgressTool, b.id, 1, 1, "not allowed", ctx=worker)
+    page = invoke_test_tool(tools.ReadAttachmentTool, a.id, ctx=worker)
+    invoke_test_tool(tools.RecordAttachmentProgressTool,
         a.id, 1, page["total_chunks"], "First payment lines 3", ctx=worker
     )
     assert {
         r["attachment_id"]
-        for r in tools.list_thread_attachments(ctx=main)["attachments"]
+        for r in invoke_test_tool(tools.ListThreadAttachmentsTool, ctx=main)["attachments"]
     } == {a.id, b.id}
-    assert tools.read_attachment(b.id, ctx=main)["chunks"]
+    assert invoke_test_tool(tools.ReadAttachmentTool, b.id, ctx=main)["chunks"]
     refs = (
         db_session.query(ContentProvenanceRef)
         .filter_by(owner_type="agent_task", owner_id=task.id)
@@ -118,24 +120,24 @@ def test_no_grant_or_wrong_skill_cannot_read(files, db_session, skill):
     task, worker = task_for(db_session, main, skill=skill, goal="attachment " + a.id)
     assert task.task_state["required_attachment_ids"] == []  # Goal text grants nothing.
     if skill == "document_processing":
-        assert tools.list_thread_attachments(ctx=worker)["attachments"] == []
+        assert invoke_test_tool(tools.ListThreadAttachmentsTool, ctx=worker)["attachments"] == []
         error = "attachment_not_authorized"
     else:
         with pytest.raises(ValueError, match="attachment_skill_required"):
-            tools.list_thread_attachments(ctx=worker)
+            invoke_test_tool(tools.ListThreadAttachmentsTool, ctx=worker)
         error = "attachment_skill_required"
     with pytest.raises(ValueError, match=error):
-        tools.read_attachment(a.id, ctx=worker)
+        invoke_test_tool(tools.ReadAttachmentTool, a.id, ctx=worker)
     with pytest.raises(ValueError, match=error):
-        tools.record_attachment_progress(a.id, 1, 1, "x", ctx=worker)
+        invoke_test_tool(tools.RecordAttachmentProgressTool, a.id, 1, 1, "x", ctx=worker)
 
 
 def test_multiple_grants_and_forget_before_cache_access(files, db_session, monkeypatch):
     (a, b), main = files
     task, worker = task_for(db_session, main, [a.id, b.id])
     for row in [a, b]:
-        page = tools.read_attachment(row.id, ctx=worker)
-        tools.record_attachment_progress(
+        page = invoke_test_tool(tools.ReadAttachmentTool, row.id, ctx=worker)
+        invoke_test_tool(tools.RecordAttachmentProgressTool,
             row.id, 1, page["total_chunks"], row.filename, ctx=worker
         )
     event_id, turn_id, aid, bid = a.event_id, a.turn_record_id, a.id, b.id
@@ -155,10 +157,10 @@ def test_multiple_grants_and_forget_before_cache_access(files, db_session, monke
         lambda *args: pytest.fail("permissions must precede cache lookup"),
     )
     with pytest.raises(HTTPException):
-        tools.read_attachment(aid, ctx=main)
+        invoke_test_tool(tools.ReadAttachmentTool, aid, ctx=main)
     for context in [worker, other]:
         with pytest.raises(ValueError, match="task_unavailable"):
-            tools.read_attachment(bid, ctx=context)
+            invoke_test_tool(tools.ReadAttachmentTool, bid, ctx=context)
 
 
 @pytest.mark.parametrize(
@@ -209,7 +211,7 @@ def test_delegate_persists_structured_grant(files, db_session, monkeypatch):
     # Preserve the real test session for inspection after the service's finally.
     monkeypatch.setattr(db_session, "close", lambda: None)
     monkeypatch.setattr(meta, "SessionLocal", lambda: db_session)
-    result = meta._delegate_task(
+    result = invoke_test_tool(meta.DelegateTaskTool,
         goal="summarize this file",
         skill_id="document_processing",
         attachment_ids=[a.id],
@@ -226,12 +228,12 @@ def test_delegate_persists_structured_grant(files, db_session, monkeypatch):
 
 def test_query_zero_match_whitespace_and_eof(files):
     (a, _), main = files
-    result = tools.read_attachment(a.id, query="zzzz_does_not_exist", ctx=main)
+    result = invoke_test_tool(tools.ReadAttachmentTool, a.id, query="zzzz_does_not_exist", ctx=main)
     assert result["chunks"] == [] and result["matched"] is False
-    first = tools.read_attachment(a.id, query=" \n\t ", ctx=main)
+    first = invoke_test_tool(tools.ReadAttachmentTool, a.id, query=" \n\t ", ctx=main)
     assert first["chunks"][0]["chunk_index"] == 0
     with pytest.raises(ValueError, match="invalid_chunk_index"):
-        tools.read_attachment(a.id, chunk_index=first["total_chunks"], ctx=main)
+        invoke_test_tool(tools.ReadAttachmentTool, a.id, chunk_index=first["total_chunks"], ctx=main)
 
 
 def test_cache_hit_sha_and_versions_invalidate(files, monkeypatch):
@@ -253,22 +255,22 @@ def test_cache_hit_sha_and_versions_invalidate(files, monkeypatch):
 
     monkeypatch.setattr(object_store, "get_verified", read)
     monkeypatch.setattr(cache.blocks, "parse_document_blocks", parse)
-    tools.read_attachment(a.id, ctx=main)
-    tools.read_attachment(a.id, chunk_index=1, ctx=main)
+    invoke_test_tool(tools.ReadAttachmentTool, a.id, ctx=main)
+    invoke_test_tool(tools.ReadAttachmentTool, a.id, chunk_index=1, ctx=main)
     assert len(reads) == len(parses) == 1
     monkeypatch.setattr(cache.blocks, "PARSER_VERSION", "next-parser")
-    tools.read_attachment(a.id, ctx=main)
+    invoke_test_tool(tools.ReadAttachmentTool, a.id, ctx=main)
     monkeypatch.setattr(cache.chunker, "CHUNKER_VERSION", "next-chunker")
-    tools.read_attachment(a.id, ctx=main)
+    invoke_test_tool(tools.ReadAttachmentTool, a.id, ctx=main)
     assert len(reads) == len(parses) == 3
     data = b"new document payment terms"
     ref, sha = object_store.put_content_addressed("chat-attachments", data, {})
     a.object_key, a.sha256 = ref.key, sha
-    tools.read_attachment(a.id, ctx=main)
+    invoke_test_tool(tools.ReadAttachmentTool, a.id, ctx=main)
     assert len(reads) == len(parses) == 4
     a.sha256 = "0" * 64
     with pytest.raises(ValueError, match="attachment_bytes_unavailable"):
-        tools.read_attachment(a.id, ctx=main)
+        invoke_test_tool(tools.ReadAttachmentTool, a.id, ctx=main)
 
 
 def test_cache_memory_eviction_oversized_and_singleflight():
@@ -327,11 +329,11 @@ def test_vision_has_no_transaction_and_discards_changed_sources(
 
     monkeypatch.setattr(LLMClient, "chat", chat)
     if change == "none":
-        result = tools.read_attachment(aid, ctx=main)
+        result = invoke_test_tool(tools.ReadAttachmentTool, aid, ctx=main)
         assert result["analysis"] == "red image" and "base64" not in str(result)
     else:
         with pytest.raises(ValueError, match="attachment_source_changed"):
-            tools.read_attachment(aid, ctx=main)
+            invoke_test_tool(tools.ReadAttachmentTool, aid, ctx=main)
 
 
 @pytest.mark.parametrize("finish_all", [False, True])
@@ -345,10 +347,10 @@ def test_structured_required_ids_drive_full_completion(files, db_session, finish
         db_session, main, [a.id, b.id], goal="完整分析所有已授权文档"
     )
     for row in [a, b] if finish_all else [a]:
-        total = tools.read_attachment(row.id, ctx=worker)["total_chunks"]
+        total = invoke_test_tool(tools.ReadAttachmentTool, row.id, ctx=worker)["total_chunks"]
         for i in range(total):
-            tools.read_attachment(row.id, chunk_index=i, ctx=worker)
-            tools.record_attachment_progress(
+            invoke_test_tool(tools.ReadAttachmentTool, row.id, chunk_index=i, ctx=worker)
+            invoke_test_tool(tools.RecordAttachmentProgressTool,
                 row.id,
                 i + 1,
                 total,

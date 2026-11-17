@@ -13,9 +13,11 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
+from aiive.core.function_spec import FunctionSpec, FunctionSpecs
 from aiive.config import settings
 from aiive.core.llm_client import LLMClient
-from aiive.tools.registry import ToolRegistration, ToolRegistry
+from aiive.tools.base import BaseTool
+from aiive.tools.registry import ToolRegistry
 from aiive.tools.tool_validation import canonical_tool_schema, validate_tool_params
 
 
@@ -26,7 +28,7 @@ def build_chat_model(client: LLMClient, *, streaming: bool = False) -> ChatOpenA
                       max_retries=0)  # Infrastructure retries belong to the host/Outbox.
 
 
-def function_definition(registration: ToolRegistration) -> dict[str, Any]:
+def function_definition(registration: BaseTool | FunctionSpec) -> dict[str, Any]:
     description = registration.description
     if registration.safety.writes_external_world:
         description += " (side_effect: true)"
@@ -100,7 +102,7 @@ class CallValidation:
         return [message_to_dict(item) for item in [safe, *self.feedback(message)]]
 
 
-def validate_calls(message: AIMessage, registry: ToolRegistry, *, require_one: bool = False) -> CallValidation:
+def validate_calls(message: AIMessage, registry: ToolRegistry | FunctionSpecs, *, require_one: bool = False) -> CallValidation:
     errors = dict(message.additional_kwargs.get("aiive_call_errors", {}))
     calls = message.tool_calls
     if require_one and len(calls) != 1:

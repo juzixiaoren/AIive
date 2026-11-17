@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+from tests.tool_helpers import invoke_test_tool, tool_method
+
 import threading
 import time
 import uuid
@@ -35,7 +37,7 @@ from aiive.memory.memory_write_service import (
     MemoryWriteService,
 )
 from aiive.tools import forget_tool
-from aiive.tools.forget_tool import handle_forget
+from aiive.tools.forget_tool import ForgetTool as handle_forget
 from sqlalchemy import text
 
 pytestmark = pytest.mark.pg
@@ -524,7 +526,7 @@ def test_handle_forget_waits_for_inflight_write_and_covers_it(
     def forgetter() -> None:
         try:
             started = time.monotonic()
-            out["forget"] = handle_forget(
+            out["forget"] = invoke_test_tool(handle_forget,
                 mode="memory_only", canonical_key=key, reason="tool-case-a",
             )
             out["forget_wait"] = time.monotonic() - started
@@ -593,7 +595,7 @@ def test_handle_forget_exclusive_lock_blocks_writer_until_shield_commit(
 
     def forgetter() -> None:
         try:
-            out["forget"] = handle_forget(
+            out["forget"] = invoke_test_tool(handle_forget,
                 mode="history_only", event_ids=[event_id], reason="tool-case-b",
             )
         except Exception as exc:  # noqa: BLE001
@@ -819,5 +821,3 @@ def test_forget_old_same_transaction_exclusive_then_shared(
     ).one()
     assert (new.lifecycle_state or "") in {"active", "candidate"}
     assert pg_session.query(ForgetOperation).count() == 1
-
-

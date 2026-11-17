@@ -1,6 +1,8 @@
 """工具结果回填预算：落盘、分页、边界、清理。全部离线，不调用外部服务。"""
 from __future__ import annotations
 
+from tests.tool_helpers import invoke_test_tool, tool_method
+
 import json
 import os
 from datetime import datetime, timedelta, timezone
@@ -21,7 +23,7 @@ from aiive.runtime.tool_output_store import (
     is_managed_path,
     save_tool_output,
 )
-from aiive.tools.builtin_files import handle_read_text_file
+from aiive.tools.builtin_files import ReadTextFileTool as handle_read_text_file
 
 
 @pytest.fixture()
@@ -134,7 +136,7 @@ def test_read_document_offloads(output_dir) -> None:
 def test_read_text_file_short_unchanged(output_dir) -> None:
     path = output_dir / "short.txt"
     path.write_text("hello\nworld\n", encoding="utf-8")
-    result = handle_read_text_file(str(path))
+    result = invoke_test_tool(handle_read_text_file, str(path))
     assert result["ok"] is True
     assert result["content"] == "hello\nworld"
     assert result["total_lines"] == 2
@@ -147,15 +149,15 @@ def test_read_text_file_short_unchanged(output_dir) -> None:
 def test_read_text_file_pagination(output_dir) -> None:
     path = output_dir / "many.txt"
     path.write_text("\n".join(f"row-{i}" for i in range(200)), encoding="utf-8")
-    first = handle_read_text_file(str(path), offset=0, limit=10)
+    first = invoke_test_tool(handle_read_text_file, str(path), offset=0, limit=10)
     assert first["lines_read"] == 10
     assert first["next_offset"] == 10
     assert first["has_more"] is True
     assert len(first["content"]) <= 1000
     assert "offset=10" in first["hint"]
-    second = handle_read_text_file(str(path), offset=first["next_offset"], limit=10)
+    second = invoke_test_tool(handle_read_text_file, str(path), offset=first["next_offset"], limit=10)
     assert second["content"].splitlines()[0] == "row-10"
-    last = handle_read_text_file(str(path), offset=195, limit=10)
+    last = invoke_test_tool(handle_read_text_file, str(path), offset=195, limit=10)
     assert last["lines_read"] == 5
     assert last["next_offset"] is None
     assert last["has_more"] is False
@@ -165,13 +167,13 @@ def test_read_text_file_pagination(output_dir) -> None:
 def test_read_text_file_long_line_char_offset(output_dir) -> None:
     path = output_dir / "long.log"
     path.write_text("A" * 5000, encoding="utf-8")
-    page = handle_read_text_file(str(path), max_chars=1000)
+    page = invoke_test_tool(handle_read_text_file, str(path), max_chars=1000)
     assert page["line_truncated"] is True
     assert len(page["content"]) == 1000
     assert page["next_offset"] == 0
     assert page["next_char_offset"] == 1000
     assert "char_offset=1000" in page["hint"]
-    tail = handle_read_text_file(str(path), char_offset=4000, max_chars=1000)
+    tail = invoke_test_tool(handle_read_text_file, str(path), char_offset=4000, max_chars=1000)
     assert tail["content"] == "A" * 1000
 
 
@@ -179,7 +181,7 @@ def test_read_text_file_long_line_char_offset(output_dir) -> None:
 def test_read_text_file_rejects_outside_path(output_dir, tmp_path) -> None:
     outside = tmp_path / "secret.txt"
     outside.write_text("nope", encoding="utf-8")
-    result = handle_read_text_file(str(outside))
+    result = invoke_test_tool(handle_read_text_file, str(outside))
     assert result["ok"] is False
     assert result["error_type"] == "access_denied"
     assert is_managed_path(str(output_dir / "x.log")) is True
@@ -254,7 +256,7 @@ def test_log_survives_restart_and_is_readable(output_dir) -> None:
     guarded = guard_tool_output("mcp_fake", json.dumps({"ok": True, "data": text}))
     log_path = json.loads(guarded.content)["log_path"]
     assert Path(log_path).is_file()
-    page = handle_read_text_file(log_path, offset=0, limit=20, max_chars=800)
+    page = invoke_test_tool(handle_read_text_file, log_path, offset=0, limit=20, max_chars=800)
     assert page["ok"] is True
     assert page["total_lines"] >= 1
     assert page["lines_read"] >= 1
@@ -298,9 +300,9 @@ def test_large_file_pages_past_old_scan_cap(output_dir) -> None:
         for i in range(total):
             handle.write(f"row-{i:06d}-{'x' * 12}\n")
     assert path.stat().st_size > 5 * 1024 * 1024
-    first = handle_read_text_file(str(path), offset=0, limit=5)
+    first = invoke_test_tool(handle_read_text_file, str(path), offset=0, limit=5)
     assert first["total_lines"] == total
-    tail = handle_read_text_file(str(path), offset=total - 3, limit=5)
+    tail = invoke_test_tool(handle_read_text_file, str(path), offset=total - 3, limit=5)
     assert tail["lines_read"] == 3
     assert tail["content"].splitlines()[0] == f"row-{total - 3:06d}-{'x' * 12}"
     assert tail["next_offset"] is None
@@ -315,7 +317,7 @@ def test_page_range_matches_next_offset(output_dir) -> None:
     offset = 0
     seen: list[str] = []
     for _ in range(200):
-        page = handle_read_text_file(str(path), offset=offset, limit=7, max_chars=200)
+        page = invoke_test_tool(handle_read_text_file, str(path), offset=offset, limit=7, max_chars=200)
         page_lines = page["content"].splitlines() if page["content"] else []
         assert page["lines_read"] == len(page_lines)
         assert page["line_range"] == [offset, offset + len(page_lines) - 1]
@@ -337,7 +339,7 @@ def test_symlink_escape_rejected(output_dir, tmp_path) -> None:
         link.symlink_to(outside)
     except (OSError, NotImplementedError):
         pytest.skip("当前平台不支持创建符号链接")
-    result = handle_read_text_file(str(link))
+    result = invoke_test_tool(handle_read_text_file, str(link))
     assert result["ok"] is False
     assert result["error_type"] == "access_denied"
 
@@ -347,7 +349,7 @@ def test_dotdot_traversal_rejected(output_dir, tmp_path) -> None:
     secret = tmp_path / "secret.txt"
     secret.write_text("secret", encoding="utf-8")
     crafted = os.path.join(str(output_dir), "..", "secret.txt")
-    result = handle_read_text_file(crafted)
+    result = invoke_test_tool(handle_read_text_file, crafted)
     assert result["ok"] is False
     assert result["error_type"] == "access_denied"
 
@@ -398,14 +400,14 @@ def test_char_range_semantics(output_dir) -> None:
     path = output_dir / "digits.log"
     digits = "0123456789" * 800  # 8000 字符单行
     path.write_text(digits, encoding="utf-8")
-    page = handle_read_text_file(str(path), max_chars=1000)
+    page = invoke_test_tool(handle_read_text_file, str(path), max_chars=1000)
     assert page["line_truncated"] is True
     assert page["line_range"] == [0, 0]
     assert page["char_range"] == [0, 1000]
     assert page["content"] == digits[page["char_range"][0]:page["char_range"][1]]
     assert page["next_offset"] == page["line_range"][0]
     assert page["next_char_offset"] == page["char_range"][1]
-    nxt = handle_read_text_file(str(path), char_offset=page["next_char_offset"], max_chars=1000)
+    nxt = invoke_test_tool(handle_read_text_file, str(path), char_offset=page["next_char_offset"], max_chars=1000)
     assert nxt["char_range"] == [1000, 2000]
     assert nxt["content"] == digits[1000:2000]
     assert nxt["next_char_offset"] == 2000
@@ -416,7 +418,7 @@ def test_multi_line_page_has_no_char_range(output_dir) -> None:
     path = output_dir / "plain.txt"
     lines = [f"v{i}" for i in range(30)]
     path.write_text("\n".join(lines), encoding="utf-8")
-    page = handle_read_text_file(str(path), offset=3, limit=5)
+    page = invoke_test_tool(handle_read_text_file, str(path), offset=3, limit=5)
     assert "char_range" not in page
     assert page["line_range"] == [3, 7]
     assert page["content"] == "\n".join(lines[3:8])

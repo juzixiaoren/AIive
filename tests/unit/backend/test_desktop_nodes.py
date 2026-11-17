@@ -1,6 +1,8 @@
 """Electron Desktop Node 在线租约与动态工具覆盖层测试。"""
 from __future__ import annotations
 
+from tests.tool_helpers import invoke_test_tool, tool_method
+
 import uuid
 
 import pytest
@@ -133,7 +135,7 @@ def test_registry_overlay_injects_node_tools_with_remote_executor(db_session, mo
     assert "读取本机文件状态" not in readonly.description
     assert "读取目标电脑文件或目录的元数据" in readonly.description
     assert readonly.parameters["path"]["required"] is True
-    assert readonly.handler(path="C:\\Users\\me\\note.txt") == {
+    assert tool_method(readonly)(path="C:\\Users\\me\\note.txt") == {
         "node_id": node_id,
         "capability": "desktop_fs_stat",
         "path": "C:\\Users\\me\\note.txt",
@@ -149,8 +151,8 @@ def test_registry_overlay_injects_node_tools_with_remote_executor(db_session, mo
         deleter.safety.descriptor_hash,
         RunContext(thread_id=thread.id, trace_id="trace-1", source="task_runtime", task_id="task-1"),
     )
-    assert approved["ok"] is True
-    assert approved["result"]["capability"] == "desktop_fs_delete"
+    assert approved["ok"] is False
+    assert approved["error_type"] == "missing_execution_identity"
     monkeypatch.setattr(
         desktop_connection_manager,
         "dispatch_sync",
@@ -164,7 +166,7 @@ def test_registry_overlay_injects_node_tools_with_remote_executor(db_session, mo
         readonly.safety.descriptor_hash,
         RunContext(thread_id=thread.id, trace_id="trace-1", source="task_runtime", task_id="task-1"),
     )
-    assert disconnected["error_type"] == "execution_unknown"
+    assert disconnected["error_type"] == "missing_execution_identity"
 
 
 def test_offline_node_tools_are_not_injected(db_session, monkeypatch) -> None:
@@ -257,3 +259,25 @@ def test_result_cannot_resolve_another_node_or_action() -> None:
         "action-1", node_id="node-1", action_id="action-1", ok=True, result={"ok": True},
     ) is True
     assert pending.event.is_set() is True
+
+
+@pytest.mark.parametrize("advertised", [False, True])
+def test_remote_cancel_policy_requires_node_support(db_session, monkeypatch, advertised):
+    from aiive.desktop.schemas import DesktopCapability
+    from aiive.tools.base import CancellationPolicy
+
+    node_id = str(uuid.uuid4())
+    thread = Thread()
+    db_session.add(thread)
+    db_session.flush()
+    hello = _hello(node_id)
+    hello.capabilities.append(DesktopCapability(
+        name="desktop_exec", description="Execute shell",
+        cancellation_policy="remote" if advertised else "none",
+    ))
+    desktop_node_service.register_online(db_session, hello)
+    monkeypatch.setattr(desktop_connection_manager, "is_connected", lambda _: True)
+    tool = build_registry_for_thread(db_session, thread.id).get("desktop_exec")
+    assert tool.definition.cancellation_policy == (
+        CancellationPolicy.REMOTE if advertised else CancellationPolicy.NONE
+    )

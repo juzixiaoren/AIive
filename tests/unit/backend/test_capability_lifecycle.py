@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+from aiive.tools.base import BaseTool, DatabaseTool
+
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,7 +37,7 @@ from aiive.mcp.bootstrap import mcp_tool_capability_id
 from aiive.mcp.installer import install_sandbox
 from aiive.tools.registry import (
     CapabilitySafetySchema,
-    ToolRegistration,
+    ToolDefinition,
     ToolRegistry,
 )
 
@@ -505,16 +507,11 @@ class TestConsistency:
         assert cap.state == "active"
 
     def test_audit_detects_orphan_registration(self, env) -> None:
-        env.registry.register(ToolRegistration(
-            safety=CapabilitySafetySchema(
-                capability_id="mcp_ghost_tool",
-                definition_source="remote_mcp",
-                definition_trust_level="untrusted",
-                risk_level="low",
-            ),
-            handler=lambda **_: None,
-            description="ghost",
-        ))
+        class FakeTool8(BaseTool):
+
+            def _run(self, **_):
+                return None
+        env.registry.register(FakeTool8(ToolDefinition(safety=CapabilitySafetySchema(capability_id='mcp_ghost_tool', definition_source='remote_mcp', definition_trust_level='untrusted', risk_level='low'), description='ghost')))
         audit = env.service().audit()
         assert any(
             issue["kind"] == "orphan_registration"

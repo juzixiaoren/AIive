@@ -21,7 +21,7 @@ def test_forget_accepts_json_body(monkeypatch):
             "note": "",
         }
 
-    monkeypatch.setattr("aiive.api.routes_forget.handle_forget", fake_handle_forget)
+    monkeypatch.setattr("aiive.api.routes_forget.ForgetTool._run", lambda self, **kwargs: fake_handle_forget(**kwargs))
     client = TestClient(create_app())
 
     response = client.post("/api/forget", json={
@@ -85,7 +85,7 @@ def test_forget_accepts_time_range(monkeypatch):
             "note": "",
         }
 
-    monkeypatch.setattr("aiive.api.routes_forget.handle_forget", fake_handle_forget)
+    monkeypatch.setattr("aiive.api.routes_forget.ForgetTool._run", lambda self, **kwargs: fake_handle_forget(**kwargs))
     client = TestClient(create_app())
 
     response = client.post("/api/forget", json={

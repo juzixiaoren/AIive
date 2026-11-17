@@ -76,8 +76,8 @@ _TYPE_MAP: dict[str, type[Any]] = {
 
 
 def _handler_signature(handler: Any) -> inspect.Signature:
-    """优先读取 ``db_handler`` 保存的原始函数签名。"""
-    target = getattr(handler, "_aiive_db_handler", handler)
+    """读取工具业务方法的类型签名。"""
+    target = handler
     try:
         return inspect.signature(target)
     except (TypeError, ValueError):
@@ -85,7 +85,7 @@ def _handler_signature(handler: Any) -> inspect.Signature:
 
 
 def _handler_type_hints(handler: Any) -> dict[str, Any]:
-    target = getattr(handler, "_aiive_db_handler", handler)
+    target = handler
     try:
         return typing.get_type_hints(target, include_extras=True)
     except (NameError, TypeError):
@@ -155,16 +155,15 @@ def build_tool_args_model(
 ) -> type[BaseModel] | None:
     """从注册信息构建严格参数模型。
 
-    ``parameters is None`` 表示旧式、无显式契约的注册项，保留兼容并跳过模型
-    构建；显式空字典表示工具不接受任何业务参数。
+    ``parameters is None`` 表示从业务方法派生契约；显式参数存在时按元数据构建；显式空字典表示工具不接受任何业务参数。
     """
     parameters = registration.parameters
     if parameters is None:
         return None
 
-    signature = _handler_signature(registration.handler)
+    signature = _handler_signature(registration._run)
     signature_params = signature.parameters
-    type_hints = _handler_type_hints(registration.handler)
+    type_hints = _handler_type_hints(registration._run)
     fields: dict[str, Any] = {}
 
     for name, raw_definition in parameters.items():
@@ -282,14 +281,14 @@ def canonical_tool_schema(registration: Any) -> dict[str, Any]:
         return deepcopy(registration.input_schema)
     model = build_tool_args_model(registration)
     if model is None:
-        signature = _handler_signature(registration.handler)
+        signature = _handler_signature(registration._run)
         parameters = {
             name: {} for name, parameter in signature.parameters.items()
-            if name not in {"ctx", "db", "tool_call_id"}
+            if name not in {"ctx", "db", "tool_call_id", "_execution"}
             and parameter.kind not in {inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL}
         }
         from dataclasses import replace
-        model = build_tool_args_model(replace(registration, parameters=parameters))
+        model = build_tool_args_model(registration.with_definition(replace(registration.definition, parameters=parameters)))
     schema: dict[str, Any] = model.model_json_schema() if model else {"type": "object", "properties": {}}
     for name, metadata in (registration.parameters or {}).items():
         if not isinstance(metadata, dict):

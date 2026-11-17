@@ -83,13 +83,13 @@ class DesktopReconciliationService:
             db.add(receipt)
         mapped = {
             "received": "received", "started": "started",
-            "committed": "committed", "failed": "failed",
+            "committed": "committed", "failed": "failed", "cancelled": "cancelled",
         }.get(entry.status, "unknown")
         receipt.status = mapped
         receipt.result_hash = entry.result_hash or None
         receipt.result_payload = entry.result if isinstance(entry.result, dict) else {"value": entry.result}
         receipt.error_message = entry.error or None
-        if mapped in {"committed", "failed"}:
+        if mapped in {"committed", "failed", "cancelled"}:
             receipt.node_completed_at = utcnow()
         db.flush()
 
@@ -117,6 +117,8 @@ class DesktopReconciliationService:
                 action, ActionStatus.SUCCEEDED.value,
                 payload={"evidence_id": evidence.id, "reconciled": True},
             )
+        elif mapped == "cancelled":
+            repo.transition_action(action, ActionStatus.CANCELLED.value, error="execution_cancelled", payload={"reconciled": True})
         elif mapped == "failed":
             repo.transition_action(
                 action, ActionStatus.FAILED.value,

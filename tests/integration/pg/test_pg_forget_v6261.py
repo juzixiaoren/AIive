@@ -1,4 +1,8 @@
 """V62.6.1 PostgreSQL regression through production handlers and tool executor."""
+
+from tests.tool_helpers import invoke_test_tool, tool_method
+
+from aiive.tools.base import BaseTool, DatabaseTool
 import inspect
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -44,8 +48,8 @@ def test_pg_agent_task_real_pool_forget(pg_sessionmaker, pg_engine, monkeypatch,
     from aiive.task_runtime.agent_executor import TaskAgentExecutor, AgentDecision
     from aiive.task_runtime.repository import TaskRepository
     from aiive.task_runtime.schemas import ActionProposal
-    from aiive.tools.registry import ToolRegistry, ToolRegistration, CapabilitySafetySchema
-    from aiive.tools.forget_tool import handle_forget
+    from aiive.tools.registry import ToolRegistry, ToolDefinition, CapabilitySafetySchema
+    from aiive.tools.forget_tool import ForgetTool as handle_forget
     from aiive.worker import handlers_agent_tasks, outbox_execution_auth as auth
     from aiive.db.forget_models import ForgetOperation
     from tests.integration.pg.test_pg_forget_v626_guard import _running_job
@@ -57,12 +61,14 @@ def test_pg_agent_task_real_pool_forget(pg_sessionmaker, pg_engine, monkeypatch,
 
     def forget_handler():
         worker_threads.append(threading.get_ident())
-        return handle_forget(mode="history_only", thread_id=thread_id, requested_by=cases.uid())
+        return invoke_test_tool(handle_forget, mode="history_only", thread_id=thread_id, requested_by=cases.uid())
 
-    registry.register(ToolRegistration(
-        CapabilitySafetySchema(capability_id="test_forget", definition_source="local_builtin", definition_trust_level="trusted", risk_level="low", allowed_instruction_sources=["task_runtime"], timeout_seconds=2),
-        forget_handler, parameters={},
-    ))
+    class FakeTool6(BaseTool):
+
+        def _run(self):
+            worker_threads.append(threading.get_ident())
+            return invoke_test_tool(handle_forget, mode='history_only', thread_id=thread_id, requested_by=cases.uid())
+    registry.register(FakeTool6(ToolDefinition(CapabilitySafetySchema(capability_id='test_forget', definition_source='local_builtin', definition_trust_level='trusted', risk_level='low', allowed_instruction_sources=['task_runtime'], timeout_seconds=2), parameters={})))
     monkeypatch.setattr(capability_broker, "build_registry_for_thread", lambda *a: registry)
     model_threads = []
 
@@ -112,7 +118,7 @@ def test_pg_agent_task_real_pool_forget(pg_sessionmaker, pg_engine, monkeypatch,
 
 def test_pg_timeout_revokes_late_forget(pg_sessionmaker, pg_engine, monkeypatch):
     from aiive.db.forget_models import ForgetOperation
-    from aiive.tools.forget_tool import handle_forget
+    from aiive.tools.forget_tool import ForgetTool as handle_forget
     from aiive.worker import outbox_execution_auth as auth
 
     monkeypatch.setattr(auth, "get_engine", lambda: pg_engine)
@@ -126,7 +132,7 @@ def test_pg_timeout_revokes_late_forget(pg_sessionmaker, pg_engine, monkeypatch)
     def delayed():
         ready.set()
         assert proceed.wait(5)
-        outcomes.append(handle_forget(mode="history_only", thread_id=thread_id, requested_by=cases.uid()))
+        outcomes.append(invoke_test_tool(handle_forget, mode="history_only", thread_id=thread_id, requested_by=cases.uid()))
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         with auth.shared_execution_authorization():

@@ -6,6 +6,8 @@
 - CoreMemoryProjection.build_blocks / load_core_memory（含丢失投影后从 memory_records 重建）
 - core key 写入会入队 core_memory_refresh outbox 任务
 """
+
+from tests.tool_helpers import invoke_test_tool
 from aiive.db.models import MemoryRecord, OutboxJob
 from aiive.memory.memory_types import LifecycleState, ValidityState
 from aiive.memory.recall_config import RecallConfig
@@ -232,7 +234,7 @@ def test_memory_search_events_respects_thread_scope(db_session):
 
     run_ctx = RunContext(thread_id="t_A", trace_id="tr", source="user_chat")
     with patch.object(bt, "SessionLocal", lambda: db_session):
-        result = bt._handle_memory_search(ctx=run_ctx, query="alpha")
+        result = invoke_test_tool(bt.MemorySearchTool, ctx=run_ctx, query="alpha")
     assert result["ok"]
     returned = {r["memory_id"] for r in result["results"]}
     assert id_a in returned

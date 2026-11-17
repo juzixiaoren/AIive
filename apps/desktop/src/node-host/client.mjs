@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
+import { ActionCancellation } from "./cancellation.mjs";
 import { spawn } from "node:child_process";
 import { DesktopActionJournal, InFlightActionCoordinator, stableStringify } from "./journal.mjs";
 import {
@@ -199,6 +200,7 @@ const capabilities = [
   },
   {
     name: "desktop_exec",
+    cancellation_policy: "remote",
     description: "在桌面电脑上通过系统 Shell 执行命令，返回退出码、stdout 和 stderr。每次调用必须由用户确认。",
     risk_level: "high",
     requires_confirmation: true,
@@ -528,6 +530,7 @@ async function executeCommand(params, executionScope = {}) {
       env: { ...inheritedEnv, ...extraEnv, AIIVE_SHELL: "desktop_exec" },
       shell: true,
       windowsHide: true,
+      detached: process.platform !== "win32",
     });
     const stdout = [];
     const stderr = [];
@@ -542,11 +545,25 @@ async function executeCommand(params, executionScope = {}) {
       if (stderrBytes < outputLimit) stderr.push(chunk.subarray(0, outputLimit - stderrBytes));
       stderrBytes += chunk.length;
     });
-    const timer = setTimeout(() => child.kill("SIGTERM"), timeoutSeconds * 1000);
+    let stoppedByCancel = false;
+    const stopTree = () => {
+      if (process.platform === "win32") {
+        const killer = spawn("taskkill", ["/F", "/T", "/PID", String(child.pid)], { windowsHide: true });
+        killer.on("error", () => child.kill("SIGKILL"));
+      } else {
+        try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
+      }
+    };
+    const abort = () => { stoppedByCancel = true; stopTree(); };
+    executionScope.signal?.addEventListener("abort", abort, { once: true });
+    if (executionScope.signal?.aborted) abort();
+    const timer = setTimeout(stopTree, timeoutSeconds * 1000);
     child.once("error", (error) => { clearTimeout(timer); reject(error); });
     child.once("close", (code, signal) => {
       clearTimeout(timer);
+      executionScope.signal?.removeEventListener("abort", abort);
       resolve({
+        stopped_by_cancel: stoppedByCancel,
         command,
         cwd,
         exit_code: code,
@@ -587,6 +604,7 @@ function websocketUrl() {
 const journal = await new DesktopActionJournal().load();
 const resourceLeases = new NodeResourceLeaseManager();
 const inFlightActions = new InFlightActionCoordinator();
+const cancellations = new ActionCancellation();
 let retryMs = 1000;
 
 function sendJson(socket, payload) {
@@ -634,46 +652,52 @@ async function handleOperation(socket, request) {
       ) {
         throw new Error("desktop_journal_identity_conflict");
       }
-      if (["committed", "failed"].includes(prior.status)) {
+      if (["committed", "failed", "cancelled"].includes(prior.status)) {
         return { entry: prior, replay: true };
       }
       throw new Error("execution_unknown_in_journal");
     }
-    assertTaskScope(request);
-    await assertResolvedPathScope(request, fs);
-    await assertPreconditions(request, fs, crypto);
-    await journal.record(identity, "received");
-    sendJson(socket, {
-      type: "operation.ack", protocol_version: protocolVersion,
-      data: { request_id: request.request_id, action_id: request.action_id, status: "received" },
-    });
-    await journal.record(identity, "started", { started_at: new Date().toISOString() });
-    sendJson(socket, {
-      type: "operation.ack", protocol_version: protocolVersion,
-      data: { request_id: request.request_id, action_id: request.action_id, status: "started" },
-    });
+    const cancellation = cancellations.start(request);
     try {
-      const result = await resourceLeases.withLease(request, async () => {
-        assertTaskScope(request);
-        await assertResolvedPathScope(request, fs);
-        await assertPreconditions(request, fs, crypto);
-        return handler(
-          request.params || {},
-          { allow_secrets: Boolean(request.scope?.allow_secrets) },
-        );
+      assertTaskScope(request);
+      await assertResolvedPathScope(request, fs);
+      await assertPreconditions(request, fs, crypto);
+      await journal.record(identity, "received", { fencing_token: request.fencing_token, request_id: request.request_id });
+      sendJson(socket, {
+        type: "operation.ack", protocol_version: protocolVersion,
+        data: { request_id: request.request_id, action_id: request.action_id, status: "received" },
       });
-      const resultHash = crypto.createHash("sha256").update(stableStringify(result)).digest("hex");
-      const entry = await journal.record(identity, "committed", {
-        result, result_hash: resultHash, completed_at: new Date().toISOString(),
+      await journal.record(identity, "started", { started_at: new Date().toISOString() });
+      sendJson(socket, {
+        type: "operation.ack", protocol_version: protocolVersion,
+        data: { request_id: request.request_id, action_id: request.action_id, status: "started" },
       });
-      return { entry, replay: false };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const entry = await journal.record(identity, "failed", {
-        error: message, completed_at: new Date().toISOString(),
-      });
-      return { entry, replay: false };
-    }
+      try {
+        const result = await resourceLeases.withLease(request, async () => {
+          assertTaskScope(request);
+          await assertResolvedPathScope(request, fs);
+          await assertPreconditions(request, fs, crypto);
+          if (cancellation.controller.signal.aborted) throw new Error("cancelled_before_start");
+          cancellation.started = true;
+          return handler(
+            request.params || {},
+            { allow_secrets: Boolean(request.scope?.allow_secrets), signal: cancellation.controller.signal },
+          );
+        });
+        if (result?.stopped_by_cancel) throw new Error("execution_unknown_cancelled_process");
+        const resultHash = crypto.createHash("sha256").update(stableStringify(result)).digest("hex");
+        const entry = await journal.record(identity, "committed", {
+          result, result_hash: resultHash, completed_at: new Date().toISOString(),
+        });
+        return { entry, replay: false };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const entry = await journal.record(identity, message === "cancelled_before_start" ? "cancelled" : message.includes("unknown") ? "unknown" : "failed", {
+          error: message, completed_at: new Date().toISOString(),
+        });
+        return { entry, replay: false };
+      }
+    } finally { cancellations.finish(cancellation); }
   });
   sendJson(socket, {
     type: "operation.result",
@@ -740,6 +764,16 @@ function connect() {
           missing_action_ids: actionIds.filter((actionId) => !journal.get(actionId)),
         },
       });
+      return;
+    }
+    if (message?.type === "operation.cancel") {
+      const result = cancellations.request(message.data || {});
+      if (result.entry) {
+        const prior = journal.get(result.entry.request.action_id);
+        await journal.record(result.entry.request, prior?.status || "received", { cancel_requested_at: new Date().toISOString() });
+      }
+      sendJson(socket, { type: "operation.cancel.result", protocol_version: protocolVersion,
+        data: { ...message.data, status: result.status } });
       return;
     }
     if (message?.type !== "operation.request") return;

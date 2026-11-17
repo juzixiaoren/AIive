@@ -23,6 +23,7 @@ class DesktopCapability(BaseModel):
     writes_external_world: bool = False
     can_delete: bool = False
     timeout_seconds: float = Field(default=30, ge=1, le=3600)
+    cancellation_policy: Literal["none", "remote"] = "none"
 
     @field_validator("name")
     @classmethod

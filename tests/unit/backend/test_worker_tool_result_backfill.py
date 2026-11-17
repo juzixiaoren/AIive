@@ -1,6 +1,8 @@
 """后台任务工具结果回填：Evidence 摘要复用统一守卫，大结果落盘并可续读（离线）。"""
 from __future__ import annotations
 
+from tests.tool_helpers import invoke_test_tool, tool_method
+
 import json
 from pathlib import Path
 
@@ -12,7 +14,7 @@ from aiive.runtime.tool_output_guard import guard_tool_output
 from aiive.runtime.tool_output_store import is_managed_path
 from aiive.task_runtime.evidence import SUMMARY_LIMIT, EvidenceStore
 from aiive.task_runtime.repository import TaskRepository
-from aiive.tools.builtin_files import handle_read_text_file
+from aiive.tools.builtin_files import ReadTextFileTool as handle_read_text_file
 
 
 @pytest.fixture()
@@ -132,7 +134,7 @@ def test_paged_read_result_is_not_trimmed(db_session, output_dir) -> None:
     # 日志就在工具输出目录里，正好覆盖「后台任务分页读取自己的日志」这条链路。
     source = output_dir / "page.txt"
     source.write_text("\n".join(f"row-{index:05d}" for index in range(500)), encoding="utf-8")
-    page = handle_read_text_file(str(source), offset=0, limit=50, max_chars=1000)
+    page = invoke_test_tool(handle_read_text_file, str(source), offset=0, limit=50, max_chars=1000)
     assert page["ok"] is True
     guarded = guard_tool_output("read_text_file", json.dumps(page), max_chars=1200)
     payload = json.loads(guarded.content)

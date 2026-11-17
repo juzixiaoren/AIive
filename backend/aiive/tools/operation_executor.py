@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -14,14 +15,14 @@ from sqlalchemy.orm import Session
 
 from aiive.context.run_context import RunContext, RUN_CTX_OUTBOX_WORKER
 from aiive.db.base import SessionLocal
-from aiive.db.models import Event, OutboxJob, ToolOperation
+from aiive.db.models import Event, OutboxJob, ToolOperation, TurnRecord
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome, HandlerResult
 from aiive.worker.job_source_guard import guard_job_sources_visible
 from aiive.worker.outbox_execution_auth import with_execution_authorization
 
 logger = logging.getLogger(__name__)
 TOOL_OPERATION_JOB_TYPE = "tool_operation"
-_TERMINAL_STATUSES = frozenset({"committed", "failed"})
+_TERMINAL_STATUSES = frozenset({"committed", "failed", "cancelled"})
 _waiters_lock = threading.Lock()
 _waiters: dict[str, threading.Event] = {}
 
@@ -107,6 +108,10 @@ def enqueue_tool_operation(
 
     db = SessionLocal()
     try:
+        turn = db.query(TurnRecord).filter(TurnRecord.id == run_context.turn_record_id).with_for_update().one_or_none()
+        if turn is not None and turn.cancel_requested_at is not None:
+            from aiive.tools.base import ToolCancelled
+            raise ToolCancelled()
         existing = db.query(ToolOperation).filter(
             ToolOperation.idempotency_key == idempotency_key,
         ).first()
@@ -164,8 +169,13 @@ def wait_for_tool_operation(operation_id: str, timeout_seconds: float) -> dict[s
     try:
         operation = _load_operation(operation_id)
         if operation is not None and operation.status not in _TERMINAL_STATUSES:
-            event.wait(timeout=max(0.0, timeout_seconds))
-            operation = _load_operation(operation_id)
+            deadline = time.monotonic() + max(0.0, timeout_seconds)
+            while operation is not None and operation.status not in _TERMINAL_STATUSES:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                event.wait(timeout=min(0.1, remaining))
+                operation = _load_operation(operation_id)
     finally:
         # 防止 _waiters 泄漏：无论 _notify 是否发生，等待结束后移除自己创建的 waiter
         with _waiters_lock:
@@ -194,6 +204,21 @@ def _load_operation(operation_id: str) -> ToolOperation | None:
         db.close()
 
 
+def request_turn_cancellation(db: Session, turn_record_id: str, now: datetime) -> None:
+    """Caller holds the Turn lock; preserve committed receipts, stop queued work."""
+    operations = db.query(ToolOperation).filter(
+        ToolOperation.turn_record_id == turn_record_id,
+        ToolOperation.status.in_(["queued", "running"]),
+    ).with_for_update(skip_locked=True).all()
+    for operation in operations:
+        operation.cancel_requested_at = operation.cancel_requested_at or now
+        if operation.status == "queued":
+            operation.status = "cancelled"
+            operation.completed_at = now
+            operation.terminal_reason = "cancelled_before_start"
+            db.add(_build_terminal_event(operation, "cancelled"))
+
+
 def operation_response(operation: ToolOperation) -> dict[str, Any]:
     """将持久化状态转换为统一 Registry 响应。"""
     common = {
@@ -203,10 +228,10 @@ def operation_response(operation: ToolOperation) -> dict[str, Any]:
     }
     if operation.status == "committed":
         return {"ok": True, "result": operation.result_payload, **common}
-    if operation.status == "failed":
+    if operation.status in {"failed", "cancelled"}:
         return {
             "ok": False,
-            "error_type": "execution_failed",
+            "error_type": "cancelled" if operation.status == "cancelled" else "execution_failed",
             "error": operation.error_message or "工具执行失败",
             **common,
         }
@@ -239,8 +264,21 @@ def handle_tool_operation(claimed: ClaimedJob) -> HandlerResult:
             return HandlerResult(HandlerOutcome.NON_RETRYABLE, "ToolOperation 不存在", terminal_reason="operation_missing")
         if operation.status == "committed":
             return HandlerResult(HandlerOutcome.COMPLETED, "operation 已提交")
+        if operation.status == "cancelled":
+            return HandlerResult(HandlerOutcome.COMPLETED, "operation cancelled before execution")
         if operation.status == "failed":
             return HandlerResult(HandlerOutcome.NON_RETRYABLE, operation.error_message or "operation 已失败", terminal_reason="operation_failed")
+        cancel_at = db.query(TurnRecord.cancel_requested_at).filter(TurnRecord.id == operation.turn_record_id).scalar()
+        if cancel_at is not None:
+            operation.cancel_requested_at = cancel_at
+            if operation.status == "queued":
+                operation.status = "cancelled"
+                operation.completed_at = datetime.now(timezone.utc)
+                operation.terminal_reason = "cancelled_before_start"
+                db.add(_build_terminal_event(operation, "cancelled"))
+                db.commit()
+                _notify(operation.id)
+                return HandlerResult(HandlerOutcome.COMPLETED, "cancelled before start")
         if operation.status in ("running", "execution_unknown") and operation.effect_mode in (
             "non_repeatable_external", "externally_reconcilable",
         ):
@@ -282,8 +320,8 @@ def handle_tool_operation(claimed: ClaimedJob) -> HandlerResult:
             turn_record_id=operation.turn_record_id,
         )
         if operation.effect_mode == "db_transactional":
-            return _execute_db_transactional(operation_id, execution_token, registration.handler, context, dict(operation.params or {}))
-        return _execute_external(operation_id, execution_token, registration.handler, context, dict(operation.params or {}))
+            return _execute_db_transactional(operation_id, execution_token, registration, context, dict(operation.params or {}))
+        return _execute_external(operation_id, execution_token, registration, context, dict(operation.params or {}))
     except Exception as error:
         db.rollback()
         logger.exception("工具 operation 领取失败: operation_id=%s", operation_id)
@@ -300,10 +338,10 @@ def _execute_db_transactional(
     params: dict[str, Any],
 ) -> HandlerResult:
     """在同一事务中提交数据库业务副作用和 operation committed 回执。"""
-    original = getattr(handler, "_aiive_db_handler", None)
-    accepts_ctx = bool(getattr(handler, "_aiive_accepts_ctx", False))
-    if original is None:
-        return _record_failure(operation_id, execution_token, "数据库工具未声明可注入事务", "invalid_db_handler")
+    from aiive.tools.base import DatabaseTool, ToolCancelled, ToolExecutionContext
+    from aiive.tools.executor import cancellation_requested
+    if not isinstance(handler, DatabaseTool):
+        return _record_failure(operation_id, execution_token, "数据库工具未声明可注入事务", "invalid_transaction_tool")
 
     db = SessionLocal()
     try:
@@ -314,7 +352,13 @@ def _execute_db_transactional(
         ).with_for_update().one_or_none()
         if operation is None:
             return HandlerResult(HandlerOutcome.CLAIM_LOST, "operation fencing 失败")
-        result = original(db, context, **params) if accepts_ctx else original(db, **params)
+        execution = ToolExecutionContext(handler.safety.capability_id, context, execution_id=operation_id,
+                                         channel="turn_operation", db=db, operation_id=operation_id)
+        if cancellation_requested(execution):
+            raise ToolCancelled()
+        result = handler.execute(execution, params)
+        if cancellation_requested(execution):
+            raise ToolCancelled()
         if isinstance(result, dict) and result.get("ok") is False:
             raise RuntimeError(str(result.get("error", "工具返回失败")))
         # handler 通过标记声明需要通知广播；广播必须在 commit 成功后执行
@@ -334,6 +378,9 @@ def _execute_db_transactional(
             _broadcast_pending_count_after_commit()
         _notify(operation_id)
         return HandlerResult(HandlerOutcome.COMPLETED, "工具副作用与回执已原子提交")
+    except ToolCancelled:
+        db.rollback()
+        return _record_cancelled(operation_id, execution_token)
     except Exception as error:
         db.rollback()
         logger.exception("数据库工具 operation 执行失败: operation_id=%s", operation_id)
@@ -351,7 +398,8 @@ def _execute_external(
 ) -> HandlerResult:
     """执行外部副作用并持久化可核验回执。"""
     try:
-        import inspect
+        from aiive.tools.base import ToolExecutionContext
+        from aiive.tools.executor import ToolExecutor
 
         # 执行前 fencing 预校验：确认自己仍持有 running + execution_token，
         # 缩小双执行窗口；已被他人接管则直接按 CLAIM_LOST 处理，不执行 handler。
@@ -367,7 +415,18 @@ def _execute_external(
         if claimed_operation is None:
             return HandlerResult(HandlerOutcome.CLAIM_LOST, "operation fencing 失败（执行前预校验）")
 
-        result = handler(ctx=context, **params) if "ctx" in inspect.signature(handler).parameters else handler(**params)
+        response = ToolExecutor.execute_direct(handler, ToolExecutionContext(handler.safety.capability_id, context,
+                                               execution_id=operation_id, channel="turn_operation", operation_id=operation_id),
+                                               params, handler.safety.timeout_seconds or 60)
+        if not response.get("ok"):
+            if response.get("error_type") == "execution_unknown":
+                return _record_unknown(operation_id, execution_token, str(response.get("error")))
+            if response.get("error_type") == "cancelled":
+                return _record_cancelled(operation_id, execution_token)
+            return _record_failure(operation_id, execution_token, str(response.get("error")), "tool_failed")
+        result = response.get("result")
+        if isinstance(result, dict) and result.get("error_type") == "execution_unknown":
+            return _record_unknown(operation_id, execution_token, str(result.get("error")))
         if isinstance(result, dict) and (result.get("ok") is False or result.get("allowed") is False):
             # handler 明确拒绝/失败且未产生副作用：记录确定性失败，而非 unknown
             denial = str(result.get("error") or result.get("reason") or _canonical_json(result)[:500] or "工具返回失败")
@@ -396,7 +455,7 @@ def _execute_external(
     except Exception as error:
         logger.exception("外部工具 operation 执行失败: operation_id=%s", operation_id)
         operation = _load_operation(operation_id)
-        if operation is not None and operation.effect_mode == "non_repeatable_external":
+        if operation is not None and operation.effect_mode in {"non_repeatable_external", "externally_reconcilable"}:
             return _record_unknown(operation_id, execution_token, str(error))
         return _record_failure(operation_id, execution_token, str(error), "handler_failed")
 
@@ -459,6 +518,26 @@ def _record_unknown(operation_id: str, execution_token: str, error: str) -> Hand
         )
     finally:
         db.close()
+
+
+def _record_cancelled(operation_id: str, execution_token: str) -> HandlerResult:
+    """Called only before start or after a confirmed transaction rollback/stop."""
+    with SessionLocal() as db:
+        operation = db.query(ToolOperation).filter(
+            ToolOperation.id == operation_id, ToolOperation.status == "running",
+            ToolOperation.execution_token == execution_token,
+        ).with_for_update().one_or_none()
+        if operation is None:
+            return HandlerResult(HandlerOutcome.CLAIM_LOST, "operation fencing failed")
+        now = datetime.now(timezone.utc)
+        operation.status = "cancelled"
+        operation.cancel_requested_at = operation.cancel_requested_at or now
+        operation.completed_at = now
+        operation.terminal_reason = "execution_cancelled"
+        db.add(_build_terminal_event(operation, "cancelled"))
+        db.commit()
+    _notify(operation_id)
+    return HandlerResult(HandlerOutcome.COMPLETED, "execution cancelled")
 
 
 def _record_failure(operation_id: str, execution_token: str, error: str, reason: str) -> HandlerResult:

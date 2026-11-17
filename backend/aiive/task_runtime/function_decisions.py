@@ -8,7 +8,8 @@ from typing import Any
 
 from aiive.core.function_calling import function_definition
 from aiive.task_runtime.schemas import ActionProposal
-from aiive.tools.registry import CapabilitySafetySchema, ToolRegistration, ToolRegistry
+from aiive.tools.registry import CapabilitySafetySchema
+from aiive.core.function_spec import FunctionSpec, FunctionSpecs
 
 
 CONTROLS = {
@@ -27,13 +28,9 @@ def proposal_function_name(capability_id: str) -> str:
     return f"propose_{slug}_{digest}"
 
 
-def _never_execute(**_kwargs: Any) -> Any:
-    raise RuntimeError("worker_decisions_are_not_executable")
-
-
 class WorkerFunctions:
     def __init__(self, tool_view: dict[str, Any]):
-        self.registry: ToolRegistry = ToolRegistry()
+        self.registry: FunctionSpecs = FunctionSpecs()
         self.capabilities: dict[str, str] = {}
         fields = ActionProposal.model_json_schema()["properties"]
         for name, (_, keys) in CONTROLS.items():
@@ -70,9 +67,9 @@ class WorkerFunctions:
             self._register(name, f"Propose {capability_id}: {definition.get('description', '')}. Does not execute the tool.", schema)
 
     def _register(self, name: str, description: str, schema: dict[str, Any]) -> None:
-        self.registry.register(ToolRegistration(
+        self.registry.register(FunctionSpec(
             CapabilitySafetySchema(name, "local_builtin", "trusted", "low"),
-            _never_execute, description=description, input_schema=schema,
+            description=description, input_schema=schema,
         ))
 
     def definitions(self) -> list[dict[str, Any]]:

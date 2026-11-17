@@ -196,7 +196,9 @@ class _ToolGate:
         self.forget_started: bool = False
 
 
-def execute_in_tool_thread(executor: Any, invoke: Callable[[], Any], timeout: float) -> Any:
+def execute_in_tool_thread(executor: Any, invoke: Callable[[], Any], timeout: float,
+                           observe_cancel: Callable[[], bool] | None = None,
+                           await_terminal: bool = False) -> Any:
     """Transfer execution, never Connection ownership, to a pool worker.
 
     The parent releases its own connection before submission. The child acquires
@@ -233,14 +235,35 @@ def execute_in_tool_thread(executor: Any, invoke: Callable[[], Any], timeout: fl
     try:
         future = executor.submit(child)
         try:
-            return future.result(timeout=timeout)
+            import time
+            deadline = time.monotonic() + timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise concurrent.futures.TimeoutError()
+                try:
+                    return future.result(timeout=min(0.1, remaining))
+                except concurrent.futures.TimeoutError:
+                    if future.done():
+                        raise
+                    if observe_cancel is not None and observe_cancel():
+                        with gate.lock:
+                            if not gate.forget_started:
+                                gate.cancelled = True
         except concurrent.futures.TimeoutError:
             with gate.lock:
                 started = gate.forget_started
                 if not started:
                     gate.cancelled = True
-            if started:
-                return future.result()
+            if started or await_terminal:
+                while True:
+                    try:
+                        return future.result(timeout=0.1)
+                    except concurrent.futures.TimeoutError:
+                        if future.done():
+                            raise
+                        if observe_cancel is not None:
+                            observe_cancel()
             future.cancel()
             raise
     finally:
