@@ -14,6 +14,7 @@ from aiive.context.run_context import RunContext, RUN_CTX_TRUSTED_APPROVAL
 from aiive.db.base import SessionLocal
 from aiive.db.models import ApprovalRequest, Event, Thread, TurnRecord
 from aiive.runtime.working_state import WorkingStateService
+from aiive.tools.base import outcome_is_unknown
 from aiive.tools.registry import get_tool_registry
 
 logger = logging.getLogger(__name__)
@@ -210,10 +211,10 @@ def respond_approval(request: ApprovalRespondRequest) -> dict[str, Any]:
             tool_call_id=tool_call_id,
         )
 
-    error_type = str(result.get("error_type", "") or "")
+    unknown_outcome = outcome_is_unknown(result)
     if result.get("ok"):
         final_status = "succeeded"
-    elif error_type == "execution_unknown":
+    elif unknown_outcome:
         final_status = "interrupted_unknown"
     else:
         final_status = "failed"
@@ -265,7 +266,7 @@ def respond_approval(request: ApprovalRespondRequest) -> dict[str, Any]:
                 "result": result,
                 "status": (
                     "completed" if result.get("ok")
-                    else "execution_unknown" if error_type == "execution_unknown"
+                    else "execution_unknown" if unknown_outcome
                     else "failed"
                 ),
                 "tool_call_id": tool_call_id,

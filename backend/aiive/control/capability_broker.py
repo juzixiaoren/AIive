@@ -16,7 +16,7 @@ from aiive.db.models import AgentAction, AgentRun, AgentTask, TaskEvidence
 from aiive.desktop.registry_overlay import build_registry_for_thread
 from aiive.mcp.bootstrap import registered_tool_ids
 from aiive.task_runtime.resource_locks import ResourceBusyError, ResourceLockService
-from aiive.tools.base import BaseTool
+from aiive.tools.base import BaseTool, outcome_is_unknown
 from aiive.tools.registry import ToolRegistry
 
 
@@ -251,7 +251,8 @@ class CapabilityBroker:
                     "timeout_seconds": registration.safety.timeout_seconds or 30,
                 },
             )
-            if result.get("error_type") == "execution_unknown":
+            if outcome_is_unknown(result):
+                # 结果未知的 Action 保留资源锁，避免后续 Action 与未确认副作用并发。
                 release_grant = False
             return result
         except Exception:

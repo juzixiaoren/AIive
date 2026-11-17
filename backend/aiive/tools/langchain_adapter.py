@@ -57,18 +57,24 @@ def _make_handler(registry: ToolRegistry, capability_id: str, run_context: RunCo
             err = result.get("error", "Any error")
             import json
 
-            return json.dumps(
-                {
-                    "ok": False,
-                    "error": err,
-                    "error_type": result.get("error_type", "execution_failed"),
-                    "execution_status": result.get("execution_status", "failed"),
-                    "operation_id": result.get("operation_id", ""),
-                    "retryable": result.get("retryable", False),
-                    "issues": result.get("issues", []),
-                },
-                ensure_ascii=False,
-            )
+            # 失败时把业务 details 平铺回内容（exit_code / stdout / path 等），
+            # 模型看到的字段与改造前一致；执行状态字段仍然以封套为准。
+            details = result.get("details")
+            payload: dict[str, object] = dict(details) if isinstance(details, dict) else {}
+            payload.update({
+                "ok": False,
+                "error": err,
+                "error_type": result.get("error_type", "execution_failed"),
+                "execution_status": result.get("execution_status", "failed"),
+                "outcome_known": result.get("outcome_known", True),
+                "side_effect_started": result.get("side_effect_started", False),
+                "operation_id": result.get("operation_id", ""),
+                "retryable": result.get("retryable", False),
+                "issues": result.get("issues", []),
+            })
+            # default=str：业务 details 里可能含 Path/datetime，不能让序列化
+            # 异常把一次明确的失败变成调用崩溃。
+            return json.dumps(payload, ensure_ascii=False, default=str)
         inner = result.get("result", result)
         if isinstance(inner, dict):
             import json

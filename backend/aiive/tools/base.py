@@ -6,6 +6,7 @@ import inspect
 import threading
 import uuid
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from copy import copy
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -64,6 +65,20 @@ class ToolExecutionContext:
     action_id: str = ""
 
 
+# 明确表示"外部副作用真实结果未知"的错误码；其余错误码都视为确定性结论。
+UNKNOWN_OUTCOME_CODES: frozenset[str] = frozenset({
+    "execution_unknown",
+    "desktop_operation_timeout",
+    "desktop_node_disconnected",
+})
+
+# 业务结果字典里属于执行状态封套的键；其余键都是业务数据，原样保留在 details。
+_RESULT_ENVELOPE_KEYS: frozenset[str] = frozenset({
+    "ok", "error", "error_type", "code", "reason", "message",
+    "execution_status", "outcome_known", "side_effect_started", "retry_hint",
+})
+
+
 @dataclass(frozen=True)
 class ToolError:
     code: str
@@ -72,6 +87,46 @@ class ToolError:
     side_effect_started: bool = False
     retry_hint: str = "never"
     details: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_business_result(cls, value: Mapping[str, Any]) -> ToolError:
+        """把工具业务字典的显式失败标记转换为统一错误。
+
+        execution_unknown 与"结果未知"标记优先于 cancelled：只有确认已停止且
+        没有未提交副作用时才能记录取消，否则必须保留未知语义。
+        """
+        raw_code = str(value.get("error_type") or value.get("code") or "")
+        status = str(value.get("execution_status") or "")
+        unknown = (
+            value.get("outcome_known") is False
+            or status == "execution_unknown"
+            or raw_code in UNKNOWN_OUTCOME_CODES
+        )
+        cancelled = not unknown and (
+            raw_code == "cancelled" or value.get("cancelled") is True
+        )
+        if unknown:
+            code = "execution_unknown"
+        elif cancelled:
+            code = "cancelled"
+        else:
+            code = raw_code or "execution_failed"
+        message = str(
+            value.get("error") or value.get("reason") or value.get("message") or ""
+        ) or f"Tool reported {code}"
+        details = {
+            key: item
+            for key, item in value.items()
+            if key not in _RESULT_ENVELOPE_KEYS
+        }
+        return cls(
+            code=code,
+            message=message,
+            outcome_known=not unknown,
+            side_effect_started=unknown,
+            retry_hint=str(value.get("retry_hint") or "never"),
+            details=details,
+        )
 
     def payload(self) -> dict[str, Any]:
         return {
@@ -97,9 +152,54 @@ class ToolResult:
     error: ToolError | None = None
 
     def payload(self) -> dict[str, Any]:
-        return (
-            self.error.payload() if self.error else {"ok": True, "result": self.value}
-        )
+        # 业务字典里的显式失败不能被包装成成功；这里与 coerce_tool_result
+        # 共用同一判定，任何构造路径都不会丢失失败语义。
+        if self.error is not None:
+            return self.error.payload()
+        if isinstance(self.value, ToolResult):
+            return self.value.payload()
+        if business_result_failed(self.value):
+            return tool_error_from_business_result(self.value).payload()
+        return {"ok": True, "result": self.value}
+
+
+def business_result_failed(value: Any) -> bool:
+    """只检查业务结果字典的顶层显式失败标记，绝不递归扫描嵌套业务数据。"""
+    if not isinstance(value, Mapping):
+        return False
+    return value.get("ok") is False or value.get("allowed") is False
+
+
+def tool_error_from_business_result(value: Mapping[str, Any]) -> ToolError:
+    return ToolError.from_business_result(value)
+
+
+def coerce_tool_result(value: Any) -> ToolResult:
+    """工具返回值进入调用方之前的唯一归一化入口。
+
+    兼容尚未改造的业务字典：只有顶层 ok=false / allowed=false 才判定失败。
+    """
+    if isinstance(value, ToolResult):
+        return value
+    if isinstance(value, ToolError):
+        return ToolResult(error=value)
+    if business_result_failed(value):
+        return ToolResult(error=tool_error_from_business_result(value))
+    return ToolResult(value=value)
+
+
+def outcome_is_unknown(payload: Mapping[str, Any]) -> bool:
+    """统一 payload 是否代表"外部副作用真实结果未知"。
+
+    Callers must not downgrade these payloads to success, failure or cancellation.
+    """
+    if payload.get("ok") is True:
+        return False
+    if payload.get("outcome_known") is False:
+        return True
+    if str(payload.get("execution_status") or "") == "execution_unknown":
+        return True
+    return str(payload.get("error_type") or "") in UNKNOWN_OUTCOME_CODES
 
 
 class BaseTool(ABC):

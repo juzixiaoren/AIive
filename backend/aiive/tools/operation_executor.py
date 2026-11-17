@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from aiive.context.run_context import RunContext, RUN_CTX_OUTBOX_WORKER
 from aiive.db.base import SessionLocal
+from aiive.tools.base import coerce_tool_result, outcome_is_unknown
 from aiive.db.models import Event, OutboxJob, ToolOperation, TurnRecord
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome, HandlerResult
 from aiive.worker.job_source_guard import guard_job_sources_visible
@@ -233,12 +234,16 @@ def operation_response(operation: ToolOperation) -> dict[str, Any]:
             "ok": False,
             "error_type": "cancelled" if operation.status == "cancelled" else "execution_failed",
             "error": operation.error_message or "工具执行失败",
+            "outcome_known": True,
+            "side_effect_started": False,
             **common,
         }
     return {
         "ok": False,
         "error_type": "execution_unknown",
         "error": "工具已持久化受理，最终状态尚未确认；请查询原 operation，禁止重复提交",
+        "outcome_known": False,
+        "side_effect_started": True,
         **common,
     }
 
@@ -356,11 +361,18 @@ def _execute_db_transactional(
                                          channel="turn_operation", db=db, operation_id=operation_id)
         if cancellation_requested(execution):
             raise ToolCancelled()
-        result = handler.execute(execution, params)
+        coerced = coerce_tool_result(handler.execute(execution, params))
         if cancellation_requested(execution):
             raise ToolCancelled()
-        if isinstance(result, dict) and result.get("ok") is False:
-            raise RuntimeError(str(result.get("error", "工具返回失败")))
+        if coerced.error is not None:
+            # 业务结果明确失败：整个事务回滚（含业务写入）。事务归本函数所有，
+            # 回滚即代表没有未提交副作用，因此未知语义在这里收敛为确定性失败。
+            db.rollback()
+            return _record_failure(
+                operation_id, execution_token,
+                f"{coerced.error.code}: {coerced.error.message}", "handler_failed",
+            )
+        result = coerced.value
         # handler 通过标记声明需要通知广播；广播必须在 commit 成功后执行
         needs_broadcast = bool(
             isinstance(result, dict) and result.pop("needs_notification_broadcast", False)
@@ -419,18 +431,13 @@ def _execute_external(
                                                execution_id=operation_id, channel="turn_operation", operation_id=operation_id),
                                                params, handler.safety.timeout_seconds or 60)
         if not response.get("ok"):
-            if response.get("error_type") == "execution_unknown":
+            # execute_direct 已经按统一契约归一化业务失败，这里只做状态映射。
+            if outcome_is_unknown(response):
                 return _record_unknown(operation_id, execution_token, str(response.get("error")))
             if response.get("error_type") == "cancelled":
                 return _record_cancelled(operation_id, execution_token)
             return _record_failure(operation_id, execution_token, str(response.get("error")), "tool_failed")
         result = response.get("result")
-        if isinstance(result, dict) and result.get("error_type") == "execution_unknown":
-            return _record_unknown(operation_id, execution_token, str(result.get("error")))
-        if isinstance(result, dict) and (result.get("ok") is False or result.get("allowed") is False):
-            # handler 明确拒绝/失败且未产生副作用：记录确定性失败，而非 unknown
-            denial = str(result.get("error") or result.get("reason") or _canonical_json(result)[:500] or "工具返回失败")
-            return _record_failure(operation_id, execution_token, denial, "handler_denied")
         db = SessionLocal()
         try:
             operation = db.query(ToolOperation).filter(

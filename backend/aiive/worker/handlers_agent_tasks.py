@@ -89,16 +89,38 @@ def handle_agent_task_run(claimed: ClaimedJob) -> HandlerResult:
             task = repo.get_task(task_id, for_update=True)
             if (task is not None and runtime is not None
                     and task.current_run_id == runtime.active_run_id
-                    and task.status in {TaskStatus.DISPATCHING.value, TaskStatus.RUNNING.value}):
+                    and task.status in {
+                        TaskStatus.DISPATCHING.value, TaskStatus.RUNNING.value,
+                        TaskStatus.CANCELLED.value,
+                    }):
                 run = db.get(AgentRun, task.current_run_id) if task.current_run_id else None
+                cancelled = task.status == TaskStatus.CANCELLED.value
                 if run is not None and run.status == RunStatus.RUNNING.value:
-                    repo.finish_run(run, status=RunStatus.FAILED.value, error=str(error),
-                                    token_usage=run.token_usage, model=run.model)
+                    # 已取消任务只把 Run 收敛为 interrupted，绝不回到可执行状态。
+                    repo.finish_run(
+                        run,
+                        status=RunStatus.INTERRUPTED.value if cancelled else RunStatus.FAILED.value,
+                        error=str(error),
+                        token_usage=run.token_usage, model=run.model,
+                    )
                 uncertain = db.query(AgentAction).filter(
                     AgentAction.task_id == task.id,
                     AgentAction.status.in_([ActionStatus.DISPATCHED.value, ActionStatus.RUNNING.value, ActionStatus.UNKNOWN.value]),
                 ).all()
-                if uncertain:
+                if cancelled:
+                    for action in uncertain:
+                        if action.status != ActionStatus.UNKNOWN.value:
+                            repo.transition_action(action, ActionStatus.UNKNOWN.value, error="cancelled_worker_failed")
+                    repo.append_event(
+                        task.id, "cancelled_execution_recovered",
+                        {"reason": "worker_failed_after_cancel", "action_ids": [a.id for a in uncertain]},
+                        visibility="conversation",
+                    )
+                    repo.checkpoint(
+                        task.id, reason="cancelled_execution_recovery",
+                        pending_action_refs=[a.id for a in uncertain],
+                    )
+                elif uncertain:
                     for action in uncertain:
                         if action.status != ActionStatus.UNKNOWN.value:
                             repo.transition_action(action, ActionStatus.UNKNOWN.value, error="run_failed")
@@ -108,8 +130,9 @@ def handle_agent_task_run(claimed: ClaimedJob) -> HandlerResult:
                     repo.append_event(task.id, "task_reconciliation_required", {"action_ids": [a.id for a in uncertain]})
                 else:
                     repo.transition_task(task, TaskStatus.QUEUED.value)
-                repo.append_event(task.id, "run_failed", {"error": str(error)[:1000]})
-                repo.checkpoint(task.id, reason="run_failed")
+                if not cancelled:
+                    repo.append_event(task.id, "run_failed", {"error": str(error)[:1000]})
+                    repo.checkpoint(task.id, reason="run_failed")
                 db.commit()
         except Exception:
             db.rollback()

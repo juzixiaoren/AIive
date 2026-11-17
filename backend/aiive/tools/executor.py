@@ -9,6 +9,7 @@ from typing import Any
 
 from aiive.context.run_context import RunContext
 from aiive.tools.base import (
+    UNKNOWN_OUTCOME_CODES,
     BaseTool,
     CancellationPolicy,
     CancelResult,
@@ -17,6 +18,8 @@ from aiive.tools.base import (
     ToolError,
     ToolExecutionContext,
     ToolResult,
+    business_result_failed,
+    coerce_tool_result,
 )
 from aiive.config import settings
 from aiive.tools.registry import DEFAULT_TOOL_TIMEOUT, ToolRegistry
@@ -79,6 +82,7 @@ class DirectAdapter:
     def invoke(
         tool: BaseTool, context: ToolExecutionContext, arguments: dict[str, Any]
     ) -> Any:
+        """执行一次工具业务方法；返回值由 ToolExecutor 统一归一化。"""
         if tool.executor_kind == "desktop_node" and context.channel == "task_action":
             return DesktopAdapter.invoke(tool, context, arguments)
         if isinstance(tool, DatabaseTool) and context.db is None:
@@ -90,6 +94,11 @@ class DirectAdapter:
                 try:
                     result = tool.execute(context, arguments)
                     context.cancellation.checkpoint()
+                    if business_result_failed(result):
+                        # 业务结果明确失败：必须先回滚业务事务再上报失败，
+                        # 绝不允许先提交副作用、再把失败包装成成功回执。
+                        db.rollback()
+                        return result
                     db.commit()
                     return result
                 except BaseException:
@@ -121,12 +130,13 @@ class DesktopAdapter:
             if result.get("ok"):
                 return ToolResult(result.get("result"))
             code = str(result.get("error_type", "execution_failed"))
+            unknown = code in UNKNOWN_OUTCOME_CODES
             return ToolResult(
                 error=ToolError(
                     code,
                     str(result.get("error")),
-                    outcome_known=code != "execution_unknown",
-                    side_effect_started=code == "execution_unknown",
+                    outcome_known=not unknown,
+                    side_effect_started=unknown,
                 )
             )
         except DesktopDispatchError as error:
@@ -288,11 +298,7 @@ class ToolExecutor:
                 await_terminal=context.channel == "turn_operation",
             )
             return {
-                **(
-                    result.payload()
-                    if isinstance(result, ToolResult)
-                    else ToolResult(result).payload()
-                ),
+                **coerce_tool_result(result).payload(),
                 "execution_id": context.execution_id,
             }
         except (ToolCancelled, concurrent.futures.CancelledError):

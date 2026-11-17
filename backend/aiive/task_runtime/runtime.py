@@ -35,8 +35,27 @@ from aiive.task_runtime.tool_injection import (
     record_search,
     resident_definitions,
 )
+from aiive.tools.base import outcome_is_unknown
 
 logger = logging.getLogger(__name__)
+
+
+def action_outcome(result: dict[str, Any]) -> str:
+    """把工具执行 payload 映射为 Action 终态语义。
+
+    成功 / 确定性失败 / 已确认取消 / 外部副作用未知必须互斥，未确认的结果
+    一律优先判为 unknown，不能被降级成成功或普通失败。
+    """
+    if result.get("ok"):
+        return "succeeded"
+    if outcome_is_unknown(result):
+        return "unknown"
+    error_type = str(result.get("error_type") or "")
+    if error_type == "cancelled":
+        return "cancelled"
+    if error_type == "precondition_failed":
+        return "invalidated"
+    return "failed"
 
 
 class PersistentTaskRuntime:
@@ -373,6 +392,12 @@ class PersistentTaskRuntime:
             self.db.commit()
 
         # 单 Run 的推理/执行步数耗尽，checkpoint 后以新 Run 继续。
+        self.db.refresh(task)
+        if task.status == TaskStatus.CANCELLED.value:
+            # 已取消的任务不回到 QUEUED，也不再创建新 Run。
+            self.repo.finish_run(run, status=RunStatus.INTERRUPTED.value, error="task_cancelled")
+            self.db.commit()
+            return {"status": task.status, "task_id": task.id}
         self.repo.finish_run(
             run, summary={"continued": True}, token_usage=run_tokens, model=last_model,
         )
@@ -468,8 +493,9 @@ class PersistentTaskRuntime:
         self.db.refresh(refreshed_action)
         task = refreshed_task
         action = refreshed_action
+        outcome = action_outcome(result)
         error_type = str(result.get("error_type", ""))
-        if result.get("ok"):
+        if outcome == "succeeded":
             evidence = self.evidence.capture_result(
                 self.db, task_id=task.id, run_id=run.id, action=action, result=result,
             )
@@ -480,7 +506,7 @@ class PersistentTaskRuntime:
             self.repo.checkpoint(task.id, reason="action_succeeded")
             self.db.commit()
             return "continue"
-        if error_type in {"execution_unknown", "desktop_operation_timeout", "desktop_node_disconnected"}:
+        if outcome == "unknown":
             self.repo.transition_action(
                 action, ActionStatus.UNKNOWN.value,
                 error=str(result.get("error", "execution_unknown")),
@@ -506,9 +532,12 @@ class PersistentTaskRuntime:
             self.repo.checkpoint(task.id, reason="execution_unknown", pending_action_refs=[action.id])
             self.db.commit()
             return "blocked"
-        if error_type == "cancelled":
-            self.repo.transition_action(action, ActionStatus.CANCELLED.value, error="execution_cancelled")
-        elif error_type == "precondition_failed":
+        if outcome == "cancelled":
+            self.repo.transition_action(
+                action, ActionStatus.CANCELLED.value,
+                error=str(result.get("error") or "execution_cancelled"),
+            )
+        elif outcome == "invalidated":
             self.repo.transition_action(
                 action, ActionStatus.INVALIDATED.value,
                 error=str(result.get("error", "precondition_failed")),

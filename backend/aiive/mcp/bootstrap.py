@@ -110,7 +110,13 @@ class MCPTool(BaseTool):
     def _run(self, **params: Any) -> dict[str, Any]:
         result: MCPToolResult = get_runtime_client().call_tool(
             self.db_capability_id, self.tool_name, params, timeout=MCP_TOOL_TIMEOUT_SECONDS)
-        return {"ok": result.ok, "result": result.result, "error": result.error, "untrusted": True}
+        return {
+            "ok": result.ok,
+            "result": result.result,
+            "error": result.error,
+            "untrusted": True,
+            "outcome_known": result.outcome_known,
+        }
 
 
 def register_capability_tools(

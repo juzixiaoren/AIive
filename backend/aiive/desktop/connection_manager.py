@@ -33,6 +33,21 @@ class _PendingDispatch:
     error: str = ""
 
 
+def classify_pending_error(error: str) -> str:
+    """把 Node 回报的失败原因映射为工具执行错误码。
+
+    取消与前置条件失败是确定性结论；断连以及任何标注 "unknown" 的原因都
+    代表外部副作用真实结果未知，不能降级成普通失败或成功。
+    """
+    if error == "cancelled_before_start":
+        return "cancelled"
+    if error.startswith("precondition_"):
+        return "precondition_failed"
+    if error == "desktop_node_disconnected" or "unknown" in error:
+        return "execution_unknown"
+    return "execution_failed"
+
+
 class DesktopConnectionManager:
     """维护 node_id 到唯一活跃 WebSocket 的映射和同步工具调用等待器。"""
 
@@ -184,13 +199,11 @@ class DesktopConnectionManager:
                     self.cancel_action_sync(node_id, action_id, request_id, fencing_token)
                     cancel_sent = True
             if pending.error:
-                error_type = (
-                    "cancelled" if pending.error == "cancelled_before_start"
-                    else "precondition_failed" if pending.error.startswith("precondition_")
-                    else "execution_unknown" if "unknown" in pending.error
-                    else "execution_failed"
-                )
-                return {"ok": False, "error": pending.error, "error_type": error_type}
+                return {
+                    "ok": False,
+                    "error": pending.error,
+                    "error_type": classify_pending_error(str(pending.error)),
+                }
             return {
                 "ok": True,
                 "result": pending.payload,

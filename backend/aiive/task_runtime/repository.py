@@ -825,8 +825,17 @@ class TaskRepository:
 
 
 def recover_stale_tasks(db: Session, *, now: datetime | None = None) -> int:
-    """服务重启/租约过期恢复：不重放未知 Action，只重新调度安全状态。"""
+    """服务重启/租约过期恢复：不重放未知 Action，只收敛到安全状态。
+
+    活跃 Task 与已取消 Task 走不同分支：前者可以重新排队，后者必须保持
+    cancelled 终态（见 recover_cancelled_execution）。
+    """
     now = now or utcnow()
+    return _recover_stale_active_tasks(db, now=now) + recover_cancelled_execution(db, now=now)
+
+
+def _recover_stale_active_tasks(db: Session, *, now: datetime) -> int:
+    """dispatching/running 的 Task：未知副作用进入对账，其余重新排队。"""
     recovered = 0
     candidates = db.query(AgentTask).filter(
         AgentTask.status.in_([
@@ -864,6 +873,86 @@ def recover_stale_tasks(db: Session, *, now: datetime | None = None) -> int:
             repo.enqueue_run(task, trigger="recovery")
             repo.append_event(task.id, "task_recovered", {"reason": "worker_lease_expired"})
         repo.checkpoint(task.id, reason="recovery")
+        recovered += 1
+    return recovered
+
+
+def recover_cancelled_execution(db: Session, *, now: datetime | None = None) -> int:
+    """取消后的 Worker 崩溃恢复：Task 保持 cancelled，只收敛 Run 与 Action。
+
+    取消后 Worker 可能在工具执行期间崩溃，留下 running Run 与 dispatched /
+    running Action。这里只做状态收敛：Run -> interrupted，未完成 Action ->
+    unknown，Task 不回到 queued/reconciling，也不重新创建执行 Job、不重放
+    任何未知副作用。已有 UNKNOWN Action 保持 UNKNOWN；重复执行不会重复
+    产生终态事件（Run 已收敛且没有未完成 Action 时直接跳过）。
+    """
+    now = now or utcnow()
+    recovered = 0
+    candidates = db.query(AgentTask).filter(
+        AgentTask.status == TaskStatus.CANCELLED.value,
+        AgentTask.current_run_id.isnot(None),
+    ).with_for_update(skip_locked=True).all()
+    from aiive.task_runtime.read_repository import TaskReadRepository
+
+    reader = TaskReadRepository(db)
+    repo = TaskRepository(db)
+    for task in candidates:
+        if not reader.task_visible(task):
+            # 已遗忘的 Task 由 Forget 级联清理，恢复流程不读取隐藏内容。
+            continue
+        run = db.get(AgentRun, task.current_run_id) if task.current_run_id else None
+        actions = db.query(AgentAction).filter(
+            AgentAction.task_id == task.id,
+            AgentAction.status.in_([
+                ActionStatus.DISPATCHED.value,
+                ActionStatus.RUNNING.value,
+                ActionStatus.UNKNOWN.value,
+            ]),
+        ).order_by(AgentAction.sequence.asc()).all()
+        unsettled = [
+            action for action in actions if action.status != ActionStatus.UNKNOWN.value
+        ]
+        active_run = (
+            run if run is not None and run.status == RunStatus.RUNNING.value else None
+        )
+        if active_run is not None:
+            lease = active_run.lease_expires_at
+            if lease is not None and lease.tzinfo is None:
+                lease = lease.replace(tzinfo=timezone.utc)
+            if lease is not None and lease > now:
+                # Worker 仍持有租约：等待它自己收敛，避免与在途执行竞争。
+                continue
+        if not unsettled and active_run is None:
+            continue
+        # 已有 UNKNOWN Action 保持 UNKNOWN，只收敛仍在执行中的那些。
+        for action in unsettled:
+            repo.transition_action(
+                action, ActionStatus.UNKNOWN.value,
+                error="cancelled_worker_lease_expired",
+            )
+        unknown_ids = [action.id for action in actions]
+        if active_run is not None:
+            repo.finish_run(
+                active_run,
+                status=RunStatus.INTERRUPTED.value,
+                summary={"cancelled_with_unconfirmed_actions": unknown_ids},
+                error="cancelled_worker_lease_expired",
+            )
+        repo.append_event(
+            task.id,
+            "cancelled_execution_recovered",
+            {
+                "reason": "cancelled_worker_lease_expired",
+                "run_id": run.id if run is not None else None,
+                "action_ids": unknown_ids,
+                "task_status": task.status,
+            },
+            visibility="conversation",
+        )
+        repo.checkpoint(
+            task.id, reason="cancelled_execution_recovery",
+            pending_action_refs=unknown_ids,
+        )
         recovered += 1
     return recovered
 

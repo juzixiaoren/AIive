@@ -64,11 +64,13 @@ class MCPToolResult:
         result: 成功时的返回数据（{"content": [...], "structured": ...}）
         error: 失败时的错误信息
         untrusted: MCP 输出始终为不信任内容，恒为 True
+        outcome_known: 请求发出后的异常为 False（外部副作用未知），协议层拒绝为 True
     """
     ok: bool
     result: Any = None
     error: str | None = None
     untrusted: bool = True
+    outcome_known: bool = True
 
 
 @dataclass(frozen=True)
@@ -466,6 +468,16 @@ class MCPRuntimeClient:
         startup_timeout: float = DEFAULT_STARTUP_TIMEOUT_SECONDS,
     ) -> MCPToolResult:
         """真实 tools/call：结果始终带 untrusted=True 标记。"""
+        # 会话启动失败说明请求还没发出，副作用一定没有发生；
+        # 请求发出后的异常只代表"真实结果未知"，不能降级成确定性失败。
+        try:
+            self._ensure_worker(capability_id, startup_timeout)
+        except Exception as e:
+            logger.warning(
+                "MCP 工具会话启动失败: capability=%s tool=%s error=%s",
+                capability_id, tool_name, e,
+            )
+            return MCPToolResult(ok=False, error=str(e), untrusted=True)
         try:
             raw = self._submit_with_restart(
                 capability_id, "call_tool",
@@ -477,7 +489,9 @@ class MCPRuntimeClient:
                 "MCP 工具调用失败: capability=%s tool=%s error=%s",
                 capability_id, tool_name, e,
             )
-            return MCPToolResult(ok=False, error=str(e), untrusted=True)
+            return MCPToolResult(
+                ok=False, error=str(e), untrusted=True, outcome_known=False,
+            )
         return _convert_call_result(raw)
 
     # -- 生命周期 -------------------------------------------------------
