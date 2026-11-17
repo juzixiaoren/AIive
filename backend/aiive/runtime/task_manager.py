@@ -154,6 +154,7 @@ class TaskManager:
         task = (
             self._db.query(Task)
             .filter(Task.id == task_id)
+            .populate_existing()
             .with_for_update()
             .first()
         )
@@ -188,6 +189,9 @@ class TaskManager:
                 Event.event_type == "reminder_created",
                 Event.payload["task_id"].as_string() == task.id,
             )
+            .order_by(Event.id)
+            .populate_existing()
+            .with_for_update()
             .all()
         )
         for event in related:

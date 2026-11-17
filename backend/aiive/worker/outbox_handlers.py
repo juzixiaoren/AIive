@@ -534,10 +534,11 @@ def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
 
     db_a = SessionLocal()
     try:
-        outbox = db_a.query(OutboxJob).filter(OutboxJob.id == claimed.id).with_for_update().first()
+        # Match cancel/enqueue lock order: Task -> Outbox -> Event.
+        task = db_a.query(Task).filter(Task.id == task_id).populate_existing().with_for_update().first()
+        outbox = db_a.query(OutboxJob).filter(OutboxJob.id == claimed.id).populate_existing().with_for_update().first()
         if outbox is None or not _claim_matches(outbox, claimed, datetime.now(timezone.utc)):
             return HandlerResult(HandlerOutcome.CLAIM_LOST, "提醒投递 claim 已失效")
-        task = db_a.query(Task).filter(Task.id == task_id).with_for_update().first()
         if task is None:
             return HandlerResult(
                 HandlerOutcome.NON_RETRYABLE,
@@ -635,11 +636,12 @@ def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
     degraded = False
     db_c = SessionLocal()
     try:
-        outbox = db_c.query(OutboxJob).filter(OutboxJob.id == claimed.id).with_for_update().first()
+        # Match cancel/enqueue lock order: Task -> Outbox -> Event.
+        task = db_c.query(Task).filter(Task.id == task_id).populate_existing().with_for_update().first()
+        outbox = db_c.query(OutboxJob).filter(OutboxJob.id == claimed.id).populate_existing().with_for_update().first()
         if outbox is None or not _claim_matches(outbox, claimed, datetime.now(timezone.utc)):
             db_c.rollback()
             return HandlerResult(HandlerOutcome.CLAIM_LOST, "提醒完成阶段 claim 已失效")
-        task = db_c.query(Task).filter(Task.id == task_id).with_for_update().first()
         if task is None:
             db_c.rollback()
             return HandlerResult(
@@ -651,6 +653,23 @@ def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
             db_c.commit()
             return HandlerResult(HandlerOutcome.COMPLETED, "提醒投递期间已取消")
         if task.status == "dispatching":
+            # Lock the exact event passed to the Turn, and re-read after any
+            # concurrent confirm/snooze/dismiss. Terminal events must never be
+            # reactivated, including through the fallback notification path.
+            reminder_event = db_c.query(Event).filter(
+                Event.id == reminder_id,
+                Event.event_type == "reminder_created",
+            ).populate_existing().with_for_update().first()
+            if reminder_event is not None:
+                reminder_payload = dict(reminder_event.payload or {})
+                reminder_status = str(reminder_payload.get("status", ""))
+                if reminder_payload.get("dismissed") or reminder_status not in {"pending", "alerting"}:
+                    task.status = (
+                        "cancelled" if reminder_payload.get("dismissed") or reminder_status == "cancelled"
+                        else "completed"
+                    )
+                    db_c.commit()
+                    return HandlerResult(HandlerOutcome.COMPLETED, "提醒事件已处理，保留其当前状态")
             alert_verified = _remind_alert_succeeded(db_c, turn_id, reminder_id)
             if not alert_verified:
                 # 「LLM 未调用 remind_alert」对确定性 turn_id 是重试不可改变的
@@ -674,10 +693,6 @@ def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
                         "degraded_reason": "remind_alert_not_invoked",
                     },
                 ))
-            reminder_event = db_c.query(Event).filter(
-                Event.event_type == "reminder_created",
-                Event.trace_id == task_id,
-            ).order_by(Event.created_at.desc()).first()
             if reminder_event is None:
                 reminder_event = Event(
                     trace_id=task_id,

@@ -72,14 +72,40 @@ def handle_remind_alert(db: Session, reminder_id: str):
     返回:
         包含 ok、reminder_id、content、status 的字典
     """
-    from aiive.db.models import Event
+    from aiive.db.models import Event, Task
+
+    # Read identity first, then lock Task -> Event, matching cancellation. Never
+    # hold an Event lock while waiting for the Task lock held by cancel().
     event = db.get(Event, reminder_id)
     if not event:
         return {"ok": False, "error": "Reminder not found"}
     if event.event_type != "reminder_created":
         return {"ok": False, "error": f"Not a reminder event (type={event.event_type})"}
+    task_id = (event.payload or {}).get("task_id") or event.trace_id
+    task = db.query(Task).filter(Task.id == task_id).populate_existing().with_for_update().one_or_none()
+    if task is None or task.task_type != "reminder":
+        return {"ok": False, "reminder_id": reminder_id, "error": "Reminder task not found"}
+    event = db.query(Event).filter(Event.id == reminder_id).populate_existing().with_for_update().one_or_none()
+    if event is None:
+        return {"ok": False, "error": "Reminder not found"}
 
     payload = dict(event.payload or {})
+    status = str(payload.get("status", ""))
+    if task.status in {"cancelled", "failed"} or payload.get("dismissed") or status not in {"pending", "alerting"}:
+        return {
+            "ok": False, "reminder_id": reminder_id, "status": status,
+            "task_status": task.status, "error": "Reminder no longer allows activation",
+        }
+    if status == "alerting":
+        return {
+            "ok": True, "reminder_id": reminder_id, "content": payload.get("content", ""),
+            "status": status, "already_applied": True,
+        }
+    if task.status not in {"pending", "dispatching"}:
+        return {
+            "ok": False, "reminder_id": reminder_id, "status": status,
+            "task_status": task.status, "error": "Reminder task no longer allows activation",
+        }
     payload["status"] = "alerting"
     event.payload = payload
     db.flush()
