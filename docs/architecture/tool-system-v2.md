@@ -87,7 +87,8 @@ Attachment 的 Vision 前后事务、Forget Phase A 的授权交接，以及运�
 | --- | --- | --- |
 | 参数校验失败 / 启动前失败（bash 缺失、cwd 不存在） | True | False |
 | 确定性失败但已写出一部分（写了一半文件） | True | True |
-| Shell 超时（进程树已终止，超时前可能已改文件/发请求） | True | True |
+| Shell 超时（进程树已确认终止，超时前可能已改文件/发请求） | True | True |
+| Shell 超时但终止未确认（进程可能仍在运行） | False | True |
 | 外部调用超时 / 断连（已发出） | False | True |
 | 无法确认请求是否发出 | False | False |
 
@@ -177,7 +178,8 @@ failed，保留审计原因；降级不会恢复被取消的工作。
 - `test_desktop_dispatch_phase.py`：真实连接管理器 + 模拟 WebSocket 的发送
   前后失败分类、pending 生命周期（未提交不残留、超时后可重派、按身份清理）。
 - `test_local_shell.py` / `test_tool_operation_execution.py`：真实 Shell 超时
-  后文件已写出、结果确定且副作用已开始，Operation 回执持久化同样的事实。
+  后文件已写出、结果确定且副作用已开始，Operation 回执持久化同样的事实；
+  进程树终止未确认时（`terminated=False`）结果转为 UNKNOWN。
 - `test_task_cancelled_execution_recovery.py`、`test_agent_contract_recovery.py`：
   取消恢复幂等与 Outbox 返回值。
 - `test_tool_and_cancel_recovery_pg.py`：PostgreSQL 上的结构化失败回滚与

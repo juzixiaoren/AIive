@@ -147,3 +147,20 @@ request_id、fencing_token、Journal 与幂等回放语义未变。
 验证：`test_desktop_dispatch_phase.py` 16 例，覆盖无循环、无连接、提交前循环
 关闭（两条路径）、发送失败、等待超时、超时后同 id 重派成功、旧收尾不误删新
 pending、Node 终态正常返回。
+
+### 7.3 补充：终止未确认的 Shell 超时
+
+超时后 `_terminate_tree` 现在返回"是否已确认进程退出"（kill 后 `wait(5s)` 成功
+才为 True）。此前该函数吞掉所有失败，随后无条件 `outcome_known=True`——即使
+进程树可能仍在运行并继续产生副作用，也把结果报成已知。
+
+现在超时分支记录 `terminated`：确认终止 → `outcome_known=True`、
+`side_effect_started=True`（保留 `error_type="timeout"`）；未能确认 →
+`outcome_known=False`，归一化后为 `execution_unknown`，Task Action 进入
+UNKNOWN 并保留资源锁，Operation 记为 `execution_unknown` 而不是 failed。
+同时修复取消分支：原先取消后 `proc.wait(5)` 抛超时会被外层当作 `timed_out`
+（把取消误标成超时），现在统一由 `_terminate_tree` 确认。
+
+验证：`_terminate_tree` 的确认/未确认单测；真实 bash 下强制"终止未确认"后
+返回值、归一化、执行器 payload 三层都保持 `outcome_known=False,
+side_effect_started=True, details.terminated=False`。

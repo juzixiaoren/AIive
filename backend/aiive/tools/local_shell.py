@@ -150,6 +150,8 @@ def run_bash(command: str, *, cwd: str, timeout_seconds: float | None = None, ca
     )
     timed_out = False
     cancelled = False
+    # 进程正常结束视为已确认；终止进程树后由 _terminate_tree 回填真实结论。
+    terminated = True
     try:
         proc = subprocess.Popen(
             argv,
@@ -176,8 +178,7 @@ def run_bash(command: str, *, cwd: str, timeout_seconds: float | None = None, ca
             while proc.poll() is None:
                 if cancel_check is not None and cancel_check():
                     cancelled = True
-                    _terminate_tree(proc)
-                    proc.wait(timeout=5)
+                    terminated = _terminate_tree(proc)
                     break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -188,11 +189,7 @@ def run_bash(command: str, *, cwd: str, timeout_seconds: float | None = None, ca
                     continue
         except subprocess.TimeoutExpired:
             timed_out = True
-            _terminate_tree(proc)
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
+            terminated = _terminate_tree(proc)
         for pump in pumps:
             pump.join(timeout=_JOIN_TIMEOUT)
     finally:
@@ -241,14 +238,23 @@ def run_bash(command: str, *, cwd: str, timeout_seconds: float | None = None, ca
             cancelled=True,
             outcome_known=False,
             side_effect_started=True,
+            terminated=terminated,
         )
     if timed_out:
         result["error_type"] = "timeout"
-        result["error"] = f"命令在 {timeout:.0f}s 内未结束，已终止进程树。"
-        # 终止进程树只保证"不再继续"，不能证明超时前没有改过文件或发出请求：
-        # 结果确定（已终止）但副作用可能已经开始，两个事实分别记录。
-        result["outcome_known"] = True
         result["side_effect_started"] = True
+        result["terminated"] = terminated
+        # 只有确认进程已停止，超时才是"结果已知、副作用已开始"；否则进程可能
+        # 仍在运行并继续产生副作用，执行结果本身就是未知的。
+        if terminated:
+            result["outcome_known"] = True
+            result["error"] = f"命令在 {timeout:.0f}s 内未结束，已终止进程树。"
+        else:
+            result["outcome_known"] = False
+            result["error"] = (
+                f"命令在 {timeout:.0f}s 内未结束，且进程树终止未确认；"
+                "执行结果与副作用均无法确认，需要人工核验。"
+            )
     return result
 
 
@@ -395,8 +401,8 @@ def _failure(error_type: str, message: str, started: float) -> dict[str, Any]:
     }
 
 
-def _terminate_tree(proc: subprocess.Popen[bytes]) -> None:
-    """终止整个进程树；先按平台批量终止，再兜底 kill 主进程。"""
+def _kill_process_tree(proc: subprocess.Popen[bytes]) -> None:
+    """按平台尽力终止整个进程树；是否真的停止由 _terminate_tree 确认。"""
     if sys.platform.startswith("win"):
         try:
             subprocess.run(
@@ -417,3 +423,18 @@ def _terminate_tree(proc: subprocess.Popen[bytes]) -> None:
             proc.kill()
         except OSError:
             pass
+
+
+def _terminate_tree(proc: subprocess.Popen[bytes]) -> bool:
+    """终止进程树并确认子进程已经退出。
+
+    只有 wait 成功返回才算"已确认停止"；否则命令可能仍在运行、继续产生副作用，
+    调用方必须按执行结果未知上报，不能报告已知。
+    """
+    _kill_process_tree(proc)
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        logger.warning("进程树终止未确认，可能仍在运行: pid=%s", proc.pid)
+        return False
+    return True

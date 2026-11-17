@@ -205,6 +205,53 @@ def test_run_shell_timeout_keeps_partial_side_effect(tmp_path) -> None:
     assert payload["side_effect_started"] is True
 
 
+def test_unconfirmed_shell_termination_normalizes_to_unknown() -> None:
+    """终止未确认的超时不能报已知：工具字典里的 timeout 让位于 UNKNOWN。"""
+    payload = coerce_tool_result({
+        "ok": False,
+        "error_type": "timeout",
+        "error": "命令在 1s 内未结束，且进程树终止未确认",
+        "timed_out": True,
+        "terminated": False,
+        "outcome_known": False,
+        "side_effect_started": True,
+    }).payload()
+
+    assert payload["error_type"] == "execution_unknown"
+    assert payload["execution_status"] == "execution_unknown"
+    assert payload["outcome_known"] is False
+    assert payload["side_effect_started"] is True
+    assert payload["details"]["timed_out"] is True
+    assert payload["details"]["terminated"] is False
+
+
+def test_run_shell_unconfirmed_termination_is_unknown(tmp_path, monkeypatch) -> None:
+    from aiive.tools import local_shell
+
+    def _kill_without_confirmation(proc):
+        local_shell._kill_process_tree(proc)
+        return False
+
+    monkeypatch.setattr(local_shell, "_terminate_tree", _kill_without_confirmation)
+    tool = get_tool_registry().get("run_shell")
+    assert tool is not None
+
+    payload = ToolExecutor.execute_direct(
+        tool,
+        ToolExecutionContext("run_shell"),
+        {"command": "sleep 30", "cwd": str(tmp_path), "timeout_seconds": 1},
+        10,
+    )
+
+    assert payload["ok"] is False
+    assert payload["error_type"] == "execution_unknown"
+    assert payload["execution_status"] == "execution_unknown"
+    assert payload["outcome_known"] is False
+    assert payload["side_effect_started"] is True
+    assert payload["details"]["timed_out"] is True
+    assert payload["details"]["terminated"] is False
+
+
 @pytest.fixture
 def write_session_factory(tmp_path, monkeypatch):
     """DatabaseTool 需要真实独立事务，因此使用可跨线程的独立 SQLite 库。"""

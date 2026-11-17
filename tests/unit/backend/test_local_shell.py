@@ -1,6 +1,7 @@
 """本机 Bash 执行契约测试（离线；真实 bash，不访问网络）。"""
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -99,6 +100,10 @@ def test_run_shell_timeout_terminates_process_tree(tmp_path) -> None:
     assert result["exit_code"] is None
     assert result["error_type"] == "timeout"
     assert result["duration_ms"] < 15_000
+    # 进程确实被终止：结果已知，副作用可能已经开始。
+    assert result["terminated"] is True
+    assert result["outcome_known"] is True
+    assert result["side_effect_started"] is True
 
 
 def test_run_shell_timeout_records_partial_side_effects(tmp_path) -> None:
@@ -113,6 +118,48 @@ def test_run_shell_timeout_records_partial_side_effects(tmp_path) -> None:
     assert result["timed_out"] is True
     assert result["outcome_known"] is True
     assert result["side_effect_started"] is True
+
+
+def test_unconfirmed_termination_reports_unknown_outcome(tmp_path, monkeypatch) -> None:
+    """无法确认进程终止时，命令可能仍在运行：结果与副作用都不能报已知。"""
+    _require_bash()
+
+    def _kill_without_confirmation(proc):
+        # 真实杀掉进程避免测试留下孤儿，只模拟"无法确认已停止"的结论。
+        local_shell._kill_process_tree(proc)
+        return False
+
+    monkeypatch.setattr(local_shell, "_terminate_tree", _kill_without_confirmation)
+
+    result = run_bash("sleep 30", cwd=str(tmp_path), timeout_seconds=1)
+
+    assert result["ok"] is False
+    assert result["error_type"] == "timeout"
+    assert result["timed_out"] is True
+    assert result["terminated"] is False
+    assert result["outcome_known"] is False
+    assert result["side_effect_started"] is True
+    assert "无法确认" in result["error"]
+    assert result["duration_ms"] < 15_000
+
+
+def test_terminate_tree_confirms_only_when_the_process_exits(monkeypatch) -> None:
+    class _Stopped:
+        pid = 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    class _Stubborn:
+        pid = 0
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("cmd", timeout)
+
+    monkeypatch.setattr(local_shell, "_kill_process_tree", lambda _proc: None)
+
+    assert local_shell._terminate_tree(_Stopped()) is True
+    assert local_shell._terminate_tree(_Stubborn()) is False
 
 
 def test_run_shell_truncates_large_output(tmp_path, monkeypatch) -> None:
