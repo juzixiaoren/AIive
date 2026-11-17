@@ -354,17 +354,17 @@ V2 新增：`base.py`（统一类/Context/取消/结果）、`executor.py`（协
 |---|---|
 | `registry.py` | ToolDefinition、CapabilitySafetySchema；仅注册 BaseTool；catalog/search/definition/snapshot/scoped；execute/execute_approved/execute_brokered 仅转交 ToolExecutor；完整定义指纹包含取消能力、幂等/对账与有效超时 |
 | `builtin_tools.py` | register_builtin_tools 组合全部领域工具类；_build_safety/require_ctx；DatabaseTool 通过执行适配器获得实际执行线程内事务；无 db_handler 或函数 Handler 注册 |
-| `builtin_shell.py` / `local_shell.py` | 本机 Bash（`run_shell`，常驻核心）：`handle_run_shell` → `run_bash`（真实 bash 子进程，`resolve_bash` 按 配置→PATH→Git Bash 路径 探测，找不到返回 `shell_unavailable` 且不回退 cmd/powershell）；stdout/stderr 由 `_pump` 线程边读边写 `StreamingLog`（容量 `shell_max_log_bytes`，默认 8 MiB），内存只留 `shell_output_preview_chars` 预览（输出未超过预览长度时不保留日志文件），结果含 `stdout_bytes`/`capture_truncated`/`stdout_log`/`next_offset`/`next_char_offset`，日志不可用时退化为有界内存并标 `log_error`；超时 `_terminate_tree`（POSIX 进程组 / Windows `taskkill /T`）；`isolated_env` 仅透传白名单变量 |
+| `builtin_shell.py` / `local_shell.py` | 本机 Bash（`run_shell`，常驻核心）：`RunShellTool._run` → `run_bash`（真实 bash 子进程，`resolve_bash` 按 配置→PATH→Git Bash 路径 探测，找不到返回 `shell_unavailable` 且不回退 cmd/powershell）；stdout/stderr 由 `_pump` 线程边读边写 `StreamingLog`（容量 `shell_max_log_bytes`，默认 8 MiB），内存只留 `shell_output_preview_chars` 预览（输出未超过预览长度时不保留日志文件），结果含 `stdout_bytes`/`capture_truncated`/`stdout_log`/`next_offset`/`next_char_offset`，日志不可用时退化为有界内存并标 `log_error`；超时 `_terminate_tree`（POSIX 进程组 / Windows `taskkill /T`）；`isolated_env` 仅透传白名单变量 |
 | `shell_policy.py` | `classify_shell_command`（只读白名单 + 复合操作符拦截 + git 子命令细分 + 网络命令识别）→ `ShellVerdict(read_only, uses_network, reason)`；`shell_path_violations`（命令内路径须落在 `allowed_roots`，越界 block；`$VAR` 等动态路径降级审批）；供 `control/task_policy.py` 与 `runtime/policy_engine.py` 决定放行/审批/联网拒绝 |
 | `tool_validation.py` | `build_tool_args_model` L150（`create_model(strict=True, extra="forbid")`）；`validate_tool_params` L340 返回可重试 `error_payload()` |
 | `operation_executor.py` | `enqueue_tool_operation` L89（幂等键=sha256(turn_record_id\|tool_call_id\|capability_id\|params_hash)）；`handle_tool_operation` L219（`with_for_update` fencing+execution_token） |
 | `safe_delete.py` | 全仓唯一合法删除入口：`SafeDeleteScopeRegistry` L16、`safe_delete` L126（scope 白名单+符号链接+危险路径；trash/quarantine/hard_delete_for_test_only） |
-| `forget_tool.py` | `handle_forget` / `handle_forget_status`（Phase 6A） |
+| `forget_tool.py` | `ForgetTool` / `ForgetStatusTool`（Phase 6A） |
 | `langchain_adapter.py` | ToolRegistry → LangChain `StructuredTool` 桥（闭包注入 RunContext）；description 与 parameters 均消费 `core/function_calling.py::function_definition`，安全描述在该函数统一生成 |
 
-**内置工具 handler 领域拆分（`builtin_*.py`，第一轮架构重构从 `builtin_tools.py` 抽出，仅放实现，注册仍由 `register_builtin_tools` 统一完成；`builtin_tools.py` 末尾 re-export 全部 handler 以保持导入契约不变）：**
+**内置工具类的领域拆分（`builtin_*.py` 维护业务方法，`register_builtin_tools` 统一构造工具实例与有效定义）：**
 
-| 领域模块 | 工具 handler |
+| 领域模块 | 类工具对应的 capability_id |
 |---|---|
 | `builtin_basic.py` | `echo`、`get_current_time` |
 | `builtin_reminders.py` | `schedule_reminder`、`remind_alert`、`confirm_reminder`、`snooze_reminder`、`list_tasks`、`cancel_task`、`dismiss_notifications`、`show_notifications` |
@@ -380,7 +380,7 @@ V2 新增：`base.py`（统一类/Context/取消/结果）、`executor.py`（协
 
 **统一执行**：三个入口共享 ToolExecutor 校验与执行。DirectAdapter、TurnOperationAdapter、DesktopAdapter 保留实际环境边界；Task 仍先经 CapabilityBroker / Scope / Approval / Resource Lock。取消与迁移见 [Tool System V2](architecture/tool-system-v2.md)。
 
-**38 个内置工具清单**（注册于 `builtin_tools.py::register_builtin_tools` L141 起；handler 实现分布于上表 `builtin_*.py` 领域模块，经 `builtin_tools.py` 末尾 re-export 保持导入契约不变）：
+**38 个内置工具清单**（由 `builtin_tools.py::register_builtin_tools` 注册，业务实现位于上表领域工具类）：
 基础：`echo`、`get_current_time`；本机 Shell：`run_shell`；提醒/任务：`schedule_reminder`、`remind_alert`、`confirm_reminder`、`snooze_reminder`、`list_tasks`、`cancel_task`、`show_notifications`、`dismiss_notifications`；记忆写入：`remember_or_update`、`forget`、`forget_status`、`run_memory_maintenance`；记忆召回：`memory_search`、`memory_timeline`、`memory_event_log`、`history_search`；文件：`safe_delete`、`read_text_file`、`read_document`；知识库：`ingest_document`、`reindex_document`、`search_knowledge`；联网：`web_search`、`fetch_web_page`；MCP：`search_mcp`、`install_mcp_sandbox`、`plan_capability`；自进化：`create_selfdev_plan`、`apply_patch_to_inactive_slot`、`promote_slot`、`rollback_slot`、`run_selfdev_repair`；节奏/注意力：`query_rhythm`、`query_attention`；WorkingState：`update_working_state`。
 动态补充：桌面节点 14 个 `desktop_*` 能力（`desktop/protocol.py::DESKTOP_CAPABILITIES`）+ MCP 桥接工具（`mcp/bootstrap.py`）。
 
