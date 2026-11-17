@@ -11,7 +11,7 @@ from aiive.tools.base import BaseTool
 
 import logging
 from datetime import datetime
-from typing import Any
+from typing import override, Any
 
 from aiive.context.run_context import RunContext
 from aiive.db.base import SessionLocal
@@ -58,6 +58,7 @@ MODE_EXPLANATIONS = {
 
 
 class ForgetTool(BaseTool):
+    @override
     def _run(self,
         mode: str = "everywhere",
         memory_ids: list[str] | None = None,
@@ -161,6 +162,7 @@ class ForgetTool(BaseTool):
 
 
 class ForgetStatusTool(BaseTool):
+    @override
     def _run(self,
         operation_key: str = "",
         _ctx: RunContext | None = None,

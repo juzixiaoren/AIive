@@ -1,5 +1,7 @@
 """Domain tool handlers (implementation) split from builtin_tools."""
 
+from typing import override
+
 from aiive.tools.base import BaseTool, DatabaseTool
 
 from sqlalchemy.orm import Session
@@ -7,6 +9,7 @@ from sqlalchemy.orm import Session
 
 
 class PlanCapabilityTool(DatabaseTool):
+    @override
     def _run(self, db: Session, goal: str):
         """分析目标，搜索 MCP 候选，评估风险，生成安装计划并持久化。
 
@@ -58,6 +61,7 @@ class PlanCapabilityTool(DatabaseTool):
 
 
 class SearchMcpTool(BaseTool):
+    @override
     def _run(self, goal: str = ""):
         """根据目标搜索匹配的 MCP 候选服务器。
 
@@ -73,6 +77,7 @@ class SearchMcpTool(BaseTool):
 
 
 class InstallMcpSandboxTool(DatabaseTool):
+    @override
     def _run(self,
         db: Session,
         candidate_name: str,

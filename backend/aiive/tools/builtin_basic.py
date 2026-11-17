@@ -3,16 +3,18 @@
 from aiive.tools.base import BaseTool
 
 from datetime import datetime, timezone
-from typing import Any
+from typing import override, Any
 
 
 class EchoTool(BaseTool):
+    @override
     def _run(self, message: str = "") -> str:
         """回显工具：原样返回输入消息。"""
         return message
 
 
 class GetCurrentTimeTool(BaseTool):
+    @override
     def _run(self) -> dict[str, Any]:
         """获取当前时间（UTC 与服务器本地时区）。
 

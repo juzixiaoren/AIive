@@ -1,5 +1,7 @@
 """Domain tool handlers (implementation) split from builtin_tools."""
 
+from typing import override
+
 from aiive.tools.base import BaseTool
 
 import logging
@@ -12,6 +14,7 @@ from typing import TextIO
 
 
 class SafeDeleteTool(BaseTool):
+    @override
     def _run(self, path: str, scope_id: str = "test_artifacts", mode: str = "trash"):
         """安全删除文件，仅允许删除已注册 scope 内的文件。
 
@@ -88,6 +91,7 @@ def _iter_lines(handle: TextIO) -> Iterator[str]:
 
 
 class ReadTextFileTool(BaseTool):
+    @override
     def _run(self,
         path: str,
         offset: int = 0,

@@ -3,12 +3,13 @@ from __future__ import annotations
 
 from aiive.tools.base import BaseTool, ToolExecutionContext
 
-from typing import Any
+from typing import override, Any
 
 from aiive.tools.local_shell import run_bash
 
 
 class RunShellTool(BaseTool):
+    @override
     def _run(self, command: str, cwd: str, timeout_seconds: int = 0, _execution: ToolExecutionContext | None = None) -> dict[str, Any]:
         """在 AIive 所在主机用真实 bash 执行单条命令。
 

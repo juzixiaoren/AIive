@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from sqlalchemy.orm import Session
 from sqlalchemy import true
 from dataclasses import asdict
-from typing import Any
+from typing import override, Any
 
 from aiive.config import settings
 from aiive.context.run_context import RunContext
@@ -68,6 +68,7 @@ def _sources(db: Session, ctx: RunContext, ids: list[str]) -> None:
 
 
 class ListThreadAttachmentsTool(BaseTool):
+    @override
     def _run(self,
         query: str = "", limit: int = 20, offset: int = 0, ctx: RunContext | None = None
     ) -> dict[str, Any]:
@@ -171,6 +172,7 @@ def _vision_analysis(
 
 
 class ReadAttachmentTool(BaseTool):
+    @override
     def _run(self,
         attachment_id: str,
         query: str = "",
@@ -290,6 +292,7 @@ class ReadAttachmentTool(BaseTool):
 
 
 class RecordAttachmentProgressTool(BaseTool):
+    @override
     def _run(self,
         attachment_id: str,
         next_chunk_index: int,

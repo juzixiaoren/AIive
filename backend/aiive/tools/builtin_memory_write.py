@@ -1,5 +1,7 @@
 """Domain tool handlers (implementation) split from builtin_tools."""
 
+from typing import override
+
 from aiive.tools.base import DatabaseTool
 
 from sqlalchemy.orm import Session
@@ -9,6 +11,7 @@ from aiive.tools.builtin_tools import require_ctx
 
 
 class RememberOrUpdateTool(DatabaseTool):
+    @override
     def _run(self, db: Session, ctx: RunContext | None, content: str, memory_type: str = "fact", memory_key: str = "", keywords: list[str] | None = None):
         """创建或更新记忆，通过 MemoryWriteService 统一写入（查重下沉到服务层）。
 
@@ -83,6 +86,7 @@ class RememberOrUpdateTool(DatabaseTool):
 
 
 class RunMemoryMaintenanceTool(DatabaseTool):
+    @override
     def _run(self, db: Session, ctx: RunContext | None):
         """事务化入队一次手工记忆维护，并返回入队前只读诊断快照。"""
         from aiive.memory.memory_maintenance import MemoryMaintenance

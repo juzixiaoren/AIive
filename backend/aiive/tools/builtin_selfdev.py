@@ -3,10 +3,11 @@
 from aiive.tools.base import BaseTool
 
 from pathlib import Path
-from typing import Any
+from typing import override, Any
 
 
 class CreateSelfdevPlanTool(BaseTool):
+    @override
     def _run(self, goal: str = ""):
         """生成自进化补丁计划。
 
@@ -23,6 +24,7 @@ class CreateSelfdevPlanTool(BaseTool):
 
 
 class ApplyPatchToInactiveSlotTool(BaseTool):
+    @override
     def _run(self, operations: list[dict[str, Any]] | None = None):
         """将补丁应用到非活跃槽位（不影响当前运行版本）。
 
@@ -62,6 +64,7 @@ class ApplyPatchToInactiveSlotTool(BaseTool):
 
 
 class PromoteSlotTool(BaseTool):
+    @override
     def _run(self):
         """健康检查通过后将非活跃槽位提升为活跃版本。
 
@@ -74,6 +77,7 @@ class PromoteSlotTool(BaseTool):
 
 
 class RunSelfdevRepairTool(BaseTool):
+    @override
     def _run(self,
         goal: str = "", max_rounds: int = 3, promote: bool = False
     ):
@@ -89,6 +93,7 @@ class RunSelfdevRepairTool(BaseTool):
 
 
 class RollbackSlotTool(BaseTool):
+    @override
     def _run(self):
         """回滚到上一个活跃槽位版本。
 

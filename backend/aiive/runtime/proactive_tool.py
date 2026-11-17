@@ -10,7 +10,7 @@ from aiive.tools.base import BaseTool
 
 import hashlib
 import logging
-from typing import Any
+from typing import override, Any
 
 from aiive.context.run_context import RunContext
 from aiive.db.base import SessionLocal
@@ -45,6 +45,7 @@ NOTIFY_USER_PARAMETERS: dict[str, Any] = {
 
 
 class NotifyUserTool(BaseTool):
+    @override
     def _run(self,
         content: str,
         event_id: str = "",

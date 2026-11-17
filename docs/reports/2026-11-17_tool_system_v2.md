@@ -16,12 +16,12 @@ Desktop Journal 与 Forget 授权交接边界。Worker 控制契约独立为 Fun
 | --- | --- |
 | 全量后端 | `python -m pytest -q --disable-warnings`：2,098 passed、151 skipped；跳过项主要是默认不启用的 PG 专项、Embedding 服务与 Windows 下的 POSIX 部署脚本 |
 | PostgreSQL 关键回归 | contracts、forget_exec_auth、forget_v6261、tool_v2_cancellation：37 passed；独立临时 pgvector/pg16，真实连接和事务 |
-| 最终定向回归 | Persistent Task、ToolOperation、取消、Agent Contract、Desktop：78 passed；随后 Desktop 声明兼容、Task 与取消定向回归：42 passed |
+| 最终定向回归 | Persistent Task、ToolOperation、取消、Agent Contract、Desktop：78 passed；随后 Desktop 声明兼容、Task 与取消定向回归：42 passed；节点能力声明兼容测试：10 passed |
 | Desktop Node | 12 passed；包括真实 Node Host 入口启动/终止进程、身份 fencing、Journal UNKNOWN 重启后不重放 |
 | Web | TypeScript + Vite build；chat 15 passed、work 20 passed |
 | Android | TypeScript + Vite build |
 | Desktop | Electron Forge Windows x64 package |
-| 静态检查 | Ruff `--select F,E9` 通过；basedpyright 0 errors |
+| 静态检查 | Ruff `--select F,E9` 通过；basedpyright 0 errors / 0 warnings（同时确认退出码为 0） |
 | 数据库 | PostgreSQL 从旧 head 升级；3 条旧 Operation（queued/committed/execution_unknown）状态保留，取消时间为 NULL；`alembic check` 无差异；downgrade / upgrade 回环通过 |
 
 PG 取消测试证明：取消可以在执行事务持有 Operation 行锁时提交；业务写入和

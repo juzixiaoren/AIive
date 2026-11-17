@@ -11,10 +11,11 @@ from aiive.tools.builtin_tools import require_ctx
 
 logger = logging.getLogger(__name__)
 
-from typing import Any
+from typing import override, Any
 
 
 class MemorySearchTool(DatabaseTool):
+    @override
     def _run(self,
         db: Session,
         ctx: RunContext | None,
@@ -131,6 +132,7 @@ class MemorySearchTool(DatabaseTool):
 
 
 class HistorySearchTool(DatabaseTool):
+    @override
     def _run(self,
         db: Session,
         ctx: RunContext | None,
@@ -194,6 +196,7 @@ class HistorySearchTool(DatabaseTool):
 
 
 class MemoryTimelineTool(DatabaseTool):
+    @override
     def _run(self,
         db: Session,
         ctx: RunContext | None,
@@ -304,6 +307,7 @@ class MemoryTimelineTool(DatabaseTool):
 
 
 class MemoryEventLogTool(DatabaseTool):
+    @override
     def _run(self, db: Session, ctx: RunContext | None, query: str = ""):
         """搜索原始 episodic 记忆与工具执行事件（只读 drill-down，不做语义检索）。
 

@@ -14,7 +14,7 @@ from __future__ import annotations
 from aiive.tools.base import BaseTool
 
 import logging
-from typing import Any
+from typing import override, Any
 
 from sqlalchemy.orm import Session
 
@@ -149,6 +149,7 @@ def _closed_result(db: Session, question: PendingQuestion) -> dict[str, Any]:
 
 
 class AnswerGoalQuestionTool(BaseTool):
+    @override
     def _run(self,
         answer: str,
         question_id: str = "",

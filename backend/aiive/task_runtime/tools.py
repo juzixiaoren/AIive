@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from aiive.tools.base import BaseTool
 
-from typing import Any
+from typing import override, Any
 
 from aiive.context.run_context import RunContext
 from aiive.db.base import SessionLocal
@@ -21,6 +21,7 @@ def _require_context(ctx: RunContext | None) -> RunContext:
 
 
 class DelegateTaskTool(BaseTool):
+    @override
     def _run(self,
         goal: str,
         task_type: str = "general",
@@ -176,6 +177,7 @@ def _delegate_goal(
         db.close()
 
 class GetTaskStatusTool(BaseTool):
+    @override
     def _run(self, task_id: str, ctx: RunContext | None = None) -> dict[str, Any]:
         run_ctx = _require_context(ctx)
         db = SessionLocal()
@@ -200,6 +202,7 @@ class GetTaskStatusTool(BaseTool):
 
 
 class CancelTaskTool(BaseTool):
+    @override
     def _run(self, task_id: str, ctx: RunContext | None = None) -> dict[str, Any]:
         run_ctx = _require_context(ctx)
         db = SessionLocal()
@@ -220,6 +223,7 @@ class CancelTaskTool(BaseTool):
 
 
 class SendTaskInputTool(BaseTool):
+    @override
     def _run(self, task_id: str, content: str, ctx: RunContext | None = None) -> dict[str, Any]:
         run_ctx = _require_context(ctx)
         db = SessionLocal()
@@ -260,6 +264,7 @@ def _registration(
 
 
 class ListSkillsTool(BaseTool):
+    @override
     def _run(self) -> dict[str, Any]:
         from aiive.skills import list_skills
 

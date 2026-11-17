@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any
+from typing import override, Any
 
 from aiive.mcp.runtime_client import (
     MCPToolResult,
@@ -103,9 +103,10 @@ def _input_schema_to_parameters(input_schema: dict[str, Any]) -> dict[str, Any]:
 class MCPTool(BaseTool):
     def __init__(self, definition: ToolDefinition, db_capability_id: str, tool_name: str):
         super().__init__(definition)
-        self.db_capability_id = db_capability_id
-        self.tool_name = tool_name
+        self.db_capability_id: str = db_capability_id
+        self.tool_name: str = tool_name
 
+    @override
     def _run(self, **params: Any) -> dict[str, Any]:
         result: MCPToolResult = get_runtime_client().call_tool(
             self.db_capability_id, self.tool_name, params, timeout=MCP_TOOL_TIMEOUT_SECONDS)

@@ -14,10 +14,10 @@ from aiive.forget.selector_normalizer import (
     validate_selector_combination,
 )
 from aiive.tools.forget_tool import ForgetTool, ForgetStatusTool
-from aiive.tools.base import ToolExecutionContext
+from aiive.tools.base import BaseTool, ToolExecutionContext
 from aiive.tools.registry import ToolDefinition, CapabilitySafetySchema
 
-def _api_tool(tool_type, name):
+def _api_tool(tool_type: type[BaseTool], name: str) -> BaseTool:
     return tool_type(ToolDefinition(CapabilitySafetySchema(name, "api", "trusted", "high")))
 
 router = APIRouter(prefix="/api/forget", tags=["forget"])

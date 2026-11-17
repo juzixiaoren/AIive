@@ -1,5 +1,7 @@
 """Domain tool handlers (implementation) split from builtin_tools."""
 
+from typing import override
+
 from aiive.tools.base import DatabaseTool
 
 import logging
@@ -16,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 
 
 class ScheduleReminderTool(DatabaseTool):
+    @override
     def _run(self, db: Session, ctx: RunContext | None, content: str, delay_minutes: int = 1):
         """创建定时提醒及其通知收件箱事件。
 
@@ -64,6 +67,7 @@ class ScheduleReminderTool(DatabaseTool):
 
 
 class RemindAlertTool(DatabaseTool):
+    @override
     def _run(self, db: Session, reminder_id: str):
         """LLM 在提醒到期时调用此工具，激活提醒警报。
 
@@ -122,6 +126,7 @@ class RemindAlertTool(DatabaseTool):
 
 
 class ConfirmReminderTool(DatabaseTool):
+    @override
     def _run(self, db: Session, reminder_id: str):
         """用户确认提醒完成，将状态标记为 confirmed。
 
@@ -152,6 +157,7 @@ class ConfirmReminderTool(DatabaseTool):
 
 
 class SnoozeReminderTool(DatabaseTool):
+    @override
     def _run(self, db: Session, ctx: RunContext | None, reminder_id: str, delay_minutes: int = 5):
         """用户延迟提醒，创建新的延时任务和事件。
 
@@ -244,6 +250,7 @@ class SnoozeReminderTool(DatabaseTool):
 
 
 class ListTasksTool(DatabaseTool):
+    @override
     def _run(self, db: Session, ctx: RunContext | None, status: str = "", thread_id: str = ""):
         """列出所有任务/提醒。
 
@@ -265,6 +272,7 @@ class ListTasksTool(DatabaseTool):
 
 
 class CancelTaskTool(DatabaseTool):
+    @override
     def _run(self, db: Session, task_id: str):
         """按 ID 取消任务，委托 TaskManager.cancel 的唯一取消规则。
 
@@ -285,6 +293,7 @@ class CancelTaskTool(DatabaseTool):
 
 
 class DismissNotificationsTool(DatabaseTool):
+    @override
     def _run(self, db: Session, ctx: RunContext | None, scope: str = "thread"):
         """清除未执行的通知：将待提醒/提醒中/已延时的通知标记为 cancelled。
 
@@ -319,6 +328,7 @@ class DismissNotificationsTool(DatabaseTool):
 
 
 class ShowNotificationsTool(DatabaseTool):
+    @override
     def _run(self, db: Session):
         """显示已触发的通知（notification_created 和 reminder_created 事件）。
 

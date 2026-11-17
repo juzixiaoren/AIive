@@ -110,7 +110,7 @@ class BaseTool(ABC):
     """
 
     def __init__(self, definition: ToolDefinition):
-        self.definition = definition
+        self.definition: ToolDefinition = definition
 
     @property
     def safety(self):
@@ -171,6 +171,7 @@ class BaseTool(ABC):
             str(error),
             outcome_known=not external,
             side_effect_started=external,
+            details={"execution_id": context.execution_id},
         )
 
     def request_cancel(self, context: ToolExecutionContext) -> CancelResult:
@@ -185,14 +186,17 @@ class BaseTool(ABC):
                 "reconciliation_unavailable",
                 "No reconciliation provider",
                 outcome_known=False,
+                details={"execution_id": context.execution_id},
             )
         )
 
     def compensate(self, context: ToolExecutionContext, receipt: Any) -> ToolResult:
+        del receipt
         return ToolResult(
             error=ToolError(
                 "compensation_unavailable",
                 "Compensation requires a separate authorized operation",
+                details={"execution_id": context.execution_id},
             )
         )
 

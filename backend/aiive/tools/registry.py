@@ -8,7 +8,6 @@
 - ToolRegistry: 工具注册表，管理注册、查询、schema 渲染和执行
 """
 
-import concurrent.futures
 import hashlib
 import json
 import logging
@@ -25,15 +24,6 @@ logger = logging.getLogger(__name__)
 
 # 所有工具的默认超时时间（秒）：来自配置，未显式声明 timeout 的工具使用此值
 DEFAULT_TOOL_TIMEOUT = settings.tool_default_timeout_seconds
-
-# 模块级线程池：复用避免重复创建开销，daemon 线程不阻止进程退出。
-# 池大小来自配置：超时后子线程不被 cancel（见 execute 说明），
-# 阻塞 I/O 型工具接连超时可能占满此池，可按部署环境调大。
-_tool_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=settings.tool_executor_max_workers,
-    thread_name_prefix="tool-worker",
-)
-
 
 @dataclass(frozen=True)
 class CapabilitySafetySchema:
@@ -183,7 +173,7 @@ class ToolRegistry:
         """初始化空的工具注册表。"""
         self._tools: dict[str, BaseTool] = {}
 
-    def register(self, reg: BaseTool) -> None:
+    def register(self, reg: object) -> None:
         """注册工具，保存规范契约并重新计算完整定义指纹。
 
         参数:

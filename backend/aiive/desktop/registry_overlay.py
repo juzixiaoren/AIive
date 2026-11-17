@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import override, Any
 
 from sqlalchemy.orm import Session
 
@@ -54,6 +54,7 @@ def _schema_parameters(schema: dict[str, Any]) -> dict[str, Any]:
 
 
 class DesktopTool(BaseTool):
+    @override
     def _run(self, **params: Any) -> Any:
         return desktop_connection_manager.dispatch_sync(self.executor_node_id, self.safety.capability_id,
                                                         params, self.safety.timeout_seconds)

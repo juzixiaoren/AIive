@@ -1,5 +1,7 @@
 """Domain tool handlers (implementation) split from builtin_tools."""
 
+from typing import override
+
 from aiive.tools.base import BaseTool, DatabaseTool
 
 from sqlalchemy.orm import Session
@@ -7,6 +9,7 @@ from sqlalchemy.orm import Session
 
 
 class ReadDocumentTool(BaseTool):
+    @override
     def _run(self, file_path: str, max_chars: int = 50_000):
         """从允许根目录提取结构化文档纯文本，不执行宏或嵌入内容。"""
         from aiive.knowledge.access import resolve_knowledge_path
@@ -27,6 +30,7 @@ class ReadDocumentTool(BaseTool):
 
 
 class IngestDocumentTool(DatabaseTool):
+    @override
     def _run(self, db: Session, file_path: str):
         """通过统一摄取服务持久化原文并导入知识库。"""
         from aiive.knowledge.access import resolve_knowledge_path
@@ -36,6 +40,7 @@ class IngestDocumentTool(DatabaseTool):
 
 
 class ReindexDocumentTool(DatabaseTool):
+    @override
     def _run(self, db: Session, document_id: str):
         """从持久原文重新生成知识文档分块。"""
         from aiive.knowledge.ingestor import KnowledgeIngestor
@@ -44,6 +49,7 @@ class ReindexDocumentTool(DatabaseTool):
 
 
 class SearchKnowledgeTool(DatabaseTool):
+    @override
     def _run(self, db: Session, query: str, limit: int = 5):
         """搜索已导入的文档知识。
 

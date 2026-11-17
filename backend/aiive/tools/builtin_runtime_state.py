@@ -3,7 +3,7 @@
 from aiive.tools.base import DatabaseTool
 
 from datetime import datetime, timezone
-from typing import Any
+from typing import override, Any
 
 from sqlalchemy.orm import Session
 
@@ -13,6 +13,7 @@ from aiive.tools.builtin_tools import require_ctx
 
 
 class QueryRhythmTool(DatabaseTool):
+    @override
     def _run(self, db: Session):
         """获取每日节奏摘要。"""
         from aiive.runtime.rhythm_manager import RhythmManager
@@ -20,6 +21,7 @@ class QueryRhythmTool(DatabaseTool):
 
 
 class QueryAttentionTool(DatabaseTool):
+    @override
     def _run(self, db: Session, ctx: RunContext | None, thread_id: str = ""):
         """只读查询当前注意力状态与空闲评估，不写入新的 AttentionState。"""
         from aiive.runtime.attention_manager import AttentionManager
@@ -29,6 +31,7 @@ class QueryAttentionTool(DatabaseTool):
 
 
 class UpdateWorkingStateTool(DatabaseTool):
+    @override
     def _run(self,
         db: Session, ctx: RunContext | None,
         field: str, operation: str = "set",

@@ -18,8 +18,14 @@ from aiive.tools.base import (
     ToolExecutionContext,
     ToolResult,
 )
-from aiive.tools.registry import DEFAULT_TOOL_TIMEOUT, ToolRegistry, _tool_executor
+from aiive.config import settings
+from aiive.tools.registry import DEFAULT_TOOL_TIMEOUT, ToolRegistry
 from aiive.tools.tool_validation import validate_tool_params
+
+tool_thread_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=settings.tool_executor_max_workers,
+    thread_name_prefix="tool-worker",
+)
 
 _active_lock = threading.Lock()
 _active: dict[str, tuple[BaseTool, ToolExecutionContext]] = {}
@@ -99,6 +105,7 @@ class DesktopAdapter:
     def invoke(
         tool: BaseTool, context: ToolExecutionContext, arguments: dict[str, Any]
     ) -> ToolResult:
+        del arguments
         from aiive.desktop.connection_manager import (
             DesktopDispatchError,
             desktop_connection_manager,
@@ -160,7 +167,7 @@ class TurnOperationAdapter:
 
 class ToolExecutor:
     def __init__(self, registry: ToolRegistry):
-        self.registry = registry
+        self.registry: ToolRegistry = registry
 
     def execute(
         self,
@@ -274,7 +281,7 @@ class ToolExecutor:
 
         try:
             result = execute_in_tool_thread(
-                _tool_executor,
+                tool_thread_pool,
                 invoke,
                 timeout,
                 observe_cancel=lambda: cancellation_requested(context),
