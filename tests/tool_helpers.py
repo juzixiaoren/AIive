@@ -2,7 +2,7 @@
 
 import inspect
 
-from aiive.tools.base import BaseTool, ToolExecutionContext
+from aiive.tools.base import BaseTool, ToolExecutionContext, ToolResult
 from aiive.tools.executor import DirectAdapter
 from aiive.tools.registry import CapabilitySafetySchema, ToolDefinition
 
@@ -30,4 +30,6 @@ def invoke_test_tool(tool, *args, **kwargs):
     run = params.pop("ctx", None)
     db = params.pop("db", None)
     context = ToolExecutionContext(tool.safety.capability_id, run, db=db)
-    return DirectAdapter.invoke(tool, context, params)
+    result = DirectAdapter.invoke(tool, context, params)
+    # 数据库工具路径返回归一化 ToolResult；测试需要的是原始业务返回值。
+    return result.value if isinstance(result, ToolResult) else result

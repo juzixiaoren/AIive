@@ -401,3 +401,67 @@ def test_model_boundary_preserves_content_unavailable(durable_db, monkeypatch):
     assert result.outcome == HandlerOutcome.COMPLETED
     assert "task_content_unavailable" in result.reason
     assert durable_db.query(AgentAction).filter_by(task_id=task_id).count() == 0
+
+
+def _cancel_during_run(self, task, capabilities):
+    """模拟：运行中用户取消，Worker 在工具执行期间崩溃。"""
+    repo = TaskRepository(self.db)
+    run = self.db.get(AgentRun, task.current_run_id)
+    action = repo.create_action(
+        task=task, run=run, capability_id="get_current_time", arguments={},
+        descriptor_hash="test", risk_level="low", requires_approval=False,
+    )
+    for status in ["validated", "ready", "dispatched"]:
+        repo.transition_action(action, status)
+    repo.cancel_task(task.id, reason="user_cancelled")
+    self.db.commit()
+    raise RuntimeError("worker crashed after cancel")
+
+
+def test_cancelled_recovery_completes_outbox_job(durable_db, monkeypatch):
+    """取消终态收敛并提交后，本次投递已经产生实际效果，不应再重试。"""
+    task_id, claimed = setup_job(durable_db)
+    monkeypatch.setattr(TaskAgentExecutor, "decide", _cancel_during_run)
+
+    assert handle_agent_task_run(claimed).outcome == HandlerOutcome.COMPLETED
+
+    durable_db.expire_all()
+    task = durable_db.get(AgentTask, task_id)
+    assert task.status == "cancelled"
+    assert durable_db.get(AgentRun, task.current_run_id).status == "interrupted"
+    actions = durable_db.query(AgentAction).filter_by(task_id=task_id).all()
+    assert [action.status for action in actions] == ["unknown"]
+    assert durable_db.query(AgentTaskEvent).filter_by(
+        task_id=task_id, event_type="cancelled_execution_recovered",
+    ).count() == 1
+
+    # 再次投递只会读到同一个取消终态，不会重复记录恢复事件。
+    assert handle_agent_task_run(claimed).outcome == HandlerOutcome.COMPLETED
+    durable_db.expire_all()
+    assert durable_db.query(AgentTaskEvent).filter_by(
+        task_id=task_id, event_type="cancelled_execution_recovered",
+    ).count() == 1
+
+
+def test_cancelled_recovery_failure_stays_retryable(durable_db, monkeypatch):
+    """恢复事务失败时不得报告成功：状态全部回滚，Outbox 仍可重试。"""
+    task_id, claimed = setup_job(durable_db)
+    monkeypatch.setattr(TaskAgentExecutor, "decide", _cancel_during_run)
+
+    original_checkpoint = TaskRepository.checkpoint
+
+    def failing_checkpoint(self, task_id, *, reason, **kwargs):
+        if reason == "cancelled_execution_recovery":
+            raise RuntimeError("recovery flush failed")
+        return original_checkpoint(self, task_id, reason=reason, **kwargs)
+
+    monkeypatch.setattr(TaskRepository, "checkpoint", failing_checkpoint)
+
+    assert handle_agent_task_run(claimed).outcome == HandlerOutcome.RETRYABLE_ERROR
+
+    durable_db.expire_all()
+    assert durable_db.get(AgentTask, task_id).status == "cancelled"
+    assert durable_db.query(AgentAction).filter_by(task_id=task_id).one().status == "dispatched"
+    assert durable_db.query(AgentTaskEvent).filter_by(
+        task_id=task_id, event_type="cancelled_execution_recovered",
+    ).count() == 0

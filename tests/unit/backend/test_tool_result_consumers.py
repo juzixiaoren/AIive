@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 
 from aiive.context.run_context import RunContext
 from aiive.mcp.bootstrap import MCPTool, MCP_TOOL_TIMEOUT_SECONDS
@@ -11,7 +12,7 @@ from aiive.mcp.runtime_client import (
     _convert_call_result,
 )
 from aiive.runtime.tool_events import parse_tool_execution_receipt
-from aiive.tools.base import ToolExecutionContext
+from aiive.tools.base import BaseTool, ToolExecutionContext
 from aiive.tools.executor import ToolExecutor
 from aiive.tools.langchain_adapter import build_langchain_tools
 from aiive.tools.registry import (
@@ -197,3 +198,40 @@ def test_desktop_disconnect_keeps_unknown_outcome(monkeypatch) -> None:
     assert payload["error_type"] == "execution_unknown"
     assert payload["outcome_known"] is False
     assert payload["side_effect_started"] is True
+
+
+class _PartialFailureProbe(BaseTool):
+    def _run(self):
+        return {
+            "ok": False,
+            "error_type": "execution_failed",
+            "error": "写了一半文件",
+            "outcome_known": True,
+            "side_effect_started": True,
+            "written": 1,
+        }
+
+
+def test_langchain_content_keeps_side_effect_flags() -> None:
+    registry = get_tool_registry()
+    capability_id = f"contract_partial_{uuid.uuid4().hex[:8]}"
+    registry.register(
+        _PartialFailureProbe(
+            ToolDefinition(
+                CapabilitySafetySchema(capability_id, "test", "trusted", "low"),
+                description="partial failure probe",
+                parameters={},
+            )
+        )
+    )
+    try:
+        content = _langchain_tool(registry, capability_id).invoke({})
+    finally:
+        registry.unregister(capability_id)
+
+    parsed = json.loads(content)
+    assert parsed["ok"] is False
+    assert parsed["error_type"] == "execution_failed"
+    assert parsed["outcome_known"] is True
+    assert parsed["side_effect_started"] is True
+    assert parsed["written"] == 1

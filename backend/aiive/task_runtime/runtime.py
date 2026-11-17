@@ -553,7 +553,13 @@ class PersistentTaskRuntime:
             self.repo.transition_action(
                 action, ActionStatus.FAILED.value,
                 error=str(result.get("error", "execution_failed")),
-                payload={"evidence_id": evidence.id, "error_type": error_type},
+                payload={
+                    "evidence_id": evidence.id,
+                    "error_type": error_type,
+                    # 失败与"是否已产生外部影响"是两个独立事实，事件里都要保留。
+                    "outcome_known": bool(result.get("outcome_known", True)),
+                    "side_effect_started": bool(result.get("side_effect_started", False)),
+                },
             )
         self.repo.checkpoint(task.id, reason="action_failed")
         self.db.commit()

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import uuid
 
-from aiive.db.models import AgentAction, AgentRun, TaskEvidence, Thread
+from aiive.db.models import AgentAction, AgentRun, AgentTaskEvent, TaskEvidence, Thread
 from aiive.task_runtime.agent_executor import AgentDecision
 from aiive.task_runtime.repository import TaskRepository
 from aiive.task_runtime.runtime import PersistentTaskRuntime
@@ -64,6 +64,17 @@ class _UnknownOutcomeTool(BaseTool):
 class _CancelledOutcomeTool(BaseTool):
     def _run(self):
         return {"ok": False, "error_type": "cancelled", "error": "Cancelled before execution"}
+
+
+class _PartialFailureTool(BaseTool):
+    def _run(self):
+        return {
+            "ok": False,
+            "error_type": "execution_failed",
+            "error": "写了一半文件",
+            "outcome_known": True,
+            "side_effect_started": True,
+        }
 
 
 def _register(tool_type, capability_id: str):
@@ -170,3 +181,30 @@ def test_successful_action_still_succeeds(db_session, tmp_path) -> None:
     action = db_session.query(AgentAction).filter(AgentAction.task_id == task.id).one()
     assert action.status == ActionStatus.SUCCEEDED.value
     assert db_session.get(type(task), task.id).status == TaskStatus.SUCCEEDED.value
+
+
+def test_failed_action_event_keeps_side_effect_fact(db_session, tmp_path) -> None:
+    """确定性失败也可能已经产生了部分外部副作用，事件必须保留这个事实。"""
+    capability_id = f"contract_partial_{uuid.uuid4().hex[:8]}"
+    registry = _register(_PartialFailureTool, capability_id)
+    try:
+        task = _task(db_session, _thread(db_session), [capability_id], [str(tmp_path)])
+        agent = SequenceAgent(
+            ActionProposal(decision="action", capability_id=capability_id, arguments={}),
+            ActionProposal(decision="finish", summary="部分完成", report_status="partial"),
+        )
+
+        PersistentTaskRuntime(db_session, agent_executor=agent).run(task.id)
+
+        db_session.expire_all()
+        action = db_session.query(AgentAction).filter(AgentAction.task_id == task.id).one()
+        assert action.status == ActionStatus.FAILED.value
+        event = db_session.query(AgentTaskEvent).filter(
+            AgentTaskEvent.task_id == task.id,
+            AgentTaskEvent.event_type == "action_failed",
+        ).one()
+        assert event.payload["error_type"] == "execution_failed"
+        assert event.payload["outcome_known"] is True
+        assert event.payload["side_effect_started"] is True
+    finally:
+        registry.unregister(capability_id)

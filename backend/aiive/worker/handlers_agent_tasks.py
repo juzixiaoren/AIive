@@ -84,6 +84,7 @@ def handle_agent_task_run(claimed: ClaimedJob) -> HandlerResult:
     except Exception as error:
         logger.exception("Agent Task Run 失败: task_id=%s", task_id)
         db.rollback()
+        converged_cancelled = False
         try:
             repo = TaskRepository(db)
             task = repo.get_task(task_id, for_update=True)
@@ -134,9 +135,17 @@ def handle_agent_task_run(claimed: ClaimedJob) -> HandlerResult:
                     repo.append_event(task.id, "run_failed", {"error": str(error)[:1000]})
                     repo.checkpoint(task.id, reason="run_failed")
                 db.commit()
+                # 只有提交成功后才确认"这次投递已经完成了实际工作"。
+                converged_cancelled = cancelled
         except Exception:
             db.rollback()
+            converged_cancelled = False
             logger.exception("Agent Task 失败状态回收失败: task_id=%s", task_id)
+        if converged_cancelled:
+            # 取消终态已收敛并提交：不需要 Outbox 再投递一次去读同一个终态。
+            return HandlerResult(
+                HandlerOutcome.COMPLETED, reason="cancelled_execution_recovered",
+            )
         return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, reason=str(error))
     finally:
         db.close()

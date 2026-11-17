@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -226,3 +228,206 @@ def test_database_tool_success_still_commits_business_transaction(write_session_
     assert payload["result"] == "written"
     with write_session_factory() as db:
         assert db.get(Thread, "contract-committed") is not None
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param(
+            {"ok": False, "error_type": "execution_failed", "error": "参数不合法"},
+            (True, False),
+            id="known_without_side_effect",
+        ),
+        pytest.param(
+            {
+                "ok": False,
+                "error_type": "execution_failed",
+                "error": "写了一半文件",
+                "outcome_known": True,
+                "side_effect_started": True,
+                "written": 2,
+            },
+            (True, True),
+            id="known_with_side_effect",
+        ),
+        pytest.param(
+            {"ok": False, "error_type": "execution_unknown", "error": "对端无响应"},
+            (False, True),
+            id="unknown_started",
+        ),
+        pytest.param(
+            {
+                "ok": False,
+                "error_type": "execution_unknown",
+                "error": "无法确认请求是否发出",
+                "side_effect_started": False,
+            },
+            (False, False),
+            id="unknown_unconfirmed_start",
+        ),
+    ],
+)
+def test_outcome_known_and_side_effect_started_are_independent(raw, expected) -> None:
+    outcome_known, side_effect_started = expected
+
+    payload = coerce_tool_result(raw).payload()
+
+    assert payload["outcome_known"] is outcome_known
+    assert payload["side_effect_started"] is side_effect_started
+    assert payload["ok"] is False
+
+
+def test_known_failure_keeps_original_code_and_business_details() -> None:
+    raw = {
+        "ok": False,
+        "error_type": "execution_failed",
+        "error": "写入第 2 个文件时失败",
+        "outcome_known": True,
+        "side_effect_started": True,
+        "written_files": ["a.txt", "b.txt"],
+    }
+
+    error = coerce_tool_result(raw).error
+
+    assert error is not None
+    assert error.code == "execution_failed"
+    assert error.outcome_known is True
+    assert error.side_effect_started is True
+    assert error.details["written_files"] == ["a.txt", "b.txt"]
+
+
+def test_coercion_keeps_raw_business_value_for_diagnostics() -> None:
+    raw = {"ok": False, "error_type": "execution_failed", "error": "失败", "path": "/tmp/x"}
+
+    result = coerce_tool_result(raw)
+
+    assert result.error is not None
+    # 原始业务字典保留给诊断与既有调用方；payload() 仍然只输出错误封套。
+    assert result.value == raw
+    assert result.payload()["ok"] is False
+
+
+class _ScriptedWriteTool(DatabaseTool):
+    """先写一行业务数据，再返回脚本化结果，用来验证提交/回滚边界。"""
+
+    def __init__(self, definition, outcome):
+        super().__init__(definition)
+        self.outcome = outcome
+        self.row_id = f"contract-row-{uuid.uuid4()}"
+
+    def _run(self, db):
+        db.add(Thread(id=self.row_id, title="scripted write"))
+        db.flush()
+        return self.outcome
+
+
+def _scripted_tool(outcome) -> _ScriptedWriteTool:
+    return _ScriptedWriteTool(
+        ToolDefinition(
+            CapabilitySafetySchema("contract_scripted_write", "test", "trusted", "low"),
+            parameters={},
+        ),
+        outcome,
+    )
+
+
+STRUCTURED_FAILURES = [
+    pytest.param(
+        {"ok": False, "error_type": "execution_failed", "error": "失败"},
+        id="dict_ok_false",
+    ),
+    pytest.param(
+        {"ok": False, "allowed": False, "reason": "范围外"},
+        id="dict_allowed_false",
+    ),
+    pytest.param(
+        ToolError("execution_failed", "失败", side_effect_started=True),
+        id="tool_error",
+    ),
+    pytest.param(
+        ToolResult(error=ToolError("execution_unknown", "未知", outcome_known=False)),
+        id="tool_result_error",
+    ),
+    pytest.param(
+        ToolResult(value={"ok": False, "error_type": "execution_failed", "error": "失败"}),
+        id="tool_result_value",
+    ),
+]
+
+
+@pytest.mark.parametrize("outcome", STRUCTURED_FAILURES)
+def test_database_tool_structured_failure_never_commits(write_session_factory, outcome) -> None:
+    tool = _scripted_tool(outcome)
+
+    payload = ToolExecutor.execute_direct(
+        tool, ToolExecutionContext(tool.safety.capability_id), {}, 10,
+    )
+
+    assert payload["ok"] is False
+    with write_session_factory() as db:
+        assert db.get(Thread, tool.row_id) is None
+
+
+def test_database_tool_success_commits_scripted_write(write_session_factory) -> None:
+    tool = _scripted_tool("written")
+
+    payload = ToolExecutor.execute_direct(
+        tool, ToolExecutionContext(tool.safety.capability_id), {}, 10,
+    )
+
+    assert payload["ok"] is True
+    assert payload["result"] == "written"
+    with write_session_factory() as db:
+        assert db.get(Thread, tool.row_id) is not None
+
+
+def test_operation_response_keeps_persisted_side_effect_facts() -> None:
+    from aiive.db.models import ToolOperation
+    from aiive.tools.operation_executor import operation_response
+
+    failed = ToolOperation(
+        id="op-failed",
+        idempotency_key="key",
+        thread_id="thread",
+        turn_record_id="turn-record",
+        turn_id="turn",
+        tool_call_id="call",
+        capability_id="run_shell",
+        params={},
+        params_hash="hash",
+        descriptor_hash="descriptor",
+        status="failed",
+        effect_mode="non_repeatable_external",
+        outbox_job_id="job",
+        trace_id="trace",
+        error_message="写了一半",
+        effect_receipt={"outcome_known": True, "side_effect_started": True},
+    )
+
+    payload = operation_response(failed)
+
+    assert payload["ok"] is False
+    assert payload["outcome_known"] is True
+    assert payload["side_effect_started"] is True
+
+    unknown = ToolOperation(
+        id="op-unknown",
+        idempotency_key="key-2",
+        thread_id="thread",
+        turn_record_id="turn-record",
+        turn_id="turn",
+        tool_call_id="call-2",
+        capability_id="run_shell",
+        params={},
+        params_hash="hash",
+        descriptor_hash="descriptor",
+        status="execution_unknown",
+        effect_mode="non_repeatable_external",
+        outbox_job_id="job-2",
+        trace_id="trace",
+    )
+
+    unknown_payload = operation_response(unknown)
+
+    assert unknown_payload["outcome_known"] is False
+    assert unknown_payload["side_effect_started"] is True

@@ -14,12 +14,23 @@ from typing import Any
 from fastapi import WebSocket
 
 from aiive.config import settings
+from aiive.desktop.protocol import DesktopDispatchPhase
 
 logger = logging.getLogger(__name__)
 
 
 class DesktopDispatchError(RuntimeError):
-    """桌面节点不在线、超时或返回失败。"""
+    """桌面节点不在线、超时、断连或返回失败。
+
+    phase 标明这次派发相对"请求已写往 Node"边界的位置，调用方据此区分
+    确定性未执行与外部副作用未知；默认 SUBMITTED（无法确认即按未知处理）。
+    """
+
+    def __init__(
+        self, message: str, phase: DesktopDispatchPhase = DesktopDispatchPhase.SUBMITTED,
+    ) -> None:
+        super().__init__(message)
+        self.phase: DesktopDispatchPhase = phase
 
 
 @dataclass
@@ -91,8 +102,32 @@ class DesktopConnectionManager:
         with self._lock:
             websocket = self._connections.get(node_id)
         if websocket is None:
-            raise DesktopDispatchError("desktop_node_offline")
-        await websocket.send_text(json.dumps(payload, ensure_ascii=False))
+            # 没有 socket：请求一定没有写出去。
+            raise DesktopDispatchError(
+                "desktop_node_offline", phase=DesktopDispatchPhase.NOT_SUBMITTED,
+            )
+        try:
+            await websocket.send_text(json.dumps(payload, ensure_ascii=False))
+        except Exception as error:
+            # 写 socket 过程中失败：对端可能已经收到请求，只能判为未知。
+            raise DesktopDispatchError(
+                f"desktop_send_failed: {error}", phase=DesktopDispatchPhase.SUBMITTED,
+            ) from error
+
+    def _submit_to_loop(self, coroutine: Any) -> Any:
+        """投递协程到主事件循环；循环不可用时请求尚未发出。"""
+        loop = self._main_loop
+        if loop is not None:
+            try:
+                return asyncio.run_coroutine_threadsafe(coroutine, loop)
+            except RuntimeError as error:
+                message = f"main_loop_unavailable: {error}"
+        else:
+            message = "main_loop_unavailable"
+        close = getattr(coroutine, "close", None)
+        if callable(close):
+            close()
+        raise DesktopDispatchError(message, phase=DesktopDispatchPhase.NOT_SUBMITTED)
 
     def dispatch_sync(
         self,
@@ -102,14 +137,20 @@ class DesktopConnectionManager:
         timeout_seconds: float | None = None,
     ) -> Any:
         """从工具工作线程投递到主事件循环，并有限等待节点终态。"""
-        if self._main_loop is None or not self.is_connected(node_id):
-            raise DesktopDispatchError("desktop_node_offline")
+        if self._main_loop is None:
+            raise DesktopDispatchError(
+                "main_loop_unavailable", phase=DesktopDispatchPhase.NOT_SUBMITTED,
+            )
+        if not self.is_connected(node_id):
+            raise DesktopDispatchError(
+                "desktop_node_offline", phase=DesktopDispatchPhase.NOT_SUBMITTED,
+            )
         request_id = str(uuid.uuid4())
         pending = _PendingDispatch(node_id=node_id)
         with self._lock:
             self._pending[request_id] = pending
         timeout = timeout_seconds or settings.aiive_desktop_dispatch_timeout_seconds
-        future = asyncio.run_coroutine_threadsafe(
+        future = self._submit_to_loop(
             self._send(node_id, {
                 "type": "operation.request",
                 "data": {
@@ -118,20 +159,27 @@ class DesktopConnectionManager:
                     "params": params,
                     "timeout_seconds": timeout,
                 },
-            }),
-            self._main_loop,
+            })
         )
         try:
             future.result(timeout=min(5.0, timeout))
             if not pending.event.wait(timeout=timeout):
-                raise DesktopDispatchError("desktop_operation_timeout")
+                raise DesktopDispatchError(
+                    "desktop_operation_timeout", phase=DesktopDispatchPhase.SUBMITTED,
+                )
             if pending.error:
-                raise DesktopDispatchError(pending.error)
+                # Node 已经返回明确终态：按回执处理。
+                raise DesktopDispatchError(
+                    pending.error, phase=DesktopDispatchPhase.TERMINAL,
+                )
             return pending.payload
         except DesktopDispatchError:
             raise
         except Exception as error:
-            raise DesktopDispatchError(str(error)) from error
+            # 发送/等待期间的未知异常：对端可能已经收到请求。
+            raise DesktopDispatchError(
+                str(error), phase=DesktopDispatchPhase.SUBMITTED,
+            ) from error
         finally:
             with self._lock:
                 self._pending.pop(request_id, None)
@@ -154,39 +202,56 @@ class DesktopConnectionManager:
         cancel_check: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         """投递 v2 持久 Action；request_id=action_id，重试时 Node journal 幂等回放。"""
-        if self._main_loop is None or not self.is_connected(node_id):
-            raise DesktopDispatchError("desktop_node_offline")
+        if self._main_loop is None:
+            raise DesktopDispatchError(
+                "main_loop_unavailable", phase=DesktopDispatchPhase.NOT_SUBMITTED,
+            )
+        if not self.is_connected(node_id):
+            raise DesktopDispatchError(
+                "desktop_node_offline", phase=DesktopDispatchPhase.NOT_SUBMITTED,
+            )
+        timeout = timeout_seconds or settings.aiive_desktop_dispatch_timeout_seconds
+        from aiive.desktop.protocol import DESKTOP_PROTOCOL_VERSION, DesktopActionEnvelope
+
         request_id = action_id
+        try:
+            # 发送前完成信封校验：本地参数/身份不合法时请求一定不会发出。
+            envelope = DesktopActionEnvelope(
+                request_id=request_id,
+                action_id=action_id,
+                task_id=task_id,
+                run_id=run_id,
+                idempotency_key=idempotency_key,
+                arguments_hash=arguments_hash,
+                capability_id=capability_id,
+                params=params,
+                preconditions=preconditions,
+                scope=scope,
+                timeout_seconds=timeout,
+                fencing_token=fencing_token,
+            )
+        except Exception as error:
+            raise DesktopDispatchError(
+                f"desktop_envelope_invalid: {error}",
+                phase=DesktopDispatchPhase.NOT_SUBMITTED,
+            ) from error
+
         pending = _PendingDispatch(node_id=node_id, action_id=action_id)
         with self._lock:
             existing = self._pending.get(request_id)
             if existing is not None and not existing.event.is_set():
-                raise DesktopDispatchError("desktop_action_already_in_flight")
+                # 同一个 Action 已有在途请求：本次没有发送，但真实结果未知。
+                raise DesktopDispatchError(
+                    "desktop_action_already_in_flight",
+                    phase=DesktopDispatchPhase.SUBMITTED,
+                )
             self._pending[request_id] = pending
-        timeout = timeout_seconds or settings.aiive_desktop_dispatch_timeout_seconds
-        from aiive.desktop.protocol import DESKTOP_PROTOCOL_VERSION, DesktopActionEnvelope
-
-        envelope = DesktopActionEnvelope(
-            request_id=request_id,
-            action_id=action_id,
-            task_id=task_id,
-            run_id=run_id,
-            idempotency_key=idempotency_key,
-            arguments_hash=arguments_hash,
-            capability_id=capability_id,
-            params=params,
-            preconditions=preconditions,
-            scope=scope,
-            timeout_seconds=timeout,
-            fencing_token=fencing_token,
-        )
-        future = asyncio.run_coroutine_threadsafe(
+        future = self._submit_to_loop(
             self._send(node_id, {
                 "type": "operation.request",
                 "protocol_version": DESKTOP_PROTOCOL_VERSION,
                 "data": envelope.model_dump(mode="json"),
-            }),
-            self._main_loop,
+            })
         )
         try:
             future.result(timeout=min(5.0, timeout))
@@ -194,9 +259,18 @@ class DesktopConnectionManager:
             cancel_sent = False
             while not pending.event.wait(timeout=min(0.1, max(0, deadline-time.monotonic()))):
                 if time.monotonic() >= deadline:
-                    raise DesktopDispatchError("desktop_operation_timeout")
+                    raise DesktopDispatchError(
+                        "desktop_operation_timeout", phase=DesktopDispatchPhase.SUBMITTED,
+                    )
                 if not cancel_sent and cancel_check is not None and cancel_check():
-                    self.cancel_action_sync(node_id, action_id, request_id, fencing_token)
+                    # 取消投递失败不能改变本次派发的结论：请求已经在 Node 侧，
+                    # 继续等待真实终态，最终由 Journal 对账兜底。
+                    try:
+                        self.cancel_action_sync(node_id, action_id, request_id, fencing_token)
+                    except Exception:
+                        logger.warning(
+                            "Desktop 取消投递失败: action_id=%s", action_id, exc_info=True,
+                        )
                     cancel_sent = True
             if pending.error:
                 return {
@@ -213,7 +287,10 @@ class DesktopConnectionManager:
         except DesktopDispatchError:
             raise
         except Exception as error:
-            raise DesktopDispatchError(str(error)) from error
+            # 发送/等待期间的未知异常：对端可能已经收到请求。
+            raise DesktopDispatchError(
+                str(error), phase=DesktopDispatchPhase.SUBMITTED,
+            ) from error
         finally:
             with self._lock:
                 self._pending.pop(request_id, None)
@@ -221,7 +298,9 @@ class DesktopConnectionManager:
     def cancel_action_sync(self, node_id: str, action_id: str, request_id: str, fencing_token: str) -> None:
         from aiive.desktop.protocol import DesktopCancelEnvelope, DESKTOP_PROTOCOL_VERSION
         if self._main_loop is None:
-            raise DesktopDispatchError("desktop_node_offline")
+            raise DesktopDispatchError(
+                "main_loop_unavailable", phase=DesktopDispatchPhase.NOT_SUBMITTED,
+            )
         envelope = DesktopCancelEnvelope(action_id=action_id, request_id=request_id, fencing_token=fencing_token)
         future = asyncio.run_coroutine_threadsafe(self._send(node_id, {
             "type": "operation.cancel", "protocol_version": DESKTOP_PROTOCOL_VERSION,

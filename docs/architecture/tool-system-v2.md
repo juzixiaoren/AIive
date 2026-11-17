@@ -1,6 +1,6 @@
 # Tool System V2
 
-更新：2026-11-17。本文描述类化工具、执行协调与取消的实际实现。
+更新：2026-11-17。本文描述类化工具、执行协调、结果契约与取消恢复的实际实现。
 
 ## 审查与决策
 
@@ -39,8 +39,8 @@ Worker 控制协议由 core/function_spec.py 的 FunctionSpec / FunctionSpecs
 
 - ToolExecutor：统一工具查找、来源/指纹/Schema 校验、执行前取消检查、
   适配器选择、执行 Context、错误/超时响应。Registry 的三个执行方法仅转发。
-- DirectAdapter：调用工具；DatabaseTool 的业务事务在实际工作线程创建、
-  提交/回滚与关闭。
+- DirectAdapter：调用工具并**先归一化再决定事务**；DatabaseTool 的业务
+  事务在实际工作线程创建、提交/回滚与关闭（详见下节）。
 - TurnOperationAdapter：创建或复用 ToolOperation / Outbox，按 operation_id
   有限等待。Operation 的事务执行继续将业务副作用和 committed receipt
   原子提交；非重复外部操作的 UNKNOWN 不重放。
@@ -51,6 +51,56 @@ Worker 控制协议由 core/function_spec.py 的 FunctionSpec / FunctionSpecs
 
 Attachment 的 Vision 前后事务、Forget Phase A 的授权交接，以及运行期元工具
 自身服务事务仍保留各自领域边界，不把 Session 搬进跨线程 Context。
+
+## 统一执行结果契约
+
+`tools/base.py` 的 `coerce_tool_result` 是工具返回值进入调用方之前的唯一
+归一化入口，`ToolExecutor.execute_direct` 是唯一转换点。其它层不再各自解析
+`ok` / `allowed`。
+
+- 失败识别只看业务字典**顶层**标记（`ok is False` / `allowed is False`），
+  绝不递归扫描嵌套业务数据；`ToolError`、`ToolResult(error=...)`、
+  `ToolResult(value={"ok": false})` 同样判为失败。
+- 失败时原业务字典保留在 `ToolResult.value` 供诊断，业务字段进入
+  `ToolError.details`；`payload()` 永远优先输出错误封套。
+- `execution_unknown` 与 `UNKNOWN_OUTCOME_CODES`（Desktop 超时/断连）统一
+  改写为 `execution_unknown` 并强制 `outcome_known=False`；只有结果确定时才
+  可能判为 `cancelled`。
+
+事务判断与结果判断必须同源：
+
+- DirectAdapter 先 `coerce_tool_result`，`error is not None` → `rollback`
+  后返回规范化结果；无错误才 `commit`。
+- `operation_executor._execute_db_transactional` 使用同一份判定；业务失败时
+  整个事务（含业务写入）回滚，再以独立短事务记录 `failed`。
+- 失败/未知在 `ToolOperation.effect_receipt` 中持久化
+  `{"outcome_known": ..., "side_effect_started": ...}`，`operation_response`
+  原样透出，晚到的查询不会丢失"已经开始产生外部影响"这一事实。
+
+`outcome_known` 与 `side_effect_started` 相互独立：确定性失败也可能已经写了
+半个文件（`True/True`），未知结果也可能确认尚未开始（`False/False`）。
+未显式声明时，UNKNOWN 默认 `side_effect_started=True`，确定性失败/取消默认
+`False`；显式值优先。终态只由契约决定，`side_effect_started` 不参与推导
+成功/失败/UNKNOWN。
+
+## Desktop 发送边界
+
+`DesktopDispatchError.phase`（`desktop/protocol.py::DesktopDispatchPhase`）
+以"请求是否已写往 Node"为界：
+
+| 场景 | phase | 工具结果 |
+| --- | --- | --- |
+| 主事件循环不可用 / Node 离线 | NOT_SUBMITTED | `execution_failed`，确定未执行 |
+| 本地信封参数校验失败 | NOT_SUBMITTED | `execution_failed` |
+| 写 socket 过程中异常 | SUBMITTED | `execution_unknown` |
+| 已发送后等待超时 / 断连 | SUBMITTED | `execution_unknown` |
+| 同一 Action 已有在途请求 | SUBMITTED | `execution_unknown` |
+| Node 执行前拒绝 | TERMINAL | 按 `classify_pending_error` 映射 |
+
+写 socket 失败按 UNKNOWN 处理：本机没有 ACK 不能证明对端没有收到请求。取消
+投递失败不改变本次派发结论；UNKNOWN 保留资源锁并等待 Journal 对账。
+Task 路径（`DesktopAdapter`）与聊天路径（`DesktopTool._run`）共用
+`desktop_dispatch_result` 的阶段映射。
 
 ## 取消与结果
 
@@ -73,7 +123,13 @@ Desktop 节点必须在 capability 中显式声明 remote，旧节点默认 none
    断线/超时不代表取消成功。Node 终态写 Journal，再通过原结果通道回传。
 
 Outbox 的外部执行在前台等待超时后仍继续保存真实终态；不会因前台 Turn
-取消或有限等待结束而丢弃晚到回执。Forget 已进入 Phase A 时等待其确定终态，
+取消或有限等待结束而丢弃晚到回执。
+
+Task 取消后的崩溃恢复（`recover_cancelled_execution`）：Task=cancelled 且
+Run=running、租约过期时，Run→interrupted，dispatched/running 的 Action→
+unknown，Task 保持 cancelled，不重放、不重新入队；重复执行是空操作。Worker
+异常分支在取消任务上收敛成功并**提交事务后**返回 COMPLETED（否则仍返回
+RETRYABLE_ERROR），避免下一次投递只读到同一个终态的空转。Forget 已进入 Phase A 时等待其确定终态，
 共享执行授权继续由实际线程独立获取、释放与恢复。
 
 ToolError 包含 code、message、outcome_known、side_effect_started、retry_hint、
@@ -99,5 +155,15 @@ failed，保留审计原因；降级不会恢复被取消的工作。
 - `test_pg_tool_v2_cancellation.py`：真实 PostgreSQL + Outbox，排队取消、
   行锁竞争与提交前回滚，证明取消意图可在工具持有事务锁时提交。
 - `test_tool_operation_execution.py`：幂等、事务 receipt、有限等待与最终提交。
+- `test_tool_result_contract.py`：结果契约、DatabaseTool 六种结果的事务边界、
+  outcome_known / side_effect_started 组合、operation receipt 字段。
+- `test_tool_result_consumers.py`：LangChain ToolMessage、回执解析、MCP、Desktop。
+- `test_task_action_result_contract.py`：Action 终态与事件中的副作用事实。
+- `test_desktop_dispatch_phase.py`：真实连接管理器 + 模拟 WebSocket 的发送
+  前后失败分类。
+- `test_task_cancelled_execution_recovery.py`、`test_agent_contract_recovery.py`：
+  取消恢复幂等与 Outbox 返回值。
+- `test_tool_and_cancel_recovery_pg.py`：PostgreSQL 上的结构化失败回滚与
+  SKIP LOCKED 并发恢复。
 - Desktop Node：journal、locks、cancellation 三组测试；Web/Android 构建与共享
   chat/work 契约测试；Ruff、basedpyright、Alembic upgrade/check。

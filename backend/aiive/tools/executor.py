@@ -18,7 +18,6 @@ from aiive.tools.base import (
     ToolError,
     ToolExecutionContext,
     ToolResult,
-    business_result_failed,
     coerce_tool_result,
 )
 from aiive.config import settings
@@ -77,12 +76,55 @@ def cancellation_requested(context: ToolExecutionContext) -> bool:
     return context.cancellation.requested
 
 
+def desktop_dispatch_result(error: Any) -> ToolResult:
+    """把带执行阶段的 Desktop 派发异常映射为统一工具结果。
+
+    NOT_SUBMITTED：确认请求没有发出，判确定性失败（副作用一定没有发生）。
+    SUBMITTED：请求已发出或无法确认，保留 UNKNOWN，等待 Journal 对账。
+    TERMINAL：Node 已给出明确原因，按错误码判定。
+    """
+    from aiive.desktop.connection_manager import classify_pending_error
+    from aiive.desktop.protocol import DesktopDispatchPhase
+
+    phase = getattr(error, "phase", DesktopDispatchPhase.SUBMITTED)
+    details = {"dispatch_phase": getattr(phase, "value", str(phase))}
+    if phase == DesktopDispatchPhase.NOT_SUBMITTED:
+        return ToolResult(
+            error=ToolError("execution_failed", str(error), details=details),
+        )
+    if phase == DesktopDispatchPhase.TERMINAL:
+        code = classify_pending_error(str(error))
+        unknown = code in UNKNOWN_OUTCOME_CODES
+        return ToolResult(
+            error=ToolError(
+                code,
+                str(error),
+                outcome_known=not unknown,
+                side_effect_started=unknown,
+                details=details,
+            )
+        )
+    return ToolResult(
+        error=ToolError(
+            "execution_unknown",
+            str(error),
+            outcome_known=False,
+            side_effect_started=True,
+            details=details,
+        )
+    )
+
+
 class DirectAdapter:
     @staticmethod
     def invoke(
         tool: BaseTool, context: ToolExecutionContext, arguments: dict[str, Any]
     ) -> Any:
-        """执行一次工具业务方法；返回值由 ToolExecutor 统一归一化。"""
+        """执行一次工具业务方法。
+
+        DatabaseTool 在自己的事务里先归一化再提交/回滚，返回规范化结果；
+        其余工具的原始返回值由 ToolExecutor.execute_direct 统一归一化。
+        """
         if tool.executor_kind == "desktop_node" and context.channel == "task_action":
             return DesktopAdapter.invoke(tool, context, arguments)
         if isinstance(tool, DatabaseTool) and context.db is None:
@@ -92,15 +134,15 @@ class DirectAdapter:
             with SessionLocal() as db:
                 context.db = db
                 try:
-                    result = tool.execute(context, arguments)
+                    # 先归一化再决定提交/回滚：ToolError / ToolResult / 业务字典
+                    # 走同一份失败判断，绝不在提交之后才发现结构化失败。
+                    normalized = coerce_tool_result(tool.execute(context, arguments))
                     context.cancellation.checkpoint()
-                    if business_result_failed(result):
-                        # 业务结果明确失败：必须先回滚业务事务再上报失败，
-                        # 绝不允许先提交副作用、再把失败包装成成功回执。
+                    if normalized.error is not None:
                         db.rollback()
-                        return result
+                        return normalized
                     db.commit()
-                    return result
+                    return normalized
                 except BaseException:
                     db.rollback()
                     raise
@@ -140,14 +182,7 @@ class DesktopAdapter:
                 )
             )
         except DesktopDispatchError as error:
-            return ToolResult(
-                error=ToolError(
-                    "execution_unknown",
-                    str(error),
-                    outcome_known=False,
-                    side_effect_started=True,
-                )
-            )
+            return desktop_dispatch_result(error)
 
 
 class TurnOperationAdapter:
@@ -327,6 +362,14 @@ class ToolExecutor:
             }
         except Exception as error:
             require_execution_authorization()
+            if tool.executor_kind == "desktop_node":
+                from aiive.desktop.connection_manager import DesktopDispatchError
+
+                if isinstance(error, DesktopDispatchError):
+                    return {
+                        **desktop_dispatch_result(error).payload(),
+                        "execution_id": context.execution_id,
+                    }
             return {
                 **tool.normalize_error(error, context).payload(),
                 "execution_id": context.execution_id,

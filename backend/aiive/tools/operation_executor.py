@@ -221,21 +221,32 @@ def request_turn_cancellation(db: Session, turn_record_id: str, now: datetime) -
 
 
 def operation_response(operation: ToolOperation) -> dict[str, Any]:
-    """将持久化状态转换为统一 Registry 响应。"""
+    """将持久化状态转换为统一 Registry 响应。
+
+    outcome_known / side_effect_started 优先取持久化回执，避免失败回执丢失
+    "已经产生了部分外部影响"这一事实。
+    """
     common = {
         "operation_id": operation.id,
         "tool_call_id": operation.tool_call_id,
         "execution_status": operation.status,
     }
+    receipt = operation.effect_receipt if isinstance(operation.effect_receipt, dict) else {}
     if operation.status == "committed":
-        return {"ok": True, "result": operation.result_payload, **common}
+        return {
+            "ok": True,
+            "result": operation.result_payload,
+            "outcome_known": True,
+            "side_effect_started": bool(receipt.get("side_effect_started", True)),
+            **common,
+        }
     if operation.status in {"failed", "cancelled"}:
         return {
             "ok": False,
             "error_type": "cancelled" if operation.status == "cancelled" else "execution_failed",
             "error": operation.error_message or "工具执行失败",
-            "outcome_known": True,
-            "side_effect_started": False,
+            "outcome_known": bool(receipt.get("outcome_known", True)),
+            "side_effect_started": bool(receipt.get("side_effect_started", False)),
             **common,
         }
     return {
@@ -436,7 +447,10 @@ def _execute_external(
                 return _record_unknown(operation_id, execution_token, str(response.get("error")))
             if response.get("error_type") == "cancelled":
                 return _record_cancelled(operation_id, execution_token)
-            return _record_failure(operation_id, execution_token, str(response.get("error")), "tool_failed")
+            return _record_failure(
+                operation_id, execution_token, str(response.get("error")), "tool_failed",
+                side_effect_started=bool(response.get("side_effect_started", False)),
+            )
         result = response.get("result")
         db = SessionLocal()
         try:
@@ -512,6 +526,7 @@ def _record_unknown(operation_id: str, execution_token: str, error: str) -> Hand
             return HandlerResult(HandlerOutcome.CLAIM_LOST, "operation fencing 失败")
         operation.status = "execution_unknown"
         operation.error_message = error[:2000]
+        operation.effect_receipt = {"outcome_known": False, "side_effect_started": True}
         operation.terminal_reason = "external_outcome_requires_reconciliation"
         operation.execution_token = None
         operation.updated_at = datetime.now(timezone.utc)
@@ -547,7 +562,10 @@ def _record_cancelled(operation_id: str, execution_token: str) -> HandlerResult:
     return HandlerResult(HandlerOutcome.COMPLETED, "execution cancelled")
 
 
-def _record_failure(operation_id: str, execution_token: str, error: str, reason: str) -> HandlerResult:
+def _record_failure(
+    operation_id: str, execution_token: str, error: str, reason: str,
+    *, side_effect_started: bool = False,
+) -> HandlerResult:
     """使用独立短事务记录确定性失败终态。"""
     db = SessionLocal()
     try:
@@ -558,15 +576,25 @@ def _record_failure(operation_id: str, execution_token: str, error: str, reason:
         ).with_for_update().one_or_none()
         if operation is None:
             return HandlerResult(HandlerOutcome.CLAIM_LOST, "operation fencing 失败")
-        return _fail_operation(db, operation, error, reason)
+        return _fail_operation(
+            db, operation, error, reason, side_effect_started=side_effect_started,
+        )
     finally:
         db.close()
 
 
-def _fail_operation(db: Session, operation: ToolOperation, error: str, reason: str) -> HandlerResult:
+def _fail_operation(
+    db: Session, operation: ToolOperation, error: str, reason: str,
+    *, side_effect_started: bool = False,
+) -> HandlerResult:
     """提交失败终态并通知等待者。"""
     operation.status = "failed"
     operation.error_message = error[:2000]
+    # 确定性失败 ≠ 没有副作用：已经执行过的外部操作必须保留这个事实。
+    operation.effect_receipt = {
+        "outcome_known": True,
+        "side_effect_started": side_effect_started,
+    }
     operation.terminal_reason = reason
     completed_at = datetime.now(timezone.utc)
     operation.completed_at = completed_at

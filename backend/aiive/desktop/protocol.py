@@ -2,12 +2,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 DESKTOP_PROTOCOL_VERSION = 2
+
+
+class DesktopDispatchPhase(StrEnum):
+    """一次 Desktop 派发相对"请求已写往 Node"边界所处的阶段。
+
+    NOT_SUBMITTED: 确认请求没有发出，副作用一定没有发生（确定性失败）。
+    SUBMITTED: 请求已经发出（或无法确认是否发出），真实结果未知。
+    TERMINAL: Node 已返回明确终态，按回执处理。
+    """
+
+    NOT_SUBMITTED = "not_submitted"
+    SUBMITTED = "submitted"
+    TERMINAL = "terminal"
 
 
 @dataclass(frozen=True)

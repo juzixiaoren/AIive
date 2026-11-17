@@ -4,6 +4,7 @@ from __future__ import annotations
 import uuid
 from datetime import timedelta
 
+import pytest
 from sqlalchemy import select
 
 from aiive.db.models import (
@@ -16,7 +17,7 @@ from aiive.db.models import (
 )
 from aiive.task_runtime.repository import TaskRepository, recover_stale_tasks, utcnow
 from aiive.task_runtime.schemas import ActionStatus, RunStatus, TaskStatus
-from aiive.tools.base import DatabaseTool, ToolExecutionContext
+from aiive.tools.base import DatabaseTool, ToolError, ToolExecutionContext, ToolResult
 from aiive.tools.executor import ToolExecutor
 from aiive.tools.registry import CapabilitySafetySchema, ToolDefinition
 
@@ -111,6 +112,18 @@ class _RejectingWriteTool(DatabaseTool):
         return {"ok": False, "error_type": "execution_failed", "error": "业务校验失败"}
 
 
+class _ScriptedWriteTool(DatabaseTool):
+    def __init__(self, definition, outcome):
+        super().__init__(definition)
+        self.outcome = outcome
+        self.row_id = f"pg-contract-row-{uuid.uuid4()}"
+
+    def _run(self, db):
+        db.add(Thread(id=self.row_id, title="scripted write"))
+        db.flush()
+        return self.outcome
+
+
 class _CommittingWriteTool(DatabaseTool):
     def _run(self, db):
         db.add(Thread(id="pg-contract-committed", title="must commit"))
@@ -125,6 +138,40 @@ def _db_tool(tool_type, capability_id: str):
             parameters={},
         )
     )
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        pytest.param({"ok": False, "error_type": "execution_failed", "error": "失败"}, id="dict_ok_false"),
+        pytest.param({"ok": False, "allowed": False, "reason": "范围外"}, id="dict_allowed_false"),
+        pytest.param(ToolError("execution_failed", "失败"), id="tool_error"),
+        pytest.param(
+            ToolResult(error=ToolError("execution_unknown", "未知", outcome_known=False)),
+            id="tool_result_error",
+        ),
+        pytest.param(
+            ToolResult(value={"ok": False, "error_type": "execution_failed", "error": "失败"}),
+            id="tool_result_value",
+        ),
+    ],
+)
+def test_database_tool_structured_failure_rolls_back_on_postgres(pg_sessionmaker, outcome) -> None:
+    tool = _ScriptedWriteTool(
+        ToolDefinition(
+            CapabilitySafetySchema("pg_contract_scripted_write", "test", "trusted", "low"),
+            parameters={},
+        ),
+        outcome,
+    )
+
+    payload = ToolExecutor.execute_direct(
+        tool, ToolExecutionContext(tool.safety.capability_id), {}, 10,
+    )
+
+    assert payload["ok"] is False
+    with pg_sessionmaker() as db:
+        assert db.get(Thread, tool.row_id) is None
 
 
 def test_database_tool_failure_rolls_back_on_postgres(pg_sessionmaker) -> None:

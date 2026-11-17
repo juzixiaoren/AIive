@@ -298,3 +298,50 @@ def test_repeated_snooze_creates_one_followup_task(operation_session_factory):
         ).count() == 2
     finally:
         db.close()
+
+
+def test_external_failure_persists_side_effect_receipt(operation_session_factory, monkeypatch):
+    """外部工具确定性失败但已产生部分副作用时，回执必须保留这个事实。"""
+    from aiive.tools.base import BaseTool
+    from aiive.tools.registry import CapabilitySafetySchema, ToolDefinition, ToolRegistry
+
+    class PartialFailureTool(BaseTool):
+        def _run(self):
+            return {
+                "ok": False,
+                "error_type": "execution_failed",
+                "error": "写了一半文件",
+                "outcome_known": True,
+                "side_effect_started": True,
+            }
+
+    registry = ToolRegistry()
+    registry.register(PartialFailureTool(ToolDefinition(
+        CapabilitySafetySchema(
+            "contract_partial_external", "test", "trusted", "medium",
+            writes_external_world=True, effect_mode="non_repeatable_external",
+        ),
+        parameters={},
+    )))
+    monkeypatch.setattr("aiive.tools.registry.get_tool_registry", lambda: registry)
+
+    context = _source_context(operation_session_factory)
+    registration = registry.get("contract_partial_external")
+    operation = enqueue_tool_operation(
+        "contract_partial_external", {},
+        registration.safety.descriptor_hash, registration.safety.effect_mode,
+        context, "call-partial",
+    )
+
+    assert _worker().poll(max_jobs=1) == 1
+
+    db = operation_session_factory()
+    try:
+        persisted = db.get(ToolOperation, operation.id)
+        assert persisted is not None
+        assert persisted.status == "failed"
+        assert persisted.effect_receipt == {
+            "outcome_known": True, "side_effect_started": True,
+        }
+    finally:
+        db.close()

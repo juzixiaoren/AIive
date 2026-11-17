@@ -119,11 +119,17 @@ class ToolError:
             for key, item in value.items()
             if key not in _RESULT_ENVELOPE_KEYS
         }
+        # outcome_known 与 side_effect_started 相互独立：结果确定的失败也可能
+        # 已经产生了部分外部影响。只有 unknown 强制 outcome_known=False；
+        # side_effect_started 以显式声明为准，未声明时按执行阶段推导
+        # （未知 → 无法排除已开始执行；确定性失败/取消 → 默认未产生）。
+        explicit_started = value.get("side_effect_started")
+        side_effect_started = unknown if explicit_started is None else bool(explicit_started)
         return cls(
             code=code,
             message=message,
             outcome_known=not unknown,
-            side_effect_started=unknown,
+            side_effect_started=side_effect_started,
             retry_hint=str(value.get("retry_hint") or "never"),
             details=details,
         )
@@ -159,6 +165,7 @@ class ToolResult:
         if isinstance(self.value, ToolResult):
             return self.value.payload()
         if business_result_failed(self.value):
+            # 直接构造 ToolResult(value={"ok": false}) 也不能被当成成功。
             return tool_error_from_business_result(self.value).payload()
         return {"ok": True, "result": self.value}
 
@@ -178,13 +185,21 @@ def coerce_tool_result(value: Any) -> ToolResult:
     """工具返回值进入调用方之前的唯一归一化入口。
 
     兼容尚未改造的业务字典：只有顶层 ok=false / allowed=false 才判定失败。
+    失败时同时保留原始业务字典（value），供诊断与既有调用方读取；是否成功
+    只由 ToolResult.error 决定，payload() 永远优先输出错误封套。
     """
     if isinstance(value, ToolResult):
+        if value.error is None and business_result_failed(value.value):
+            # ToolResult 包裹了业务失败字典：同样不能当成成功。
+            return ToolResult(
+                value=value.value,
+                error=tool_error_from_business_result(value.value),
+            )
         return value
     if isinstance(value, ToolError):
         return ToolResult(error=value)
     if business_result_failed(value):
-        return ToolResult(error=tool_error_from_business_result(value))
+        return ToolResult(value=value, error=tool_error_from_business_result(value))
     return ToolResult(value=value)
 
 
