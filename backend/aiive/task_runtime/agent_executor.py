@@ -60,7 +60,9 @@ class TaskAgentExecutor:
             call_messages.extend(messages_from_dict(feedback))
         model = self.chat_model if self.chat_model is not None else build_chat_model(self.llm)
         try:
-            response = model.bind_tools(functions.definitions(), tool_choice="required", parallel_tool_calls=False).invoke(
+            # Thinking providers may reject forced tool_choice. Exactly one call is
+            # still enforced locally by validate_calls(require_one=True), with bounded repair.
+            response = model.bind_tools(functions.definitions(), tool_choice="auto", parallel_tool_calls=False).invoke(
                 call_messages, config={"metadata": {"task_id": task_id}, "run_name": "task_decision"},
             )
         except TaskContentUnavailable:

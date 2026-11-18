@@ -61,7 +61,7 @@ export class WorkClient {
   }
   timeline(id: string, after: number): Promise<Timeline> {
     return this.json(
-      `${this.path(id)}/timeline?after_sequence=${after}&limit=100`,
+      `${this.path(id)}/timeline?after_sequence=${after}&limit=50`,
     );
   }
   private post(path: string, body: unknown = {}): Promise<unknown> {

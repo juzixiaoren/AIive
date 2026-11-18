@@ -106,7 +106,7 @@ class Model:
 
     def bind_tools(self, definitions, **kwargs):
         self.definitions = definitions
-        assert kwargs == {"tool_choice": "required", "parallel_tool_calls": False}
+        assert kwargs == {"tool_choice": "auto", "parallel_tool_calls": False}
         return self
 
     def invoke(self, messages, **kwargs):

@@ -61,6 +61,16 @@ const json = (data) =>
     headers: { "Content-Type": "application/json" },
   });
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+test("timeline requests fit the server pagination contract", async () => {
+  const client = new WorkClient(async (path) => {
+    const url = new URL(path, "https://api.example/");
+    const limit = Number(url.searchParams.get("limit"));
+    assert.ok(limit >= 1 && limit <= 50);
+    assert.equal(url.searchParams.get("after_sequence"), "42");
+    return json({ items: [], next_sequence: 42, has_more: false });
+  });
+  await client.timeline("task", 42);
+});
 const view = (id) => ({
   task: { task_id: id },
   timeline: [{ id: "1", sequence: 1, title: "old" }],
@@ -152,7 +162,7 @@ test("every public operation uses the existing API; question rejection is step-s
   ])
     await api.goal("task", action);
   assert.ok(requests.some(([p]) => p === "agent-tasks/a%2Fb/work-view"));
-  assert.ok(requests.some(([p]) => p.endsWith("after_sequence=42&limit=100")));
+  assert.ok(requests.some(([p]) => p.endsWith("after_sequence=42&limit=50")));
   assert.deepEqual(requests.find(([p]) => p === "approval/respond")[1], {
     approval_id: "ap",
     action: "deny",
