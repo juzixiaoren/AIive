@@ -166,20 +166,22 @@ def test_task_snapshot_invalidated_before_model_send(db_session, monkeypatch):
 
     db = db_session
     _, task, _, _, _, event, _, _ = task_result(db, monkeypatch)
-    original = TaskContextAssembler.messages
+    original = TaskContextAssembler.render
     monkeypatch.setattr(TaskContextAssembler, "_registries", lambda *a: (ToolRegistry(), ToolRegistry()))
 
-    def snapshot_then_forget(assembler, *args, **kwargs):
+    def render_then_forget(assembler, *args, **kwargs):
         result = original(assembler, *args, **kwargs)
         assert "INDEPENDENT_PRIVATE_CONTENT" in str(result)
         shield(db, event)
         return result
 
-    monkeypatch.setattr(TaskContextAssembler, "messages", snapshot_then_forget)
+    monkeypatch.setattr(TaskContextAssembler, "render", render_then_forget)
     llm = Mock()
+    llm.default_model = "deepseek-chat"
+    model = Mock()
     with pytest.raises(TaskContentUnavailable):
-        TaskAgentExecutor(db, llm).decide(task, [])
-    llm.chat.assert_not_called()
+        TaskAgentExecutor(db, llm, chat_model=model).decide(task, [])
+    model.bind_tools.assert_not_called()
 
 
 def test_goal_question_modify_keeps_real_input_proof_and_blocks_current_plan(

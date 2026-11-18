@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import codecs
-from typing import Any
+from typing import Any, override
 
 from aiive.context.run_context import RunContext
 from aiive.task_runtime.evidence import ArtifactStore, EvidenceStore
@@ -19,6 +19,7 @@ def _task_id(db: Session, ctx: RunContext | None) -> str:
 
 
 class ListTaskFilesTool(DatabaseTool):
+    @override
     def _run(self, db: Session, ctx: RunContext | None, kind: str, cursor: str = "", limit: int = 10):
         from aiive.task_runtime.work_read_model import WorkReadModel
 
@@ -48,6 +49,7 @@ def _read_text(item: Any, read: Any, db: Session, offset: int, max_bytes: int) -
 
 
 class ReadTaskEvidenceTool(DatabaseTool):
+    @override
     def _run(self, db: Session, ctx: RunContext | None, evidence_id: str, offset: int = 0, max_bytes: int = 4096):
         evidence = TaskReadRepository(db).get_evidence(_task_id(db, ctx), evidence_id)
         if evidence and ctx and ctx.action_id:
@@ -56,6 +58,7 @@ class ReadTaskEvidenceTool(DatabaseTool):
 
 
 class ReadTaskArtifactTool(DatabaseTool):
+    @override
     def _run(self, db: Session, ctx: RunContext | None, artifact_id: str, offset: int = 0, max_bytes: int = 4096):
         artifact = TaskReadRepository(db).get_artifact(_task_id(db, ctx), artifact_id)
         if artifact and ctx and ctx.action_id:

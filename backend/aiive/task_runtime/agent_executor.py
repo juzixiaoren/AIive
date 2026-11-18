@@ -36,8 +36,8 @@ class TaskAgentExecutor:
         self.db: Session = db
         self.llm: LLMClient = llm_client or default_llm_client()
         self.chat_model: Any = chat_model
-        self.profile = ModelProfile.from_config("deepseek", self.llm.default_model)
-        self.counter = LiteLLMTokenCounter(profile=self.profile)
+        self.profile: ModelProfile = ModelProfile.from_config("deepseek", self.llm.default_model)
+        self.counter: LiteLLMTokenCounter = LiteLLMTokenCounter(profile=self.profile)
 
     def decide(self, task: AgentTask, capabilities: list[dict[str, Any]]) -> AgentDecision:
         from aiive.forget.concurrency import forget_revision

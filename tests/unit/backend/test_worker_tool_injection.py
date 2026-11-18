@@ -7,7 +7,7 @@ import pytest
 from pydantic import ValidationError
 
 from aiive.control.capability_broker import CapabilityBroker
-from aiive.control.scope import TaskScope
+from aiive.control.scope import TASK_READ_CAPABILITIES, TaskScope
 from aiive.db.models import AgentAction, Thread
 from aiive.task_runtime.agent_executor import AgentDecision
 from aiive.task_runtime.context_assembler import TaskContextAssembler
@@ -204,7 +204,7 @@ def test_small_catalog_injects_full_schemas(db_session) -> None:
     )
     assert snapshot["tools"]["mode"] == "full"
     available_ids = {item["capability_id"] for item in snapshot["tools"]["available"]}
-    assert available_ids == {"echo", "get_current_time"}
+    assert available_ids == {"echo", "get_current_time"} | set(TASK_READ_CAPABILITIES)
     assert '"input_schema"' not in messages[1]["content"]
     from aiive.task_runtime.function_decisions import WorkerFunctions
     functions = WorkerFunctions(snapshot["tools"])

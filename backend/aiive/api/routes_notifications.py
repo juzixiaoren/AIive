@@ -5,7 +5,7 @@ API路由模块：通知管理
 - 支持按类别筛选和删除通知
 """
 import logging
-from typing import Literal, cast
+from typing import ClassVar, Literal, cast
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
@@ -157,7 +157,7 @@ def list_notifications(
 
 
 class ReminderActionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
     action: Literal["confirm", "snooze"]
     delay_minutes: int = Field(default=5, ge=1, le=525600)

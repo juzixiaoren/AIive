@@ -105,6 +105,7 @@ class RollbackSlotTool(BaseTool):
 
 
 class PromotionStatusTool(DatabaseTool):
+    @override
     def _run(self, db: Any, ctx: Any, action_id: str):
         from aiive.db.models import AgentAction
         from aiive.supervisor.promotion_status import promotion_status

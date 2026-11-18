@@ -23,10 +23,8 @@ from aiive.db.forget_models import ContentProvenanceRef
 from aiive.forget.durable_sources import sources_visible
 from aiive.forget.source_policy import SourceReferences, blocked_sources_reason
 
-Child = TypeVar(
-    "Child",
-    bound=ApprovalRequest | AgentAction | AgentRun | AgentTaskEvent | AgentTaskCheckpoint | TaskEvidence | TaskArtifact,
-)
+ChildObject = ApprovalRequest | AgentAction | AgentRun | AgentTaskEvent | AgentTaskCheckpoint | TaskEvidence | TaskArtifact
+Child = TypeVar("Child", bound=ChildObject)
 
 
 class TaskContentUnavailable(PermissionError):
@@ -136,7 +134,7 @@ class TaskReadRepository:
         task = query.first()
         return task if task is not None and self.task_visible(task) else None
 
-    def visible_child(self, owner_type: str, item: Child) -> bool:
+    def visible_child(self, owner_type: str, item: ChildObject) -> bool:
         task = self.db.get(AgentTask, item.task_id)
         if task is None or not self.task_visible(task):
             return False

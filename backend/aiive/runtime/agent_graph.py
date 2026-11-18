@@ -288,7 +288,7 @@ class AgentGraph:
         self._db: Session = db
         self._thread_state: ThreadState = ThreadState(db)
         self._action_planner: ActionPlanner = ActionPlanner(llm_client)
-        self._user_timezone = user_timezone
+        self._user_timezone: str | None = user_timezone
 
     # ------------------------------------------------------------------
     # LangChain LLM 工厂

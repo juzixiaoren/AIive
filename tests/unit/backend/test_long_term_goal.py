@@ -538,7 +538,9 @@ def test_delegate_task_accepts_goal_plan_and_keeps_tool_surface(db_session) -> N
     registry = build_main_agent_registry()
     assert {item["capability_id"] for item in registry.list_all()} == {
         "list_skills", "delegate_task", "get_task_status", "cancel_task", "send_task_input",
-        "list_thread_attachments", "read_attachment",
+        "list_thread_attachments", "read_attachment", "get_current_time",
+        "schedule_reminder", "list_reminders", "cancel_reminder", "confirm_reminder",
+        "snooze_reminder", "memory_search", "history_search", "forget", "forget_status",
     }
     thread = _thread(db_session)
     handler = tool_method(registry.get('delegate_task'))

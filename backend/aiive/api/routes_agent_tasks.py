@@ -44,7 +44,7 @@ class TaskInputRequest(BaseModel):
 
 
 class ReconcileActionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     resolution: Literal["completed", "not_executed"]
     observation: str = Field(min_length=1, max_length=500)

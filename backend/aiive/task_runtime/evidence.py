@@ -9,6 +9,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from aiive.db.models import AgentAction, TaskArtifact, TaskEvidence
+from aiive.runtime.tool_output_guard import guard_tool_output
 from aiive.storage.object_store import ObjectRef, get_range, import_content_addressed, put_content_addressed
 
 
@@ -23,13 +24,27 @@ def _json_bytes(value: Any) -> bytes:
 def _summary(
     tool_name: str,
     value: Any,
+    *,
+    thread_id: str = "",
+    trace_id: str = "",
+    tool_call_id: str = "",
 ) -> str:
-    """Keep bounded observations. The full result already has a durable Evidence ID."""
+    """Evidence 摘要复用统一回填守卫。
+
+    后台任务的工具结果只有这份摘要会再次进入 LLM 上下文，因此必须走同一个入口：
+    小结果原样保留；大结果落盘并给出总量、日志路径与续读位置，且保持 JSON 结构完整，
+    而不是在字符预算处把 JSON 从中间切断。
+    """
     text = json.dumps(value, ensure_ascii=False, default=str)
     limit = 32000 if tool_name in FULL_OBSERVATION_TOOLS else SUMMARY_LIMIT
-    if len(text) <= limit:
-        return text
-    return json.dumps({"preview": text[:limit // 2], "truncated": True}, ensure_ascii=False)
+    return guard_tool_output(
+        tool_name,
+        text,
+        thread_id=thread_id,
+        trace_id=trace_id,
+        tool_call_id=tool_call_id,
+        max_chars=limit,
+    ).content
 
 
 FULL_OBSERVATION_TOOLS = frozenset({
@@ -90,7 +105,13 @@ class EvidenceStore:
             run_id=run_id,
             action_id=action.id,
             kind=kind,
-            summary=_summary(action.capability_id, result),
+            summary=_summary(
+                action.capability_id,
+                result,
+                thread_id=task_id,
+                trace_id=run_id,
+                tool_call_id=action.id,
+            ),
             inline_payload=inline,
             object_bucket=bucket,
             object_key=key,

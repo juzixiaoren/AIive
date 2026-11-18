@@ -68,6 +68,7 @@ def _build_graph_for_test(
     graph._thread_state.get_or_create_thread.return_value = MagicMock(id="thread-1")
     graph._memory_store = MagicMock()
     graph._action_planner = MagicMock()
+    graph._user_timezone = "UTC"
     graph._action_planner.classify_memory_signal.return_value = MemorySignalDecision(
         action=MemorySignalAction.EXTRACT_ASYNC.value, confidence=0.5, reason="test",
     )

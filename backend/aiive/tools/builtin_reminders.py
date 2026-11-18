@@ -293,6 +293,7 @@ class ListTasksTool(DatabaseTool):
 
 
 class ListRemindersTool(DatabaseTool):
+    @override
     def _run(self, db: Session, ctx: RunContext | None, status: str = "", cursor: str = "", limit: int = 25):
         from aiive.db.models import Event, Task
 
@@ -347,6 +348,7 @@ class CancelTaskTool(DatabaseTool):
 
 
 class CancelReminderTool(DatabaseTool):
+    @override
     def _run(self, db: Session, ctx: RunContext | None, task_id: str):
         from aiive.db.models import Event, Task
         from aiive.runtime.task_manager import TaskManager

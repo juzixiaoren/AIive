@@ -103,6 +103,7 @@ class SearchKnowledgeTool(DatabaseTool):
 
 
 class ReadKnowledgeChunkTool(DatabaseTool):
+    @override
     def _run(self, db: Session, chunk_id: str, offset: int = 0, max_chars: int = 4000):
         from aiive.db.models import Chunk, Document
         from aiive.forget.durable_sources import references_visible

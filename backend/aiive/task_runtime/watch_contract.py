@@ -1,6 +1,6 @@
 """Worker watch parameters shared by function calling and the server."""
 from datetime import datetime
-from typing import Annotated, Literal
+from typing import Annotated, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
 from aiive.core.scheduling_time import schedule_instant
@@ -11,7 +11,7 @@ def parse_instant(value: str, *, legacy: bool = False) -> datetime:
 
 
 class WatchModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
     next_check_at: str | None = Field(
         default=None, description="Optional earliest poll for file or node. Time watches use config.at.",
@@ -24,7 +24,7 @@ class WatchModel(BaseModel):
 
 
 class TimeConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
     at: str = Field(description="Trigger instant, e.g. 2026-11-19T09:00:00+08:00.")
 
@@ -35,7 +35,7 @@ class TimeConfig(BaseModel):
 
 
 class FileConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     path: str = Field(min_length=1, description="Absolute path in an allowed root on the backend host.")
     condition: Literal["exists", "missing", "changed"] = Field(
@@ -45,7 +45,7 @@ class FileConfig(BaseModel):
 
 
 class NodeConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     node_id: str | None = Field(default=None, min_length=1, description="Registered node. Defaults to the task's target.")
     status: Literal["online", "offline"] = "online"

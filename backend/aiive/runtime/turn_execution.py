@@ -262,7 +262,7 @@ class TurnExecutionService:
     ):
         self._attachment_ids: list[str] = list(attachment_ids or [])
         from aiive.core.scheduling_time import user_timezone
-        self._user_timezone = user_timezone(device_timezone)
+        self._user_timezone: str | None = user_timezone(device_timezone)
         self._llm_client: LLMClient = llm_client or default_llm_client()
         self._message_source: MessageSource = (
             message_source
