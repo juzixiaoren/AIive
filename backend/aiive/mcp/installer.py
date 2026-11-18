@@ -14,6 +14,7 @@ MCP 安装器：管理 MCP（Model Context Protocol）服务器的真实沙箱�
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -132,8 +133,16 @@ def _run_npm_install(
     cmd = [
         npm_path, "install", pkg_spec,
         "--prefix", str(sandbox_dir),
-        "--no-audit", "--no-fund", "--loglevel", "error",
+        "--ignore-scripts", "--no-audit", "--no-fund", "--loglevel", "error",
     ]
+    install_env = {
+        key: value for key, value in os.environ.items()
+        if key.upper() in {
+            "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "HOME", "USERPROFILE",
+            "APPDATA", "LOCALAPPDATA", "TMP", "TEMP", "TMPDIR",
+            "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE",
+        }
+    }
     logger.info("MCP npm install: %s", " ".join(cmd))
     try:
         proc = subprocess.run(
@@ -142,6 +151,7 @@ def _run_npm_install(
             text=True,
             timeout=NPM_INSTALL_TIMEOUT_SECONDS,
             cwd=str(sandbox_dir),
+            env=install_env,
         )
     except subprocess.TimeoutExpired:
         return {"ok": False, "entry_js": None,

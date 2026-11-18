@@ -259,6 +259,8 @@ class AutomaticRecallEngine:
                 query = query.filter(MemoryRecord.scope_id == scope_id)
             else:
                 query = query.filter(MemoryRecord.scope_id.is_(None))
+            if request.memory_types:
+                query = query.filter(MemoryRecord.memory_type.in_(request.memory_types))
             recs = query.order_by(MemoryRecord.importance.desc()).limit(5).all()
             out.extend(self._to_items(recs, "exact", 1.0, chain, request.query))
             if out:
@@ -286,6 +288,7 @@ class AutomaticRecallEngine:
             lifecycle_states=self._lifecycle_states(include_sleeping, include_archived),
             validity_states=self._validity_states(include_archived),
             limit=limit,
+            **({"memory_types": request.memory_types} if request.memory_types else {}),
         )
         if hits is None:
             status = getattr(self._bm25_service, "status", "error")
@@ -351,6 +354,7 @@ class AutomaticRecallEngine:
         for scope_type, scope_id in chain:
             recs = self._query_scope_text(
                 scope_type, scope_id, qlow, tokens, include_sleeping, include_archived,
+                memory_types=request.memory_types,
             )
             for r in recs:
                 if r.id in seen:
@@ -419,6 +423,7 @@ class AutomaticRecallEngine:
     def _query_scope_text(
         self, scope_type: str, scope_id: str | None, qlow: str, tokens: list[str],
         include_sleeping: bool = False, include_archived: bool = False,
+        memory_types: list[str] | None = None,
     ) -> Sequence[MemoryRecord]:
         q = self._db.query(MemoryRecord).filter(
             MemoryRecord.lifecycle_state.in_(
@@ -431,6 +436,8 @@ class AutomaticRecallEngine:
             q = q.filter(MemoryRecord.scope_id == scope_id)
         else:
             q = q.filter(MemoryRecord.scope_id.is_(None))
+        if memory_types:
+            q = q.filter(MemoryRecord.memory_type.in_(memory_types))
         # Match any individual token (or the full query) as a substring, so
         # token-based relevance scoring has candidates to score. keywords(JSON)
         # 是显式检索词，cast 成 Text 后做 ILIKE 子串匹配，使「奶茶」能命中带

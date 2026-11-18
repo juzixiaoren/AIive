@@ -1,6 +1,6 @@
 """Domain tool handlers (implementation) split from builtin_tools."""
 
-from aiive.tools.base import BaseTool
+from aiive.tools.base import BaseTool, DatabaseTool
 
 from pathlib import Path
 from typing import override, Any
@@ -102,3 +102,20 @@ class RollbackSlotTool(BaseTool):
         from aiive.supervisor.client import supervisor_client_from_settings
         from aiive.supervisor.release_manager import ReleaseManager
         return ReleaseManager(client=supervisor_client_from_settings()).rollback()
+
+
+class PromotionStatusTool(DatabaseTool):
+    def _run(self, db: Any, ctx: Any, action_id: str):
+        from aiive.db.models import AgentAction
+        from aiive.supervisor.promotion_status import promotion_status
+        from aiive.task_runtime.read_repository import TaskReadRepository
+
+        action = db.get(AgentAction, action_id)
+        if not ctx or not ctx.task_id or not action or action.task_id != ctx.task_id:
+            raise ValueError("promotion_action_unavailable")
+        if not TaskReadRepository(db).visible_child("agent_action", action):
+            raise ValueError("promotion_action_unavailable")
+        request_id = (action.result_summary or {}).get("promotion_request_id")
+        if not isinstance(request_id, str):
+            raise ValueError("promotion_has_no_supervisor_request")
+        return {"request_id": request_id, "status": promotion_status(request_id)}

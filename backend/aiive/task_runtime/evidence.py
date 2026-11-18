@@ -9,8 +9,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from aiive.db.models import AgentAction, TaskArtifact, TaskEvidence
-from aiive.runtime.tool_output_guard import guard_tool_output
-from aiive.storage.object_store import ObjectRef, get_range, put_content_addressed
+from aiive.storage.object_store import ObjectRef, get_range, import_content_addressed, put_content_addressed
 
 
 INLINE_LIMIT = 4096
@@ -24,27 +23,20 @@ def _json_bytes(value: Any) -> bytes:
 def _summary(
     tool_name: str,
     value: Any,
-    *,
-    thread_id: str = "",
-    trace_id: str = "",
-    tool_call_id: str = "",
 ) -> str:
-    """Evidence 摘要复用统一回填守卫。
-
-    后台任务的工具结果只有这份摘要会再次进入 LLM 上下文，因此必须走同一个入口：
-    小结果原样保留；大结果落盘到工具输出目录并给出总字节数、日志路径与续读位置，
-    而不是像旧实现那样在 1200 字符处把 JSON 从中间切断。
-    """
+    """Keep bounded observations. The full result already has a durable Evidence ID."""
     text = json.dumps(value, ensure_ascii=False, default=str)
-    guarded = guard_tool_output(
-        tool_name,
-        text,
-        thread_id=thread_id,
-        trace_id=trace_id,
-        tool_call_id=tool_call_id,
-        max_chars=SUMMARY_LIMIT,
-    )
-    return guarded.content
+    limit = 32000 if tool_name in FULL_OBSERVATION_TOOLS else SUMMARY_LIMIT
+    if len(text) <= limit:
+        return text
+    return json.dumps({"preview": text[:limit // 2], "truncated": True}, ensure_ascii=False)
+
+
+FULL_OBSERVATION_TOOLS = frozenset({
+    "read_attachment", "list_thread_attachments", "record_attachment_progress",
+    "list_task_files", "read_task_artifact", "read_task_evidence",
+    "read_document", "read_knowledge_chunk",
+})
 
 
 class EvidenceStore:
@@ -76,6 +68,9 @@ class EvidenceStore:
             grouped.setdefault(source_type, set()).add(source_id)
         if not references_visible(db, grouped):
             raise ValueError("forget_source_blocked")
+        result = result if isinstance(result, dict) else {"value": result}
+        if action.capability_id == "run_shell":
+            result = self._capture_shell_logs(db, task_id, action, result)
         data = _json_bytes(result)
         digest = hashlib.sha256(data).hexdigest()
         inline: dict[str, Any] | None
@@ -89,19 +84,13 @@ class EvidenceStore:
             bucket, key = ref.bucket, ref.key
             inline = None
         else:
-            inline = result if isinstance(result, dict) else {"value": result}
+            inline = result
         evidence = TaskEvidence(
             task_id=task_id,
             run_id=run_id,
             action_id=action.id,
             kind=kind,
-            summary=_summary(
-                action.capability_id,
-                result,
-                thread_id=task_id,
-                trace_id=run_id,
-                tool_call_id=action.id,
-            ),
+            summary=_summary(action.capability_id, result),
             inline_payload=inline,
             object_bucket=bucket,
             object_key=key,
@@ -119,15 +108,70 @@ class EvidenceStore:
         refs = list(action.evidence_refs or [])
         refs.append({"evidence_id": evidence.id, "kind": kind, "content_hash": digest})
         action.evidence_refs = refs
-        action.result_summary = {
-            "ok": bool(result.get("ok")) if isinstance(result, dict) and "ok" in result else True,
+        summary: dict[str, Any] = {
+            "ok": bool(result.get("ok", True)),
             "summary": evidence.summary,
             "evidence_id": evidence.id,
             "content_size": evidence.content_size,
         }
+        shell_result = result.get("result", result.get("details", result))
+        if action.capability_id == "run_shell" and isinstance(shell_result, dict) and shell_result.get("output_artifacts"):
+            summary["output_artifacts"] = shell_result["output_artifacts"]
+        if action.capability_id in {"promote_slot", "run_selfdev_repair"} and isinstance(shell_result, dict):
+            promotion = shell_result.get("promotion") if action.capability_id == "run_selfdev_repair" else shell_result
+            if isinstance(promotion, dict):
+                if promotion.get("status") == "switch_requested" and promotion.get("request_id"):
+                    summary["promotion_request_id"] = promotion["request_id"]
+                elif promotion.get("ok") and promotion.get("release_status") == "monitoring":
+                    summary["deployment_confirmation_required"] = True
+        action.result_summary = summary
         self._capture_declared_artifacts(db, task_id, action, result)
         db.flush()
         return evidence
+
+    @staticmethod
+    def _capture_shell_logs(
+        db: Session, task_id: str, action: AgentAction, result: dict[str, Any],
+    ) -> dict[str, Any]:
+        from pathlib import Path
+
+        from aiive.runtime.tool_output_store import tool_output_root
+        from aiive.task_runtime.read_repository import inherit_sources
+
+        key = "result" if isinstance(result.get("result"), dict) else "details" if isinstance(result.get("details"), dict) else None
+        payload = dict(result[key] if key else result)
+        artifacts = {}
+        for stream in ("stdout", "stderr"):
+            raw_path = payload.pop(f"{stream}_log", None)
+            if not raw_path:
+                continue
+            try:
+                path = Path(raw_path)
+                # Only output paths issued by this built-in executor are eligible.
+                if path.is_symlink() or path.resolve().parent != tool_output_root().resolve() or path.suffix != ".log":
+                    raise ValueError("unexpected Shell log path")
+                ref, digest, size = import_content_addressed("task-artifacts", path)
+            except (ValueError, OSError, RuntimeError):
+                artifacts[stream] = {"available": False}
+                continue
+            if size == 0:
+                continue
+            artifact = TaskArtifact(
+                task_id=task_id, action_id=action.id, name=f"Shell {stream}.log",
+                artifact_type="shell_log", summary=f"Shell {stream}",
+                object_bucket=ref.bucket, object_key=ref.key, content_hash=digest,
+                mime_type="text/plain; charset=utf-8", content_size=size,
+            )
+            db.add(artifact)
+            db.flush()
+            inherit_sources(db, "task_artifact", artifact.id, [
+                ("agent_task", task_id), ("goal_plan", task_id), ("agent_action", action.id),
+            ])
+            truncated = payload.get("capture_truncated") or {}
+            artifacts[stream] = {"artifact_id": artifact.id, "size": size, "truncated": bool(truncated.get(stream))}
+        if artifacts:
+            payload["output_artifacts"] = artifacts
+        return {**result, key: payload} if key else payload
 
     def _capture_declared_artifacts(
         self, db: Session, task_id: str, action: AgentAction, result: Any,

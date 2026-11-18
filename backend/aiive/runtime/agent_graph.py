@@ -283,11 +283,12 @@ class AgentGraph:
         _action_planner: 动作规划器（记忆信号分类）
     """
 
-    def __init__(self, llm_client: LLMClient, db: Session):
+    def __init__(self, llm_client: LLMClient, db: Session, *, user_timezone: str | None = None):
         self._llm_client: LLMClient = llm_client
         self._db: Session = db
         self._thread_state: ThreadState = ThreadState(db)
         self._action_planner: ActionPlanner = ActionPlanner(llm_client)
+        self._user_timezone = user_timezone
 
     # ------------------------------------------------------------------
     # LangChain LLM 工厂
@@ -995,6 +996,7 @@ class AgentGraph:
             source=exec_ctx.message_source.value,
             turn_id=exec_ctx.turn_id,
             turn_record_id=exec_ctx.turn_record_id,
+            user_timezone=self._user_timezone,
         )
         tools = build_langchain_tools(registry, run_context=run_ctx_exec)
         if not tools:

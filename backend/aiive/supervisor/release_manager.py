@@ -92,7 +92,9 @@ class ReleaseManager:
                     }
             # Supervisor 托管：真正启动候选进程并验证，切换由守护进程完成。
             # 本进程随后会被替换，因此只提交请求并返回 accepted，不等待结果。
-            if self._client is not None and self._client.available():
+            if self._client is not None:
+                if not self._client.available():
+                    return {"ok": False, "error": "supervisor_unavailable", "previous_active": previous}
                 accepted = self._client.submit(
                     "promote",
                     {"target": current, "gate_ok": bool(run_gate)},

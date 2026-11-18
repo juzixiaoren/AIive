@@ -114,7 +114,7 @@ class UnifiedRetriever:
 
         # 1. 各路超取；只统计本次请求实际启用的路由。
         allowed = set(request.source_types or [])
-        exact_enabled = bool(request.query.strip())
+        exact_enabled = bool(request.query.strip()) and not request.memory_types
         memory_enabled = request.scope_context is not None and (
             not allowed or "memory_record" in allowed
         )
@@ -290,6 +290,7 @@ class UnifiedRetriever:
         eng_req = MemoryRecallRequest(
             query=request.query,
             scope_context=scope,
+            memory_types=request.memory_types,
             top_k=top_k,
             token_budget=request.token_budget,
         )

@@ -112,6 +112,7 @@ BM25_STATEMENT_TEMPLATE = """
       AND m.lifecycle_state IN :lifecycle_states
       AND m.validity_state IN :validity_states
       AND ({scope_sql})
+      {type_sql}
     ORDER BY score DESC, m.id ASC
     LIMIT :limit
 """
@@ -346,6 +347,7 @@ class Bm25SearchService:
         lifecycle_states: list[str],
         validity_states: list[str],
         limit: int,
+        memory_types: list[str] | None = None,
     ) -> list[Bm25Hit] | None:
         """执行 BM25 检索。
 
@@ -371,7 +373,9 @@ class Bm25SearchService:
         # 中文整句几乎必然落空。match_disjunction 用索引上的 jieba tokenizer
         # 对 query 分词后做 OR 匹配，等价于「任一查询词命中」，与旧词法路由
         # 的召回语义一致，同时分数仍是真 BM25。
-        statement = BM25_STATEMENT_TEMPLATE.format(scope_sql=scope_sql)
+        statement = BM25_STATEMENT_TEMPLATE.format(
+            scope_sql=scope_sql, type_sql="AND m.memory_type IN :memory_types" if memory_types else "",
+        )
         sql = text(statement).bindparams(
             bindparam("lifecycle_states", expanding=True),
             bindparam("validity_states", expanding=True),
@@ -382,6 +386,9 @@ class Bm25SearchService:
             "lifecycle_states": list(lifecycle_states),
             "validity_states": list(validity_states),
         })
+        if memory_types:
+            sql = sql.bindparams(bindparam("memory_types", expanding=True))
+            params["memory_types"] = memory_types
         try:
             with self._db.begin_nested():
                 rows = self._db.execute(sql, params).all()

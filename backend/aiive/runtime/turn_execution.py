@@ -258,8 +258,11 @@ class TurnExecutionService:
         llm_client: LLMClient | None = None,
         message_source: str | MessageSource = MessageSource.USER,
         attachment_ids: list[str] | None = None,
+        device_timezone: str | None = None,
     ):
         self._attachment_ids: list[str] = list(attachment_ids or [])
+        from aiive.core.scheduling_time import user_timezone
+        self._user_timezone = user_timezone(device_timezone)
         self._llm_client: LLMClient = llm_client or default_llm_client()
         self._message_source: MessageSource = (
             message_source
@@ -421,7 +424,7 @@ class TurnExecutionService:
         # ── Phase 2: 流式图执行 ──
         graph_db = SessionLocal()
         try:
-            graph = AgentGraph(self._llm_client, graph_db)
+            graph = AgentGraph(self._llm_client, graph_db, user_timezone=self._user_timezone)
             ag_result: AgentGraphResult | None = None
 
             async for event in graph._execute_graph_stream(  # pyright: ignore[reportPrivateUsage]
@@ -1482,7 +1485,7 @@ class TurnExecutionService:
             # Phase 3: AgentGraph execution
             graph_db = SessionLocal()
             try:
-                graph = AgentGraph(self._llm_client, graph_db)
+                graph = AgentGraph(self._llm_client, graph_db, user_timezone=self._user_timezone)
                 ag_result = graph._execute_graph(  # pyright: ignore[reportPrivateUsage]
                     message=message, exec_ctx=exec_ctx, ctx_bundle=ctx_bundle,
                     # 同步路径也在节点边界检查取消：下一轮 LLM/工具调用前停止，

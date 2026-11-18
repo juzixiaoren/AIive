@@ -5,9 +5,10 @@ API路由模块：通知管理
 - 支持按类别筛选和删除通知
 """
 import logging
-from typing import cast
+from typing import Literal, cast
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
@@ -20,9 +21,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
 
 # 通知事件状态，仅用于通知读模型筛选。
-PENDING_STATUSES = ["pending", "alerting", "snoozed"]
+PENDING_STATUSES = ["pending", "alerting"]
 # 已执行状态：已确认、已取消
-DONE_STATUSES = ["confirmed", "cancelled"]
+DONE_STATUSES = ["confirmed", "cancelled", "snoozed"]
 
 NOTIFICATION_EVENT_TYPES = ["notification_created", "reminder_created"]
 
@@ -147,10 +148,46 @@ def list_notifications(
                 "status": p.get("status", ""),
                 "thread_id": e.thread_id or "",
                 "created_at": e.created_at.isoformat() if e.created_at else "",
+                "scheduled_at": p.get("scheduled_at"),
             })
         except Exception:
             logger.warning("通知条目解析失败，已跳过: event_id=%s", e.id, exc_info=True)
             continue
+    return result
+
+
+class ReminderActionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["confirm", "snooze"]
+    delay_minutes: int = Field(default=5, ge=1, le=525600)
+
+
+@router.post("/notifications/{notification_id}/reminder")
+def handle_reminder_action(
+    notification_id: str, request: ReminderActionRequest, db: Session = Depends(get_db),
+):
+    from aiive.context.run_context import RunContext
+    from aiive.task_runtime.repository import queue_notification_refresh
+    from aiive.tools.base import ToolExecutionContext
+    from aiive.tools.registry import get_tool_registry
+
+    event = db.query(Event).filter_by(id=notification_id, event_type="reminder_created").first()
+    if event is None or (event.payload or {}).get("dismissed"):
+        raise HTTPException(status_code=404, detail="提醒不存在")
+    capability = f"{request.action}_reminder"
+    tool = get_tool_registry().get(capability)
+    assert tool is not None
+    ctx = RunContext(thread_id=event.thread_id or "", trace_id=event.trace_id)
+    args: dict[str, str | int] = {"reminder_id": notification_id}
+    if request.action == "snooze":
+        args["delay_minutes"] = request.delay_minutes
+    result = tool.execute(ToolExecutionContext(capability, ctx, db=db), args)
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail="提醒当前状态无法执行此操作")
+    if result.pop("needs_notification_broadcast", False):
+        queue_notification_refresh(db)
+    db.commit()
     return result
 
 

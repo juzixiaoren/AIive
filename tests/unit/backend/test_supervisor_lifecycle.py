@@ -180,6 +180,12 @@ def test_promote_switches_real_process_and_keeps_state_consistent(make_superviso
     release_state = json.loads((tmp_path / "release_state.json").read_text(encoding="utf-8"))
     assert release_state["active_slot"] == "B"
     assert release_state["status"] == "monitoring"
+    request_id = state["promotion_request_id"]
+    client = SupervisorClient(supervisor.paths)
+    assert client.result(request_id)["status"] == "switched"
+    write_json_atomic(supervisor.paths.state_file, {**state, "monitor_until": "2000-01-01T00:00:00Z"})
+    assert supervisor.tick()["action"] == "monitoring_completed"
+    assert client.result(request_id)["status"] == "promoted"
 
 
 def test_promote_candidate_start_failure_keeps_old_version(make_supervisor) -> None:
@@ -269,7 +275,9 @@ def test_slot_manifest_excludes_persistent_data() -> None:
 def test_app_exit_during_monitor_rolls_back_to_previous(make_supervisor) -> None:
     supervisor = make_supervisor()
     supervisor.recover()
-    assert _promote(supervisor)["ok"] is True
+    result = _promote(supervisor)
+    assert result["ok"] is True, result
+    request_id = supervisor.state()["promotion_request_id"]
     candidate_pid = supervisor.state()["process"]["pid"]
 
     _kill(candidate_pid)
@@ -282,6 +290,7 @@ def test_app_exit_during_monitor_rolls_back_to_previous(make_supervisor) -> None
     kinds = [event["kind"] for event in read_events(supervisor.paths, 50)]
     assert "auto_rollback" in kinds
     assert "process_exited" in kinds
+    assert SupervisorClient(supervisor.paths).result(request_id)["status"] == "rolled_back"
 
 
 def test_promote_without_gate_is_rejected(make_supervisor) -> None:

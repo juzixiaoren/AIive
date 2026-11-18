@@ -5,6 +5,8 @@ import type {
   Inbox,
   QuestionIntent,
   Timeline,
+  WorkFileKind,
+  WorkFilePage,
   WorkView,
 } from "./types";
 
@@ -64,6 +66,12 @@ export class WorkClient {
       `${this.path(id)}/timeline?after_sequence=${after}&limit=50`,
     );
   }
+  olderTimeline(id: string, before: number): Promise<Timeline> {
+    return this.json(`${this.path(id)}/timeline?before_sequence=${before}&limit=50`);
+  }
+  files(id: string, kind: WorkFileKind, cursor: string): Promise<WorkFilePage> {
+    return this.json(`${this.path(id)}/${kind}?limit=50&cursor=${encodeURIComponent(cursor)}`);
+  }
   private post(path: string, body: unknown = {}): Promise<unknown> {
     return this.json(path, {
       method: "POST",
@@ -76,6 +84,9 @@ export class WorkClient {
   }
   cancel(id: string): Promise<unknown> {
     return this.post(`${this.path(id)}/cancel`);
+  }
+  resolveAction(id: string, action: string, resolution: "completed" | "not_executed", observation: string, attempt_id: string): Promise<unknown> {
+    return this.post(`${this.path(id)}/actions/${encodeURIComponent(action)}/resolve`, { resolution, observation, attempt_id });
   }
   approval(approval_id: string, action: "approve" | "deny"): Promise<unknown> {
     return this.post("approval/respond", { approval_id, action });

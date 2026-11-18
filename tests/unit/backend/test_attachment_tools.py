@@ -211,6 +211,26 @@ def test_image_calls_vision_without_persisting_base64(
     assert result["analysis"] == "red square"
     assert "base64" not in str(result)
     assert "base64" not in str([e.payload for e in db_session.query(Event)])
+    from aiive.task_runtime.repository import TaskRepository
+    from aiive.task_runtime.runtime import PersistentTaskRuntime
+    from aiive.task_runtime.schemas import ActionProposal
+    from tests.unit.backend.test_persistent_task_runtime import SequenceAgent
+
+    task = TaskRepository(db_session).create_task(
+        thread_id=ctx.thread_id, goal="process image", enqueue=False,
+        task_brief={
+            "initial_input": {"skill_id": "document_processing", "attachment_ids": [row.id]},
+            "scope": {"capability_policy": "unified"},
+        },
+    )
+    ctx.task_id = task.id
+    runtime = PersistentTaskRuntime(db_session, agent_executor=SequenceAgent(
+        ActionProposal(decision="action", capability_id="read_attachment", arguments={"attachment_id": row.id}),
+        ActionProposal(decision="finish", summary="red square"),
+    ))
+    assert runtime.run(task.id)["status"] == "succeeded"
+    assert task.task_state["attachment_image_receipts"][row.id]["sha256"] == digest
+    ctx.task_id = ""
     monkeypatch.setattr(settings, "aiive_vision_model", "")
     monkeypatch.setattr(settings, "aiive_llm_vision_enabled", False)
     with pytest.raises(ValueError, match="vision_not_configured"):

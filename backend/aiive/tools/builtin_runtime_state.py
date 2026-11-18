@@ -7,9 +7,8 @@ from typing import override, Any
 
 from sqlalchemy.orm import Session
 
-from aiive.context.run_context import RunContext
+from aiive.context.run_context import RunContext, require_ctx
 from aiive.runtime.working_state import WorkingStateService
-from aiive.tools.builtin_tools import require_ctx
 
 
 class QueryRhythmTool(DatabaseTool):

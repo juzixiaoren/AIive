@@ -5,6 +5,7 @@ import {
   type TimelineEvent,
   type WorkSummary,
   type WorkView,
+  type WorkFileKind,
 } from "./types";
 
 export interface WorkState {
@@ -138,10 +139,28 @@ export class WorkController {
       const inbox = inboxResult.status === "fulfilled" ? inboxResult.value : null;
       const view = viewResult.status === "fulfilled" ? viewResult.value : null;
       const failures = [inboxResult, viewResult].flatMap(r => r.status === "rejected" ? [errorMessage(r.reason)] : []);
+      const previous = this.state.view;
+      const sameVisibility = view?.visibility_revision !== undefined
+        && previous?.task.task_id === view.task.task_id
+        && previous.visibility_revision === view.visibility_revision;
+      const first = view?.timeline[0]?.sequence;
+      const olderLoaded = sameVisibility && first !== undefined
+        && this.state.timeline.some((row) => row.sequence === first)
+        && this.state.timeline[0]?.sequence < first;
+      if (view && previous && sameVisibility) {
+        for (const kind of ["evidence", "artifacts"] as const) {
+          if (previous[kind].length > 50) {
+            view[kind] = [...new Map([...view[kind], ...previous[kind]].map((file) => [file.id, file])).values()];
+            view.metadata_cursors = { ...view.metadata_cursors, [kind]: previous.metadata_cursors?.[kind] };
+          }
+        }
+      }
       this.set({
         items: inbox?.items || [], cursor: inbox?.next_cursor || null, more: inbox?.has_more || false,
-        view, timeline: view?.timeline || [], historyCursor: 0,
-        historyMore: Boolean(view?.truncated.timeline), error: failures.join("；"),
+        view, timeline: olderLoaded ? mergeTimeline(this.state.timeline, view?.timeline || []) : view?.timeline || [],
+        historyCursor: olderLoaded ? this.state.historyCursor : view?.history_cursor || first || 0,
+        historyMore: olderLoaded ? this.state.historyMore : Boolean(view?.truncated.timeline),
+        error: failures.join("；"),
       });
       if (view) {
         let after = view.last_sequence;
@@ -186,12 +205,12 @@ export class WorkController {
     }
   }
   async history(): Promise<void> {
-    if (!this.state.selected || this.state.loading) return;
+    if (!this.state.selected || !this.state.historyCursor || !this.state.historyMore || this.state.loading) return;
     const generation = this.generation,
       snapshot = this.snapshot;
     this.set({ loading: true });
     try {
-      const page = await this.api.timeline(
+      const page = await this.api.olderTimeline(
         this.state.selected,
         this.state.historyCursor,
       );
@@ -201,6 +220,27 @@ export class WorkController {
           historyCursor: page.next_sequence,
           historyMore: page.has_more,
         });
+    } catch (error) {
+      if (generation === this.generation && snapshot === this.snapshot && !this.disposed)
+        this.set({ error: errorMessage(error) });
+    } finally {
+      if (!this.runner) this.set({ loading: false });
+    }
+  }
+  async olderFiles(kind: WorkFileKind): Promise<void> {
+    const { view, selected } = this.state;
+    const cursor = view?.metadata_cursors?.[kind];
+    if (!view || !cursor || !selected || this.state.loading) return;
+    const generation = this.generation, snapshot = this.snapshot;
+    this.set({ loading: true });
+    try {
+      const page = await this.api.files(selected, kind, cursor);
+      if (generation !== this.generation || snapshot !== this.snapshot || this.disposed) return;
+      this.set({ view: {
+        ...view,
+        [kind]: [...new Map([...view[kind], ...page.items].map((file) => [file.id, file])).values()],
+        metadata_cursors: { ...view.metadata_cursors, [kind]: page.next_cursor },
+      } });
     } catch (error) {
       if (generation === this.generation && snapshot === this.snapshot && !this.disposed)
         this.set({ error: errorMessage(error) });

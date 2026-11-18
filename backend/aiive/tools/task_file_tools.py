@@ -1,0 +1,63 @@
+"""Read evidence and artifacts belonging to this Worker task."""
+from __future__ import annotations
+
+import codecs
+from typing import Any
+
+from aiive.context.run_context import RunContext
+from aiive.task_runtime.evidence import ArtifactStore, EvidenceStore
+from aiive.task_runtime.read_repository import TaskReadRepository, inherit_sources
+from aiive.tools.base import DatabaseTool
+from sqlalchemy.orm import Session
+
+
+def _task_id(db: Session, ctx: RunContext | None) -> str:
+    task = TaskReadRepository(db).get_task(ctx.task_id) if ctx and ctx.task_id else None
+    if task is None or ctx is None or task.thread_id != ctx.thread_id:
+        raise ValueError("task_files_unavailable")
+    return task.id
+
+
+class ListTaskFilesTool(DatabaseTool):
+    def _run(self, db: Session, ctx: RunContext | None, kind: str, cursor: str = "", limit: int = 10):
+        from aiive.task_runtime.work_read_model import WorkReadModel
+
+        page = WorkReadModel(db).metadata_page(_task_id(db, ctx), kind, cursor or None, limit)
+        owner = "task_evidence" if kind == "evidence" else "task_artifact"
+        if ctx and ctx.action_id:
+            inherit_sources(db, "agent_action", ctx.action_id, [(owner, item["id"]) for item in page["items"]])
+        for item in page["items"]:
+            item["summary"] = item["summary"][:200]
+            item["created_at"] = item["created_at"].isoformat()
+        return page
+
+
+def _read_text(item: Any, read: Any, db: Session, offset: int, max_bytes: int) -> dict[str, Any]:
+    if item is None:
+        return {"ok": False, "error_type": "task_file_unavailable"}
+    mime = item.mime_type
+    if not (mime.startswith("text/") or mime.startswith("application/json")):
+        return {"ok": True, "id": item.id, "mime_type": mime, "size": item.content_size,
+                "download_in_work_center": True}
+    data, has_more = read(db, item, offset, max_bytes)
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    content = decoder.decode(data, final=not has_more)
+    consumed = len(data) - len(decoder.getstate()[0])
+    return {"ok": True, "id": item.id, "mime_type": mime, "content": content, "offset": offset,
+            "next_offset": offset + consumed if has_more else None, "has_more": has_more}
+
+
+class ReadTaskEvidenceTool(DatabaseTool):
+    def _run(self, db: Session, ctx: RunContext | None, evidence_id: str, offset: int = 0, max_bytes: int = 4096):
+        evidence = TaskReadRepository(db).get_evidence(_task_id(db, ctx), evidence_id)
+        if evidence and ctx and ctx.action_id:
+            inherit_sources(db, "agent_action", ctx.action_id, [("task_evidence", evidence.id)])
+        return _read_text(evidence, EvidenceStore.read, db, offset, max_bytes)
+
+
+class ReadTaskArtifactTool(DatabaseTool):
+    def _run(self, db: Session, ctx: RunContext | None, artifact_id: str, offset: int = 0, max_bytes: int = 4096):
+        artifact = TaskReadRepository(db).get_artifact(_task_id(db, ctx), artifact_id)
+        if artifact and ctx and ctx.action_id:
+            inherit_sources(db, "agent_action", ctx.action_id, [("task_artifact", artifact.id)])
+        return _read_text(artifact, ArtifactStore.read, db, offset, max_bytes)

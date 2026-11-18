@@ -32,7 +32,7 @@ class DelegateTaskTool(BaseTool):
         allowed_roots: list[str] | None = None,
         allowed_capabilities: list[str] | None = None,
         allowed_hosts: list[str] | None = None,
-        allow_network: bool = False,
+        allow_network: bool | None = None,
         allow_secrets: bool = False,
         isolation_mode: str = "shared",
         deterministic_action: dict[str, Any] | None = None,
@@ -54,6 +54,11 @@ class DelegateTaskTool(BaseTool):
                 acceptance_criteria=acceptance_criteria or [],
                 constraints=constraints or [],
                 budgets=budgets,
+                scope={
+                    "allowed_roots": allowed_roots or [], "allowed_capabilities": allowed_capabilities or [],
+                    "allowed_hosts": allowed_hosts or [], "allow_network": bool(allow_network),
+                    "allow_secrets": allow_secrets, "isolation_mode": isolation_mode,
+                },
             )
         selected_skill = None
         if skill_id:
@@ -73,7 +78,7 @@ class DelegateTaskTool(BaseTool):
             capability_policy = "restricted"
         else:
             # Skill 只提供指令与网络需求，不再用技能 profile 缩小可发现能力面。
-            effective_capabilities = list(selected_skill.capabilities) if selected_skill is not None else []
+            effective_capabilities = []
             capability_policy = "unified"
         raw_brief = {
             "acceptance_criteria": acceptance_criteria or [],
@@ -83,7 +88,7 @@ class DelegateTaskTool(BaseTool):
                 "allowed_capabilities": effective_capabilities,
                 "capability_policy": capability_policy,
                 "allowed_hosts": allowed_hosts or [],
-                "allow_network": allow_network or bool(
+                "allow_network": allow_network if allow_network is not None else bool(
                     selected_skill and selected_skill.requires_network
                 ),
                 "allow_secrets": allow_secrets,
@@ -91,6 +96,7 @@ class DelegateTaskTool(BaseTool):
             },
             "initial_input": {
                 "attachment_ids": attachment_ids if attachment_ids is not None else [],
+                **({"user_timezone": run_ctx.user_timezone} if run_ctx.user_timezone else {}),
                 **({"skill_id": selected_skill.skill_id} if selected_skill else {}),
                 **({"deterministic_action": deterministic_action} if deterministic_action else {}),
             },
@@ -133,12 +139,15 @@ def _delegate_goal(
     acceptance_criteria: list[str],
     constraints: list[str],
     budgets: dict[str, Any] | None,
+    scope: dict[str, Any],
 ) -> dict[str, Any]:
     """把结构化计划落成"待确认"的长期目标任务（不入执行队列）。"""
     from aiive.task_runtime.goal_plan import GOAL_TASK_TYPE, GoalPlan, summarize
     from aiive.task_runtime.goal_service import GoalService
 
     payload = dict(raw_plan)
+    if run_ctx.user_timezone:
+        payload.setdefault("timezone", run_ctx.user_timezone)
     if acceptance_criteria and not payload.get("acceptance"):
         payload["acceptance"] = acceptance_criteria
     # 先做纯模型校验：计划非法时不落库，直接把可读错误返回给主 Agent。
@@ -148,8 +157,8 @@ def _delegate_goal(
         brief = normalize_task_brief(GOAL_TASK_TYPE, {
             "acceptance_criteria": list(payload.get("acceptance") or []),
             "constraints": constraints,
-            "scope": {"allowed_roots": [], "allowed_capabilities": [], "capability_policy": "unified"},
-            "initial_input": {"goal": True},
+            "scope": scope,
+            "initial_input": {"goal": True, **({"user_timezone": run_ctx.user_timezone} if run_ctx.user_timezone else {})},
         })
         task = TaskRepository(db).create_task(
             thread_id=run_ctx.thread_id,
@@ -270,13 +279,15 @@ class ListSkillsTool(BaseTool):
 
         return {
             "skills": [skill.as_dict() for skill in list_skills()],
-            "hint": "将选中的 skill_id 传给 delegate_task，服务端会应用最小 capability profile。",
+            "hint": "将选中的 skill_id 传给 delegate_task 以加载工作指引和联网需求。实际执行受任务授权、服务端策略和审批约束。",
         }
 
 
 
 def build_main_agent_registry() -> ToolRegistry:
-    """Main 固定能力：任务管理与当前 Thread 附件；不含任意文件/桌面执行。"""
+    """User-facing Task, attachment, reminder and privacy controls."""
+    from aiive.skills import list_skills
+
     registry = ToolRegistry()
     deterministic_schema = ActionProposal.model_json_schema()
     deterministic_schema["properties"] = {key: value for key, value in deterministic_schema["properties"].items()
@@ -284,7 +295,7 @@ def build_main_agent_registry() -> ToolRegistry:
     deterministic_schema["required"] = ["capability_id"]
     registry.register(_registration(
         "list_skills",
-        "列出可用于持久任务的内置 Skill、能力范围和联网要求。",
+        "列出可用于持久任务的内置 Skill、相关能力和联网要求。",
         {},
         ListSkillsTool,
     ))
@@ -297,14 +308,20 @@ def build_main_agent_registry() -> ToolRegistry:
             "skill_id": {
                 "type": "str",
                 "description": "可选内置 Skill ID；先用 list_skills 查询。",
-                "enum": ["", "document_processing", "web_research", "knowledge_base", "mcp_management"],
+                "enum": ["", *(skill.skill_id for skill in list_skills())],
             },
             "attachment_ids": {"type": "list", "description": "聊天附件任务的明确授权 ID 列表，仅用于 document_processing；目标文本不授予附件权限。"},
             "title": {"type": "str"},
             "acceptance_criteria": {"type": "list"},
             "constraints": {"type": "list"},
-            "allowed_roots": {"type": "list", "description": "任务允许访问的绝对路径根目录"},
-            "allowed_capabilities": {"type": "list", "description": "可选；不填则使用任务类型最小 profile"},
+            "allowed_roots": {
+                "type": "list",
+                "description": "本机或桌面文件、Shell 工作目录、文件等待和知识摄取需要用户授权的最小绝对路径根。聊天附件用 attachment_ids。",
+            },
+            "allowed_capabilities": {
+                "type": "list",
+                "description": "非空时为任务的能力授权白名单；留空时由 Worker 在统一工具目录按需发现，仍受任务范围和审批约束。",
+            },
             "allowed_hosts": {"type": "list", "description": "可选联网域名白名单"},
             "allow_network": {"type": "bool", "default": False},
             "allow_secrets": {"type": "bool", "default": False},
@@ -352,5 +369,15 @@ def build_main_agent_registry() -> ToolRegistry:
         SendTaskInputTool,
     ))
     from aiive.tools.attachment_tools import register_attachment_tools
+    from aiive.tools.registry import get_tool_registry
+
     register_attachment_tools(registry)
+    builtin = get_tool_registry()
+    for name in (
+        "get_current_time", "schedule_reminder", "list_reminders", "cancel_reminder",
+        "confirm_reminder", "snooze_reminder", "memory_search", "history_search", "forget", "forget_status",
+    ):
+        tool = builtin.get(name)
+        if tool is not None:
+            registry.register(tool)
     return registry

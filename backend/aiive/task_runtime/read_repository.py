@@ -25,13 +25,7 @@ from aiive.forget.source_policy import SourceReferences, blocked_sources_reason
 
 Child = TypeVar(
     "Child",
-    ApprovalRequest,
-    AgentAction,
-    AgentRun,
-    AgentTaskEvent,
-    AgentTaskCheckpoint,
-    TaskEvidence,
-    TaskArtifact,
+    bound=ApprovalRequest | AgentAction | AgentRun | AgentTaskEvent | AgentTaskCheckpoint | TaskEvidence | TaskArtifact,
 )
 
 

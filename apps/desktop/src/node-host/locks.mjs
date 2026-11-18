@@ -67,7 +67,12 @@ export async function assertPreconditions(request, fs, crypto) {
     ? request.params.path
     : typeof request.params?.source === "string" ? request.params.source : null;
   const target = rawTarget ? path.resolve(rawTarget) : null;
-  if (!target) return;
+  if (!target) {
+    if (Object.keys(preconditions).length) throw new Error("precondition_path_required");
+    return;
+  }
+  if (Object.keys(preconditions).some(key => !["exists", "sha256", "size", "mtime_ns", "file_id"].includes(key)))
+    throw new Error("precondition_unsupported_field");
   let exists = true;
   try { await fs.lstat(target); } catch (error) {
     if (error?.code === "ENOENT") exists = false;
@@ -75,6 +80,8 @@ export async function assertPreconditions(request, fs, crypto) {
   }
   if (preconditions.exists === true && !exists) throw new Error("precondition_missing_path");
   if (preconditions.exists === false && exists) throw new Error("precondition_path_already_exists");
+  if (!exists && ["size", "mtime_ns", "file_id"].some(key => preconditions[key] !== undefined))
+    throw new Error("precondition_metadata_requires_path");
   if (exists) {
     const stat = await fs.stat(target, { bigint: true });
     if (preconditions.size !== undefined) {
@@ -97,7 +104,8 @@ export async function assertPreconditions(request, fs, crypto) {
     }
   }
   const expected = preconditions.sha256 || request.params.expected_sha256;
-  if (expected && exists) {
+  if (expected) {
+    if (!exists) throw new Error("precondition_sha256_requires_file");
     const content = await fs.readFile(target);
     const actual = crypto.createHash("sha256").update(content).digest("hex");
     if (actual.toLowerCase() !== String(expected).toLowerCase()) {

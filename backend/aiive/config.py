@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     )
 
     aiive_data_dir: str = ".data"
+    # Explicit account preference overrides the browser/device's IANA time zone.
+    aiive_user_timezone: str = ""
 
     aiive_attachment_max_bytes: int = Field(default=20 * 1024 * 1024, ge=1, le=20 * 1024 * 1024)
     aiive_attachment_max_count: int = Field(default=5, ge=1, le=5)
@@ -44,6 +46,9 @@ class Settings(BaseSettings):
     aiive_llm_context_window: int = 256000
     # 模型单次生成的最大输出 token（从上下文窗口中预留）。
     aiive_llm_max_output_tokens: int = 4096
+    # Set the uncached input and output rates of the configured Worker model.
+    aiive_worker_input_usd_per_million: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    aiive_worker_output_usd_per_million: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     # 当前 Segment 历史量的密封阈值，实际取与全局输入上限一半的较小值。
     aiive_segment_seal_token_threshold: int = 64000
     # 内部分类/提取调用的 JSON mode。auto 遇到明确的不支持错误时回退为

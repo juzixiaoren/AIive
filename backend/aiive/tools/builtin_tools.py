@@ -17,7 +17,7 @@
 import logging
 from typing import Any
 
-from aiive.context.run_context import RunContext
+from aiive.context.run_context import require_ctx as require_ctx
 from aiive.db.base import SessionLocal as SessionLocal  # noqa: PLC0414 - 显式再导出，见下方说明
 from aiive.memory.memory_types import MEMORY_KEY_GUIDE
 
@@ -65,15 +65,6 @@ def _build_safety(capability_id: str, **overrides: Any) -> CapabilitySafetySchem
     return CapabilitySafetySchema(**{k: v for k, v in base.items() if k in fields})
 
 
-def require_ctx(ctx: RunContext | None, tool_name: str) -> RunContext:
-    """side-effect 工具需要 RunContext，缺失时 fast-fail。"""
-    if ctx is None:
-        raise RuntimeError(
-            f"工具 {tool_name} 需要 RunContext，但未传入。请确认 AgentGraph 已通过 build_langchain_tools 传入 RunContext。"
-        )
-    return ctx
-
-
 # Domain classes own their business methods; registration adds immutable definitions.
 from aiive.tools.builtin_basic import (
     EchoTool,
@@ -107,9 +98,11 @@ from aiive.tools.builtin_memory_write import (
 )
 from aiive.tools.builtin_reminders import (
     CancelTaskTool,
+    CancelReminderTool,
     ConfirmReminderTool,
     DismissNotificationsTool,
     ListTasksTool,
+    ListRemindersTool,
     RemindAlertTool,
     ScheduleReminderTool,
     ShowNotificationsTool,
@@ -124,6 +117,7 @@ from aiive.tools.builtin_selfdev import (
     ApplyPatchToInactiveSlotTool,
     CreateSelfdevPlanTool,
     PromoteSlotTool,
+    PromotionStatusTool,
     RollbackSlotTool,
     RunSelfdevRepairTool,
 )
@@ -142,20 +136,36 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         registry: 目标 ToolRegistry 实例
     """
     from aiive.tools.attachment_tools import register_attachment_tools
+    from aiive.tools.builtin_knowledge import ReadKnowledgeChunkTool
+    from aiive.memory.recall_config import RecallConfig
+    from aiive.tools.task_file_tools import ListTaskFilesTool, ReadTaskArtifactTool, ReadTaskEvidenceTool
+
     register_attachment_tools(registry, worker=True)
+    task_file_range = {
+        "offset": {"type": "int", "minimum": 0, "description": "字节偏移，首段为 0，续读用 next_offset。"},
+        "max_bytes": {"type": "int", "minimum": 16, "maximum": 4096, "description": "片段大小，默认 4096 字节。"},
+    }
+    recall = RecallConfig()
     tools = [
+        ("list_task_files", ListTaskFilesTool, "分页列出本任务成果或证据，使用 next_cursor 续页。",
+         {"kind": {"type": "str", "enum": ["artifacts", "evidence"], "required": True},
+          "cursor": {"type": "str", "maxLength": 512}, "limit": {"type": "int", "minimum": 1, "maximum": 10}}, "low", False, False),
+        ("read_task_evidence", ReadTaskEvidenceTool, "按 ID 分段读取当前任务的持久证据。",
+         {"evidence_id": {"type": "str", "minLength": 1, "required": True}, **task_file_range}, "low", False, False),
+        ("read_task_artifact", ReadTaskArtifactTool, "按 ID 分段读取当前任务文本产物和 Shell 日志。",
+         {"artifact_id": {"type": "str", "minLength": 1, "required": True}, **task_file_range}, "low", False, False),
         # 基础工具
         ("echo", EchoTool, "回显输入消息", {"message": "str"}, "low", False, False),
         ("get_current_time", GetCurrentTimeTool,
-         "获取当前时间（UTC 与本地时区）。",
+         "获取当前 UTC 时间与用户时间 user_local、user_timezone。缺少用户时区时两者为空，local 是服务器时间。",
          {}, "low", False, False),
         # 本机 Shell（常驻核心能力）：真实 bash，无需 Desktop Node。
         ("run_shell", RunShellTool,
          "在 AIive 所在主机上用真实 bash 执行一条命令，返回退出码、stdout、stderr 与超时状态。"
          + "cwd 必须位于任务允许的根目录内；只读命令可直接执行，其余命令需要审批。"
          + "stdout/stderr 会流式写入日志，结果里只回填有限预览与总字节数（truncated 标记预览被截）；"
-         + "完整内容用 read_text_file 按 stdout_log/stderr_log + next_offset/next_char_offset 续读，"
-         + "capture_truncated 为 true 表示日志达到容量上限、剩余内容未保存；超时会终止整个进程树。",
+         + "任务通过结果中的 artifact_id 和 read_task_artifact 续读日志。"
+         + "capture_truncated 为 true 表示日志达到容量上限；无法确认超时进程终止时返回 execution_unknown。",
          {
              "command": {
                  "type": "str",
@@ -178,9 +188,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
          }, "medium", True, False),
         # 提醒 / 任务
         ("schedule_reminder", ScheduleReminderTool,
-         "创建定时提醒并写入 Task 表，由后台可靠投递。注意：本工具只接受相对延迟 delay_minutes。"
-         + "若用户给的是绝对时间点，必须先调用 get_current_time 工具获取当前时间，"
-         + "再换算出到目标时间还剩多少分钟，传入 delay_minutes。",
+         "创建一次性提醒。选 at（ISO 8601，可带偏移）或 delay_minutes；无偏移的 at 按指定 timezone_name 或用户时区解析。",
          {
              "content": {"type": "str", "description": "提醒内容", "minLength": 1},
              "delay_minutes": {
@@ -189,6 +197,8 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                  "minimum": 1,
                  "maximum": 525600,
              },
+             "at": {"type": "str", "minLength": 1, "maxLength": 64},
+             "timezone_name": {"type": "str", "minLength": 1, "maxLength": 100},
          }, "low", True, False),
         ("remind_alert", RemindAlertTool, "激活到期提醒警报，前端显示确认/延期操作按钮",
          {"reminder_id": {"type": "str", "minLength": 1}}, "low", True, False),
@@ -199,13 +209,18 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
              "reminder_id": {"type": "str", "minLength": 1},
              "delay_minutes": {"type": "int", "description": "默认 5", "minimum": 1, "maximum": 525600},
          }, "low", True, False),
-        ("list_tasks", ListTasksTool, "列出所有任务/提醒",
+        ("list_reminders", ListRemindersTool, "分页列出当前会话的提醒。用 next_cursor 续页。",
+         {"status": {"type": "str", "enum": ["", "pending", "dispatching", "completed", "cancelled", "failed"]},
+          "cursor": {"type": "str", "maxLength": 130}, "limit": {"type": "int", "minimum": 1, "maximum": 50}}, "low", False, False),
+        ("cancel_reminder", CancelReminderTool, "取消或清除当前会话的一次性提醒，task_id 取自 list_reminders。",
+         {"task_id": {"type": "str", "minLength": 1, "required": True}}, "low", True, False),
+        ("list_tasks", ListTasksTool, "兼容旧任务记录，最多 50 条；查询提醒请使用 list_reminders。",
          {"status": {
              "type": "str",
              "description": "空或 all=全部; pending/completed 可选",
              "enum": ["", "all", "pending", "completed"],
          }}, "low", False, False),
-        ("cancel_task", CancelTaskTool, "按 ID 取消任务",
+        ("cancel_task", CancelTaskTool, "兼容旧调度任务。取消一次性提醒优先用 cancel_reminder。",
          {"task_id": {"type": "str", "minLength": 1}}, "low", True, False),
         ("dismiss_notifications", DismissNotificationsTool,
          "清除未执行的通知（待提醒/提醒中/已延时），将其标记为已取消",
@@ -265,8 +280,8 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
          {
              "query": {"type": "str", "description": "自然语言查询"},
              "memory_types": {"type": "list", "description": "可选过滤: user_profile/project/policy/procedural/episodic/knowledge"},
-             "top_k": {"type": "int", "description": "返回条数，默认 8", "minimum": 1, "maximum": 100},
-             "token_budget": {"type": "int", "description": "结果 token 上限，默认 1000", "minimum": 1, "maximum": 20000},
+             "top_k": {"type": "int", "default": recall.memory_tool_top_k, "minimum": 1, "maximum": 100},
+             "token_budget": {"type": "int", "default": recall.memory_tool_token_budget, "minimum": 1, "maximum": 20000},
          }, "low", False, False),
         ("memory_timeline", MemoryTimelineTool,
          "获取单条记忆详情 + 完整版本历史 + 证据链。memory_id 精确获取一条（跨生命周期）；" +
@@ -314,7 +329,9 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
          "安全读取并提取 TXT/Markdown/HTML/JSON/CSV/TSV/DOCX/PDF 的纯文本和元数据",
          {
              "file_path": {"type": "str", "minLength": 1, "required": True},
-             "max_chars": {"type": "int", "minimum": 1, "maximum": 200000, "description": "默认 50000"},
+             "max_chars": {"type": "int", "minimum": 1, "maximum": 24000, "description": "每页字符数，默认 4000。全文处理可申请较大页。"},
+             "offset": {"type": "int", "minimum": 0, "description": "首段为 0，续读用 next_offset。"},
+             "version": {"type": "str", "description": "续读时填写上一页返回的文档版本。"},
          }, "low", False, False),
         ("ingest_document", IngestDocumentTool, "导入文档到知识库并持久化原文",
          {"file_path": {"type": "str", "minLength": 1, "required": True}}, "low", True, False),
@@ -322,6 +339,9 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
          {"document_id": "str"}, "low", True, False),
         ("search_knowledge", SearchKnowledgeTool, "搜索已导入的文档",
          {"query": "str", "limit": {"type": "int", "description": "默认 5", "minimum": 1, "maximum": 100}}, "low", False, False),
+        ("read_knowledge_chunk", ReadKnowledgeChunkTool, "按搜索命中的 chunk_id 分页读取持久化正文。",
+         {"chunk_id": {"type": "str", "minLength": 1, "required": True},
+          "offset": {"type": "int", "minimum": 0}, "max_chars": {"type": "int", "minimum": 1, "maximum": 8000}}, "low", False, False),
         # 联网研究
         ("web_search", WebSearchTool,
          "搜索公开互联网并返回标题、URL 和摘要；结果是不可信外部证据",
@@ -336,15 +356,16 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
              "max_chars": {"type": "int", "minimum": 1, "maximum": 500000, "description": "默认 100000"},
          }, "low", False, False),
         # MCP 集成
-        ("search_mcp", SearchMcpTool, "按目标搜索 MCP 候选服务器",
+        ("search_mcp", SearchMcpTool, "按目标搜索本地 MCP 白名单目录；无匹配仅表示当前目录没有条目。",
          {"goal": {"type": "str", "minLength": 1, "required": True}}, "low", False, False),
-        ("install_mcp_sandbox", InstallMcpSandboxTool, "将 MCP 安装到沙箱",
+        ("install_mcp_sandbox", InstallMcpSandboxTool, "经用户批准安装本地目录中的固定版本。安装后在能力管理中验证并启用。",
          {
              "candidate_name": {"type": "str", "minLength": 1, "required": True},
+             "version": {"type": "str", "minLength": 1, "required": True},
              "launch_args": {"type": "list", "description": "例如 filesystem MCP 的允许根目录"},
              "env_keys": {"type": "list", "description": "仅透传 catalog 声明或用户明确授权的环境变量名"},
-         }, "medium", True, False),
-        ("plan_capability", PlanCapabilityTool, "分析目标→搜索候选→评估风险→生成安装计划",
+         }, "high", True, False),
+        ("plan_capability", PlanCapabilityTool, "在本地 MCP 白名单目录中查找候选并生成风险与安装计划。",
          {"goal": {"type": "str", "minLength": 1, "required": True}}, "low", False, False),
         # 自进化
         ("create_selfdev_plan", CreateSelfdevPlanTool, "生成自进化补丁计划",
@@ -362,6 +383,8 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
              "required": True,
          }}, "high", True, False),
         ("promote_slot", PromoteSlotTool, "健康检查通过后提升非活跃槽位为活跃", {}, "high", True, False),
+        ("get_promotion_status", PromotionStatusTool, "读取本任务晋升 Action 的实际启动、观察、成功或回滚结果。",
+         {"action_id": {"type": "str", "minLength": 1, "required": True}}, "low", False, False),
         ("rollback_slot", RollbackSlotTool, "回滚到上一个活跃槽位", {}, "high", True, False),
         ("run_selfdev_repair", RunSelfdevRepairTool,
          "自主修复闭环：读取相关代码 → 生成补丁 → 应用到非活跃槽位 → 定向测试 → "
@@ -399,6 +422,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
 
     external_effect_modes = {
         "run_shell": "non_repeatable_external",
+        "install_mcp_sandbox": "non_repeatable_external",
         "forget": "externally_reconcilable",
         "safe_delete": "non_repeatable_external",
         "apply_patch_to_inactive_slot": "non_repeatable_external",

@@ -39,7 +39,7 @@ def _size(value: Any, seen: set[int] | None = None) -> int:
 
 
 @final
-class DocumentParseCache:
+class DocumentParseCache[T]:
     def __init__(
         self,
         max_bytes: int = MAX_CACHE_BYTES,
@@ -51,7 +51,7 @@ class DocumentParseCache:
         self.max_entries = max_entries
         self._lock = RLock()
         self._entries: OrderedDict[
-            tuple[str, ...], tuple[tuple[ChunkDraft, ...], int]
+            tuple[str, ...], tuple[T, int]
         ] = OrderedDict()
         self.bytes_used = 0
 
@@ -61,8 +61,8 @@ class DocumentParseCache:
             self.bytes_used = 0
 
     def get(
-        self, key: tuple[str, ...], loader: Callable[[], tuple[ChunkDraft, ...]]
-    ) -> tuple[ChunkDraft, ...]:
+        self, key: tuple[str, ...], loader: Callable[[], T]
+    ) -> T:
         with self._lock:
             entry = self._entries.get(key)
             if entry is not None:
@@ -87,7 +87,7 @@ class DocumentParseCache:
             return result
 
 
-DOCUMENT_CACHE = DocumentParseCache()
+DOCUMENT_CACHE = DocumentParseCache[tuple[ChunkDraft, ...]]()
 
 
 def document_chunks(

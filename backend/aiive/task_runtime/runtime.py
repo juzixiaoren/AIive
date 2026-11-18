@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -14,9 +14,9 @@ from aiive.control.approval_service import TaskApprovalService
 from aiive.control.capability_broker import CapabilityBroker
 from aiive.db.models import AgentAction, AgentRun, AgentTask, TaskArtifact, TaskEvidence
 from aiive.task_runtime.agent_executor import TaskAgentExecutor
-from aiive.task_runtime.errors import AgentOutputValidationError
+from aiive.task_runtime.errors import AgentOutputValidationError, TaskModelBudgetError
 from aiive.tools.tool_validation import validate_tool_params
-from aiive.core.function_calling import correction_allowed, CallValidation
+from aiive.core.function_calling import correction_allowed, CallValidation, output_error
 from aiive.task_runtime.evidence import EvidenceStore
 from aiive.task_runtime.goal_service import GoalService
 from aiive.task_runtime.repository import TaskRepository, utcnow
@@ -73,6 +73,14 @@ class PersistentTaskRuntime:
         self.active_run_id: str | None = None
 
     def run(self, task_id: str, *, trigger: str = "dispatch") -> dict[str, Any]:
+        candidate = self.repo.get_task(task_id, for_update=True)
+        if candidate is not None and candidate.status == TaskStatus.QUEUED.value:
+            budget = TaskBudget.model_validate(candidate.budgets or {})
+            if int((candidate.usage or {}).get("runs", 0)) >= budget.max_runs:
+                return self._complete(
+                    candidate, None, status="partial", summary="任务运行次数已达到上限。",
+                    unresolved=["run_budget_exhausted"],
+                )
         task, run = self.repo.start_run(task_id, trigger=trigger)
         self.active_run_id = run.id
         self.db.commit()
@@ -207,6 +215,12 @@ class PersistentTaskRuntime:
                 self.db.commit()
                 try:
                     decision = self.agent.decide(task, resident)
+                except TaskModelBudgetError as error:
+                    task.usage = {**(task.usage or {}), "model_calls": max(0, usage["model_calls"] - 1)}
+                    return self._complete(
+                        task, run, status="partial", summary="模型请求超过任务预算或所需预算信息不可用。",
+                        unresolved=[str(error)], model=last_model, token_usage=run_tokens,
+                    )
                 except AgentOutputValidationError as error:
                     last_model = error.model
                     run_tokens = self._merge_usage(run_tokens, error.token_usage)
@@ -251,6 +265,29 @@ class PersistentTaskRuntime:
                         self.db.commit()
                         continue
                     proposal.arguments = validation.validated_params
+            if proposal.decision == "watch":
+                from aiive.task_runtime.watchers import WatcherService
+
+                try:
+                    WatcherService(self.db).create_from_proposal(task, proposal.watch)
+                except (ValueError, OSError, RuntimeError) as error:
+                    correction_failures += 1
+                    if not correction_allowed(correction_failures) or self._budget_issue(task, budget, before_model=True):
+                        return self._complete(
+                            task, run, status="partial", summary="无法建立任务等待条件。",
+                            unresolved=[str(error)[:500]], model=last_model, token_usage=run_tokens,
+                        )
+                    payload = output_error("invalid_watch", path="watch", expected="valid watch and authorized target")
+                    payload["issues"][0]["message"] = str(error)[:500]
+                    from langchain_core.messages import HumanMessage, message_to_dict
+                    repair = [message_to_dict(HumanMessage(content=json.dumps(payload, ensure_ascii=False)))]
+                    if decision is not None and decision.call_message is not None:
+                        call_id = str(decision.call_message.tool_calls[0]["id"])
+                        repair = CallValidation({call_id: payload}).retry_turn(decision.call_message)
+                    task.task_state = {**(task.task_state or {}), "validation_feedback": payload,
+                                       "validation_failures": correction_failures, "validation_messages": repair}
+                    self.db.commit()
+                    continue
             correction_failures = 0
             state = dict(task.task_state or {})
             state.pop("validation_feedback", None)
@@ -273,6 +310,7 @@ class PersistentTaskRuntime:
                 return self._complete(
                     task, run, status=proposal.report_status,
                     summary=proposal.summary or "任务已完成。",
+                    risks=proposal.risks, unresolved=proposal.unresolved,
                     model=last_model, token_usage=run_tokens,
                 )
             if proposal.decision == "ask_user":
@@ -309,9 +347,6 @@ class PersistentTaskRuntime:
                 self.db.commit()
                 return {"status": task.status, "task_id": task.id, "question": proposal.question}
             if proposal.decision == "watch":
-                from aiive.task_runtime.watchers import WatcherService
-
-                WatcherService(self.db).create_from_proposal(task, proposal.watch)
                 self.repo.transition_task(
                     task, TaskStatus.BLOCKED_USER.value,
                     event_type="task_watching",
@@ -507,6 +542,11 @@ class PersistentTaskRuntime:
             self.db.commit()
             return "continue"
         if outcome == "unknown":
+            if action.capability_id == "run_shell":
+                self.evidence.capture_result(
+                    self.db, task_id=task.id, run_id=run.id, action=action, result=result,
+                    kind="tool_error",
+                )
             self.repo.transition_action(
                 action, ActionStatus.UNKNOWN.value,
                 error=str(result.get("error", "execution_unknown")),
@@ -568,29 +608,70 @@ class PersistentTaskRuntime:
     def _complete(
         self,
         task: AgentTask,
-        run: AgentRun,
+        run: AgentRun | None,
         *,
         status: Literal["succeeded", "partial", "failed"],
         summary: str,
         unresolved: list[str] | None = None,
+        risks: list[str] | None = None,
         model: str | None = None,
         token_usage: dict[str, int] | None = None,
         failed_run: bool = False,
     ) -> dict[str, Any]:
         task = self.db.get(AgentTask, task.id) or task
         progress = (task.task_state or {}).get("attachment_processing") or {}
+        images = (task.task_state or {}).get("attachment_image_receipts") or {}
         required = (task.task_state or {}).get("required_attachment_ids", [])
         if status == "succeeded" and any(
-            not isinstance(progress.get(aid), dict)
-            or int(progress[aid].get("total_chunks", 0)) <= 0
-            or progress[aid].get("next_chunk_index") != progress[aid].get("total_chunks")
-            or progress[aid].get("processed_chunk_count") != progress[aid].get("total_chunks")
+            aid not in images and (
+                not isinstance(progress.get(aid), dict)
+                or int(progress[aid].get("total_chunks", 0)) <= 0
+                or progress[aid].get("next_chunk_index") != progress[aid].get("total_chunks")
+                or progress[aid].get("processed_chunk_count") != progress[aid].get("total_chunks")
+            )
             for aid in required
         ):
             status = "partial"
             summary = "附件全文处理尚未完成。" + summary
             unresolved = [*(unresolved or []), "attachment_processing_incomplete"]
-        if task.status == TaskStatus.QUEUED.value:
+        if status == "succeeded" and run is not None:
+            from aiive.supervisor.promotion_status import promotion_status
+            from aiive.task_runtime.watchers import WatcherService
+
+            latest = self.db.query(AgentAction).filter(
+                AgentAction.task_id == task.id, AgentAction.capability_id.in_(["promote_slot", "run_selfdev_repair"]),
+                AgentAction.status == ActionStatus.SUCCEEDED.value,
+            ).order_by(AgentAction.sequence.desc()).first()
+            deployment = (latest.result_summary or {}) if latest else {}
+            request = deployment.get("promotion_request_id")
+            if deployment.get("deployment_confirmation_required"):
+                status = "partial"
+                summary = "发布槽位已切换，当前服务运行版本待确认。"
+                unresolved = [*(unresolved or []), "active_process_requires_verification"]
+            if isinstance(request, str) and latest is not None:
+                promotion = promotion_status(request)
+                if promotion in {"requested", "observing"}:
+                    started = latest.completed_at or utcnow()
+                    if started.tzinfo is None:
+                        started = started.replace(tzinfo=timezone.utc)
+                    deadline = started + timedelta(minutes=20)
+                    if utcnow() < deadline:
+                        WatcherService(self.db).wait_for_promotion(task, request, deadline)
+                        self.repo.transition_task(task, TaskStatus.BLOCKED_USER.value, event_type="task_watching",
+                                                  event_payload={"reason": "awaiting_promotion_result"}, visibility="conversation")
+                        self.repo.finish_run(run, summary={"blocked": "promotion", "request_id": request},
+                                             token_usage=token_usage, model=model)
+                        self.repo.checkpoint(task.id, reason="awaiting_promotion_result")
+                        self.db.commit()
+                        return {"status": task.status, "task_id": task.id, "promotion": promotion}
+                if promotion != "promoted":
+                    status = "partial"
+                    summary = {
+                        "rolled_back": "部署已回滚。",
+                        "failed": "部署未完成。",
+                    }.get(promotion, "修复结果已保留，部署结果仍待确认。")
+                    unresolved = [*(unresolved or []), f"promotion_{promotion}"]
+        if run is not None and task.status == TaskStatus.QUEUED.value:
             self.repo.transition_task(task, TaskStatus.DISPATCHING.value)
             self.repo.transition_task(task, TaskStatus.RUNNING.value)
         evidence_ids = [row[0] for row in self.db.query(TaskEvidence.id).filter(TaskEvidence.task_id == task.id).all()]
@@ -604,11 +685,12 @@ class PersistentTaskRuntime:
             completed_actions=succeeded,
             evidence_refs=evidence_ids,
             artifact_refs=artifact_ids,
-            unresolved=unresolved or [],
+            risks=list(dict.fromkeys(risks or [])),
+            unresolved=list(dict.fromkeys(unresolved or [])),
         ).model_dump(mode="json")
         goals = GoalService(self.db) if GoalService.is_goal_task(task) else None
         if goals is not None:
-            if status == "succeeded":
+            if status == "succeeded" and run is not None:
                 decision = goals.on_step_finished(task, run, report)
                 if decision in {"advance", "wait"}:
                     # 单步完成不等于目标完成：结算步骤后继续推进或进入等待。
@@ -637,7 +719,7 @@ class PersistentTaskRuntime:
             else:
                 goals.on_goal_blocked(task, summary)
         # 目标钩子可能把任务重新排队/转入等待，因此 VERIFYING 只在真正收敛时进入。
-        if task.status == TaskStatus.QUEUED.value:
+        if run is not None and task.status == TaskStatus.QUEUED.value:
             self.repo.transition_task(task, TaskStatus.DISPATCHING.value)
             self.repo.transition_task(task, TaskStatus.RUNNING.value)
         self.repo.transition_task(task, TaskStatus.VERIFYING.value)
@@ -652,14 +734,15 @@ class PersistentTaskRuntime:
             event_payload=report,
             visibility="conversation",
         )
-        self.repo.finish_run(
-            run,
-            status=RunStatus.FAILED.value if status == "failed" or failed_run else RunStatus.COMPLETED.value,
-            summary=report,
-            token_usage=token_usage,
-            model=model,
-            error=summary if status == "failed" or failed_run else None,
-        )
+        if run is not None:
+            self.repo.finish_run(
+                run,
+                status=RunStatus.FAILED.value if status == "failed" or failed_run else RunStatus.COMPLETED.value,
+                summary=report,
+                token_usage=token_usage,
+                model=model,
+                error=summary if status == "failed" or failed_run else None,
+            )
         self.repo.checkpoint(task.id, reason=f"completed_{status}")
         self.db.commit()
         return {"status": task.status, "task_id": task.id, "report": report}
@@ -695,8 +778,6 @@ class PersistentTaskRuntime:
         cls, task: AgentTask, budget: TaskBudget, *, before_model: bool,
     ) -> str | None:
         usage = task.usage or {}
-        if int(usage.get("runs", 0)) > budget.max_runs:
-            return "run_budget_exhausted"
         if before_model and int(usage.get("model_calls", 0)) >= budget.max_model_calls:
             return "model_call_budget_exhausted"
         total_tokens = int(usage.get("prompt_tokens", 0)) + int(usage.get("completion_tokens", 0))

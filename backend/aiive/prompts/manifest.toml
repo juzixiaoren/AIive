@@ -1,6 +1,6 @@
 [prompts."agent.stable_contract"]
 file = "agent/stable_contract.md"
-version = "2.2.0"
+version = "2.3.0"
 role = "system"
 variables = []
 
@@ -58,15 +58,9 @@ version = "2.0.0"
 role = "user"
 variables = ["error_text"]
 
-[prompts."runtime.reminder_delivery"]
-file = "runtime/reminder_delivery.md"
-version = "2.0.0"
-role = "user"
-variables = ["reminder_id", "title", "content"]
-
 [prompts."task_runtime.worker_system"]
 file = "task_runtime/worker_system.md"
-version = "3.0.0"
+version = "3.1.0"
 role = "system"
 variables = []
 

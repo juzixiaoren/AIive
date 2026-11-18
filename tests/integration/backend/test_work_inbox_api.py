@@ -413,5 +413,7 @@ def test_work_view_history_budgets(db_session):
         )
     db_session.flush()
     view = model.work_view(db_session.get(AgentTask, "00000"))
-    assert view["timeline"] == [] and view["truncated"]["timeline"]
+    assert view["timeline"] == []
+    assert not view["truncated"]["timeline"]
+    assert view["history_cursor"] is None
     assert view["last_sequence"] == 600

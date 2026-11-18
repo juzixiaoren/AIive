@@ -3,15 +3,54 @@
 from aiive.tools.base import DatabaseTool
 
 import logging
+import json
 
 from sqlalchemy.orm import Session
 
-from aiive.context.run_context import RunContext
-from aiive.tools.builtin_tools import require_ctx
+from aiive.context.run_context import RunContext, require_ctx
 
 logger = logging.getLogger(__name__)
 
 from typing import override, Any
+
+
+def _recall_limits(db: Session, ctx: RunContext, requested: int | None):
+    from aiive.db.models import AgentTask
+    from aiive.memory.recall_config import RecallConfig
+
+    config = RecallConfig()
+    task = None
+    if ctx.task_id and ctx.agent_run_id:
+        task = db.query(AgentTask).filter_by(id=ctx.task_id).populate_existing().with_for_update().one()
+        stored = (task.usage or {}).get("recall") or {}
+        if stored.get("run_id") != ctx.agent_run_id:
+            stored = {}
+        ctx.memory_tool_calls = int(stored.get("calls", 0))
+        ctx.memory_recall_tokens = int(stored.get("tokens", 0))
+    remaining = config.max_total_recall_token_budget - ctx.memory_recall_tokens
+    budget = min(requested or config.memory_tool_token_budget, remaining)
+    if ctx.memory_tool_calls >= config.max_memory_tool_calls_per_turn or budget <= 0:
+        return 0, task
+    ctx.memory_tool_calls += 1
+    return budget, task
+
+
+def _pack_recall_results(ctx: RunContext, task: Any, results: list[dict[str, Any]], budget: int):
+    from aiive.runtime.token_counter import LiteLLMTokenCounter
+
+    selected = []
+    used = 0
+    for row in results:
+        size = LiteLLMTokenCounter.count_text(json.dumps(row, ensure_ascii=False, default=str), padded=False)
+        if used + size <= budget:
+            selected.append(row)
+            used += size
+    ctx.memory_recall_tokens += used
+    if task is not None:
+        task.usage = {**(task.usage or {}), "recall": {
+            "run_id": ctx.agent_run_id, "calls": ctx.memory_tool_calls, "tokens": ctx.memory_recall_tokens,
+        }}
+    return selected, used
 
 
 class MemorySearchTool(DatabaseTool):
@@ -48,21 +87,14 @@ class MemorySearchTool(DatabaseTool):
         from aiive.retrieval.unified_retriever import UnifiedRetriever
 
         ctx = require_ctx(ctx, "memory_search")
-        # Kernel-enforced per-turn budget (requirement #28)
-        if ctx.memory_tool_calls >= RecallConfig().max_memory_tool_calls_per_turn:
-            return {
-                "ok": False,
-                "error": "memory_tool_call_budget_exceeded",
-                "hint": "单轮 memory 工具调用次数已达上限，请基于已召回结果继续推理。",
-            }
-        ctx.memory_tool_calls += 1
-
         if not query or not query.strip():
             return {"ok": True, "results": [], "hint": "Empty query. Provide a non-empty query."}
 
         rcfg = RetrievalConfig()
-        effective_top_k: int = top_k if top_k is not None else rcfg.search_max_results
-        effective_token_budget: int = token_budget if token_budget is not None else rcfg.search_token_budget
+        effective_top_k = top_k if top_k is not None else RecallConfig().memory_tool_top_k
+        effective_token_budget, task = _recall_limits(db, ctx, token_budget)
+        if not effective_token_budget:
+            return {"ok": False, "error_type": "recall_budget_exhausted", "results": []}
 
         scope = build_scope_context(db, ctx, ctx.thread_id)
         retriever = UnifiedRetriever(db, rcfg)
@@ -72,16 +104,14 @@ class MemorySearchTool(DatabaseTool):
             scope_context=scope,
             thread_id=ctx.thread_id,
             source_types=["memory_record"],
+            memory_types=memory_types,
             include_sleeping=True,
             include_archived=include_archived,
             max_results=effective_top_k,
-            token_budget=effective_token_budget,
         ))
 
         # 兼容旧输出格式：RetrievalHit → dict
         items = result.hits
-        if memory_types:
-            items = [h for h in items if h.provenance.get("memory_type", "") in memory_types]
 
         results = []
         touched_ids: list[str] = []
@@ -101,7 +131,7 @@ class MemorySearchTool(DatabaseTool):
                 "memory_type": h.provenance.get("memory_type", ""),
                 "canonical_key": h.canonical_key or h.title,
                 "scope_type": h.scope_type,
-                "relevance_score": h.lexical_score,
+                "relevance_score": h.final_score,
                 "validity_state": "valid",
                 "lifecycle_state": h.lifecycle_state,
             })
@@ -111,6 +141,10 @@ class MemorySearchTool(DatabaseTool):
             mid = h.memory_record_id or h.source_id
             if mid:
                 touched_ids.append(str(mid))
+
+        results, used = _pack_recall_results(ctx, task, results, effective_token_budget)
+        returned_ids = {row["memory_id"] for row in results}
+        touched_ids = [item for item in touched_ids if item in returned_ids]
 
         # touch 实际返回的记忆（best-effort，排除 archived/forgotten）
         try:
@@ -126,6 +160,7 @@ class MemorySearchTool(DatabaseTool):
             "memory_types": memory_types or [],
             "results": results,
             "total": len(results),
+            "recall_tokens": used,
             "degraded": result.degraded,
             "note": "统一检索（经 UnifiedRetriever）；retrieved historical memory; may be stale — current explicit user input overrides defaults",
         }
@@ -156,7 +191,7 @@ class HistorySearchTool(DatabaseTool):
         返回:
             包含 results（统一 RetrievalHit 列表）的字典
         """
-        from aiive.memory.recall_config import RetrievalConfig
+        from aiive.memory.recall_config import RecallConfig, RetrievalConfig
         from aiive.memory.scope_resolver import build_scope_context
         from aiive.retrieval.retrieval_types import RetrievalMode, RetrievalRequest
         from aiive.retrieval.unified_retriever import UnifiedRetriever
@@ -166,8 +201,10 @@ class HistorySearchTool(DatabaseTool):
             return {"ok": True, "results": [], "hint": "Empty query. Provide a non-empty query."}
 
         rcfg = RetrievalConfig()
-        effective_top_k: int = top_k if top_k is not None else rcfg.search_max_results
-        effective_budget: int = token_budget if token_budget is not None else rcfg.search_token_budget
+        effective_top_k = top_k if top_k is not None else RecallConfig().memory_tool_top_k
+        effective_budget, task = _recall_limits(db, ctx, token_budget)
+        if not effective_budget:
+            return {"ok": False, "error_type": "recall_budget_exhausted", "results": []}
 
         scope = build_scope_context(db, ctx, ctx.thread_id)
         mode = RetrievalMode.DEEP if deep else RetrievalMode.SEARCH
@@ -178,18 +215,19 @@ class HistorySearchTool(DatabaseTool):
             thread_id=ctx.thread_id,
             include_archived=include_archived,
             max_results=effective_top_k,
-            token_budget=effective_budget,
         )
         retriever = UnifiedRetriever(db, rcfg)
         result = retriever.retrieve(req)
 
         results = [h.model_dump(exclude_none=True) for h in result.hits]
+        results, used = _pack_recall_results(ctx, task, results[:effective_top_k], effective_budget)
         return {
             "ok": True,
             "query": query,
             "deep": deep,
             "results": results,
             "total": len(results),
+            "recall_tokens": used,
             "degraded": result.degraded,
             "note": "统一检索结果（含记忆/摘要/检查点/原始）；当前明确用户输入始终覆盖这些默认值",
         }

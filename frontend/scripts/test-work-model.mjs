@@ -724,7 +724,7 @@ test("both chat transports submit issued attachment IDs and a stable turn key", 
     const noop = () => {};
     await webChat.sendMessageStream("question", "thread", noop, noop, noop, noop, noop, undefined, ["issued-id"], "stable-key");
     await androidChat.streamMessage("question", "thread", { onStarted: noop, onToken: noop }, new AbortController().signal, ["issued-id"], "stable-key");
-    assert.deepEqual(sent, [0, 1].map(() => ({ message: "question", thread_id: "thread", attachment_ids: ["issued-id"], turn_id: "stable-key" })));
+    assert.deepEqual(sent, [0, 1].map(() => ({ message: "question", thread_id: "thread", attachment_ids: ["issued-id"], turn_id: "stable-key", timezone: Intl.DateTimeFormat().resolvedOptions().timeZone })));
   } finally { globalThis.fetch = previousFetch; }
 });
 

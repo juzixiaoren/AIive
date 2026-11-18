@@ -6,8 +6,7 @@ from aiive.tools.base import DatabaseTool
 
 from sqlalchemy.orm import Session
 
-from aiive.context.run_context import RunContext
-from aiive.tools.builtin_tools import require_ctx
+from aiive.context.run_context import RunContext, require_ctx
 
 
 class RememberOrUpdateTool(DatabaseTool):

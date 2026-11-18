@@ -156,7 +156,7 @@ export async function streamMessage(
       Accept: "text/event-stream",
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ message, thread_id: threadId ?? null, attachment_ids: attachmentIds, turn_id: turnId }),
+    body: JSON.stringify({ message, thread_id: threadId ?? null, attachment_ids: attachmentIds, turn_id: turnId, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone }),
     signal,
   });
   if (!response.ok) throw await chatApiErrorFromResponse(response);

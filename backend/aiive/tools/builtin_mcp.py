@@ -73,7 +73,11 @@ class SearchMcpTool(BaseTool):
         """
         from aiive.mcp.discovery import search_mcp_candidates
         candidates = search_mcp_candidates(goal)
-        return [{"name": c.name, "source": c.source, "version": c.version, "description": c.description, "risk_notes": c.risk_notes, "declared_tools": c.declared_tools} for c in candidates]
+        return {"catalog": "local_allowlist", "has_match": bool(candidates), "candidates": [
+            {"name": c.name, "source": c.source, "version": c.version, "description": c.description,
+             "risk_notes": c.risk_notes, "declared_tools": c.declared_tools, "required_env": c.required_env}
+            for c in candidates
+        ]}
 
 
 class InstallMcpSandboxTool(DatabaseTool):
@@ -81,6 +85,7 @@ class InstallMcpSandboxTool(DatabaseTool):
     def _run(self,
         db: Session,
         candidate_name: str,
+        version: str,
         launch_args: list[str] | None = None,
         env_keys: list[str] | None = None,
     ):
@@ -96,24 +101,20 @@ class InstallMcpSandboxTool(DatabaseTool):
         返回:
             安装结果字典
         """
-        from aiive.mcp.discovery import get_candidate_by_name, search_mcp_candidates
+        from aiive.mcp.discovery import get_candidate_by_name
         from aiive.mcp.installer import install_sandbox
-        exact = get_candidate_by_name(candidate_name)
-        if exact is not None:
-            c = exact
-        else:
-            candidates = search_mcp_candidates(candidate_name)
-            if not candidates:
-                return {"ok": False, "error": "No candidate found"}
-            c = candidates[0]
-        requested_env = set(env_keys or c.required_env)
+        c = get_candidate_by_name(candidate_name)
+        if c is None or c.version != version:
+            return {"ok": False, "error_type": "mcp_catalog_candidate_changed",
+                    "error": "Search the local catalog again and use its exact name and version."}
+        requested_env = set(env_keys or ())
         undeclared_env = requested_env - set(c.required_env)
         if undeclared_env:
             return {
                 "ok": False,
                 "error": f"MCP env keys not declared by catalog: {sorted(undeclared_env)}",
             }
-        return install_sandbox(
+        result = install_sandbox(
             db, c.name, c.package_ref, c.version, c.transport, c.declared_tools,
             {
                 "name": c.name, "source": c.source, "description": c.description,
@@ -123,3 +124,7 @@ class InstallMcpSandboxTool(DatabaseTool):
             launch_args=launch_args or [],
             env_keys=sorted(requested_env),
         )
+        if result.get("ok"):
+            result.update(usable=False, next_step="verify_and_enable_in_capability_manager",
+                          version=c.version, source=c.source)
+        return result

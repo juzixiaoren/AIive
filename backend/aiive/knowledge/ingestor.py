@@ -310,8 +310,13 @@ class KnowledgeIngestor:
 
     def read_source(self, document_id: str) -> bytes:
         """从对象存储读取并校验指定文档的持久原文。"""
+        from aiive.forget.durable_sources import references_visible
+        from aiive.knowledge.access import document_sources
+
         document = self._db.get(Document, document_id)
-        if document is None:
+        if document is None or document.status in INACTIVE_STATUSES or not references_visible(
+            self._db, document_sources(self._db, document_id)
+        ):
             raise LookupError("知识文档不存在")
         if not document.object_bucket or not document.object_key:
             raise LookupError("知识文档没有可用的持久原文")
@@ -406,6 +411,9 @@ def search_chunks(db: Session, query: str, limit: int = 5) -> list[dict[str, Any
     即使残留分块或向量也不会被召回。两路结果按 RRF 融合去重，词法命中优先级
     不低于向量命中，因此纯关键词查询的排序与接入向量前一致。
     """
+    from aiive.forget.durable_sources import references_visible
+    from aiive.knowledge.access import document_sources, sources_payload
+
     normalized = query.strip().casefold()
     if not normalized:
         return []
@@ -416,7 +424,16 @@ def search_chunks(db: Session, query: str, limit: int = 5) -> list[dict[str, Any
     lexical_hits = _lexical_chunk_hits(db, normalized, depth)
     vector_hits = _vector_chunk_hits(db, query.strip(), depth)
     fused = _fuse_chunk_hits(lexical_hits, vector_hits, limit)
-    return _expand_neighbor_hits(db, fused)
+    visible_sources = {}
+    for hit in fused:
+        document_id = str(hit["document_id"])
+        if document_id in visible_sources:
+            continue
+        sources = document_sources(db, document_id)
+        if references_visible(db, sources):
+            visible_sources[document_id] = sources_payload(sources)
+    visible = [hit for hit in fused if str(hit["document_id"]) in visible_sources]
+    return [{**hit, **visible_sources[str(hit["document_id"])]} for hit in _expand_neighbor_hits(db, visible)]
 
 
 # 混合检索融合参数：RRF 让两路排名可比，权重表达"词法不弱于向量"的既有排序契约。

@@ -27,6 +27,7 @@ import argparse
 import json
 import os
 import signal
+import socket
 import sys
 import time
 from dataclasses import dataclass
@@ -318,7 +319,16 @@ class Supervisor:
         )
         self._event("switch_started", target=target, previous=active)
 
-        staging_port = int(self.config.port) + 1
+        try:
+            family, socktype, proto, _, address = socket.getaddrinfo(
+                self.config.host, 0, type=socket.SOCK_STREAM,
+            )[0]
+            with socket.socket(family, socktype, proto) as staging:
+                staging.bind(address)
+                staging_port = int(staging.getsockname()[1])
+        except OSError as error:
+            self._fail_switch(active, "candidate_port_unavailable", error=str(error))
+            return {"ok": False, "status": "switch_failed", "error": "candidate_port_unavailable", "active_slot": active}
         candidate, error = self.controller.start(
             slot=target, slot_root=self._slot_root(target), port=staging_port, role="candidate",
         )
@@ -395,6 +405,7 @@ class Supervisor:
         self._write_state(
             phase="running", active_slot=target, previous_slot=active,
             process=new_record.as_dict(), candidate=None, candidate_slot=None,
+            promotion_request_id=request.get("id"),
             monitor_until=datetime.fromtimestamp(monitor_until, timezone.utc).isoformat(),
             successful_checks=1, last_error=None,
         )
@@ -530,7 +541,8 @@ class Supervisor:
             self._write_state(successful_checks=int(state.get("successful_checks") or 0) + 1)
             return {"ok": True, "action": "monitoring_healthy"}
         if monitor_until is not None and state.get("previous_slot"):
-            self._write_state(previous_slot=None, monitor_until=None)
+            self._record_promotion_outcome(state.get("promotion_request_id"), "promoted")
+            self._write_state(previous_slot=None, monitor_until=None, promotion_request_id=None)
             self._write_release_state(
                 status="stable", previous_active=state.get("previous_slot"),
                 active_slot=active,
@@ -628,18 +640,22 @@ class Supervisor:
 
     def _restore_previous(self, slot: str, *, reason: str, **detail: Any) -> dict[str, Any]:
         """回滚：启动目标槽位并**验证**健康后才写 active_slot。"""
-        record = self._record_from_state(self.state())
+        state = self.state()
+        request_id = state.get("promotion_request_id") if state.get("monitor_until") else None
+        record = self._record_from_state(state)
         if record is not None:
             self.controller.stop(record)
         started, error = self.controller.start(
             slot=slot, slot_root=self._slot_root(slot), port=self.config.port, role="active",
         )
         if started is None:
+            self._record_promotion_outcome(request_id, "failed")
             self._write_state(phase="degraded", last_error=f"restore_failed:{error}", process=None)
             self._event("restore_failed", slot=slot, reason=reason, error=error, **detail)
             return {"ok": False, "error": error, "verified": False, "slot": slot}
         health = self._wait_process_healthy(started, self.config.port)
         if not health["ok"]:
+            self._record_promotion_outcome(request_id, "failed")
             self.controller.stop(started)
             self._write_state(phase="degraded", last_error="restore_health_failed", process=None)
             self._event("restore_failed", slot=slot, reason=reason, health=health.get("health"), **detail)
@@ -648,9 +664,10 @@ class Supervisor:
                 "verified": False, "health": health.get("health"),
             }
         self.slots.set_active_slot(slot)
+        self._record_promotion_outcome(request_id, "rolled_back")
         self._write_state(
             phase="running", active_slot=slot, process=started.as_dict(),
-            previous_slot=None, monitor_until=None, candidate=None, last_error=None,
+            previous_slot=None, monitor_until=None, promotion_request_id=None, candidate=None, last_error=None,
         )
         self._write_release_state(
             status="rolled_back", previous_active=None, active_slot=slot, reason=reason,
@@ -666,6 +683,14 @@ class Supervisor:
         state["updated_at"] = iso_now()
         state["source"] = "supervisor"
         write_json_atomic(path, state)
+
+    def _record_promotion_outcome(self, request_id: Any, status: str) -> None:
+        if not isinstance(request_id, str) or len(request_id) != 32 or any(c not in "0123456789abcdef" for c in request_id):
+            return
+        path = self.paths.results_dir / f"{request_id}.json"
+        receipt = read_json(path)
+        if receipt.get("kind") == "promote" and receipt.get("status") == "switched":
+            write_json_atomic(path, {**receipt, "status": status, "ok": status == "promoted", "observed_at": iso_now()})
 
     def stop_managed_process(self) -> dict[str, Any]:
         """显式停止受管进程（运维/测试用），不改变 active_slot。"""

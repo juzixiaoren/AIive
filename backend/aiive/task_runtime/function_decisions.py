@@ -7,13 +7,14 @@ import re
 from typing import Any
 
 from aiive.core.function_calling import function_definition
-from aiive.task_runtime.schemas import ActionProposal
+from aiive.task_runtime.schemas import ActionProposal, FilePreconditions
+from aiive.task_runtime.watch_contract import WATCH_PROPOSAL
 from aiive.tools.registry import CapabilitySafetySchema
 from aiive.core.function_spec import FunctionSpec, FunctionSpecs
 
 
 CONTROLS = {
-    "task_finish": ("finish", ("summary", "report_status")),
+    "task_finish": ("finish", ("summary", "report_status", "risks", "unresolved")),
     "task_ask_user": ("ask_user", ("question",)),
     "task_watch": ("watch", ("watch",)),
     "task_search_capabilities": ("search_capabilities", ("query",)),
@@ -35,19 +36,20 @@ class WorkerFunctions:
         fields = ActionProposal.model_json_schema()["properties"]
         for name, (_, keys) in CONTROLS.items():
             properties = {key: deepcopy(fields[key]) for key in keys}
-            required = [key for key in keys if key not in {"report_status"}]
+            required = [key for key in keys if key not in {"report_status", "risks", "unresolved"}]
+            definitions = {}
+            description = f"Task control: {CONTROLS[name][0]}. Produce a decision only."
             for key in ("question", "query", "capability_id"):
                 if key in properties:
                     properties[key]["minLength"] = 1
             if name == "task_watch":
-                properties["watch"] = {
-                    "type": "object", "required": ["watch_type"], "additionalProperties": False,
-                    "properties": {"watch_type": {"type": "string", "enum": ["time", "file", "node"]},
-                                   "config": {"type": "object", "additionalProperties": True, "default": {}},
-                                   "next_check_at": {"type": ["string", "null"], "default": None}},
-                }
-            self._register(name, f"Task control: {CONTROLS[name][0]}. Produce a decision only.",
-                           {"type": "object", "properties": properties, "required": required, "additionalProperties": False})
+                properties["watch"] = WATCH_PROPOSAL.json_schema()
+                definitions = properties["watch"].pop("$defs", {})
+                description = "Wait for one match, then resume this task. File watches run on the backend host."
+            schema = {"type": "object", "properties": properties, "required": required, "additionalProperties": False}
+            if definitions:
+                schema["$defs"] = definitions
+            self._register(name, description, schema)
         selected = {}
         for group in ("resident", "available", "loaded"):
             for definition in tool_view.get(group, []):
@@ -60,8 +62,11 @@ class WorkerFunctions:
             self.capabilities[name] = capability_id
             arguments = deepcopy(definition["input_schema"])
             definitions = arguments.pop("$defs", {})
+            properties = {"arguments": arguments, **{key: deepcopy(fields[key]) for key in ("effects", "summary")}}
+            if {"path", "source", "file_path"}.intersection(arguments.get("properties", {})):
+                properties["preconditions"] = FilePreconditions.model_json_schema()
             schema = {"type": "object", "additionalProperties": False, "required": ["arguments"],
-                      "properties": {"arguments": arguments, **{key: deepcopy(fields[key]) for key in ("preconditions", "effects", "summary")}}}
+                      "properties": properties}
             if definitions:
                 schema["$defs"] = definitions
             self._register(name, f"Propose {capability_id}: {definition.get('description', '')}. Does not execute the tool.", schema)

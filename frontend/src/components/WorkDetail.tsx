@@ -41,11 +41,11 @@ function AttentionCard({
         <small>有效期至 {new Date(item.expires_at).toLocaleString()}</small>
       )}
       {item.preview && <pre>{JSON.stringify(item.preview, null, 2)}</pre>}
-      {input && (
+      {(input || item.kind === "action_reconciliation") && (
         <label>
-          你的回答
+          {item.kind === "action_reconciliation" ? "你核对到的外部结果" : "你的回答"}
           <textarea
-            maxLength={2000}
+            maxLength={item.kind === "action_reconciliation" ? 500 : 2000}
             value={answer}
             onChange={(e) => setAnswer(e.target.value)}
           />
@@ -57,9 +57,11 @@ function AttentionCard({
             key={action}
             disabled={
               state.busy ||
-              (["answer", "send_input"].includes(action) && !answer.trim())
+              (["answer", "send_input", "completed", "not_executed"].includes(action) && !answer.trim())
             }
             onClick={() => {
+              if (action === "not_executed" && !window.confirm("确认此操作从未执行？尚未结束的任务将重新派发此操作。"))
+                return;
               if (action === "modify" || action === "modify_plan") {
                 onEdit(item, answer);
                 return;
@@ -318,6 +320,8 @@ export default function WorkDetail({
           <article className="work-report">
             <h3>工作报告</h3>
             <p>{task.report.summary}</p>
+            {task.report.unresolved?.map((item) => <p key={item}>待处理 · {item}</p>)}
+            {task.report.risks?.map((item) => <p key={item}>风险 · {item}</p>)}
           </article>
         )}
         {!task.report && !view.artifacts.length && !view.evidence.length && (
@@ -341,13 +345,16 @@ export default function WorkDetail({
             kind="evidence"
           />
         ))}
-        {(view.truncated.task_artifact || view.truncated.task_evidence) && (
-          <p>仅展示最近的 50 项可见成果或证据。</p>
+        {view.metadata_cursors?.artifacts && (
+          <button disabled={state.loading} onClick={() => void controller.olderFiles("artifacts")}>加载更早的成果</button>
+        )}
+        {view.metadata_cursors?.evidence && (
+          <button disabled={state.loading} onClick={() => void controller.olderFiles("evidence")}>加载更早的证据</button>
         )}
       </section>
       <details>
         <summary>技术执行详情（{view.actions.length}）</summary>
-        <p>结果未知的操作等待设备 Journal 对账，不提供普通重试。</p>
+        <p>设备操作由设备日志核对。其他未知操作可在工作详情中确认结果。</p>
         {view.actions.map((action) => (
           <article key={action.id}>
             <strong>{action.capability_id}</strong>

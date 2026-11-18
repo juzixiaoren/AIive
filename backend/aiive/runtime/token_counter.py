@@ -120,7 +120,7 @@ class LiteLLMTokenCounter:
     # ── 单段文本 token 计数（Phase 5 统一检索 token budget 打包）──
 
     @staticmethod
-    def count_text(text: str, model: str = "deepseek/deepseek-v4-flash") -> int:
+    def count_text(text: str, model: str = "deepseek/deepseek-v4-flash", *, padded: bool = True) -> int:
         """对单段文本做真实 token 计数（返回 safe_tokens）。
 
         内部走 LiteLLM 真实计数 + fallback 保守估算；
@@ -136,7 +136,7 @@ class LiteLLMTokenCounter:
             model=model,
             messages=[{"role": "system", "content": text}],
         )
-        return result.safe_tokens
+        return result.safe_tokens if padded else result.estimated_tokens
 
 
 # count_text 的进程级共享 counter（按 model 缓存）。避免检索热路径上

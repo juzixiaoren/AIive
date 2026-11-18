@@ -55,6 +55,7 @@ class MemoryRecallRequest(BaseModel):
     query: str
     active_goal: str | None = None
     scope_context: ScopeContext
+    memory_types: list[str] | None = None
     top_k: int = 8
     token_budget: int | None = None
     request_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])

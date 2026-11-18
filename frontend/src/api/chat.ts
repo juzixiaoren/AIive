@@ -98,7 +98,7 @@ export async function sendMessageStream(
   const res = await apiFetch("api/chat/stream", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message, thread_id: threadId ?? null, attachment_ids: attachmentIds, turn_id: turnId }),
+    body: JSON.stringify({ message, thread_id: threadId ?? null, attachment_ids: attachmentIds, turn_id: turnId, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone }),
     signal,
   });
 

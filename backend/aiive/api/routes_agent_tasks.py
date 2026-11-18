@@ -7,7 +7,7 @@ from pathlib import PurePath
 from typing import Any, ClassVar, Literal
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
@@ -41,6 +41,30 @@ class CreateAgentTaskRequest(BaseModel):
 class TaskInputRequest(BaseModel):
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
     content: str = Field(min_length=1, max_length=20_000)
+
+
+class ReconcileActionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    resolution: Literal["completed", "not_executed"]
+    observation: str = Field(min_length=1, max_length=500)
+    attempt_id: str = Field(min_length=1, max_length=80)
+
+
+@router.post("/{task_id}/actions/{action_id}/resolve")
+def resolve_task_action(
+    task_id: str, action_id: str, request: ReconcileActionRequest, db: Session = Depends(get_db),
+) -> dict[str, str]:
+    from aiive.task_runtime.manual_reconciliation import resolve_unknown_action
+
+    try:
+        result = resolve_unknown_action(db, task_id, action_id, request.resolution, request.observation, request.attempt_id)
+        db.commit()
+        return result
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 @router.post("")
@@ -109,13 +133,39 @@ def get_work_view(task_id: str, db: Session = Depends(get_db)) -> dict[str, Any]
 @router.get("/{task_id}/timeline")
 def get_work_timeline(task_id: str, after_sequence: int = Query(default=0, ge=0),
                       limit: int = Query(default=50, ge=1, le=50),
+                      before_sequence: int | None = Query(default=None, gt=0),
                       db: Session = Depends(get_db)) -> dict[str, Any]:
     from aiive.task_runtime.work_read_model import WorkReadModel
     with db.no_autoflush:
         model = WorkReadModel(db)
         if model.reader.get_task(task_id) is None:
             raise HTTPException(status_code=404, detail="任务不存在")
+        if before_sequence is not None:
+            if after_sequence:
+                raise HTTPException(status_code=400, detail="choose_one_timeline_cursor")
+            return model.timeline_history(task_id, before_sequence, limit)
         return model.timeline(task_id, after_sequence, limit)
+
+
+@router.get("/{task_id}/evidence")
+@router.get("/{task_id}/artifacts")
+def list_work_files(
+    task_id: str,
+    request: Request,
+    cursor: str | None = Query(default=None, max_length=512),
+    limit: int = Query(default=50, ge=1, le=50),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    from aiive.task_runtime.work_read_model import WorkReadModel
+
+    model = WorkReadModel(db)
+    if model.reader.get_task(task_id) is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    kind = request.url.path.rsplit("/", 1)[-1]
+    try:
+        return model.metadata_page(task_id, kind, cursor, limit)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
 
 @router.get("/{task_id}")

@@ -105,8 +105,11 @@ class Model:
         self.messages = []
 
     def bind_tools(self, definitions, **kwargs):
+        from aiive.runtime.context_budget import ContextBudget
+
         self.definitions = definitions
-        assert kwargs == {"tool_choice": "auto", "parallel_tool_calls": False}
+        assert kwargs == {"tool_choice": "auto", "parallel_tool_calls": False,
+                          "max_tokens": ContextBudget.default().reserved_output_tokens}
         return self
 
     def invoke(self, messages, **kwargs):
@@ -271,8 +274,8 @@ def test_unknown_effect_recovery_does_not_replay(durable_db, monkeypatch):
 def test_correction_cannot_expand_scope(durable_db, monkeypatch):
     task_id, claimed = setup_job(durable_db)
     wire_model(monkeypatch, [
-        '{"decision":"action","capability_id":"list_tasks","arguments":{"bad":1}}',
-        '{"decision":"action","capability_id":"list_tasks"}',
+        '{"decision":"action","capability_id":"list_reminders","arguments":{"bad":1}}',
+        '{"decision":"action","capability_id":"list_reminders"}',
         '{"decision":"finish","report_status":"failed"}',
     ])
     assert handle_agent_task_run(claimed).outcome == HandlerOutcome.COMPLETED

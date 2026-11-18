@@ -29,6 +29,7 @@ export interface Attention {
   created_at: string;
   expires_at: string | null;
   allowed_actions: string[];
+  attempt_id?: string | null;
   question_id?: string | null;
   step_id?: string | null;
   approval_id?: string | null;
@@ -102,7 +103,7 @@ export interface WorkView {
     | "updated_at"
   > & {
     goal: string;
-    report: { summary: string } | null;
+    report: { summary: string; risks?: string[]; unresolved?: string[] } | null;
     last_error: string | null;
   };
   bucket: Bucket;
@@ -127,10 +128,18 @@ export interface WorkView {
     completed_at: string | null;
   }>;
   timeline: TimelineEvent[];
+  visibility_revision?: number;
+  history_cursor?: number | null;
+  metadata_cursors?: Partial<Record<WorkFileKind, string | null>>;
   last_sequence: number;
   artifacts: FileMetadata[];
   evidence: FileMetadata[];
   truncated: Record<string, boolean>;
+}
+export type WorkFileKind = "artifacts" | "evidence";
+export interface WorkFilePage {
+  items: FileMetadata[];
+  next_cursor: string | null;
 }
 export interface Inbox {
   items: WorkSummary[];

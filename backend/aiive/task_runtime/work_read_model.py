@@ -9,7 +9,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, TypeVar
+from typing import Any
 
 from sqlalchemy import func, tuple_
 from sqlalchemy.orm import Session
@@ -36,9 +36,6 @@ from aiive.task_runtime.goal_questions import (
 from aiive.task_runtime.read_repository import TaskReadRepository
 from aiive.task_runtime.repository import TERMINAL_TASK_STATES, canonical_json
 
-Metadata = TypeVar("Metadata", TaskArtifact, TaskEvidence)
-
-
 class WorkBucket(StrEnum):
     ATTENTION = "attention"
     ACTIVE = "active"
@@ -60,6 +57,7 @@ class WorkAttentionItem:
     question_id: str | None = None
     step_id: str | None = None
     approval_id: str | None = None
+    attempt_id: str | None = None
     preview: dict[str, Any] | None = None
 
 
@@ -80,6 +78,7 @@ def approval_preview(approval: ApprovalRequest) -> dict[str, Any]:
         "run_shell": ("command", "cwd"),
         "desktop_fs_delete": ("path", "recursive"),
         "desktop_fs_write": ("path",),
+        "install_mcp_sandbox": ("candidate_name", "version"),
     }
     for key in fields.get(tool, ()):
         if isinstance(args.get(key), (str, bool, int)):
@@ -95,6 +94,14 @@ def approval_preview(approval: ApprovalRequest) -> dict[str, Any]:
         result["content_size"] = (
             len(content.encode("utf-8")) if isinstance(content, str) else None
         )
+    if tool == "install_mcp_sandbox":
+        from aiive.mcp.discovery import get_candidate_by_name
+
+        candidate = get_candidate_by_name(str(args.get("candidate_name", "")))
+        result["source"] = candidate.source if candidate else "local_allowlist"
+        result["env_names"] = list(args.get("env_keys") or [])
+        result["launch_args"] = list(args.get("launch_args") or [])
+        result["lifecycle_scripts"] = "disabled"
     return result
 
 
@@ -134,9 +141,16 @@ TIMELINE_TITLES = {
     "task_cancelled": "任务已取消",
     "task_blocked_user": "等待用户回答",
     "task_watching": "等待事件",
+    "user_input_received": "收到用户补充信息",
+    "watch_triggered": "等待条件已满足",
+    "watch_failed": "等待条件不可用",
+    "user_input_received": "收到用户补充信息",
+    "watch_triggered": "等待条件已满足",
+    "watch_failed": "等待条件不可用",
     "run_started": "开始执行",
     "task_recovered": "任务已恢复",
     "task_reconciliation_required": "等待执行核对",
+    "action_reconciled_by_user": "用户已确认操作结果",
     "goal_step_continued": "步骤继续执行",
 }
 
@@ -161,6 +175,7 @@ TIMELINE_TITLES.update(
     }
 )
 ATTENTION_ACTIONS = {
+    "action_reconciliation": ("确认未知操作", ["completed", "not_executed"]),
     "action_approval": ("审批操作", ["approve", "deny"]),
     "task_question": ("任务等待回答", ["send_input"]),
     "goal_confirmation": ("确认目标计划", ["confirm", "modify", "reject"]),
@@ -378,6 +393,14 @@ class WorkReadModel:
         terminal = task.status in TERMINAL_TASK_STATES or (
             plan and plan.status in TERMINAL_GOAL_STATES
         )
+        for action in actions:
+            if action.status == "unknown" and not action.target_node_id:
+                preview = {"tool_name": action.capability_id, "action_id": action.id}
+                if action.capability_id == "run_shell":
+                    preview["command"] = str((action.arguments or {}).get("command") or "")[:1000]
+                add("action_reconciliation", action.id,
+                    "请核对外部操作是否已完成，或确认它从未执行。",
+                    preview=preview, attempt_id=action.execution_token or action.id)
         if not terminal and not (plan and plan.status == "paused"):
             if plan and plan.status == "proposed":
                 add("goal_confirmation", task.id, plan.summary)
@@ -613,6 +636,67 @@ class WorkReadModel:
         )
         return {"items": items, "next_sequence": cursor, "has_more": more}
 
+    def timeline_history(
+        self, task_id: str, before_sequence: int | None = None, limit: int = 50,
+    ) -> dict[str, Any]:
+        query = self.db.query(AgentTaskEvent).filter(
+            AgentTaskEvent.task_id == task_id,
+            AgentTaskEvent.visibility != "internal",
+            AgentTaskEvent.event_type.in_(TIMELINE_TITLES),
+        )
+        if before_sequence is not None:
+            query = query.filter(AgentTaskEvent.sequence < before_sequence)
+        rows = query.order_by(AgentTaskEvent.sequence.desc()).limit(HISTORY_SCAN_LIMIT + 1).all()
+        items = []
+        cursor = before_sequence
+        scanned = 0
+        for row in rows[:HISTORY_SCAN_LIMIT]:
+            cursor = row.sequence
+            scanned += 1
+            item = self.project_event(row)
+            if item is not None:
+                items.append(item)
+                if len(items) == limit:
+                    break
+        return {"items": list(reversed(items)), "next_sequence": cursor, "has_more": scanned < len(rows)}
+
+    def metadata_page(
+        self, task_id: str, kind: str, cursor: str | None = None, limit: int = METADATA_LIMIT,
+    ) -> dict[str, Any]:
+        model, owner, fields = {
+            "artifacts": (TaskArtifact, "task_artifact", ("name", "artifact_type")),
+            "evidence": (TaskEvidence, "task_evidence", ("kind",)),
+        }[kind]
+        query = self.db.query(model).filter(model.task_id == task_id)
+        if cursor:
+            try:
+                scope, table, created_at, row_id = json.loads(base64.b64decode(cursor, altchars=b"-_", validate=True))
+                if scope != task_id or table != kind or not isinstance(row_id, str) or not row_id:
+                    raise ValueError("invalid scope")
+                before = datetime.fromisoformat(created_at), row_id
+            except (ValueError, TypeError):
+                raise ValueError("invalid_work_cursor") from None
+            query = query.filter(tuple_(model.created_at, model.id) < before)
+        rows = query.order_by(model.created_at.desc(), model.id.desc()).limit(HISTORY_SCAN_LIMIT + 1).all()
+        items = []
+        last = None
+        scanned = 0
+        for row in rows[:HISTORY_SCAN_LIMIT]:
+            last = row
+            scanned += 1
+            if self.reader.visible_child(owner, row):
+                items.append({
+                    key: getattr(row, key)
+                    for key in ("id", "summary", "mime_type", "content_size", "content_hash", "created_at", *fields)
+                })
+                if len(items) == limit:
+                    break
+        more = scanned < len(rows)
+        token = None
+        if more and last is not None:
+            token = base64.urlsafe_b64encode(json.dumps([task_id, kind, last.created_at.isoformat(), last.id]).encode()).decode()
+        return {"items": items, "next_cursor": token, "has_more": more}
+
     def inbox(
         self, bucket: str = "attention", limit: int = 30, cursor: str | None = None
     ) -> dict[str, Any]:
@@ -691,6 +775,9 @@ class WorkReadModel:
         return {"items": items, "next_cursor": token, "has_more": more}
 
     def work_view(self, task: AgentTask) -> dict[str, Any]:
+        from aiive.forget.concurrency import forget_revision
+
+        visibility_revision = forget_revision(self.db)
         projection = self.project_many([task])[0]
         goal = None
         if (task.task_state or {}).get("goal"):
@@ -703,61 +790,16 @@ class WorkReadModel:
                         step["trigger"].pop("match", None)
             except ValueError:
                 pass
-        visible_events = (
-            self.db.query(AgentTaskEvent)
-            .filter_by(task_id=task.id)
-            .order_by(AgentTaskEvent.sequence.desc())
-            .limit(HISTORY_SCAN_LIMIT + 1)
-            .all()
-        )
-        projected_events = [
-            item
-            for e in visible_events[:HISTORY_SCAN_LIMIT]
-            if (item := self.project_event(e)) is not None
-        ]
-        timeline = projected_events[:50]
-        truncation: dict[str, bool] = {
-            "timeline": len(visible_events) > HISTORY_SCAN_LIMIT
-            or len(projected_events) > 50
+        history = self.timeline_history(task.id)
+        artifact_page = self.metadata_page(task.id, "artifacts")
+        evidence_page = self.metadata_page(task.id, "evidence")
+        artifacts = artifact_page["items"]
+        evidence = evidence_page["items"]
+        truncation = {
+            "timeline": history["has_more"],
+            "task_artifact": artifact_page["has_more"],
+            "task_evidence": evidence_page["has_more"],
         }
-
-        def metadata(model: type[Metadata], owner: str) -> list[dict[str, Any]]:
-            candidates = (
-                self.db.query(model)
-                .filter_by(task_id=task.id)
-                .order_by(model.created_at.desc(), model.id.desc())
-                .limit(HISTORY_SCAN_LIMIT + 1)
-                .all()
-            )
-            visible = self.reader.filter_children(
-                owner, candidates[:HISTORY_SCAN_LIMIT]
-            )
-            truncation[owner] = (
-                len(candidates) > HISTORY_SCAN_LIMIT or len(visible) > METADATA_LIMIT
-            )
-            fields = (
-                "id",
-                "summary",
-                "mime_type",
-                "content_size",
-                "content_hash",
-                "created_at",
-            )
-            return [
-                {
-                    key: getattr(row, key)
-                    for key in fields
-                    + (
-                        ("name", "artifact_type")
-                        if isinstance(row, TaskArtifact)
-                        else ("kind",)
-                    )
-                }
-                for row in visible[:METADATA_LIMIT]
-            ]
-
-        artifacts = metadata(TaskArtifact, "task_artifact")
-        evidence = metadata(TaskEvidence, "task_evidence")
         if goal is not None:
             visible_evidence_ids = {item["id"] for item in evidence}
             valid_question_steps = {
@@ -790,9 +832,9 @@ class WorkReadModel:
             {
                 "goal": task.goal[:2000],
                 "report": {
-                    "summary": report_summary[:2000]
-                    if isinstance(report_summary, str)
-                    else "执行结果已记录。"
+                    "summary": report_summary[:2000] if isinstance(report_summary, str) else "执行结果已记录。",
+                    "risks": (task.report or {}).get("risks", []),
+                    "unresolved": (task.report or {}).get("unresolved", []),
                 }
                 if task.report
                 else None,
@@ -811,7 +853,12 @@ class WorkReadModel:
             "goal": goal,
             "current_activity": projection["current_activity"],
             "target_device": projection["target_device"],
-            "timeline": list(reversed(timeline)),
+            "timeline": history["items"],
+            "visibility_revision": visibility_revision,
+            "history_cursor": history["next_sequence"] if history["has_more"] else None,
+            "metadata_cursors": {
+                "artifacts": artifact_page["next_cursor"], "evidence": evidence_page["next_cursor"],
+            },
             "artifacts": artifacts,
             "evidence": evidence,
             "truncated": truncation,

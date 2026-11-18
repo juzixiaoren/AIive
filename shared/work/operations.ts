@@ -19,8 +19,11 @@ export const actionLabels: Record<string, string> = {
   start_step: "开始此步骤",
   approve_step: "授权此步骤",
   end: "结束目标",
+  completed: "确认已完成",
+  not_executed: "确认未执行",
 };
 export const attentionHelp: Record<string, string> = {
+  action_reconciliation: "只有确认操作从未执行，尚未结束的任务才会重新派发该操作。暂时无法确认时可保持等待。",
   action_approval:
     "这是一次具体操作的审批。拒绝会使当前工作失败；批准的仅是服务端保存的操作。",
   goal_step_approval: "授权这个 Goal 步骤；具体高风险操作仍可能单独请求审批。",
@@ -103,6 +106,11 @@ export function performAttention(
 ): Promise<unknown> {
   if (!item.allowed_actions.includes(action))
     throw new Error("操作已不可用，请刷新。");
+  if (item.kind === "action_reconciliation" && (action === "completed" || action === "not_executed")) {
+    if (!text.trim()) throw new Error("请填写核对依据。");
+    if (!item.attempt_id) throw new Error("执行记录已变化，请刷新。");
+    return api.resolveAction(task, item.resource_id, action, text.trim(), item.attempt_id);
+  }
   if (
     item.kind === "action_approval" &&
     item.approval_id &&

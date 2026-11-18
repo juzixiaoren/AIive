@@ -8,21 +8,21 @@ from typing import Any
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from aiive.control.scope import TaskScope, path_within
+from aiive.control.scope import TaskScope
 from aiive.db.models import AgentTask, AgentTaskWatch, DesktopNode, ThreadDesktopBinding
 from aiive.task_runtime.repository import TaskRepository, utcnow
 from aiive.task_runtime.schemas import TaskStatus
+from aiive.task_runtime.watch_contract import WATCH_PROPOSAL, FileWatch, NodeWatch, TimeWatch, parse_instant
 
 
-SUPPORTED_WATCHES = frozenset({"time", "file", "node"})
+SUPPORTED_WATCHES = frozenset({"time", "file", "node", "promotion"})
 
 
 def _parse_time(value: Any) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        return parse_instant(value, legacy=True)
     except ValueError:
         return None
 
@@ -33,31 +33,51 @@ class WatcherService:
         self.repo: TaskRepository = TaskRepository(db)
 
     def create_from_proposal(self, task: AgentTask, proposal: dict[str, Any]) -> AgentTaskWatch:
-        watch_type = str(proposal.get("watch_type") or "")
-        if watch_type not in SUPPORTED_WATCHES:
-            raise ValueError("unsupported_watch_type")
-        config = dict(proposal.get("config") or {})
-        if watch_type == "file":
-            path = str(config.get("path") or "")
-            scope = TaskScope.from_brief(task.task_brief or {})
-            if not path or not any(path_within(path, root) for root in scope.allowed_roots):
-                raise ValueError("watch_path_outside_task_scope")
-        if watch_type == "node" and not config.get("node_id"):
-            config["node_id"] = task.target_node_id
-        if watch_type == "node" and not config.get("node_id"):
-            raise ValueError("node_watch_requires_node_id")
-        next_check = _parse_time(proposal.get("next_check_at")) or utcnow()
+        parsed = WATCH_PROPOSAL.validate_python(proposal, strict=True)
+        config = parsed.config.model_dump(exclude_none=True)
+        next_check = _parse_time(parsed.next_check_at) or utcnow()
+        if isinstance(parsed, TimeWatch):
+            next_check = parse_instant(parsed.config.at)
+        if isinstance(parsed, FileWatch):
+            config["path"] = str(self._local_path(task, parsed.config.path))
+        if isinstance(parsed, NodeWatch):
+            node_id = parsed.config.node_id or task.target_node_id
+            if not node_id:
+                raise ValueError("node_watch_requires_node_id")
+            if self.db.get(DesktopNode, node_id) is None:
+                raise ValueError("node_watch_unknown_node")
+            config["node_id"] = node_id
         watch = AgentTaskWatch(
             task_id=task.id,
-            watch_type=watch_type,
+            watch_type=parsed.watch_type,
             config=config,
-            cursor=self._snapshot(watch_type, config),
+            cursor=self._snapshot(parsed.watch_type, config),
             status="active",
             next_check_at=next_check,
         )
         self.db.add(watch)
         self.db.flush()
         return watch
+
+    def wait_for_promotion(self, task: AgentTask, request_id: str, deadline: datetime) -> None:
+        self.db.add(AgentTaskWatch(
+            task_id=task.id, watch_type="promotion", status="active",
+            config={"request_id": request_id, "deadline": deadline.isoformat()},
+            cursor={}, next_check_at=utcnow() + timedelta(seconds=15),
+        ))
+
+    @staticmethod
+    def _local_path(task: AgentTask, value: str) -> Path:
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            raise ValueError("watch_path_requires_absolute_backend_path")
+        scope = TaskScope.from_brief(task.task_brief or {})
+        path = path.resolve()
+        for root in map(Path, scope.allowed_roots):
+            root = root.expanduser()
+            if root.is_absolute() and path.is_relative_to(root.resolve()):
+                return path
+        raise ValueError("watch_path_outside_task_scope")
 
     def poll_due(self, *, now: datetime | None = None, limit: int = 100) -> int:
         now = now or utcnow()
@@ -68,7 +88,28 @@ class WatcherService:
         triggered = 0
         for watch in watches:
             watch.last_checked_at = now
-            current = self._snapshot(watch.watch_type, watch.config or {})
+            config = watch.config or {}
+            try:
+                interval = int(config.get("interval_seconds", 30))
+                if not 5 <= interval <= 3600:
+                    raise ValueError("watch_invalid_interval")
+                if watch.watch_type == "time" and _parse_time(config.get("at")) is None:
+                    raise ValueError("watch_invalid_at")
+                if watch.watch_type == "file":
+                    if config.get("condition", "changed") not in {"changed", "exists", "missing"}:
+                        raise ValueError("watch_invalid_file_condition")
+                    owner = self.repo.get_task(watch.task_id)
+                    if owner is None:
+                        raise ValueError("watch_task_not_found")
+                    config = {**config, "path": str(self._local_path(owner, str(config.get("path") or "")))}
+                if watch.watch_type == "node" and config.get("status", "online") not in {"online", "offline"}:
+                    raise ValueError("watch_invalid_node_status")
+                current = self._snapshot(watch.watch_type, config)
+                if watch.watch_type not in SUPPORTED_WATCHES or current.get("status") == "missing":
+                    raise ValueError("watch_target_unavailable")
+            except (ValueError, TypeError, OSError, RuntimeError) as error:
+                self._fail(watch, str(error))
+                continue
             if self._triggered(watch, current, now):
                 watch.status = "completed"
                 watch.cursor = current
@@ -96,9 +137,22 @@ class WatcherService:
                 triggered += 1
             else:
                 watch.cursor = current
-                watch.next_check_at = now + timedelta(seconds=max(5, int((watch.config or {}).get("interval_seconds", 30))))
+                watch.next_check_at = now + timedelta(seconds=interval)
         self.db.flush()
         return triggered
+
+    def _fail(self, watch: AgentTaskWatch, reason: str) -> None:
+        watch.status = "completed"
+        watch.cursor = {"error": reason[:240]}
+        task = self.repo.get_task(watch.task_id, for_update=True)
+        if task is None or task.status not in {TaskStatus.BLOCKED_USER.value, TaskStatus.BLOCKED_NODE.value}:
+            return
+        self.repo.append_event(task.id, "watch_failed", {
+            "watch_id": watch.id, "watch_type": watch.watch_type, "reason": reason[:240],
+        }, visibility="conversation")
+        self.repo.transition_task(task, TaskStatus.QUEUED.value)
+        self.repo.enqueue_run(task, trigger="watch_failed")
+        self.repo.checkpoint(task.id, reason="watch_failed")
 
     def wake_node_tasks(self, node_id: str) -> int:
         """NodeOnline 事件直接恢复显式/绑定任务；无需等待 LLM 或轮询。"""
@@ -137,18 +191,22 @@ class WatcherService:
             try:
                 stat = path.stat()
                 return {"exists": True, "mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
-            except OSError:
+            except (FileNotFoundError, NotADirectoryError):
                 return {"exists": False}
         if watch_type == "node":
             node = self.db.get(DesktopNode, config.get("node_id"))
             lease = node.lease_expires_at if node else None
             if lease is not None and lease.tzinfo is None:
                 lease = lease.replace(tzinfo=timezone.utc)
-            status = node.status if node and lease is not None and lease > utcnow() else "offline"
+            status = "online" if node and node.status == "online" and lease is not None and lease > utcnow() else "offline"
             return {
                 "status": status if node else "missing",
                 "lease_expires_at": node.lease_expires_at.isoformat() if node and node.lease_expires_at else None,
             }
+        if watch_type == "promotion":
+            from aiive.supervisor.promotion_status import promotion_status
+
+            return {"status": promotion_status(str(config.get("request_id") or ""))}
         return {}
 
     @staticmethod
@@ -168,4 +226,7 @@ class WatcherService:
         if watch.watch_type == "node":
             expected = str(config.get("status") or "online")
             return current.get("status") == expected
+        if watch.watch_type == "promotion":
+            deadline = _parse_time(config.get("deadline"))
+            return current.get("status") not in {"requested", "observing"} or deadline is None or now >= deadline
         return False

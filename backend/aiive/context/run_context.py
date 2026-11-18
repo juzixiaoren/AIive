@@ -23,6 +23,12 @@ RUN_CTX_TRUSTED_APPROVAL = "trusted_approval"  # 已服务端审批的可信工�
 RUN_CTX_MANUAL_MEMORY_API = "manual_memory_api"  # 手动记忆写入 API 触发
 
 
+def require_ctx(ctx: "RunContext | None", tool_name: str) -> "RunContext":
+    if ctx is None:
+        raise RuntimeError(f"工具 {tool_name} 需要运行上下文")
+    return ctx
+
+
 @dataclass
 class RunContext:
     """单次 Agent 调用轮次的运行时上下文。
@@ -53,6 +59,7 @@ class RunContext:
     execution_mode: str = "system_best_effort"  # "user_required" | "system_best_effort"
     source_event_ids: list[str] = field(default_factory=list)  # 真实 Event.id
     memory_tool_calls: int = 0  # Kernel-enforced per-turn Agent-Initiated Recall budget
+    memory_recall_tokens: int = 0
     project_id: str | None = None
     workspace_id: str | None = None
     capability_ids: list[str] = field(default_factory=list)
@@ -61,6 +68,7 @@ class RunContext:
     task_id: str = ""
     agent_run_id: str = ""
     action_id: str = ""
+    user_timezone: str | None = None
 
     @property
     def is_valid(self) -> bool:

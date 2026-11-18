@@ -154,7 +154,7 @@ class MemoryVectorProjectionService:
                 MemoryRecord.scope_type == scope_type,
                 MemoryRecord.scope_id == scope_id if scope_id is not None else MemoryRecord.scope_id.is_(None),
             ))
-        rows = (
+        candidates = (
             self._db.query(MemoryRecord, distance.label("distance"))
             .join(MemoryVectorProjection, MemoryVectorProjection.memory_id == MemoryRecord.id)
             .filter(
@@ -164,10 +164,10 @@ class MemoryVectorProjectionService:
                 MemoryVectorProjection.embedding_model == embedding_model_identity(),
                 or_(*scope_conditions),
             )
-            .order_by(distance.asc())
-            .limit(limit)
-            .all()
         )
+        if request.memory_types:
+            candidates = candidates.filter(MemoryRecord.memory_type.in_(request.memory_types))
+        rows = candidates.order_by(distance.asc()).limit(limit).all()
         allowed_ids = set(ForgetVisibilityService.filter_memory_ids(
             self._db, [record.id for record, _ in rows],
         ))

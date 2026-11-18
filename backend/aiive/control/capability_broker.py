@@ -10,7 +10,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from aiive.context.run_context import RunContext
-from aiive.control.scope import TaskScope, action_resource_keys
+from aiive.control.scope import TASK_READ_CAPABILITIES, TaskScope, action_resource_keys
 from aiive.control.task_policy import ActionPolicyDecision, TaskPolicyEngine
 from aiive.db.models import AgentAction, AgentRun, AgentTask, TaskEvidence
 from aiive.desktop.registry_overlay import build_registry_for_thread
@@ -46,7 +46,7 @@ class CapabilityBroker:
         registry = build_registry_for_thread(self.db, task.thread_id, task.target_node_id)
         if scope.capability_policy == "unified":
             return registry
-        return registry.scoped(scope.allowed_capabilities)
+        return registry.scoped(scope.allowed_capabilities | TASK_READ_CAPABILITIES)
 
     def available_registry(self, task: AgentTask) -> ToolRegistry:
         """发现视图：内置 + 在线桌面 + MCP 的完整可用能力，不按任务收窄。
@@ -149,8 +149,12 @@ class CapabilityBroker:
         """
         issues: list[str] = []
         pre = action.preconditions or {}
-        path_value = action.arguments.get("path") or action.arguments.get("source")
-        if not isinstance(path_value, str) or action.target_node_id:
+        if set(pre) - {"exists", "sha256", "size", "mtime_ns", "file_id"}:
+            return ["precondition_unsupported_field"]
+        path_value = action.arguments.get("path") or action.arguments.get("source") or action.arguments.get("file_path")
+        if not isinstance(path_value, str):
+            return ["precondition_path_required"] if pre else []
+        if action.target_node_id:
             return issues
         path = Path(path_value).expanduser()
         if pre.get("exists") is True and not path.exists():
@@ -158,10 +162,14 @@ class CapabilityBroker:
         if pre.get("exists") is False and path.exists():
             issues.append("precondition_path_already_exists")
         expected = pre.get("sha256") or action.arguments.get("expected_sha256")
-        if expected and path.is_file():
+        if expected and not path.is_file():
+            issues.append("precondition_sha256_requires_file")
+        elif expected:
             actual = hashlib.sha256(path.read_bytes()).hexdigest()
             if actual.casefold() != str(expected).casefold():
                 issues.append("precondition_sha256_changed")
+        if not path.exists() and any(pre.get(key) is not None for key in ("size", "mtime_ns", "file_id")):
+            issues.append("precondition_metadata_requires_path")
         if path.exists():
             stat = path.stat()
             expected_size = pre.get("size")
@@ -240,7 +248,8 @@ class CapabilityBroker:
             result = ToolExecutor(registry).execute(
                 action.capability_id, action.arguments or {}, "task_runtime",
                 RunContext(thread_id=task.thread_id, trace_id=task.id, source="task_runtime",
-                           task_id=task.id, agent_run_id=run.id, action_id=action.id),
+                           task_id=task.id, agent_run_id=run.id, action_id=action.id,
+                           user_timezone=(task.task_brief.get("initial_input") or {}).get("user_timezone")),
                 expected_descriptor_hash=action.descriptor_hash, channel="task_action",
                 authorization={
                     "node_id": registration.executor_node_id, "task_id": task.id, "run_id": run.id,

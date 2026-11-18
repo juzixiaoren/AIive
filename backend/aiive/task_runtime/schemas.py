@@ -2,9 +2,29 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any, ClassVar, Literal
+from typing import Annotated, Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+ReportNote = Annotated[str, Field(min_length=1, max_length=500)]
+
+
+class FilePreconditions(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    exists: bool | None = Field(default=None, description="Expected existence of the path or source.")
+    sha256: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{64}$")
+    size: int | None = Field(default=None, ge=0)
+    mtime_ns: int | Annotated[str, Field(pattern=r"^-?[0-9]{1,20}$")] | None = Field(
+        default=None, description="Expected nanosecond timestamp. Use a decimal string to preserve all digits on Desktop.",
+    )
+    file_id: str | None = Field(default=None, min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def consistent(self) -> "FilePreconditions":
+        if self.exists is False and any(value is not None for value in (self.sha256, self.size, self.mtime_ns, self.file_id)):
+            raise ValueError("a missing file has no version metadata")
+        return self
 
 
 class TaskStatus(StrEnum):
@@ -54,7 +74,10 @@ class TaskBudget(BaseModel):
     max_tool_failures: int = Field(default=10, ge=1, le=1000)
     max_total_tokens: int = Field(default=200_000, ge=1000)
     max_wall_time_seconds: int | None = Field(default=None, ge=1, le=31_536_000)
-    max_cost_usd: float | None = Field(default=None, ge=0.01, le=1_000_000)
+    max_cost_usd: float | None = Field(
+        default=None, ge=0.01, le=1_000_000,
+        description="Worker decision model budget. Requires the operator to configure model token rates.",
+    )
     deadline_at: str | None = None
 
 
@@ -97,6 +120,8 @@ class ActionProposal(BaseModel):
     # search_capabilities 的检索关键词；发现类决策只读，不产生 Action。
     query: str = ""
     report_status: Literal["succeeded", "partial", "failed"] = "succeeded"
+    risks: list[ReportNote] = Field(default_factory=list, max_length=16)
+    unresolved: list[ReportNote] = Field(default_factory=list, max_length=16)
     question: str = ""
     watch: dict[str, Any] = Field(default_factory=dict)
 
@@ -104,6 +129,10 @@ class ActionProposal(BaseModel):
     def validate_decision_payload(self) -> "ActionProposal":
         if self.decision == "action" and not self.capability_id:
             raise ValueError("action decision requires capability_id")
+        if self.preconditions:
+            if not (self.arguments.get("path") or self.arguments.get("source") or self.arguments.get("file_path")):
+                raise ValueError("file preconditions require a file path or source")
+            self.preconditions = FilePreconditions.model_validate(self.preconditions, strict=True).model_dump(exclude_none=True)
         if self.decision == "ask_user" and not self.question.strip():
             raise ValueError("ask_user decision requires question")
         if self.decision == "watch" and not self.watch:

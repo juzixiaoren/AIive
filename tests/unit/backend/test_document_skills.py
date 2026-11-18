@@ -113,7 +113,7 @@ def test_knowledge_roots_use_settings_and_reject_sibling_paths(
         raise AssertionError("sibling path must not pass the knowledge root boundary")
 
 
-def test_delegate_task_applies_skill_profile_and_worker_instructions(db_session) -> None:
+def test_delegate_task_uses_unified_discovery_and_worker_instructions(db_session) -> None:
     thread = Thread(title="skill delegation")
     db_session.add(thread)
     db_session.commit()
@@ -131,7 +131,8 @@ def test_delegate_task_applies_skill_profile_and_worker_instructions(db_session)
     assert task is not None
     scope = task.task_brief["scope"]
     assert scope["allow_network"] is True
-    assert {"web_search", "fetch_web_page"}.issubset(scope["allowed_capabilities"])
+    assert scope["allowed_capabilities"] == []
+    assert scope["capability_policy"] == "unified"
     messages, snapshot, _refs = TaskContextAssembler(db_session).messages(
         task, [{"capability_id": "web_search"}],
     )

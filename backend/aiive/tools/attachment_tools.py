@@ -286,7 +286,15 @@ class ReadAttachmentTool(BaseTool):
                 or not references_visible(db, {"event": [source_id]})
             ):
                 raise ValueError("attachment_source_changed")
+            if run.task_id:
+                task = db.query(AgentTask).filter_by(id=run.task_id).with_for_update().one()
+                state = dict(task.task_state or {})
+                completed_images = dict(state.get("attachment_image_receipts") or {})
+                completed_images[row.id] = {"sha256": row.sha256, "model": model}
+                task.task_state = {**state, "attachment_image_receipts": completed_images}
         result.update(analysis=analysis, model=model)
+        if run.task_id:
+            result["image_processing_complete"] = True
         return result
 
 

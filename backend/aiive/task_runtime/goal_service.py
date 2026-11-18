@@ -95,14 +95,16 @@ class GoalService:
     def attach_plan(self, task: AgentTask, raw_plan: dict[str, Any]) -> GoalPlan:
         """把计划挂到新建任务上，并让任务停在“等待用户确认”。"""
         now = utcnow()
-        plan = GoalPlan.model_validate({
+        from aiive.task_runtime.goal_plan import normalize_plan_times
+
+        plan = GoalPlan.model_validate(normalize_plan_times({
             **raw_plan,
             "status": GoalStatus.PROPOSED,
             "created_at": _iso(now),
             "confirmed_at": None,
             "current_step_id": None,
             "revision": 1,
-        })
+        }))
         for step in plan.steps:
             step.status = GoalStepStatus.PENDING
             # 规则从提案时刻开始生效：避免确认后到首次扫描之间的事件被漏掉。
@@ -271,7 +273,9 @@ class GoalService:
         for key in ("summary", "deadline", "timezone", "acceptance", "steps"):
             if key in changes and changes[key] is not None:
                 payload[key] = changes[key]
-        candidate = GoalPlan.model_validate(payload)
+        from aiive.task_runtime.goal_plan import normalize_plan_times
+
+        candidate = GoalPlan.model_validate(normalize_plan_times(payload, plan.model_dump(mode="json")))
         now = utcnow()
 
         invalidated: dict[str, str] = {}

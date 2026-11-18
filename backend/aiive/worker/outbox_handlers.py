@@ -476,320 +476,56 @@ def handle_memory_extraction(claimed: ClaimedJob) -> HandlerResult:
 # ============================================================================
 
 
-def _remind_alert_succeeded(db: Session, turn_id: str, expected_reminder_id: str) -> bool:
-    """校验当前提醒 Turn 是否真实成功调用了 remind_alert 且目标 ID 匹配。
-
-    只有 LLM 实际执行该工具（tool_call 与 completed 的 tool_result 成对出现、
-    且参数中的 reminder_id 与本次到期事件一致）才视为已警报，禁止伪造卡片或状态。
-    """
-    calls: dict[str, tuple[str, dict[str, Any]]] = {}
-    results: dict[str, str] = {}
-    events = db.query(Event).filter(
-        Event.turn_id == turn_id,
-        Event.event_type.in_(["tool_call", "tool_result"]),
-    ).all()
-    for event in events:
-        payload = event.payload or {}
-        tool_call_id = str(payload.get("tool_call_id", "") or "")
-        if event.event_type == "tool_call":
-            calls[tool_call_id] = (str(payload.get("name", "")), payload.get("params") or {})
-        else:
-            results[tool_call_id] = str(payload.get("status", ""))
-    for tool_call_id, (name, params) in calls.items():
-        if name != "remind_alert":
-            continue
-        if str(params.get("reminder_id", "")) != str(expected_reminder_id):
-            continue
-        if results.get(tool_call_id) == "completed":
-            return True
-    return False
-
-
 @with_execution_authorization
 def handle_reminder_delivery(claimed: ClaimedJob) -> HandlerResult:
-    """投递到期提醒：使用确定性 Turn 唤醒 Agent，成功后完成 Task。"""
-    import uuid as _uuid
+    """Activate the durable reminder notification without asking a model to mutate state."""
+    from aiive.task_runtime.repository import queue_notification_refresh
 
-    auth_sessions = authorized_session_factory(SessionLocal)
-    fresh_claimed, guard = guard_job_sources_visible(claimed, auth_sessions)
+    fresh, guard = guard_job_sources_visible(claimed, authorized_session_factory(SessionLocal))
     if guard is not None:
         return guard
-    assert fresh_claimed is not None
-    claimed = fresh_claimed
-    payload = claimed.payload
-    if is_redacted_payload(payload):
-        return HandlerResult(HandlerOutcome.COMPLETED, "forget_content_redacted")
-    task_id = str(payload.get("task_id", ""))
-    thread_id = str(payload.get("thread_id", ""))
-    title = str(payload.get("title", ""))
-    content = str(payload.get("content", "")) or title
-    from aiive.runtime.reminder_outbox import reminder_operation_id
-    operation_id = str(payload.get("operation_id", "")) or reminder_operation_id(task_id)
-    if not task_id or not thread_id or not title:
-        return HandlerResult(
-            HandlerOutcome.NON_RETRYABLE,
-            "提醒投递参数不完整",
-            terminal_reason="invalid_reminder_payload",
-        )
-
-    db_a = SessionLocal()
+    assert fresh is not None
+    task_id = str(fresh.payload.get("task_id") or "")
+    if not task_id:
+        return HandlerResult(HandlerOutcome.NON_RETRYABLE, terminal_reason="invalid_reminder_payload")
+    db = SessionLocal()
     try:
-        # Match cancel/enqueue lock order: Task -> Outbox -> Event.
-        task = db_a.query(Task).filter(Task.id == task_id).populate_existing().with_for_update().first()
-        outbox = db_a.query(OutboxJob).filter(OutboxJob.id == claimed.id).populate_existing().with_for_update().first()
-        if outbox is None or not _claim_matches(outbox, claimed, datetime.now(timezone.utc)):
-            return HandlerResult(HandlerOutcome.CLAIM_LOST, "提醒投递 claim 已失效")
+        task = db.query(Task).filter_by(id=task_id).populate_existing().with_for_update().first()
+        outbox = db.query(OutboxJob).filter_by(id=fresh.id).populate_existing().with_for_update().first()
+        if outbox is None or not _claim_matches(outbox, fresh, datetime.now(timezone.utc)):
+            return HandlerResult(HandlerOutcome.CLAIM_LOST, "reminder_claim_lost")
         if task is None:
-            return HandlerResult(
-                HandlerOutcome.NON_RETRYABLE,
-                "提醒任务不存在",
-                terminal_reason="reminder_task_not_found",
-            )
-        if task.status == "completed":
-            return HandlerResult(HandlerOutcome.COMPLETED, "提醒已由其他执行完成")
-        if task.status == "cancelled":
-            return HandlerResult(HandlerOutcome.COMPLETED, "提醒已取消")
-        if task.status != "dispatching":
-            return HandlerResult(
-                HandlerOutcome.NON_RETRYABLE,
-                f"提醒任务状态无效: {task.status}",
-                terminal_reason="invalid_reminder_task_status",
-            )
-        reminder_event = db_a.query(Event).filter(
-            Event.event_type == "reminder_created",
-            Event.trace_id == task_id,
-        ).order_by(Event.created_at.desc()).first()
-        if reminder_event is None:
-            return HandlerResult(
-                HandlerOutcome.NON_RETRYABLE,
-                "提醒缺少关联的 reminder_created 事件",
-                terminal_reason="reminder_event_not_found",
-            )
-        reminder_id = reminder_event.id
-        db_a.commit()
-    finally:
-        db_a.close()
-
-    turn_id = str(_uuid.uuid5(_uuid.NAMESPACE_URL, operation_id))
-    message = get_prompt_registry().render(
-        "runtime.reminder_delivery",
-        reminder_id=reminder_id,
-        title=title,
-        content=content,
-    ).content
-    try:
-        from aiive.core.llm_client import default_llm_client
-        from aiive.runtime.turn_execution import TurnConflictError, TurnExecutionService
-    except Exception as exc:
-        logger.exception("提醒 Agent 运行时加载异常: task_id=%s", task_id)
-        return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, f"提醒 Agent 运行时加载异常: {exc}")
-
-    try:
-        result = TurnExecutionService(
-            default_llm_client(), message_source="runtime_event",
-        ).execute_turn(message=message, thread_id=thread_id, turn_id=turn_id)
-    except TurnConflictError as exc:
-        # turn_id 由 operation_id 确定性生成：Turn 已 completed 时重跑只会命中
-        # 缓存（turn_cached）。不重跑 Turn，直接进入下方校验阶段读缓存 Turn 的
-        # 事件流校验 _remind_alert_succeeded，由其决定完成或降级。
-        if str(exc) == "turn_cached":
-            result = {}
+            return HandlerResult(HandlerOutcome.NON_RETRYABLE, terminal_reason="reminder_task_not_found")
+        if task.status in {"cancelled", "completed"}:
+            return HandlerResult(HandlerOutcome.COMPLETED, f"reminder_{task.status}")
+        if task.task_type != "reminder" or task.status != "dispatching":
+            return HandlerResult(HandlerOutcome.NON_RETRYABLE, terminal_reason="invalid_reminder_task_status")
+        reminder = db.query(Event).filter_by(
+            event_type="reminder_created", trace_id=task_id,
+        ).order_by(Event.created_at.desc()).populate_existing().with_for_update().first()
+        if reminder is None:
+            # Some older tasks were created through /tasks without an inbox event.
+            reminder = Event(event_type="reminder_created", trace_id=task_id, thread_id=task.thread_id,
+                             payload={"task_id": task_id, "title": task.title, "content": task.title,
+                                      "scheduled_at": fresh.payload.get("scheduled_at")})
+            db.add(reminder)
+        payload = dict(reminder.payload or {})
+        status = payload.get("status", "pending")
+        if payload.get("dismissed") or status == "cancelled":
+            task.status = "cancelled"
         else:
-            logger.exception("提醒 Agent Turn 冲突: task_id=%s", task_id)
-            return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, f"提醒 Agent Turn 冲突: {exc}")
-    except Exception as exc:
-        logger.exception("提醒 Agent 执行异常: task_id=%s", task_id)
-        return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, f"提醒 Agent 执行异常: {exc}")
-
-    turn_error = str(result.get("error") or "")
-    if turn_error == "turn_in_progress":
-        return HandlerResult(HandlerOutcome.RETRY_LATER, "提醒 Turn 正在执行")
-    if turn_error == "turn_cached_no_payload":
-        # Turn 已 completed 但缓存无 payload：重试不可能改变结果，
-        # 继续进入校验/降级路径（event_id 由下方 DB 回查兜底）。
-        result = {}
-    elif turn_error:
-        return HandlerResult(
-            HandlerOutcome.RETRYABLE_ERROR,
-            f"提醒 Agent 执行失败: {turn_error}",
-        )
-    event_id = str(result.get("event_id", "") or "")
-    if not event_id:
-        db_event = SessionLocal()
-        try:
-            assistant_event = db_event.query(Event).filter(
-                Event.thread_id == thread_id,
-                Event.turn_id == turn_id,
-                Event.event_type == "llm_response",
-            ).order_by(Event.turn_event_index.desc(), Event.id.desc()).first()
-            event_id = str(assistant_event.id) if assistant_event is not None else ""
-        finally:
-            db_event.close()
-    if not event_id:
-        # Turn 已 completed（确定性 turn_id），缺 llm_response 同样不会因重试改变；
-        # 继续进入校验阶段，由 remind_alert 校验决定完成或降级，不再空转重试。
-        logger.warning(
-            "提醒 Turn 缺少可验证的 llm_response event_id，进入校验/降级路径: task_id=%s",
-            task_id,
-        )
-
-    degraded = False
-    db_c = SessionLocal()
-    try:
-        # Match cancel/enqueue lock order: Task -> Outbox -> Event.
-        task = db_c.query(Task).filter(Task.id == task_id).populate_existing().with_for_update().first()
-        outbox = db_c.query(OutboxJob).filter(OutboxJob.id == claimed.id).populate_existing().with_for_update().first()
-        if outbox is None or not _claim_matches(outbox, claimed, datetime.now(timezone.utc)):
-            db_c.rollback()
-            return HandlerResult(HandlerOutcome.CLAIM_LOST, "提醒完成阶段 claim 已失效")
-        if task is None:
-            db_c.rollback()
-            return HandlerResult(
-                HandlerOutcome.NON_RETRYABLE,
-                "提醒任务不存在",
-                terminal_reason="reminder_task_not_found",
-            )
-        if task.status == "cancelled":
-            db_c.commit()
-            return HandlerResult(HandlerOutcome.COMPLETED, "提醒投递期间已取消")
-        if task.status == "dispatching":
-            # Lock the exact event passed to the Turn, and re-read after any
-            # concurrent confirm/snooze/dismiss. Terminal events must never be
-            # reactivated, including through the fallback notification path.
-            reminder_event = db_c.query(Event).filter(
-                Event.id == reminder_id,
-                Event.event_type == "reminder_created",
-            ).populate_existing().with_for_update().first()
-            if reminder_event is not None:
-                reminder_payload = dict(reminder_event.payload or {})
-                reminder_status = str(reminder_payload.get("status", ""))
-                if reminder_payload.get("dismissed") or reminder_status not in {"pending", "alerting"}:
-                    task.status = (
-                        "cancelled" if reminder_payload.get("dismissed") or reminder_status == "cancelled"
-                        else "completed"
-                    )
-                    db_c.commit()
-                    return HandlerResult(HandlerOutcome.COMPLETED, "提醒事件已处理，保留其当前状态")
-            alert_verified = _remind_alert_succeeded(db_c, turn_id, reminder_id)
-            if not alert_verified:
-                # 「LLM 未调用 remind_alert」对确定性 turn_id 是重试不可改变的
-                # 终态（重跑只会命中 turn 缓存）。不再空转重试直至 deadletter
-                # （用户全程无感知），降级为兜底通知：写 notification_created
-                # 事件（含 task 信息）并完成任务，保证用户可感知提醒已到期。
-                degraded = True
-                db_c.add(Event(
-                    trace_id=claimed.trace_id or task_id,
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    event_type="notification_created",
-                    payload={
-                        "task_id": task_id,
-                        "task_type": task.task_type,
-                        "title": title,
-                        "content": content,
-                        "message": content,
-                        "status": "alerting",
-                        "degraded": True,
-                        "degraded_reason": "remind_alert_not_invoked",
-                    },
-                ))
-            if reminder_event is None:
-                reminder_event = Event(
-                    trace_id=task_id,
-                    thread_id=thread_id,
-                    event_type="reminder_created",
-                    payload={
-                        "task_id": task_id,
-                        "title": title,
-                        "content": content,
-                        "status": "alerting",
-                    },
-                )
-                db_c.add(reminder_event)
-            else:
-                reminder_payload = dict(reminder_event.payload or {})
-                reminder_payload["status"] = "alerting"
-                reminder_event.payload = reminder_payload
-            if alert_verified:
-                db_c.add(Event(
-                    trace_id=claimed.trace_id or task_id,
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    event_type="reminder_triggered",
-                    payload={
-                        "task_id": task_id,
-                        "task_type": task.task_type,
-                        "title": title,
-                        "turn_id": turn_id,
-                    },
-                ))
             task.status = "completed"
-        elif task.status != "completed":
-            db_c.rollback()
-            return HandlerResult(HandlerOutcome.CLAIM_LOST, f"提醒状态已变化: {task.status}")
-        db_c.commit()
-    except Exception as exc:
-        db_c.rollback()
-        logger.exception("提醒完成状态持久化失败: task_id=%s", task_id)
-        return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, f"提醒完成状态持久化失败: {exc}")
+            if status in {"pending", "alerting"}:
+                reminder.payload = {**payload, "status": "alerting", "alerted_at": datetime.now(timezone.utc).isoformat()}
+                queue_notification_refresh(db)
+        db.commit()
+        return HandlerResult(HandlerOutcome.COMPLETED, "reminder_delivery_recorded")
+    except Exception as error:
+        db.rollback()
+        logger.exception("Reminder delivery failed: task_id=%s", task_id)
+        return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, reason=str(error))
     finally:
-        db_c.close()
-
-    try:
-        from aiive.api.routes_notifications import broadcast_pending_count
-
-        db_notification = SessionLocal()
-        try:
-            broadcast_pending_count(db_notification)
-        finally:
-            db_notification.close()
-    except Exception:
-        logger.exception("提醒通知状态推送失败: task_id=%s", task_id)
-
-    if degraded:
-        # 降级路径：无有效 Agent 回复可推送，改为向来源线程广播兜底通知，
-        # 前端据此提示提醒已到期。返回 COMPLETED（降级成功），不再重试。
-        try:
-            from aiive.api.ws_manager import ws_manager
-
-            ws_manager.broadcast_to_thread_sync(
-                thread_id,
-                "reminder_fallback_notification",
-                {
-                    "task_id": task_id,
-                    "title": title,
-                    "content": content,
-                    "thread_id": thread_id,
-                    "degraded_reason": "remind_alert_not_invoked",
-                },
-            )
-        except Exception:
-            logger.exception("提醒降级通知 WebSocket 推送失败: task_id=%s", task_id)
-        return HandlerResult(
-            HandlerOutcome.COMPLETED,
-            "提醒 Turn 未调用 remind_alert，已降级为兜底通知",
-        )
-
-    try:
-        from aiive.api.ws_manager import ws_manager
-
-        ws_manager.broadcast_to_thread_sync(
-            thread_id,
-            "new_message",
-            {
-                "event_id": event_id,
-                "reply": result.get("reply", ""),
-                "thread_id": result.get("thread_id", thread_id),
-                "trace_id": result.get("trace_id", ""),
-                "action_cards": result.get("action_cards", []),
-                # 后台提醒 turn 同样带上工具调用记录，使前端能显示 remind_alert 等工具调用框
-                "tool_calls": result.get("tool_calls", []),
-            },
-        )
-    except Exception:
-        logger.exception("提醒回复 WebSocket 推送失败: task_id=%s", task_id)
-
-    return HandlerResult(HandlerOutcome.COMPLETED, "提醒 Agent 回复已完成")
+        db.close()
 
 
 # ============================================================================

@@ -14,6 +14,10 @@ class TaskNotRunnableError(ValueError):
     pass
 
 
+class TaskModelBudgetError(ValueError):
+    """The Worker request was rejected before contacting the model."""
+
+
 class AgentOutputValidationError(Exception):
     def __init__(self, issues: list[dict[str, Any]], *, token_usage: dict[str, int] | None = None, model: str = "", feedback: list[dict[str, Any]] | None = None, payload: dict[str, Any] | None = None):
         super().__init__("agent_output_validation_error")

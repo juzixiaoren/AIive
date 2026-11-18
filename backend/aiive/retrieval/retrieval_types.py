@@ -37,6 +37,7 @@ class RetrievalRequest(BaseModel):
     scope_context: Any | None = None
     thread_id: str | None = None
     source_types: list[str] | None = None
+    memory_types: list[str] | None = None
     include_sleeping: bool = False
     # archived 源仅在 SEARCH/DEEP + include_archived=true 时返回；AUTO 永远过滤
     include_archived: bool = False

@@ -13,6 +13,41 @@ MAX_STEPS = 32
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 
 
+def normalize_plan_times(
+    payload: dict[str, Any], previous: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Freeze newly entered wall times to UTC; leave unchanged persisted rules alone."""
+    from copy import deepcopy
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    from aiive.core.scheduling_time import schedule_instant
+
+    result = deepcopy(payload)
+    zone = result.get("timezone") or DEFAULT_TIMEZONE
+    try:
+        ZoneInfo(zone)
+    except (TypeError, ValueError, ZoneInfoNotFoundError) as error:
+        raise ValueError("invalid_goal_timezone") from error
+    old_steps = {item["id"]: item for item in (previous or {}).get("steps", [])}
+    for step in result.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        old_step = old_steps.get(step.get("id"), {})
+        for key, fields in (("schedule", ("at",)), ("trigger", ("at", "start", "end"))):
+            rule = step.get(key)
+            if not isinstance(rule, dict) or rule == old_step.get(key):
+                continue
+            rule_zone = rule.setdefault("timezone", zone)
+            try:
+                ZoneInfo(rule_zone)
+            except (TypeError, ValueError, ZoneInfoNotFoundError) as error:
+                raise ValueError("invalid_goal_timezone") from error
+            for field in fields:
+                if rule.get(field):
+                    rule[field] = schedule_instant(rule[field], rule_zone).isoformat()
+    return result
+
+
 class GoalStepKind(StrEnum):
     AUTONOMOUS = "autonomous"
     INTERACTIVE = "interactive"

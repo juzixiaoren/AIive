@@ -18,6 +18,7 @@ interface Notif {
   status: string;
   thread_id: string;
   created_at: string;
+  scheduled_at?: string | null;
 }
 
 /** 通知状态中文标签映射 */
@@ -107,6 +108,23 @@ export default function NotificationsPage() {
     }
   };
 
+  const handleReminder = async (n: Notif, action: "confirm" | "snooze") => {
+    setBusyId(n.id);
+    try {
+      const response = await apiFetch(`api/notifications/${encodeURIComponent(n.id)}/reminder`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, delay_minutes: 5 }),
+      });
+      if (!response.ok) throw new Error("提醒状态已变化，请刷新后查看。");
+      refresh();
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : "提醒操作失败");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   return (
     <div>
       <div className="flex items-center gap-3 mb-4">
@@ -162,7 +180,13 @@ export default function NotificationsPage() {
             <div className="text-xs text-muted mt-1">{n.message}</div>
             {/* 创建时间和删除按钮 */}
             <div className="flex items-center justify-between mt-2">
-              <div className="text-[10px] text-faint font-mono">{n.created_at?.slice(11, 19)}</div>
+              <div className="text-[10px] text-faint font-mono">{new Date(n.scheduled_at || n.created_at).toLocaleString()}</div>
+              {n.event_type === "reminder_created" && n.status === "alerting" && (
+                <div className="flex gap-2">
+                  <button disabled={busyId === n.id} onClick={() => void handleReminder(n, "confirm")}>确认完成</button>
+                  <button disabled={busyId === n.id} onClick={() => void handleReminder(n, "snooze")}>5 分钟后提醒</button>
+                </div>
+              )}
               <button
                 disabled={busyId === n.id}
                 onClick={() => handleDelete(n)}

@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
-from aiive.db.models import TaskResourceLock
+from aiive.db.models import AgentAction, TaskResourceLock
 
 
 @dataclass(frozen=True)
@@ -44,8 +44,9 @@ class ResourceLockService:
             current = db.query(TaskResourceLock).filter(
                 TaskResourceLock.resource_key == key,
             ).with_for_update().one_or_none()
-            if current is not None and _aware(current.lease_expires_at) > now:
-                if current.task_id != task_id or current.action_id != action_id:
+            if current is not None and (current.task_id != task_id or current.action_id != action_id):
+                status = db.query(AgentAction.status).filter_by(id=current.action_id).scalar()
+                if _aware(current.lease_expires_at) > now or status == "unknown":
                     raise ResourceBusyError(key)
             if current is None:
                 current = TaskResourceLock(
@@ -82,4 +83,8 @@ class ResourceLockService:
     def expire(self, db: Session) -> int:
         return db.query(TaskResourceLock).filter(
             TaskResourceLock.lease_expires_at <= datetime.now(timezone.utc),
+            ~db.query(AgentAction.id).filter(
+                AgentAction.id == TaskResourceLock.action_id,
+                AgentAction.status == "unknown",
+            ).exists(),
         ).delete(synchronize_session=False)

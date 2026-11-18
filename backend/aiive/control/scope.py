@@ -10,6 +10,9 @@ from urllib.parse import urlsplit
 
 PATH_ARGUMENTS = frozenset({"path", "source", "destination", "cwd", "file_path", "target_file"})
 URL_ARGUMENTS = frozenset({"url"})
+TASK_READ_CAPABILITIES = frozenset({
+    "list_task_files", "read_task_evidence", "read_task_artifact", "get_promotion_status",
+})
 
 
 def _normalize_remote_path(value: str) -> str:
@@ -63,7 +66,7 @@ class TaskScope:
         )
 
     def allows_capability(self, capability_id: str) -> bool:
-        if self.capability_policy == "unified":
+        if self.capability_policy == "unified" or capability_id in TASK_READ_CAPABILITIES:
             return True
         return capability_id in self.allowed_capabilities
 

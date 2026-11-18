@@ -13,15 +13,19 @@ WORKER_RESIDENT_CAPABILITIES: tuple[str, ...] = (
     "list_thread_attachments",
     "read_attachment",
     "record_attachment_progress",
+    "list_task_files",
+    "read_task_evidence",
+    "read_task_artifact",
     "memory_search",
     "memory_timeline",
     "memory_event_log",
     "web_search",
     "search_knowledge",
+    "read_knowledge_chunk",
     "run_shell",
     "desktop_exec",
-    "list_tasks",
-    "cancel_task",
+    "list_reminders",
+    "cancel_reminder",
 )
 
 # 目录规模较小时直接注入完整 Schema（少一次模型调用）；超过阈值改用按需发现。

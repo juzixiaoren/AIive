@@ -82,11 +82,13 @@ def _task(db_session, thread: Thread, **kwargs):
     )
 
 
-def test_main_agent_only_has_task_meta_tools() -> None:
+def test_main_agent_has_task_reminder_and_privacy_entrypoints() -> None:
     registry = build_main_agent_registry()
     assert {item["capability_id"] for item in registry.list_all()} == {
         "list_skills", "delegate_task", "get_task_status", "cancel_task", "send_task_input",
         "list_thread_attachments", "read_attachment",
+        "get_current_time", "schedule_reminder", "list_reminders", "cancel_reminder",
+        "confirm_reminder", "snooze_reminder", "memory_search", "history_search", "forget", "forget_status",
     }
     assert registry.get("desktop_fs_read_text") is None
     assert registry.get("safe_delete") is None

@@ -68,11 +68,11 @@ _DEFINITIONS: tuple[dict[str, Any], ...] = (
     {
         "skill_id": "knowledge_base",
         "name": "本地知识库",
-        "description": "管理持久原文、分块索引、文档列表和关键词检索。",
+        "description": "导入本地文档，检索并按需读取持久正文，管理分块索引。",
         "version": "1.0.0",
         "default_task_type": "knowledge",
         "capabilities": (
-            "ingest_document", "search_knowledge", "reindex_document", "read_document",
+            "ingest_document", "search_knowledge", "read_knowledge_chunk", "reindex_document", "read_document",
         ),
         "supported_formats": ("txt", "md", "html", "json", "csv", "docx", "pdf"),
         "security_notes": ("对象存储保存原始字节，索引仅保存提取后的纯文本。",),
@@ -80,8 +80,8 @@ _DEFINITIONS: tuple[dict[str, Any], ...] = (
     {
         "skill_id": "mcp_management",
         "name": "MCP 能力管理",
-        "description": "发现受控 MCP 候选、生成风险计划并通过沙箱和真实冒烟激活。",
-        "version": "1.0.0",
+        "description": "查询本地 MCP 目录、评估并申请安装，在能力管理完成验证和启用。",
+        "version": "1.1.0",
         "default_task_type": "mcp",
         "capabilities": ("search_mcp", "plan_capability", "install_mcp_sandbox"),
         "requires_network": True,

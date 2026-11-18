@@ -103,6 +103,7 @@ class ChatRequest(BaseModel):
     thread_id: str | None = None
     turn_id: str | None = None
     attachment_ids: list[str] = Field(default_factory=list, max_length=5)
+    timezone: str | None = Field(default=None, max_length=100)
 
 
 class SystemChatRequest(BaseModel):
@@ -120,7 +121,7 @@ class SystemChatRequest(BaseModel):
 def chat(request: ChatRequest) -> ChatResponse:
     """同步聊天接口，通过 TurnExecutionService 执行。"""
     client = default_llm_client()
-    service = TurnExecutionService(client, message_source="user", attachment_ids=request.attachment_ids)
+    service = TurnExecutionService(client, message_source="user", attachment_ids=request.attachment_ids, device_timezone=request.timezone)
     try:
         result = service.execute_turn(
             message=request.message,
@@ -167,7 +168,7 @@ def chat_system(request: SystemChatRequest) -> ChatResponse:
 async def chat_stream(request: ChatRequest):
     """流式聊天接口，通过 TurnExecutionService 执行。"""
     client = default_llm_client()
-    service = TurnExecutionService(client, message_source="user", attachment_ids=request.attachment_ids)
+    service = TurnExecutionService(client, message_source="user", attachment_ids=request.attachment_ids, device_timezone=request.timezone)
 
     async def generate():
         try:

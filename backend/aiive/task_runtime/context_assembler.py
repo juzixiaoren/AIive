@@ -11,6 +11,7 @@ from aiive.db.models import AgentTask
 from aiive.prompts import get_prompt_registry
 from aiive.skills import SkillDefinition
 from aiive.task_runtime.repository import TaskRepository
+from aiive.task_runtime.evidence import FULL_OBSERVATION_TOOLS
 from aiive.task_runtime.tool_injection import build_tool_view, discovery_state
 from aiive.tools.registry import ToolRegistry
 
@@ -48,9 +49,9 @@ class TaskContextAssembler:
         checkpoint = TaskRepository(self.db).latest_checkpoint(task.id)
         actions = reader.actions(task.id)
         evidence = list(reversed(reader.evidence(task.id)[-20:]))
-        attachment_actions = {a.id for a in actions if a.capability_id == "read_attachment"}
+        page_actions = {a.id for a in actions if a.capability_id in FULL_OBSERVATION_TOOLS}
         artifacts = reader.artifacts(task.id)
-        events = reader.signals(task.id, ["user_input_received", "watch_triggered", "approval_denied",
+        events = reader.signals(task.id, ["user_input_received", "watch_triggered", "watch_failed", "approval_denied",
             "task_recovered", "action_invalidated"])
         return {
             "task": {
@@ -82,7 +83,7 @@ class TaskContextAssembler:
                 for item in reversed(actions)
             ],
             "evidence": [
-                {"id": item.id, "action_id": item.action_id, "kind": item.kind, "summary": item.summary if item.action_id in attachment_actions and len(item.summary) <= 32000 else item.summary[:1600]}
+                {"id": item.id, "action_id": item.action_id, "kind": item.kind, "summary": item.summary if item.action_id in page_actions and len(item.summary) <= 32000 else item.summary[:1600]}
                 for item in reversed(evidence)
             ],
             "artifacts": [
@@ -110,6 +111,12 @@ class TaskContextAssembler:
         snapshot = self.snapshot(
             task, capabilities, registry=registry, discovery_registry=discovery_registry,
         )
+        messages, prompt_refs = self.render(task, snapshot)
+        return messages, snapshot, prompt_refs
+
+    def render(
+        self, task: AgentTask, snapshot: dict[str, Any],
+    ) -> tuple[list[dict[str, str]], list[str]]:
         prompts = get_prompt_registry()
         system = prompts.render("task_runtime.worker_system")
         skill = self._active_skill(task)
@@ -131,7 +138,8 @@ class TaskContextAssembler:
         for group in ("resident", "available", "loaded"):
             for definition in prompt_snapshot["tools"].get(group, []):
                 definition.pop("parameters", None)
-                definition.pop("input_schema", None)
+                if definition.pop("input_schema", None) is not None and definition.get("status", "ready") == "ready":
+                    definition.pop("description", None)
         # Binding and prompt metadata share the same exact selection snapshot.
         user = prompts.render(
             "task_runtime.task_context",
@@ -139,7 +147,6 @@ class TaskContextAssembler:
         )
         return (
             [{"role": system.role, "content": system_content}, {"role": user.role, "content": user.content}],
-            snapshot,
             [system.audit_ref, user.audit_ref],
         )
 

@@ -1,5 +1,6 @@
 import { AttachmentComposer, AttachmentCards, type Attachment } from "../../../shared/chat/attachments";
 import { saveChatAttachment } from "./work/chatFiles";
+import ReminderInbox from "./ReminderInbox";
 import { apiFetch as attachmentApiFetch, getToken as attachmentToken } from "./api/auth";
 const attachmentFetch = (path: string, init?: RequestInit) => attachmentApiFetch(path, init);
 import { App as CapacitorApp } from "@capacitor/app";
@@ -626,7 +627,7 @@ export function ChatApp({ username, onLogout, active, onOpenWork }: { username: 
 
 
 export function MobileShell({ username, onLogout }: { username: string; onLogout: () => void }) {
-  const [tab, setTab] = useState<"chat" | "work">("chat");
+  const [tab, setTab] = useState<"chat" | "work" | "reminders">("chat");
   const [task, setTask] = useState("");
   useEffect(() => {
     const subscription = CapacitorApp.addListener("appStateChange", ({ isActive }) => {
@@ -639,7 +640,12 @@ export function MobileShell({ username, onLogout }: { username: string; onLogout
       <ChatApp username={username} onLogout={onLogout} active={tab === "chat"} onOpenWork={id => { setTask(id); setTab("work"); }} />
     </div>
     {tab === "work" && <WorkCenter key={task} taskId={task} />}
-    <nav className="mobile-tabs" aria-label="底部导航"><button aria-current={tab === "chat"} onClick={() => setTab("chat")}>对话</button><button aria-current={tab === "work"} onClick={() => { setTask(""); setTab("work"); }}>工作</button></nav>
+    {tab === "reminders" && <ReminderInbox />}
+    <nav className="mobile-tabs" aria-label="底部导航">
+      <button aria-current={tab === "chat"} onClick={() => setTab("chat")}>对话</button>
+      <button aria-current={tab === "work"} onClick={() => { setTask(""); setTab("work"); }}>工作</button>
+      <button aria-current={tab === "reminders"} onClick={() => setTab("reminders")}>提醒</button>
+    </nav>
   </div>;
 }
 

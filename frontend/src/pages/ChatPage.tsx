@@ -471,75 +471,20 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
     }
   };
 
-  /** 处理提醒操作：通过系统指令让 LLM 调用 confirm_reminder / snooze_reminder */
   const handleReminderAction = async (action: "confirm" | "snooze", reminderId: string, delayMin?: number) => {
-    if (!threadId || !reminderId || inFlightRef.current) {
-      if (!threadId) setError("当前对话线程尚未建立，无法处理提醒");
-      return;
-    }
-    inFlightRef.current = true;
-    setError(null);
-    setLoading(true);
-    const text = action === "confirm"
-      ? `[系统指令] 请调用 confirm_reminder 工具，参数 reminder_id="${reminderId}"`
-      : `[系统指令] 请调用 snooze_reminder 工具，参数 reminder_id="${reminderId}"，delay_minutes=${delayMin ?? 5}`;
-    // 不添加用户消息到聊天列表，作为系统指令隐藏发送
-    const placeholderMsg: Message = {
-      id: genMessageId(),
-      role: "agent", content: "", traceId: "", threadId: threadId ?? "",
-      actionCards: [],
-    };
-    setMessages(prev => [...prev, placeholderMsg]);
     try {
-      const res = await apiFetch("api/chat/system", {
+      const response = await apiFetch(`api/notifications/${encodeURIComponent(reminderId)}/reminder`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text, thread_id: threadId }),
+        body: JSON.stringify({ action, delay_minutes: delayMin ?? 5 }),
       });
-      // 后端用 202 表达"已有对话轮次进行中"，不能落入成功分支
-      if (res.status === 202) throw new Error("当前有对话正在进行，请稍后再试");
-      const responseText = await res.text();
-      let result: Record<string, unknown> = {};
-      if (responseText) {
-        try {
-          result = JSON.parse(responseText) as Record<string, unknown>;
-        } catch {
-          if (res.ok) throw new Error("系统指令响应格式无效");
-        }
-      }
-      if (!res.ok) {
-        const detail = result.detail;
-        const message = typeof detail === "string"
-          ? detail
-          : typeof detail === "object" && detail !== null && "message" in detail
-            ? String((detail as Record<string, unknown>).message)
-            : responseText || `系统指令失败 HTTP ${res.status}`;
-        throw new Error(message);
-      }
-      const reply = typeof result.reply === "string" ? result.reply : "";
-      const traceId = typeof result.trace_id === "string" ? result.trace_id : "";
-      const resultThreadId = typeof result.thread_id === "string" ? result.thread_id : (threadId || "");
-      const actionCards = Array.isArray(result.action_cards) ? result.action_cards : [];
-      if (!reply || !traceId) throw new Error("系统指令响应缺少 reply 或 trace_id");
-      setMessages(prev => prev.map(message => {
-        if (message.id === placeholderMsg.id) {
-          return { ...message, content: reply, traceId, threadId: resultThreadId, actionCards };
-        }
-        const nextCards = message.actionCards?.filter(card => card.reminder_id !== reminderId);
-        return nextCards?.length === message.actionCards?.length
-          ? message
-          : { ...message, actionCards: nextCards };
-      }));
-    } catch (e: unknown) {
-      setMessages(prev => prev.filter(message => message.id !== placeholderMsg.id));
-      setError(e instanceof Error ? e.message : "未知错误");
-    } finally {
-      inFlightRef.current = false;
-      setLoading(false);
-      if (historyRefreshPendingRef.current && threadId) {
-        historyRefreshPendingRef.current = false;
-        await loadRemoteMessages(threadId);
-      }
+      if (!response.ok) throw new Error("提醒状态已经变化，请在通知中心刷新后查看。");
+      setMessages(previous => previous.map(message => ({
+        ...message,
+        actionCards: message.actionCards?.filter(card => card.reminder_id !== reminderId),
+      })));
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "提醒操作失败");
     }
   };
 

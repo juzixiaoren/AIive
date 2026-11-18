@@ -105,6 +105,33 @@ def put_content_addressed(
     return ref, content_hash
 
 
+def import_content_addressed(bucket: str, source: Path) -> tuple[ObjectRef, str, int]:
+    """Import a trusted file with bounded memory and publish the complete object atomically."""
+    staging = ObjectRef(bucket, f".import-{uuid4().hex}.tmp").path
+    staging.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with source.open("rb") as input_stream, staging.open("xb") as output:
+            for data in iter(lambda: input_stream.read(256 * 1024), b""):
+                digest.update(data)
+                size += len(data)
+                output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        value = digest.hexdigest()
+        ref = ObjectRef(bucket, f"sha256/{value[:2]}/{value}")
+        ref.path.parent.mkdir(parents=True, exist_ok=True)
+        if ref.path.exists():
+            with ref.path.open("rb") as stored:
+                if hashlib.file_digest(stored, "sha256").hexdigest() == value:
+                    return ref, value, size
+        os.replace(staging, ref.path)
+        return ref, value, size
+    finally:
+        staging.unlink(missing_ok=True)
+
+
 def get(ref: ObjectRef) -> bytes:
     """读取对象的原始字节。"""
     return ref.path.read_bytes()

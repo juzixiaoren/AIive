@@ -6,10 +6,10 @@ from aiive.tools.base import DatabaseTool
 
 import logging
 
+from sqlalchemy import tuple_
 from sqlalchemy.orm import Session
 
-from aiive.context.run_context import RunContext
-from aiive.tools.builtin_tools import require_ctx
+from aiive.context.run_context import RunContext, require_ctx
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +19,8 @@ from datetime import datetime, timedelta, timezone
 
 class ScheduleReminderTool(DatabaseTool):
     @override
-    def _run(self, db: Session, ctx: RunContext | None, content: str, delay_minutes: int = 1):
+    def _run(self, db: Session, ctx: RunContext | None, content: str, delay_minutes: int | None = None,
+             at: str | None = None, timezone_name: str | None = None):
         """创建定时提醒及其通知收件箱事件。
 
         参数:
@@ -29,20 +30,31 @@ class ScheduleReminderTool(DatabaseTool):
         返回:
             包含 reminder_set、task_id、content、delay_minutes 等字段的字典
         """
+        from aiive.core.scheduling_time import schedule_instant, user_timezone
         from aiive.db.models import Event
         from aiive.runtime.task_manager import TaskManager
 
         ctx = require_ctx(ctx, "schedule_reminder")
-        next_check = datetime.now(timezone.utc) + timedelta(minutes=delay_minutes)
+        if at is not None and delay_minutes is not None:
+            return {"ok": False, "error_type": "choose_absolute_or_relative_reminder"}
+        now = datetime.now(timezone.utc)
+        zone = timezone_name or user_timezone(ctx.user_timezone)
+        if at is not None:
+            next_check = schedule_instant(at, zone)
+            if next_check <= now:
+                return {"ok": False, "error_type": "reminder_time_has_passed"}
+        else:
+            delay_minutes = delay_minutes if delay_minutes is not None else 1
+            next_check = now + timedelta(minutes=delay_minutes)
         task = TaskManager(db).create(
             task_type="reminder",
-            title=content,
-            description=f"延迟{delay_minutes}分钟",
+            title=content[:255],
+            description=f"提醒时间 {next_check.isoformat()}",
             next_check_at=next_check,
         )
         task.thread_id = ctx.thread_id
         db.flush()
-        db.add(Event(
+        event = Event(
             trace_id=task.id,
             thread_id=ctx.thread_id,
             event_type="reminder_created",
@@ -53,15 +65,19 @@ class ScheduleReminderTool(DatabaseTool):
                 "status": "pending",
                 "scheduled_at": next_check.isoformat(),
             },
-        ))
+        )
+        db.add(event)
         db.flush()
         # 提醒创建后需要推送最新 pending 数量；广播由 operation_executor 在事务
         # commit 成功后统一执行（避免事务提交前广播造成幻影计数）。
         return {
             "reminder_set": True,
             "task_id": task.id,
+            "reminder_id": event.id,
             "content": content,
             "delay_minutes": delay_minutes,
+            "scheduled_at": next_check.isoformat(),
+            "timezone": zone,
             "needs_notification_broadcast": True,
         }
 
@@ -127,7 +143,7 @@ class RemindAlertTool(DatabaseTool):
 
 class ConfirmReminderTool(DatabaseTool):
     @override
-    def _run(self, db: Session, reminder_id: str):
+    def _run(self, db: Session, reminder_id: str, ctx: RunContext | None = None):
         """用户确认提醒完成，将状态标记为 confirmed。
 
         参数:
@@ -139,6 +155,8 @@ class ConfirmReminderTool(DatabaseTool):
         from aiive.db.models import Event
         event = db.query(Event).filter(Event.id == reminder_id).with_for_update().one_or_none()
         if not event:
+            return {"ok": False, "error": "Reminder not found"}
+        if ctx and ctx.thread_id != event.thread_id:
             return {"ok": False, "error": "Reminder not found"}
         if event.event_type != "reminder_created":
             return {"ok": False, "error": f"Not a reminder event (type={event.event_type})"}
@@ -177,6 +195,9 @@ class SnoozeReminderTool(DatabaseTool):
         event = db.query(Event).filter(Event.id == reminder_id).with_for_update().one_or_none()
         if not event:
             return {"ok": False, "error": "Reminder not found"}
+        ctx = require_ctx(ctx, "snooze_reminder")
+        if event.thread_id != ctx.thread_id:
+            return {"ok": False, "error": "Reminder not found"}
         if event.event_type != "reminder_created":
             return {"ok": False, "error": f"Not a reminder event (type={event.event_type})"}
 
@@ -205,7 +226,7 @@ class SnoozeReminderTool(DatabaseTool):
         task = Task(
             id=str(_uuid.uuid4()),
             task_type="reminder",
-            title=content,
+            title=content[:255],
             status="pending",
             description=f"延时{delay_minutes}分钟 (原提醒: {reminder_id[:8]})",
             next_check_at=next_check,
@@ -215,7 +236,6 @@ class SnoozeReminderTool(DatabaseTool):
         db.flush()
 
         # 创建新的 pending 事件（thread_id 统一沿用原提醒事件的线程，与新 Task 一致）
-        ctx = require_ctx(ctx, "snooze_reminder")
         new_event = Event(
             id=str(_uuid.uuid4()),
             trace_id=task.id,
@@ -226,6 +246,7 @@ class SnoozeReminderTool(DatabaseTool):
                 "status": "pending",
                 "content": content,
                 "delay_minutes": delay_minutes,
+                "scheduled_at": next_check.isoformat(),
                 "snoozed_from": reminder_id,
             },
         )
@@ -271,6 +292,40 @@ class ListTasksTool(DatabaseTool):
         return [{"id": t.id, "task_type": t.task_type, "title": t.title, "status": t.status, "next_check_at": t.next_check_at.isoformat() if t.next_check_at else None} for t in tasks]
 
 
+class ListRemindersTool(DatabaseTool):
+    def _run(self, db: Session, ctx: RunContext | None, status: str = "", cursor: str = "", limit: int = 25):
+        from aiive.db.models import Event, Task
+
+        thread_id = require_ctx(ctx, "list_reminders").thread_id
+        query = db.query(Task).filter_by(thread_id=thread_id, task_type="reminder")
+        if status:
+            query = query.filter_by(status=status)
+        if cursor:
+            instant, separator, task_id = cursor.partition("|")
+            if not separator or not task_id:
+                raise ValueError("invalid_reminder_cursor")
+            query = query.filter(tuple_(Task.created_at, Task.id) < (datetime.fromisoformat(instant), task_id))
+        rows = query.order_by(Task.created_at.desc(), Task.id.desc()).limit(limit + 1).all()
+        page = rows[:limit]
+        events = db.query(Event).filter(
+            Event.event_type == "reminder_created", Event.trace_id.in_([task.id for task in page]),
+            Event.thread_id == thread_id,
+        ).order_by(Event.created_at.asc()).all()
+        by_task = {event.trace_id: event for event in events}
+        return {
+            "items": [
+                {"task_id": task.id, "title": task.title, "status": task.status,
+                 "scheduled_at": ((event.payload or {}).get("scheduled_at") if (event := by_task.get(task.id)) else None)
+                 or (task.next_check_at.isoformat() if task.next_check_at else None),
+                 "reminder_id": event.id if event else None,
+                 "notification_status": (event.payload or {}).get("status") if event else None}
+                for task in page
+            ],
+            "has_more": len(rows) > limit,
+            "next_cursor": f"{page[-1].created_at.isoformat()}|{page[-1].id}" if len(rows) > limit else None,
+        }
+
+
 class CancelTaskTool(DatabaseTool):
     @override
     def _run(self, db: Session, task_id: str):
@@ -291,6 +346,24 @@ class CancelTaskTool(DatabaseTool):
         }
 
 
+class CancelReminderTool(DatabaseTool):
+    def _run(self, db: Session, ctx: RunContext | None, task_id: str):
+        from aiive.db.models import Event, Task
+        from aiive.runtime.task_manager import TaskManager
+
+        thread_id = require_ctx(ctx, "cancel_reminder").thread_id
+        task = db.query(Task).filter_by(id=task_id, task_type="reminder", thread_id=thread_id).with_for_update().first()
+        if task is None:
+            return {"ok": False, "error_type": "reminder_unavailable"}
+        result = TaskManager(db).cancel(task_id)
+        if task.status == "completed":
+            event = db.query(Event).filter_by(thread_id=thread_id, event_type="reminder_created", trace_id=task_id).with_for_update().first()
+            if event and (event.payload or {}).get("status") == "alerting":
+                event.payload = {**event.payload, "status": "cancelled", "dismissed": True}
+                return {"ok": True, "task_id": task_id, "status": "dismissed", "needs_notification_broadcast": True}
+        return {**result, "needs_notification_broadcast": bool(result.get("changed"))}
+
+
 
 class DismissNotificationsTool(DatabaseTool):
     @override
@@ -306,25 +379,38 @@ class DismissNotificationsTool(DatabaseTool):
         返回:
             包含 dismissed_count 的字典
         """
-        from aiive.db.models import Event
+        from aiive.db.models import Event, Task
+        from aiive.runtime.task_manager import TaskManager
         pending_statuses = ["pending", "alerting", "snoozed"]
         query = db.query(Event).filter(
             Event.event_type.in_(["notification_created", "reminder_created"])
         )
         # 写操作默认限定当前线程（与 list_tasks 一致），scope="all" 显式跨线程
-        if scope != "all" and ctx is not None and ctx.thread_id:
-            query = query.filter(Event.thread_id == ctx.thread_id)
-        events = query.order_by(Event.created_at.desc()).limit(200).all()
+        if scope != "all":
+            query = query.filter(Event.thread_id == require_ctx(ctx, "dismiss_notifications").thread_id)
+        query = query.filter(Event.payload["status"].as_string().in_(pending_statuses))
+        events = query.order_by(Event.id).all()
+        related = {}
+        for event in events:
+            payload = event.payload or {}
+            if not payload.get("goal_key") and not payload.get("agent_task_id"):
+                task_id = payload.get("reminder_task_id") or payload.get("task_id")
+                if task_id:
+                    related[str(task_id)] = event.thread_id
+        manager = TaskManager(db)
+        for task_id, thread_id in sorted(related.items()):
+            task = db.get(Task, task_id)
+            if task and task.task_type == "reminder" and task.thread_id == thread_id:
+                manager.cancel(task_id)
         count = 0
         for e in events:
-            status = (e.payload or {}).get("status", "")
-            if status in pending_statuses:
-                p = dict(e.payload or {})
-                p["status"] = "cancelled"
-                e.payload = p
+            current = db.query(Event).filter_by(id=e.id).populate_existing().with_for_update().first()
+            if current and (current.payload or {}).get("status") in pending_statuses:
+                current.payload = {**current.payload, "status": "cancelled", "dismissed": True}
                 count += 1
-
-        return {"ok": True, "dismissed_count": count}
+            elif current and (current.payload or {}).get("status") == "cancelled":
+                count += 1
+        return {"ok": True, "dismissed_count": count, "needs_notification_broadcast": bool(count)}
 
 
 class ShowNotificationsTool(DatabaseTool):

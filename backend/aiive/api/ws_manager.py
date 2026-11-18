@@ -101,13 +101,14 @@ class ConnectionManager:
 
     def broadcast_notification_sync(self, pending_count: int) -> None:
         """线程安全的同步推送入口，供后台 daemon 线程调用。"""
-        if self._main_loop is None:
-            logger.warning("主事件循环未绑定，跳过通知广播")
+        loop = self._main_loop
+        if loop is None or loop.is_closed() or not loop.is_running():
             return
-        asyncio.run_coroutine_threadsafe(
-            self.broadcast_notification(pending_count),
-            self._main_loop,
-        )
+        broadcast = self.broadcast_notification(pending_count)
+        try:
+            asyncio.run_coroutine_threadsafe(broadcast, loop)
+        except RuntimeError:
+            broadcast.close()
 
 
 # 全局单例
