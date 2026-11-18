@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 
 from aiive.db.base import SessionLocal
 from aiive.db.models import Artifact
+from aiive.runtime.message_normalizer import tool_result_content
 from aiive.runtime.token_models import TokenCount
 
 logger = logging.getLogger(__name__)
@@ -147,8 +148,12 @@ class ToolResultNormalizer:
         result = []
         for d in turn_dicts:
             if d.get("type") == "tool_result":
+                tool_name = str(d.get("tool_name") or d.get("name") or "")
+                if tool_name == "get_task_status":
+                    result.append(d)
+                    continue
                 raw = d.get("tool_result", {})
-                result_text = _json.dumps(raw, ensure_ascii=False, default=str)
+                result_text = tool_result_content(raw, tool_name)
                 tc = self._token_counter.count_messages(
                     self._model, [{"role": "user", "content": result_text}],
                 )
@@ -170,7 +175,9 @@ class ToolResultNormalizer:
         result = []
         for d in turn_dicts:
             if d.get("type") == "tool_result":
-                result_text = _json.dumps(d.get("tool_result", {}), ensure_ascii=False, default=str)
+                result_text = tool_result_content(
+                    d.get("tool_result", {}), str(d.get("tool_name") or d.get("name") or ""),
+                )
                 existing_ref = d.get("artifact_ref", "")
                 preview = self._build_deterministic_preview(
                     result_text, existing_ref or "artifact://sparse",

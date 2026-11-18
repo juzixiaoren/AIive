@@ -284,14 +284,6 @@ def test_save_is_atomic_and_unique(output_dir) -> None:
     assert list(output_dir.glob(".tmp-*")) == []
 
 
-# 18. 接线守卫：_tools_node 必须在构造回执前调用统一入口
-def test_tools_node_wires_guard() -> None:
-    source = (Path(__file__).resolve().parents[3] / "backend/aiive/runtime/agent_graph.py").read_text(encoding="utf-8")
-    node = source.split("def _tools_node", 1)[1].split("return {", 1)[0]
-    assert "guard_tool_output(" in node
-    assert node.index("guard_tool_output(") < node.index("parse_tool_execution_receipt(")
-
-
 # 19. 大文件（> 5MB）仍可翻页读到末尾：不再有整文件扫描上限
 def test_large_file_pages_past_old_scan_cap(output_dir) -> None:
     path = output_dir / "huge.log"

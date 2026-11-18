@@ -65,7 +65,6 @@ from aiive.runtime.tool_events import (
 from aiive.tools.langchain_adapter import build_langchain_tools
 from aiive.tools.registry import ToolRegistry
 from aiive.runtime.tool_normalizer import ToolResultNormalizer
-from aiive.runtime.tool_output_guard import guard_tool_output
 from aiive.runtime.token_counter import LiteLLMTokenCounter
 from aiive.runtime.working_state import WorkingStateService
 from aiive.runtime.message_normalizer import normalize_tool_call, normalize_tool_result
@@ -842,27 +841,15 @@ class AgentGraph:
             for i, tc in enumerate(tc_list):
                 tm = tool_messages[i] if i < len(tool_messages) else None
                 raw_content = str(tm.content) if tm else ""
-
-                # ── 统一预算：大结果落盘 + 有界回填 ──
-                # 必须在 ToolMessage 内容进入下一轮 LLM 之前完成；按工具类型分流
-                # （Bash 行数/字符、文件读取分页、其他工具字符），不逐工具重复实现。
-                if tm is not None:
-                    guarded = guard_tool_output(
-                        str(tc.get("name", "") or ""), raw_content,
-                        thread_id=thread_id, trace_id=trace_id,
-                        tool_call_id=str(tc.get("id", "") or ""),
-                    )
-                    if guarded.content != raw_content:
-                        tm.content = guarded.content
-                        raw_content = guarded.content
+                tool_name = str(tc.get("name") or "")
 
                 receipt = parse_tool_execution_receipt(raw_content)
                 is_error = not receipt.ok
                 record_status = receipt.status
 
-                # ── A: 规范化（有界引用化 / 内联）──
+                # 任务状态工具已在源头分页，保持每页的状态、用量及续读游标。
                 artifact_ref = ""
-                if tm is not None and normalizer is not None:
+                if tm is not None and normalizer is not None and tool_name != "get_task_status":
                     norm: ToolResultNormalizer = normalizer
                     try:
                         view = norm.normalize(

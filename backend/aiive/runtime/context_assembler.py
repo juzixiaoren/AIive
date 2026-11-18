@@ -27,7 +27,6 @@ from aiive.db.models import (
     MemoryRecallCandidate,
 )
 from aiive.memory.recall_config import RecallConfig
-from aiive.runtime.tool_output_guard import guard_tool_output
 from aiive.memory.memory_read_model import MemoryReadModel
 from aiive.memory.memory_store import MemoryStore
 from aiive.memory.core_memory_projection import load_core_memory
@@ -45,7 +44,7 @@ from aiive.runtime.token_counter import TokenCounter
 from aiive.core.function_calling import function_definitions
 from aiive.runtime.tool_normalizer import ToolResultNormalizer
 from aiive.runtime.working_state import WorkingStateService
-from aiive.runtime.message_normalizer import normalize_tool_call, normalize_tool_result
+from aiive.runtime.message_normalizer import normalize_tool_call, normalize_tool_result, tool_result_content
 
 logger = logging.getLogger(__name__)
 
@@ -942,16 +941,10 @@ class ContextAssembler:
             elif etype in ("tool_result", "tool_result_ref"):
                 _flush_pending()
                 normalized = normalize_tool_result(item)
-                tool_result = normalized["result"]
-                content = tool_result if isinstance(tool_result, str) else _json.dumps(tool_result, ensure_ascii=False, default=str)
-                # 历史回放是工具结果再次进入 LLM 上下文的入口：同样走统一预算。
-                # 守卫对自身产物幂等（already_guarded 直接原样返回），因此新数据不会二次落盘；
-                # 只有 V51 之前写入的超大历史结果会在这里被收口一次。
-                content = guard_tool_output(str(normalized.get("name") or ""), content).content
                 result.append({
                     "role": "tool",
                     "tool_call_id": normalized["id"],
-                    "content": content,
+                    "content": tool_result_content(normalized["result"], normalized["name"]),
                     "name": normalized["name"],
                 })
             elif etype == "assistant":

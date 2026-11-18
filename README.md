@@ -191,14 +191,16 @@ Web、Android 或 Electron 界面发出的自然语言指令都由后端 Agent �
 删除。详细协议、节点绑定、权限与构建说明见
 [Desktop 应用与本地执行节点指南](docs/guides/DESKTOP_APP.md)。
 
-工具结果在进入模型上下文之前统一过预算：文件读取超过 1000 字符只回填路径、总字符数、
+主对话的 `get_task_status` 直接返回结构化状态和报告。详情较大时用同一个工具按
+`details_page.next_cursor` 续读。其他主对话工具结果使用 Token 预算。
+
+后台任务的 Evidence 摘要使用 `tool_output_guard` 控制回填大小：文件读取超过 1000 字符只回填路径、总字符数、
 总行数与分页提示；Shell 输出超过 1000 行只回填首尾各 50 行；其他工具（含 MCP）超过
-1000 字符只回填结构化摘要。聊天、后台任务的 Evidence 摘要、聊天历史回放共用同一个
-`tool_output_guard` 入口，重复处理（回放/重试）不会二次截断或二次落盘。`run_shell` 的
+1000 字符只回填结构化摘要。`run_shell` 的
 stdout/stderr 由后台线程边读边写日志（`SHELL_MAX_LOG_BYTES`，默认 8 MiB），内存只留
 `SHELL_OUTPUT_PREVIEW_CHARS`（默认 2000）字符预览、总字节数与续读位置；日志达到容量上限时
 `capture_truncated=true`，不会声称已保存全部内容。完整原始结果落盘到 `TOOL_OUTPUT_DIR`（默认
-`.data/tool_outputs`），模型可用 `read_text_file` 按 `offset`/`limit` 分页读取（流式逐行扫描，
+`.data/tool_outputs`），具备 `read_text_file` 能力及路径授权的 Worker 可按 `offset`/`limit` 分页读取（流式逐行扫描，
 不受文件总大小限制；单行超长时用 `char_offset` 行内续读）；
 日志保留 `TOOL_OUTPUT_RETENTION_HOURS`（默认 10 小时），由后台调度器每
 `TOOL_OUTPUT_CLEANUP_INTERVAL_HOURS`（默认 5 小时）清理一次，只删该目录内的日志。

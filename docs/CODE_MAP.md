@@ -114,7 +114,7 @@
 | 副作用工具 Outbox 化执行 | `tools/operation_executor.py` | `worker/scheduler_daemon.py::_poll_tool_operations` | `test_tool_operation*.py` |
 | 安全删除 | `tools/safe_delete.py` | `tools/builtin_files.py::handle_safe_delete` | `test_safe_delete*.py` |
 | 工具结果引用化（大结果→Artifact） | `runtime/tool_normalizer.py`、`runtime/tool_executor.py` | `storage/object_store.py`、`runtime/action_cards.py` | — |
-| 工具结果回填预算（V51/V52，大结果→临时日志 + 有界回填） | `runtime/tool_output_guard.py`（唯一入口 `guard_tool_output`）、`runtime/tool_output_store.py`（`StreamingLog` 落盘/清理） | 三个入口：`runtime/agent_graph.py::_tools_node`（聊天）、`task_runtime/evidence.py::_summary`（后台任务 Evidence）、`runtime/context_assembler.py::_messages_from_events`（聊天历史回放）；另有 `tools/builtin_files.py::handle_read_text_file`、`worker/scheduler_daemon.py::_tool_output_cleanup_job`、`config.py` | `test_tool_output_guard.py`（26 例）、`test_shell_output_capture.py`（9 例）、`test_worker_tool_result_backfill.py`（6 例） |
+| 工具结果回填预算 | `runtime/tool_normalizer.py`（主对话 Token 预算）、`task_runtime/tools.py::GetTaskStatusTool`（任务详情分页）、`runtime/tool_output_guard.py`（Worker Evidence 摘要） | `runtime/agent_graph.py::_tools_node`、`runtime/message_normalizer.py::tool_result_content`（聊天历史回放）、`task_runtime/evidence.py::_summary`、`runtime/tool_output_store.py`（落盘和清理） | `test_persistent_task_runtime.py`、`test_context_assembler.py`、`test_tool_output_guard.py`、`test_worker_tool_result_backfill.py` |
 | 工具注入方案（分层/tool_plan/检索选型分析） | `docs/architecture/工具注入方案分析.md` | 下述注入面实证 | — |
 
 **工具注入面（改绑定/可见性前必读）**：对话 Agent 每轮绑定 Main Agent 单 Turn 工具面（`runtime/turn_tool_surface.py::build_turn_tool_registry`）：5 个任务元工具 + 附件工具 + notify_user，仅在有未关闭问题时追加 answer_goal_question；Schema 由 `core/function_calling.py::function_definitions` 从 Canonical 契约导出，与 Token 预算同源，无前缀截断。持久任务 Worker 采用**分层注入 + 自主发现**（`task_runtime/tool_injection.py`）：L0 常驻能力（长期记忆读取、基础搜索、本机 `run_shell`、`desktop_exec`、任务管理）始终注入完整定义；其余能力由 Worker 通过 `search_capabilities` / `describe_capability` 两个只读决策按需发现，`TaskContextAssembler` 只注入 `tools.resident / available / discovered / loaded`，**不再整段注入 `list_all()` 清单**；目录 ≤12 个工具时直接全量注入 Schema，超过则转为发现模式。发现范围覆盖全部可用能力（内置 + 在线桌面 + MCP + 自进化），**不受 task_type / Skill Profile 收窄**（`TaskScope.capability_policy=unified`）；执行仍由 `CapabilityBroker` 的授权视图 + `TaskPolicyEngine` + 审批 + 资源锁 + `descriptor_hash` 裁决，发现不扩大权限。模型可见 Schema 的导出统一走 `core/function_calling.py::function_definitions`（Canonical 契约，已排除 ctx/db/tool_call_id），ContextInspector、Token 预算与 LangChain 绑定同源。方案与实施记录见 `docs/architecture/工具注入方案分析.md`。
@@ -286,7 +286,7 @@
 | `epoch_manager.py` / `compaction.py` | Epoch/Segment 生命周期+密封冻结；Segment 压缩（source_hash+LLM 输出校验） |
 | `thread_state.py` | `ThreadState`：历史消息有界读取分页 |
 | `tool_normalizer.py` / `tool_executor.py` / `action_cards.py` | 大工具结果→`Artifact` 引用化；`build_action_cards`/`build_pending_operations`；`ActionCard`/`PendingOperation`/`ChatResponse` 契约 |
-| `tool_output_guard.py` | V51/V52 统一回填预算（三个入口共用：聊天 `_tools_node`、后台 `EvidenceStore._summary`、聊天历史回放 `_messages_from_events`）：`INLINE_CHAR_LIMIT=1000`，可选 `max_chars` 供后台任务用更紧预算；`guard_tool_output(tool_name, content)` 按工具分流——`run_shell` 走 `_guard_shell`（两种模式：**>1000 行 → 必回填前 50 + 后 50 行**，单行裁剪到 200 字符，`omitted_lines=[50,total-50]`；≤1000 行但单段 >4000 字符 → `char_budget` 前缀预算，不重复首尾；两种模式都落盘 + `mode`/`total_lines`/`omitted_lines`/`log_path`），`read_text_file`/`read_document` 走 `_guard_file_read`（>1000 字符只回填 path/total_chars/total_lines/hint），其余（含 MCP）走 `_guard_payload`/`_guard_text`（完整结果落盘 + 摘要 + 类型 + 长度 + 日志）。保留 `ok`/`error`/`error_type`/`exit_code`/`operation_id`/`execution_status`；落盘失败降级为有界预览并标 `offload_error`；回填内容一律标注不可信。V52 增补：`run_shell` 结果带 `stdout_log`/`stderr_log` 时走 `bash_streamed_log`（只回填预览 + `*_meta`，不二次落盘）；`_is_guarded_payload`（`truncated` + 不可信 `note`）保证重复处理幂等；`_fit_budget` 对超出调用方预算的摘要做结构保留收口（先裁长文本、再按重要性丢字段，绝不输出半截 JSON）。 |
+| `tool_output_guard.py` | Worker Evidence 的字符预算和日志落盘。`run_shell` 复用已写入的流式日志，或按行数和字符数生成预览；分页文件结果可直接回填；其他超长结果写入日志并回填摘要。`_is_guarded_payload` 避免对摘要重复落盘，`_fit_budget` 按调用方预算保留可解析的 JSON。 |
 | `tool_output_store.py` | V51 落盘与生命周期：`tool_output_root`/`ensure_tool_output_root`（`settings.tool_output_dir`，默认 `.data/tool_outputs`）、`is_managed_path`（目录包含关系校验，供读取授权）、`StreamingLog`（流式写入：`.tmp-*` → `os.replace` 原子收尾、`max_bytes` 容量上限 + `capture_truncated`、`write()` 不缓存完整内容）、`save_tool_output`（同一实现的字符串入口：时间戳 + uuid 唯一名）、`cleanup_expired_tool_outputs`（只删本目录一层 `.log`/残留 `.tmp-*`，超 `tool_output_retention_hours` 默认 10h）。 |
 | `token_counter.py` / `token_models.py` | LiteLLM token 计数；`TokenCount`/`ModelProfile` |
 | `task_manager.py` / `reminder_outbox.py` | `TaskManager`：提醒 CRUD、取消（仅 pending/dispatching 修改 Task、pending Outbox 与关联 Event；cancelled 幂等；completed/failed 不变；调用方提交；Task→Outbox→Event 锁序，刷新并锁定关联事件）、手动单条入队（create 仅 reminder；check_now 拒绝历史旧类型）；`reminder_outbox`：投递 operation_id、payload、幂等、终态收敛与到期查询的唯一实现 |
@@ -815,8 +815,8 @@ LLM 决定调用工具
           内存只留 shell_output_preview_chars 字符预览 + 总字节数 + (next_offset, next_char_offset)
       → read_text_file: 按 offset/limit/max_chars 分页，返回 total_lines/total_chars/next_offset
       → MCP: mcp/runtime_client → 远端结果 JSON
-  → 入口 1（聊天）agent_graph._tools_node
-      → guard_tool_output(tool_name, raw_content)          # 唯一预算入口
+  → Worker EvidenceStore.capture_result → _summary(capability_id, result, max_chars=1200)
+      → guard_tool_output(tool_name, raw_content)
           ├ 已是守卫产物（truncated + note）→ 原样返回（already_guarded，幂等，不二次落盘）
           ├ run_shell 带 stdout_log/stderr_log → 只回填预览 + *_meta（total_bytes / capture_truncated /
           │            next_offset / next_char_offset / log_path），不再二次落盘（bash_streamed_log）
@@ -824,18 +824,15 @@ LLM 决定调用工具
           │            char_budget 前缀预算；两种模式都落盘 + total_lines / omitted_lines / log_path
           ├ read_text_file/read_document：>1000 字符 → path/total_chars/total_lines/hint（分页由 read_text_file 流式承担）
           └ 其他（含 MCP）：>1000 字符 → 完整结果落盘 + 摘要/类型/长度/log_path
-      → ToolResultNormalizer.normalize（Token 级 Artifact 引用化，兜底）
-      → ToolMessage 进入下一轮 LLM
-  → 入口 2（后台任务）EvidenceStore.capture_result → _summary(capability_id, result, max_chars=1200)
-      → 同一个 guard_tool_output：小结果原样进 Evidence.summary，大结果落盘 + 结构化摘要
-      → TaskContextAssembler 只做 1600 字符切片，不再出现「裸切 JSON」的二次截断
-  → 入口 3（聊天历史回放）ContextAssembler._messages_from_events 的 tool_result 分支
-      → 同一个 guard_tool_output：新数据 already_guarded 直接返回；仅 V51 前的超大历史结果被收口一次
-  → 模型按需 read_text_file(path=log_path, offset=..., char_offset=...)
+      → 已授权的 Worker 可按需 read_text_file(path=log_path, offset=..., char_offset=...)
+  → 主对话 agent_graph._tools_node
+      → get_task_status 直接返回结构化状态，超长详情按 details_page.next_cursor 续读
+      → 其余工具使用 ToolResultNormalizer 的 Token 预算
+  → 主对话历史回放使用 message_normalizer.tool_result_content 恢复模型可见结果
   → scheduler(_tool_output_cleanup_job, 5h) → cleanup_expired_tool_outputs（>10h 的 .log）
 ```
 
-不变量：短结果（<=1000 字符）原样回填；完整内容只落盘不回填；ok/error/error_type/
+Worker Evidence 摘要中，短结果（<=1000 字符）原样回填。超长输出按工具类型落盘；ok/error/error_type/
 exit_code/operation_id 等结构化字段始终保留；落盘失败降级为有界预览并标 offload_error；
 清理只作用于 settings.tool_output_dir 一层内的日志，不触碰其他临时文件与项目文件。
 

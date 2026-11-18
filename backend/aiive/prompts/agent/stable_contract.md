@@ -34,7 +34,7 @@
 
 - `delegate_task`：把结构化 TaskBrief 交给持久 Task Runtime；
 - `list_skills`：查看内置 Skill、相关能力和联网要求；
-- `get_task_status`：读取压缩后的状态、关键事件和 TaskReport；
+- `get_task_status`：读取当前会话任务的状态、用量、待审批项和报告；出现 `details_page.next_cursor` 时，可用同一工具续读；
 - `cancel_task`：取消尚未结束的 Task；
 - `send_task_input`：向等待输入的 Task 追加结构化用户信息。
 

@@ -6,6 +6,8 @@
 - pending_seal 语义（软阈值触发，而非"发生过裁剪"）
 - ContextBudget 默认配置入口
 """
+import json
+
 import pytest
 
 from aiive.runtime.context_assembler import ContextAssembler
@@ -13,6 +15,7 @@ from aiive.db.models import Epoch, Segment, SegmentSummary, Thread
 from aiive.runtime.context_budget import ContextBudget
 from aiive.runtime.thread_state import ThreadState
 from aiive.runtime.token_models import TokenCount
+from aiive.runtime.tool_output_guard import UNTRUSTED_NOTE
 
 
 class _FakeTokenCounter:
@@ -66,6 +69,31 @@ def test_tool_call_id_pairing_matches():
     assert assistant["tool_calls"][0]["id"] == "call_abc"
     assert tool_msg["tool_call_id"] == "call_abc"
     assert assistant["tool_calls"][0]["id"] == tool_msg["tool_call_id"]
+
+
+def test_replay_uses_old_status_preview_without_repeating_the_file_read_hint():
+    events = _events_with_tool_call_id()
+    events[1]["tool_name"] = events[2]["tool_name"] = "get_task_status"
+    old_content = {
+        "ok": True, "truncated": True, "full_length": 1249, "log_path": "retained.log",
+        "hint": "完整内容已落盘，可用 read_text_file 按行分页查看 log_path。",
+        "preview": r'任务\n"' * 60,
+        "keys": ["status", "report", "usage", "pending_approvals"],
+        "keys_report": ["status", "summary", "completed_actions", "evidence_refs", "artifact_refs", "risks", "unresolved"],
+        "note": UNTRUSTED_NOTE,
+    }
+    events[2]["tool_result"] = {
+        "ok": True, "result": _dump(old_content), "operation_id": "",
+        "execution_status": "", "error_type": "",
+    }
+
+    assert len(_dump(events[2]["tool_result"])) > 1000
+    messages = ContextAssembler._dicts_to_prompt_messages(events)
+    content = json.loads(next(msg["content"] for msg in messages if msg["role"] == "tool"))
+    assert content["full_length"] == 1249
+    assert content["preview"] == old_content["preview"]
+    assert "get_task_status" in content["hint"]
+    assert "read_text_file" not in content["hint"]
 
 
 def test_multiple_tool_call_ids_each_paired():

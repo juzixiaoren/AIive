@@ -6,7 +6,11 @@ import json
 import logging
 from typing import Any
 
+from aiive.runtime.tool_output_guard import UNTRUSTED_NOTE
+
 logger = logging.getLogger(__name__)
+
+_TOOL_RECORD_RESULT_KEYS = {"ok", "result", "operation_id", "execution_status", "error_type"}
 
 
 def stable_tool_call_id(data: dict[str, Any]) -> str:
@@ -61,6 +65,44 @@ def normalize_tool_result(data: dict[str, Any]) -> dict[str, Any]:
         "name": str(data.get("tool_name") or data.get("name") or ""),
         "result": result,
     }
+
+
+def tool_result_content(result: object, tool_name: str) -> str:
+    """恢复工具的模型可见内容，兼容带执行回执的持久化结果。"""
+    if isinstance(result, dict) and result.keys() == _TOOL_RECORD_RESULT_KEYS:
+        inner = result["result"]
+        if isinstance(inner, str) and result["ok"] is True and not any(
+            result[key] for key in ("operation_id", "execution_status", "error_type")
+        ):
+            result = inner
+        elif isinstance(inner, str) and inner.startswith("{"):
+            try:
+                payload = json.loads(inner)
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict):
+                result = {**payload, **{k: v for k, v in result.items() if k != "result" and v != ""}}
+
+    content = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+    # 旧字符守卫在主对话中也生成了只有文件工具可用时才有效的提示。
+    if UNTRUSTED_NOTE not in content or "read_text_file" not in content:
+        return content
+    try:
+        payload = json.loads(content)
+    except ValueError:
+        return content
+    if (
+        isinstance(payload, dict)
+        and payload.get("truncated") is True
+        and payload.get("note") == UNTRUSTED_NOTE
+        and "read_text_file" in str(payload.get("hint") or "")
+    ):
+        if tool_name == "get_task_status":
+            payload["hint"] = "用原任务 ID 再调用 get_task_status，读取当前状态和报告。"
+        else:
+            del payload["hint"]
+        return json.dumps(payload, ensure_ascii=False)
+    return content
 
 
 def _normalize_args(raw_args: Any) -> dict[str, Any]:

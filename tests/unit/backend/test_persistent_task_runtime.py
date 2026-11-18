@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -18,6 +19,7 @@ from aiive.control.scope import (
 from aiive.db.models import (
     AgentAction,
     AgentRun,
+    AgentTask,
     AgentTaskEvent,
     AgentTaskWatch,
     ApprovalRequest,
@@ -91,8 +93,130 @@ def test_main_agent_has_task_reminder_and_privacy_entrypoints() -> None:
         "confirm_reminder", "snooze_reminder", "memory_search", "history_search", "forget", "forget_status",
     }
     assert registry.get("desktop_fs_read_text") is None
+    assert registry.get("read_text_file") is None
     assert registry.get("safe_delete") is None
     assert registry.get("promote_slot") is None
+
+
+def test_main_tool_returns_status_report_and_pending_approval_to_model(db_session) -> None:
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+    from langchain_core.runnables import RunnableLambda
+
+    from aiive.context.run_context import RunContext
+    from aiive.core.llm_client import FakeLLMClient
+    from aiive.runtime.agent_graph import AgentGraph
+    from aiive.runtime.context_assembler import ContextAssembler
+    from aiive.runtime.token_models import TokenCount
+    from aiive.runtime.tool_normalizer import ToolResultNormalizer
+    from aiive.runtime.turn_tool_surface import build_turn_tool_registry
+    from aiive.tools.langchain_adapter import build_langchain_tools
+
+    thread = _thread(db_session)
+    task = _task(db_session, thread, title="长" * 255)
+    repo = TaskRepository(db_session)
+    _, run = repo.start_run(task.id, trigger="test")
+    action = AgentAction(
+        task_id=task.id, run_id=run.id, sequence=1, capability_id="read_text_file",
+        arguments_hash="a" * 64, descriptor_hash="d" * 64, idempotency_key="test-status-approval",
+    )
+    db_session.add(action)
+    db_session.flush()
+    expires_at = datetime(2026, 11, 19, tzinfo=timezone.utc)
+    approval = ApprovalRequest(
+        thread_id=thread.id, task_id=task.id, action_id=action.id,
+        tool_name=action.capability_id, tool_args={}, tool_args_hash=action.arguments_hash,
+        descriptor_hash=action.descriptor_hash, expires_at=expires_at,
+    )
+    db_session.add(approval)
+    task.status = "blocked_approval"
+    task.report = {"status": "partial", "summary": "保留原始任务报告。" * 120}
+    task.usage = {"actions": 1}
+    db_session.flush()
+
+    class HighTokenCount:
+        def count_messages(self, *_args):
+            return TokenCount(estimated_tokens=3000, safety_margin_tokens=0)
+
+    def assistant(messages):
+        if any(isinstance(message, ToolMessage) for message in messages):
+            return AIMessage(content="查询完成")
+        return AIMessage(content="", tool_calls=[
+            {"id": "get-status", "name": "get_task_status", "args": {"task_id": task.id}},
+        ])
+
+    registry = build_turn_tool_registry()
+    tools = build_langchain_tools(registry, RunContext(thread_id=thread.id, trace_id="trace-status"))
+    normalizer = ToolResultNormalizer(HighTokenCount(), "test")
+    graph = AgentGraph(FakeLLMClient(), db_session)
+    compiled, _, _ = graph._build_graph(
+        RunnableLambda(assistant), tools, registry, normalizer=normalizer, thread_id=thread.id,
+    )
+    result = compiled.invoke({"messages": [HumanMessage(content="任务状态")], "tool_records": []})
+    message = next(message for message in result["messages"] if isinstance(message, ToolMessage))
+    assert len(message.content) > 1000
+    content = json.loads(message.content)
+    assert content["status"] == "blocked_approval"
+    assert content["report"] == task.report
+    assert content["usage"] == {"actions": 1}
+    assert content["pending_approvals"][0]["id"] == approval.id
+    assert datetime.fromisoformat(content["pending_approvals"][0]["expires_at"]).date() == expires_at.date()
+
+    record = result["tool_records"][0]
+    history = normalizer.normalize_turn([
+        {"type": "tool_call", "tool_name": record["name"], "tool_call_id": record["tool_call_id"]},
+        {
+            "type": "tool_result", "tool_name": record["name"],
+            "tool_call_id": record["tool_call_id"], "tool_result": record["result"],
+        },
+    ])
+    replay = ContextAssembler._dicts_to_prompt_messages(history)
+    assert next(msg["content"] for msg in replay if msg["role"] == "tool") == message.content
+
+
+def test_task_status_large_details_paginate_within_the_same_thread(db_session) -> None:
+    from aiive.context.run_context import RunContext
+    from aiive.tools.langchain_adapter import build_langchain_tools
+
+    thread = _thread(db_session)
+    other_thread = _thread(db_session)
+    task = _task(db_session, thread)
+    task.status = "partial"
+    task.report = {"status": "partial", "summary": '长报告\n含引号"🙂' * 600}
+    db_session.flush()
+    registry = build_main_agent_registry()
+    status_tool = build_langchain_tools(
+        registry, RunContext(thread_id=thread.id, trace_id="trace-page"), ["get_task_status"],
+    )[0]
+    wrong_thread_tool = build_langchain_tools(
+        registry, RunContext(thread_id=other_thread.id, trace_id="trace-other"), ["get_task_status"],
+    )[0]
+
+    args = {"task_id": task.id}
+    response = json.loads(status_tool.invoke(args))
+    cursor = response["details_page"]["next_cursor"]
+    assert cursor is not None
+    assert json.loads(wrong_thread_tool.invoke({**args, "details_cursor": cursor}))["ok"] is False
+
+    fragments = []
+    while True:
+        page = response["details_page"]
+        assert response["status"] == "partial"
+        assert "usage" in response
+        assert len(page["content"]) <= 1800
+        assert page["offset"] == sum(len(part) for part in fragments)
+        fragments.append(page["content"])
+        if page["next_cursor"] is None:
+            break
+        response = json.loads(status_tool.invoke({**args, "details_cursor": page["next_cursor"]}))
+    assert json.loads("".join(fragments)) == {"report": task.report, "pending_approvals": []}
+
+    current_task = db_session.get(AgentTask, args["task_id"])
+    assert current_task is not None
+    current_task.report = {"status": "partial", "summary": "报告已更新"}
+    db_session.flush()
+    stale = json.loads(status_tool.invoke({**args, "details_cursor": cursor}))
+    assert stale["ok"] is False
+    assert "task_details_changed" in stale["error"]
 
 
 def test_create_task_goal_cannot_be_overridden_by_brief(db_session) -> None:

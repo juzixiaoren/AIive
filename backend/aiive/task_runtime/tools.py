@@ -1,9 +1,11 @@
 """Main Agent 唯一可见的 Persistent Task 元工具。"""
 from __future__ import annotations
 
-from aiive.tools.base import BaseTool
-
+import hashlib
+import json
 from typing import override, Any
+
+from fastapi.encoders import jsonable_encoder
 
 from aiive.context.run_context import RunContext
 from aiive.db.base import SessionLocal
@@ -11,7 +13,12 @@ from aiive.task_runtime.repository import TaskRepository
 from aiive.task_runtime.router import normalize_task_brief
 from aiive.task_runtime.schemas import TaskBudget, ActionProposal
 from aiive.task_runtime.goal_plan import GoalPlan
+from aiive.tools.base import BaseTool
 from aiive.tools.registry import CapabilitySafetySchema, ToolDefinition, ToolRegistry
+
+
+TASK_STATUS_INLINE_CHARS = 4000
+TASK_DETAILS_PAGE_CHARS = 1800
 
 
 def _require_context(ctx: RunContext | None) -> RunContext:
@@ -187,7 +194,12 @@ def _delegate_goal(
 
 class GetTaskStatusTool(BaseTool):
     @override
-    def _run(self, task_id: str, ctx: RunContext | None = None) -> dict[str, Any]:
+    def _run(
+        self,
+        task_id: str,
+        details_cursor: str = "",
+        ctx: RunContext | None = None,
+    ) -> dict[str, Any]:
         run_ctx = _require_context(ctx)
         db = SessionLocal()
         try:
@@ -196,14 +208,45 @@ class GetTaskStatusTool(BaseTool):
             if task is None or task.thread_id != run_ctx.thread_id:
                 raise ValueError("task_not_found")
             detail = repo.detail(task, include_events=False)
-            return {
+            result = {
                 "task_id": task.id,
                 "title": task.title,
                 "status": task.status,
                 "usage": task.usage or {},
-                "report": task.report,
-                "pending_approvals": [item for item in detail["approvals"] if item["status"] == "pending"],
                 "artifact_count": len(detail["artifacts"]),
+            }
+            approvals = jsonable_encoder([
+                item for item in detail["approvals"] if item["status"] == "pending"
+            ], sqlalchemy_safe=False)
+            details = {
+                "report": task.report,
+                "pending_approvals": approvals,
+            }
+            inline = {**result, **details}
+            if not details_cursor and len(json.dumps(inline, ensure_ascii=False)) <= TASK_STATUS_INLINE_CHARS:
+                return inline
+
+            # 页游标绑定本次详情内容，防止任务或审批更新时把两份快照拼在一起。
+            serialized = json.dumps(details, ensure_ascii=False, sort_keys=True)
+            version = hashlib.sha256(f"{task.id}:{serialized}".encode()).hexdigest()[:16]
+            offset = 0
+            if details_cursor:
+                cursor_version, _, cursor_offset = details_cursor.partition(":")
+                if cursor_version != version:
+                    raise ValueError("task_details_changed")
+                offset = int(cursor_offset)
+                if not 0 < offset < len(serialized):
+                    raise ValueError("invalid_task_details_cursor")
+            end = min(offset + TASK_DETAILS_PAGE_CHARS, len(serialized))
+            return {
+                **result,
+                "pending_approval_count": len(approvals),
+                "details_page": {
+                    "content": serialized[offset:end],
+                    "offset": offset,
+                    "total_chars": len(serialized),
+                    "next_cursor": f"{version}:{end}" if end < len(serialized) else None,
+                },
             }
         finally:
             db.close()
@@ -311,7 +354,7 @@ def build_main_agent_registry() -> ToolRegistry:
                 "enum": ["", *(skill.skill_id for skill in list_skills())],
             },
             "attachment_ids": {"type": "list", "description": "聊天附件任务的明确授权 ID 列表，仅用于 document_processing；目标文本不授予附件权限。"},
-            "title": {"type": "str"},
+            "title": {"type": "str", "description": "简短任务标题，完整目标和约束请写入 goal 和 constraints。"},
             "acceptance_criteria": {"type": "list"},
             "constraints": {"type": "list"},
             "allowed_roots": {
@@ -351,8 +394,18 @@ def build_main_agent_registry() -> ToolRegistry:
         DelegateTaskTool,
     ))
     registry.register(_registration(
-        "get_task_status", "查询当前对话所属持久任务的高层状态和报告。",
-        {"task_id": {"type": "str", "required": True, "minLength": 1}},
+        "get_task_status",
+        "查询当前对话所属任务的状态、用量、报告和待审批项。详情较长时返回 details_page，"
+        + "按顺序读取 content（报告和待审批项的 JSON 文本）；用同一 task_id 和 next_cursor 续读。"
+        + "如返回 task_details_changed，去掉游标重新查询。",
+        {
+            "task_id": {"type": "str", "required": True, "minLength": 1},
+            "details_cursor": {
+                "type": "str", "minLength": 18, "maxLength": 27,
+                "pattern": "^[0-9a-f]{16}:[0-9]{1,10}$",
+                "description": "上一页 details_page.next_cursor 的原值；首次查询省略。",
+            },
+        },
         GetTaskStatusTool,
     ))
     registry.register(_registration(

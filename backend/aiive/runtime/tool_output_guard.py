@@ -1,7 +1,6 @@
 """统一工具结果回填守卫：在工具结果进入 LLM 上下文之前做确定性预算。
 
-单一入口 `guard_tool_output`，由 `runtime/agent_graph.py::_tools_node` 在构造
-ToolMessage 之后、Token 级引用化之前调用。规则：
+单一入口 `guard_tool_output`，用于 Worker 的 Evidence 摘要。规则：
 
 - 短结果（<= INLINE_CHAR_LIMIT）原样返回，行为不变；
 - `run_shell`：单段输出超过 1000 行或超过字符预算时，完整 stdout/stderr 落盘，

@@ -14,7 +14,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from aiive.db.models import TurnRecord, Event, Thread
-from aiive.runtime.message_normalizer import normalize_tool_call, normalize_tool_result
+from aiive.runtime.message_normalizer import normalize_tool_call, normalize_tool_result, tool_result_content
 
 
 @dataclass
@@ -208,10 +208,8 @@ class ThreadState:
             status = str(rd.get("tool_status") or "unknown") if rd else "unknown"
             result_text = ""
             if rd is not None:
-                raw = rd.get("tool_result", {})
-                result_text = raw if isinstance(raw, str) else _json.dumps(
-                    raw, ensure_ascii=False, default=str,
-                )
+                normalized = normalize_tool_result(rd)
+                result_text = tool_result_content(normalized["result"], name)
             tool_lines.append(f"- {name} -> {status}: {result_text}")
         if not tool_lines:
             return []
@@ -252,13 +250,11 @@ class ThreadState:
                 }]})
             elif etype in ("tool_result", "tool_result_ref"):
                 normalized = normalize_tool_result(d)
-                tr = normalized["result"]
-                tr_str = tr if isinstance(tr, str) else _json.dumps(tr, ensure_ascii=False, default=str)
                 msgs.append({
                     "role": "tool",
                     "tool_call_id": normalized["id"],
                     "name": normalized["name"],
-                    "content": tr_str,
+                    "content": tool_result_content(normalized["result"], normalized["name"]),
                 })
         return msgs
 
