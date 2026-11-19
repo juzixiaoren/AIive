@@ -1,14 +1,16 @@
 """公开网页研究工具的 SSRF、解析和 Task Scope 测试。"""
 from __future__ import annotations
 
-from aiive.tools.base import BaseTool, DatabaseTool
+import json
 
 import httpx
 import pytest
+from pydantic import SecretStr
 
 from aiive.config import settings
 from aiive.control.scope import TaskScope
 from aiive.control.task_policy import TaskPolicyEngine
+from aiive.tools.base import BaseTool
 from aiive.tools.registry import CapabilitySafetySchema, ToolDefinition
 from aiive.web import client as web_client
 from aiive.web.client import WebAccessError, fetch_web_page, search_web
@@ -47,22 +49,64 @@ def test_web_fetch_extracts_visible_text(monkeypatch) -> None:
     assert result["untrusted"] is True
 
 
-def test_duckduckgo_search_parses_and_unwraps_results(monkeypatch) -> None:
-    monkeypatch.setattr(web_client, "_resolve_public_host", _public_dns)
-    monkeypatch.setattr(settings, "aiive_web_search_provider", "duckduckgo")
-    html = (
-        '<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fdoc">文档标题</a>'
-        '<a class="result__snippet">摘要内容</a>'
-    )
-    transport = httpx.MockTransport(lambda request: httpx.Response(
-        200, headers={"content-type": "text/html"}, text=html, request=request,
-    ))
-    result = search_web("文档处理", transport=transport)
-    assert result["provider"] == "duckduckgo"
+@pytest.fixture
+def yuanbao_settings(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "aiive_web_search_enabled", True)
+    monkeypatch.setattr(settings, "aiive_yuanbao_search_api_key", SecretStr("test-key"))
+
+
+def test_yuanbao_search_authenticates_and_normalizes_results(yuanbao_settings) -> None:
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert str(request.url) == "https://api.wsa.cloud.tencent.com/SearchPro"
+        assert request.headers["Authorization"] == "Bearer test-key"
+        assert json.loads(request.content) == {"Query": "文档处理"}
+        return httpx.Response(200, json={"Response": {"Pages": [
+            "not-json",
+            json.dumps({"url": "javascript:void(0)"}),
+            json.dumps({"title": "文档标题", "url": "https://example.com/doc", "passage": "摘要内容"}),
+            json.dumps({"title": "第二条", "url": "https://example.com/other"}),
+        ]}})
+
+    result = search_web(" 文档处理 ", limit=1, transport=httpx.MockTransport(handle_request))
+    assert result["provider"] == "yuanbao"
+    assert result["query"] == "文档处理"
+    assert result["total"] == 1
     assert result["results"] == [{
         "title": "文档标题", "url": "https://example.com/doc", "snippet": "摘要内容",
     }]
     assert result["untrusted"] is True
+
+
+def test_yuanbao_search_missing_key_does_not_make_request(monkeypatch, yuanbao_settings) -> None:
+    monkeypatch.setattr(settings, "aiive_yuanbao_search_api_key", SecretStr(""))
+    transport = httpx.MockTransport(lambda request: pytest.fail("unexpected HTTP request"))
+    with pytest.raises(WebAccessError, match="AIIVE_YUANBAO_SEARCH_API_KEY"):
+        search_web("query", transport=transport)
+
+
+def test_yuanbao_search_does_not_forward_key_on_redirect(yuanbao_settings) -> None:
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "api.wsa.cloud.tencent.com"
+        return httpx.Response(307, headers={"Location": "https://example.com/"})
+
+    with pytest.raises(WebAccessError, match="yuanbao_search_http_error:307"):
+        search_web("query", transport=httpx.MockTransport(handle_request))
+
+
+def test_yuanbao_search_reports_api_error_without_echoing_message(yuanbao_settings) -> None:
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json={
+        "Response": {"Error": {"Code": "AuthFailure", "Message": "Bearer test-key"}},
+    }))
+    with pytest.raises(WebAccessError, match="^yuanbao_search_api_error:AuthFailure$"):
+        search_web("query", transport=transport)
+
+
+def test_yuanbao_search_caps_response_size(monkeypatch, yuanbao_settings) -> None:
+    monkeypatch.setattr(settings, "aiive_web_max_response_bytes", 1024)
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, content=b" " * 1025))
+    with pytest.raises(WebAccessError, match="web_response_too_large"):
+        search_web("query", transport=transport)
 
 
 def test_network_capability_requires_scope_and_url_host_allowlist() -> None:

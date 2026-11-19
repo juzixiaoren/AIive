@@ -6,7 +6,7 @@
 """
 from typing import ClassVar, Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -213,12 +213,8 @@ class Settings(BaseSettings):
     supervisor_monitor_seconds: int = 600
     supervisor_state_dir: str = ""
 
-    # 公开网页检索与抓取。默认 DuckDuckGo HTML 无需密钥；也可切换 Brave API
-    # 或自建 SearXNG。所有返回内容均标记为不可信外部证据。
     aiive_web_search_enabled: bool = True
-    aiive_web_search_provider: Literal["duckduckgo", "brave", "searxng"] = "duckduckgo"
-    aiive_brave_search_api_key: str = ""
-    aiive_searxng_base_url: str = ""
+    aiive_yuanbao_search_api_key: SecretStr = SecretStr("")
     aiive_web_request_timeout_seconds: int = 15
     aiive_web_max_response_bytes: int = 2_000_000
     aiive_web_user_agent: str = "AIive/0.1 (+local-personal-agent)"
@@ -286,10 +282,6 @@ class Settings(BaseSettings):
             raise ValueError("AIIVE_WEB_REQUEST_TIMEOUT_SECONDS 必须大于 0")
         if not 1024 <= self.aiive_web_max_response_bytes <= 10_000_000:
             raise ValueError("AIIVE_WEB_MAX_RESPONSE_BYTES 必须在 1KB 到 10MB 之间")
-        if self.aiive_web_search_provider == "brave" and not self.aiive_brave_search_api_key.strip():
-            raise ValueError("使用 Brave 搜索时必须配置 AIIVE_BRAVE_SEARCH_API_KEY")
-        if self.aiive_web_search_provider == "searxng" and not self.aiive_searxng_base_url.strip():
-            raise ValueError("使用 SearXNG 搜索时必须配置 AIIVE_SEARXNG_BASE_URL")
         if self.aiive_desktop_node_lease_seconds < 15:
             raise ValueError("AIIVE_DESKTOP_NODE_LEASE_SECONDS 不能小于 15")
         if self.aiive_desktop_dispatch_timeout_seconds <= 0:

@@ -7,11 +7,13 @@ import re
 import socket
 from html.parser import HTMLParser
 from typing import Any, override
-from urllib.parse import parse_qs, unquote, urljoin, urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 
 from aiive.config import settings
+
+_YUANBAO_SEARCH_URL = "https://api.wsa.cloud.tencent.com/SearchPro"
 
 
 class WebAccessError(ValueError):
@@ -72,19 +74,23 @@ def _pin_url_to_address(url: str, address: str) -> str:
     return urlunsplit((parsed.scheme, host, parsed.path, parsed.query, ""))
 
 
+def _read_web_body(response: httpx.Response) -> bytes:
+    body = bytearray()
+    for chunk in response.iter_bytes():
+        if len(body) + len(chunk) > settings.aiive_web_max_response_bytes:
+            raise WebAccessError("web_response_too_large")
+        body.extend(chunk)
+    return bytes(body)
+
+
 def _read_response(
     url: str,
     *,
-    headers: dict[str, str] | None = None,
-    params: dict[str, Any] | None = None,
     transport: httpx.BaseTransport | None = None,
-    accepted_types: tuple[str, ...] = ("text/", "application/json", "application/xhtml+xml"),
 ) -> tuple[str, str, bytes]:
     current = url
-    current_params = params
-    base_headers = {"User-Agent": settings.aiive_web_user_agent, **(headers or {})}
     for _hop in range(6):
-        logical_url = str(httpx.URL(current, params=current_params))
+        logical_url = str(httpx.URL(current))
         host, addresses = _validate_public_url(logical_url)
         # Mock/custom transports are already isolated by their caller. Production
         # requests use the exact validated address so DNS cannot change afterward.
@@ -94,7 +100,7 @@ def _read_response(
         last_transport_error: httpx.TransportError | None = None
         redirected = False
         for target in targets:
-            request_headers = dict(base_headers)
+            request_headers = {"User-Agent": settings.aiive_web_user_agent}
             extensions: dict[str, Any] = {}
             if transport is None:
                 request_headers["Host"] = urlsplit(logical_url).netloc
@@ -119,27 +125,19 @@ def _read_response(
                             if not location:
                                 raise WebAccessError("redirect_without_location")
                             current = urljoin(logical_url, location)
-                            current_params = None
                             redirected = True
                             break
                         response.raise_for_status()
                         content_type = response.headers.get(
                             "content-type", "",
                         ).split(";", 1)[0].casefold()
-                        if not any(
-                            content_type.startswith(prefix) for prefix in accepted_types
+                        if not content_type.startswith(
+                            ("text/", "application/json", "application/xhtml+xml"),
                         ):
                             raise WebAccessError(
                                 f"unsupported_web_content_type:{content_type or 'missing'}"
                             )
-                        chunks: list[bytes] = []
-                        size = 0
-                        for chunk in response.iter_bytes():
-                            size += len(chunk)
-                            if size > settings.aiive_web_max_response_bytes:
-                                raise WebAccessError("web_response_too_large")
-                            chunks.append(chunk)
-                        return logical_url, content_type, b"".join(chunks)
+                        return logical_url, content_type, _read_web_body(response)
                     finally:
                         response.close()
             except httpx.TransportError as error:
@@ -206,48 +204,6 @@ class _PageTextParser(HTMLParser):
         return title, text
 
 
-class _DuckDuckGoParser(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.results: list[dict[str, str]] = []
-        self._link: dict[str, str] | None = None
-        self._snippet: list[str] | None = None
-
-    @override
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        values = dict(attrs)
-        classes = set((values.get("class") or "").split())
-        if tag == "a" and "result__a" in classes:
-            self._link = {"title": "", "url": values.get("href") or "", "snippet": ""}
-        elif "result__snippet" in classes and self.results:
-            self._snippet = []
-
-    @override
-    def handle_endtag(self, tag: str) -> None:
-        if tag == "a" and self._link is not None:
-            self._link["title"] = re.sub(r"\s+", " ", self._link["title"]).strip()
-            if self._link["title"] and self._link["url"]:
-                self.results.append(self._link)
-            self._link = None
-        if self._snippet is not None and tag in {"a", "div", "span"}:
-            if self.results:
-                self.results[-1]["snippet"] = re.sub(r"\s+", " ", " ".join(self._snippet)).strip()
-            self._snippet = None
-
-    @override
-    def handle_data(self, data: str) -> None:
-        if self._link is not None:
-            self._link["title"] += data
-        elif self._snippet is not None:
-            self._snippet.append(data)
-
-
-def _unwrap_ddg_url(url: str) -> str:
-    absolute = urljoin("https://duckduckgo.com", url)
-    uddg = parse_qs(urlsplit(absolute).query).get("uddg")
-    return unquote(uddg[0]) if uddg else absolute
-
-
 def fetch_web_page(
     url: str,
     *,
@@ -275,6 +231,52 @@ def fetch_web_page(
     }
 
 
+def _parse_yuanbao_results(data: bytes, limit: int) -> list[dict[str, str]]:
+    try:
+        payload = json.loads(data)
+    except (ValueError, RecursionError):
+        raise WebAccessError("yuanbao_search_invalid_response") from None
+    response = payload.get("Response") if isinstance(payload, dict) else None
+    if not isinstance(response, dict):
+        raise WebAccessError("yuanbao_search_invalid_response")
+    if response.get("Error") is not None:
+        error = response["Error"]
+        code = error.get("Code") if isinstance(error, dict) else None
+        if isinstance(code, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9.]{0,79}", code):
+            raise WebAccessError(f"yuanbao_search_api_error:{code}")
+        raise WebAccessError("yuanbao_search_api_error")
+    if "Pages" not in response:
+        raise WebAccessError("yuanbao_search_invalid_response")
+    pages = response["Pages"]
+    if pages is None:
+        return []
+    if not isinstance(pages, list):
+        raise WebAccessError("yuanbao_search_invalid_response")
+
+    results: list[dict[str, str]] = []
+    for page in pages:
+        if not isinstance(page, str):
+            continue
+        try:
+            item = json.loads(page)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(item, dict):
+            continue
+        url = item.get("url")
+        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+            continue
+        title, snippet = item.get("title"), item.get("passage")
+        results.append({
+            "title": title if isinstance(title, str) else "",
+            "url": url,
+            "snippet": snippet if isinstance(snippet, str) else "",
+        })
+        if len(results) == limit:
+            break
+    return results
+
+
 def search_web(
     query: str,
     *,
@@ -286,43 +288,34 @@ def search_web(
     query = query.strip()
     if not query:
         raise WebAccessError("empty_search_query")
+    api_key = settings.aiive_yuanbao_search_api_key.get_secret_value().strip()
+    if not api_key:
+        raise WebAccessError("yuanbao_search_api_key_missing: configure AIIVE_YUANBAO_SEARCH_API_KEY")
     limit = max(1, min(limit, 10))
-    provider = settings.aiive_web_search_provider
-    if provider == "brave":
-        _url, _content_type, data = _read_response(
-            "https://api.search.brave.com/res/v1/web/search",
-            headers={"Accept": "application/json", "X-Subscription-Token": settings.aiive_brave_search_api_key},
-            params={"q": query, "count": limit}, transport=transport,
-        )
-        payload = json.loads(_decode_web(data))
-        raw_results = (payload.get("web") or {}).get("results") or []
-        results = [
-            {"title": str(item.get("title", "")), "url": str(item.get("url", "")),
-             "snippet": str(item.get("description", ""))}
-            for item in raw_results[:limit] if isinstance(item, dict)
-        ]
-    elif provider == "searxng":
-        base = settings.aiive_searxng_base_url.rstrip("/") + "/search"
-        _url, _content_type, data = _read_response(
-            base, params={"q": query, "format": "json"}, transport=transport,
-        )
-        payload = json.loads(_decode_web(data))
-        results = [
-            {"title": str(item.get("title", "")), "url": str(item.get("url", "")),
-             "snippet": str(item.get("content", ""))}
-            for item in (payload.get("results") or [])[:limit] if isinstance(item, dict)
-        ]
-    else:
-        _url, _content_type, data = _read_response(
-            "https://html.duckduckgo.com/html/", params={"q": query}, transport=transport,
-            accepted_types=("text/html",),
-        )
-        parser = _DuckDuckGoParser()
-        parser.feed(_decode_web(data))
-        results = [
-            {**item, "url": _unwrap_ddg_url(item["url"])} for item in parser.results[:limit]
-        ]
+    try:
+        with httpx.Client(
+            timeout=settings.aiive_web_request_timeout_seconds,
+            follow_redirects=False,
+            trust_env=False,
+            transport=transport,
+        ) as client, client.stream(
+            "POST",
+            _YUANBAO_SEARCH_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json; charset=utf-8",
+                "User-Agent": settings.aiive_web_user_agent,
+            },
+            json={"Query": query},
+        ) as response:
+            if not response.is_success:
+                raise WebAccessError(f"yuanbao_search_http_error:{response.status_code}")
+            data = _read_web_body(response)
+    except httpx.RequestError:
+        raise WebAccessError("yuanbao_search_request_failed") from None
+
+    results = _parse_yuanbao_results(data, limit)
     return {
-        "ok": True, "query": query, "provider": provider, "results": results,
+        "ok": True, "query": query, "provider": "yuanbao", "results": results,
         "total": len(results), "untrusted": True,
     }

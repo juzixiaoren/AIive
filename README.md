@@ -347,7 +347,7 @@ AIive/
 - `reindex_document` — 从内容寻址原文重建索引
 
 ### 联网研究
-- `web_search` — DuckDuckGo（免密钥）/ Brave / SearXNG 搜索
+- `web_search` — 腾讯云元宝搜索。在后端 `.env` 中填入 `AIIVE_YUANBAO_SEARCH_API_KEY`（API Key，不是 KeyName）；未配置时仅搜索不可用，不影响网页抓取。
 - `fetch_web_page` — 带 SSRF、重定向、响应大小限制的网页正文抓取
 
 ### 内置 Skills
