@@ -33,7 +33,7 @@ class ListTaskFilesTool(DatabaseTool):
         return page
 
 
-def _read_text(item: Any, read: Any, db: Session, offset: int, max_bytes: int) -> dict[str, Any]:
+def read_text_task_file(item: Any, read: Any, db: Session, offset: int, max_bytes: int) -> dict[str, Any]:
     if item is None:
         return {"ok": False, "error_type": "task_file_unavailable"}
     mime = item.mime_type
@@ -54,7 +54,7 @@ class ReadTaskEvidenceTool(DatabaseTool):
         evidence = TaskReadRepository(db).get_evidence(_task_id(db, ctx), evidence_id)
         if evidence and ctx and ctx.action_id:
             inherit_sources(db, "agent_action", ctx.action_id, [("task_evidence", evidence.id)])
-        return _read_text(evidence, EvidenceStore.read, db, offset, max_bytes)
+        return read_text_task_file(evidence, EvidenceStore.read, db, offset, max_bytes)
 
 
 class ReadTaskArtifactTool(DatabaseTool):
@@ -63,4 +63,4 @@ class ReadTaskArtifactTool(DatabaseTool):
         artifact = TaskReadRepository(db).get_artifact(_task_id(db, ctx), artifact_id)
         if artifact and ctx and ctx.action_id:
             inherit_sources(db, "agent_action", ctx.action_id, [("task_artifact", artifact.id)])
-        return _read_text(artifact, ArtifactStore.read, db, offset, max_bytes)
+        return read_text_task_file(artifact, ArtifactStore.read, db, offset, max_bytes)

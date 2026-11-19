@@ -27,6 +27,7 @@ class TaskContextAssembler:
         *,
         registry: ToolRegistry | None = None,
         discovery_registry: ToolRegistry | None = None,
+        reporting: bool = False,
     ) -> dict[str, Any]:
         """构造 Task Context 快照。
 
@@ -39,13 +40,15 @@ class TaskContextAssembler:
         if not reader.task_visible(task):
             raise TaskContentUnavailable("task_unavailable")
         skill = self._active_skill(task)
-        execution, available = self._registries(task, registry, discovery_registry)
-        tool_view = build_tool_view(
-            execution,
-            capabilities,
-            discovery_state(task.task_state or {}),
-            discovery_registry=available,
-        )
+        tool_view = {}
+        if not reporting:
+            execution, available = self._registries(task, registry, discovery_registry)
+            tool_view = build_tool_view(
+                execution,
+                capabilities,
+                discovery_state(task.task_state or {}),
+                discovery_registry=available,
+            )
         checkpoint = TaskRepository(self.db).latest_checkpoint(task.id)
         actions = reader.actions(task.id)
         evidence = list(reversed(reader.evidence(task.id)[-20:]))
@@ -135,6 +138,11 @@ class TaskContextAssembler:
             )
         from copy import deepcopy
         prompt_snapshot = deepcopy(snapshot)
+        evidence_ids = {item["id"] for item in prompt_snapshot["evidence"]}
+        for action in prompt_snapshot["actions"]:
+            result = action["result_summary"]
+            if isinstance(result, dict) and result.get("evidence_id") in evidence_ids:
+                result.pop("summary", None)
         for group in ("resident", "available", "loaded"):
             for definition in prompt_snapshot["tools"].get(group, []):
                 definition.pop("parameters", None)

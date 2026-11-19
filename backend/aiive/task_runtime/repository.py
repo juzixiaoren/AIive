@@ -215,7 +215,7 @@ class TaskRepository:
             target_node_id=target_node_id,
             task_brief=brief.model_dump(mode="json"),
             task_state={"plan": [], "inputs": [], "last_decision": None},
-            budgets=budget.model_dump(mode="json"),
+            budgets=budget.model_dump(mode="json", exclude_unset=True, exclude_none=True),
             usage={
                 "runs": 0,
                 "model_calls": 0,
@@ -451,7 +451,9 @@ class TaskRepository:
         self.db.flush()
         return job
 
-    def start_run(self, task_id: str, *, trigger: str, lease_seconds: int = 120) -> tuple[AgentTask, AgentRun]:
+    def start_run(
+        self, task_id: str, *, trigger: str, lease_seconds: int = 120, count_toward_budget: bool = True,
+    ) -> tuple[AgentTask, AgentRun]:
         task = self.get_task(task_id, for_update=True)
         if task is None:
             raise TaskNotFoundError("task_not_found")
@@ -490,9 +492,10 @@ class TaskRepository:
             event_type="run_started",
             event_payload={"run_id": run.id, "run_index": run_index, "trigger": trigger},
         )
-        usage = dict(task.usage or {})
-        usage["runs"] = int(usage.get("runs", 0)) + 1
-        task.usage = usage
+        if count_toward_budget:
+            usage = dict(task.usage or {})
+            usage["runs"] = int(usage.get("runs", 0)) + 1
+            task.usage = usage
         self.db.flush()
         return task, run
 

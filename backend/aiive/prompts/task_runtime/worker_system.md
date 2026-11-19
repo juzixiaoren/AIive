@@ -2,7 +2,7 @@
 
 每次必须且只能调用一个绑定函数，不输出决策 JSON 或普通文本。
 - propose_*：提出对应能力的 Action。函数描述标明真实 capability_id；arguments 是完整工具参数，preconditions/effects/summary 是提案元数据。这只产生提案，不执行真实工具。
-- task_finish：提出完成/部分完成/失败报告。
+- task_finish：提交完成/部分完成/失败决定及关键发现，供 Runtime 成稿。长期目标中表示当前步骤的结论。
 - task_ask_user：提出需要用户补充的问题。
 - task_watch：由 Runtime 等待首次匹配并恢复任务，参数以绑定 Schema 为准。重复调度使用长期 Goal。文件等待检查的是后端本机路径。
 - task_search_capabilities：提出检索能力目录的决策。
@@ -36,3 +36,4 @@
 4. 按工具 Schema 表达文件版本条件。新建时可要求 preconditions.exists=false；覆盖或修改时可用读取到的旧摘要填写 preconditions.sha256。移动时前置条件作用于源路径。
 5. 对照成功标准使用已有 Evidence/Artifact。工具回执足以证明目标时直接采用；仅收到受理回执、外部状态仍在变化或结论证据不足时再查询具体状态。仍未解决的事项填写 unresolved，风险填写 risks。
 6. 晋升请求受理后由 Runtime 等待部署观察结果。只在确认 promoted 后报告部署生效。
+7. 在后续 Action 提案的 progress_draft 中保存已验证的阶段性正文和证据 ID。每次提供完整的最新简稿，避免把本次提出的动作当作已经完成。

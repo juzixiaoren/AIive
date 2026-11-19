@@ -65,14 +65,16 @@ class ActionStatus(StrEnum):
 
 
 class TaskBudget(BaseModel):
+    """Optional execution limits. Omit/null/empty means no task-wide limits. Reports are metered separately."""
+
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
-    max_runs: int = Field(default=20, ge=1, le=1000)
-    max_model_calls: int = Field(default=30, ge=1, le=5000)
-    max_actions: int = Field(default=50, ge=1, le=5000)
+    max_runs: int | None = Field(default=None, ge=1, le=1000)
+    max_model_calls: int | None = Field(default=None, ge=1, le=5000)
+    max_actions: int | None = Field(default=None, ge=1, le=5000)
     max_actions_per_run: int = Field(default=8, ge=1, le=100)
-    max_tool_failures: int = Field(default=10, ge=1, le=1000)
-    max_total_tokens: int = Field(default=200_000, ge=1000)
+    max_tool_failures: int | None = Field(default=None, ge=1, le=1000)
+    max_total_tokens: int | None = Field(default=None, ge=1000)
     max_wall_time_seconds: int | None = Field(default=None, ge=1, le=31_536_000)
     max_cost_usd: float | None = Field(
         default=None, ge=0.01, le=1_000_000,
@@ -117,6 +119,7 @@ class ActionProposal(BaseModel):
     preconditions: dict[str, Any] = Field(default_factory=dict)
     effects: dict[str, Any] = Field(default_factory=dict)
     summary: str = ""
+    progress_draft: str = Field(default="", max_length=8000)
     # search_capabilities 的检索关键词；发现类决策只读，不产生 Action。
     query: str = ""
     report_status: Literal["succeeded", "partial", "failed"] = "succeeded"
@@ -154,3 +157,7 @@ class TaskReport(BaseModel):
     artifact_refs: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     unresolved: list[str] = Field(default_factory=list)
+    stop_reason: str | None = None
+    budget_exhausted: bool | None = None
+    report_usage: dict[str, int] | None = None
+    report_incomplete: bool | None = None

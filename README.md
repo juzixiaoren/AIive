@@ -192,7 +192,10 @@ Web、Android 或 Electron 界面发出的自然语言指令都由后端 Agent �
 [Desktop 应用与本地执行节点指南](docs/guides/DESKTOP_APP.md)。
 
 主对话的 `get_task_status` 直接返回结构化状态和报告。详情较大时用同一个工具按
-`details_page.next_cursor` 续读。其他主对话工具结果使用 Token 预算。
+`details_page.next_cursor` 续读，也可传 `evidence_id` 读取当前任务的证据。
+创建后台任务时可省略 `budgets`，或传 `null` / `{}`，只启用显式设置的执行上限。
+任务触顶后从已持久化的进度生成 `partial` 报告，报告用量在 `report_usage` 单列。
+主对话可通过 `budget_exhausted` 和 `stop_reason` 判断报告是否因执行预算而提前收尾。
 
 后台任务的 Evidence 摘要使用 `tool_output_guard` 控制回填大小：文件读取超过 1000 字符只回填路径、总字符数、
 总行数与分页提示；Shell 输出超过 1000 行只回填首尾各 50 行；其他工具（含 MCP）超过

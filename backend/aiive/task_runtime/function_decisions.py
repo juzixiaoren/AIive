@@ -62,7 +62,9 @@ class WorkerFunctions:
             self.capabilities[name] = capability_id
             arguments = deepcopy(definition["input_schema"])
             definitions = arguments.pop("$defs", {})
-            properties = {"arguments": arguments, **{key: deepcopy(fields[key]) for key in ("effects", "summary")}}
+            properties = {"arguments": arguments, **{
+                key: deepcopy(fields[key]) for key in ("effects", "summary", "progress_draft")
+            }}
             if {"path", "source", "file_path"}.intersection(arguments.get("properties", {})):
                 properties["preconditions"] = FilePreconditions.model_json_schema()
             schema = {"type": "object", "additionalProperties": False, "required": ["arguments"],

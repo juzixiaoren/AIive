@@ -8,6 +8,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from aiive.control.approval_service import TaskApprovalService
 from aiive.control.capability_broker import CapabilityBroker
 from aiive.control.scope import (
@@ -181,7 +183,8 @@ def test_task_status_large_details_paginate_within_the_same_thread(db_session) -
     other_thread = _thread(db_session)
     task = _task(db_session, thread)
     task.status = "partial"
-    task.report = {"status": "partial", "summary": '长报告\n含引号"🙂' * 600}
+    task.report = {"status": "partial", "summary": '长报告\n含引号"🙂' * 600,
+                   "budget_exhausted": True, "stop_reason": "token_budget_exhausted"}
     db_session.flush()
     registry = build_main_agent_registry()
     status_tool = build_langchain_tools(
@@ -201,6 +204,8 @@ def test_task_status_large_details_paginate_within_the_same_thread(db_session) -
     while True:
         page = response["details_page"]
         assert response["status"] == "partial"
+        assert response["budget_exhausted"] is True
+        assert response["stop_reason"] == "token_budget_exhausted"
         assert "usage" in response
         assert len(page["content"]) <= 1800
         assert page["offset"] == sum(len(part) for part in fragments)
@@ -217,6 +222,55 @@ def test_task_status_large_details_paginate_within_the_same_thread(db_session) -
     stale = json.loads(status_tool.invoke({**args, "details_cursor": cursor}))
     assert stale["ok"] is False
     assert "task_details_changed" in stale["error"]
+
+
+@pytest.mark.parametrize("budget_args", [{}, {"budgets": None}, {"budgets": {}}])
+def test_create_without_budget_via_api_and_main_agent(db_session, budget_args) -> None:
+    from aiive.api.routes_agent_tasks import CreateAgentTaskRequest, create_agent_task
+    from aiive.context.run_context import RunContext
+    from aiive.tools.langchain_adapter import build_langchain_tools
+
+    thread = _thread(db_session)
+    request = CreateAgentTaskRequest(thread_id=thread.id, goal="完成测试任务", **budget_args)
+    assert create_agent_task(request, db_session)["budgets"] == {}
+    delegate = build_langchain_tools(
+        build_main_agent_registry(), RunContext(thread_id=thread.id, trace_id="budget-delegate"), ["delegate_task"],
+    )[0]
+    delegated = json.loads(delegate.invoke({"goal": "完成测试任务", **budget_args}))
+    task = db_session.get(AgentTask, delegated["task_id"])
+    assert task.budgets == {}
+    task.usage = {**task.usage, "runs": 20, "model_calls": 30, "actions": 50,
+                  "tool_failures": 10, "prompt_tokens": 300_000}
+    result = PersistentTaskRuntime(db_session, agent_executor=SequenceAgent(
+        ActionProposal(decision="action", capability_id="get_current_time"),
+        ActionProposal(decision="finish", summary="已取得结果"),
+    )).run(task.id)
+    assert result["status"] == "succeeded"
+    assert task.usage["actions"] == 51 and task.usage["runs"] == 21
+
+
+def test_main_agent_can_read_own_task_evidence_only(db_session) -> None:
+    from aiive.context.run_context import RunContext
+    from aiive.tools.langchain_adapter import build_langchain_tools
+
+    thread = _thread(db_session)
+    other_thread = _thread(db_session)
+    task = _task(db_session, thread)
+    report = PersistentTaskRuntime(db_session, agent_executor=SequenceAgent(
+        ActionProposal(decision="action", capability_id="get_current_time"),
+        ActionProposal(decision="finish", summary="已取得结果"),
+    )).run(task.id)["report"]
+    args = {"task_id": task.id, "evidence_id": report["evidence_refs"][0]}
+    registry = build_main_agent_registry()
+    own_tool = build_langchain_tools(registry, RunContext(thread_id=thread.id, trace_id="evidence"), ["get_task_status"])[0]
+    other_tool = build_langchain_tools(
+        registry, RunContext(thread_id=other_thread.id, trace_id="other-evidence"), ["get_task_status"],
+    )[0]
+    evidence = json.loads(own_tool.invoke(args))["evidence"]
+    assert evidence["ok"] and json.loads(evidence["content"])["ok"]
+    assert json.loads(other_tool.invoke(args))["ok"] is False
+    another_task = _task(db_session, thread)
+    assert not json.loads(own_tool.invoke({**args, "task_id": another_task.id}))["evidence"]["ok"]
 
 
 def test_create_task_goal_cannot_be_overridden_by_brief(db_session) -> None:
@@ -898,8 +952,8 @@ def test_complex_task_keeps_multiple_actions_in_task_timeline(db_session) -> Non
 def test_action_budget_stops_new_action_without_losing_completed_evidence(db_session) -> None:
     task = _task(db_session, _thread(db_session), budgets={"max_actions": 1})
     agent = SequenceAgent(
-        ActionProposal(decision="action", capability_id="get_current_time", summary="first"),
-        ActionProposal(decision="action", capability_id="get_current_time", summary="over budget"),
+        ActionProposal(decision="action", capability_id="get_current_time", summary="first",
+                       progress_draft="此前已记录的用户要求"),
     )
 
     result = PersistentTaskRuntime(db_session, agent_executor=agent).run(task.id)
@@ -908,6 +962,9 @@ def test_action_budget_stops_new_action_without_losing_completed_evidence(db_ses
     assert result["status"] == TaskStatus.PARTIAL.value
     assert len(actions) == 1 and actions[0].status == ActionStatus.SUCCEEDED.value
     assert result["report"]["unresolved"] == ["action_budget_exhausted"]
+    assert result["report"]["evidence_refs"]
+    assert "此前已记录的用户要求" in result["report"]["summary"]
+    assert result["report"]["summary"].endswith("预算已达上限终止")
 
 
 def test_self_improvement_trusted_core_is_immutable() -> None:

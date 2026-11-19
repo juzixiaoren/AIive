@@ -114,6 +114,8 @@ class Model:
 
     def invoke(self, messages, **kwargs):
         self.messages.append(messages)
+        if kwargs.get("config", {}).get("run_name") == "task_report":
+            return AIMessage(content="执行结果与待完成事项。")
         output = next(self.outputs)
         if isinstance(output, Exception):
             raise output
@@ -157,8 +159,10 @@ def test_structural_exhaustion_real_handler(durable_db, monkeypatch, limit):
     task = durable_db.get(AgentTask, task_id)
     run = durable_db.get(AgentRun, task.current_run_id)
     calls = min(limit, 3)
-    assert task.status == "failed" and run.status == "failed" and run.lease_expires_at is None
-    assert task.usage["model_calls"] == calls == len(model.messages)
+    assert task.status == ("partial" if limit <= 2 else "failed")
+    assert run.status == ("completed" if limit <= 2 else "failed") and run.lease_expires_at is None
+    assert task.usage["model_calls"] == calls
+    assert len(model.messages) == calls + int(limit <= 2)
     assert task.usage["prompt_tokens"] == calls * 10
     assert run.token_usage["total_tokens"] == calls * 15
     assert durable_db.query(AgentAction).filter_by(task_id=task_id).count() == 0
@@ -174,11 +178,13 @@ def test_structure_then_arguments_corrected_before_action(durable_db, monkeypatc
         '{"decision":"finish","summary":"done"}'])
     assert handle_agent_task_run(claimed).outcome == HandlerOutcome.COMPLETED
     durable_db.expire_all()
-    assert durable_db.get(AgentTask, task_id).status == "succeeded"
+    task = durable_db.get(AgentTask, task_id)
+    assert task.status == "succeeded"
+    assert task.report["summary"] == "执行结果与待完成事项。"
     actions = durable_db.query(AgentAction).filter_by(task_id=task_id).all()
     assert len(actions) == 1 and actions[0].status == "succeeded"
     assert "max_steps" in model.messages[2][-1].content
-    assert durable_db.get(AgentTask, task_id).usage["model_calls"] == 4
+    assert task.usage["model_calls"] == 4 and len(model.messages) == 5
 
 
 @pytest.mark.parametrize("error", [TimeoutError("timeout"), RuntimeError("rate_limit"), ValueError("unexpected")])

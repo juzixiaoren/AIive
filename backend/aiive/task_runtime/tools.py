@@ -198,6 +198,8 @@ class GetTaskStatusTool(BaseTool):
         self,
         task_id: str,
         details_cursor: str = "",
+        evidence_id: str = "",
+        evidence_offset: int = 0,
         ctx: RunContext | None = None,
     ) -> dict[str, Any]:
         run_ctx = _require_context(ctx)
@@ -207,14 +209,28 @@ class GetTaskStatusTool(BaseTool):
             task = repo.get_task(task_id)
             if task is None or task.thread_id != run_ctx.thread_id:
                 raise ValueError("task_not_found")
+            if evidence_id:
+                from aiive.task_runtime.evidence import EvidenceStore
+                from aiive.task_runtime.read_repository import TaskReadRepository
+                from aiive.tools.task_file_tools import read_text_task_file
+
+                evidence = TaskReadRepository(db).get_evidence(task.id, evidence_id)
+                return {"task_id": task.id, "evidence": read_text_task_file(
+                    evidence, EvidenceStore.read, db, evidence_offset, TASK_DETAILS_PAGE_CHARS,
+                )}
             detail = repo.detail(task, include_events=False)
             result = {
                 "task_id": task.id,
                 "title": task.title,
                 "status": task.status,
                 "usage": task.usage or {},
+                "budgets": task.budgets or {},
                 "artifact_count": len(detail["artifacts"]),
             }
+            report = task.report or {}
+            for key in ("budget_exhausted", "stop_reason"):
+                if key in report:
+                    result[key] = report[key]
             approvals = jsonable_encoder([
                 item for item in detail["approvals"] if item["status"] == "pending"
             ], sqlalchemy_safe=False)
@@ -397,7 +413,8 @@ def build_main_agent_registry() -> ToolRegistry:
         "get_task_status",
         "查询当前对话所属任务的状态、用量、报告和待审批项。详情较长时返回 details_page，"
         + "按顺序读取 content（报告和待审批项的 JSON 文本）；用同一 task_id 和 next_cursor 续读。"
-        + "如返回 task_details_changed，去掉游标重新查询。",
+        + "如返回 task_details_changed，去掉游标重新查询。budget_exhausted 为 true 时，报告仅基于已完成的行动。"
+        + "传报告中的 evidence_id 可读取原始证据文本，按 evidence.next_offset 续读。",
         {
             "task_id": {"type": "str", "required": True, "minLength": 1},
             "details_cursor": {
@@ -405,6 +422,8 @@ def build_main_agent_registry() -> ToolRegistry:
                 "pattern": "^[0-9a-f]{16}:[0-9]{1,10}$",
                 "description": "上一页 details_page.next_cursor 的原值；首次查询省略。",
             },
+            "evidence_id": {"type": "str", "minLength": 1, "maxLength": 64},
+            "evidence_offset": {"type": "int", "minimum": 0},
         },
         GetTaskStatusTool,
     ))

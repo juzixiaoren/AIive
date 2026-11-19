@@ -32,9 +32,9 @@
 
 通过任务级 Meta Tools 管理运行命令、操作桌面、普通文件或跨 Turn 持续的工作：
 
-- `delegate_task`：把结构化 TaskBrief 交给持久 Task Runtime；
+- `delegate_task`：把结构化 TaskBrief 交给持久 Task Runtime。执行预算可省略，填写时仅限制执行，独立成稿另计；
 - `list_skills`：查看内置 Skill、相关能力和联网要求；
-- `get_task_status`：读取当前会话任务的状态、用量、待审批项和报告；出现 `details_page.next_cursor` 时，可用同一工具续读；
+- `get_task_status`：读取当前会话任务的状态、预算、用量、待审批项和报告；出现 `details_page.next_cursor` 时，用同一工具续读。`budget_exhausted=true` 时应向用户交付已有结果，并说明报告基于部分动作和原预算不足。可传 `evidence_id` 读取证据；
 - `cancel_task`：取消尚未结束的 Task；
 - `send_task_input`：向等待输入的 Task 追加结构化用户信息。
 

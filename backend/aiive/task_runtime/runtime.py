@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from aiive.control.approval_service import TaskApprovalService
@@ -74,26 +75,30 @@ class PersistentTaskRuntime:
 
     def run(self, task_id: str, *, trigger: str = "dispatch") -> dict[str, Any]:
         candidate = self.repo.get_task(task_id, for_update=True)
+        pending_report = None
+        initial_budget_issue = None
         if candidate is not None and candidate.status == TaskStatus.QUEUED.value:
             budget = TaskBudget.model_validate(candidate.budgets or {})
-            if int((candidate.usage or {}).get("runs", 0)) >= budget.max_runs:
-                return self._complete(
-                    candidate, None, status="partial", summary="任务运行次数已达到上限。",
-                    unresolved=["run_budget_exhausted"],
+            pending_report = (candidate.task_state or {}).get("pending_report")
+            if budget.max_runs is not None and int((candidate.usage or {}).get("runs", 0)) >= budget.max_runs:
+                initial_budget_issue = "run_budget_exhausted"
+            else:
+                initial_budget_issue = self._budget_issue(
+                    candidate, budget, before_model=self.repo.ready_action(candidate.id) is None,
                 )
-        task, run = self.repo.start_run(task_id, trigger=trigger)
+        report_only = pending_report is not None or initial_budget_issue is not None
+        task, run = self.repo.start_run(
+            task_id, trigger="report" if report_only else trigger, count_toward_budget=not report_only,
+        )
         self.active_run_id = run.id
         self.db.commit()
+        if pending_report is not None:
+            return self._finish_report(task, run, pending_report)
+        if initial_budget_issue:
+            return self._stop_for_budget(task, run, initial_budget_issue)
         self._ensure_isolation(task, run)
         self.db.commit()
         budget = TaskBudget.model_validate(task.budgets or {})
-        initial_budget_issue = self._budget_issue(task, budget, before_model=False)
-        if initial_budget_issue:
-            return self._complete(
-                task, run, status="partial",
-                summary="任务运行预算或截止时间已耗尽。",
-                unresolved=[initial_budget_issue],
-            )
 
         goals = GoalService(self.db) if GoalService.is_goal_task(task) else None
         if goals is not None and not goals.on_run_started(task, run):
@@ -140,23 +145,15 @@ class PersistentTaskRuntime:
                 self.db.commit()
                 return {"status": task.status, "task_id": task.id}
             ready = self.repo.ready_action(task.id)
+            budget_issue = self._budget_issue(task, budget, before_model=ready is None)
+            if budget_issue:
+                return self._stop_for_budget(task, run, budget_issue)
             if ready is not None:
                 outcome = self._dispatch_ready(task, run, ready)
                 completed_this_run += 1
                 if outcome in {"blocked", "terminal"}:
                     return {"status": task.status, "task_id": task.id, "action_id": ready.id}
                 continue
-
-            budget_issue = self._budget_issue(task, budget, before_model=True)
-            if budget_issue:
-                if correction_failures:
-                    return self._validation_failed(task, run, run_tokens, last_model)
-                return self._complete(
-                    task, run, status="partial",
-                    summary="任务预算已耗尽。",
-                    unresolved=[budget_issue],
-                    model=last_model, token_usage=run_tokens,
-                )
 
             broker = CapabilityBroker(self.db)
             # 常驻入口按"全部可用能力"解析：即使任务显式收窄了授权，L0 入口仍可见，
@@ -217,10 +214,7 @@ class PersistentTaskRuntime:
                     decision = self.agent.decide(task, resident)
                 except TaskModelBudgetError as error:
                     task.usage = {**(task.usage or {}), "model_calls": max(0, usage["model_calls"] - 1)}
-                    return self._complete(
-                        task, run, status="partial", summary="模型请求超过任务预算或所需预算信息不可用。",
-                        unresolved=[str(error)], model=last_model, token_usage=run_tokens,
-                    )
+                    return self._stop_for_budget(task, run, str(error))
                 except AgentOutputValidationError as error:
                     last_model = error.model
                     run_tokens = self._merge_usage(run_tokens, error.token_usage)
@@ -229,7 +223,10 @@ class PersistentTaskRuntime:
                     run.token_usage = run_tokens
                     run.model = last_model
                     correction_failures += 1
-                    if not correction_allowed(correction_failures) or self._budget_issue(task, budget, before_model=True):
+                    budget_issue = self._budget_issue(task, budget, before_model=True)
+                    if budget_issue:
+                        return self._stop_for_budget(task, run, budget_issue)
+                    if not correction_allowed(correction_failures):
                         return self._validation_failed(task, run, run_tokens, last_model)
                     task.task_state = {**(task.task_state or {}), "validation_feedback": error.payload(), "validation_failures": correction_failures, "validation_messages": error.feedback}
                     self.db.commit()
@@ -246,13 +243,21 @@ class PersistentTaskRuntime:
                     "prompt_refs": decision.prompt_refs,
                 }
                 proposal = decision.proposal
+                if proposal.progress_draft.strip():
+                    task.task_state = {**(task.task_state or {}), "progress_draft": proposal.progress_draft}
+                budget_issue = self._budget_issue(task, budget, before_model=False)
+                if budget_issue:
+                    return self._stop_for_budget(task, run, budget_issue)
             if proposal.decision == "action":
                 registration = available.get(proposal.capability_id)
                 if registration is not None:
                     validation = validate_tool_params(registration, proposal.arguments)
                     if not validation.ok:
                         correction_failures += 1
-                        if task.executor_type == "deterministic" or not correction_allowed(correction_failures) or self._budget_issue(task, budget, before_model=True):
+                        budget_issue = self._budget_issue(task, budget, before_model=True)
+                        if budget_issue:
+                            return self._stop_for_budget(task, run, budget_issue)
+                        if task.executor_type == "deterministic" or not correction_allowed(correction_failures):
                             return self._validation_failed(task, run, run_tokens, last_model)
                         payload = validation.error_payload(proposal.capability_id)
                         from langchain_core.messages import HumanMessage, message_to_dict
@@ -272,7 +277,10 @@ class PersistentTaskRuntime:
                     WatcherService(self.db).create_from_proposal(task, proposal.watch)
                 except (ValueError, OSError, RuntimeError) as error:
                     correction_failures += 1
-                    if not correction_allowed(correction_failures) or self._budget_issue(task, budget, before_model=True):
+                    budget_issue = self._budget_issue(task, budget, before_model=True)
+                    if budget_issue:
+                        return self._stop_for_budget(task, run, budget_issue)
+                    if not correction_allowed(correction_failures):
                         return self._complete(
                             task, run, status="partial", summary="无法建立任务等待条件。",
                             unresolved=[str(error)[:500]], model=last_model, token_usage=run_tokens,
@@ -293,7 +301,7 @@ class PersistentTaskRuntime:
             state.pop("validation_feedback", None)
             state.pop("validation_failures", None)
             state.pop("validation_messages", None)
-            state["last_decision"] = proposal.model_dump(mode="json")
+            state["last_decision"] = proposal.model_dump(mode="json", exclude={"progress_draft"})
             task.task_state = state
             self.repo.append_event(
                 task.id, "agent_decision",
@@ -307,6 +315,13 @@ class PersistentTaskRuntime:
                 continue
 
             if proposal.decision == "finish":
+                if goals is None:
+                    return self._finish_report(task, run, {
+                        "status": proposal.report_status,
+                        "summary": proposal.summary or "任务已完成。",
+                        "risks": proposal.risks,
+                        "unresolved": proposal.unresolved,
+                    })
                 return self._complete(
                     task, run, status=proposal.report_status,
                     summary=proposal.summary or "任务已完成。",
@@ -357,14 +372,6 @@ class PersistentTaskRuntime:
                 self.repo.checkpoint(task.id, reason="watching")
                 self.db.commit()
                 return {"status": task.status, "task_id": task.id}
-
-            if int((task.usage or {}).get("actions", 0)) >= budget.max_actions:
-                return self._complete(
-                    task, run, status="partial",
-                    summary="任务 Action 预算已耗尽。",
-                    unresolved=["action_budget_exhausted"],
-                    model=last_model, token_usage=run_tokens,
-                )
 
             prepared = broker.prepare(task, proposal.capability_id, proposal.arguments)
             registration = prepared.registration
@@ -433,6 +440,11 @@ class PersistentTaskRuntime:
             self.repo.finish_run(run, status=RunStatus.INTERRUPTED.value, error="task_cancelled")
             self.db.commit()
             return {"status": task.status, "task_id": task.id}
+        budget_issue = self._budget_issue(task, budget, before_model=self.repo.ready_action(task.id) is None)
+        if budget_issue:
+            return self._stop_for_budget(task, run, budget_issue)
+        if budget.max_runs is not None and int((task.usage or {}).get("runs", 0)) >= budget.max_runs:
+            return self._stop_for_budget(task, run, "run_budget_exhausted")
         self.repo.finish_run(
             run, summary={"continued": True}, token_usage=run_tokens, model=last_model,
         )
@@ -441,6 +453,76 @@ class PersistentTaskRuntime:
         self.repo.enqueue_run(task, trigger="continue")
         self.db.commit()
         return {"status": task.status, "task_id": task.id, "continued": True}
+
+    def _stop_for_budget(self, task: AgentTask, run: AgentRun, reason: str) -> dict[str, Any]:
+        return self._finish_report(task, run, {
+            "status": "partial", "summary": "", "stop_reason": reason,
+            "budget_exhausted": reason.endswith("_budget_exhausted") or reason == "deadline_exceeded",
+            "unresolved": [reason],
+        })
+
+    def _finish_report(self, task: AgentTask, run: AgentRun, outcome: dict[str, Any]) -> dict[str, Any]:
+        from aiive.task_runtime.read_repository import TaskReadRepository
+        from aiive.worker.outbox_execution_auth import require_execution_authorization
+
+        def renew() -> bool:
+            require_execution_authorization()
+            self.repo.renew_run(run, lease_seconds=180)
+            self.db.refresh(task)
+            return task.status != TaskStatus.CANCELLED.value
+
+        self.db.flush()  # Persist the final execution accounting before renew_run refreshes the row.
+        active = renew()
+        writer = getattr(self.agent, "generate_report", None)
+        summary, usage, report_incomplete = "", {}, True
+        if active:
+            task.task_state = {**(task.task_state or {}), "pending_report": outcome}
+            self.db.commit()
+            if writer:
+                summary, usage, report_incomplete = writer(task, outcome, renew=renew)
+            active = renew()
+        if not active:
+            self.repo.finish_run(run, status=RunStatus.INTERRUPTED.value, error="task_cancelled",
+                                 token_usage=run.token_usage, model=run.model)
+            self.db.commit()
+            return {"status": task.status, "task_id": task.id}
+
+        state = dict(task.task_state or {})
+        state.pop("pending_report", None)
+        task.task_state = state
+        if outcome.get("stop_reason"):
+            ready = self.repo.ready_action(task.id)
+            if ready is not None:
+                self.repo.transition_action(ready, ActionStatus.INVALIDATED.value, error=outcome["stop_reason"])
+            if report_incomplete:
+                actions = TaskReadRepository(self.db).actions(task.id)
+                counts = dict(self.db.query(AgentAction.status, func.count(AgentAction.id)).filter_by(
+                    task_id=task.id,
+                ).group_by(AgentAction.status).all())
+                completed = [f"- #{item.sequence} {item.capability_id}" for item in reversed(actions)
+                             if item.status == ActionStatus.SUCCEEDED.value]
+                unfinished = [f"- #{item.sequence} {item.capability_id}（{item.status}）" for item in reversed(actions)
+                              if item.status != ActionStatus.SUCCEEDED.value]
+                fallback = [f"### 已完成（{counts.get(ActionStatus.SUCCEEDED.value, 0)} 个动作）",
+                            *(completed or ["- 暂无可列出的成功动作。"]), "### 未完成或待核实",
+                            *unfinished, "- 任务目标仍待完整验收。"]
+                fallback.extend(f"- 待验收：{item}" for item in (task.task_brief or {}).get("acceptance_criteria", []))
+                draft = state.get("progress_draft", "")
+                if draft:
+                    fallback.extend(["### 保存的草稿", str(draft)])
+                summary = "\n\n".join(filter(None, [summary, "\n".join(fallback)]))
+            suffix = "预算已达上限终止" if outcome.get("budget_exhausted") else "任务执行已终止"
+            summary = f"{summary.rstrip()}\n\n{suffix}"
+        else:
+            summary = "\n\n".join(filter(None, [summary, outcome["summary"]])) if report_incomplete else summary
+
+        return self._complete(
+            task, run, status=outcome["status"], summary=summary,
+            unresolved=outcome.get("unresolved"), risks=outcome.get("risks"),
+            model=run.model, token_usage=run.token_usage, stop_reason=outcome.get("stop_reason"),
+            budget_exhausted=outcome.get("budget_exhausted"), report_usage=usage or None,
+            report_incomplete=True if report_incomplete and writer else None,
+        )
 
     def _validation_failed(self, task: AgentTask, run: AgentRun, tokens: dict[str, int], model: str | None) -> dict[str, Any]:
         progress = self.db.query(AgentAction).filter_by(task_id=task.id, status=ActionStatus.SUCCEEDED.value).count()
@@ -617,6 +699,10 @@ class PersistentTaskRuntime:
         model: str | None = None,
         token_usage: dict[str, int] | None = None,
         failed_run: bool = False,
+        stop_reason: str | None = None,
+        budget_exhausted: bool | None = None,
+        report_usage: dict[str, int] | None = None,
+        report_incomplete: bool | None = None,
     ) -> dict[str, Any]:
         task = self.db.get(AgentTask, task.id) or task
         progress = (task.task_state or {}).get("attachment_processing") or {}
@@ -687,7 +773,11 @@ class PersistentTaskRuntime:
             artifact_refs=artifact_ids,
             risks=list(dict.fromkeys(risks or [])),
             unresolved=list(dict.fromkeys(unresolved or [])),
-        ).model_dump(mode="json")
+            stop_reason=stop_reason,
+            budget_exhausted=budget_exhausted,
+            report_usage=report_usage,
+            report_incomplete=report_incomplete,
+        ).model_dump(mode="json", exclude_none=True)
         goals = GoalService(self.db) if GoalService.is_goal_task(task) else None
         if goals is not None:
             if status == "succeeded" and run is not None:
@@ -778,12 +868,15 @@ class PersistentTaskRuntime:
         cls, task: AgentTask, budget: TaskBudget, *, before_model: bool,
     ) -> str | None:
         usage = task.usage or {}
-        if before_model and int(usage.get("model_calls", 0)) >= budget.max_model_calls:
-            return "model_call_budget_exhausted"
+        if before_model:
+            if budget.max_actions is not None and int(usage.get("actions", 0)) >= budget.max_actions:
+                return "action_budget_exhausted"
+            if budget.max_model_calls is not None and int(usage.get("model_calls", 0)) >= budget.max_model_calls:
+                return "model_call_budget_exhausted"
         total_tokens = int(usage.get("prompt_tokens", 0)) + int(usage.get("completion_tokens", 0))
-        if total_tokens >= budget.max_total_tokens:
+        if budget.max_total_tokens is not None and total_tokens >= budget.max_total_tokens:
             return "token_budget_exhausted"
-        if int(usage.get("tool_failures", 0)) >= budget.max_tool_failures:
+        if budget.max_tool_failures is not None and int(usage.get("tool_failures", 0)) >= budget.max_tool_failures:
             return "tool_failure_budget_exhausted"
         if budget.max_cost_usd is not None and float(usage.get("cost_usd", 0.0)) >= budget.max_cost_usd:
             return "cost_budget_exhausted"

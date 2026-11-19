@@ -18,7 +18,7 @@ from aiive.task_runtime.evidence import EvidenceStore, artifact_bytes
 from aiive.task_runtime.repository import TaskRepository
 from aiive.task_runtime.read_repository import TaskReadRepository, TaskContentUnavailable
 from aiive.task_runtime.router import normalize_task_brief
-from aiive.task_runtime.schemas import TaskBudget, TaskBrief
+from aiive.task_runtime.schemas import TaskBrief
 
 
 router = APIRouter(prefix="/api/agent-tasks", tags=["agent-tasks"])
@@ -34,7 +34,7 @@ class CreateAgentTaskRequest(BaseModel):
     source_turn_record_id: str | None = None
     target_node_id: str | None = None
     task_brief: dict[str, Any] = Field(default_factory=dict)
-    budgets: dict[str, Any] = Field(default_factory=dict)
+    budgets: dict[str, Any] | None = None
     priority: int = Field(default=50, ge=0, le=100)
 
 
@@ -73,7 +73,6 @@ def create_agent_task(request: CreateAgentTaskRequest, db: Session = Depends(get
         brief = normalize_task_brief(request.task_type, request.task_brief)
         brief["goal"] = request.goal
         TaskBrief.model_validate(brief)
-        TaskBudget.model_validate(request.budgets)
         task = TaskRepository(db).create_task(
             thread_id=request.thread_id,
             source_turn_record_id=request.source_turn_record_id,
