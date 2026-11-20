@@ -28,6 +28,7 @@ class TurnExecutionContext:
         turn_record_id: 当前 TurnRecord 数据库主键（用于 FK 关联）。
         execution_id: 本轮执行的唯一 ID（用于租约 / 心跳 / 幂等）。
         trace_id: 链路追踪 ID。
+        request_event_id: 已持久化的请求 Event.id。
     """
 
     message_source: MessageSource
@@ -37,3 +38,4 @@ class TurnExecutionContext:
     execution_id: str
     trace_id: str
     task_terminal_wakeup: bool = False
+    request_event_id: str | None = None

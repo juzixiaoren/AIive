@@ -299,6 +299,8 @@ class TestPendingConfirmation:
 
         assert results[0].outcome is WriteOutcome.CONFLICT_PENDING
         assert results[0].written is False
+        assert results[0].to_dict()["ok"] is True
+        assert results[0].to_dict()["state"] == "pending_confirmation"
 
         # 旧记忆与旧关系保持不变；没有产生新记忆、新关系。
         old_after = db.get(MemoryRecord, old.id)

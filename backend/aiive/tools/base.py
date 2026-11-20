@@ -171,7 +171,7 @@ class ToolResult:
 
 
 def business_result_failed(value: Any) -> bool:
-    """只检查业务结果字典的顶层显式失败标记，绝不递归扫描嵌套业务数据。"""
+    """只检查顶层显式失败标记。written、outcome、state 等业务字段由各工具解释。"""
     if not isinstance(value, Mapping):
         return False
     return value.get("ok") is False or value.get("allowed") is False

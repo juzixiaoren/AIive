@@ -6,9 +6,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from aiive.context.run_context import RunContext
+from aiive.db.forget_models import ContentProvenanceRef
 from aiive.db.models import (
     Base,
     Event,
+    MemoryEvidence,
     MemoryProposal,
     MemoryRecord,
     OutboxJob,
@@ -18,6 +20,7 @@ from aiive.db.models import (
     TurnRecord,
 )
 from aiive.tools.operation_executor import enqueue_tool_operation
+from aiive.task_runtime.tools import build_main_agent_registry
 from aiive.tools.registry import get_tool_registry
 from aiive.worker.handler_registry import HandlerRegistry
 from aiive.worker.outbox_handlers import register_all
@@ -42,7 +45,7 @@ def operation_session_factory(tmp_path, monkeypatch):
     engine.dispose()
 
 
-def _source_context(factory) -> RunContext:
+def _source_context(factory, *, source="user", with_request=True) -> RunContext:
     """创建满足 ToolOperation 外键约束的真实 Thread 和 TurnRecord。"""
     db = factory()
     try:
@@ -53,8 +56,14 @@ def _source_context(factory) -> RunContext:
             turn_id=str(uuid.uuid4()),
             status="running",
             request_fingerprint="test",
+            source=source,
         )
         db.add_all([thread, turn])
+        if with_request:
+            event = Event(id=str(uuid.uuid4()), thread_id=thread.id, turn_id=turn.turn_id,
+                          trace_id="", event_type="user_message", payload={"message_source": source})
+            turn.request_event_id = event.id
+            db.add(event)
         db.commit()
         return RunContext(
             thread_id=thread.id,
@@ -171,7 +180,12 @@ def test_remember_or_update_commits_memory_and_receipt_atomically(operation_sess
     context = _source_context(operation_session_factory)
     context.source_event_ids = ["source-event-memory"]
     registry = get_tool_registry()
-    registration = registry.get("remember_or_update")
+    main = build_main_agent_registry()
+    for name in ("memory_search", "memory_timeline", "remember_or_update", "history_search", "forget", "forget_status"):
+        assert main.get(name) is not None
+        assert type(main.get(name)) is type(registry.get(name))
+        assert main.get(name).safety.descriptor_hash == registry.get(name).safety.descriptor_hash
+    registration = main.get("remember_or_update")
     assert registration is not None
     operation = enqueue_tool_operation(
         "remember_or_update",
@@ -188,21 +202,135 @@ def test_remember_or_update_commits_memory_and_receipt_atomically(operation_sess
 
     assert _worker().poll(max_jobs=1) == 1
 
-    db = operation_session_factory()
-    try:
+    with operation_session_factory() as db:
         persisted = db.get(ToolOperation, operation.id)
         assert persisted is not None
         assert persisted.status == "committed"
         assert persisted.effect_receipt == {"transactional": True, "committed": True}
-        assert db.query(MemoryRecord).filter(
+        record = db.query(MemoryRecord).filter(
             MemoryRecord.canonical_key == "user.preference.theme",
-        ).count() == 1
+        ).one()
+        assert persisted.result_payload["ok"] and persisted.result_payload["written"]
+        assert persisted.result_payload["state"] == "active"
         proposal = db.query(MemoryProposal).filter(
             MemoryProposal.source_turn_record_id == context.turn_record_id,
         ).one()
-        assert proposal.final_memory_id is not None
-    finally:
-        db.close()
+        event_id = db.get(TurnRecord, context.turn_record_id).request_event_id
+        assert event_id != context.trace_id and event_id not in context.source_event_ids
+        assert proposal.source_event_ids == [event_id]
+        assert proposal.evidence[0]["source_event_id"] == event_id
+        assert proposal.final_memory_id == record.id
+        assert db.query(MemoryEvidence).filter_by(memory_id=record.id).one().source_event_id == event_id
+        assert db.query(ContentProvenanceRef).filter_by(owner_id=record.id).one().source_id == event_id
+        memory_id = record.id
+
+    context.source_event_ids = [event_id]
+    def execute(name, args):
+        return main.execute(name, args, "trusted_user_command", context)
+
+    search = execute("memory_search", {"query": "user.preference.theme"})
+    assert memory_id in {row["memory_id"] for row in search["result"]["results"]}
+    timeline = execute("memory_timeline", {"memory_id": memory_id, "include_evidence": True})
+    assert timeline["result"]["current"]["evidence"][0]["source_event_id"] == event_id
+
+    from aiive.forget.phase_a_shield import execute_phase_a_shield
+    from aiive.runtime.context_assembler import ContextAssembler
+    from aiive.runtime.token_counter import LiteLLMTokenCounter
+
+    def automatically_recalled_ids():
+        with operation_session_factory() as db:
+            assembler = ContextAssembler(LiteLLMTokenCounter())
+            assembled = assembler.assemble(db, "user.preference.theme", db.get(Thread, context.thread_id))
+            return {item["memory_id"] for item in assembled.snapshot.injected_memory_ids}
+
+    assert memory_id in automatically_recalled_ids()
+    with operation_session_factory.begin() as db:
+        execute_phase_a_shield(db, mode="history_only", event_ids=[event_id], requested_by="test")
+    context.memory_tool_calls = 0
+    assert execute("memory_search", {"query": "user.preference.theme"})["result"]["results"] == []
+    assert execute("memory_timeline", {"memory_id": memory_id})["ok"] is False
+    assert execute("get_tool_operation_status", {"operation_id": operation.id})["ok"] is False
+    assert memory_id not in automatically_recalled_ids()
+
+
+@pytest.mark.parametrize(("decision", "outcome", "written", "state", "audit_operation"), [
+    ("candidate", "written", True, "candidate", "create"),
+    ("reject", "gate_rejected", False, "", "reject"),
+    ("ignore", "ignored", False, "", "ignore"),
+    ("replay", "reinforce_skipped", False, "active", "create"),
+])
+def test_memory_decisions_commit_with_audit(
+    operation_session_factory, monkeypatch, decision, outcome, written, state, audit_operation,
+):
+    from aiive.memory.conflict_resolver import ConflictResolver, ResolutionResult
+    from aiive.memory.memory_gate import GateDecision, MemoryGate
+
+    context = _source_context(operation_session_factory)
+    tool = get_tool_registry().get("remember_or_update")
+    args = {"content": "dark mode", "memory_type": "user_profile", "memory_key": "user.preference.theme"}
+    if decision == "ignore":
+        monkeypatch.setattr(ConflictResolver, "resolve", lambda *_: ResolutionResult("ignore", reason="test ignore"))
+    elif decision != "replay":
+        monkeypatch.setattr(MemoryGate, "decide", lambda *_: GateDecision(decision, reason="test decision"))
+
+    def enqueue(call_id):
+        return enqueue_tool_operation("remember_or_update", args, tool.safety.descriptor_hash,
+                                      tool.safety.effect_mode, context, call_id)
+
+    operation = enqueue("first")
+    assert _worker().poll(max_jobs=1) == 1
+    if decision == "replay":
+        operation = enqueue("repeat")
+        assert _worker().poll(max_jobs=10) >= 1
+
+    with operation_session_factory() as db:
+        receipt = db.get(ToolOperation, operation.id)
+        assert receipt.status == "committed"
+        result = receipt.result_payload
+        assert (result["ok"], result["written"], result["outcome"], result["state"]) == (True, written, outcome, state)
+        proposal = db.query(MemoryProposal).filter_by(source_turn_record_id=context.turn_record_id).one()
+        assert proposal.final_operation == audit_operation
+        assert result["canonical_key"] == proposal.canonical_key
+
+
+@pytest.mark.parametrize(("source", "with_request"), [("user", False), ("runtime_event", True), ("system_command", True)])
+def test_memory_worker_fails_closed_without_user_event(operation_session_factory, source, with_request):
+    context = _source_context(operation_session_factory, source=source, with_request=with_request)
+    tool = get_tool_registry().get("remember_or_update")
+    operation = enqueue_tool_operation("remember_or_update", {"content": "should not be saved"},
+                                       tool.safety.descriptor_hash, tool.safety.effect_mode, context, "invalid-source")
+    assert _worker().poll(max_jobs=1) == 1
+    with operation_session_factory() as db:
+        receipt = db.get(ToolOperation, operation.id)
+        assert (receipt.status, receipt.terminal_reason) == ("failed", "invalid_memory_source")
+        assert db.query(MemoryRecord).count() == db.query(MemoryProposal).count() == 0
+
+
+@pytest.mark.parametrize("status", ["queued", "running", "execution_unknown", "failed", "committed"])
+def test_get_tool_operation_status_reads_only_same_thread(operation_session_factory, status):
+    main = build_main_agent_registry()
+    context = _source_context(operation_session_factory)
+    other_context = _source_context(operation_session_factory)
+    tool = main.get("schedule_reminder")
+    operation = enqueue_tool_operation("schedule_reminder", {}, tool.safety.descriptor_hash,
+                                       tool.safety.effect_mode, context, "status-test")
+    with operation_session_factory.begin() as db:
+        persisted = db.get(ToolOperation, operation.id)
+        persisted.status = status
+        persisted.result_payload = {"confirmed": True}
+        persisted.error_message = "test error" if status == "failed" else None
+        persisted.terminal_reason = "test terminal reason" if status == "failed" else None
+
+    args = {"operation_id": operation.id}
+    response = main.execute("get_tool_operation_status", args, "trusted_user_command", context)["result"]
+    assert response["status"] == status
+    assert response["result"] == ({"confirmed": True} if status == "committed" else None)
+    assert response["error"] == ("test error" if status == "failed" else None)
+    assert response["terminal_reason"] == ("test terminal reason" if status == "failed" else None)
+    denied = main.execute("get_tool_operation_status", args, "trusted_user_command", other_context)
+    missing = main.execute("get_tool_operation_status", {"operation_id": "missing"}, "trusted_user_command", context)
+    assert denied["ok"] is False
+    assert denied["error_type"] == missing["error_type"] == "operation_not_found"
 
 
 def test_confirm_rejects_non_reminder_event(operation_session_factory):

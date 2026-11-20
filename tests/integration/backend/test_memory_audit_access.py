@@ -115,6 +115,77 @@ def test_integrity_audit_does_not_return_content(db_session):
     assert rec.content not in json.dumps(report)
 
 
+@pytest.mark.parametrize("scenario", ["verified", "blocked", "ambiguous", "unlinked"])
+def test_legacy_memory_sources_repaired_only_with_visible_turn_proof(db_session, scenario):
+    from aiive.db.forget_models import ContentProvenanceRef
+    from aiive.db.models import MemoryEvidence, MemoryProposal as StoredProposal
+    from aiive.forget.visibility_service import ForgetVisibilityService
+    from aiive.memory.integrity_audit import audit_or_repair_memory_sources
+    from tests.integration.backend.test_forget_v6261 import uid
+
+    _, turn, event = source(db_session)
+    turn.request_event_id = event.id
+    old_id = uid()
+    rec = memory(db_session)
+    rec.source_event_id = old_id
+    proof = StoredProposal(
+        proposal_id=uid(), final_memory_id=rec.id, final_operation="create",
+        source_turn_record_id=None if scenario == "unlinked" else turn.id, source_turn_id=turn.turn_id,
+        extractor_name="remember_or_update_tool", source_event_ids=[old_id],
+        content=rec.content, evidence=[{"source_event_id": old_id, "source_type": "user_message", "content_span": rec.content}],
+    )
+    ev = MemoryEvidence(memory_id=rec.id, source_event_id=old_id, source_type="user_message", relation="supports")
+    ref = ContentProvenanceRef(owner_type="memory_record", owner_id=rec.id, source_type="event", source_id=old_id)
+    db_session.add_all([proof, ev, ref])
+    if scenario == "ambiguous":
+        _, other_turn, other_event = source(db_session)
+        other_turn.request_event_id = other_event.id
+        db_session.add(StoredProposal(
+            proposal_id=uid(), source_turn_record_id=other_turn.id,
+            extractor_name="remember_or_update_tool", source_event_ids=[old_id],
+        ))
+    if scenario == "blocked":
+        shield(db_session, event)
+    db_session.flush()
+
+    assert not ForgetVisibilityService.filter_memory_ids(db_session, [rec.id])
+    diagnostic, = audit_or_repair_memory_sources(db_session)
+    assert diagnostic["status"] == ("repairable" if scenario == "verified" else "unresolved")
+    assert rec.content not in str(diagnostic)
+    assert ev.source_event_id == old_id
+
+    result, = audit_or_repair_memory_sources(db_session, apply=True)
+    if scenario == "verified":
+        assert result["status"] == "repaired"
+        assert rec.source_event_id == ev.source_event_id == ref.source_id == event.id
+        assert proof.source_event_ids == [event.id]
+        assert proof.evidence[0]["source_event_id"] == event.id
+        assert ForgetVisibilityService.filter_memory_ids(db_session, [rec.id]) == [rec.id]
+        assert audit_or_repair_memory_sources(db_session, apply=True) == []
+        shield(db_session, event)
+        assert not ForgetVisibilityService.filter_memory_ids(db_session, [rec.id])
+    else:
+        assert result == diagnostic
+        assert proof.source_event_ids == [old_id]
+        assert not ForgetVisibilityService.filter_memory_ids(db_session, [rec.id])
+
+
+def test_dangling_evidence_alone_keeps_memory_fail_closed(db_session):
+    from aiive.db.models import MemoryEvidence
+    from aiive.forget.visibility_service import ForgetVisibilityService
+    from aiive.memory.integrity_audit import audit_or_repair_memory_sources
+    from tests.integration.backend.test_forget_v6261 import uid
+
+    _, _, event = source(db_session)
+    rec = memory(db_session, event)
+    ev = MemoryEvidence(memory_id=rec.id, source_event_id=uid(), source_type="user_message", relation="supports")
+    db_session.add(ev)
+    db_session.flush()
+    finding, = audit_or_repair_memory_sources(db_session, apply=True)
+    assert finding["status"] == "unresolved" and finding["evidence_ids"] == [ev.id]
+    assert not ForgetVisibilityService.filter_memory_ids(db_session, [rec.id])
+
+
 def test_forget_watermark_invalidates_context(db_session):
     from aiive.forget.concurrency import forget_revision
     _, _, event = source(db_session)

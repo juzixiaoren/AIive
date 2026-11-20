@@ -1,6 +1,7 @@
 """V62.5：Outbox 精确关联、cutoff 新旧 Job、嵌套 List 清理、旧 Payload fencing。"""
 from __future__ import annotations
 
+import pytest
 from sqlalchemy.orm import Session, sessionmaker
 
 from aiive.db.forget_models import ForgetTarget
@@ -185,7 +186,8 @@ def test_outbox_precise_matching_and_cutoff_boundaries(db_session: Session) -> N
     assert by_id[collision.id].payload["user_message"] == "collision"
 
 
-def test_new_memory_extraction_job_still_executes(db_session: Session, monkeypatch) -> None:
+@pytest.mark.parametrize("legacy_payload", [False, True])
+def test_new_memory_extraction_job_still_executes(db_session: Session, monkeypatch, legacy_payload) -> None:
     from aiive.worker import outbox_handlers
     from aiive.worker.outbox_dto import ClaimedJob
 
@@ -200,12 +202,14 @@ def test_new_memory_extraction_job_still_executes(db_session: Session, monkeypat
     ))
     new_turn = _turn(db_session, thread_id, _at(120))
     new_ev = _event(db_session, thread_id, "new", _at(120), new_turn.turn_id)
+    new_turn.source = "user"
+    new_turn.request_event_id = new_ev
     job = OutboxJob(
         id=_id(), operation_id="memory_extraction:new2",
         job_type="memory_extraction", status="pending",
         payload={
             "user_message": "new secret", "reply": "new reply",
-            "thread_id": thread_id, "source_event_ids": [new_ev],
+            "thread_id": thread_id, **({} if legacy_payload else {"source_event_ids": [new_ev]}),
             "source_turn_record_id": new_turn.id,
             "source_turn_id": new_turn.turn_id,
             "message_source": "user", "extraction_mode": "async",
@@ -240,7 +244,10 @@ def test_new_memory_extraction_job_still_executes(db_session: Session, monkeypat
     ensure_running_claim(claimed, db=db_session)
     result = outbox_handlers.handle_memory_extraction(claimed)
     assert "forget_content_redacted" not in result.reason
-    assert captured.get("user_message") == "new secret"
+    assert captured.get("user_message") == "new secret", result.reason
+    assert captured["source_event_ids"] == [new_ev]
+    if legacy_payload:
+        assert captured["reply"] == ""  # No persisted response event supports this payload text.
 
 
 def test_partial_task_new_run_job_preserved(db_session: Session) -> None:

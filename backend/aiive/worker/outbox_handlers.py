@@ -14,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from aiive.config import settings
-from aiive.context.run_context import RunContext, RUN_CTX_OUTBOX_WORKER
+from aiive.context.run_context import RunContext, RUN_CTX_OUTBOX_WORKER, load_user_request_event
 from aiive.core.llm_client import LLMClient
 from aiive.db.base import SessionLocal
 from aiive.db.models import (
@@ -199,6 +199,24 @@ def handle_memory_extraction(claimed: ClaimedJob) -> HandlerResult:
         validated_source = _validate_source_turn(
             db_a, source_turn_record_id, thread_id, claimed,
         )
+        if not source_event_ids:
+            # Historical jobs may carry only the TurnRecord ID. Recover persisted
+            # sources before the Forget check and before any extraction call.
+            turn = db_a.get(TurnRecord, validated_source.turn_record_id)
+            if turn is None:
+                raise NonRetryableJobError("source_turn_missing")
+            request_event = load_user_request_event(db_a, turn)
+            if request_event is None:
+                raise NonRetryableJobError("user_request_event_required")
+            source_event_ids = [request_event.id]
+            replies = db_a.query(Event.id).filter_by(
+                thread_id=turn.thread_id, turn_id=turn.turn_id, event_type="llm_response",
+            ).limit(2).all() if reply else []
+            assistant_event_id = replies[0][0] if len(replies) == 1 else ""
+            if assistant_event_id:
+                source_event_ids.append(assistant_event_id)
+            else:
+                reply = ""
 
         # A2: IngestionRun 幂等创建 + 状态检查
         irun = _resolve_ingestion_run(
@@ -287,7 +305,7 @@ def handle_memory_extraction(claimed: ClaimedJob) -> HandlerResult:
         proposals: list[MemoryProposal] = extractor.extract(
             user_message=user_message, reply=reply,
             trace_id=claimed.trace_id, thread_id=thread_id,
-            source_event_ids=source_event_ids or None,
+            source_event_ids=source_event_ids,
             assistant_event_ids=[assistant_event_id] if assistant_event_id else None,
         )
     except Exception as e:
@@ -422,15 +440,11 @@ def handle_memory_extraction(claimed: ClaimedJob) -> HandlerResult:
             return HandlerResult(HandlerOutcome.COMPLETED, "empty_extraction",
                                  ingestion_run_id=run_id)
 
-        # C3: 注入 Phase 2 provenance 到 proposal → 原子写入批次
-        # Phase B 抽取时已按 payload 的真实事件构建 evidence 与 source_event_ids；
-        # 此处仅补充 turn 溯源字段。source_event_ids 只在 payload 非空时覆盖，
-        # 避免把 Phase B 使用的 trace_id 兜底清空导致 evidence 与 source_event_ids 不一致。
+        # C3: 补充已验证的来源和 Turn 溯源字段，原子写入批次。
         for p in proposals:
             p.source_turn_id = source_turn_id
             p.source_turn_record_id = source_turn_record_id
-            if source_event_ids:
-                p.source_event_ids = list(source_event_ids)
+            p.source_event_ids = list(source_event_ids)
             p.execution_mode = "system_best_effort"
         writer.write_batch(
             proposals=proposals, ingestion_run=run_c, run_context=run_ctx,

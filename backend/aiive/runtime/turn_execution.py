@@ -340,6 +340,7 @@ class TurnExecutionService:
             turn_record_id=turn.id,
             execution_id=execution_id,
             trace_id=trace_id,
+            request_event_id=turn.request_event_id,
         )
         try:
             yield {
@@ -1504,6 +1505,7 @@ class TurnExecutionService:
                 execution_id=execution_id,
                 trace_id=trace_id,
                 task_terminal_wakeup=self._task_terminal_wakeup,
+                request_event_id=turn.request_event_id,
             )
             ctx_bundle = self._load_context(message, turn, exec_ctx)
 

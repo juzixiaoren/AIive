@@ -258,7 +258,7 @@ class MemoryTimelineTool(DatabaseTool):
         返回:
             current (最新 active+valid 记录)、revisions (全部版本)、evidence 的字典
         """
-        from aiive.db.models import MemoryEvidence, MemoryRecord
+        from aiive.db.models import Event, MemoryEvidence, MemoryRecord
         from aiive.memory.memory_policy import MemoryPolicyEngine, MemoryReadChannel
         from aiive.memory.memory_types import LifecycleState, ValidityState
 
@@ -294,6 +294,7 @@ class MemoryTimelineTool(DatabaseTool):
             if include_evidence:
                 evs = (
                     db.query(MemoryEvidence)
+                    .join(Event, Event.id == MemoryEvidence.source_event_id)
                     .filter(MemoryEvidence.memory_id == r.id)
                     .order_by(MemoryEvidence.created_at.asc())
                     .all()
@@ -302,6 +303,7 @@ class MemoryTimelineTool(DatabaseTool):
                     db, "event", [e.source_event_id for e in evs if e.source_event_id]))
                 d["evidence"] = [
                     {
+                        "source_event_id": e.source_event_id,
                         "source_type": e.source_type,
                         "trust_level": e.trust_level,
                         "relation": e.relation,

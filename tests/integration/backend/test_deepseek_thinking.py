@@ -160,6 +160,66 @@ async def test_async_stream_keeps_reasoning_separate_from_answer(wire):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("explicit", [False, True])
+async def test_chat_memory_write_and_fallback_are_shared_by_sync_and_stream(db, wire, monkeypatch, streaming, explicit):
+    from aiive.db.models import MemoryProposal, MemoryRecord, ToolOperation
+    from aiive.tools import operation_executor
+    from aiive.worker.handler_registry import HandlerRegistry
+    from aiive.worker.outbox_handlers import register_all
+    from aiive.worker.outbox_heartbeat import ActiveClaimRegistry
+    from aiive.worker.outbox_worker import OutboxWorker
+
+    client, responses, requests = wire
+    args = json.dumps({"content": "dark theme", "memory_type": "user_profile", "memory_key": "user.preference.theme"})
+    if explicit:
+        responses.append(reply(PRIVATE + "write", calls=[call("remember", "remember_or_update", args)]))
+    responses.append(reply(PRIVATE + "final", text="Done"))
+
+    classified = []
+
+    def classify(*args):
+        classified.append(args)
+        return MemorySignalDecision(action="extract_async", confidence=1, reason="test fallback")
+
+    handlers = HandlerRegistry()
+    register_all(handlers)
+    worker = OutboxWorker("memory-chat-test", handlers, ActiveClaimRegistry())
+    wait = operation_executor.wait_for_tool_operation
+
+    def dispatch_and_wait(operation_id, _timeout):
+        assert worker.poll(max_jobs=1, only_types=frozenset({"tool_operation"})) == 1
+        return wait(operation_id, 0)
+
+    monkeypatch.setattr(AgentGraph, "_classify_memory_signal", classify)
+    monkeypatch.setattr(operation_executor, "wait_for_tool_operation", dispatch_and_wait)
+    service = TurnExecutionService(client)
+    thread_id = get_current_thread_id(db)
+    message = "I prefer a dark theme."
+    if streaming:
+        events = [event async for event in service.execute_turn_stream(message, thread_id, "memory-chat")]
+        assert events[-1]["type"] == "done"
+    else:
+        result = await asyncio.to_thread(service.execute_turn, message, thread_id, "memory-chat")
+        assert result["reply"] == "Done"
+
+    turn = db.query(TurnRecord).filter_by(turn_id="memory-chat").one()
+    if explicit:
+        assert not classified
+        assert db.query(OutboxJob).filter_by(job_type="memory_extraction").count() == 0
+        receipt = db.query(ToolOperation).filter_by(turn_record_id=turn.id).one()
+        assert receipt.status == "committed" and receipt.result_payload["state"] == "active"
+        assert db.query(MemoryRecord).filter_by(id=receipt.result_payload["memory_id"]).count() == 1
+        assert db.query(MemoryProposal).filter_by(source_turn_record_id=turn.id).one().source_event_ids == [turn.request_event_id]
+        tool_message = next(msg for msg in requests[-1]["messages"] if msg["role"] == "tool")
+        assert json.loads(tool_message["content"])["written"] is True
+    else:
+        assert len(classified) == 1
+        job = db.query(OutboxJob).filter_by(job_type="memory_extraction").one()
+        assert turn.request_event_id in job.payload["source_event_ids"]
+
+
+@pytest.mark.asyncio
 async def test_private_metadata_survives_streamed_batches_and_a_new_turn(db, wire, monkeypatch):
     client, responses, requests = wire
     responses.extend([

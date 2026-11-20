@@ -273,7 +273,7 @@ LLM tool_call "run_memory_maintenance"                           [builtin_tools.
 
 ## 三、记忆信号分类（ActionPlanner）
 
-所有"是否提取记忆 / 何时提取"的语义判断都由 `ActionPlanner.classify_memory_signal()` 完成，
+主 Agent 在工具循环内决定是否显式保存记忆。当本轮没有尝试 `remember_or_update` 时，补充提取路径由 `ActionPlanner.classify_memory_signal()` 决定是否提取及调度优先级，
 **完全不依赖关键词表**。
 
 ```mermaid

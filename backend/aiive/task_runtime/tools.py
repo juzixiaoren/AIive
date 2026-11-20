@@ -356,7 +356,7 @@ class ListSkillsTool(BaseTool):
 
 
 def build_main_agent_registry() -> ToolRegistry:
-    """User-facing Task, attachment, reminder and privacy controls."""
+    """User-facing task, attachment, reminder, memory and privacy controls."""
     from aiive.skills import list_skills
 
     registry = ToolRegistry()
@@ -453,13 +453,21 @@ def build_main_agent_registry() -> ToolRegistry:
         SendTaskInputTool,
     ))
     from aiive.tools.attachment_tools import register_attachment_tools
+    from aiive.tools.operation_executor import GetToolOperationStatusTool
     from aiive.tools.registry import get_tool_registry
 
     register_attachment_tools(registry)
+    registry.register(_registration(
+        "get_tool_operation_status",
+        "按 operation_id 查询当前对话的工具操作。仅 committed 返回确认结果。",
+        {"operation_id": {"type": "str", "required": True, "minLength": 1, "maxLength": 36}},
+        GetToolOperationStatusTool,
+    ))
     builtin = get_tool_registry()
     for name in (
         "get_current_time", "schedule_reminder", "list_reminders", "cancel_reminder",
-        "confirm_reminder", "snooze_reminder", "memory_search", "history_search", "forget", "forget_status",
+        "confirm_reminder", "snooze_reminder", "memory_search", "memory_timeline", "remember_or_update",
+        "history_search", "forget", "forget_status",
     ):
         tool = builtin.get(name)
         if tool is not None:

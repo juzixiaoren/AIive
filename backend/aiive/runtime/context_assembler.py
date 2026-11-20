@@ -274,6 +274,15 @@ class ContextAssembler:
         message = render_attachment_refs(message, [r for refs in current_refs.values() for r in refs])
         candidates.fixed["current_message"] = message
 
+        pack = agent_ctx.get("recall_pack")
+        recall_degraded = pack is None or pack.degraded
+        core_loaded = agent_ctx.get("core_loaded", False)
+        recall_hits = sum(hit.source_type == "memory_record" for hit in candidates.retrieval)
+        degradation = []
+        if not core_loaded:
+            degradation.append("core_load_failed")
+        if recall_degraded:
+            degradation.append((pack.degraded_reason if pack is not None else "") or "recall_unavailable")
 
         def render() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
             core_text = render_core_memory(candidates.core)
@@ -286,15 +295,25 @@ class ContextAssembler:
             history_text = self._render_history_summary([
                 hit for hit in candidates.retrieval if hit.source_type != "memory_record"
             ])
-            recall_text = self._render_memory_hits([
+            injected = [
                 hit for hit in candidates.retrieval if hit.source_type == "memory_record"
-            ])
+            ]
+            recall_text = self._render_memory_hits(injected)
+            memory_state = (
+                f"## Memory State\nCore Memory: {'loaded' if core_loaded else 'degraded'}"
+                f" (blocks injected={len(candidates.core)}). "
+                f"Automatic Recall: {'degraded' if recall_degraded else 'completed'}, "
+                f"hits={recall_hits}, injected={len(injected)}, budget_dropped={recall_hits - len(injected)}."
+            )
+            if degradation:
+                memory_state += " Reason: " + ", ".join(degradation) + "."
             graph_text, _ = render_expansion_block(candidates.graph)
             recall_messages = [{"role": "system", "content": text}
-                               for text in (recall_text, graph_text) if text]
+                               for text in (memory_state, recall_text, graph_text) if text]
             rendered.update(
                 system=system_content, core=core_text, history=history_msgs, working=working_text,
                 summaries=seg_text, retrieved=recall_text, graph=graph_text, history_summary=history_text,
+                memory_state=memory_state,
             )
             prompt_messages = self._compose_prompt_messages(
                 system_content=system_content, epoch_checkpoint_text=epoch_cp_text,
@@ -335,7 +354,7 @@ class ContextAssembler:
             epoch_checkpoint_text=epoch_cp_text, segment_summary_text=rendered["summaries"],
             sealing_bridge_text=bridge_text, recall_text=rendered["retrieved"], graph_text=rendered["graph"],
             history_summary_text=rendered["history_summary"], history_msgs=rendered["history"],
-            tools_schema=tools_schema,
+            tools_schema=tools_schema, memory_state_text=rendered["memory_state"],
         )
         reports = self._build_reports(total_count, removed=candidates.removed, **report_args)
         if not safe:
@@ -343,7 +362,6 @@ class ContextAssembler:
                 total_count.safe_tokens, self._budget.model_context_window, reports,
                 self._budget.model_context_window - requested_output,
             )
-        pack = agent_ctx.get("recall_pack")
         if pack is not None:
             pack = pack.model_copy(update={"items": [
                 UnifiedRetriever.memory_hit_to_recall_item(hit)
@@ -442,7 +460,14 @@ class ContextAssembler:
 
         from aiive.runtime.system_contract import build_stable_contract
         stable_contract = build_stable_contract(identity.to_dict(), policies)
-        core_blocks = load_core_memory(db, config)
+        core_loaded = True
+        try:
+            with db.begin_nested():
+                core_blocks = load_core_memory(db, config)
+        except Exception:
+            logger.warning("Core Memory 加载失败", exc_info=True)
+            core_blocks = []
+            core_loaded = False
 
         scope = build_scope_context(db, None, thread_id)
         # Phase 5：统一检索编排（memory + summary + checkpoint），失败降级原 AutomaticRecall
@@ -479,6 +504,7 @@ class ContextAssembler:
             "identity": identity,
             "policies": policies,
             "core_blocks": core_blocks,
+            "core_loaded": core_loaded,
             "recall_pack": pack,
             "retrieval_hits": retrieval_hits,
             "graph_expansion": graph_expansion,
@@ -548,7 +574,8 @@ class ContextAssembler:
         # 降级事实随 pack 一起向上传递：BM25 不可用时 notes 里带
         # memory_recall_degraded:<原因>，调用方不得把它当成「BM25 已生效」。
         recall_degraded_notes = [
-            note for note in result.notes if note.startswith("memory_recall_degraded")
+            note for note in result.notes
+            if note.startswith("memory_recall_degraded:") or note.endswith("_degraded")
         ]
         pack = MemoryRecallPack(
             request_id=result.request_id,
@@ -1061,6 +1088,7 @@ class ContextAssembler:
         history_summary_text: str = "",
         history_msgs: list[dict[str, Any]] | None = None,
         tools_schema: list[dict[str, Any]] | None = None,
+        memory_state_text: str = "",
     ) -> list[PartitionReport]:
         """生成各分区 token 统计报告（含 total 汇总）。"""
         removed = removed or {}
@@ -1084,6 +1112,7 @@ class ContextAssembler:
             _report("segment_summaries", [{"role": "system", "content": segment_summary_text}]),
             _report("sealing_bridge", [{"role": "system", "content": sealing_bridge_text}]),
             _report("graph", [{"role": "system", "content": graph_text}]),
+            _report("memory_state", [{"role": "system", "content": memory_state_text}]),
             _report("retrieved_memory", [{"role": "system", "content": recall_text}]),
             _report("retrieved_history_summary", [{"role": "system", "content": history_summary_text}]),
             _report("recent_messages", history),
@@ -1115,6 +1144,7 @@ class ContextAssembler:
         tools_schema: list[dict[str, Any]] | None = None,
         user_message: str = "",
         _source: str = "user",
+        memory_state_text: str = "",
     ) -> ContextSnapshotData:
         """构建送入 LLM 的输入分区强类型快照。"""
         items: list[ContextSnapshotItem] = []
@@ -1160,6 +1190,7 @@ class ContextAssembler:
         _add("working_state", "working_state", "system", "trusted", working_state_text)
         _add("sealing_bridge", "sealing_bridge", "system", "trusted", sealing_bridge_text)
         _add("history_summary", "history_summary", "system", "trusted", history_summary_text)
+        _add("memory_state", "memory_state", "system", "trusted", memory_state_text)
 
         # 召回记忆（本轮证据，非系统指令 → 标记 untrusted）
         _add("recall_memory", "recall_memory", "memory", "untrusted", recall_text)

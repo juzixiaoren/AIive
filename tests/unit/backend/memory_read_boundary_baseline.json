@@ -13,7 +13,7 @@
   "backend/aiive/memory/graph_expansion.py": 2,
   "backend/aiive/memory/graph_projection.py": 2,
   "backend/aiive/memory/graph_rebuild.py": 3,
-  "backend/aiive/memory/integrity_audit.py": 2,
+  "backend/aiive/memory/integrity_audit.py": 4,
   "backend/aiive/memory/memory_access_tracker.py": 1,
   "backend/aiive/memory/memory_maintenance.py": 1,
   "backend/aiive/memory/memory_mutation.py": 1,

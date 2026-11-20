@@ -111,7 +111,8 @@ class WriteResult:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "ok": self.written,
+            "ok": self.outcome != WriteOutcome.FAILED,
+            "written": self.written,
             "outcome": self.outcome.value,
             "operation": self.operation,
             "memory_id": self.memory_id,
@@ -565,7 +566,6 @@ class MemoryWriteService:
         try:
             replay = self._replay_completed_write(proposal)
             if replay is not None:
-                self._db.commit()
                 return replay
             # 3. SELECT FOR UPDATE existing active records（无 active 则先唤醒 sleeping 同键记录）
             existing_active: Sequence[MemoryRecord] = self._load_existing_or_wake_sleeping(
@@ -1051,10 +1051,11 @@ class MemoryWriteService:
         }:
             return None
         visible_id = prior.final_memory_id or ""
-        if visible_id and not ForgetVisibilityService.filter_memory_ids(self._db, [visible_id]):
-            visible_id = ""
+        record = self._store.get_by_id(visible_id) if visible_id else None
         return WriteResult(outcome=WriteOutcome.REINFORCE_SKIPPED, operation="ignore",
-                           memory_id=visible_id, reason="request_already_processed")
+                           memory_id=record.id if record is not None else "",
+                           state=record.lifecycle_state if record is not None else "",
+                           reason="request_already_processed")
 
     def _proposal_already_persisted(self, proposal: MemoryProposal) -> bool:
         """同 idempotency_key 的 proposal 是否已持久化（重复请求判定）。"""

@@ -8,8 +8,14 @@ RunContext 通过 _make_handler 闭包捕获 → registry.execute() 注入 handl
 全程不经过 LLM tool schema，模型不可见。
 """
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from aiive.memory.recall_models import ScopeContext
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
+
+    from aiive.db.models import Event, TurnRecord
 
 # RunContext.source 取值（调用执行者标签）。
 # 注意：它与 MessageSource（会话回合消息来源：user / system_command /
@@ -27,6 +33,20 @@ def require_ctx(ctx: "RunContext | None", tool_name: str) -> "RunContext":
     if ctx is None:
         raise RuntimeError(f"工具 {tool_name} 需要运行上下文")
     return ctx
+
+
+def load_user_request_event(db: "Session", turn: "TurnRecord") -> "Event | None":
+    """Resolve the persisted request event of a verified user turn."""
+    from sqlalchemy.orm import load_only
+
+    from aiive.db.models import Event
+
+    if turn.source != "user" or not turn.request_event_id:
+        return None
+    return db.query(Event).options(load_only(Event.id, Event.created_at)).filter_by(
+        id=turn.request_event_id, thread_id=turn.thread_id,
+        turn_id=turn.turn_id, event_type="user_message",
+    ).one_or_none()
 
 
 @dataclass
@@ -74,6 +94,16 @@ class RunContext:
     def is_valid(self) -> bool:
         """thread_id 和 trace_id 均非空。"""
         return bool(self.thread_id and self.trace_id)
+
+    def load_user_request_event(self, db: "Session") -> "Event | None":
+        from aiive.db.models import TurnRecord
+
+        if not self.turn_record_id or not self.thread_id or not self.turn_id:
+            return None
+        turn = db.query(TurnRecord).filter_by(
+            id=self.turn_record_id, thread_id=self.thread_id, turn_id=self.turn_id,
+        ).one_or_none()
+        return load_user_request_event(db, turn) if turn is not None else None
 
     def to_scope_context(self) -> ScopeContext:
         """将 RunContext 的 scope 信息投影为召回用的 ScopeContext（V2 §九）。

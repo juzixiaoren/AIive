@@ -232,7 +232,8 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         ("show_notifications", ShowNotificationsTool, "显示已触发的通知", {}, "low", False, False),
         # 记忆管理 —— 写入
         ("remember_or_update", RememberOrUpdateTool,
-         "记住或更新一条长期记忆。相同 memory_key 自动覆盖旧值，无需手动查重。\n"
+         "保存本轮用户提供的长期信息。按 MemoryKeyRegistry 处理同键记录：相同内容可强化；"
+         + "单值键按冲突策略修订或替换旧值，多值键允许不同内容并存。请检查 written、outcome 和 state。\n"
          + MEMORY_KEY_GUIDE,
          {
              "content": {"type": "str", "description": "记忆内容文本；身份键只填纯值", "minLength": 1},

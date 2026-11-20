@@ -1028,6 +1028,7 @@ class AgentGraph:
             source=exec_ctx.message_source.value,
             turn_id=exec_ctx.turn_id,
             turn_record_id=exec_ctx.turn_record_id,
+            source_event_ids=[exec_ctx.request_event_id] if exec_ctx.request_event_id else [],
             user_timezone=self._user_timezone,
         )
         tools = build_langchain_tools(registry, run_context=run_ctx_exec)
@@ -1101,6 +1102,17 @@ class AgentGraph:
             signal.action, message, message_source,
         ).value
         return signal
+
+    def _memory_signal_for_turn(
+        self, message: str, reply: str, trace_id: str, message_source: Any,
+        records: list[dict[str, Any]],
+    ) -> "MemorySignalDecision":
+        if any(record.get("name") == "remember_or_update" for record in records):
+            return MemorySignalDecision(
+                action=MemorySignalAction.SKIP.value, confidence=1.0,
+                reason="explicit_memory_write_attempted",
+            )
+        return self._classify_memory_signal(message, reply, trace_id, message_source)
 
     def _assemble_agent_result(
         self,
@@ -1259,7 +1271,9 @@ class AgentGraph:
                 len(result.get("tool_records", [])),
             )
 
-        signal = self._classify_memory_signal(message, reply, trace.trace_id, message_source)
+        signal = self._memory_signal_for_turn(
+            message, reply, trace.trace_id, message_source, [*_records_raw, *pending_approvals],
+        )
         return self._assemble_agent_result(
             reply=reply,
             graph_state_tool_records=result.get("tool_records", []),
@@ -1537,7 +1551,8 @@ class AgentGraph:
         graph_state_tool_records = [r for r in state_records if r.get("status") != "blocked"]
 
         signal = await asyncio.to_thread(
-            self._classify_memory_signal, message, reply, trace.trace_id, message_source,
+            self._memory_signal_for_turn, message, reply, trace.trace_id, message_source,
+            [*_records_raw, *pending_approvals],
         )
 
         if not reply and not pending_approvals and not _records_raw:

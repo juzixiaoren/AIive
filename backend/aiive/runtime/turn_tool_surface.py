@@ -1,6 +1,6 @@
 """Main Agent 单 Turn 工具面：唯一注册入口。
 
-工具面 = 固定任务元工具 + 附件工具 + 本轮条件工具：
+工具面包含任务、附件、提醒、记忆和遗忘工具，以及本轮运行时工具：
 - notify_user：每个 Turn 都注册（服务端仍按 turn_event_inbox 授权）；
 - answer_goal_question：只在确有未关闭问题时注册，避免把闲聊误判成回答。
 
@@ -18,7 +18,7 @@ from aiive.tools.registry import ToolRegistry
 
 
 def build_turn_tool_registry(open_questions: list[Any] | None = None) -> ToolRegistry:
-    """构建本轮对话 Agent 的真实工具面（固定元工具 + 条件工具）。"""
+    """构建本轮对话 Agent 的工具面。"""
     registry = build_main_agent_registry()
     register_notify_user(registry)
     if open_questions:

@@ -502,7 +502,7 @@ class ForgetVisibilityService:
         无来源仅允许持久化提案证明为 manual_memory_api 独立 create 的记录。
         后续混入无来源提案不继承该豁免；空引用、未知类型和悬空来源关闭。
         """
-        from aiive.db.models import Event, MemoryProposal, MemoryRecord
+        from aiive.db.models import Event, MemoryEvidence, MemoryProposal, MemoryRecord
 
         records = session.query(MemoryRecord).filter(MemoryRecord.id.in_(memory_ids)).all()
         refs = session.query(ContentProvenanceRef).filter(
@@ -551,6 +551,11 @@ class ForgetVisibilityService:
                 ):
                     blocked.add(record.id)
         event_ids = set().union(*by_memory.values()) if by_memory else set()
+        # Older rows can have dangling Evidence even when the durable reference was never copied.
+        blocked.update(row[0] for row in session.query(MemoryEvidence.memory_id).outerjoin(
+            Event, Event.id == MemoryEvidence.source_event_id,
+        ).filter(MemoryEvidence.memory_id.in_(memory_ids), MemoryEvidence.source_event_id.is_not(None),
+                 Event.id.is_(None)).distinct().all())
         events = session.query(Event.id, Event.created_at).filter(Event.id.in_(event_ids)).all() if event_ids else []
         unsafe = event_ids - {row[0] for row in events if ForgetVisibilityService._as_utc(row[1]) is not None}
         unsafe.update(ForgetVisibilityService.blocked_target_ids(

@@ -1,5 +1,6 @@
 """Domain tool handlers (implementation) split from builtin_tools."""
 
+from dataclasses import replace
 from typing import override
 
 from aiive.tools.base import DatabaseTool
@@ -16,27 +17,17 @@ class RememberOrUpdateTool(DatabaseTool):
 
         execution_mode = "user_required"：写入失败时本工具返回 error，Turn 不得声称成功。
         """
-        from aiive.memory.memory_types import EvidenceItem, TrustLevel
-        from aiive.memory.memory_write_service import MemoryWriteService
+        from aiive.memory.memory_types import TrustLevel, WriteOutcome
+        from aiive.memory.memory_write_service import MemoryWriteService, WriteResult
         from aiive.memory.proposal_normalizer import ProposalNormalizer
 
         ctx = require_ctx(ctx, "remember_or_update")
-        # Phase 2: user_required 失败语义 — 写入失败必须明确返回 error
-        ctx.execution_mode = "user_required"
-        writer = MemoryWriteService(db)
-
-        # 幂等键来源：优先用真实 Event.id；流式/工具上下文缺失时退化为 trace_id，
-        # 保证同轮次稳定、跨轮次不互相冲突（彻底避免固定键冲突）。
-        source_event_ids = list(ctx.source_event_ids) or ([ctx.trace_id] if ctx.trace_id else [])
-
-        evidence = [EvidenceItem(
-            # source_event_id 用于 reinforce 防重（同一来源事件不重复强化）
-            source_event_id=source_event_ids[0] if source_event_ids else None,
-            source_type="user_message",
-            trust_level=TrustLevel.TRUSTED.value,
-            relation="supports",
-            content_span=content,
-        )]
+        source_event = ctx.load_user_request_event(db)
+        if source_event is None or ctx.source_event_ids != [source_event.id]:
+            reason = "user_request_event_required"
+            return {**WriteResult(WriteOutcome.FAILED, reason=reason).to_dict(),
+                    "error": reason, "canonical_key": ""}
+        ctx = replace(ctx, execution_mode="user_required")
 
         normalizer = ProposalNormalizer()
         result = normalizer.normalize(
@@ -46,8 +37,7 @@ class RememberOrUpdateTool(DatabaseTool):
             confidence=0.95,
             importance=0.8,
             trust_level=TrustLevel.TRUSTED.value,
-            evidence=[e.model_dump() for e in evidence],
-            source_event_ids=source_event_ids,
+            source_event_ids=ctx.source_event_ids,
             extractor_name="remember_or_update_tool",
             extractor_version="1.0",
             thread_id=ctx.thread_id,
@@ -55,33 +45,27 @@ class RememberOrUpdateTool(DatabaseTool):
         )
 
         if result.error or result.proposal is None:
-            return {"ok": False, "error": result.error or "Normalization failed", "memory_write_failed": True}
+            reason = result.error or "Normalization failed"
+            return {**WriteResult(WriteOutcome.FAILED, reason=reason).to_dict(),
+                    "error": reason, "canonical_key": ""}
 
         # Phase 2: provenance — 真实 Event.id + TurnRecord PK
         result.proposal.source_turn_record_id = ctx.turn_record_id
         result.proposal.source_turn_id = ctx.turn_id
-        result.proposal.source_event_ids = source_event_ids
         result.proposal.execution_mode = ctx.execution_mode
         # 关键：provenance 注入后重算幂等键，确保键包含真实来源与内容，彻底避免固定键冲突
         result.proposal.compute_request_idempotency()
 
-        try:
-            write_result = writer.write(result.proposal, run_context=ctx)
-        except Exception as e:
-            return {"ok": False, "error": str(e), "memory_write_failed": True}
-
-        db.flush()
-
-        return {
-            "ok": write_result.written,
-            "memory_id": write_result.memory_id,
-            "content": content,
+        write_result = MemoryWriteService(db).write(result.proposal, run_context=ctx)
+        payload = {
+            **write_result.to_dict(),
             "memory_type": result.proposal.memory_type,
             "canonical_key": result.proposal.canonical_key,
             "keywords": result.proposal.keywords,
-            "state": write_result.state,
-            "operation": write_result.operation,
         }
+        if write_result.outcome == WriteOutcome.FAILED:
+            payload["error"] = write_result.reason
+        return payload
 
 
 class RunMemoryMaintenanceTool(DatabaseTool):

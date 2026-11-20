@@ -165,11 +165,9 @@ explicit user input always overrides these defaults.
 
 | 工具 | 参数 | 说明 |
 |---|---|---|
-| `memory_search` | query, types, top_k(8), budget(1000) | query-aware 搜索，scope 约束 |
-| `memory_get` | memory_id / canonical_key | 精确单条获取 |
-| `memory_timeline` | canonical_key | 版本历史 + 有效期 |
-| `memory_evidence` | memory_id | 证据溯源 |
-| `memory_search_events` | query | 原始 episodic drill-down |
+| `memory_search` | query, memory_types, top_k, token_budget | 在当前 Scope Chain 内搜索长期记忆 |
+| `memory_timeline` | memory_id / canonical_key, include_evidence | 按 ID 看单条及其生命周期，按键看版本历史。可返回可见证据的真实 Event ID |
+| `history_search` | query, deep, top_k, token_budget | 搜索记忆和历史摘要，可通过 `deep` 回溯原始对话 |
 
 **安全约束**：
 - 单轮最多调用 6 次（`max_memory_tool_calls_per_turn`）
@@ -182,45 +180,32 @@ explicit user input always overrides these defaults.
 ## 四、主线程调用链
 
 ```
-POST /api/chat                              routes_chat.py
-  → invoke_chat()                           graph.py (DB 会话管理)
-  → AgentGraph.run()                        agent_graph.py
+同步 / 流式聊天 → TurnExecutionService
+      ├─ 持久化 TurnRecord 和 request_event_id
+      ├─ ContextAssembler → Core Memory / UnifiedRetriever / ContextOverflowPacker
+      │                     └─ 最终提示词和快照包含 Memory State
+      ├─ AgentGraph → 主 Agent 工具循环
+      │    └─ remember_or_update → ToolOperation + Outbox
+      │         └─ Worker → 验证用户请求 Event → MemoryWriteService
+      │                      └─ 原子提交写入决策、审计和 ToolOperation 回执
       │
-      ├─ Trace.new()                        trace_id
-      ├─ ensure_committed_thread()          创建 / 查找 thread
-      ├─ build_langchain_llm()              ChatOpenAI
-      ├─ build_langchain_tools()            25+ 工具 (闭包注入 RunContext)
-      ├─ history = load_recent_messages_bounded()  有界 Thread 历史
-      │
-      ├─ ContextAssembler                    ★ V2/Phase 5 上下文装配
-      │    ├─ resolve_identity()            L0 Kernel Contract (精确 key)
-      │    ├─ resolve_policies()            L0 Kernel Contract (policy key)
-      │    ├─ load_core_memory()            ★ L1 Core Memory Projection
-      │    ├─ build_scope_context()          Scope Chain (thread→global)
-      │    ├─ UnifiedRetriever.retrieve()    ★ 统一检索编排
-      │    │    └─ AutomaticRecallEngine.recall()  memory_record 路由
-      │    │         ├─ _route_exact()
-      │    │         ├─ _route_lexical()
-      │    │         ├─ _route_recent_episode()
-      │    │         └─ fuse_and_pack()
-      │    ├─ _persist_recall_run()         持久化 recall_runs + candidates
-      │    └─ assemble_system_content()     上下文层组装
-      │
-      ├─ [SystemMessage(assembled)]         注入 assembled context
-      │   + [History messages]              Thread Working State
-      │   + [HumanMessage(current)]
-      │
-      ├─ StateGraph.compile().invoke()       LangGraph 执行
-      │    ├─ assistant → policy_check → tools → assistant 循环
-      │    │   └─ Agent 可调用 L3 记忆工具  ★ L3
-      │    └─ END
-      │
-      └─ _finalize()
-           ├─ classify_memory_signal()      记忆提取信号
-           ├─ outbox.enqueue("memory_extraction")  异步记忆写入
-           ├─ ContextSnapshot 持久化
-           └─ db.commit()
+      └─ Turn 收口
+           ├─ 已尝试显式写入 → 跳过分类和自动提取
+           └─ 无显式写入 → ActionPlanner → memory_extraction Outbox
+                                               └─ UnifiedMemoryExtractor → MemoryWriteService
 ```
+
+主 Agent 使用当前用户输入和对话上下文判断是否保存稳定偏好、事实、决策或协作规则。它可以先搜索并沿用已有记忆键。单值键按 `MemoryKeyRegistry` 的冲突策略修订或替换，多值键允许不同内容并存，相同内容可强化。自动提取继续处理符合策略的回合和已有 Outbox 任务。
+
+`ok` 表示工具执行是否成功。`written` 表示是否实际写入记忆记录，`outcome` 和 `reason` 描述业务决策，`state` 表示记录的生命周期或待确认状态。`gate_rejected`、`ignored`、`reinforce_skipped` 和 `conflict_pending` 是可提交的业务结果。`written=true` 的候选记录仍处于 `candidate`。只有确认回执中的 `written=true` 且 `state=active` 表示写入已生效。操作等待超时后，通过原 `operation_id` 调用 `get_tool_operation_status`。该工具限制同 Thread 并应用 Forget 可见性，只有 `committed` 返回已确认的执行结果。
+
+`Memory State` 区分 Core Memory 加载状态、Automatic Recall 完成或降级、记忆命中数、打包后实际注入数和预算淘汰数，并附降级原因。命中数是统一检索返回给装配器的记忆条数。该块随打包结果重新渲染并计入上下文预算，无需额外模型调用。零命中和读取降级都不能用来判断全库总量。
+
+### 来源溯源和历史修复
+
+Worker 按 `ToolOperation.turn_record_id` 读取 `TurnRecord`，核验 Thread、逻辑 Turn、`source=user` 及 `request_event_id` 指向的真实 `user_message`。真实 Event ID 随 `RunContext.source_event_ids` 进入提案、证据和 `ContentProvenanceRef`。来源缺失或非用户回合时写入失败。缺少 Event 列表的旧自动提取任务同样从实际请求事件恢复来源，仅在能定位真实回复事件时使用回复。Forget 继续通过来源闭包控制可见性和防重抽。
+
+在配置了目标数据库的环境运行 `python -m aiive.memory.integrity_audit` 可只读扫描悬空引用。带 `--apply` 时，在同一事务中修复能够证明来自唯一用户 `source_turn_record_id` 的旧 `remember_or_update` 写入。修复会检查旧引用、真实请求事件、Turn 和记忆所有者的 Forget 状态，同步更新记录、提案、证据及持久来源引用。报告只包含行 ID、状态和原因。未能证明来源或已被屏蔽的行保持不可见，重复运行会跳过已修复的引用。
 
 ---
 

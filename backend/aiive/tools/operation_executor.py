@@ -8,14 +8,14 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, override
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from aiive.context.run_context import RunContext, RUN_CTX_OUTBOX_WORKER
+from aiive.context.run_context import RunContext, RUN_CTX_OUTBOX_WORKER, require_ctx
 from aiive.db.base import SessionLocal
-from aiive.tools.base import coerce_tool_result, outcome_is_unknown
+from aiive.tools.base import DatabaseTool, coerce_tool_result, outcome_is_unknown
 from aiive.db.models import Event, OutboxJob, ToolOperation, TurnRecord
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome, HandlerResult
 from aiive.worker.job_source_guard import guard_job_sources_visible
@@ -241,12 +241,22 @@ def operation_response(operation: ToolOperation) -> dict[str, Any]:
             **common,
         }
     if operation.status in {"failed", "cancelled"}:
+        details = {}
+        if operation.status == "failed" and operation.capability_id == "remember_or_update":
+            from aiive.memory.memory_types import WriteOutcome
+            from aiive.memory.memory_write_service import WriteResult
+
+            details = {"details": {
+                **WriteResult(WriteOutcome.FAILED, reason=operation.error_message or "execution_failed").to_dict(),
+                "canonical_key": "",
+            }}
         return {
             "ok": False,
             "error_type": "cancelled" if operation.status == "cancelled" else "execution_failed",
             "error": operation.error_message or "工具执行失败",
             "outcome_known": bool(receipt.get("outcome_known", True)),
             "side_effect_started": bool(receipt.get("side_effect_started", False)),
+            **details,
             **common,
         }
     return {
@@ -257,6 +267,45 @@ def operation_response(operation: ToolOperation) -> dict[str, Any]:
         "side_effect_started": True,
         **common,
     }
+
+
+class GetToolOperationStatusTool(DatabaseTool):
+    @override
+    def _run(self, db: Session, ctx: RunContext | None, operation_id: str) -> dict[str, Any]:
+        from aiive.forget.source_policy import blocked_reference_ids
+        from aiive.forget.visibility_service import ForgetVisibilityService
+
+        run_context = require_ctx(ctx, "get_tool_operation_status")
+        unavailable = {"ok": False, "error_type": "operation_not_found", "error": "工具操作不可用"}
+        operation = db.query(ToolOperation).filter_by(
+            id=operation_id, thread_id=run_context.thread_id,
+        ).one_or_none()
+        if operation is None:
+            return unavailable
+        turn = db.get(TurnRecord, operation.turn_record_id)
+        if turn is None or (turn.thread_id, turn.turn_id) != (operation.thread_id, operation.turn_id):
+            return unavailable
+        visibility = ForgetVisibilityService
+        if (visibility.blocked_target_ids(db, "tool_operation", [(operation.id, operation.created_at)])
+                or visibility.blocked_target_ids(db, "turn_record", [(turn.id, turn.created_at)])
+                or (turn.request_event_id and blocked_reference_ids(db, "event", {turn.request_event_id: None}))):
+            return unavailable
+
+        result = operation.result_payload if operation.status == "committed" else None
+        if operation.capability_id == "remember_or_update" and isinstance(result, dict):
+            memory_id = result.get("memory_id")
+            if memory_id and result.get("outcome") != "conflict_pending" and blocked_reference_ids(
+                db, "memory_record", {memory_id: None},
+            ):
+                return unavailable
+        return {
+            "ok": True,
+            "operation_id": operation.id,
+            "status": operation.status,
+            "result": result,
+            "error": operation.error_message,
+            "terminal_reason": operation.terminal_reason,
+        }
 
 
 @with_execution_authorization
@@ -335,6 +384,11 @@ def handle_tool_operation(claimed: ClaimedJob) -> HandlerResult:
             turn_id=operation.turn_id,
             turn_record_id=operation.turn_record_id,
         )
+        if operation.capability_id == "remember_or_update":
+            source_event = context.load_user_request_event(db)
+            if source_event is None:
+                return _record_failure(operation_id, execution_token, "user_request_event_required", "invalid_memory_source")
+            context.source_event_ids = [source_event.id]
         if operation.effect_mode == "db_transactional":
             return _execute_db_transactional(operation_id, execution_token, registration, context, dict(operation.params or {}))
         return _execute_external(operation_id, execution_token, registration, context, dict(operation.params or {}))
@@ -354,7 +408,7 @@ def _execute_db_transactional(
     params: dict[str, Any],
 ) -> HandlerResult:
     """在同一事务中提交数据库业务副作用和 operation committed 回执。"""
-    from aiive.tools.base import DatabaseTool, ToolCancelled, ToolExecutionContext
+    from aiive.tools.base import ToolCancelled, ToolExecutionContext
     from aiive.tools.executor import cancellation_requested
     if not isinstance(handler, DatabaseTool):
         return _record_failure(operation_id, execution_token, "数据库工具未声明可注入事务", "invalid_transaction_tool")

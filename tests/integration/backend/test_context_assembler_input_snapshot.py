@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+import pytest
+
 from aiive.runtime.context_assembler import (
     ContextAssembler,
     ContextSnapshotData,
@@ -53,6 +55,49 @@ def _make_assembler() -> ContextAssembler:
             context_window=200_000, max_output_tokens=2_000,
         ),
     )
+
+
+@pytest.mark.parametrize("scenario", ["no_hits", "degraded", "budget_dropped"])
+def test_memory_state_matches_the_final_prompt(db, monkeypatch, scenario):
+    from aiive.retrieval.unified_retriever import UnifiedRetriever
+
+    class Counter(_FakeTokenCounter):
+        def count_messages(self, model, messages, tools=None):
+            total = 900 if any("very large recall hit" in message.get("content", "") for message in messages) else 100
+            return TokenCount(estimated_tokens=total, safe_tokens=total, safety_margin_tokens=0)
+
+    degraded = scenario == "degraded"
+    hits = [RetrievalHit(source_type="memory_record", source_id="small", source_version="1", snippet="small hit", final_score=0.9),
+            RetrievalHit(source_type="memory_record", source_id="large", source_version="1", snippet="very large recall hit", final_score=0.1)
+            ] if scenario == "budget_dropped" else []
+    monkeypatch.setattr(UnifiedRetriever, "retrieve", lambda _, req: RetrievalResult(
+        request_id=req.request_id, hits=hits, degraded=degraded,
+        notes=["memory_route_degraded"] if degraded else [],
+    ))
+    if degraded:
+        def broken_core(*args):
+            raise RuntimeError("internal error detail")
+
+        monkeypatch.setattr("aiive.runtime.context_assembler.load_core_memory", broken_core)
+    assembler = ContextAssembler(token_counter=Counter(), budget=ContextBudget(
+        model_context_window=750, reserved_output_tokens=100,
+    ))
+    thread = new_thread(db)
+    assembled = assembler.assemble(db, "test", thread)
+    state, = [m["content"] for m in assembled.messages if m["content"].startswith("## Memory State")]
+    assert assembled.snapshot.full_contents["memory_state"] == state
+    if degraded:
+        assert "Core Memory: degraded" in state
+        assert "Automatic Recall: degraded, hits=0, injected=0, budget_dropped=0" in state
+        assert "core_load_failed" in state and "memory_route_degraded" in state
+        assert "internal error detail" not in state
+    elif hits:
+        assert "hits=2, injected=1, budget_dropped=1" in state
+        assert not any("very large recall hit" in m["content"] for m in assembled.messages)
+        assert any("small hit" in m["content"] for m in assembled.messages)
+    else:
+        assert "Core Memory: loaded" in state
+        assert "Automatic Recall: completed, hits=0, injected=0, budget_dropped=0" in state
 
 
 def test_unified_recall_diagnostic_failure_does_not_retry_or_pollute_session(db, monkeypatch) -> None:
