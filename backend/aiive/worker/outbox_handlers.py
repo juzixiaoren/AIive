@@ -1502,6 +1502,10 @@ def _reconstruct_source_turns(db: Session, event_manifest: list[dict[str, Any]])
     # event_manifest 已在冻结时按 (turn_sequence, turn_event_index) 排序；
     # 不可使用随机 UUID turn_id 排序，否则摘要会打乱跨 Turn 的因果顺序。
     for e in sorted(events, key=lambda item: event_order.get(item.id, len(event_order))):
+        et = e.event_type
+        pl = e.payload or {}
+        if pl.get("protocol_only"):
+            continue
         turn = by_turn.setdefault(e.turn_id or "", {
             "turn_id": e.turn_id,
             "user_message": "",
@@ -1509,8 +1513,6 @@ def _reconstruct_source_turns(db: Session, event_manifest: list[dict[str, Any]])
             "tool_calls": [],
             "tool_results": [],
         })
-        et = e.event_type
-        pl = e.payload or {}
         if et == "user_message":
             turn["user_message"] = pl.get("content", "")
         elif et == "llm_response":

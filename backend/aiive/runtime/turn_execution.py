@@ -56,6 +56,7 @@ from aiive.runtime.context_budget import ContextBudget
 from aiive.runtime.epoch_manager import EpochManager
 from aiive.runtime.execution_context import TurnExecutionContext
 from aiive.config import settings
+from aiive.core.assistant_protocol import PROVIDER_METADATA
 from aiive.runtime.thread_state import ThreadState
 from aiive.runtime.thread_bootstrap import ThreadBootstrapService
 from aiive.runtime.conversation_state import (
@@ -958,6 +959,46 @@ class TurnExecutionService:
         finally:
             db.close()
 
+    @staticmethod
+    def _write_tool_batch_events(
+        db: Session, turn: TurnRecord, trace_id: str, index: int, records: list[ToolRecord],
+        *, interrupted: bool = False, cancelled: bool = False,
+    ) -> int:
+        batches: dict[int, list[ToolRecord]] = {}
+        for record in records:
+            batches.setdefault(record.batch_index, []).append(record)
+
+        for batch_index, batch in sorted(batches.items()):
+            batch.sort(key=lambda record: record.batch_position)
+            carrier = next((record for record in batch if record.provider_metadata), batch[0])
+            for phase in ("tool_call", "tool_result"):
+                for position, record in enumerate(batch):
+                    payload: dict[str, Any] = {
+                        "name": record.name, "tool_call_id": record.tool_call_id, "batch_index": batch_index,
+                    }
+                    if record.protocol_only or record.status in ("blocked", "pending_approval"):
+                        payload["protocol_only"] = True
+                        payload["protocol_status"] = record.status
+                    if interrupted:
+                        payload["interrupted"] = True
+                    if cancelled:
+                        payload["cancelled"] = True
+                    if phase == "tool_call":
+                        payload["params"] = record.params
+                        if position == 0:
+                            if carrier.provider_metadata:
+                                payload[PROVIDER_METADATA] = carrier.provider_metadata
+                            if carrier.assistant_content:
+                                payload["assistant_content"] = carrier.assistant_content
+                    else:
+                        payload.update(result=record.result, status=record.status)
+                    db.add(Event(
+                        id=str(_uuid.uuid4()), trace_id=trace_id, thread_id=turn.thread_id,
+                        turn_id=turn.turn_id, event_type=phase, turn_event_index=index, payload=payload,
+                    ))
+                    index += 1
+        return index
+
     def _persist_interrupted_tool_facts(
         self,
         turn: TurnRecord,
@@ -983,28 +1024,12 @@ class TurnExecutionService:
                 db, turn.thread_id, owner_kind=OWNER_TURN, owner_id=turn.id,
             )
 
-            for index, record in enumerate(tool_records):
-                event_index = 1 + index * 2
-                db.add(Event(
-                    id=str(_uuid.uuid4()), trace_id=trace_id,
-                    thread_id=turn.thread_id, event_type="tool_call", turn_id=turn.turn_id,
-                    turn_event_index=event_index,
-                    payload={
-                        "name": record.name, "params": record.params,
-                        "tool_call_id": record.tool_call_id, "batch_index": record.batch_index,
-                        "interrupted": True,
-                    },
-                ))
-                db.add(Event(
-                    id=str(_uuid.uuid4()), trace_id=trace_id,
-                    thread_id=turn.thread_id, event_type="tool_result", turn_id=turn.turn_id,
-                    turn_event_index=event_index + 1,
-                    payload={
-                        "name": record.name, "result": record.result, "status": record.status,
-                        "tool_call_id": record.tool_call_id, "batch_index": record.batch_index,
-                        "interrupted": True,
-                    },
-                ))
+            max_index = db.query(func.max(Event.turn_event_index)).filter(
+                Event.thread_id == thread_id, Event.turn_id == turn.turn_id,
+            ).scalar()
+            self._write_tool_batch_events(
+                db, turn, trace_id, int(max_index or 0) + 1, tool_records, interrupted=True,
+            )
             db.commit()
         except Exception:
             db.rollback()
@@ -1060,32 +1085,9 @@ class TurnExecutionService:
                 Event.turn_id == turn_id,
             ).scalar()
             idx = int(max_index or 0) + 1
-            for record in tool_records:
-                db.add(Event(
-                    id=str(_uuid.uuid4()), trace_id=trace_id,
-                    thread_id=thread_id, event_type="tool_call",
-                    turn_id=turn_id, turn_event_index=idx,
-                    payload={
-                        "name": record.name, "params": record.params,
-                        "tool_call_id": record.tool_call_id,
-                        "batch_index": record.batch_index,
-                        "interrupted": True, "cancelled": True,
-                    },
-                ))
-                idx += 1
-                db.add(Event(
-                    id=str(_uuid.uuid4()), trace_id=trace_id,
-                    thread_id=thread_id, event_type="tool_result",
-                    turn_id=turn_id, turn_event_index=idx,
-                    payload={
-                        "name": record.name, "result": record.result,
-                        "status": record.status,
-                        "tool_call_id": record.tool_call_id,
-                        "batch_index": record.batch_index,
-                        "interrupted": True, "cancelled": True,
-                    },
-                ))
-                idx += 1
+            self._write_tool_batch_events(
+                db, turn, trace_id, idx, tool_records, interrupted=True, cancelled=True,
+            )
 
             row = db.get(TurnRecord, turn.id)
             if row is not None:
@@ -1170,7 +1172,7 @@ class TurnExecutionService:
                 raise TurnCancelled(
                     trace_id=ag_result.trace_id,
                     partial_reply=ag_result.reply,
-                    tool_records=ag_result.tool_records,
+                    tool_records=[*ag_result.tool_records, *ag_result.protocol_tool_records],
                 )
 
             now = datetime.now(timezone.utc)
@@ -1230,35 +1232,32 @@ class TurnExecutionService:
                 db.rollback()
                 raise FencingViolationError("fencing violation")
 
-            # Events：pending_approval 工具不写入 tool_call/tool_result，等待审批后补充；
-            # blocked 工具从未执行，也不写入（避免孤儿 tool_call 破坏历史配对），
-            # 其事实由 llm_response 事件内的 tool_blocked action card 承载。
-            # 主动消息可能在 Turn 执行期间已写入同一 Turn（turn_event_index 递增）；
-            # 后续工具/最终答复必须接在它后面，不能从 1 重新编号造成乱序。
+            # Append after proactive messages that may already be part of this turn.
             max_index = db.query(func.max(Event.turn_event_index)).filter(
                 Event.thread_id == turn.thread_id,
                 Event.turn_id == turn.turn_id,
             ).scalar()
-            idx = int(max_index or 0) + 1
-            executed_records = [
-                r for r in ag_result.tool_records
-                if r.status not in ("pending_approval", "blocked")
+            records = [
+                record for record in ag_result.tool_records
+                if record.provider_metadata or record.status not in ("pending_approval", "blocked")
             ]
-            for r in executed_records:
-                db.add(Event(id=str(_uuid.uuid4()), trace_id=ag_result.trace_id, thread_id=turn.thread_id,
-                             event_type="tool_call", turn_id=turn.turn_id, turn_event_index=idx,
-                             payload={"name": r.name, "params": r.params, "tool_call_id": r.tool_call_id, "batch_index": r.batch_index}))
-                idx += 1
-                db.add(Event(id=str(_uuid.uuid4()), trace_id=ag_result.trace_id, thread_id=turn.thread_id,
-                             event_type="tool_result", turn_id=turn.turn_id, turn_event_index=idx,
-                             payload={"name": r.name, "result": r.result, "status": r.status, "tool_call_id": r.tool_call_id, "batch_index": r.batch_index}))
-                idx += 1
-            if publish_reply:
+            idx = self._write_tool_batch_events(
+                db, turn, ag_result.trace_id, int(max_index or 0) + 1,
+                [*records, *ag_result.protocol_tool_records],
+            )
+            if publish_reply or ag_result.provider_metadata.get("provider") == "deepseek":
+                payload = {
+                    "content": ag_result.reply if publish_reply else "",
+                    "action_cards": response_dict["action_cards"],
+                    "pending_operations": response_dict["pending_operations"],
+                }
+                if ag_result.provider_metadata:
+                    payload[PROVIDER_METADATA] = ag_result.provider_metadata
+                if not publish_reply:
+                    payload["protocol_only"] = True
                 db.add(Event(id=assistant_event_id, trace_id=ag_result.trace_id, thread_id=turn.thread_id,
                              event_type="llm_response", turn_id=turn.turn_id, turn_event_index=idx,
-                             payload={"content": ag_result.reply,
-                                      "action_cards": response_dict["action_cards"],
-                                      "pending_operations": response_dict["pending_operations"]}))
+                             payload=payload))
                 idx += 1
 
             for approval in ag_result.pending_approvals:
@@ -1344,6 +1343,7 @@ class TurnExecutionService:
                         # Attachment-derived replies are chat evidence, never automatic memory input.
                         "reply": "" if any(
                             (e.payload or {}).get("name") == "read_attachment"
+                            and not (e.payload or {}).get("protocol_only")
                             for e in db.query(Event).filter(Event.thread_id == turn.thread_id, Event.turn_id == turn.turn_id, Event.event_type == "tool_result").all()
                         ) else ag_result.reply,
                         "thread_id": turn.thread_id,
@@ -1557,6 +1557,9 @@ class TurnExecutionService:
                 "cancelled": True,
                 "_status": 409,
             }
+        except GraphExecutionInterrupted as interrupted:
+            self._persist_interrupted_tool_facts(turn, execution_id, interrupted.trace_id, interrupted.tool_records)
+            raise interrupted.error from interrupted
         except ContextBudgetExceededError as e:
             logger.error("Context budget exceeded: %s", e)
             db = SessionLocal()

@@ -12,7 +12,8 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 from collections.abc import Sequence
-from typing import Any, override
+from typing import Any, Literal, override
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -122,6 +123,9 @@ class LLMClient:
         default_model: str,
         timeout_seconds: int = 30,
         json_mode_policy: str = "auto",
+        *,
+        provider: Literal["auto", "deepseek", "openai_compatible"] = "auto",
+        deepseek_thinking: Literal["enabled", "disabled"] = "enabled",
     ):
         """初始化 LLM 客户端。
 
@@ -136,6 +140,10 @@ class LLMClient:
         self._default_model: str = default_model
         self._timeout_seconds: int = timeout_seconds
         self._json_mode_policy: str = json_mode_policy
+        if provider == "auto":
+            provider = "deepseek" if urlsplit(self._base_url).hostname == "api.deepseek.com" else "openai_compatible"
+        self.provider: Literal["deepseek", "openai_compatible"] = provider
+        self.deepseek_thinking: Literal["enabled", "disabled"] = deepseek_thinking
 
     @staticmethod
     def _is_json_mode_unsupported(response: httpx.Response) -> bool:
@@ -359,6 +367,8 @@ def default_llm_client() -> "LLMClient":
     from aiive.config import settings
 
     return LLMClient(
+        provider=settings.aiive_llm_provider,
+        deepseek_thinking=settings.aiive_llm_deepseek_thinking,
         base_url=settings.aiive_llm_base_url,
         api_key=settings.aiive_llm_api_key,
         default_model=settings.aiive_llm_model,

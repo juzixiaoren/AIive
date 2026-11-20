@@ -13,7 +13,9 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from aiive.db.models import TurnRecord, Event, Thread
+from aiive.core.assistant_protocol import PROVIDER_METADATA
+from aiive.db.models import TurnRecord, Event, LLMCall, Thread
+from aiive.forget.visibility_service import ForgetVisibilityService
 from aiive.runtime.message_normalizer import normalize_tool_call, normalize_tool_result, tool_result_content
 
 
@@ -128,7 +130,10 @@ class ThreadState:
                     stopped_by = "max_events"
                     break
 
-                turn_dicts = self._events_to_dicts(events, turn.source)
+                blocked = ForgetVisibilityService.blocked_target_ids(
+                    db, "event", [(event.id, event.created_at) for event in events],
+                )
+                turn_dicts = self._events_to_dicts([event for event in events if event.id not in blocked], turn.source)
                 turn_bytes = sum(len(_json.dumps(d, ensure_ascii=False, default=str).encode()) for d in turn_dicts)
                 total_bytes += turn_bytes
                 if total_bytes > max_raw_bytes:
@@ -189,12 +194,16 @@ class ThreadState:
     def _degrade_interrupted_turn_dicts(
         turn_dicts: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """将中断 Turn 的事件降级为有界 system 文本（不还原为对话消息）。
-
-        中断 Turn 无正常 llm_response，若按原样注入会产生孤儿 tool_call/结果；
-        改为一条 system 说明，让模型知晓「上轮中断前哪些工具已实际执行」。
-        无任何已确认工具事实时返回空列表（整轮跳过）。
-        """
+        """保留有协议元数据的中断批次，旧批次用有界说明记录副作用。"""
+        if any(item.get("type") == "tool_call" and item.get(PROVIDER_METADATA) for item in turn_dicts):
+            # The paired tool facts can be replayed with their original Assistant
+            # metadata. Keep the interruption notice, including for partial batches.
+            return [*turn_dicts, {
+                "type": "system",
+                "content": "[上一轮 Turn 在工具调用后中断，已记录的工具副作用可能已生效，请勿盲目重复执行]",
+                "turn_id": turn_dicts[0].get("turn_id"),
+                "protected": True,
+            }]
         tool_lines: list[str] = []
         results_by_id: dict[str, dict[str, Any]] = {
             str(d.get("tool_call_id") or ""): d
@@ -236,18 +245,25 @@ class ThreadState:
                 msgs.append({"role": "user", "content": content})
             elif etype == "system" and content:
                 msgs.append({"role": "system", "content": content})
-            elif etype == "assistant" and content:
+            elif etype == "assistant" and (content or d.get(PROVIDER_METADATA)):
                 msgs.append({"role": "assistant", "content": content})
+                if metadata := d.get(PROVIDER_METADATA):
+                    msgs[-1][PROVIDER_METADATA] = metadata
             elif etype == "tool_call":
                 call = normalize_tool_call(d)
-                msgs.append({"role": "assistant", "tool_calls": [{
+                msg: dict[str, Any] = {"role": "assistant", "tool_calls": [{
                     "id": call["id"],
                     "type": "function",
                     "function": {
                         "name": call["name"],
                         "arguments": _json.dumps(call["args"], ensure_ascii=False),
                     },
-                }]})
+                }]}
+                if metadata := d.get(PROVIDER_METADATA):
+                    msg[PROVIDER_METADATA] = metadata
+                if content := d.get("assistant_content"):
+                    msg["content"] = content
+                msgs.append(msg)
             elif etype in ("tool_result", "tool_result_ref"):
                 normalized = normalize_tool_result(d)
                 msgs.append({
@@ -343,6 +359,8 @@ class ThreadState:
         tools_attached = False
         for event in events:
             payload = event.payload or {}
+            if payload.get("protocol_only"):
+                continue
             if event.event_type == "user_message" and payload.get("content"):
                 message_source = turn_source or payload.get("message_source")
                 if message_source in (None, "user"):
@@ -460,7 +478,6 @@ class ThreadState:
         )
         if not events:
             return []
-        from aiive.forget.visibility_service import ForgetVisibilityService
         blocked = ForgetVisibilityService.blocked_target_ids(
             self._db, "event", [(event.id, event.created_at) for event in events])
         events = [event for event in events if event.id not in blocked]
@@ -494,22 +511,70 @@ class ThreadState:
         db = object_session(events[0]) if events else None
         refs = event_attachment_refs(db, [e.id for e in events if e.event_type == "user_message"]) if db is not None else {}
         messages: list[dict[str, Any]] = []
+        legacy_traces = {
+            e.trace_id for e in events if e.event_type in ("llm_response", "tool_call")
+            and not (e.payload or {}).get(PROVIDER_METADATA)
+            and not (e.payload or {}).get("proactive")
+            and not (e.payload or {}).get("approval_id")
+        }
+        compatible_traces = set()
+        if db is not None and legacy_traces:
+            calls = db.query(LLMCall.trace_id, LLMCall.model).filter(
+                LLMCall.thread_id == events[0].thread_id, LLMCall.trace_id.in_(legacy_traces),
+            ).all()
+            # Old Main Agent used the prefix "deepseek/" for every model in LLMCall.
+            # Trust a documented model family or explicit provider prefix, not that default.
+            compatible = {"openai", "openai_compatible", "anthropic", "gemini", "google", "qwen", "dashscope", "ollama", "zhipu"}
+            models_by_trace: dict[str, set[str]] = {}
+            for trace_id, model in calls:
+                models_by_trace.setdefault(trace_id, set()).add(model.lower())
+            compatible_traces = {
+                trace_id for trace_id, models in models_by_trace.items()
+                if all(
+                    model.partition("/")[0] in compatible
+                    or model.rsplit("/", 1)[-1].startswith(
+                        ("gpt-", "chatgpt-", "o1", "o3", "o4", "claude-", "gemini-", "qwen", "glm-", "kimi-", "llama", "mistral-")
+                    )
+                    for model in models
+                )
+            }
         for event in events:
             p = event.payload or {}
             etype = event.event_type
+            common: dict[str, Any] = {"event_id": event.id, "trace_id": event.trace_id, "turn_id": event.turn_id}
             if etype == "user_message":
                 content = p.get("content", "")
                 if content or refs.get(event.id):
-                    source_val = turn_source or p.get("message_source")
-                    msg_type = "user" if source_val in (None, "user") else "system"
-                    messages.append({"type": msg_type, "content": content, "attachments": refs.get(event.id, []), "event_id": event.id, "trace_id": event.trace_id, "turn_id": event.turn_id})
-            elif etype == "tool_call":
-                # turn_id 供 stable_tool_call_id 在缺失 tool_call_id 时构造两侧一致的回退键
-                messages.append({"type": "tool_call", "tool_name": p.get("name", ""), "tool_params": p.get("params", {}), "event_id": event.id, "trace_id": event.trace_id, "tool_call_id": p.get("tool_call_id", ""), "batch_index": p.get("batch_index", 0), "turn_id": event.turn_id})
-            elif etype == "tool_result":
-                messages.append({"type": "tool_result", "tool_name": p.get("name", ""), "tool_result": p.get("result", {}), "tool_status": p.get("status", "unknown"), "event_id": event.id, "trace_id": event.trace_id, "tool_call_id": p.get("tool_call_id", ""), "batch_index": p.get("batch_index", 0), "turn_id": event.turn_id})
-            elif etype == "llm_response":
-                content = p.get("content", "")
-                if content:
-                    messages.append({"type": "assistant", "content": content, "action_cards": p.get("action_cards", []), "event_id": event.id, "trace_id": event.trace_id, "turn_id": event.turn_id})
+                    source = turn_source or p.get("message_source")
+                    role = "user" if source in (None, "user") else "system"
+                    messages.append({"type": role, "content": content, "attachments": refs.get(event.id, []), **common})
+                continue
+            metadata = p.get(PROVIDER_METADATA)
+            if not metadata:
+                if p.get("approval_id") or p.get("proactive"):
+                    metadata = {"provider": "aiive"}
+                elif event.trace_id in compatible_traces:
+                    metadata = {"provider": "openai_compatible"}
+            if etype in ("tool_call", "tool_result"):
+                common.update({
+                    "type": etype, "tool_name": p.get("name", ""), "tool_call_id": p.get("tool_call_id", ""),
+                    "batch_index": p.get("batch_index", 0),
+                })
+                for key in ("approval_id", "protocol_status"):
+                    if key in p:
+                        common[key] = p[key]
+                if etype == "tool_call":
+                    common["tool_params"] = p.get("params", {})
+                    if p.get("assistant_content"):
+                        common["assistant_content"] = p["assistant_content"]
+                    if metadata:
+                        common[PROVIDER_METADATA] = metadata
+                else:
+                    common.update(tool_result=p.get("result", {}), tool_status=p.get("status", "unknown"))
+                messages.append(common)
+            elif etype == "llm_response" and (p.get("content") or p.get(PROVIDER_METADATA)):
+                message = {"type": "assistant", "content": p.get("content", ""), "action_cards": p.get("action_cards", []), **common}
+                if metadata:
+                    message[PROVIDER_METADATA] = metadata
+                messages.append(message)
         return messages

@@ -46,6 +46,8 @@ from typing_extensions import TypedDict
 
 from aiive.context.run_context import RunContext
 from aiive.core.action_planner import ActionPlanner, MemorySignalDecision
+from aiive.core.assistant_protocol import PROVIDER_METADATA, assistant_message_kwargs, assistant_metadata
+from aiive.core.deepseek_chat import AIiveChatDeepSeek
 from aiive.core.llm_client import normalize_llm_error
 from aiive.core.function_calling import build_chat_model, normalize_calls, validate_calls, correction_allowed
 from aiive.core.llm_client import LLMClient
@@ -99,6 +101,14 @@ def _tool_calls_paired(messages: list[Any]) -> bool:
         elif isinstance(message, ToolMessage):
             pending.discard(str(message.tool_call_id or ""))
     return not pending
+
+
+def _tool_batch(message: AIMessage, messages: list[Any]) -> dict[str, Any]:
+    return {
+        "batch_index": sum(isinstance(item, AIMessage) and bool(item.tool_calls) for item in messages) - 1,
+        PROVIDER_METADATA: assistant_metadata(message),
+        "assistant_content": str(message.content or ""),
+    }
 
 
 def _ws_commit(mutate: "Callable[[Session], None]") -> None:
@@ -218,6 +228,10 @@ class ToolRecord:
     status: str = "completed"     # "completed" | "failed" | "execution_unknown" | "blocked"
     order_index: int = 0          # 全局执行顺序
     reason: str = ""              # blocked 等状态的原因说明
+    provider_metadata: dict[str, str] = field(default_factory=dict, repr=False)
+    assistant_content: str = ""
+    protocol_only: bool = False
+    batch_position: int = 0
 
 
 @dataclass
@@ -264,6 +278,8 @@ class AgentGraphResult:
     memory_signal: Any = None  # MemorySignalDecision
     llm_usage: LLMUsageStats = field(default_factory=LLMUsageStats)
     event_decisions: list[dict[str, Any]] = field(default_factory=list)
+    provider_metadata: dict[str, str] = field(default_factory=dict, repr=False)
+    protocol_tool_records: list[ToolRecord] = field(default_factory=list, repr=False)
 
 
 # ---------------------------------------------------------------------------
@@ -298,8 +314,7 @@ class AgentGraph:
     # LangChain LLM 工厂
     # ------------------------------------------------------------------
 
-    def _build_langchain_llm(self) -> ChatOpenAI:
-        """使用 AIive LLMClient 配置构建 LangChain ChatOpenAI 实例。"""
+    def _build_langchain_llm(self) -> ChatOpenAI | AIiveChatDeepSeek:
         return build_chat_model(self._llm_client, streaming=True)
 
     @staticmethod
@@ -570,11 +585,12 @@ class AgentGraph:
                 injection_text, injected = _load_event_injection()
             if task_terminal_wakeup and not injection_text:
                 # A foreground Turn may have already drained the Inbox before we acquired the lease.
-                return {"messages": [AIMessage(content="")]}
+                return {"messages": [AIMessage(content="", response_metadata={"provider": "aiive"})]}
             call_messages = [*msgs, SystemMessage(content=injection_text)] if injection_text else msgs
             from aiive.forget.concurrency import forget_revision
             if context_forget_revision is not None and forget_revision(self._db) != context_forget_revision:
-                return {"messages": [AIMessage(content="上下文因遗忘操作失效，本轮已停止。请重新发送消息。")]}
+                return {"messages": [AIMessage(content="上下文因遗忘操作失效，本轮已停止。请重新发送消息。",
+                                               response_metadata={"provider": "aiive"})]}
             resp = normalize_calls(llm_with_tools.invoke(call_messages))
             tc_count = len(getattr(resp, "tool_calls", None) or [])
             content_len = len(str(resp.content or ""))
@@ -641,11 +657,14 @@ class AgentGraph:
             if result.action == PolicyAction.CONFIRM and registry is not None and not validate_calls(last_msg, registry).ok:
                 return "continue"  # Invalid parameters must be repaired before creating an approval.
             if result.action == PolicyAction.CONFIRM:
+                batch = _tool_batch(last_msg, msgs)
                 _pending_approval_list[:] = [
                     {"name": tc["name"], "args": tc.get("args", {}), "id": tc.get("id", ""),
-                     "safe_tool_calls": tool_calls_raw}
+                     "safe_tool_calls": tool_calls_raw, **batch}
                     for tc in last_msg.tool_calls
                 ]
+                for pos, approval in enumerate(_pending_approval_list):
+                    approval["batch_position"] = pos
                 logger.info("[TRACE:graph] POLICY_CHECK(ns): action=CONFIRM → confirm (%d tools)", len(_pending_approval_list))
                 return "confirm"
             logger.info("[TRACE:graph] POLICY_CHECK(ns): action=%s → %s", result.action, "finalize" if result.action == PolicyAction.BLOCK else "continue")
@@ -653,12 +672,10 @@ class AgentGraph:
                 # 记录被阻止的工具事实（tool_blocked 卡片），避免阻断原因丢失后
                 # 被误报为 empty_llm_response。
                 blocked_set = set(result.blocked_tools)
-                batch_index = max(
-                    0,
-                    sum(1 for m in msgs if isinstance(m, AIMessage) and m.tool_calls) - 1,
-                )
-                for tc in tool_calls_raw:
-                    if tc["name"] not in blocked_set:
+                batch = _tool_batch(last_msg, msgs)
+                for pos, tc in enumerate(tool_calls_raw):
+                    blocked = tc["name"] in blocked_set
+                    if not blocked and not batch[PROVIDER_METADATA]:
                         continue
                     tool_records.append({
                         "name": tc["name"],
@@ -668,7 +685,9 @@ class AgentGraph:
                         "reason": result.reason,
                         "trace_id": trace_id,
                         "tool_call_id": str(tc.get("id", "") or ""),
-                        "batch_index": batch_index,
+                        "protocol_only": not blocked,
+                        "batch_position": pos,
+                        **batch,
                     })
                 return "finalize"
             return "continue"
@@ -703,13 +722,10 @@ class AgentGraph:
                 }
 
             attempts = int(state.get("tool_validation_attempts", 0) or 0) + 1
-            batch_index = max(
-                0,
-                sum(1 for message in msgs if isinstance(message, AIMessage) and message.tool_calls) - 1,
-            )
+            batch = _tool_batch(last_msg, msgs)
             feedback = validation.feedback(last_msg)
             validation_records: list[dict[str, Any]] = []
-            for tc in last_msg.tool_calls:
+            for pos, tc in enumerate(last_msg.tool_calls):
                 call_id = str(tc.get("id", "") or "")
                 name = str(tc.get("name", "") or "")
                 payload = validation.errors[call_id]
@@ -727,9 +743,12 @@ class AgentGraph:
                     "reason": reason,
                     "trace_id": trace_id,
                     "tool_call_id": call_id,
-                    "batch_index": batch_index,
+                    "batch_position": pos,
+                    **batch,
                 }
                 validation_records.append(record)
+            if batch[PROVIDER_METADATA]:
+                tool_records.extend({**record, "protocol_only": True} for record in validation_records)
             logger.info(
                 "[TRACE:graph] VALIDATE_TOOLS(ns): invalid batch attempts=%d tools=%s",
                 attempts,
@@ -752,13 +771,15 @@ class AgentGraph:
 
         def _validation_abort(state: _AgentState) -> dict[str, Any]:
             final_records = list(state.get("tool_validation_records", []))
-            tool_records.extend(final_records)
+            if final_records and not final_records[0].get(PROVIDER_METADATA):
+                tool_records.extend(final_records)
             return {
                 "messages": [AIMessage(
                     content=(
                         "工具参数连续校验失败，已停止执行以避免错误操作。"
                         "请补充或确认必要参数后再试。"
-                    )
+                    ),
+                    response_metadata={"provider": "aiive"},
                 )],
                 "tool_records": final_records,
             }
@@ -847,15 +868,12 @@ class AgentGraph:
                 logger.exception("[TRACE:graph] TOOLS(ns): invoke FAILED")
                 raise
 
-            tool_messages = [m for m in result.get("messages", []) if isinstance(m, ToolMessage)]
+            tool_messages = {m.tool_call_id: m for m in result.get("messages", []) if isinstance(m, ToolMessage)}
             task_status_reads: dict[str, str] = {}
-            batch_index = max(
-                0,
-                sum(1 for m in state["messages"] if isinstance(m, AIMessage) and m.tool_calls) - 1,
-            )
+            batch = _tool_batch(last_msg, state["messages"]) if isinstance(last_msg, AIMessage) else {}
 
-            for i, tc in enumerate(tc_list):
-                tm = tool_messages[i] if i < len(tool_messages) else None
+            for pos, tc in enumerate(tc_list):
+                tm = tool_messages.get(str(tc.get("id") or ""))
                 raw_content = str(tm.content) if tm else ""
                 tool_name = str(tc.get("name") or "")
 
@@ -905,7 +923,8 @@ class AgentGraph:
                     "status": record_status,
                     "trace_id": trace_id,
                     "tool_call_id": str(tc.get("id", "") or ""),
-                    "batch_index": batch_index,
+                    "batch_position": pos,
+                    **batch,
                 })
 
                 # ── B: 调用后维护 verified_tool_states / running_tool_state / artifact_refs ──
@@ -1106,6 +1125,7 @@ class AgentGraph:
         llm_usage: "LLMUsageStats",
         signal: "MemorySignalDecision",
         event_decisions: "list[dict[str, Any]] | None" = None,
+        last_message: Any = None,
     ) -> "AgentGraphResult":
         """Assemble the final AgentGraphResult from the shared post-processing.
 
@@ -1117,6 +1137,11 @@ class AgentGraph:
         # Graph state is the single source of truth for executed tool facts;
         # the closure-level records_raw additionally holds policy-blocked facts.
         tool_records = self._tool_records_from_state(graph_state_tool_records)
+        state_calls = {(r.batch_index, r.tool_call_id) for r in tool_records}
+        protocol_tool_records = [
+            r for r in self._tool_records_from_state(records_raw) if r.protocol_only
+            and (r.batch_index, r.tool_call_id) not in state_calls
+        ]
         reply = self._merge_blocked_records(records_raw, tool_records, reply)
 
         if pending_approvals:
@@ -1125,11 +1150,15 @@ class AgentGraph:
                 tc_args = pa.get("args", {}) if isinstance(pa.get("args"), dict) else {}
                 tool_records.append(ToolRecord(
                     tool_call_id=str(pa.get("id", "") or ""),
+                    batch_index=int(pa.get("batch_index", 0)),
                     name=tc_name,
                     params=tc_args,
                     result={"ok": False, "result": "awaiting_approval"},
                     status="pending_approval",
                     order_index=len(tool_records),
+                    provider_metadata=pa.get(PROVIDER_METADATA, {}),
+                    assistant_content=pa.get("assistant_content", ""),
+                    batch_position=int(pa.get("batch_position", 0)),
                 ))
             if not reply and pending_approvals:
                 tool_names = [str(pa.get("name", "")) for pa in pending_approvals]
@@ -1159,10 +1188,16 @@ class AgentGraph:
             reply=reply, trace_id=trace.trace_id, user_message=message,
             tool_records=tool_records, action_cards=action_cards,
             pending_operations=pending_operations,
-            pending_approvals=[dict(item) for item in pending_approvals],
+            pending_approvals=[
+                {key: val for key, val in item.items() if key not in (PROVIDER_METADATA, "assistant_content")}
+                for item in pending_approvals
+            ],
             context_snapshot=result_snapshot, memory_signal=signal,
             llm_usage=llm_usage,
             event_decisions=list(event_decisions or []),
+            provider_metadata=assistant_metadata(last_message)
+            if isinstance(last_message, AIMessage) and not last_message.tool_calls else {"provider": "aiive"},
+            protocol_tool_records=protocol_tool_records,
         )
 
     # ------------------------------------------------------------------
@@ -1194,21 +1229,28 @@ class AgentGraph:
         tools = prep["tools"]
         try:
             result = compiled.invoke({"messages": initial_messages, "tool_records": []})
-        except TurnCancelled:
+        except TurnCancelled as cancelled:
             # 取消是主动收口，不是模型错误：交给 Turn 层标记 cancelled。
+            cancelled.tool_records = self._tool_records_from_state(_records_raw)
             raise
         except Exception as error:
-            logger.exception(
+            logger.error(
                 "[TRACE:graph] compiled.invoke 异常: trace_id=%s model=%s msgs_count=%d tools_count=%d",
                 trace.trace_id,
                 self._llm_client.default_model,
                 len(initial_messages),
                 len(tools),
             )
-            raise normalize_llm_error(error, trace.trace_id) from error
+            normalized = normalize_llm_error(error, trace.trace_id)
+            if _records_raw:
+                raise GraphExecutionInterrupted(
+                    error=normalized, trace_id=trace.trace_id, partial_reply="",
+                    tool_records=self._tool_records_from_state(_records_raw),
+                ) from error
+            raise normalized from error
 
         # ── 提取回复 ──
-        all_messages = result["messages"]
+        all_messages = result["messages"][len(initial_messages):]
         llm_usage = self._collect_llm_usage(all_messages)
         reply = self._extract_reply(all_messages)
         if exec_ctx.task_terminal_wakeup and all_messages and isinstance(all_messages[-1], AIMessage):
@@ -1238,6 +1280,7 @@ class AgentGraph:
             llm_usage=llm_usage,
             signal=signal,
             event_decisions=result.get("event_decisions", []),
+            last_message=all_messages[-1] if all_messages else None,
         )
 
     # ------------------------------------------------------------------
@@ -1277,6 +1320,7 @@ class AgentGraph:
         final_state: dict[str, Any] | None = None
         stream_matcher = _StreamToolCallMatcher()
         stream_params_by_id: dict[str, dict[str, Any]] = {}
+        stream_batches_by_id: dict[str, dict[str, Any]] = {}
         completed_stream_records: list[ToolRecord] = []
         decision_filters: dict[str, _DecisionMarkerStreamFilter] = {}
         input_state: dict[str, Any] = {"messages": initial_messages, "tool_records": []}
@@ -1325,6 +1369,11 @@ class AgentGraph:
                         for stream_message in reversed(tool_calls):
                             if isinstance(stream_message, AIMessage) and stream_message.tool_calls:
                                 stream_matcher.register_batch(stream_message.tool_calls)
+                                batch = _tool_batch(stream_message, tool_calls)
+                                stream_batches_by_id.update({
+                                    str(call["id"]): {**batch, "batch_position": pos}
+                                    for pos, call in enumerate(stream_message.tool_calls)
+                                })
                                 break
 
                 if kind == "on_chain_end" and not event.get("parent_ids"):
@@ -1421,8 +1470,13 @@ class AgentGraph:
                     if first is not None and hasattr(first, "tool_call_id"):
                         tool_call_id = str(getattr(first, "tool_call_id", "") or "")
                     tool_call_id = stream_matcher.finish(run_id, tool_call_id)
+                    batch = stream_batches_by_id.get(tool_call_id, {})
                     completed_stream_records.append(ToolRecord(
                         tool_call_id=tool_call_id,
+                        batch_index=batch.get("batch_index", 0),
+                        provider_metadata=batch.get(PROVIDER_METADATA, {}),
+                        assistant_content=batch.get("assistant_content", ""),
+                        batch_position=batch.get("batch_position", 0),
                         name=evt_name,
                         params=stream_params_by_id.get(tool_call_id, {}),
                         result={
@@ -1446,7 +1500,7 @@ class AgentGraph:
             # 取消是主动收口，不是异常：保留已确认工具事实并原样向上传递。
             raise
         except Exception as error:
-            logger.exception(
+            logger.error(
                 "[TRACE:graph] astream_events 异常: trace_id=%s model=%s partial_tools=%d",
                 trace.trace_id, self._llm_client.default_model, len(_records_raw),
             )
@@ -1481,7 +1535,7 @@ class AgentGraph:
         reply = "".join(accumulated)
         final_messages: list[Any] = []
         if final_state is not None:
-            final_messages = final_state.get("messages", [])
+            final_messages = final_state.get("messages", [])[len(initial_messages):]
             for final_message in reversed(final_messages):
                 if isinstance(final_message, AIMessage) and final_message.content and not final_message.tool_calls:
                     reply = str(final_message.content)
@@ -1514,6 +1568,7 @@ class AgentGraph:
             event_decisions=(
                 final_state.get("event_decisions", []) if final_state is not None else []
             ),
+            last_message=final_messages[-1] if final_messages else None,
         )
         yield {"type": "__graph_result__", "result": result}
 
@@ -1529,7 +1584,7 @@ class AgentGraph:
         （状态为 blocked），需在此并入结果，产出 tool_blocked 卡片而非
         伪装成 empty_llm_response。返回（可能被替换的）回复文本。
         """
-        blocked_raw = [r for r in records_raw if r.get("status") == "blocked"]
+        blocked_raw = [r for r in records_raw if r.get("status") == "blocked" and not r.get("protocol_only")]
         for r in blocked_raw:
             tool_records.append(ToolRecord(
                 tool_call_id=str(r.get("tool_call_id", "") or ""),
@@ -1540,6 +1595,9 @@ class AgentGraph:
                 status="blocked",
                 order_index=len(tool_records),
                 reason=str(r.get("reason", "") or ""),
+                provider_metadata=r.get(PROVIDER_METADATA, {}),
+                assistant_content=r.get("assistant_content", ""),
+                batch_position=int(r.get("batch_position", 0)),
             ))
         if not reply and blocked_raw:
             names = ", ".join(sorted({str(r.get("name", "") or "") for r in blocked_raw}))
@@ -1559,6 +1617,10 @@ class AgentGraph:
                 status=str(record.get("status", "completed") or "completed"),
                 order_index=index,
                 reason=str(record.get("reason", "") or ""),
+                provider_metadata=record.get(PROVIDER_METADATA, {}),
+                assistant_content=record.get("assistant_content", ""),
+                protocol_only=bool(record.get("protocol_only")),
+                batch_position=int(record.get("batch_position", 0)),
             )
             for index, record in enumerate(records)
         ]
@@ -1580,11 +1642,9 @@ class AgentGraph:
             elif role == "user":
                 result.append(HumanMessage(content=content))
             elif role == "assistant":
-                if tool_calls:
-                    tcs = [normalize_tool_call(tc) for tc in tool_calls]
-                    result.append(AIMessage(content=content, tool_calls=tcs))
-                else:
-                    result.append(AIMessage(content=content))
+                result.append(AIMessage(content=content, tool_calls=[
+                    normalize_tool_call(tc) for tc in tool_calls or []
+                ], **assistant_message_kwargs(m.get(PROVIDER_METADATA) or {})))
             elif role == "tool":
                 normalized = normalize_tool_result(m)
                 result.append(ToolMessage(

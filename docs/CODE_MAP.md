@@ -77,6 +77,7 @@
 | Agent 图节点 / 工具循环 / 流式 | `runtime/agent_graph.py` | `tools/langchain_adapter.py`、`core/llm_client.py` | `test_agent_graph*.py` |
 | 上下文组装与 token 预算 | `runtime/context_assembler.py`、`runtime/context_budget.py` | `memory/automatic_recall.py`、`runtime/thread_state.py` | `test_context_assembler*.py` |
 | LLM 客户端（json_mode 降级/错误归一） | `core/llm_client.py` | `config.py`（LLM 配置项） | `test_llm_client*.py` |
+| DeepSeek Thinking / Function Calling | `core/deepseek_chat.py`、`core/function_calling.py` | `core/assistant_protocol.py`、`runtime/turn_execution.py`、`runtime/thread_state.py`、`runtime/context_assembler.py`、`task_runtime/agent_executor.py`、[协议说明](architecture/agent_tool_contract.md#deepseek-thinking-协议) | `test_deepseek_thinking.py` |
 | 上下文压缩（segment/epoch/checkpoint） | `runtime/compaction.py`、`runtime/epoch_manager.py` | `worker/outbox_handlers.py`（`handle_segment_sealing` 等） | `test_compaction*.py`、`test_epoch*.py` |
 | 注意力 / 节奏 | `runtime/attention_manager.py`、`runtime/rhythm_manager.py` | `api/routes_attention.py` | `test_attention*.py` |
 | WorkingState（运行中状态） | `runtime/working_state.py` | `runtime/agent_graph.py::_tools_node` | `test_working_state*.py` |

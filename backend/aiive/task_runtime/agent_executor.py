@@ -11,6 +11,8 @@ from typing import Any
 from pydantic import ValidationError
 from langchain_core.messages import AIMessage, convert_to_messages, convert_to_openai_messages, messages_from_dict
 from langchain_core.runnables import Runnable
+from aiive.core.assistant_protocol import LEGACY_FALLBACK, PROVIDER_METADATA, assistant_metadata
+from aiive.core.deepseek_chat import AIiveChatDeepSeek
 from aiive.core.function_calling import build_chat_model, normalize_calls, validate_calls, response_usage
 from aiive.task_runtime.function_decisions import WorkerFunctions
 
@@ -64,8 +66,14 @@ class TaskAgentExecutor:
         while True:
             messages, prompt_refs = assembler.render(task, snapshot)
             call_messages = [*convert_to_messages(messages), *feedback]
+            budget_messages = convert_to_openai_messages(call_messages)
+            # Conversion for counting strips LangChain metadata. The bounded repair
+            # exchange has one wire message per Assistant/ToolMessage.
+            for source, wire in zip(reversed(feedback), reversed(budget_messages)):
+                if isinstance(source, AIMessage):
+                    wire[PROVIDER_METADATA] = assistant_metadata(source)
             size = self.counter.count_messages(
-                self.profile.full_name, convert_to_openai_messages(call_messages), definitions,
+                self.profile.full_name, budget_messages, definitions,
             ).safe_tokens
             fits_context = size <= budget.hard_input_limit
             if fits_context and (remaining is None or remaining >= size + minimum_output):
@@ -93,6 +101,10 @@ class TaskAgentExecutor:
         self.db.commit()
         model = self.chat_model if self.chat_model is not None else build_chat_model(self.llm)
         output_limit: dict[str, Any] = {"max_tokens": max_output} if max_output else {}
+        if isinstance(model, AIiveChatDeepSeek) and any(
+            msg.response_metadata.get("thinking_mode") == LEGACY_FALLBACK for msg in feedback
+        ):
+            output_limit["legacy_thinking_fallback"] = True
         try:
             # Thinking providers may reject forced tool_choice. Exactly one call is
             # still enforced locally by validate_calls(require_one=True), with bounded repair.

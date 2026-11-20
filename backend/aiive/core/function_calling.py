@@ -9,19 +9,28 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage, message_to_dict
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolCall, ToolMessage, message_to_dict
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
 from aiive.core.function_spec import FunctionSpec, FunctionSpecs
 from aiive.config import settings
 from aiive.core.llm_client import LLMClient
+from aiive.core.assistant_protocol import assistant_message_kwargs, assistant_metadata
+from aiive.core.deepseek_chat import AIiveChatDeepSeek
 from aiive.tools.base import BaseTool
 from aiive.tools.registry import ToolRegistry
 from aiive.tools.tool_validation import canonical_tool_schema, validate_tool_params
 
 
-def build_chat_model(client: LLMClient, *, streaming: bool = False) -> ChatOpenAI:
+def build_chat_model(client: LLMClient, *, streaming: bool = False) -> ChatOpenAI | AIiveChatDeepSeek:
+    if client.provider == "deepseek":
+        return AIiveChatDeepSeek(
+            model=client.default_model, api_key=SecretStr(client.api_key), api_base=client.base_url,
+            temperature=0, timeout=client.timeout_seconds, streaming=streaming,
+            stream_usage=settings.aiive_llm_stream_usage, max_retries=0, use_responses_api=False, output_version="v0",
+            thinking_mode=client.deepseek_thinking,
+        )
     return ChatOpenAI(model=client.default_model, api_key=SecretStr(client.api_key),
                       base_url=client.base_url, temperature=0, timeout=client.timeout_seconds,
                       streaming=streaming, stream_usage=settings.aiive_llm_stream_usage,
@@ -98,7 +107,15 @@ class CallValidation:
 
     def retry_turn(self, message: AIMessage) -> list[dict[str, Any]]:
         # Keep only a bounded repair exchange, never a conversation transcript.
-        safe = AIMessage(content="", tool_calls=message.tool_calls)
+        calls: list[ToolCall] = []
+        for call in message.tool_calls:
+            error = self.errors.get(str(call["id"]))
+            if error and error.get("error_type") != "batch_aborted_due_to_invalid_arguments":
+                call = call.copy()
+                call["args"] = {}
+            calls.append(call)
+        safe = AIMessage(content="", tool_calls=calls,
+                         **assistant_message_kwargs(assistant_metadata(message)))
         return [message_to_dict(item) for item in [safe, *self.feedback(message)]]
 
 

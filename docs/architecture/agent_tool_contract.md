@@ -2,6 +2,18 @@
 
 Main Chat Agent 与 Persistent Task Worker 共用 LangChain Function Calling。`core/function_calling.py` 提供模型工厂、Function Schema 定义、调用归一化、参数验证、错误 ToolMessage、纠错策略和 Usage 归一化。共享组件不执行工具、不提交数据库事务、不在内部循环调用模型。
 
+## DeepSeek Thinking 协议
+
+`AIIVE_LLM_PROVIDER=auto` 按 API URL 的主机名识别 `api.deepseek.com`。反向代理可以设为 `deepseek`，`openai_compatible` 使用通用 ChatOpenAI。`AIIVE_LLM_DEEPSEEK_THINKING` 默认 `enabled`。
+
+AIive 的 `AIiveChatDeepSeek` 继承 LangChain 官方 ChatDeepSeek。SDK 将非流式响应和 SSE 的推理片段读入 `AIMessage.additional_kwargs.reasoning_content`，流式片段按到达顺序合并。适配器为响应记录实际 `provider` 和 `thinking_mode`。启用 Thinking 且携带工具定义时，适配器在 Chat Completions 请求的每条历史 Assistant 消息上原样写回可用的 `reasoning_content`，也包括没有工具调用的最终答复。工具定义、选择、参数和用量仍由 LangChain 序列化或解析。
+
+Main Agent 将每个模型工具批次的元数据写入首条 `tool_call` Event，同批调用全部写在结果之前。最终模型答复将元数据写入 `llm_response` Event。等待审批、策略拦截和已修正的校验失败保留模型协议记录。后续审批结果按原调用 ID 回填历史；审批执行和前端展示继续使用原有事实。中断时保存已确认的工具结果与对应批次元数据，重建时保留中断提示。Worker 的有界参数纠错在既有 `task_state.validation_messages` 保存修复消息和协议字段。
+
+热历史先通过 Forget 可见性过滤，再按 Turn 和批次恢复 Assistant 及其工具结果，兼容升级前调用和结果交错的事件顺序。预算估算计入推理文本。推理字段仅用于 Assistant 协议回放，聊天历史、诊断接口、SSE、WebSocket、记忆抽取和压缩摘要使用公开正文或工具事实。
+
+DeepSeek 在带工具的请求中遇到缺失推理字段的 Thinking 历史、或来源无法确认的旧 Assistant 历史时，当前 Turn 使用 `thinking.type=disabled`，响应元数据记为 `disabled_legacy_fallback`。已有 LLMCall 可确认来自其他供应商的历史，以及明确标记为关闭 Thinking 的历史可以直接回放。需要兼容的旧消息退出上下文后，新的 Turn 恢复配置的 Thinking 模式。
+
 ## 契约来源
 
 ToolRegistry 是有效工具契约的唯一入口。显式 `input_schema`（包括 MCP/Desktop 原始定义）优先；否则从已有 Pydantic 参数模型、handler 类型注解和 parameters 元数据派生 Canonical JSON Schema。领域模型的 `model_json_schema()` 可作为嵌套字段来源，本地 `$defs` 引用随包装提升到根节点。

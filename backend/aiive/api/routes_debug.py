@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from aiive.api.developer_security import redact_diagnostic_payload, require_local_developer
+from aiive.core.assistant_protocol import public_event_payload
 from aiive.db.base import get_db
 from aiive.db.models import ContextSnapshot, Event, LLMCall
 
@@ -46,7 +47,7 @@ def list_events(
                 "trace_id": e.trace_id,
                 "thread_id": e.thread_id,
                 "event_type": e.event_type,
-                "payload": redact_diagnostic_payload(e.payload),
+                "payload": redact_diagnostic_payload(public_event_payload(e.payload)),
                 "created_at": e.created_at.isoformat(),
             }
             for e in events
@@ -142,7 +143,7 @@ def get_trace(trace_id: str, db: Session = Depends(get_db)):
             "events": [
                 {
                     "event_type": e.event_type,
-                    "payload": redact_diagnostic_payload(e.payload),
+                    "payload": redact_diagnostic_payload(public_event_payload(e.payload)),
                     "created_at": e.created_at.isoformat(),
                 }
                 for e in events

@@ -13,6 +13,7 @@ from collections import OrderedDict
 from functools import lru_cache
 from typing import Any, cast, Protocol, runtime_checkable
 
+from aiive.core.assistant_protocol import PROVIDER_METADATA, REASONING_CONTENT
 from aiive.runtime.token_models import (
     ModelProfile,
     TokenCount,
@@ -99,7 +100,12 @@ class LiteLLMTokenCounter:
     ) -> TokenCount:
         try:
             from litellm import token_counter as litellm_count
-            estimated = litellm_count(model=model, messages=messages, tools=cast(Any, tools))
+            wire_messages = [{key: value for key, value in msg.items() if key != PROVIDER_METADATA} for msg in messages]
+            estimated = litellm_count(model=model, messages=wire_messages, tools=cast(Any, tools))
+            for message in messages:
+                reasoning = (message.get(PROVIDER_METADATA) or {}).get(REASONING_CONTENT)
+                if message.get("role") == "assistant" and isinstance(reasoning, str) and reasoning:
+                    estimated += litellm_count(model=model, text=reasoning)
             if estimated <= 0:
                 raise ValueError(f"LiteLLM returned {estimated}")
             margin = max(
@@ -114,8 +120,8 @@ class LiteLLMTokenCounter:
                 model=model,
             )
         except Exception as e:
-            logger.warning("LiteLLM token_counter 失败 (%s)，使用保守 fallback", e)
-            return self._fallback.estimate(model, messages, tools, error=str(e))
+            logger.warning("LiteLLM token_counter 失败 (%s)，使用保守 fallback", type(e).__name__)
+            return self._fallback.estimate(model, messages, tools, error=type(e).__name__)
 
     # ── 单段文本 token 计数（Phase 5 统一检索 token budget 打包）──
 

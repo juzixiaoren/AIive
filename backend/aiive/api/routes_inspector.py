@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
+from aiive.core.assistant_protocol import public_event_payload
 from aiive.db.base import get_db
 from aiive.db.models import (
     ContextSnapshot,
@@ -271,7 +272,7 @@ def inspector_events(
                 "id": e.id,
                 "trace_id": e.trace_id,
                 "event_type": e.event_type,
-                "payload": e.payload,
+                "payload": public_event_payload(e.payload),
                 "created_at": e.created_at.isoformat(),
             }
             for e in events

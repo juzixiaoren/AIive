@@ -13,8 +13,10 @@ dependencies = [
     "pgvector>=0.3.6",
     "alembic>=1.14",
     "langgraph>=1.0",
-    "langchain-core>=0.3",
-    "langchain-openai>=0.3",
+    "langchain-core>=1.6.12,<1.7",
+    # DeepSeek adapter uses the chat-completions payload and generation hooks.
+    "langchain-openai>=1.7.2,<1.8",
+    "langchain-deepseek>=1.0.1,<1.1",
     "langgraph-prebuilt>=1.0",
     "json-repair>=0.30.0",
     "jsonschema>=4.23",

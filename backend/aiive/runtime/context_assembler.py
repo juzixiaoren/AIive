@@ -44,6 +44,7 @@ from aiive.runtime.token_counter import TokenCounter
 from aiive.core.function_calling import function_definitions
 from aiive.runtime.tool_normalizer import ToolResultNormalizer
 from aiive.runtime.working_state import WorkingStateService
+from aiive.core.assistant_protocol import PROVIDER_METADATA, public_event_payload
 from aiive.runtime.message_normalizer import normalize_tool_call, normalize_tool_result, tool_result_content
 
 logger = logging.getLogger(__name__)
@@ -886,7 +887,10 @@ class ContextAssembler:
         for e in events:
             if e.id not in allowed:
                 continue
-            lines.append(_json.dumps({"type": e.event_type, "payload": e.payload or {}}, ensure_ascii=False, default=str))
+            if not (e.payload or {}).get("protocol_only"):
+                lines.append(_json.dumps({
+                    "type": e.event_type, "payload": public_event_payload(e.payload),
+                }, ensure_ascii=False, default=str))
         return "\n".join(lines)
 
     @staticmethod
@@ -897,63 +901,72 @@ class ContextAssembler:
         避免批量索引与全局计数器错位导致模型无法关联工具结果。
         """
         result: list[dict[str, Any]] = []
-        pending_calls: list[dict[str, Any]] = []
+        batches: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+        tool_types = {"tool_call", "tool_result", "tool_result_ref"}
+        pending = {
+            (item.get("turn_id"), item.get("tool_call_id")) for item in events
+            if item.get("type") == "tool_call" and item.get("protocol_status") == "pending_approval"
+        }
+        approvals = {
+            (item.get("turn_id"), item.get("tool_call_id")): item for item in events
+            if item.get("type") in ("tool_result", "tool_result_ref") and item.get("approval_id")
+            and (item.get("turn_id"), item.get("tool_call_id")) in pending
+        }
 
-        def _flush_pending() -> None:
-            if not pending_calls:
-                return
-            result.append({
-                "role": "assistant",
-                "tool_calls": [
-                    {
-                        "id": pc["tool_call_id"],
-                        "type": "function",
-                        "function": {
-                            "name": pc["name"],
-                            "arguments": _json.dumps(pc.get("params", {}), ensure_ascii=False),
-                        },
-                    }
-                    for pc in pending_calls
-                ],
-            })
-            pending_calls.clear()
+        def flush_batches() -> None:
+            for batch in batches.values():
+                calls = [item for item in batch if item["type"] == "tool_call"]
+                if not calls:
+                    continue
+                assistant: dict[str, Any] = {"role": "assistant", "tool_calls": []}
+                first = calls[0]
+                if first.get("assistant_content"):
+                    assistant["content"] = first["assistant_content"]
+                metadata = next((item[PROVIDER_METADATA] for item in calls if item.get(PROVIDER_METADATA)), None)
+                if metadata:
+                    assistant[PROVIDER_METADATA] = metadata
+                for item in calls:
+                    call = normalize_tool_call(item)
+                    assistant["tool_calls"].append({
+                        "id": call["id"], "type": "function",
+                        "function": {"name": call["name"], "arguments": _json.dumps(call["args"], ensure_ascii=False)},
+                    })
+                result.append(assistant)
+                for item in batch:
+                    if item["type"] == "tool_call":
+                        continue
+                    key = (item.get("turn_id"), item.get("tool_call_id"))
+                    normalized = normalize_tool_result(approvals.get(key, item))
+                    result.append({
+                        "role": "tool",
+                        "tool_call_id": normalized["id"],
+                        "content": tool_result_content(normalized["result"], normalized["name"]),
+                        "name": normalized["name"],
+                    })
+            batches.clear()
 
+        from aiive.runtime.attachments import render_attachment_refs
         for item in events:
             etype = item.get("type", "")
-            if etype == "user":
-                _flush_pending()
-                from aiive.runtime.attachments import render_attachment_refs
-                content = render_attachment_refs(item.get("content", ""), item.get("attachments", []))
-                if content:
-                    result.append({"role": "user", "content": content})
-            elif etype == "system":
-                _flush_pending()
-                content = item.get("content", "")
-                if content:
-                    result.append({"role": "system", "content": content})
-            elif etype == "tool_call":
-                call = normalize_tool_call(item)
-                pending_calls.append({
-                    "tool_call_id": call["id"],
-                    "name": call["name"],
-                    "params": call["args"],
-                })
-            elif etype in ("tool_result", "tool_result_ref"):
-                _flush_pending()
-                normalized = normalize_tool_result(item)
-                result.append({
-                    "role": "tool",
-                    "tool_call_id": normalized["id"],
-                    "content": tool_result_content(normalized["result"], normalized["name"]),
-                    "name": normalized["name"],
-                })
-            elif etype == "assistant":
-                _flush_pending()
-                content = item.get("content", "")
-                if content:
-                    result.append({"role": "assistant", "content": content})
+            if etype in tool_types:
+                key = (item.get("turn_id"), item.get("tool_call_id"))
+                if item.get("approval_id") and key in approvals:
+                    continue
+                batch_key = (item.get("turn_id"), item.get("batch_index"), item.get("approval_id"))
+                batches.setdefault(batch_key, []).append(item)
+                continue
 
-        _flush_pending()
+            flush_batches()
+            content = item.get("content", "")
+            if etype == "user":
+                content = render_attachment_refs(content, item.get("attachments", []))
+            if etype in ("system", "user", "assistant") and (content or item.get(PROVIDER_METADATA)):
+                message = {"role": etype, "content": content}
+                if etype == "assistant" and item.get(PROVIDER_METADATA):
+                    message[PROVIDER_METADATA] = item[PROVIDER_METADATA]
+                result.append(message)
+
+        flush_batches()
         return ContextAssembler._repair_tool_pairing(result)
 
     @staticmethod
@@ -1005,7 +1018,7 @@ class ContextAssembler:
                     out.append(repaired)
                     out.extend(kept_tools)
                 elif m.get("content"):
-                    out.append({"role": "assistant", "content": m["content"]})
+                    out.append({key: value for key, value in m.items() if key != "tool_calls"})
                 i = j
             elif role == "tool":
                 logger.warning(
