@@ -16,6 +16,7 @@ from sqlalchemy import or_, true
 from sqlalchemy.orm import Session
 
 from aiive.db.forget_models import ContentProvenanceRef, ForgetOperation, ForgetShield, ForgetTombstone
+from aiive.db.models import ContextSnapshot
 
 
 class ForgetVisibilityService:
@@ -23,6 +24,66 @@ class ForgetVisibilityService:
 
     单例，无状态，不持有长事务。调用方传 Session 实例。
     """
+
+    @staticmethod
+    def blocked_context_snapshot_ids(
+        session: Session, snapshots: list[ContextSnapshot],
+    ) -> set[str]:
+        """Check snapshot and recorded source visibility before exposing any of its text."""
+        from aiive.db.models import Event, TurnRecord
+
+        blocked = ForgetVisibilityService.blocked_target_ids(
+            session, "context_snapshot", [(row.id, row.created_at) for row in snapshots],
+        )
+        try:
+            for row in snapshots:
+                if row.id in blocked:
+                    continue
+                meta = row.meta or {}
+                sources: dict[str, set[str]] = {
+                    "memory_record": set(meta.get("source_memory_ids") or [])
+                    | {m["memory_id"] for m in meta.get("injected_memory_ids") or []},
+                    "turn_record": set(),
+                }
+                if row.segment_id:
+                    sources["segment"] = {row.segment_id}
+                for candidate in (meta.get("selection_trace") or {}).get("candidates", []):
+                    if not candidate.get("selected"):
+                        continue
+                    source_type = candidate.get("source_type")
+                    if source_type == "history":
+                        sources["turn_record"].add(candidate["source_id"])
+                    elif source_type == "segment_summary":
+                        sources.setdefault(source_type, set()).add(candidate["source_id"])
+                    elif source_type == "retrieval":
+                        # Retrieval candidate IDs carry the concrete source type.
+                        _, target_type, _ = candidate["candidate_id"].split(":", 2)
+                        if target_type in {"memory_record", "segment_summary", "epoch_checkpoint"}:
+                            sources.setdefault(target_type, set()).add(candidate["source_id"])
+                if row.turn_sequence is not None:
+                    sources["turn_record"].update(
+                        token for pair in session.query(TurnRecord.id, TurnRecord.turn_id).filter(
+                            TurnRecord.thread_id == row.thread_id,
+                            TurnRecord.turn_sequence == row.turn_sequence,
+                        ) for token in pair
+                    )
+                events = session.query(Event.id, Event.created_at).filter(
+                    Event.thread_id == row.thread_id,
+                    or_(Event.trace_id == row.trace_id, Event.turn_id.in_(sources["turn_record"])),
+                ).all()
+                if any(
+                    ForgetVisibilityService.blocked_target_ids(session, kind, [(sid, None) for sid in ids])
+                    for kind, ids in sources.items()
+                ) or ForgetVisibilityService.blocked_target_ids(
+                    session, "event", [(event_id, created_at) for event_id, created_at in events],
+                ):
+                    blocked.add(row.id)
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception("Context snapshot visibility lookup failed")
+            return {row.id for row in snapshots}
+        return blocked
 
     # ── Shield 检查 ──
 
@@ -512,6 +573,16 @@ class ForgetVisibilityService:
             MemoryRecord, Event, SegmentSummary, EpochCheckpoint,
             Segment, Epoch, TurnRecord,
         )
+        if target_type in {"context_snapshot", "segment"}:
+            model = ContextSnapshot if target_type == "context_snapshot" else Segment
+            rows = session.query(model.id, model.thread_id, model.created_at).filter(
+                model.id.in_(ids),
+            ).all()
+            return [
+                {"id": r[0], "thread_id": r[1], "scope_type": "thread",
+                 "scope_id": r[1], "canonical_key": None, "created_at": r[2]}
+                for r in rows
+            ]
         if target_type == "turn_record":
             # 纯 Turn 来源防重抽：用 TurnRecord.created_at 应用选择器 Shield 的
             # cutoff（Forget 之后产生的新 Turn 不应被旧 Shield 阻断）。

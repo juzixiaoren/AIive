@@ -34,6 +34,7 @@ from aiive.memory.context_assembly import assemble_system_content
 from aiive.memory.scope_resolver import build_scope_context
 from aiive.runtime.context_budget import ContextBudget
 from aiive.runtime.context_overflow import ContextCandidates, ContextOverflowPacker, HistoryTurn
+from aiive.runtime.context_preview import context_content_preview
 from aiive.runtime.attention_manager import AttentionManager
 from aiive.runtime.thread_state import ThreadState
 from aiive.runtime.token_models import (
@@ -48,10 +49,6 @@ from aiive.core.assistant_protocol import PROVIDER_METADATA, public_event_payloa
 from aiive.runtime.message_normalizer import normalize_tool_call, normalize_tool_result, tool_result_content
 
 logger = logging.getLogger(__name__)
-
-# 输入分区快照的折叠态预览截断长度（字符）
-_SNAPSHOT_PREVIEW_CHARS = 120
-
 
 def _hash_text(text: str) -> str:
     """对稳定前缀文本做短哈希，用于快照 stable_prefix_hash 展示。"""
@@ -80,13 +77,25 @@ class ContextSnapshotItem:
     source: str
     trust_level: str
     content_preview: str
-    preview_length: int = 0
+    preview_length: int | None = None
     token_estimate: int = 0
 
     def __post_init__(self) -> None:
-        self.preview_length = len(self.content_preview)
+        if self.preview_length is None:
+            self.preview_length = len(self.content_preview)
         if self.token_estimate <= 0:
             self.token_estimate = max(1, self.preview_length // 4)
+
+    @classmethod
+    def from_content(
+        cls, item_id: str, kind: str, source: str, trust_level: str, content: str,
+        *, token_estimate: int,
+    ) -> ContextSnapshotItem:
+        return cls(
+            item_id=item_id, kind=kind, source=source, trust_level=trust_level,
+            content_preview=context_content_preview(content), preview_length=len(content),
+            token_estimate=token_estimate,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """转换为数据库和 API 使用的稳定字典结构。"""
@@ -110,6 +119,7 @@ class ContextSnapshotData:
     selection_trace: dict[str, Any] = field(default_factory=dict)
     stable_prefix_hash: str = ""
     injected_memory_ids: list[dict[str, str]] = field(default_factory=list)
+    source_memory_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -355,6 +365,10 @@ class ContextAssembler:
         snapshot.selection_trace = candidates.selection_trace
         snapshot.stable_prefix_hash = _hash_text(rendered["system"])
         snapshot.injected_memory_ids = self._collect_injected_memory_ids(pack)
+        snapshot.source_memory_ids = sorted(
+            {mid for block in candidates.core for mid in block.source_memory_ids}
+            | {relation.source_memory_id for relation in candidates.graph}
+        )
         agent_ctx["attachment_source_event_ids"] = list(dict.fromkeys([
             *current_refs,
             *(event["event_id"] for turn in candidates.history for event in turn.events if event.get("attachments")),
@@ -1109,15 +1123,12 @@ class ContextAssembler:
         def _add(item_id: str, kind: str, source: str, trust_level: str, text: str) -> None:
             if not text:
                 return
-            preview = text[:_SNAPSHOT_PREVIEW_CHARS]
-            if len(text) > _SNAPSHOT_PREVIEW_CHARS:
-                preview += "..."
-            item = ContextSnapshotItem(
+            item = ContextSnapshotItem.from_content(
                 item_id=item_id,
                 kind=kind,
                 source=source,
                 trust_level=trust_level,
-                content_preview=preview,
+                content=text,
                 token_estimate=self._token_counter.count_messages(
                     self._profile.full_name, [{"role": "system", "content": text}],
                 ).estimated_tokens,
@@ -1156,17 +1167,12 @@ class ContextAssembler:
         # 工具定义
         if tools_schema:
             tools_text = _json.dumps(tools_schema, ensure_ascii=False)
-            names = [
-                (s.get("function", {}) or {}).get("name", "")
-                for s in tools_schema
-            ]
-            preview_src = ", ".join(n for n in names if n) or tools_text
-            item = ContextSnapshotItem(
+            item = ContextSnapshotItem.from_content(
                 item_id="tool_schemas",
                 kind="tool_schemas",
                 source="tools",
                 trust_level="trusted",
-                content_preview=preview_src[:_SNAPSHOT_PREVIEW_CHARS],
+                content=tools_text,
                 token_estimate=self._token_counter.count_messages(
                     self._profile.full_name, [], tools_schema,
                 ).estimated_tokens,

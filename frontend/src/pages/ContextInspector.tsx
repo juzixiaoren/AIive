@@ -1,36 +1,50 @@
-/**
- * 上下文检查器页面
- * - 根据 trace_id 查询并展示单次对话的完整上下文快照
- * - 展示上下文项列表（系统前缀、工具列表、注入记忆、历史消息、当前消息等）
- * - 支持展开/折叠每个上下文项查看详情
- * - 支持弹窗查看完整内容
- */
-
-import { apiFetch } from "../api/client";
 import { useEffect, useRef, useState } from "react";
+import { apiFetch } from "../api/client";
 
-/** 上下文项数据结构 */
 type ContextItem = {
   item_id: string;
   kind: string;
   source: string;
   trust_level: string;
   content_preview: string;
+  preview_length: number;
+  preview_truncated: boolean;
+  has_detail: boolean;
   token_estimate: number;
 };
 
-/** 注入记忆条目数据结构 */
-type InjectedMemory = {
-  memory_id: string;
-  canonical_key: string;
-  memory_type: string;
+type ContextSelectionTrace = {
+  policy_version: string | null;
+  candidates: {
+    candidate_id: string;
+    source_type: string;
+    source_id: string;
+    source_version: string | null;
+    retention_tier: number;
+    native_score: number | null;
+    source_rank: number;
+    rank_percentile: number;
+    estimated_tokens: number | null;
+    selected: boolean;
+    exclusion_reason: string | null;
+  }[];
+  eviction_order: string[];
 };
 
 type ContextSnapshot = {
+  snapshot_id: string;
+  trace_id: string;
   stable_prefix_hash: string;
   context_items: ContextItem[];
-  meta: Record<string, unknown>;
-  token_total?: number;
+  token_total: number;
+  total_tool_calls: number;
+  created_at: string;
+  selection_trace: ContextSelectionTrace;
+  injected_memory_ids: {
+    memory_id: string;
+    canonical_key: string | null;
+    memory_type: string | null;
+  }[];
 };
 
 type ContextRunResponse = {
@@ -39,11 +53,21 @@ type ContextRunResponse = {
 };
 
 type ContextItemDetailResponse = {
+  snapshot_id: string;
   item_id: string;
   full_content: string;
+  content_length: number;
 };
 
-type LoadState = "idle" | "loading" | "ready" | "not_found" | "error";
+type RunState =
+  | { status: "loading" | "not_found" }
+  | { status: "success"; data: ContextRunResponse }
+  | { status: "error"; message: string };
+
+type DetailState =
+  | { status: "idle" | "loading" }
+  | { status: "success"; data: ContextItemDetailResponse }
+  | { status: "error"; message: string };
 
 /** 上下文类型的中文标签和样式映射 */
 const KIND_META: Record<string, { label: string; bg: string; text: string; border: string }> = {
@@ -75,336 +99,343 @@ const TRUST_LABEL: Record<string, string> = {
 const SOURCE_LABEL: Record<string, string> = {
   system: "系统",
   thread: "对话",
+  history: "对话历史",
+  memory: "记忆库",
+  tools: "工具",
+  agent: "Agent",
+  attention: "注意力",
   memory_store: "记忆库",
   user: "用户",
   runtime_event: "运行时事件",
   system_command: "系统指令",
 };
 
-/**
- * 上下文检查器组件
- * @param traceId - 要检查的 trace ID，由外部传入
- */
-export default function ContextInspector({ traceId }: { traceId?: string }) {
-  const [data, setData] = useState<ContextRunResponse | null>(null);
-  const [loadState, setLoadState] = useState<LoadState>("idle");
-  const [error, setError] = useState("");
-  const [expanded, setExpanded] = useState<number | null>(null);
-  const [modalItem, setModalItem] = useState<ContextItem | null>(null);
-  /** 懒加载的完整内容缓存: item_id → full_content */
-  const [fullContents, setFullContents] = useState<Record<string, string>>({});
-  /** 正在加载的项集合（按项而非全局互斥，避免一个在途请求阻塞其他项的加载） */
-  const [loadingItems, setLoadingItems] = useState<Set<string>>(new Set());
-  /** 当前 traceId 的引用：用于丢弃旧 trace 在途请求的迟到响应（item_id 跨 trace 重复） */
-  const traceIdRef = useRef(traceId);
+function kindMeta(kind: string) {
+  return KIND_META[kind] || { label: kind, bg: "bg-background", text: "text-code", border: "border-divider" };
+}
 
-  // "查看更多" modal 打开时触发懒加载完整内容
-  useEffect(() => {
-    if (modalItem && fullContents[modalItem.item_id] === undefined) {
-      fetchDetail(modalItem.item_id);
+function itemMetadata(item: ContextItem) {
+  return [
+    { label: "来源", value: SOURCE_LABEL[item.source] || item.source },
+    { label: "信任级别", value: TRUST_LABEL[item.trust_level] || item.trust_level },
+    { label: "Token", value: `~${item.token_estimate}` },
+  ];
+}
+
+function KindBadge({ kind }: { kind: string }) {
+  const meta = kindMeta(kind);
+  return (
+    <span className={`text-xs font-medium px-2.5 py-0.5 rounded-full ${meta.text} ${meta.bg} border ${meta.border}`}>
+      {meta.label}
+    </span>
+  );
+}
+
+async function copyContent(content: string, dialog: HTMLDialogElement) {
+  if (navigator.clipboard) {
+    try {
+      await navigator.clipboard.writeText(content);
+      return;
+    } catch {
+      if (!dialog.isConnected) return;
     }
-  }, [modalItem?.item_id]); // eslint-disable-line react-hooks/exhaustive-deps
+  }
+  const field = document.createElement("textarea");
+  field.value = content;
+  field.setAttribute("readonly", "");
+  field.style.cssText = "position:fixed;left:-9999px";
+  const previousFocus = document.activeElement;
+  dialog.append(field);
+  field.select();
+  try {
+    if (!document.execCommand("copy")) throw new Error("Copy failed");
+  } finally {
+    field.remove();
+    if (previousFocus instanceof HTMLElement) previousFocus.focus();
+  }
+}
 
-  // 当 traceId 变化时，从后端加载上下文快照
+function DetailDialog({ item, detail, onClose, onRetry }: {
+  item: ContextItem;
+  detail: DetailState;
+  onClose: () => void;
+  onRetry: () => void;
+}) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  const [copyStatus, setCopyStatus] = useState("");
+  const content = detail.status === "success" ? detail.data : null;
+
+  useEffect(() => {
+    const element = dialog.current;
+    element?.showModal();
+    return () => element?.close();
+  }, []);
+
+  async function handleCopy() {
+    if (!content || !dialog.current) return;
+    try {
+      await copyContent(content.full_content, dialog.current);
+      setCopyStatus("已复制完整内容");
+    } catch {
+      setCopyStatus("复制失败，请选中正文手动复制");
+    }
+  }
+
+  return (
+    <dialog
+      ref={dialog}
+      aria-labelledby="context-detail-title"
+      onCancel={event => { event.preventDefault(); onClose(); }}
+      onClick={event => { if (event.target === event.currentTarget) onClose(); }}
+      className="m-auto w-[calc(100%-2rem)] max-w-3xl max-h-[85dvh] overflow-hidden rounded-2xl bg-surface p-0 text-content shadow-2xl backdrop:bg-content/40"
+    >
+      <div className="flex max-h-[85dvh] min-w-0 flex-col">
+        <header className="flex shrink-0 items-center justify-between gap-2 border-b border-divider px-4 py-3">
+          <h3 id="context-detail-title" className="font-semibold">完整上下文</h3>
+          <button type="button" onClick={onClose} className="rounded-lg px-3 py-1 text-sm hover:bg-surface-muted">
+            关闭
+          </button>
+        </header>
+        <div className="min-h-0 overflow-y-auto px-4 py-3">
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            <KindBadge kind={item.kind} />
+            <span className="text-xs text-faint">Item ID</span>
+            <code className="break-all text-xs">{item.item_id}</code>
+          </div>
+          <dl className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted">
+            {[...itemMetadata(item), { label: "字符数", value: String(content?.content_length ?? item.preview_length) }].map(field => (
+              <div key={field.label} className="flex gap-1">
+                <dt>{field.label}</dt><dd>{field.value}</dd>
+              </div>
+            ))}
+          </dl>
+          {detail.status === "error" ? (
+            <div className="py-4">
+              <p role="alert" className="mb-2 text-sm text-danger">{detail.message}</p>
+              <button type="button" onClick={onRetry} className="rounded bg-primary-soft px-3 py-1 text-sm text-primary">
+                重试
+              </button>
+            </div>
+          ) : content ? (
+            content.full_content === "" ? (
+              <p className="text-sm text-faint">正文为空</p>
+            ) : (
+              <pre aria-label="完整正文" className="min-w-0 whitespace-pre-wrap [overflow-wrap:anywhere] text-xs leading-relaxed">
+                {content.full_content}
+              </pre>
+            )
+          ) : (
+            <p role="status" className="py-4 text-sm text-faint">正在加载完整内容…</p>
+          )}
+        </div>
+        {content && (
+          <footer className="flex shrink-0 flex-wrap items-center gap-3 border-t border-divider px-4 py-3">
+            <button type="button" onClick={handleCopy} className="rounded bg-primary-soft px-3 py-1 text-sm text-primary">
+              复制完整内容
+            </button>
+            <span role="status" className="text-xs text-muted">{copyStatus}</span>
+          </footer>
+        )}
+      </div>
+    </dialog>
+  );
+}
+
+function ContextRun({ traceId }: { traceId: string }) {
+  const [run, setRun] = useState<RunState>({ status: "loading" });
+  const [attempt, setAttempt] = useState(0);
+  const [snapshotId, setSnapshotId] = useState("");
+  const [modalItem, setModalItem] = useState<ContextItem | null>(null);
+  const [details, setDetails] = useState(new Map<string, DetailState>());
+  const requests = useRef(new Map<string, AbortController>());
+  const runUrl = `api/context-runs/${encodeURIComponent(traceId)}`;
+
   useEffect(() => {
     const controller = new AbortController();
-    traceIdRef.current = traceId;
-    setData(null);
-    setError("");
-    setExpanded(null);
-    setModalItem(null);
-    setFullContents({});
-    setLoadingItems(new Set());
-    if (!traceId) {
-      setLoadState("idle");
-      return () => controller.abort();
-    }
-
-    setLoadState("loading");
-    apiFetch(`api/context-runs/${encodeURIComponent(traceId)}`, { signal: controller.signal })
-      .then(async response => {
+    async function load() {
+      try {
+        const response = await apiFetch(runUrl, { signal: controller.signal, cache: "no-store" });
+        if (controller.signal.aborted) return;
         if (response.status === 404) {
-          setLoadState("not_found");
-          return null;
+          setRun({ status: "not_found" });
+          return;
         }
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return response.json() as Promise<ContextRunResponse>;
-      })
-      .then(result => {
-        if (result) {
-          setData(result);
-          setLoadState("ready");
+        const data: ContextRunResponse = await response.json();
+        if (!controller.signal.aborted) {
+          setRun(data.snapshots.length ? { status: "success", data } : { status: "not_found" });
         }
-      })
-      .catch(reason => {
-        if (reason instanceof DOMException && reason.name === "AbortError") return;
-        setError(`加载失败: ${reason instanceof Error ? reason.message : "未知错误"}`);
-        setLoadState("error");
-      });
-    return () => controller.abort();
-  }, [traceId]);
-
-  /** 懒加载某条上下文项的完整内容 */
-  const fetchDetail = (itemId: string) => {
-    if (fullContents[itemId] !== undefined || loadingItems.has(itemId)) return;
-    const requestTraceId = traceId || "";
-    setLoadingItems(prev => new Set(prev).add(itemId));
-    apiFetch(`api/context-runs/${encodeURIComponent(requestTraceId)}/items/${encodeURIComponent(itemId)}`)
-      .then(async response => {
-        if (response.status === 404) throw new Error("上下文项不存在");
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return response.json() as Promise<ContextItemDetailResponse>;
-      })
-      .then(response => {
-        // trace 已切换时丢弃迟到响应，避免旧 trace 内容串进新 trace 的缓存
-        if (traceIdRef.current !== requestTraceId) return;
-        setFullContents(prev => ({ ...prev, [itemId]: response.full_content || "(空)" }));
-      })
-      .catch(reason => {
-        if (traceIdRef.current !== requestTraceId) return;
-        // 失败结果不写入缓存：关闭后重新打开即可重试
-        setError(`内容加载失败: ${reason instanceof Error ? reason.message : "未知错误"}`);
-      })
-      .finally(() => {
-        setLoadingItems(prev => {
-          const next = new Set(prev);
-          next.delete(itemId);
-          return next;
-        });
-      });
-  };
-
-  /** 展开项的处理：展开不自动加载，点击"查看更多"才触发懒加载 */
-  const handleExpand = (i: number, _item: ContextItem) => {
-    if (expanded === i) {
-      setExpanded(null);
-      return;
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          setRun({ status: "error", message: `快照加载失败：${error instanceof Error ? error.message : "未知错误"}` });
+        }
+      }
     }
-    setExpanded(i);
-  };
+    void load();
+    return () => controller.abort();
+  }, [runUrl, attempt]);
 
-  // 无 traceId 时显示引导提示
-  if (!traceId) return (
-    <div className="text-center text-faint py-16">
-      <p className="text-lg mb-2">上下文检查器</p>
-      <p className="text-sm">在对话页面点击 trace_id 即可查看该次对话的完整上下文</p>
+  useEffect(() => {
+    const pending = requests.current;
+    return () => {
+      for (const controller of pending.values()) controller.abort();
+      pending.clear();
+    };
+  }, []);
+
+  function selectSnapshot(id: string) {
+    setModalItem(null);
+    const pending = [...requests.current.keys()];
+    for (const controller of requests.current.values()) controller.abort();
+    requests.current.clear();
+    setDetails(previous => {
+      const next = new Map(previous);
+      for (const key of pending) next.delete(key);
+      return next;
+    });
+    setSnapshotId(id);
+  }
+
+  async function loadDetail(activeSnapshotId: string, itemId: string) {
+    const key = JSON.stringify([activeSnapshotId, itemId]);
+    if (details.get(key)?.status === "success" || requests.current.has(key)) return;
+    const controller = new AbortController();
+    requests.current.set(key, controller);
+    setDetails(previous => new Map(previous).set(key, { status: "loading" }));
+
+    let detail: DetailState;
+    try {
+      const query = new URLSearchParams({ snapshot_id: activeSnapshotId });
+      const response = await apiFetch(`${runUrl}/items/${encodeURIComponent(itemId)}?${query}`, {
+        signal: controller.signal,
+        cache: "no-store",
+      });
+      if (response.status === 404) throw new Error("快照或上下文项已不可用");
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data: ContextItemDetailResponse = await response.json();
+      if (data.snapshot_id !== activeSnapshotId || data.item_id !== itemId) {
+        throw new Error("服务器返回了其他上下文项");
+      }
+      detail = { status: "success", data };
+    } catch (error) {
+      detail = { status: "error", message: `内容加载失败：${error instanceof Error ? error.message : "未知错误"}` };
+    }
+    if (requests.current.get(key) !== controller) return;
+    requests.current.delete(key);
+    setDetails(previous => new Map(previous).set(key, detail));
+  }
+
+  if (run.status === "loading") return <p role="status" className="py-16 text-center text-faint">正在加载上下文快照…</p>;
+  if (run.status === "error") return (
+    <div className="py-16 text-center">
+      <p role="alert" className="mb-2 text-danger">{run.message}</p>
+      <button type="button" className="text-primary hover:underline" onClick={() => {
+        setRun({ status: "loading" });
+        setAttempt(previous => previous + 1);
+      }}>重试</button>
     </div>
   );
+  if (run.status !== "success") return (
+    <p className="py-16 text-center text-faint">未找到上下文快照（{traceId.slice(0, 8)}）</p>
+  );
 
-  if (loadState === "loading") return <div className="text-center text-faint py-16">正在加载上下文快照…</div>;
-  if (loadState === "error") return <div className="text-center text-danger py-16">{error}</div>;
-  if (loadState === "not_found") return <div className="text-center text-faint py-16">
-    <p className="text-sm">未找到上下文快照: {traceId.slice(0, 8)}…</p>
-    <p className="text-xs mt-2 text-subtle">该 trace 可能不存在，或尚未生成上下文快照</p>
-  </div>;
-  if (!data || data.snapshots.length === 0) return null;
-
-  const snapshots = data.snapshots;
-  const items = snapshots[0].context_items || [];
-  const meta = snapshots[0].meta || {};
-  const injected = (meta.injected_memory_ids as InjectedMemory[]) || [];
-  const tokenTotal = snapshots[0]?.token_total as number | undefined;
+  const { snapshots } = run.data;
+  const snapshot = snapshots.find(entry => entry.snapshot_id === snapshotId) ?? snapshots[0];
+  const { context_items: items, injected_memory_ids: injected } = snapshot;
+  const modalKey = modalItem ? JSON.stringify([snapshot.snapshot_id, modalItem.item_id]) : "";
 
   return (
     <div>
-      <h2 className="text-lg font-semibold text-content mb-1">上下文快照</h2>
-      <p className="text-xs text-faint mb-4 font-mono break-all">trace_id: {traceId}</p>
-
-      {/* 统计卡片区域 */}
-      <div className="grid grid-cols-4 gap-3 mb-5">
+      <h2 className="mb-1 text-lg font-semibold text-content">上下文快照</h2>
+      <p className="mb-4 break-all font-mono text-xs text-faint">Trace ID {traceId}</p>
+      {snapshots.length > 1 && (
+        <label className="mb-4 flex flex-wrap items-center gap-2 text-sm text-code">
+          快照
+          <select value={snapshot.snapshot_id} onChange={event => selectSnapshot(event.target.value)}
+            className="min-w-0 rounded-lg border border-divider bg-surface p-2">
+            {snapshots.map(entry => (
+              <option key={entry.snapshot_id} value={entry.snapshot_id}>
+                {new Date(entry.created_at).toLocaleString()} · {entry.snapshot_id.slice(0, 8)}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+      <dl className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
         {[
-          { label: "前缀哈希", value: String(snapshots[0]?.stable_prefix_hash || "-") },
-          { label: "上下文项", value: String(items.length) },
-          { label: "预估 Token", value: tokenTotal ? `~${tokenTotal}` : "-" },
+          { label: "前缀哈希", value: snapshot.stable_prefix_hash || "—" },
+          { label: "上下文项", value: items.length },
+          { label: "预估 Token", value: `~${snapshot.token_total}` },
           { label: "注入记忆", value: `${injected.length} 条` },
-        ].map(c => (
-          <div key={c.label} className="bg-surface border border-divider rounded-lg p-3 text-center shadow-sm">
-            <div className="text-xs text-faint mb-0.5">{c.label}</div>
-            <div className="text-sm font-mono text-title truncate">{c.value}</div>
+        ].map(field => (
+          <div key={field.label} className="min-w-0 rounded-lg border border-divider bg-surface p-3 text-center">
+            <dt className="mb-0.5 text-xs text-faint">{field.label}</dt>
+            <dd className="truncate font-mono text-sm text-title" title={String(field.value)}>{field.value}</dd>
           </div>
         ))}
-      </div>
-
-      {/* 注入的记忆 ID 列表 */}
+      </dl>
       {injected.length > 0 && (
         <div className="mb-4">
-          <h3 className="text-sm font-medium text-code mb-2">注入的记忆</h3>
-          <div className="flex flex-wrap gap-1">
-            {injected.map((m: InjectedMemory) => (
-              <span
-                key={m.memory_id}
-                title={m.memory_id}
-                className="text-[11px] bg-primary-soft text-primary-hover px-2 py-0.5 rounded font-mono inline-flex items-center gap-1"
-              >
-                {m.memory_type && <span className="opacity-70">[{m.memory_type}]</span>}
-                <span>{m.canonical_key || m.memory_id.slice(0, 8)}</span>
-              </span>
+          <h3 className="mb-2 text-sm font-medium text-code">注入的记忆</h3>
+          <ul className="flex flex-wrap gap-1">
+            {injected.map(memory => (
+              <li key={memory.memory_id} title={memory.memory_id}
+                className="rounded bg-primary-soft px-2 py-0.5 font-mono text-xs text-primary-hover">
+                {memory.memory_type && `[${memory.memory_type}] `}
+                {memory.canonical_key || memory.memory_id.slice(0, 8)}
+              </li>
             ))}
-          </div>
+          </ul>
         </div>
       )}
-
-      {/* 上下文项列表 */}
-      <h3 className="text-sm font-medium text-code mb-3">
-        上下文项 ({items.length})
-        <span className="text-xs text-faint ml-2 font-normal">点击卡片展开详情</span>
-      </h3>
-      {items.length === 0 ? (
-        <p className="text-sm text-faint">无上下文项</p>
-      ) : (
-        <div className="flex flex-col gap-2">
-          {items.map((item, i) => {
-            const kindMeta = KIND_META[item.kind] || { label: item.kind, bg: "bg-background", text: "text-code", border: "border-divider" };
-            const isOpen = expanded === i;
-
-            return (
-              <div
-                key={i}
-                onClick={() => handleExpand(i, item)}
-                className={`
-                  border rounded-xl cursor-pointer transition-all duration-200 shadow-sm hover:shadow-md
-                  ${kindMeta.border} ${kindMeta.bg}
-                  ${isOpen ? "ring-2 ring-subtle" : ""}
-                `}
-              >
-                {/* 折叠状态：摘要头部 */}
-                <div className="px-4 py-3 flex items-center gap-3 select-none">
-                  <span className={`text-xs font-medium px-2.5 py-0.5 rounded-full ${kindMeta.text} ${kindMeta.bg} border ${kindMeta.border} shrink-0`}>
-                    {kindMeta.label}
-                  </span>
-                  <span className="text-xs text-code truncate flex-1 min-w-0">
-                    {(item.content_preview || "").slice(0, 120)}
-                  </span>
-                  <span className="text-[11px] text-faint font-mono shrink-0">~{item.token_estimate}t</span>
-                  <svg
-                    className={`w-4 h-4 text-faint shrink-0 transition-transform duration-200 ${isOpen ? "rotate-180" : ""}`}
-                    fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
-                  >
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
-                  </svg>
-                </div>
-
-                {/* 展开状态：详细信息 */}
-                {isOpen && (
-                  <div className="px-4 pb-4 border-t border-divider/60">
-                    {/* 元数据网格 */}
-                    <div className="grid grid-cols-4 gap-2 mt-3 mb-3">
-                      {[
-                        { label: "类型", value: kindMeta.label },
-                        { label: "来源", value: SOURCE_LABEL[item.source] || item.source },
-                        { label: "信任级别", value: TRUST_LABEL[item.trust_level] || item.trust_level },
-                        { label: "Token", value: `~${item.token_estimate}` },
-                      ].map(f => (
-                        <div key={f.label} className="bg-surface/60 rounded-lg px-2.5 py-1.5">
-                          <div className="text-[10px] text-faint uppercase">{f.label}</div>
-                          <div className="text-xs text-title font-medium truncate">{f.value}</div>
-                        </div>
-                      ))}
+      <h3 className="mb-3 text-sm font-medium text-code">上下文项</h3>
+      {items.length === 0 && <p className="text-sm text-faint">无上下文项</p>}
+      <ul className="flex flex-col gap-2">
+        {items.map(item => {
+          const meta = kindMeta(item.kind);
+          return (
+            <li key={item.item_id} className={`min-w-0 rounded-xl border px-4 py-3 ${meta.border} ${meta.bg}`}>
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                <KindBadge kind={item.kind} />
+                <dl className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted">
+                  {itemMetadata(item).map(field => (
+                    <div key={field.label} className="flex gap-1">
+                      <dt>{field.label}</dt><dd>{field.value}</dd>
                     </div>
-
-                    {/* Item ID */}
-                    <div className="mb-2">
-                      <div className="text-[10px] text-faint uppercase mb-0.5">Item ID</div>
-                      <code className="text-[11px] bg-surface/60 text-muted px-2 py-0.5 rounded font-mono break-all block">
-                        {item.item_id}
-                      </code>
-                    </div>
-
-                    {/* 内容预览 / 完整内容 */}
-                    <div className="mb-0.5">
-                      <div className="text-[10px] text-faint uppercase mb-1">
-                        {fullContents[item.item_id] !== undefined ? "完整内容" : "内容预览"}
-                        {loadingItems.has(item.item_id) && <span className="ml-1 animate-pulse">加载中...</span>}
-                      </div>
-                      <pre className="text-xs text-code bg-surface/70 rounded-lg px-3 py-2 whitespace-pre-wrap break-all font-mono leading-relaxed max-h-60 overflow-auto">
-                        {fullContents[item.item_id] !== undefined
-                          ? fullContents[item.item_id]
-                          : item.content_preview || "(空)"}
-                      </pre>
-                    </div>
-
-                    {/* "查看更多" 链接 */}
-                    <div
-                      className="text-xs text-primary hover:text-primary-hover cursor-pointer mt-1 select-none"
-                      onClick={(e) => { e.stopPropagation(); setModalItem(item); }}
-                    >
-                      点击查看更多 →
-                    </div>
-                  </div>
-                )}
+                  ))}
+                </dl>
               </div>
-            );
-          })}
-        </div>
-      )}
-
-      {/* 居中全量内容弹窗 */}
-      {modalItem && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-6">
-          {/* 背景遮罩 */}
-          <div
-            className="absolute inset-0 bg-content/40 backdrop-blur-sm"
-            onClick={() => setModalItem(null)}
-          />
-
-          {/* 弹窗主体 */}
-          <div className="relative w-full max-w-3xl max-h-[70vh] bg-surface rounded-2xl shadow-2xl flex flex-col animate-fade-in">
-            {/* 弹窗头部 */}
-            <div className="shrink-0 px-5 py-3 border-b border-surface-muted flex items-center justify-between">
-              <div className="flex items-center gap-2 min-w-0">
-                {(() => {
-                  const m = KIND_META[modalItem.kind] || { label: modalItem.kind, bg: "bg-background", text: "text-code", border: "border-divider" };
-                  return (
-                    <span className={`text-xs font-medium px-2.5 py-0.5 rounded-full ${m.text} ${m.bg} border ${m.border} shrink-0`}>
-                      {m.label}
-                    </span>
-                  );
-                })()}
-                <span className="text-sm font-semibold text-content truncate">{modalItem.item_id}</span>
-              </div>
-              <button
-                onClick={() => setModalItem(null)}
-                className="p-1.5 rounded-lg hover:bg-surface-muted text-faint hover:text-code transition-colors shrink-0"
-              >
-                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
-
-            {/* 弹窗元数据 */}
-            <div className="shrink-0 px-5 py-3">
-              <div className="grid grid-cols-4 gap-2">
-                {[
-                  { label: "来源", value: SOURCE_LABEL[modalItem.source] || modalItem.source },
-                  { label: "信任级别", value: TRUST_LABEL[modalItem.trust_level] || modalItem.trust_level },
-                  { label: "Token", value: `~${modalItem.token_estimate}` },
-                  { label: "长度", value: `${(modalItem.content_preview || "").length} 字符` },
-                ].map(f => (
-                  <div key={f.label} className="bg-background rounded-lg px-2.5 py-1.5">
-                    <div className="text-[10px] text-faint uppercase">{f.label}</div>
-                    <div className="text-xs text-title font-medium truncate">{f.value}</div>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {/* 可滚动的完整内容区域 */}
-            <div className="flex-1 overflow-y-auto px-5 pb-6">
-              {loadingItems.has(modalItem.item_id) ? (
-                <div className="text-sm text-faint py-8 text-center animate-pulse">加载中...</div>
+              <pre className="mt-2 overflow-x-auto whitespace-pre rounded-lg bg-surface/70 px-3 py-2 font-mono text-xs leading-relaxed text-code">
+                {item.content_preview || "（空）"}
+              </pre>
+              {item.preview_truncated && (item.has_detail ? (
+                <button type="button" onClick={() => {
+                  setModalItem(item);
+                  void loadDetail(snapshot.snapshot_id, item.item_id);
+                }} className="mt-2 text-xs text-primary hover:underline">
+                  查看更多
+                </button>
               ) : (
-                <pre className="text-xs whitespace-pre-wrap break-all font-mono leading-relaxed text-title">
-                  {fullContents[modalItem.item_id] !== undefined
-                    ? fullContents[modalItem.item_id]
-                    : modalItem.content_preview || "(空)"}
-                </pre>
-              )}
-            </div>
-          </div>
-        </div>
+                <p className="mt-2 text-xs text-faint">此快照仅提供预览</p>
+              ))}
+            </li>
+          );
+        })}
+      </ul>
+      {modalItem && (
+        <DetailDialog
+          key={modalKey}
+          item={modalItem}
+          detail={details.get(modalKey) ?? { status: "idle" }}
+          onClose={() => setModalItem(null)}
+          onRetry={() => void loadDetail(snapshot.snapshot_id, modalItem.item_id)}
+        />
       )}
-
     </div>
   );
+}
+
+export default function ContextInspector({ traceId }: { traceId?: string }) {
+  if (traceId) return <ContextRun key={traceId} traceId={traceId} />;
+  return <p className="py-16 text-center text-sm text-faint">在对话页面点击 Trace ID 查看上下文快照</p>;
 }

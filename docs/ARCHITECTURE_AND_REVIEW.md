@@ -204,7 +204,9 @@ _finalize_turn  ── 事务化落库
 - 每轮 Turn 在上下文装配前生成统一 `trace_id`，ContextAssembler 只通过 `UnifiedRetriever` 发起检索；`AutomaticRecallEngine` 仅作为其内部 MemoryRecord 路由，不再由调用方二次 fallback。exact/memory/index/raw-history 路由独立降级并写入稳定 notes，全路由或编排失败返回 fail-closed 空结果。
 - `retrieval_runs/retrieval_candidates` 和 `memory_recall_runs/memory_recall_candidates` 使用独立短事务持久化；诊断写入失败仅影响可观测性，不污染上下文装配 Session、不触发第二次检索。随后 AgentGraph、action card 和最终回复复用同一 trace。
 - Inspector 支持按 `trace_id` 发现 run，再按 `run_id` 读取真实候选；前端“检索”页只展示这些数据库事实，不生成候选假数据。
-- Context Inspector 主接口和 item 详情接口在快照或条目不存在时统一返回 HTTP 404（稳定 `context_snapshot_not_found` / `context_item_not_found` code）；前端明确区分未找到与服务错误，并在 trace 切换时立即清理旧快照，避免展示上一 trace 的过期内容。
+- `GET /api/context-runs/{trace_id}` 返回 `trace_id` 和按时间倒序排列的 `snapshots`。每条快照提供 `snapshot_id`、`trace_id`、`stable_prefix_hash`、`context_items`、`token_total`、`total_tool_calls`、`created_at`、`selection_trace` 和 `injected_memory_ids`。每个条目只提供摘要及其元数据，`preview_truncated` 和 `has_detail` 控制「查看更多」入口。输入与输出摘要保留前四个逻辑行和原有换行，最多 800 个 Unicode 字符，`preview_length` 记录已保存正文的字符数。旧快照在读取时重建摘要。只有内联正文的旧目标决策快照仅提供有界预览。
+- `GET /api/context-runs/{trace_id}/items/{item_id}?snapshot_id=…` 要求同时匹配 trace、快照与快照中的条目，返回 `snapshot_id`、`item_id`、`full_content` 和 `content_length`。快照不可见或不存在时返回 404（`context_snapshot_not_found`），条目缺失或没有独立正文时返回 404（`context_item_not_found`）。两个接口共用 Forget 可见性检查。若快照或已记录的来源被屏蔽，整条快照不可见。正文仍存放在原有 `meta.full_contents`。
+- 前端只在点击「查看更多」后请求正文。成功结果按快照 ID 与条目 ID 缓存在当前 trace 的内存中。弹窗独立呈现加载、错误与重试状态。切换快照会取消在途详情，切换 trace 会同时清除缓存并取消旧请求。正文支持滚动、换行和完整复制。回归测试可在 `frontend` 中运行 `npm run test:inspector`。
 
 **D.5 Chat 错误契约**
 - 同步 `/api/chat` 的 LLM 错误统一返回 `detail={code,message,retryable,trace_id,retry_after_seconds}`，并按超时、限流、配置和上游故障映射 HTTP 状态。

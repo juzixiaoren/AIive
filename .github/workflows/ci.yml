@@ -130,8 +130,8 @@ jobs:
       - name: Android TypeScript 与 Vite 构建
         working-directory: apps/android
         run: npm run build
-      - name: 聊天与跨端工作契约测试
-        run: npm run test:chat && npm run test:work
+      - name: 前端契约与交互测试
+        run: npm run test:chat && npm run test:work && npm run test:inspector
       - name: Desktop Node Host 测试
         run: node --test ../apps/desktop/src/node-host/locks.test.mjs ../apps/desktop/src/node-host/journal.test.mjs ../apps/desktop/src/node-host/cancellation.test.mjs ../apps/desktop/src/node-host/cancellation-host.test.mjs
 

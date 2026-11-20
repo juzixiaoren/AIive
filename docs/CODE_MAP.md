@@ -236,7 +236,7 @@
 | `routes_forget.py` | `/api/forget` + `/{operation_key}/status` |
 | `routes_knowledge.py` | `/api/knowledge/ingest`、`/knowledge`、`/knowledge/maintenance`（GET 报告 / POST 清理）、`DELETE /knowledge/{id}`、`/{id}/source`、`/{id}/reindex`、`/search` |
 | `routes_epochs.py` | `/api/epochs/{thread_id}`、`/{id}/seal-segment|rollover` |
-| `routes_inspector.py` | `/api/context-runs/{trace_id}`（+`/items/{id}`）、检索运行查询 |
+| `routes_inspector.py` | `/api/context-runs/{trace_id}`、`/api/context-runs/{trace_id}/items/{item_id}?snapshot_id=…`、检索运行查询 |
 | `routes_tasks.py` | `/api/tasks` 提醒 CRUD + `/{id}/cancel|check-now`（create 仅 reminder；历史旧类型只可查询/取消，check-now 返回 unsupported_task_type） |
 | `routes_notifications.py` | `/api/notifications` |
 | `routes_attention.py` | `/api/attention/current`、`/rhythm/daily|weekly` |
@@ -531,7 +531,7 @@ V2 新增：`base.py`（统一类/Context/取消/结果）、`executor.py`（协
 | `pages/MemoriesPage.tsx` | memories | `api/memories` + `/{id}/{sleep|archive|forget}` |
 | `pages/CapabilitiesPage.tsx` | capabilities | `api/mcp/capabilities`、`api/tools`、`api/skills`、`api/capabilities?state=candidate`、`api/knowledge` |
 | `pages/EventTimeline.tsx` | events | `GET api/inspector/events?trace_id=&limit=50` |
-| `pages/ContextInspector.tsx` | context | `GET api/context-runs/{traceId}`（+`/items/{itemId}`） |
+| `pages/ContextInspector.tsx` | context | `GET api/context-runs/{traceId}` 加载摘要，点击「查看更多」后请求 `/items/{itemId}?snapshot_id=…` |
 | `pages/RetrievalInspector.tsx` | retrieval | `api/retrieval-runs`、`api/memory-recall-runs`（+`/{id}`） |
 | `pages/NotificationsPage.tsx` | notifs | `GET api/notifications?category=`、`DELETE api/notifications/{id}` |
 | `pages/DeveloperPage.tsx` | developer（独立路径 `/aiive/developer`，需 `VITE_AIIVE_DEVELOPER_UI_ENABLED=true`） | `api/debug/events`、`api/debug/llm_calls`、`api/epochs/{threadId}`、`api/outbox/jobs` |

@@ -183,13 +183,6 @@ class GraphExecutionInterrupted(Exception):
         super().__init__(str(error))
 
 
-def _truncate(text: str, max_len: int) -> str:
-    """截断文本到指定长度，超出部分用 … 表示。"""
-    if len(text) <= max_len:
-        return text
-    return text[:max_len] + "…"
-
-
 def _bound_stream_tool_content(content: str, normalizer: Any | None) -> str:
     """按 ToolResultNormalizer 内联上限（token）折算的字符上限截断流式工具输出。
 
@@ -399,7 +392,7 @@ class AgentGraph:
         """构建后执行上下文项：Agent 输出、工具调用和工具结果。
 
         返回 (context_items, full_contents)：
-        - context_items: 折叠态展示的截断预览（~20 字）
+        - context_items: Inspector 展示的四行摘要
         - full_contents: item_id → 完整文本的映射，供前端展开时懒加载
         """
         items: list[ContextSnapshotItem] = []
@@ -408,10 +401,9 @@ class AgentGraph:
         # Agent 输出
         if reply:
             item_id = "agent_output"
-            preview = reply[:20] + ("..." if len(reply) > 20 else "")
-            items.append(ContextSnapshotItem(
+            items.append(ContextSnapshotItem.from_content(
                 item_id=item_id, kind="agent_output", source="agent",
-                trust_level="trusted", content_preview=preview,
+                trust_level="trusted", content=reply,
                 token_estimate=max(1, len(reply) // 4),
             ))
             full[item_id] = reply
@@ -426,13 +418,12 @@ class AgentGraph:
             # 工具调用
             call_id = f"tool_call:{i}"
             params_text = _json.dumps(params, ensure_ascii=False)
-            preview = f"{name}({_truncate(params_text, 20)})"
-            items.append(ContextSnapshotItem(
+            full[call_id] = f"名称: {name}\n参数: {params_text}"
+            items.append(ContextSnapshotItem.from_content(
                 item_id=call_id, kind="tool_call", source="tools",
-                trust_level="trusted", content_preview=preview,
+                trust_level="trusted", content=full[call_id],
                 token_estimate=max(1, len(params_text) // 4),
             ))
-            full[call_id] = f"名称: {name}\n参数: {params_text}"
 
             # 工具结果
             result_id = f"tool_result:{i}"
@@ -440,13 +431,12 @@ class AgentGraph:
                 # Snapshot retains the read reference, never an attachment body.
                 result = {"attachment_id": params.get("attachment_id"), "query": params.get("query", ""), "chunk_index": params.get("chunk_index", 0), "body_omitted": True}
             result_text = _json.dumps(result, ensure_ascii=False)
-            preview = f"[{status}] {_truncate(result_text, 20)}"
-            items.append(ContextSnapshotItem(
+            full[result_id] = f"名称: {name}\n状态: {status}\n结果: {result_text}"
+            items.append(ContextSnapshotItem.from_content(
                 item_id=result_id, kind="tool_result", source="tools",
-                trust_level="trusted", content_preview=preview,
+                trust_level="trusted", content=full[result_id],
                 token_estimate=max(1, len(result_text) // 4),
             ))
-            full[result_id] = f"名称: {name}\n状态: {status}\n结果: {result_text}"
 
         return items, full
 
@@ -1182,6 +1172,7 @@ class AgentGraph:
             selection_trace=context_snapshot.selection_trace,
             stable_prefix_hash=context_snapshot.stable_prefix_hash,
             injected_memory_ids=list(context_snapshot.injected_memory_ids),
+            source_memory_ids=list(context_snapshot.source_memory_ids),
         )
 
         return AgentGraphResult(

@@ -177,9 +177,9 @@ def test_inspector_returns_trace_context_without_developer_redaction(db):
     db.flush()
 
     run = get_context_run("trace-sensitive", db)
-    detail = get_context_item_detail("trace-sensitive", "user:1", db)
+    detail = get_context_item_detail("trace-sensitive", "user:1", "snapshot-sensitive", db)
 
-    assert run["snapshots"][0]["context_items"][0]["content"] == "用户正文"
+    assert run["snapshots"][0]["context_items"][0]["content_preview"] == "完整用户正文"
     assert detail["full_content"] == "完整用户正文"
 
 
@@ -203,6 +203,6 @@ def test_inspector_returns_404_for_missing_snapshot_and_item(db):
     db.flush()
 
     with pytest.raises(HTTPException) as missing_item:
-        get_context_item_detail("trace-context-missing-item", "missing-item", db)
+        get_context_item_detail("trace-context-missing-item", "missing-item", "snapshot-context-missing-item", db)
     assert missing_item.value.status_code == 404
     assert missing_item.value.detail["code"] == "context_item_not_found"

@@ -13,9 +13,24 @@ import pytest
 from aiive.runtime.context_assembler import ContextAssembler
 from aiive.db.models import Epoch, Segment, SegmentSummary, Thread
 from aiive.runtime.context_budget import ContextBudget
+from aiive.runtime.context_preview import context_content_preview
 from aiive.runtime.thread_state import ThreadState
 from aiive.runtime.token_models import TokenCount
 from aiive.runtime.tool_output_guard import UNTRUSTED_NOTE
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("", ""),
+        ("1\n2\n3\n4\n", "1\n2\n3\n4\n"),
+        ("1\n\n 3\n4\n5", "1\n\n 3\n4"),
+        ("x" * 799 + "\r\ny", "x" * 799),
+        ("1\n2\n3\n" + "文" * 800 + "\n5", "1\n2\n3\n" + "文" * 794),
+    ],
+)
+def test_context_preview_keeps_logical_line_breaks_and_bounds_characters(content, expected):
+    assert context_content_preview(content) == expected
 
 
 class _FakeTokenCounter:

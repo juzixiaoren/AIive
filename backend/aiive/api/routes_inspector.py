@@ -4,9 +4,11 @@ API路由模块：诊断检查器
 - 提供事件诊断检查接口
 """
 import logging
-from typing import Any
+from datetime import datetime
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from aiive.core.assistant_protocol import public_event_payload
@@ -20,90 +22,172 @@ from aiive.db.models import (
     MemoryRecallCandidate,
 )
 
+from aiive.forget.visibility_service import ForgetVisibilityService
+from aiive.runtime.context_preview import context_content_preview
+
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
 
 
-@router.get("/context-runs/{trace_id}")
+class ContextItemPreview(BaseModel):
+    item_id: str
+    kind: str
+    source: str
+    trust_level: str
+    content_preview: str
+    preview_length: int
+    preview_truncated: bool
+    has_detail: bool
+    token_estimate: int
+
+
+class InjectedMemory(BaseModel):
+    memory_id: str
+    canonical_key: str | None = None
+    memory_type: str | None = None
+
+
+class ContextSelectionCandidate(BaseModel):
+    candidate_id: str
+    source_type: str
+    source_id: str
+    source_version: str | None = None
+    retention_tier: int
+    native_score: float | None = None
+    source_rank: int
+    rank_percentile: float
+    estimated_tokens: int | None = None
+    selected: bool
+    exclusion_reason: str | None = None
+
+
+class ContextSelectionTrace(BaseModel):
+    policy_version: str | None = None
+    candidates: list[ContextSelectionCandidate] = Field(default_factory=list)
+    eviction_order: list[str] = Field(default_factory=list)
+
+
+class ContextSnapshotSummary(BaseModel):
+    snapshot_id: str
+    trace_id: str
+    stable_prefix_hash: str
+    context_items: list[ContextItemPreview]
+    token_total: int
+    total_tool_calls: int
+    created_at: datetime
+    selection_trace: ContextSelectionTrace
+    injected_memory_ids: list[InjectedMemory]
+
+
+class ContextRunResponse(BaseModel):
+    trace_id: str
+    snapshots: list[ContextSnapshotSummary]
+
+
+class ContextItemDetailResponse(BaseModel):
+    snapshot_id: str
+    item_id: str
+    full_content: str
+    content_length: int
+
+
+def _snapshot_not_found() -> HTTPException:
+    return HTTPException(
+        status_code=404,
+        detail={"code": "context_snapshot_not_found", "message": "未找到上下文快照"},
+    )
+
+
+def _disable_context_http_cache(response: Response) -> None:
+    response.headers["Cache-Control"] = "no-store"
+
+
+def _snapshot_summary(snapshot: ContextSnapshot) -> dict[str, Any]:
+    meta = snapshot.meta or {}
+    full_contents = meta.get("full_contents") or {}
+    items: list[dict[str, Any]] = []
+    for item in snapshot.context_items or []:
+        item_id = item.get("item_id")
+        if not isinstance(item_id, str):
+            continue
+        stored_content = full_contents.get(item_id)
+        has_detail = isinstance(stored_content, str)
+        # Rebuild old 20/120-character previews. Legacy goal traces have inline text only.
+        text = stored_content if has_detail else item.get("content", item.get("content_preview", ""))
+        text = text if isinstance(text, str) else ""
+        preview = context_content_preview(text)
+        length = len(text) if has_detail or "content" in item else max(len(text), item.get("preview_length") or 0)
+        items.append({
+            "item_id": item_id,
+            "kind": item.get("kind") or item.get("role") or "unknown",
+            "source": item.get("source") or item.get("role") or "unknown",
+            "trust_level": item.get("trust_level") or "unknown",
+            "content_preview": preview,
+            "preview_length": length,
+            "preview_truncated": len(preview) < length,
+            "has_detail": has_detail,
+            "token_estimate": item.get("token_estimate") or 0,
+        })
+    return {
+        "snapshot_id": snapshot.id,
+        "trace_id": snapshot.trace_id,
+        "stable_prefix_hash": snapshot.stable_prefix_hash,
+        "context_items": items,
+        "token_total": snapshot.token_total,
+        "total_tool_calls": meta.get("total_tool_calls", 0),
+        "created_at": snapshot.created_at,
+        "selection_trace": meta.get("selection_trace") or {},
+        "injected_memory_ids": meta.get("injected_memory_ids") or [],
+    }
+
+
+@router.get(
+    "/context-runs/{trace_id}", response_model=ContextRunResponse,
+    dependencies=[Depends(_disable_context_http_cache)],
+)
 def get_context_run(trace_id: str, db: Session = Depends(get_db)):
-    """获取指定 trace_id 的上下文构建运行详情
+    """获取指定 trace 的可见快照摘要。"""
+    snapshots = (
+        db.query(ContextSnapshot)
+        .filter(ContextSnapshot.trace_id == trace_id)
+        .order_by(ContextSnapshot.created_at.desc(), ContextSnapshot.id.desc())
+        .limit(10)
+        .all()
+    )
+    blocked = ForgetVisibilityService.blocked_context_snapshot_ids(db, snapshots)
+    summaries = [_snapshot_summary(snapshot) for snapshot in snapshots if snapshot.id not in blocked]
+    if not summaries:
+        raise _snapshot_not_found()
+    return {"trace_id": trace_id, "snapshots": summaries}
 
-    Args:
-        trace_id: 追踪ID
-        db: 数据库会话
 
-    Returns:
-        上下文快照列表（包含前执行和后执行的全部上下文项）
-    """
-    try:
-        snapshots = (
-            db.query(ContextSnapshot)
-            .filter(ContextSnapshot.trace_id == trace_id)
-            .order_by(ContextSnapshot.created_at.desc())
-            .limit(10)
-            .all()
+@router.get(
+    "/context-runs/{trace_id}/items/{item_id}", response_model=ContextItemDetailResponse,
+    dependencies=[Depends(_disable_context_http_cache)],
+)
+def get_context_item_detail(
+    trace_id: str, item_id: str, snapshot_id: Annotated[str, Query(min_length=1)],
+    db: Session = Depends(get_db),
+):
+    """读取指定快照内单个可见上下文项的完整内容。"""
+    snapshot = db.query(ContextSnapshot).filter(
+        ContextSnapshot.id == snapshot_id, ContextSnapshot.trace_id == trace_id,
+    ).one_or_none()
+    if snapshot is None or ForgetVisibilityService.blocked_context_snapshot_ids(db, [snapshot]):
+        raise _snapshot_not_found()
+
+    content = None
+    if any(item.get("item_id") == item_id for item in snapshot.context_items or []):
+        content = ((snapshot.meta or {}).get("full_contents") or {}).get(item_id)
+    if not isinstance(content, str):
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "context_item_not_found", "message": "未找到上下文项"},
         )
-        if not snapshots:
-            raise HTTPException(
-                status_code=404,
-                detail={"code": "context_snapshot_not_found", "message": "未找到上下文快照"},
-            )
-        return {
-            "trace_id": trace_id,
-            "snapshots": [
-                {
-                    "stable_prefix_hash": s.stable_prefix_hash,
-                    "context_items": s.context_items,
-                    "meta": s.meta,
-                    "token_total": s.token_total,
-                }
-                for s in snapshots
-            ],
-        }
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("获取上下文构建运行详情失败: trace_id=%s", trace_id)
-        raise
-
-
-@router.get("/context-runs/{trace_id}/items/{item_id}")
-def get_context_item_detail(trace_id: str, item_id: str, db: Session = Depends(get_db)):
-    """获取指定上下文项的完整内容（懒加载）
-
-    Args:
-        trace_id: 追踪ID
-        item_id: 上下文项ID（如 agent_output、tool_call:0、tool_result:1）
-        db: 数据库会话
-
-    Returns:
-        {"item_id": ..., "full_content": "..."}
-    """
-    try:
-        snapshot = (
-            db.query(ContextSnapshot)
-            .filter(ContextSnapshot.trace_id == trace_id)
-            .order_by(ContextSnapshot.created_at.desc())
-            .first()
-        )
-        if not snapshot:
-            raise HTTPException(
-                status_code=404,
-                detail={"code": "context_snapshot_not_found", "message": "未找到上下文快照"},
-            )
-        full_contents: dict[str, Any] = snapshot.meta.get("full_contents", {}) if snapshot.meta else {}
-        content = full_contents.get(item_id)
-        if content is None:
-            raise HTTPException(
-                status_code=404,
-                detail={"code": "context_item_not_found", "message": "未找到上下文项"},
-            )
-        return {"item_id": item_id, "full_content": content}
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("获取上下文项详情失败: trace_id=%s, item_id=%s", trace_id, item_id)
-        raise
+    return {
+        "snapshot_id": snapshot.id, "item_id": item_id,
+        "full_content": content, "content_length": len(content),
+    }
 
 
 @router.get("/retrieval-runs")

@@ -1412,6 +1412,7 @@ class TurnExecutionService:
                 "full_contents": dict(snapshot.full_contents),
                 "selection_trace": dict(snapshot.selection_trace),
                 "injected_memory_ids": list(snapshot.injected_memory_ids),
+                "source_memory_ids": list(snapshot.source_memory_ids),
             },
             epoch_id=turn.epoch_id,
             segment_id=turn.segment_id,

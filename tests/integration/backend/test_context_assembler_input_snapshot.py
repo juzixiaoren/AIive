@@ -115,7 +115,9 @@ def test_assemble_populates_input_snapshot(db, monkeypatch) -> None:
         "history_summary_text": "历史摘要：讨论过性能优化",
         "stable_contract_text": "系统前缀契约内容",
         "core_memory_text": "核心记忆：用户名 Daniel",
-        "core_blocks": [CoreMemoryBlock(block_name="core.human_identity", content="用户名 Daniel", token_count=4)],
+        "core_blocks": [CoreMemoryBlock(
+            block_name="core.human_identity", content="用户名 Daniel", token_count=4, source_memory_ids=["core-source"],
+        )],
         "retrieval_hits": [
             RetrievalHit(source_type="memory_record", source_id="m1", source_version="1", snippet="用户偏好中文"),
             RetrievalHit(source_type="segment_summary", source_id="s1", source_version="1", snippet="讨论过性能优化"),
@@ -136,9 +138,8 @@ def test_assemble_populates_input_snapshot(db, monkeypatch) -> None:
     assembler._touch_injected_memory = lambda *a, **k: None
     monkeypatch.setattr(ca_mod, "WorkingStateService", _StubWorkingStateService)
 
-    assembled = assembler.assemble(
-        db=db, message="当前用户消息", thread=thread, upper_bound_sequence=0,
-    )
+    message = "当前用户消息\n  第二行\n\n第四行\n第五行"
+    assembled = assembler.assemble(db=db, message=message, thread=thread, upper_bound_sequence=0)
 
     items = assembled.snapshot.items
     kinds = {item.kind for item in items}
@@ -156,6 +157,7 @@ def test_assemble_populates_input_snapshot(db, monkeypatch) -> None:
     for item in items:
         assert isinstance(item, ContextSnapshotItem)
         assert item.token_estimate >= 1
+        assert item.preview_length == len(full[item.item_id])
 
     # 召回记忆标记为 untrusted（本轮证据非系统指令）
     recall_item = next(item for item in items if item.kind == "recall_memory")
@@ -163,7 +165,10 @@ def test_assemble_populates_input_snapshot(db, monkeypatch) -> None:
 
     # full_contents 覆盖所有 item，且当前用户消息完整保留
     assert ids <= set(full.keys())
-    assert full["user_message"] == "当前用户消息"
+    assert full["user_message"] == message
+    user_item = next(item for item in items if item.item_id == "user_message")
+    assert user_item.content_preview == "当前用户消息\n  第二行\n\n第四行"
+    assert assembled.messages[-1]["content"] == message
 
     # 注意力上下文已注入模型消息与快照
     assert any("注意力上下文" in message.get("content", "") for message in assembled.messages)
@@ -171,6 +176,30 @@ def test_assemble_populates_input_snapshot(db, monkeypatch) -> None:
 
     # stable_prefix_hash 已计算
     assert assembled.snapshot.stable_prefix_hash
+    assert assembled.snapshot.source_memory_ids == ["core-source"]
+
+
+def test_long_tool_schema_call_and_result_previews_preserve_original_content():
+    from aiive.runtime.agent_graph import AgentGraph
+
+    long_text = "数" * 900
+    tools = [{"type": "function", "function": {"name": "example", "description": long_text}}]
+    input_snapshot = _make_assembler()._build_input_snapshot(tools_schema=tools)
+    output_items, full_output = AgentGraph._build_post_context_items(
+        "首行\r\n\r\n  三\r\n四\r\n五",
+        [{"name": "example", "params": {"q": long_text}, "result": {"text": long_text}, "status": "ok"}],
+    )
+
+    assert output_items[0].content_preview == "首行\r\n\r\n  三\r\n四"
+    assert output_items[0].preview_length == len(full_output["agent_output"])
+    assert full_output["tool_call:0"].startswith("名称: example\n参数: ")
+    assert full_output["tool_result:0"].startswith("名称: example\n状态: ok\n结果: ")
+    full = {**input_snapshot.full_contents, **full_output}
+    for item in [*input_snapshot.items, *output_items[1:]]:
+        content = full[item.item_id]
+        assert long_text in content
+        assert item.content_preview == content[:800]
+        assert item.preview_length == len(content)
 
 
 def test_attention_failure_is_fail_open(db, monkeypatch) -> None:
