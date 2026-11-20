@@ -9,6 +9,16 @@ from typing import ClassVar, Literal
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+WORKER_BUDGET_LIMITS = {
+    "max_runs": 128,
+    "max_model_calls": 512,
+    "max_actions": 256,
+    "max_actions_per_run": 32,
+    "max_tool_failures": 64,
+    "max_total_tokens": 8_000_000,
+    "max_wall_time_seconds": 365 * 86400,
+}
+
 
 class Settings(BaseSettings):
     """应用配置类：从 .env 文件和环境变量加载所有配置项，提供类型校验和默认值。"""
@@ -49,6 +59,13 @@ class Settings(BaseSettings):
     # Set the uncached input and output rates of the configured Worker model.
     aiive_worker_input_usd_per_million: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     aiive_worker_output_usd_per_million: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    aiive_worker_default_max_runs: int = Field(default=8, ge=1, le=WORKER_BUDGET_LIMITS["max_runs"])
+    aiive_worker_default_max_model_calls: int = Field(default=32, ge=1, le=WORKER_BUDGET_LIMITS["max_model_calls"])
+    aiive_worker_default_max_actions: int = Field(default=24, ge=1, le=WORKER_BUDGET_LIMITS["max_actions"])
+    aiive_worker_default_max_actions_per_run: int = Field(default=8, ge=1, le=WORKER_BUDGET_LIMITS["max_actions_per_run"])
+    aiive_worker_default_max_tool_failures: int = Field(default=6, ge=1, le=WORKER_BUDGET_LIMITS["max_tool_failures"])
+    aiive_worker_default_max_total_tokens: int | None = Field(default=None, ge=1000, le=WORKER_BUDGET_LIMITS["max_total_tokens"])
+    aiive_worker_default_max_wall_time_seconds: int = Field(default=90 * 86400, ge=1, le=WORKER_BUDGET_LIMITS["max_wall_time_seconds"])
     # 当前 Segment 历史量的密封阈值，实际取与全局输入上限一半的较小值。
     aiive_segment_seal_token_threshold: int = 64000
     # 内部分类/提取调用的 JSON mode。auto 遇到明确的不支持错误时回退为

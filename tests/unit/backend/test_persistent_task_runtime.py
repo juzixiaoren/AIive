@@ -23,7 +23,6 @@ from aiive.db.models import (
     AgentRun,
     AgentTask,
     AgentTaskEvent,
-    AgentTaskWatch,
     ApprovalRequest,
     DesktopNode,
     Event,
@@ -46,7 +45,7 @@ from aiive.task_runtime.repository import (
 )
 from aiive.task_runtime.resource_locks import ResourceBusyError, ResourceLockService
 from aiive.task_runtime.runtime import PersistentTaskRuntime
-from aiive.task_runtime.schemas import ActionProposal, ActionStatus, TaskStatus
+from aiive.task_runtime.schemas import ActionProposal, ActionStatus, TaskBudget, TaskStatus
 from aiive.task_runtime.tools import build_main_agent_registry
 from aiive.task_runtime.watchers import WatcherService
 from aiive.task_runtime.worktree import WorktreeIsolation
@@ -224,7 +223,7 @@ def test_task_status_large_details_paginate_within_the_same_thread(db_session) -
     assert "task_details_changed" in stale["error"]
 
 
-@pytest.mark.parametrize("budget_args", [{}, {"budgets": None}, {"budgets": {}}])
+@pytest.mark.parametrize("budget_args", [{}, {"budgets": None}, {"budgets": {}}, {"budgets": {"max_runs": None}}])
 def test_create_without_budget_via_api_and_main_agent(db_session, budget_args) -> None:
     from aiive.api.routes_agent_tasks import CreateAgentTaskRequest, create_agent_task
     from aiive.context.run_context import RunContext
@@ -232,13 +231,23 @@ def test_create_without_budget_via_api_and_main_agent(db_session, budget_args) -
 
     thread = _thread(db_session)
     request = CreateAgentTaskRequest(thread_id=thread.id, goal="完成测试任务", **budget_args)
-    assert create_agent_task(request, db_session)["budgets"] == {}
+    defaults = TaskBudget().model_dump(exclude_none=True)
+    assert create_agent_task(request, db_session)["budgets"] == defaults
     delegate = build_langchain_tools(
         build_main_agent_registry(), RunContext(thread_id=thread.id, trace_id="budget-delegate"), ["delegate_task"],
     )[0]
     delegated = json.loads(delegate.invoke({"goal": "完成测试任务", **budget_args}))
     task = db_session.get(AgentTask, delegated["task_id"])
-    assert task.budgets == {}
+    assert task.budgets == defaults
+    task.usage = {**task.usage, "runs": defaults["max_runs"]}
+    result = PersistentTaskRuntime(db_session, agent_executor=SequenceAgent()).run(task.id)
+    assert result["report"]["stop_reason"] == "run_budget_exhausted"
+    assert task.usage["runs"] == defaults["max_runs"]
+
+
+def test_legacy_sparse_budget_keeps_its_stored_execution_limits(db_session) -> None:
+    task = _task(db_session, _thread(db_session))
+    task.budgets = {"max_actions_per_run": 40}  # Previously accepted, above the new creation ceiling.
     task.usage = {**task.usage, "runs": 20, "model_calls": 30, "actions": 50,
                   "tool_failures": 10, "prompt_tokens": 300_000}
     result = PersistentTaskRuntime(db_session, agent_executor=SequenceAgent(
@@ -247,6 +256,31 @@ def test_create_without_budget_via_api_and_main_agent(db_session, budget_args) -
     )).run(task.id)
     assert result["status"] == "succeeded"
     assert task.usage["actions"] == 51 and task.usage["runs"] == 21
+    assert task.budgets == {"max_actions_per_run": 40}
+
+
+def test_openai_delegate_budget_schema_matches_limits_and_persisted_values(db_session) -> None:
+    from langchain_core.utils.function_calling import convert_to_openai_tool
+    from pydantic import ValidationError
+
+    from aiive.config import WORKER_BUDGET_LIMITS
+    from aiive.tools.langchain_adapter import build_langchain_tools
+
+    delegate = build_langchain_tools(build_main_agent_registry(), visible_tool_ids=["delegate_task"])[0]
+    budget = convert_to_openai_tool(delegate)["function"]["parameters"]["properties"]["budgets"]
+    assert budget["additionalProperties"] is False
+    fields = budget["properties"]
+    assert fields.keys() == TaskBudget.model_fields.keys()
+    for key, field in fields.items():
+        assert field["description"] and field["default"] == getattr(TaskBudget(), key)
+        if key in WORKER_BUDGET_LIMITS:
+            assert field["anyOf"][0]["maximum"] == WORKER_BUDGET_LIMITS[key]
+    thread = _thread(db_session)
+    task = _task(db_session, thread, budgets={"max_runs": 1, "max_model_calls": 48, "max_cost_usd": 1.25})
+    assert task.budgets == {**TaskBudget().model_dump(exclude_none=True),
+                            "max_runs": 1, "max_model_calls": 48, "max_cost_usd": 1.25}
+    with pytest.raises(ValidationError, match="max_total_tokens"):
+        _task(db_session, thread, budgets={"max_total_tokens": WORKER_BUDGET_LIMITS["max_total_tokens"] + 1})
 
 
 def test_main_agent_can_read_own_task_evidence_only(db_session) -> None:

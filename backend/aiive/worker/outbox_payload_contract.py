@@ -131,6 +131,10 @@ _JOB_REFERENCE_SCHEMA: dict[str, dict[str, frozenset[str]]] = {
         "task": frozenset({"task_id"}),
         "trace": frozenset({"trace_id"}),
     },
+    "main_agent_task_terminal": {
+        "task": frozenset({"task_id"}),
+        "thread": frozenset({"thread_id"}),
+    },
     "tool_operation": {
         "child": frozenset({"tool_operation_id", "tool_call_id"}),
         "operation": frozenset({"operation_id"}),
@@ -144,7 +148,7 @@ _OPERATION_ID_BUSINESS_PREFIXES: frozenset[str] = frozenset({
     "memory_extraction", "agent_task_run", "reminder_delivery", "retrieval_refresh",
     "epoch_checkpoint", "epoch_rollover", "core", "memory_vector_refresh",
     "memory_file_projection", "memory_graph_refresh", "memory_markdown_project",
-    "segment_sealing", "compaction", "goal_event", "goal_trigger", "tool_operation",
+    "segment_sealing", "compaction", "goal_event", "goal_trigger", "tool_operation", "main_agent_task_terminal",
 })
 
 # 版本/批次 token（v3、b0）不是来源引用，直接跳过。

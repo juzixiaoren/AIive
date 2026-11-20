@@ -19,8 +19,7 @@ Main Agent                        Worker Agent
 Main Agent 固定只暴露 `delegate_task`、`get_task_status`、`cancel_task`、
 `send_task_input`。Desktop、文件、Shell 和 Self-Improvement 能力只能由 Task
 Worker 提议，并通过 Capability Broker 执行。Main Conversation 通过
-`agent_task_created` 卡片关联委派工作；普通 Task 事件在工作中心展示，真正的
-ProactiveMessage 仍进入对话。底层工具 trace 不转成聊天消息。
+`agent_task_created` 卡片关联委派工作。任务终态可以唤醒 Main Agent 验收结果，最终答复进入对话时间线。工作中心展示执行过程、证据和产物。
 
 ## 持久化事实模型
 
@@ -89,7 +88,34 @@ Journal，以 result hash 对账，再恢复 Task，绝不盲目重试未知副�
 - 代码 Task 只有显式声明 `isolation_mode=git_worktree` 时才创建独立 worktree，并将
   Task scope 收紧到该 workspace。
 - File、time 和 node Watcher 只产生事件和 Task wake，不调用 LLM 轮询。
-- Task budget 限制 Run、Action、单 Run 步数、Token 和 deadline。
+
+### Main Agent 跟进任务终态
+
+`TaskRepository.transition_task` 将 `succeeded`、`partial`、`failed` 与 `main_agent_task_terminal:<task_id>:<status>` Outbox 作业同事务写入。载荷包含任务、线程 ID 和状态。用户主动取消由取消入口确认，Forget 取消也无需唤醒。原有 Goal 订阅仍由 `goal_event_dispatch` 匹配，Goal 自身的终态由 Main Agent 跟进。
+
+Worker 校验 claim、线程和 Forget 来源，通过稳定键将同线程到期作业批量写入 `TurnEventInbox`。前台 Turn 执行时，从工具结果已配对的边界进入下一次模型调用，Outbox 等待收口。空闲时，`TurnExecutionService` 以 `runtime_event` 来源走正常租约、`ContextAssembler`、`AgentGraph` 和 `TurnRecord`。一次唤醒最多领取五个任务终态，剩余作业继续排队。
+
+Main Agent 通过 `get_task_status` 查看原始目标、验收标准、报告、预算和用量，再按需续读分页或 Evidence，判断是否反馈、继续委托或无需行动。Graph 在成功状态工具结果返回后记录本轮读取时间。正常收口与最终答复同事务，显式独立提醒与其 Inbox 回执同事务。空闲唤醒批次无法全部收口时暂缓批次答复，由各作业重试；需要另行处理的事件仍有自己的 Outbox 作业。成功答复写入后经 `new_message` 送达在线客户端，离线客户端通过会话历史取得。
+
+线程繁忙或事件仍在排队时延迟重试。中断或租约过期后，旧 Inbox 领取失效，从 Outbox 重领并刷新读取回执。重复投递遇到已处理事件直接结束。模型或读取持续失败时按 Outbox 退避，三次失败后保留 `deadletter` 与诊断原因，修复后可运维重排原作业。来源屏蔽在投递、注入、工具读取和收口时校验。
+
+### 新任务的预算
+
+`TaskBudget` 从 `AIIVE_WORKER_DEFAULT_*` 取得默认值。省略、空对象或字段为 `null` 时使用有效默认值。创建时保存完整有限预算，之后配置变更适用于新任务。既有任务保留原先保存的上限与空缺语义。显式值可在 Schema 范围内调高或调低默认值。
+
+| 字段 | 出厂默认 | 新任务硬上限 | 计量 |
+|---|---:|---:|---|
+| `max_runs` | 8 | 128 | 累计执行 Run，独立成稿 Run 单独处理 |
+| `max_model_calls` | 32 | 512 | Worker 决策调用，包含发现与纠错 |
+| `max_actions` | 24 | 256 | 累计创建的 Action，包含已进入审批或被策略拦截的 Action |
+| `max_actions_per_run` | 8 | 32 | 单 Run 批大小，能力发现也占用批位置 |
+| `max_tool_failures` | 6 | 64 | 已计入的工具执行失败，审批、取消、失效和未知结果不计 |
+| `max_total_tokens` | 512,000 | 8,000,000 | Worker 决策的累计输入和输出。缺少供应商用量时按预估保守计入。成稿用量在 `report.report_usage` |
+| `max_wall_time_seconds` | 7,776,000（90 天） | 31,536,000（365 天） | 从创建起计时，含排队、等待审批和用户输入。在 Worker 执行检查点生效 |
+| `max_cost_usd` | 无 | 1,000,000 | 仅按配置好的输入和输出 Token 价格估算 Worker 决策费用。缺少价格时，带美元上限的决策以 `cost_pricing_unavailable` 停止 |
+| `deadline_at` | 无 | — | ISO 8601 绝对时间，无时区按 UTC，和经过时间上限同时生效 |
+
+默认保留现有的八步 Run 批大小，24 个 Action 配合 32 次决策为发现、纠错和收尾留出空间，八次 Run 容纳多批执行和等待后恢复。累计 Token 默认取配置的模型窗口两倍，出厂窗口为 256,000，适用于重复发送上下文的 Worker 决策循环。90 天限制任务生命周期，涵盖跨周、跨月计划和等待。常规执行资源由 Run、Action、调用次数、Token 等预算控制。美元估算使用服务端配置的模型单价，独立成稿记录单独的 Token 用量。
 
 ## Evidence、UI 与 API
 

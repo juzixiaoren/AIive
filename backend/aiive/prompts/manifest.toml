@@ -1,6 +1,12 @@
 [prompts."agent.stable_contract"]
 file = "agent/stable_contract.md"
-version = "2.4.0"
+version = "2.5.0"
+role = "system"
+variables = []
+
+[prompts."agent.task_terminal_review"]
+file = "agent/task_terminal_review.md"
+version = "1.0.0"
 role = "system"
 variables = []
 

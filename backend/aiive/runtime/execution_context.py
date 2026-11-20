@@ -36,3 +36,4 @@ class TurnExecutionContext:
     turn_record_id: str
     execution_id: str
     trace_id: str
+    task_terminal_wakeup: bool = False

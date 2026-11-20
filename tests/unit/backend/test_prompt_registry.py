@@ -33,8 +33,9 @@ def _write_catalog(
 def test_packaged_catalog_loads_and_has_audit_identity() -> None:
     registry = get_prompt_registry()
 
-    assert len(registry.prompt_ids) == 14
+    assert len(registry.prompt_ids) == 15
     assert {
+        "agent.task_terminal_review",
         "task_runtime.worker_system",
         "task_runtime.task_context",
         "task_runtime.task_report",

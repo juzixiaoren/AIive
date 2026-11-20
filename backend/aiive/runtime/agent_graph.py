@@ -72,10 +72,15 @@ from aiive.runtime.turn_events import (
     INTERNAL_CONTEXT_HEADER,
     DecisionMarkerStreamFilter as _DecisionMarkerStreamFilter,
     build_internal_context,
+    claimed_task_terminal_events,
     claim_pending_events,
     decision_from_response,
+    parse_decision_marker,
+    record_task_status_reads,
     set_decisions,
+    task_terminal_turn_live,
 )
+from aiive.worker.job_types import MAIN_AGENT_TASK_TERMINAL
 
 
 def _tool_calls_paired(messages: list[Any]) -> bool:
@@ -450,6 +455,7 @@ class AgentGraph:
         turn_id: str = "",
         context_forget_revision: int | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        task_terminal_wakeup: bool = False,
     ) -> tuple[Any, list[dict[str, Any]], list[dict[str, Any]]]:
         """构建并返回编译后的 StateGraph、工具记录引用列表和待审批列表。
 
@@ -471,11 +477,15 @@ class AgentGraph:
                 return None, []
             db = self._db
             try:
-                rows = claim_pending_events(
+                task_turn_live = task_terminal_turn_live(db, turn_record_id, execution_id)
+                task_events = claimed_task_terminal_events(db, turn_record_id) if task_turn_live else []
+                rows = task_events + claim_pending_events(
                     db,
                     thread_id=thread_id,
                     turn_record_id=turn_record_id,
                     turn_id=turn_id,
+                    task_terminal_only=task_terminal_wakeup,
+                    include_task_terminal=task_turn_live and not task_events,
                 )
                 if not rows:
                     # 结束本次只读事务，避免长 Turn 持有跨多轮的旧快照。
@@ -558,6 +568,9 @@ class AgentGraph:
             injected: list[dict[str, Any]] = []
             if _tool_calls_paired(msgs):
                 injection_text, injected = _load_event_injection()
+            if task_terminal_wakeup and not injection_text:
+                # A foreground Turn may have already drained the Inbox before we acquired the lease.
+                return {"messages": [AIMessage(content="")]}
             call_messages = [*msgs, SystemMessage(content=injection_text)] if injection_text else msgs
             from aiive.forget.concurrency import forget_revision
             if context_forget_revision is not None and forget_revision(self._db) != context_forget_revision:
@@ -590,9 +603,11 @@ class AgentGraph:
                     {
                         "event_id": item["event_id"],
                         "event_type": item["event_type"],
-                        "decision": decision,
+                        "decision": (parse_decision_marker(raw_content)[1] or "continue")
+                        if item["event_type"] == MAIN_AGENT_TASK_TERMINAL else decision,
                     }
                     for item in injected
+                    if item["event_type"] != MAIN_AGENT_TASK_TERMINAL or not tool_names
                 ]
                 _record_event_injection(
                     injected, injection_text, decision, resp, tool_names, raw_content=raw_content,
@@ -833,6 +848,7 @@ class AgentGraph:
                 raise
 
             tool_messages = [m for m in result.get("messages", []) if isinstance(m, ToolMessage)]
+            task_status_reads: dict[str, str] = {}
             batch_index = max(
                 0,
                 sum(1 for m in state["messages"] if isinstance(m, AIMessage) and m.tool_calls) - 1,
@@ -846,6 +862,19 @@ class AgentGraph:
                 receipt = parse_tool_execution_receipt(raw_content)
                 is_error = not receipt.ok
                 record_status = receipt.status
+                args = tc.get("args", {})
+                if (tool_name == "get_task_status" and tm is not None and tm.tool_call_id == tc.get("id")
+                        and tm.status == "success" and record_status == "completed"
+                        and not args.get("evidence_id") and not args.get("details_cursor")):
+                    try:
+                        status_view = _json.loads(raw_content)
+                    except ValueError:
+                        status_view = None
+                    if (isinstance(status_view, dict) and isinstance(status_view.get("task_id"), str)
+                            and status_view["task_id"] == args.get("task_id")
+                            and isinstance(status_view.get("status"), str)
+                            and ("report" in status_view or "details_page" in status_view)):
+                        task_status_reads[status_view["task_id"]] = status_view["status"]
 
                 # 任务状态工具已在源头分页，保持每页的状态、用量及续读游标。
                 artifact_ref = ""
@@ -899,6 +928,13 @@ class AgentGraph:
                         if _ref:
                             ws_c.add_artifact_ref(db, thread_id, str(_ref), "tool_result", str(_tc.get("name", "") or ""))
                     _ws_commit(_finalize)
+
+            if task_status_reads and turn_record_id:
+                from aiive.forget.concurrency import acquire_forget_shared_lock
+                acquire_forget_shared_lock(self._db)
+                if task_terminal_turn_live(self._db, turn_record_id, execution_id):
+                    record_task_status_reads(self._db, turn_record_id, task_status_reads)
+                self._db.commit()
 
             return {
                 "messages": result.get("messages", []),
@@ -999,6 +1035,7 @@ class AgentGraph:
             execution_id=exec_ctx.execution_id, turn_id=exec_ctx.turn_id,
             context_forget_revision=getattr(assembled_ctx, "forget_revision", None),
             cancel_check=cancel_check,
+            task_terminal_wakeup=exec_ctx.task_terminal_wakeup,
         )
         return {
             "trace": trace,
@@ -1174,6 +1211,9 @@ class AgentGraph:
         all_messages = result["messages"]
         llm_usage = self._collect_llm_usage(all_messages)
         reply = self._extract_reply(all_messages)
+        if exec_ctx.task_terminal_wakeup and all_messages and isinstance(all_messages[-1], AIMessage):
+            # A marker-only no_action is a valid empty final answer.
+            reply = str(all_messages[-1].content or "") if not all_messages[-1].tool_calls else ""
 
         # 空回复且非审批挂起属于异常情况，记录告警以便定位根因
         # （LLM 空响应、工具绑定异常、streaming 兼容问题等）。

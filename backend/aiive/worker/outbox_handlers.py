@@ -1358,6 +1358,8 @@ def register_all(registry: HandlerRegistry) -> None:
     from aiive.worker.handlers_agent_tasks import handle_agent_task_run
     from aiive.worker.handlers_goal_events import handle_goal_event_dispatch
     from aiive.worker.handlers_goal_triggers import handle_goal_trigger_decision
+    from aiive.worker.handlers_task_terminal import handle_main_agent_task_terminal
+    from aiive.worker.job_types import MAIN_AGENT_TASK_TERMINAL
 
     registry.register("agent_task_run", handle_agent_task_run,
                        supported_schema_versions=frozenset({1}))
@@ -1365,6 +1367,8 @@ def register_all(registry: HandlerRegistry) -> None:
                        supported_schema_versions=frozenset({1}))
     registry.register("goal_event_dispatch", handle_goal_event_dispatch,
                        supported_schema_versions=frozenset({1}))
+    registry.register(MAIN_AGENT_TASK_TERMINAL, handle_main_agent_task_terminal,
+                      supported_schema_versions=frozenset({1}))
     registry.register("tool_operation", handle_tool_operation,
                        supported_schema_versions=frozenset({1}))
     registry.register("memory_extraction", handle_memory_extraction,

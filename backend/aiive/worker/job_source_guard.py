@@ -18,7 +18,7 @@ Phase A 提交后 Shield 立即生效，但旧 Outbox Job 的 payload 仍在内�
   - memory_vector_refresh / core_memory_refresh / memory_graph_refresh：memory_id
   - memory_markdown_project：memory_id 或 forget_operation_id（全量投影逐条过滤）
   - retrieval_index_refresh：source_type + source_id
-  - agent_task_run：task → thread / current_run / source_event
+  - agent_task_run / main_agent_task_terminal：task → thread / source_event
   - tool_operation：tool_operation_id → turn_record_id / thread_id
   - improvement_discovery：task_id / action_id
 """
@@ -416,6 +416,7 @@ _RESOLVERS = {
     "memory_conflict_question": _resolve_conflict_case,
     "memory_conflict_reply": _resolve_conflict_case,
     "agent_task_run": _resolve_task,
+    "main_agent_task_terminal": _resolve_task,
     "reminder_delivery": _resolve_reminder_task,
     "goal_trigger_decision": _resolve_task,
     "tool_operation": _resolve_tool_operation,

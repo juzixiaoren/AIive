@@ -6,6 +6,8 @@ from typing import Annotated, Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from aiive.config import WORKER_BUDGET_LIMITS, settings
+
 ReportNote = Annotated[str, Field(min_length=1, max_length=500)]
 
 
@@ -65,22 +67,58 @@ class ActionStatus(StrEnum):
 
 
 class TaskBudget(BaseModel):
-    """Optional execution limits. Omit/null/empty means no task-wide limits. Reports are metered separately."""
+    """新任务的 Worker 预算。省略预算、空对象或字段为 null 时使用服务器默认值。"""
 
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
-    max_runs: int | None = Field(default=None, ge=1, le=1000)
-    max_model_calls: int | None = Field(default=None, ge=1, le=5000)
-    max_actions: int | None = Field(default=None, ge=1, le=5000)
-    max_actions_per_run: int = Field(default=8, ge=1, le=100)
-    max_tool_failures: int | None = Field(default=None, ge=1, le=1000)
-    max_total_tokens: int | None = Field(default=None, ge=1000)
-    max_wall_time_seconds: int | None = Field(default=None, ge=1, le=31_536_000)
+    max_runs: int | None = Field(
+        default=settings.aiive_worker_default_max_runs, ge=1, le=WORKER_BUDGET_LIMITS["max_runs"],
+        description="任务累计执行 Run 上限。等待后恢复或拆批可能开启新 Run；仅成稿的 Run 不计。",
+    )
+    max_model_calls: int | None = Field(
+        default=settings.aiive_worker_default_max_model_calls, ge=1, le=WORKER_BUDGET_LIMITS["max_model_calls"],
+        description="任务累计 Worker 决策模型调用上限，包含能力发现与格式纠错调用，不含独立成稿。",
+    )
+    max_actions: int | None = Field(
+        default=settings.aiive_worker_default_max_actions, ge=1, le=WORKER_BUDGET_LIMITS["max_actions"],
+        description="任务累计创建的 Action 上限，含随后被拦截或进入审批的 Action；续跑可执行已创建的 Action。",
+    )
+    max_actions_per_run: int | None = Field(
+        default=settings.aiive_worker_default_max_actions_per_run, ge=1, le=WORKER_BUDGET_LIMITS["max_actions_per_run"],
+        description="单次 Run 的 Action 批大小上限；本轮能力发现也占一个批位置。任务总 Action 上限见 max_actions。",
+    )
+    max_tool_failures: int | None = Field(
+        default=settings.aiive_worker_default_max_tool_failures, ge=1, le=WORKER_BUDGET_LIMITS["max_tool_failures"],
+        description="累计工具执行失败次数上限；审批等待、取消、前置条件失效和执行结果未知不计入。",
+    )
+    max_total_tokens: int | None = Field(
+        default=settings.aiive_worker_default_max_total_tokens or max(
+            1000, min(2 * settings.aiive_llm_context_window, WORKER_BUDGET_LIMITS["max_total_tokens"]),
+        ), ge=1000, le=WORKER_BUDGET_LIMITS["max_total_tokens"],
+        description="Worker 决策模型累计输入加输出 Token 上限，含纠错；独立成稿单独计量。",
+    )
+    max_wall_time_seconds: int | None = Field(
+        default=settings.aiive_worker_default_max_wall_time_seconds, ge=1, le=WORKER_BUDGET_LIMITS["max_wall_time_seconds"],
+        description="从任务创建起经过的秒数上限，含排队、等待用户或审批时间；在 Worker 执行检查点生效。",
+    )
     max_cost_usd: float | None = Field(
         default=None, ge=0.01, le=1_000_000,
-        description="Worker decision model budget. Requires the operator to configure model token rates.",
+        description="Worker 决策模型的估算美元费用上限，须配置输入与输出 Token 单价；不含第三方工具及独立成稿的费用。省略时不设美元上限。",
     )
-    deadline_at: str | None = None
+    deadline_at: str | None = Field(
+        default=None, description="可选的 ISO 8601 绝对截止时间，无时区按 UTC；与经过秒数上限同时生效，省略时不设绝对截止时间。",
+    )
+
+    @classmethod
+    def for_new_task(cls, supplied: dict[str, Any] | None) -> "TaskBudget":
+        return cls.model_validate({key: value for key, value in (supplied or {}).items()
+                                   if value is not None or key not in cls.model_fields})
+
+    @classmethod
+    def from_stored(cls, stored: dict[str, Any] | None) -> "TaskBudget":
+        # Persisted budgets were validated at creation, including limits accepted by older versions.
+        values: dict[str, Any] = dict.fromkeys(cls.model_fields) | {"max_actions_per_run": 8} | (stored or {})
+        return cls.model_construct(**values)
 
 
 class TaskScopeModel(BaseModel):

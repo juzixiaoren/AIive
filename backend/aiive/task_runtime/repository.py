@@ -201,7 +201,7 @@ class TaskRepository:
         brief = TaskBrief.model_validate({**(task_brief or {}), "goal": goal})
         from aiive.runtime.attachment_access import validate_task_attachments
         authorized_attachments = validate_task_attachments(self.db, thread_id, brief.initial_input or {})
-        budget = TaskBudget.model_validate(budgets or {})
+        budget = TaskBudget.for_new_task(budgets)
         from aiive.task_runtime.router import select_executor_type
 
         task = AgentTask(
@@ -215,7 +215,7 @@ class TaskRepository:
             target_node_id=target_node_id,
             task_brief=brief.model_dump(mode="json"),
             task_state={"plan": [], "inputs": [], "last_decision": None},
-            budgets=budget.model_dump(mode="json", exclude_unset=True, exclude_none=True),
+            budgets=budget.model_dump(mode="json", exclude_none=True),
             usage={
                 "runs": 0,
                 "model_calls": 0,
@@ -276,6 +276,7 @@ class TaskRepository:
         from aiive.forget.concurrency import acquire_forget_shared_lock
         acquire_forget_shared_lock(self.db)
         ensure_transition("task", task.status, status)
+        entered_terminal = task.status != status and status in TERMINAL_TASK_STATES
         task.status = status
         task.version += 1
         task.updated_at = utcnow()
@@ -298,20 +299,29 @@ class TaskRepository:
                 event_payload or {"status": status},
                 visibility=visibility,
             )
-        if status in TERMINAL_TASK_STATES:
+        if entered_terminal:
             self._publish_terminal_event(task, status)
         return task
 
     def _publish_terminal_event(self, task: AgentTask, status: str) -> None:
-        """任务终态是长期目标可订阅的真实事件：与状态变更同事务投递。
+        """单独投递 Main Agent 事件，保留 Goal 订阅的原有语义。"""
+        from aiive.worker.job_types import MAIN_AGENT_TASK_TERMINAL
 
-        目标自身任务不发布（避免自激）；没有活跃目标时发布器直接丢弃。
-        发布失败不能影响任务终态落库，因此只记录告警。
-        """
+        # 用户主动取消已有同步确认，Forget 取消也无需唤醒 Main Agent。
+        if status != TaskStatus.CANCELLED.value:
+            self.db.add(OutboxJob(
+                operation_id=f"{MAIN_AGENT_TASK_TERMINAL}:{task.id}:{status}",
+                job_type=MAIN_AGENT_TASK_TERMINAL,
+                status="pending",
+                payload={"task_id": task.id, "thread_id": task.thread_id, "status": status},
+                max_retries=3,
+            ))
+            self.db.flush()
         try:
             from aiive.task_runtime.goal_events import publish_task_terminal_event
 
-            publish_task_terminal_event(self.db, task, status)
+            with self.db.begin_nested():
+                publish_task_terminal_event(self.db, task, status)
         except Exception:  # noqa: BLE001 - 事件投递失败不阻断任务终态
             logger.warning("任务终态事件投递失败: task_id=%s status=%s", task.id, status, exc_info=True)
 

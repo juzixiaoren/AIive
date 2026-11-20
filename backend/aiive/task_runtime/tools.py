@@ -127,7 +127,7 @@ class DelegateTaskTool(BaseTool):
                 "status": task.status,
                 "title": task.title,
                 "skill_id": selected_skill.skill_id if selected_skill else None,
-                "summary": "任务已进入持久执行队列；后续状态、审批和产物可在任务中心查看。",
+                "summary": "任务已进入持久执行队列；结束后对话会跟进，状态、审批和产物也可在任务中心查看。",
             }
         except Exception:
             db.rollback()
@@ -205,6 +205,8 @@ class GetTaskStatusTool(BaseTool):
         run_ctx = _require_context(ctx)
         db = SessionLocal()
         try:
+            from aiive.forget.concurrency import acquire_forget_shared_lock
+            acquire_forget_shared_lock(db)
             repo = TaskRepository(db)
             task = repo.get_task(task_id)
             if task is None or task.thread_id != run_ctx.thread_id:
@@ -219,10 +221,13 @@ class GetTaskStatusTool(BaseTool):
                     evidence, EvidenceStore.read, db, evidence_offset, TASK_DETAILS_PAGE_CHARS,
                 )}
             detail = repo.detail(task, include_events=False)
-            result = {
+            result: dict[str, Any] = {
                 "task_id": task.id,
                 "title": task.title,
+                "task_type": task.task_type,
                 "status": task.status,
+                "created_at": task.created_at.isoformat(),
+                "completed_at": task.completed_at.isoformat() if task.completed_at else None,
                 "usage": task.usage or {},
                 "budgets": task.budgets or {},
                 "artifact_count": len(detail["artifacts"]),
@@ -238,6 +243,13 @@ class GetTaskStatusTool(BaseTool):
                 "report": task.report,
                 "pending_approvals": approvals,
             }
+            if task.last_error:
+                details["last_error"] = task.last_error
+            request = {"goal": task.goal, "acceptance_criteria": (task.task_brief or {}).get("acceptance_criteria") or []}
+            if len(json.dumps(request, ensure_ascii=False)) > TASK_STATUS_INLINE_CHARS // 2:
+                details.update(request)
+            else:
+                result.update(request)
             inline = {**result, **details}
             if not details_cursor and len(json.dumps(inline, ensure_ascii=False)) <= TASK_STATUS_INLINE_CHARS:
                 return inline
@@ -411,8 +423,8 @@ def build_main_agent_registry() -> ToolRegistry:
     ))
     registry.register(_registration(
         "get_task_status",
-        "查询当前对话所属任务的状态、用量、报告和待审批项。详情较长时返回 details_page，"
-        + "按顺序读取 content（报告和待审批项的 JSON 文本）；用同一 task_id 和 next_cursor 续读。"
+        "查询当前对话任务的原始目标、验收标准、状态、预算、用量、报告和待审批项。详情较长时返回 details_page，"
+        + "按顺序读取 JSON 文本 content；长目标和验收标准也可能在分页中。用同一 task_id 和 next_cursor 续读。"
         + "如返回 task_details_changed，去掉游标重新查询。budget_exhausted 为 true 时，报告仅基于已完成的行动。"
         + "传报告中的 evidence_id 可读取原始证据文本，按 evidence.next_offset 续读。",
         {

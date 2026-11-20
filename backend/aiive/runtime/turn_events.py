@@ -1,14 +1,7 @@
-"""Turn 运行事件收件箱：在安全边界把运行事件注入当前 Agent 循环。
+"""Outbox 持久投递运行事件，Inbox 在工具调用配对后把事件作为 SystemMessage 交给 Turn。
 
-设计边界（复用优先，不新建事件总线 / Agent）：
-- 事件仍由既有 Outbox（goal_event_dispatch / goal_trigger_decision）可靠投递与重试；
-  本模块只保存"已投递、等待当前 Turn 处理"的事件视图，供 agent_graph 在
-  **工具批次完成之后、下一次 LLM 决策之前**读取；
-- 事件以 SystemMessage 注入，不伪装成用户消息，也不单独发起第二个 LLM Run；
-- 同一 dedupe_key 只落一行；已被本 Turn 处理的事件会让 Outbox 决策作业直接完成，
-  避免同一事件被决策两次；
-- Turn 中断/进程重启时，未处理事件保持 pending/injected/deferred，Outbox 作业在
-  租约失效后按原路径兜底处理。
+Goal 事件由现有决策流程兜底。任务终态可在空闲时入箱，重新领取前按 Turn 租约恢复，
+只有本 Turn 对应的状态读取回执和决策都成立时才随回复收口。
 """
 from __future__ import annotations
 
@@ -18,13 +11,15 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from aiive.db.models import Event, OutboxJob, SelfDevRequest, TurnEventInbox, TurnRecord
 from aiive.db.forget_models import ContentProvenanceRef
 from aiive.forget.durable_sources import collect_sources, persist_sources, references_visible, sources_visible
+from aiive.prompts import get_prompt_registry
 from aiive.task_runtime.read_repository import TaskReadRepository, inherit_sources
+from aiive.worker.job_types import MAIN_AGENT_TASK_TERMINAL
 
 logger = logging.getLogger(__name__)
 
@@ -340,6 +335,9 @@ def _inbox_visible(db: Session, row: TurnEventInbox) -> bool:
         return False
     data = row.payload or {}
     task_id = data.get("task_id")
+    if row.event_type == MAIN_AGENT_TASK_TERMINAL:
+        task = TaskReadRepository(db).get_task(task_id) if isinstance(task_id, str) else None
+        return task is not None and task.thread_id == row.thread_id and task.status == data.get("status")
     if task_id and (not isinstance(task_id, str) or TaskReadRepository(db).get_task(task_id) is None):
         return False
     return trigger_event_sources(db, str(data.get("trigger_event_id") or data.get("event_id") or ""),
@@ -359,8 +357,7 @@ def enqueue_turn_event(
 ) -> TurnEventInbox | None:
     """持久化一条待注入事件；重复 dedupe_key 或没有活跃 Turn 时返回 None。
 
-    调用方负责 commit，与触发事实保持同一事务。只有存在活跃前台 Turn 时才入箱：
-    没有 Turn 时由 Outbox 直接处理，不制造无主积压。
+    调用方负责 commit。默认只接收活跃 Turn 的事件，任务终态也可在空闲时预先入箱。
     """
     if not thread_id or not dedupe_key:
         return None
@@ -384,6 +381,7 @@ def enqueue_turn_event(
         oldest = db.query(TurnEventInbox).filter(
             TurnEventInbox.thread_id == thread_id,
             TurnEventInbox.status == STATUS_PENDING,
+            TurnEventInbox.event_type != MAIN_AGENT_TASK_TERMINAL,
         ).order_by(
             TurnEventInbox.created_at.asc(), TurnEventInbox.id.asc(),
         ).limit(need).all()
@@ -447,14 +445,23 @@ def claim_pending_events(
     turn_record_id: str,
     turn_id: str,
     limit: int = MAX_INJECT_PER_CALL,
+    task_terminal_only: bool = False,
+    include_task_terminal: bool = True,
 ) -> list[TurnEventInbox]:
     """按优先级领取待注入事件；领取后状态置 injected，重复调用不会重复注入。"""
     from aiive.forget.concurrency import acquire_forget_shared_lock
     acquire_forget_shared_lock(db)
-    rows = db.query(TurnEventInbox).filter(
+    query = db.query(TurnEventInbox).filter(
         TurnEventInbox.thread_id == thread_id,
         TurnEventInbox.status == STATUS_PENDING,
-    ).order_by(
+    )
+    if task_terminal_only:
+        query = query.filter(TurnEventInbox.event_type == MAIN_AGENT_TASK_TERMINAL)
+        if not include_task_terminal:
+            return []
+    elif not include_task_terminal:
+        query = query.filter(TurnEventInbox.event_type != MAIN_AGENT_TASK_TERMINAL)
+    rows = query.order_by(
         TurnEventInbox.priority.desc(),
         TurnEventInbox.created_at.asc(),
         TurnEventInbox.id.asc(),
@@ -478,6 +485,104 @@ def claim_pending_events(
         claimed.append(row)
     db.flush()
     return claimed
+
+
+def expire_orphaned_task_events(db: Session, thread_id: str) -> None:
+    """Release interrupted claims back to their Outbox jobs, including expired Turn leases."""
+    active_claim = db.query(TurnRecord.id).filter(
+        TurnRecord.id == TurnEventInbox.turn_record_id,
+        TurnRecord.status == "running",
+        TurnRecord.lease_expires_at > _now(),
+    ).exists()
+    db.query(TurnEventInbox).filter(
+        TurnEventInbox.thread_id == thread_id,
+        TurnEventInbox.event_type == MAIN_AGENT_TASK_TERMINAL,
+        TurnEventInbox.status == STATUS_INJECTED,
+        ~active_claim,
+    ).update({TurnEventInbox.status: STATUS_EXPIRED, TurnEventInbox.decision: "turn_interrupted"},
+             synchronize_session=False)
+
+
+def stage_task_terminal_event(
+    db: Session, thread_id: str, dedupe_key: str, payload: dict[str, Any],
+) -> TurnEventInbox | None:
+    """Called under the thread row lock, so concurrent Outbox claims share one Inbox row."""
+    row = db.query(TurnEventInbox).filter_by(dedupe_key=dedupe_key).populate_existing().one_or_none()
+    if row is None:
+        return enqueue_turn_event(
+            db, thread_id=thread_id, dedupe_key=dedupe_key, event_type=MAIN_AGENT_TASK_TERMINAL,
+            source="task_runtime", payload={"task_id": payload["task_id"], "status": payload["status"]},
+            only_if_active=False,
+        )
+    if row.status != STATUS_HANDLED and not _inbox_visible(db, row):
+        row.status = STATUS_EXPIRED
+        row.decision = "source_blocked"
+    elif row.status == STATUS_EXPIRED and row.decision != "source_blocked":
+        open_count = db.query(func.count(TurnEventInbox.id)).filter(
+            TurnEventInbox.thread_id == thread_id, TurnEventInbox.status.in_(OPEN_STATUSES),
+        ).scalar() or 0
+        if open_count < MAX_PENDING_PER_THREAD:
+            row.status = STATUS_PENDING
+            row.turn_record_id = row.turn_id = row.decision = None
+            row.injected_at = row.task_status_read_at = row.handled_at = None
+    return row
+
+
+def task_terminal_turn_live(db: Session, turn_record_id: str, execution_id: str) -> bool:
+    return db.query(TurnRecord.id).filter(
+        TurnRecord.id == turn_record_id, TurnRecord.execution_id == execution_id,
+        TurnRecord.status == "running", TurnRecord.lease_expires_at > _now(),
+    ).scalar() is not None
+
+
+def claimed_task_terminal_events(db: Session, turn_record_id: str, *, for_update: bool = False) -> list[TurnEventInbox]:
+    query = db.query(TurnEventInbox).filter_by(
+        turn_record_id=turn_record_id, event_type=MAIN_AGENT_TASK_TERMINAL, status=STATUS_INJECTED,
+    ).order_by(TurnEventInbox.created_at, TurnEventInbox.id)
+    if for_update:
+        query = query.with_for_update()
+    return query.all()
+
+
+def record_task_status_reads(db: Session, turn_record_id: str, statuses: dict[str, str]) -> None:
+    """Store proof only for the task and terminal status returned to this Turn."""
+    for row in claimed_task_terminal_events(db, turn_record_id, for_update=True):
+        data = row.payload or {}
+        task_id = str(data.get("task_id") or "")
+        if task_id in statuses and statuses[task_id] == data.get("status") and _inbox_visible(db, row):
+            row.task_status_read_at = _now()
+
+
+def finish_task_terminal_events(
+    db: Session, rows: list[TurnEventInbox], decisions: dict[str, str], *, has_reply: bool, wakeup: bool,
+) -> bool:
+    """Close validated observations atomically with the final reply. Return whether to show it."""
+    accepted: set[str] = set()
+    blocked: set[str] = set()
+    for row in rows:
+        decision = decisions.get(row.id)
+        if not _inbox_visible(db, row):
+            blocked.add(row.id)
+        elif row.task_status_read_at and decision and decision != "defer" and (has_reply or decision == "no_action"):
+            accepted.add(row.id)
+    # A wakeup has no independent user question to answer. If any observation is
+    # incomplete, discard the batch reply and let the respective Outbox jobs retry.
+    show_reply = bool(rows) and len(accepted) == len(rows)
+    if wakeup and not show_reply:
+        accepted.clear()
+    for row in rows:
+        if row.id in accepted:
+            row.status = STATUS_HANDLED
+            row.decision = decisions[row.id]
+            row.handled_at = _now()
+        else:
+            row.status = STATUS_EXPIRED
+            row.decision = (
+                "source_blocked" if row.id in blocked else
+                "task_status_unread" if not row.task_status_read_at else
+                "defer" if decisions.get(row.id) == "defer" else "task_review_incomplete"
+            )
+    return show_reply or not wakeup
 
 
 def inbox_state(db: Session, dedupe_key: str) -> str:
@@ -510,6 +615,7 @@ def set_decisions(db: Session, event_ids: list[str], decisions: dict[str, str]) 
     rows = db.query(TurnEventInbox).filter(
         TurnEventInbox.id.in_(event_ids),
         TurnEventInbox.status == STATUS_INJECTED,
+        TurnEventInbox.event_type != MAIN_AGENT_TASK_TERMINAL,
     ).all()
     for row in rows:
         decision = str(decisions.get(row.id, "") or "")
@@ -529,6 +635,7 @@ def mark_turn_handled(
     rows = db.query(TurnEventInbox).filter(
         TurnEventInbox.turn_record_id == turn_record_id,
         TurnEventInbox.status == STATUS_INJECTED,
+        TurnEventInbox.event_type != MAIN_AGENT_TASK_TERMINAL,
     ).all()
     moment = _now()
     for row in rows:
@@ -549,7 +656,24 @@ def claimed_rows_for_turn(db: Session, turn_record_id: str) -> list[TurnEventInb
     return db.query(TurnEventInbox).filter(
         TurnEventInbox.turn_record_id == turn_record_id,
         TurnEventInbox.status.in_((STATUS_INJECTED, STATUS_HANDLED)),
+        or_(TurnEventInbox.event_type != MAIN_AGENT_TASK_TERMINAL,
+            TurnEventInbox.status == STATUS_INJECTED),
     ).order_by(TurnEventInbox.created_at.asc()).all()
+
+
+def can_notify_for_event(db: Session, row: TurnEventInbox) -> bool:
+    if row.event_type != MAIN_AGENT_TASK_TERMINAL:
+        return True
+    turn = db.query(TurnRecord.id).filter(
+        TurnRecord.id == row.turn_record_id, TurnRecord.status == "running",
+        TurnRecord.lease_expires_at > _now(), TurnRecord.cancel_requested_at.is_(None),
+    ).with_for_update().scalar()
+    if turn is None:
+        return False
+    db.refresh(row)
+    return row.status == STATUS_INJECTED and row.turn_record_id == turn and (
+        row.task_status_read_at is not None and _inbox_visible(db, row)
+    )
 
 
 def mark_notified(
@@ -564,6 +688,8 @@ def mark_notified(
     ).all()
     moment = _now()
     for row in rows:
+        if row.event_type == MAIN_AGENT_TASK_TERMINAL and row.task_status_read_at is None:
+            continue
         row.status = STATUS_HANDLED
         row.decision = "notify"
         row.message_event_id = message_event_id
@@ -601,9 +727,13 @@ def build_internal_context(db: Session, rows: list[TurnEventInbox]) -> str:
     ]
     for index, row in enumerate(rows, start=1):
         payload = dict(row.payload or {})
-        task = _task_snapshot(db, str(payload.get("task_id") or ""))
         lines.append(f"事件 {index}（event_id={row.id}）")
         lines.append(f"- 类型: {row.event_type}")
+        if row.event_type == MAIN_AGENT_TASK_TERMINAL:
+            lines.append(f"- task_id: {payload['task_id']} · Worker 状态: {payload['status']}")
+            lines.append("- 本轮已取得状态结果。" if row.task_status_read_at else "- 本轮尚未取得状态结果，先调用 get_task_status。")
+            continue
+        task = _task_snapshot(db, str(payload.get("task_id") or ""))
         lines.append(f"- 来源: {row.source}")
         lines.append(f"- 优先级: {row.priority}")
         if payload.get("task_title") or task.get("title"):
@@ -629,16 +759,19 @@ def build_internal_context(db: Session, rows: list[TurnEventInbox]) -> str:
         lines.append(f"- 到达时间: {_iso(row.created_at) if row.created_at else ''}")
         lines.append("")
 
-    lines.extend([
-        "处理要求（必须明确选择一种，并在回复第一行给出标记，标记不会展示给用户）：",
-        "- 立即处理：直接调用所需工具；如同时需要提醒用户，调用 notify_user（同一批工具调用）。",
-        "- 延后：输出 [[EVENT_DECISION: defer]]，系统会在本 Turn 结束后交给原目标决策流程。",
-        "- 继续当前任务：输出 [[EVENT_DECISION: continue]]。",
-        "- 无需行动：输出 [[EVENT_DECISION: no_action]]。",
-        "notify_user 只用于向用户发送一条独立提醒，消息会写入聊天时间线；",
-        "不要把提醒内容混进原任务的最终答复，发完后继续完成原任务。",
-        "涉及取消、修改计划或审批时，只能使用现有工具与安全内核，不得绕过。",
-    ])
+    if any(row.event_type == MAIN_AGENT_TASK_TERMINAL for row in rows):
+        lines.append(get_prompt_registry().render("agent.task_terminal_review").content)
+    if any(row.event_type != MAIN_AGENT_TASK_TERMINAL for row in rows):
+        lines.extend([
+            "处理要求（必须明确选择一种，并在回复第一行给出标记，标记不会展示给用户）：",
+            "- 立即处理：直接调用所需工具；如同时需要提醒用户，调用 notify_user（同一批工具调用）。",
+            "- 延后：输出 [[EVENT_DECISION: defer]]，系统会在本 Turn 结束后交给原目标决策流程。",
+            "- 继续当前任务：输出 [[EVENT_DECISION: continue]]。",
+            "- 无需行动：输出 [[EVENT_DECISION: no_action]]。",
+            "notify_user 只用于向用户发送一条独立提醒，消息会写入聊天时间线；",
+            "不要把提醒内容混进原任务的最终答复，发完后继续完成原任务。",
+            "涉及取消、修改计划或审批时，只能使用现有工具与安全内核，不得绕过。",
+        ])
     return "\n".join(lines)
 
 

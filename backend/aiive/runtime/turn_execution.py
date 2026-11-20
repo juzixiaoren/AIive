@@ -72,7 +72,7 @@ from aiive.runtime.thread_lease import (
 from aiive.runtime.token_counter import LiteLLMTokenCounter
 from aiive.runtime.token_models import ModelProfile, TokenSafetyConfig
 from aiive.runtime.tool_normalizer import ToolResultNormalizer
-from aiive.runtime.turn_events import mark_turn_handled
+from aiive.runtime.turn_events import claimed_task_terminal_events, finish_task_terminal_events, mark_turn_handled
 from aiive.runtime.working_state import WorkingStateService
 
 from functools import lru_cache
@@ -259,6 +259,8 @@ class TurnExecutionService:
         message_source: str | MessageSource = MessageSource.USER,
         attachment_ids: list[str] | None = None,
         device_timezone: str | None = None,
+        *,
+        task_terminal_wakeup: bool = False,
     ):
         self._attachment_ids: list[str] = list(attachment_ids or [])
         from aiive.core.scheduling_time import user_timezone
@@ -269,6 +271,9 @@ class TurnExecutionService:
             if isinstance(message_source, MessageSource)
             else MessageSource(message_source)
         )
+        if task_terminal_wakeup and self._message_source is not MessageSource.RUNTIME_EVENT:
+            raise ValueError("task_terminal_wakeup_requires_runtime_event")
+        self._task_terminal_wakeup: bool = task_terminal_wakeup
         model = self._llm_client.default_model
         self._profile: ModelProfile = _shared_profile(model)
         self._safety: TokenSafetyConfig = _SHARED_SAFETY
@@ -1134,6 +1139,8 @@ class TurnExecutionService:
         ag_result: AgentGraphResult, heartbeat: TurnHeartbeat,
         assembled_ctx: AssembledContext | None = None,
         assistant_event_id: str | None = None,
+        *,
+        task_terminal_wakeup: bool = False,
     ) -> dict[str, Any]:
         if heartbeat.lease_lost:
             raise FencingViolationError("lease lost")
@@ -1148,12 +1155,18 @@ class TurnExecutionService:
 
         db = SessionLocal()
         try:
+            from aiive.forget.concurrency import acquire_forget_shared_lock
+            acquire_forget_shared_lock(db)
             # 取消与完成收口的竞态：取消信号已落库就必须走取消路径，
             # 不能把本轮标成 completed 或产生记忆抽取任务。
-            cancel_value = db.query(TurnRecord.cancel_requested_at).filter(
+            locked_turn = db.query(TurnRecord.cancel_requested_at, TurnRecord.lease_expires_at).filter(
                 TurnRecord.id == turn.id,
-            ).scalar()
-            if cancel_value is not None:
+                TurnRecord.execution_id == execution_id,
+                TurnRecord.status == "running",
+            ).with_for_update().one_or_none()
+            if locked_turn is None:
+                raise FencingViolationError("fencing violation")
+            if locked_turn.cancel_requested_at is not None:
                 raise TurnCancelled(
                     trace_id=ag_result.trace_id,
                     partial_reply=ag_result.reply,
@@ -1161,6 +1174,24 @@ class TurnExecutionService:
                 )
 
             now = datetime.now(timezone.utc)
+            task_events = claimed_task_terminal_events(db, turn.id)
+            if (task_terminal_wakeup or task_events) and (
+                locked_turn.lease_expires_at is None or _as_aware(locked_turn.lease_expires_at) <= now
+            ):
+                raise FencingViolationError("task terminal turn lease expired")
+            db.query(Thread).filter(Thread.id == turn.thread_id).update(
+                {Thread.last_activity_at: now}, synchronize_session=False,
+            )
+            event_decisions = {
+                str(item.get("event_id") or ""): str(item.get("decision") or "")
+                for item in ag_result.event_decisions
+            }
+            if not finish_task_terminal_events(
+                db, task_events, event_decisions, has_reply=bool(ag_result.reply.strip()),
+                wakeup=task_terminal_wakeup,
+            ):
+                ag_result.reply = ""
+            publish_reply = not task_terminal_wakeup or bool(ag_result.reply.strip())
             response_dict = ChatResponse(
                 reply=ag_result.reply,
                 event_id=assistant_event_id,
@@ -1180,6 +1211,8 @@ class TurnExecutionService:
                 ],
                 parse_errors=[],
             ).model_dump(mode="json", exclude_none=True)
+            if not publish_reply:
+                response_dict.pop("event_id")
 
             affected = db.query(TurnRecord).filter(
                 TurnRecord.id == turn.id,
@@ -1197,10 +1230,6 @@ class TurnExecutionService:
                 db.rollback()
                 raise FencingViolationError("fencing violation")
 
-            # 记录线程活动时间（Idle Scanner / 自动压缩链路依赖，见 Thread 模型注释）
-            db.query(Thread).filter(Thread.id == turn.thread_id).update(
-                {Thread.last_activity_at: now}, synchronize_session=False,
-            )
             # Events：pending_approval 工具不写入 tool_call/tool_result，等待审批后补充；
             # blocked 工具从未执行，也不写入（避免孤儿 tool_call 破坏历史配对），
             # 其事实由 llm_response 事件内的 tool_blocked action card 承载。
@@ -1224,12 +1253,13 @@ class TurnExecutionService:
                              event_type="tool_result", turn_id=turn.turn_id, turn_event_index=idx,
                              payload={"name": r.name, "result": r.result, "status": r.status, "tool_call_id": r.tool_call_id, "batch_index": r.batch_index}))
                 idx += 1
-            db.add(Event(id=assistant_event_id, trace_id=ag_result.trace_id, thread_id=turn.thread_id,
-                         event_type="llm_response", turn_id=turn.turn_id, turn_event_index=idx,
-                         payload={"content": ag_result.reply,
-                                  "action_cards": response_dict["action_cards"],
-                                  "pending_operations": response_dict["pending_operations"]}))
-            idx += 1
+            if publish_reply:
+                db.add(Event(id=assistant_event_id, trace_id=ag_result.trace_id, thread_id=turn.thread_id,
+                             event_type="llm_response", turn_id=turn.turn_id, turn_event_index=idx,
+                             payload={"content": ag_result.reply,
+                                      "action_cards": response_dict["action_cards"],
+                                      "pending_operations": response_dict["pending_operations"]}))
+                idx += 1
 
             for approval in ag_result.pending_approvals:
                 approval_id = str(approval.get("approval_id", "") or "")
@@ -1334,14 +1364,7 @@ class TurnExecutionService:
             # 事件收口：defer 留给 Outbox 稍后决策，其余标记 handled，
             # 避免同一事件在 Turn 结束后被决策作业二次调用模型。
             try:
-                mark_turn_handled(
-                    db,
-                    turn.id,
-                    {
-                        str(item.get("event_id") or ""): str(item.get("decision") or "")
-                        for item in ag_result.event_decisions
-                    },
-                )
+                mark_turn_handled(db, turn.id, event_decisions)
             except Exception:
                 # 收件箱收口失败不应阻断 Turn 提交；未收口事件由 Outbox 兜底。
                 logger.exception("Turn 事件收件箱收口失败: turn_id=%s", turn.turn_id)
@@ -1479,6 +1502,7 @@ class TurnExecutionService:
                 turn_record_id=turn.id,
                 execution_id=execution_id,
                 trace_id=trace_id,
+                task_terminal_wakeup=self._task_terminal_wakeup,
             )
             ctx_bundle = self._load_context(message, turn, exec_ctx)
 
@@ -1497,7 +1521,7 @@ class TurnExecutionService:
 
             # LLM 返回空回复且未执行任何工具 → 异常空响应，向用户明确提示，
             # 同时标记 turn 为 completed 避免阻塞后续消息。
-            if not ag_result.reply and not ag_result.tool_records:
+            if not self._task_terminal_wakeup and not ag_result.reply and not ag_result.tool_records:
                 logger.error(
                     "[TurnExecution] LLM 空响应（无回复且无工具调用）: "
                     + "trace_id=%s thread_id=%s message=%s",
@@ -1517,6 +1541,7 @@ class TurnExecutionService:
             assembled_ctx = ctx_bundle.assembled_ctx if ctx_bundle else None
             response = self._finalize_turn(
                 turn, execution_id, ag_result, heartbeat, assembled_ctx,
+                task_terminal_wakeup=self._task_terminal_wakeup,
             )
             return response
 

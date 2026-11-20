@@ -16,6 +16,7 @@ from aiive.context.run_context import RunContext
 from aiive.db.base import SessionLocal
 from aiive.runtime.proactive_message import ProactiveMessageService
 from aiive.runtime.turn_events import (
+    can_notify_for_event,
     claimed_rows_for_turn,
     mark_notified,
     parse_decision_marker,
@@ -60,6 +61,8 @@ class NotifyUserTool(BaseTool):
 
         db = SessionLocal()
         try:
+            from aiive.forget.concurrency import acquire_forget_shared_lock
+            acquire_forget_shared_lock(db)
             rows = claimed_rows_for_turn(db, ctx.turn_record_id)
             if not rows:
                 # 没有已注入事件时不允许主动插话，避免把普通回答拆成两条消息。
@@ -70,6 +73,8 @@ class NotifyUserTool(BaseTool):
                     raise ValueError("event_not_claimed_by_turn")
             else:
                 selected = rows
+            if any(not can_notify_for_event(db, row) for row in selected):
+                raise ValueError("read_task_status_before_notify")
             identity = ",".join(sorted(row.id for row in selected))
             digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
             dedupe_key = f"event_set:{digest}"

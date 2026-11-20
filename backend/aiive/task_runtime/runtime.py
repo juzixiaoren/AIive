@@ -78,7 +78,7 @@ class PersistentTaskRuntime:
         pending_report = None
         initial_budget_issue = None
         if candidate is not None and candidate.status == TaskStatus.QUEUED.value:
-            budget = TaskBudget.model_validate(candidate.budgets or {})
+            budget = TaskBudget.from_stored(candidate.budgets)
             pending_report = (candidate.task_state or {}).get("pending_report")
             if budget.max_runs is not None and int((candidate.usage or {}).get("runs", 0)) >= budget.max_runs:
                 initial_budget_issue = "run_budget_exhausted"
@@ -98,7 +98,7 @@ class PersistentTaskRuntime:
             return self._stop_for_budget(task, run, initial_budget_issue)
         self._ensure_isolation(task, run)
         self.db.commit()
-        budget = TaskBudget.model_validate(task.budgets or {})
+        budget = TaskBudget.from_stored(task.budgets)
 
         goals = GoalService(self.db) if GoalService.is_goal_task(task) else None
         if goals is not None and not goals.on_run_started(task, run):
@@ -119,7 +119,7 @@ class PersistentTaskRuntime:
         completed_this_run = 0
         last_model: str | None = None
         run_tokens: dict[str, int] = {}
-        while completed_this_run < budget.max_actions_per_run:
+        while completed_this_run < (budget.max_actions_per_run or 8):
             from aiive.worker.outbox_execution_auth import require_execution_authorization
             from aiive.worker.job_source_guard import task_sources_visible
 

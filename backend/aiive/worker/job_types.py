@@ -2,6 +2,7 @@
 from aiive.memory.recall_config import ENABLED_OUTBOX_JOB_TYPES as _LEGACY_TYPES
 
 AGENT_TASK_JOB_TYPES: frozenset[str] = frozenset({"agent_task_run"})
+MAIN_AGENT_TASK_TERMINAL = "main_agent_task_terminal"
 # 知识库维护：孤儿分块/失效文档/对象引用的幂等清理（复用 Outbox，不另建任务框架）
 KNOWLEDGE_JOB_TYPES: frozenset[str] = frozenset({"knowledge_maintenance"})
 # 自进化上游：从真实运行证据中发现改进候选（只生成候选，不改代码、不晋升）
@@ -18,4 +19,5 @@ ENABLED_OUTBOX_JOB_TYPES: frozenset[str] = (
     | KNOWLEDGE_JOB_TYPES
     | IMPROVEMENT_JOB_TYPES
     | GOAL_TRIGGER_JOB_TYPES
+    | {MAIN_AGENT_TASK_TERMINAL}
 )
