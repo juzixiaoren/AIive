@@ -23,7 +23,7 @@ from aiive.worker.outbox_execution_auth import with_execution_authorization
 
 logger = logging.getLogger(__name__)
 TOOL_OPERATION_JOB_TYPE = "tool_operation"
-_TERMINAL_STATUSES = frozenset({"committed", "failed", "cancelled"})
+_WAIT_FINISHED_STATUSES = frozenset({"committed", "failed", "cancelled", "execution_unknown"})
 _waiters_lock = threading.Lock()
 _waiters: dict[str, threading.Event] = {}
 
@@ -45,42 +45,17 @@ def _waiter(operation_id: str) -> threading.Event:
 
 
 def _notify(operation_id: str) -> None:
-    """唤醒等待者，并同步 WorkingState 与线程 WebSocket 的真实终态。"""
+    """提交后唤醒等待者并推送线程 WebSocket。"""
     with _waiters_lock:
         event = _waiters.pop(operation_id, None)
     if event is not None:
         event.set()
-    operation = _load_operation(operation_id)
-    if operation is None:
-        return
-    if operation.status in _TERMINAL_STATUSES:
-        db = SessionLocal()
-        try:
-            from aiive.runtime.working_state import WorkingStateService
-
-            working_state = WorkingStateService()
-            working_state.remove_uncommitted_side_effect(
-                db, operation.thread_id, operation.tool_call_id,
-            )
-            working_state.update_verified_tool_state(
-                db,
-                operation.thread_id,
-                operation.capability_id,
-                {
-                    "ok": operation.status == "committed",
-                    "tool_call_id": operation.tool_call_id,
-                    "operation_id": operation.id,
-                },
-            )
-            db.commit()
-        except Exception:
-            db.rollback()
-            logger.exception("同步工具 operation WorkingState 失败: operation_id=%s", operation_id)
-        finally:
-            db.close()
     try:
         from aiive.api.ws_manager import ws_manager
 
+        operation = _load_operation(operation_id)
+        if operation is None:
+            return
         ws_manager.broadcast_to_thread_sync(
             operation.thread_id,
             "tool_operation",
@@ -169,9 +144,9 @@ def wait_for_tool_operation(operation_id: str, timeout_seconds: float) -> dict[s
     event = _waiter(operation_id)
     try:
         operation = _load_operation(operation_id)
-        if operation is not None and operation.status not in _TERMINAL_STATUSES:
+        if operation is not None and operation.status not in _WAIT_FINISHED_STATUSES:
             deadline = time.monotonic() + max(0.0, timeout_seconds)
-            while operation is not None and operation.status not in _TERMINAL_STATUSES:
+            while operation is not None and operation.status not in _WAIT_FINISHED_STATUSES:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
@@ -210,14 +185,14 @@ def request_turn_cancellation(db: Session, turn_record_id: str, now: datetime) -
     operations = db.query(ToolOperation).filter(
         ToolOperation.turn_record_id == turn_record_id,
         ToolOperation.status.in_(["queued", "running"]),
-    ).with_for_update(skip_locked=True).all()
+    ).order_by(ToolOperation.id).with_for_update(skip_locked=True).all()
     for operation in operations:
         operation.cancel_requested_at = operation.cancel_requested_at or now
         if operation.status == "queued":
             operation.status = "cancelled"
             operation.completed_at = now
             operation.terminal_reason = "cancelled_before_start"
-            db.add(_build_terminal_event(operation, "cancelled"))
+            _stage_terminal_operation(db, operation)
 
 
 def operation_response(operation: ToolOperation) -> dict[str, Any]:
@@ -327,6 +302,8 @@ def handle_tool_operation(claimed: ClaimedJob) -> HandlerResult:
         ).with_for_update().one_or_none()
         if operation is None:
             return HandlerResult(HandlerOutcome.NON_RETRYABLE, "ToolOperation 不存在", terminal_reason="operation_missing")
+        if not _operation_target_visible(db, operation):
+            return HandlerResult(HandlerOutcome.COMPLETED, "tool_operation_source_blocked")
         if operation.status == "committed":
             return HandlerResult(HandlerOutcome.COMPLETED, "operation 已提交")
         if operation.status == "cancelled":
@@ -340,19 +317,21 @@ def handle_tool_operation(claimed: ClaimedJob) -> HandlerResult:
                 operation.status = "cancelled"
                 operation.completed_at = datetime.now(timezone.utc)
                 operation.terminal_reason = "cancelled_before_start"
-                db.add(_build_terminal_event(operation, "cancelled"))
+                _stage_terminal_operation(db, operation)
                 db.commit()
                 _notify(operation.id)
                 return HandlerResult(HandlerOutcome.COMPLETED, "cancelled before start")
         if operation.status in ("running", "execution_unknown") and operation.effect_mode in (
             "non_repeatable_external", "externally_reconcilable",
         ):
-            operation.status = "execution_unknown"
-            operation.execution_token = None
-            operation.terminal_reason = "external_outcome_requires_reconciliation"
-            operation.updated_at = datetime.now(timezone.utc)
-            db.commit()
-            _notify(operation.id)
+            if operation.status == "running":
+                operation.status = "execution_unknown"
+                operation.execution_token = None
+                operation.terminal_reason = "external_outcome_requires_reconciliation"
+                operation.updated_at = datetime.now(timezone.utc)
+                _stage_terminal_operation(db, operation)
+                db.commit()
+                _notify(operation.id)
             return HandlerResult(
                 HandlerOutcome.NON_RETRYABLE,
                 "不可重复外部操作的真实终态未知，需要人工核验",
@@ -449,7 +428,7 @@ def _execute_db_transactional(
         completed_at = datetime.now(timezone.utc)
         operation.completed_at = completed_at
         operation.updated_at = completed_at
-        db.add(_build_terminal_event(operation, "committed"))
+        _stage_terminal_operation(db, operation)
         db.commit()
         if needs_broadcast:
             _broadcast_pending_count_after_commit()
@@ -521,7 +500,7 @@ def _execute_external(
             completed_at = datetime.now(timezone.utc)
             operation.completed_at = completed_at
             operation.updated_at = completed_at
-            db.add(_build_terminal_event(operation, "committed"))
+            _stage_terminal_operation(db, operation)
             db.commit()
         finally:
             db.close()
@@ -546,6 +525,37 @@ def _broadcast_pending_count_after_commit() -> None:
         logger.exception("commit 后广播通知计数失败")
     finally:
         db.close()
+
+
+def _operation_target_visible(db: Session, operation: ToolOperation) -> bool:
+    from aiive.forget.visibility_service import ForgetVisibilityService
+
+    return not ForgetVisibilityService.blocked_target_ids(
+        db, "tool_operation", [(operation.id, operation.created_at)],
+    )
+
+
+def _stage_terminal_operation(db: Session, operation: ToolOperation) -> None:
+    """持有 ToolOperation 行锁，在同一事务中提交回执、事件与 WorkingState。"""
+    from aiive.forget.durable_sources import references_visible
+    from aiive.runtime.working_state import WorkingStateService
+
+    # Worker 持 Forget 执行授权，取消入口也在读取前获取共享锁。
+    # 外部工具交接授权期间可能发生 Forget，提交时再检查持久化来源。
+    if not _operation_target_visible(db, operation) or not references_visible(
+        db, {"turn_record": [operation.turn_record_id]},
+    ):
+        operation.result_payload = None
+        operation.effect_receipt = {}
+        operation.error_message = None
+        return
+
+    db.add(_build_terminal_event(operation, operation.status))
+    working = WorkingStateService()
+    if operation.status == "execution_unknown":
+        working.remove_running_tool(db, operation.thread_id, operation.tool_call_id)
+    else:
+        working.finish_tool_operation(db, operation)
 
 
 def _build_terminal_event(operation: ToolOperation, status: str) -> Event:
@@ -584,7 +594,7 @@ def _record_unknown(operation_id: str, execution_token: str, error: str) -> Hand
         operation.terminal_reason = "external_outcome_requires_reconciliation"
         operation.execution_token = None
         operation.updated_at = datetime.now(timezone.utc)
-        db.add(_build_terminal_event(operation, "execution_unknown"))
+        _stage_terminal_operation(db, operation)
         db.commit()
         _notify(operation_id)
         return HandlerResult(
@@ -610,7 +620,7 @@ def _record_cancelled(operation_id: str, execution_token: str) -> HandlerResult:
         operation.cancel_requested_at = operation.cancel_requested_at or now
         operation.completed_at = now
         operation.terminal_reason = "execution_cancelled"
-        db.add(_build_terminal_event(operation, "cancelled"))
+        _stage_terminal_operation(db, operation)
         db.commit()
     _notify(operation_id)
     return HandlerResult(HandlerOutcome.COMPLETED, "execution cancelled")
@@ -653,7 +663,7 @@ def _fail_operation(
     completed_at = datetime.now(timezone.utc)
     operation.completed_at = completed_at
     operation.updated_at = completed_at
-    db.add(_build_terminal_event(operation, "failed"))
+    _stage_terminal_operation(db, operation)
     db.commit()
     _notify(operation.id)
     return HandlerResult(HandlerOutcome.NON_RETRYABLE, error, terminal_reason=reason)

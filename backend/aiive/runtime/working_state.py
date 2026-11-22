@@ -13,9 +13,11 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy.orm import Session
+from sqlalchemy import tuple_
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.orm import Query, Session
 
-from aiive.db.models import TurnRecord, WorkingState
+from aiive.db.models import ToolOperation, TurnRecord, WorkingState
 
 logger = logging.getLogger(__name__)
 
@@ -25,23 +27,29 @@ MAX_LIST_ITEMS = 10
 class WorkingStateService:
     """WorkingState 的 CRUD 与生命周期管理。每次操作使用独立短事务。"""
 
-    def get_or_create(self, db: Session, thread_id: str, epoch_id: str = "") -> WorkingState:
-        ws = db.query(WorkingState).filter(WorkingState.thread_id == thread_id).first()
-        if ws is None:
-            ws = WorkingState(
-                thread_id=thread_id,
-                epoch_id=epoch_id or None,
-                open_loops=[],
-                active_constraints=[],
-                pending_approvals=[],
-                artifact_refs=[],
-                verified_tool_states=[],
-                uncommitted_side_effects=[],
-                running_tool_state=[],
-                version=1,
+    @staticmethod
+    def _row_for_update(db: Session, thread_id: str) -> Query[WorkingState]:
+        return db.query(WorkingState).filter_by(thread_id=thread_id).populate_existing().with_for_update()
+
+    def get_or_create(
+        self, db: Session, thread_id: str, epoch_id: str = "", *, for_update: bool = False,
+    ) -> WorkingState:
+        query = (
+            self._row_for_update(db, thread_id) if for_update
+            else db.query(WorkingState).filter_by(thread_id=thread_id)
+        )
+        ws = query.one_or_none()
+        if ws is not None:
+            return ws
+        if db.get_bind().dialect.name == "postgresql":
+            db.execute(
+                pg_insert(WorkingState).values(thread_id=thread_id, epoch_id=epoch_id or None)
+                .on_conflict_do_nothing(index_elements=[WorkingState.thread_id])
             )
-            db.add(ws)
-            db.flush()
+            return query.one()
+        ws = WorkingState(thread_id=thread_id, epoch_id=epoch_id or None)
+        db.add(ws)
+        db.flush()
         return ws
 
     # ── 确定性字段：由 Turn 生命周期维护 ──
@@ -52,7 +60,7 @@ class WorkingStateService:
         tool_call_id: str, name: str,
     ) -> None:
         """工具开始前：添加运行中工具记录。"""
-        ws = self.get_or_create(db, thread_id)
+        ws = self.get_or_create(db, thread_id, for_update=True)
         running = list(ws.running_tool_state or [])
         running.append({
             "turn_record_id": turn_record_id,
@@ -71,10 +79,17 @@ class WorkingStateService:
         self, db: Session, thread_id: str, tool_call_id: str,
     ) -> None:
         """工具完成或失败后：移除运行中工具记录。"""
-        ws = self.get_or_create(db, thread_id)
-        running = list(ws.running_tool_state or [])
-        running = [t for t in running if t.get("tool_call_id") != tool_call_id]
-        ws.running_tool_state = running
+        ws = self._row_for_update(db, thread_id).one_or_none()
+        if ws is None:
+            return
+        running = ws.running_tool_state or []
+        remaining = [
+            item for item in running
+            if not isinstance(item, dict) or item.get("tool_call_id") != tool_call_id
+        ]
+        if remaining == running:
+            return
+        ws.running_tool_state = remaining
         ws.version = (ws.version or 0) + 1
         ws.updated_at = datetime.now(timezone.utc)
 
@@ -86,26 +101,49 @@ class WorkingStateService:
         verified_tool_states 每条目保持 tool_name 去重语义，并将 tool_call_id
         提升为顶层字段（Phase 3 以 tool_call_id 作为稳定键），同时保留完整 state。
         """
-        ws = self.get_or_create(db, thread_id)
-        states = list(ws.verified_tool_states or [])
-        states = [s for s in states if s.get("tool_name") != tool_name]
+        ws = self.get_or_create(db, thread_id, for_update=True)
+        self._set_verified_tool_state(ws, tool_name, state)
+
+    @staticmethod
+    def _set_verified_tool_state(ws: WorkingState, tool_name: str, state: dict[str, Any]) -> None:
+        states = [
+            item for item in (ws.verified_tool_states or [])
+            if not isinstance(item, dict) or item.get("tool_name") != tool_name
+        ]
+        now = datetime.now(timezone.utc)
         states.append({
             "tool_name": tool_name,
             "tool_call_id": state.get("tool_call_id"),
             "state": state,
-            "verified_at": datetime.now(timezone.utc).isoformat(),
+            "verified_at": now.isoformat(),
         })
-        if len(states) > MAX_LIST_ITEMS:
-            states = states[-MAX_LIST_ITEMS:]
-        ws.verified_tool_states = states
+        ws.verified_tool_states = states[-MAX_LIST_ITEMS:]
         ws.version = (ws.version or 0) + 1
-        ws.updated_at = datetime.now(timezone.utc)
+        ws.updated_at = now
+
+    def finish_tool_operation(self, db: Session, operation: ToolOperation) -> None:
+        """Project a known outcome while the caller holds the ToolOperation row lock."""
+        ws = self.get_or_create(db, operation.thread_id, for_update=True)
+        call_id = operation.tool_call_id
+        ws.running_tool_state = [
+            item for item in (ws.running_tool_state or [])
+            if not isinstance(item, dict) or item.get("tool_call_id") != call_id
+        ]
+        ws.uncommitted_side_effects = [
+            item for item in (ws.uncommitted_side_effects or [])
+            if not isinstance(item, dict) or item.get("ref") != call_id
+        ]
+        self._set_verified_tool_state(ws, operation.capability_id, {
+            "ok": operation.status == "committed",
+            "tool_call_id": call_id,
+            "operation_id": operation.id,
+        })
 
     def add_uncommitted_side_effect(
         self, db: Session, thread_id: str, ref: str, description: str, risk: str,
     ) -> None:
         """副作用执行前：添加未提交副作用记录。"""
-        ws = self.get_or_create(db, thread_id)
+        ws = self.get_or_create(db, thread_id, for_update=True)
         effects = list(ws.uncommitted_side_effects or [])
         effects.append({"ref": ref, "description": description, "risk": risk})
         if len(effects) > MAX_LIST_ITEMS:
@@ -116,10 +154,14 @@ class WorkingStateService:
 
     def remove_uncommitted_side_effect(self, db: Session, thread_id: str, ref: str) -> None:
         """副作用提交/回滚后：移除记录。"""
-        ws = self.get_or_create(db, thread_id)
-        effects = list(ws.uncommitted_side_effects or [])
-        effects = [e for e in effects if e.get("ref") != ref]
-        ws.uncommitted_side_effects = effects
+        ws = self._row_for_update(db, thread_id).one_or_none()
+        if ws is None:
+            return
+        effects = ws.uncommitted_side_effects or []
+        remaining = [item for item in effects if not isinstance(item, dict) or item.get("ref") != ref]
+        if remaining == effects:
+            return
+        ws.uncommitted_side_effects = remaining
         ws.version = (ws.version or 0) + 1
         ws.updated_at = datetime.now(timezone.utc)
 
@@ -127,7 +169,7 @@ class WorkingStateService:
         self, db: Session, thread_id: str, ref: str, kind: str, description: str,
     ) -> None:
         """Artifact 持久化时：写入 artifact 引用。"""
-        ws = self.get_or_create(db, thread_id)
+        ws = self.get_or_create(db, thread_id, for_update=True)
         refs = list(ws.artifact_refs or [])
         refs.append({"ref": ref, "kind": kind, "description": description})
         if len(refs) > MAX_LIST_ITEMS:
@@ -140,7 +182,7 @@ class WorkingStateService:
         self, db: Session, thread_id: str, approval_id: str, action: str,
     ) -> None:
         """审批请求时：添加待审批记录。"""
-        ws = self.get_or_create(db, thread_id)
+        ws = self.get_or_create(db, thread_id, for_update=True)
         approvals = list(ws.pending_approvals or [])
         approvals.append({
             "id": approval_id, "action": action,
@@ -154,7 +196,7 @@ class WorkingStateService:
 
     def remove_pending_approval(self, db: Session, thread_id: str, approval_id: str) -> None:
         """审批处理后：移除记录。"""
-        ws = self.get_or_create(db, thread_id)
+        ws = self.get_or_create(db, thread_id, for_update=True)
         approvals = list(ws.pending_approvals or [])
         approvals = [a for a in approvals if a.get("id") != approval_id]
         ws.pending_approvals = approvals
@@ -163,32 +205,48 @@ class WorkingStateService:
 
     # ── 崩溃恢复 ──
 
+    @staticmethod
+    def unsettled_tool_calls(db: Session, calls: list[tuple[str, str]]) -> set[str]:
+        """Read durable statuses without taking ToolOperation row locks."""
+        return {
+            call_id for (call_id,) in db.query(ToolOperation.tool_call_id).filter(
+                tuple_(ToolOperation.turn_record_id, ToolOperation.tool_call_id).in_(calls),
+                ToolOperation.status.in_(["queued", "running", "execution_unknown"]),
+            )
+        }
+
     def recover_orphaned_tools(self, db: Session, thread_id: str) -> None:
         """清理崩溃残留的孤立运行状态。
 
         - running_tool_state：对应 TurnRecord 已非 running 的条目移除；
         - uncommitted_side_effects：ref 对应上述被移除的孤立运行条目
-          （即其 Turn 已达终态、正常清理路径未走到）的记录一并移除，
+          且无未决持久化操作的记录一并移除，
           否则崩溃残留会永久阻塞 Segment 密封（check_sealable 检查该字段）。
           正常 execution_unknown 挂起副作用（有终态 Turn 但确认流程仍在进行、
           且无对应 running 条目）不在此清理范围。
         """
-        ws = self.get_or_create(db, thread_id)
+        ws = self.get_or_create(db, thread_id, for_update=True)
         running = list(ws.running_tool_state or [])
-        stale: list[str] = []
+        stale: list[tuple[str, str]] = []
         for entry in running:
-            tr = db.get(TurnRecord, entry.get("turn_record_id", ""))
+            if not isinstance(entry, dict):
+                continue
+            turn_id = entry.get("turn_record_id", "")
+            tr = db.get(TurnRecord, turn_id)
             if tr is None or tr.status != "running":
-                stale.append(entry.get("tool_call_id", ""))
+                stale.append((turn_id, entry.get("tool_call_id", "")))
         if stale:
-            running = [t for t in running if t.get("tool_call_id") not in stale]
+            stale_calls = {call_id for _, call_id in stale}
+            running = [t for t in running if not isinstance(t, dict) or t.get("tool_call_id") not in stale_calls]
             ws.running_tool_state = running
             ws.version = (ws.version or 0) + 1
             ws.updated_at = datetime.now(timezone.utc)
             logger.info("已恢复 %d 个孤立运行工具 thread=%s", len(stale), thread_id)
 
             effects = list(ws.uncommitted_side_effects or [])
-            cleaned_effects = [e for e in effects if e.get("ref") not in stale]
+            # A durable operation can outlive its Turn.
+            stale_effects = stale_calls - self.unsettled_tool_calls(db, stale)
+            cleaned_effects = [e for e in effects if not isinstance(e, dict) or e.get("ref") not in stale_effects]
             if len(cleaned_effects) != len(effects):
                 ws.uncommitted_side_effects = cleaned_effects
                 logger.info(
@@ -203,7 +261,7 @@ class WorkingStateService:
         field: str, operation: str, payload: dict[str, Any],
         _source_turn_id: str, _idempotency_key: str,
     ) -> None:
-        ws = self.get_or_create(db, thread_id)
+        ws = self.get_or_create(db, thread_id, for_update=True)
         current = list(getattr(ws, field, None) or [])
         payload = {**payload, "source_turn_id": _source_turn_id}
         if operation == "add":
@@ -234,7 +292,7 @@ class WorkingStateService:
         Hidden items are omitted independently, retaining unrelated new items.
         """
         from aiive.db.forget_models import ContentProvenanceRef
-        from aiive.db.models import Artifact, Event, ToolOperation, ApprovalRequest
+        from aiive.db.models import Artifact, Event, ApprovalRequest
         from aiive.runtime.compaction import build_working_state_snapshot
         from aiive.worker.job_source_guard import JobSources, blocked_source_reason
         from aiive.worker.outbox_dto import ClaimedJob

@@ -195,7 +195,8 @@
 | `sleep_due` | `effective_last_accessed_at` | `(last_accessed_at OR observed_at OR created_at) <= now - cooling_days` 且 `lifecycle_state=active/sleeping` |
 
 - **时间到期记录不受 `updated_at` 旧 high-water 限制**：`expired_ephemeral` / `candidate_due` / `sleep_due` 三条 lane 以各自时间维为游标，**即便 `updated_at <= previous_cutoff` 也必须被处理**（典型场景：很久未更新但今天刚到 TTL 的 candidate、今天 `valid_to` 到期的 ephemeral、长期未访问但 importance 偏低需 sleeping 的 active）。`changed` lane 仍受 dirty 增量下界约束。
-- 每条 lane 有独立的 `(lane_cursor_time, lane_cursor_id)` 续跑游标，存于 `MemoryMaintenanceBatch`（见 E.3）。
+- 每条 lane 有独立的时间与 ID 游标。两项为空时没有下界，仅有时间时以 `time >= cursor_time` 开始，两项都有时严格按 `(time, id) > (cursor_time, cursor_id)` 续跑。
+- 新 Run 的 changed lane 从上一次成功 Run 的 `cutoff_updated_at` 开始，ID 初始为空。批次完成后推进到本批最后一条扫描记录，包含因 Forget 不可见而被跳过的记录。这些记录保留跳过审计且不会冻结为 Input。
 
 ## C.3 seed 与 neighbor（第 4 点）
 - Phase A 先按各 lane 的 dirty 下界选出 **seed** 记忆；再对每条 seed 扩展 `相同 canonical_key + scope_type + scope_id` 的 **neighbor**（用 `(canonical_key, scope_type, scope_id)` 复合索引）。seed 与 neighbor 都冻结进 `MemoryMaintenanceInput` 并标注 `input_role = seed | neighbor`。
@@ -213,14 +214,11 @@
 
 - Scheduler 每 3600s 跑 `_maintenance_scanner_job`（新）。
 - `last_successful_maintenance_at`：从 `MemoryMaintenanceRun` 中该 scope 最近 succeeded 的 `completed_at` 推导（避免新增状态表；可按 scope 建少量索引）。
-- Daily 条件：`last_successful_maintenance_at <= now-24h` AND 不存在 `pending/running` 的 `memory_maintenance` OutboxJob（同 scope）AND 存在 dirty candidate（用轻量 `EXISTS` 查询，不展开全量）。
-- Idle 条件：`threads.last_activity_at <= now - idle_threshold` AND 上次维护后存在 dirty memory（同样 EXISTS 轻量判定）AND 当前 idle window 未执行过（`operation_id` window_bucket 去重）。
-- `_has_dirty_memory` 的轻量 EXISTS 判定各 lane 现已具真实筛选意义：
-  - `changed` lane：`updated_at > last_successful_maintenance_at`（从未维护过则任何记录均视为 dirty）；`AccessTracker.touch` 不更新 `updated_at`，不会误触发。
-  - `sleep_due` lane：非 pinned 的 `active/sleeping` 记录且 `observed_at <= now - sleep_cooling_days`，未达冷却不触发，避免每日空转 Run。
-  - `expired_ephemeral` / `candidate_due` 仍按各自时间维游标判定。
-- `operation_id = memory_maintenance:all_user_memories:{policy_version}:{window_bucket}`（第 8 点，`maintenance_scope_key = all_user_memories`，**不使用 `scope_id=None` 字符串**）。`UNIQUE(operation_id)` 保证幂等；**`enqueue_maintenance_job` 在调用 `OutboxWorker.enqueue` 之前统一做 `EXISTS` 去重检查（worker 与 fallback 两条路径都走）**，因此生产态（`_outbox_worker` 已注册）同 window_bucket 不会因裸 `db.add` 触发 `UNIQUE` 冲突 `IntegrityError`。无 dirty memory 时不创建空 Run/Job。
-- v1 使用一个**全量**维护 Run（`maintenance_scope_key = all_user_memories`）。注意：Run 自身的 `scope_type` 是维护调度标识，**绝不等同于** `MemoryRecord.scope_type=global`（第 6/8 点）。该 Run 覆盖数据库中**所有** MemoryRecord（无论其自身 `scope_type`/`scope_id` 是 project/thread/...）。规划分组仍按每条记忆真实的 `canonical_key + scope_type + scope_id`（见 J 节）。
+- Daily 在距离上次成功完成达到配置间隔且有 dirty memory 时触发。Idle 在有空闲线程且有 dirty memory 时触发。
+- changed 的 dirty 下界为上次成功 Run 的 `cutoff_updated_at`，包含边界。其他三条 lane 各自按到期条件触发。无 dirty memory 时不创建自动 Job。
+- Daily 与 Idle 共用同一 UTC 日窗口，operation ID 为 `memory_maintenance:all_user_memories:{policy_version}:{YYYY-MM-DD}`。升级前当天的 `idle-YYYY-MM-DD` 键也视为已占用该窗口。
+- 同键的 pending/running 任务复用。completed/deadletter 保持原终态与审计，下一 UTC 日有新的键。不同键的入队共用全局在途检查，存在其他 pending/running 维护任务时跳过。PostgreSQL 用事务 advisory lock 串行化检查和插入，UNIQUE 竞争用 SAVEPOINT 恢复并复用胜出的键。
+- 手工工具用 `manual-{turn_record_id}` 作为独立窗口，缺少记录 ID 时用逻辑 Turn ID 或 trace ID。相同手工请求复用同一个 attempt，新手工请求用新的 Turn。每个 attempt 使用 Outbox 已有的 `max_retries=3`，旧死信保留。
 
 # E. MemoryMaintenanceRun（新增表）
 
@@ -248,7 +246,7 @@
 | started_at / completed_at / created_at / updated_at | DateTime | |
 
 **唯一约束**：`UNIQUE(outbox_job_id)`、`UNIQUE(operation_id)`。
-**接管语义**：同 Phase 3 —— 同一 OutboxJob 重试/重放复用同一 Run，`execution_token` 重新生成、`claim_count+1`；`failure_attempt_count` 仅真正失败重试时 +1（`CONTINUE` 不计）；Phase A 已提交的 `cursor_updated_at`/`cursor_id`/`cutoff_updated_at`/`MemoryMaintenanceInput` 全部不可变，新 Worker 直接续跑。
+**接管语义**：同 Phase 3 —— 同一 OutboxJob 重试/重放复用同一 Run，`execution_token` 重新生成、`claim_count+1`；`failure_attempt_count` 仅真正失败重试时 +1（`CONTINUE` 不计）；Phase A 已提交的 cutoff 与冻结 Input 在接管时保持原值。新 Worker 优先接管未完成 Batch，Run 游标在 Batch finalize 时推进。
 
 # E.2 MemoryMaintenanceInput（不可变维护输入，新增表）
 
@@ -284,7 +282,7 @@ Phase A 提交前冻结全部候选快照，使 Phase A 提交后崩溃、新 Wo
 | batch_no | int | Run 内批次序号（从 0 递增） |
 | candidate_lane | String(32) | 本批所属 lane：`changed` / `expired_ephemeral` / `candidate_due` / `sleep_due`（第 1 点） |
 | status | String(32) | frozen / planned / applying / done / deadletter（统一终态，禁止混用 `aborted+abort_reason`，见第 8 点） |
-| lane_cursor_time | DateTime nullable | 本批 lane 游标时间维（语义随 `candidate_lane`：`changed`→updated_at；`expired_ephemeral`→valid_to；`candidate_due`→candidate_deadline；`sleep_due`→effective_last_accessed_at） |
+| lane_cursor_time | DateTime nullable | 本批 lane 游标时间维（语义随 `candidate_lane`：`changed`→updated_at；`expired_ephemeral`→valid_to；`candidate_due`→created_at（由 TTL 计算到期阈值）；`sleep_due`→effective_last_accessed_at） |
 | lane_cursor_id | String(36) nullable | 本批 lane 游标 id 维（`(lane_cursor_time, lane_cursor_id)` 复合，消除单字符串歧义） |
 | cursor_start_time / cursor_start_id | DateTime / String(36) nullable | 本批 seed 游标起点（语义同上，随 lane） |
 | cursor_end_time / cursor_end_id | DateTime / String(36) nullable | 本批 seed 游标终点（推进后回填） |
@@ -588,3 +586,10 @@ Phase A 提交前冻结全部候选快照，使 Phase A 提交后崩溃、新 Wo
 4. **阈值缺省值（第 13 点）**：✅ 同意采用：candidate promotion confidence = 0.7、`candidate TTL = 30 days`、`importance sleep threshold = 0.3`、`normal cooling = 30 days`、`user_required cooling = 90 days`。**优先级例外（已确认）**：`user_required + retention_policy=ephemeral + valid_to` 到期 → 仍然 `archived`；90 天保护只适用于 `user_required + normal`，不能覆盖用户明确设置的临时有效期；`effective_pinned` 才是最高级保护。
 
 > 以上确认后进入实施（先 migration → 模型 → 服务 → handler → scheduler → 测试）。实施允许直接编码，无需再提交完整方案。
+
+
+## 调度与续跑回归
+
+`tests/integration/backend/test_phase4_scheduler_worker.py` 使用已注册的真实 OutboxWorker，覆盖自动窗口的四种任务状态、下一窗口、人工补跑、四条 Lane 的时间边界、同时间戳分页、Forget 可见性及 Worker 接管冻结 Batch。
+
+使用 `AIIVE_PG_TESTS=1` 运行 `tests/integration/pg/test_pg_maintenance_enqueue.py`，验证同窗和不同窗的并发入队，以及 UNIQUE 冲突后调用方事务仍可提交。

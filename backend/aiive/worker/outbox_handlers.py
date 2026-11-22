@@ -765,7 +765,9 @@ def _seed_lane_time(seed: Any, lane: str) -> Any:
     return None
 
 
-def _maintenance_lane_cursor(db: Session, run: MemoryMaintenanceRun, lane: str):
+def _maintenance_lane_cursor(
+    db: Session, run: MemoryMaintenanceRun, lane: str,
+) -> tuple[datetime | None, str | None]:
     """返回某 lane 的续跑游标 (cursor_time, cursor_id)。
 
     - changed lane 用 Run 级 `cursor_updated_at`/`cursor_id`；
@@ -1143,7 +1145,9 @@ def _resolve_maintenance_run(
             "operation_id": operation_id,
             "scope_type": "all_user_memories",
             "cutoff_updated_at": now,
+            # 新 Run 从上次快照上界（包含同时间戳）开始，批次完成后才推进 ID。
             "cursor_updated_at": prev_cutoff,
+            "cursor_id": None,
             "status": "running",
         },
         conflict_columns=["outbox_job_id"],

@@ -515,3 +515,45 @@ def test_run_shell_timeout_persists_partial_side_effect_receipt(
         assert terminal.payload["status"] == "failed"
     finally:
         db.close()
+
+
+
+def test_unknown_external_operation_replay_preserves_one_terminal_event(operation_session_factory):
+    """A Worker replay after uncertain delivery preserves the existing receipt and pending effect."""
+    from aiive.db.models import WorkingState
+    from aiive.runtime.working_state import WorkingStateService
+
+    context = _source_context(operation_session_factory)
+    registration = get_tool_registry().get("run_shell")
+    assert registration is not None
+    operation = enqueue_tool_operation(
+        "run_shell", {}, registration.safety.descriptor_hash, registration.safety.effect_mode,
+        context, "call-unknown",
+    )
+    working = WorkingStateService()
+    with operation_session_factory() as db:
+        db.get(ToolOperation, operation.id).status = "running"
+        working.add_running_tool(db, context.thread_id, context.turn_record_id, "exec", "call-unknown", "run_shell")
+        working.add_uncommitted_side_effect(db, context.thread_id, "call-unknown", "shell", "high")
+        db.commit()
+
+    worker = _worker()
+    assert worker.poll(max_jobs=1) == 1
+    with operation_session_factory() as db:
+        persisted = db.get(ToolOperation, operation.id)
+        ws = db.query(WorkingState).filter_by(thread_id=context.thread_id).one()
+        assert persisted.status == "execution_unknown"
+        assert ws.running_tool_state == ws.verified_tool_states == []
+        assert [item["ref"] for item in ws.uncommitted_side_effects] == ["call-unknown"]
+        version = ws.version
+        # Simulate another delivery after the operation committed its unknown outcome.
+        db.get(OutboxJob, operation.outbox_job_id).status = "pending"
+        db.commit()
+
+    assert worker.poll(max_jobs=1) == 1
+    with operation_session_factory() as db:
+        terminal = db.query(Event).filter_by(event_type="tool_operation_terminal").one()
+        assert terminal.payload["operation_id"] == operation.id
+        assert terminal.payload["status"] == "execution_unknown"
+        assert db.get(OutboxJob, operation.outbox_job_id).status == "deadletter"
+        assert db.query(WorkingState).filter_by(thread_id=context.thread_id).one().version == version

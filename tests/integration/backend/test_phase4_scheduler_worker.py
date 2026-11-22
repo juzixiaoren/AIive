@@ -24,9 +24,13 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from aiive.db.base import SessionLocal
+from aiive.db.forget_models import ContentProvenanceRef
+from aiive.forget.phase_a_shield import execute_phase_a_shield
 from aiive.db.models import (
     Event,
+    MemoryMaintenanceAction,
     MemoryMaintenanceBatch,
+    MemoryMaintenanceInput,
     MemoryMaintenanceRun,
     MemoryRecord,
     OutboxJob,
@@ -36,12 +40,15 @@ from aiive.memory.memory_types import LifecycleState
 from aiive.context.run_context import RunContext
 from aiive.tools.builtin_tools import RunMemoryMaintenanceTool as _handle_run_memory_maintenance
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome
-from aiive.worker.outbox_handlers import handle_memory_maintenance
+from aiive.worker.handler_registry import HandlerRegistry
+from aiive.worker.outbox_handlers import handle_memory_maintenance, register_all
+from aiive.worker.outbox_heartbeat import ActiveClaimRegistry
 from aiive.runtime.thread_state import ThreadState
 from aiive.worker.outbox_worker import OutboxWorker
 from aiive.worker.scheduler_daemon import (
     _maintenance_scanner_job,
     enqueue_maintenance_job,
+    set_outbox_worker,
 )
 from tests.support import ensure_running_claim
 
@@ -162,35 +169,65 @@ def test_scheduler_idempotent_operation_id(db):
     assert db.query(OutboxJob).filter(OutboxJob.operation_id == op).count() == 1
 
 
-def test_production_path_idempotent_with_worker(db):
-    """🔴 回归：生产态 _outbox_worker 已注册时，同 window_bucket 仍幂等，
-    不会因 OutboxWorker.enqueue 裸 db.add 触发 operation_id UNIQUE 冲突。
+@pytest.fixture
+def registered_worker(_scheduler_fallback):
+    registry = HandlerRegistry()
+    register_all(registry)
+    worker = OutboxWorker("maintenance-test", registry, ActiveClaimRegistry())
+    set_outbox_worker(worker)
+    return worker
 
-    复现原 bug：若去重检查被跳过，第二次 enqueue 会 db.add 同 operation_id，
-    commit 时抛 IntegrityError。
-    """
-    import aiive.worker.scheduler_daemon as sd
 
-    class _StubWorker:
-        def enqueue(self, db, job_type, payload, trace_id=None, operation_id=None):
-            if job_type != "memory_maintenance":
-                raise ValueError("not allowed")
-            db.add(OutboxJob(
-                operation_id=operation_id, job_type=job_type,
-                status="pending", payload=payload, max_retries=3,
-            ))
-            return None
+@pytest.mark.parametrize("status", ["pending", "running", "completed", "deadletter"])
+def test_production_path_idempotent_with_worker(db, registered_worker, status):
+    now = _now()
+    op_id = enqueue_maintenance_job(db, now=now)
+    assert enqueue_maintenance_job(db, now=now) == op_id
+    job = db.query(OutboxJob).filter_by(operation_id=op_id).one()
+    job.status = status
+    db.commit()
 
-    prev = sd._outbox_worker
-    sd._outbox_worker = _StubWorker()
-    try:
-        op1 = enqueue_maintenance_job(db, window_bucket="b-prod", now=_now())
-        op2 = enqueue_maintenance_job(db, window_bucket="b-prod", now=_now())
-        db.commit()
-    finally:
-        sd._outbox_worker = prev
-    assert op1 == op2
-    assert db.query(OutboxJob).filter(OutboxJob.operation_id == op1).count() == 1
+    assert enqueue_maintenance_job(db, now=now) == op_id
+    next_op = enqueue_maintenance_job(db, now=now + timedelta(days=1))
+    db.commit()
+    assert db.query(OutboxJob).filter_by(operation_id=op_id).one().status == status
+    if status in {"pending", "running"}:
+        assert next_op is None
+    else:
+        assert next_op and next_op != op_id
+        assert db.query(OutboxJob).filter_by(operation_id=next_op).one().status == "pending"
+
+
+def test_manual_attempt_has_own_audit_and_retry_budget(db, registered_worker):
+    now = _now()
+    base_id = enqueue_maintenance_job(db, now=now)
+    base = db.query(OutboxJob).filter_by(operation_id=base_id).one()
+    base.status = "deadletter"
+    base.retry_count = base.max_retries
+    base.terminal_at = now
+    db.commit()
+
+    run_manually = tool_method(_handle_run_memory_maintenance)
+    ctx = RunContext(thread_id="manual-thread", turn_id="manual-1",
+                     turn_record_id="manual-attempt-1", trace_id="manual-trace")
+    first = run_manually(db, ctx)
+    manual_id = first["maintenance_operation_id"]
+    assert first["enqueued"] and manual_id != base_id
+    assert manual_id.endswith(":manual-manual-attempt-1")
+    assert run_manually(db, ctx)["maintenance_operation_id"] == manual_id
+    manual = db.query(OutboxJob).filter_by(operation_id=manual_id).one()
+    assert manual.retry_count == 0
+    assert manual.max_retries == 3
+    manual.status = "deadletter"
+    db.commit()
+    assert run_manually(db, ctx)["maintenance_operation_id"] == manual_id
+    assert manual.status == "deadletter"
+    second = run_manually(db, RunContext(thread_id="manual-thread", turn_id="manual-2",
+                                       turn_record_id="manual-attempt-2", trace_id="manual-trace-2"))
+    assert second["enqueued"] and second["maintenance_operation_id"] not in (base_id, manual_id)
+    db.commit()
+    assert base.status == "deadletter" and base.retry_count == base.max_retries
+    assert base.terminal_at.replace(tzinfo=timezone.utc) == now
 
 
 def test_scheduler_operation_id_format(db):
@@ -199,8 +236,8 @@ def test_scheduler_operation_id_format(db):
     assert op == "memory_maintenance:all_user_memories:phase4.v1:2026-07-15"
 
 
-def test_scheduler_idle_triggers(db):
-    """#2 idle 线程 + 维护后 dirty → idle bucket enqueue。"""
+def test_scheduler_idle_triggers(db, registered_worker):
+    """#2 Daily 未到期时，Idle 也能创建当天的自动维护任务。"""
     now = _now()
     # 已有近期的 succeeded run，使 Daily 条件不满足（daily_due=False），逼出 idle 分支
     old_job = OutboxJob(
@@ -212,15 +249,53 @@ def test_scheduler_idle_triggers(db):
     db.add(MemoryMaintenanceRun(
         id=str(uuid.uuid4()), outbox_job_id=old_job.id,
         operation_id="old-run", scope_type="all_user_memories",
-        cutoff_updated_at=now, status="succeeded", completed_at=now,
+        cutoff_updated_at=now - timedelta(minutes=3), status="succeeded", completed_at=now,
     ))
-    _mk_record(db, lifecycle_state=LifecycleState.ACTIVE.value)
+    _mk_record(db, lifecycle_state=LifecycleState.ACTIVE.value, updated_at=now - timedelta(minutes=1))
     db.add(Thread(id="t1", last_activity_at=now - timedelta(seconds=1000)))
     db.commit()
     _maintenance_scanner_job()
     jobs = db.query(OutboxJob).filter(OutboxJob.job_type == "memory_maintenance").all()
-    # 既有 old-job 与新 idle bucket 各一条；idle 分支触发后应有含 idle- 前缀的 Job
-    assert any("idle-" in j.operation_id for j in jobs)
+    assert len(jobs) == 2
+    auto = next(job for job in jobs if job.operation_id != "old-job")
+    assert auto.operation_id.endswith(now.strftime("%Y-%m-%d"))
+    auto.status = "deadletter"
+    db.commit()
+    _maintenance_scanner_job()
+    assert db.query(OutboxJob).filter_by(job_type="memory_maintenance").count() == 2
+
+
+@pytest.mark.parametrize("daily_due", [True, False])
+def test_scanner_skips_when_manual_maintenance_is_running(db, registered_worker, daily_due):
+    now = _now()
+    if not daily_due:
+        old = OutboxJob(operation_id="prior", job_type="memory_maintenance", status="completed", payload={})
+        db.add(old)
+        db.flush()
+        db.add(MemoryMaintenanceRun(
+            outbox_job_id=old.id, operation_id=old.operation_id,
+            cutoff_updated_at=now - timedelta(minutes=1), status="succeeded", completed_at=now,
+        ))
+    _mk_record(db, lifecycle_state="active")
+    db.add(Thread(id="idle-thread", last_activity_at=now - timedelta(days=1)))
+    manual_id = enqueue_maintenance_job(db, window_bucket="manual-active", now=now)
+    manual = db.query(OutboxJob).filter_by(operation_id=manual_id).one()
+    manual.status = "running"
+    db.commit()
+
+    _maintenance_scanner_job()
+    assert db.query(OutboxJob).filter(OutboxJob.operation_id.like("memory_maintenance:%")).count() == 1
+
+
+def test_scanner_reuses_legacy_idle_daily_window(db, registered_worker):
+    now = _now()
+    legacy_id = enqueue_maintenance_job(db, window_bucket=f"idle-{now:%Y-%m-%d}", now=now)
+    db.query(OutboxJob).filter_by(operation_id=legacy_id).one().status = "deadletter"
+    _mk_record(db, lifecycle_state="active")
+    db.commit()
+
+    _maintenance_scanner_job()
+    assert db.query(OutboxJob).filter_by(job_type="memory_maintenance").one().operation_id == legacy_id
 
 
 def test_tool_run_memory_maintenance_enqueues(db):
@@ -491,3 +566,115 @@ def test_handler_continue_keeps_run_running(db, monkeypatch):
         assert run.status == "succeeded"
     finally:
         s.close()
+
+
+@pytest.mark.parametrize("lane", ["changed", "expired_ephemeral", "candidate_due", "sleep_due"])
+def test_handler_resumes_time_only_cursor_at_timestamp_boundary(db, registered_worker, monkeypatch, lane):
+    import aiive.memory.memory_maintenance_planner as planner
+    import aiive.memory.recall_config as rc
+
+    config = rc.MaintenanceConfig(max_maintenance_batch=1)
+    monkeypatch.setattr(rc, "MaintenanceConfig", lambda: config)
+    now = _now()
+    types = frozenset({"memory_maintenance"})
+    assert enqueue_maintenance_job(db, window_bucket="before-boundary")
+    db.commit()
+    assert registered_worker.poll(max_jobs=1, only_types=types) == 1
+    previous = db.query(MemoryMaintenanceRun).one()
+    assert previous.status == "succeeded"
+    assert (previous.cursor_updated_at, previous.cursor_id) == (None, None)
+
+    boundary = previous.cutoff_updated_at
+    if lane != "changed":
+        boundary = boundary - timedelta(days=90)
+    updated_at = previous.cutoff_updated_at if lane == "changed" else boundary - timedelta(days=1)
+    settings = {
+        "changed": {},
+        "expired_ephemeral": dict(lifecycle_state="active", retention_policy="ephemeral", valid_to=boundary),
+        "candidate_due": dict(created_at=boundary),
+        "sleep_due": dict(lifecycle_state="active", last_accessed_at=boundary),
+    }[lane]
+    ids = ["boundary-a", "boundary-b", "boundary-c"]
+    hidden_id = "boundary-ax"
+    for record_id in [*ids, hidden_id]:
+        _mk_record(db, id=record_id, canonical_key=record_id, **settings)
+    db.flush()
+    db.query(MemoryRecord).filter(MemoryRecord.id.in_([*ids, hidden_id])).update({"updated_at": updated_at})
+    source_ref = db.query(ContentProvenanceRef).filter_by(
+        owner_type="memory_record", owner_id=hidden_id, source_type="event",
+    ).one()
+    execute_phase_a_shield(db, mode="history_only", event_ids=[source_ref.source_id], reason="cursor regression")
+
+    op_id = enqueue_maintenance_job(db, window_bucket="after-boundary", now=now)
+    job = db.query(OutboxJob).filter_by(operation_id=op_id).one()
+
+    if lane != "changed":
+        # A persisted legacy Batch can have a time-only end cursor. The real
+        # handler recovers that cursor through _maintenance_lane_cursor.
+        run = MemoryMaintenanceRun(
+            outbox_job_id=job.id, operation_id=op_id, cutoff_updated_at=now + timedelta(seconds=1),
+            cursor_updated_at=previous.cutoff_updated_at, status="running",
+        )
+        db.add(run)
+        db.flush()
+        db.add(MemoryMaintenanceBatch(
+            run_id=run.id, batch_no=0, candidate_lane=lane, status="done", cursor_end_time=boundary,
+        ))
+    db.commit()
+
+    class WorkerInterrupted(BaseException):
+        pass
+
+    def stop_before_planning(*args, **kwargs):
+        raise WorkerInterrupted
+
+    with monkeypatch.context() as interrupted:
+        interrupted.setattr(planner, "plan_batch", stop_before_planning)
+        with pytest.raises(WorkerInterrupted):
+            registered_worker.poll(max_jobs=1, only_types=types)
+    db.expire_all()
+    run = db.query(MemoryMaintenanceRun).filter_by(outbox_job_id=job.id).one()
+    frozen = db.query(MemoryMaintenanceBatch).filter_by(run_id=run.id, status="frozen").one()
+    assert frozen.candidate_lane == lane
+    assert frozen.cursor_start_time == boundary
+    assert frozen.cursor_start_id is None
+    assert frozen.cursor_end_id == ids[0]
+    frozen_id = frozen.id
+    first_input = db.query(MemoryMaintenanceInput).filter_by(batch_id=frozen_id).one()
+    assert first_input.memory_record_id == ids[0]
+    first_input_id = first_input.id
+
+    job.lease_expires_at = now - timedelta(seconds=1)
+    db.commit()
+    assert registered_worker.poll(max_jobs=1, only_types=types) == 1
+    db.expire_all()
+    assert db.get(MemoryMaintenanceBatch, frozen_id).status == "done"
+    assert db.query(MemoryMaintenanceInput).filter_by(batch_id=frozen_id).one().id == first_input_id
+    assert job.status == "pending"
+
+    for _ in range(10):
+        if job.status == "completed":
+            break
+        assert registered_worker.poll(max_jobs=1, only_types=types) == 1
+        db.expire_all()
+    assert job.status == "completed"
+    assert job.retry_count == run.failure_attempt_count == 0
+    assert run.status == "succeeded"
+    batches = db.query(MemoryMaintenanceBatch).filter(
+        MemoryMaintenanceBatch.run_id == run.id,
+        MemoryMaintenanceBatch.candidate_lane == lane,
+        MemoryMaintenanceBatch.cursor_end_id.isnot(None),
+    ).order_by(MemoryMaintenanceBatch.batch_no).all()
+    scanned_ids = [ids[0], hidden_id, *ids[1:]]
+    assert [batch.cursor_end_id for batch in batches] == scanned_ids
+    assert [batch.cursor_start_id for batch in batches] == [None, *scanned_ids[:-1]]
+    skipped = db.query(MemoryMaintenanceAction).filter_by(
+        run_id=run.id, subject_memory_record_id=hidden_id, reason_code="forget_source_blocked",
+    ).one()
+    assert skipped.status == "skipped_stale"
+    seed_ids = [
+        row.memory_record_id
+        for batch in batches
+        for row in db.query(MemoryMaintenanceInput).filter_by(batch_id=batch.id, input_role="seed")
+    ]
+    assert seed_ids == ids

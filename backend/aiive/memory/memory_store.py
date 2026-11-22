@@ -272,7 +272,7 @@ class MemoryStore:
         - expired_ephemeral → valid_to（不受 updated_at 旧 high-water 限制）
         - candidate_due → created_at（派生 deadline，不受 updated_at 限制）
         - sleep_due → effective_last_accessed_at（不受 updated_at 限制）
-        `cursor_time`/`cursor_id` 为续跑游标（不含已处理记录）。
+        时间游标单独存在时包含边界时间，带 ID 时才排除已处理的键。
         """
         if lane not in _MAINTENANCE_LANES:
             raise ValueError(f"未知维护 lane: {lane}")
@@ -297,14 +297,7 @@ class MemoryStore:
                 ]),
                 MR.updated_at <= cutoff,
             )
-            if ctime is not None:
-                q = q.filter(
-                    or_(
-                        MR.updated_at > ctime,
-                        and_(MR.updated_at == ctime, MR.id > cursor_id),
-                    )
-                )
-            q = q.order_by(MR.updated_at.asc(), MR.id.asc())
+            time_column = MR.updated_at
 
         elif lane == "expired_ephemeral":
             q = q.filter(
@@ -316,14 +309,7 @@ class MemoryStore:
                 MR.valid_to.isnot(None),
                 MR.valid_to <= now_n,
             )
-            if ctime is not None:
-                q = q.filter(
-                    or_(
-                        MR.valid_to > ctime,
-                        and_(MR.valid_to == ctime, MR.id > cursor_id),
-                    )
-                )
-            q = q.order_by(MR.valid_to.asc(), MR.id.asc())
+            time_column = MR.valid_to
 
         elif lane == "candidate_due":
             deadline = now_n - timedelta(days=ttl_days)
@@ -331,16 +317,9 @@ class MemoryStore:
                 MR.lifecycle_state == LifecycleState.CANDIDATE.value,
                 MR.created_at <= deadline,
             )
-            if ctime is not None:
-                q = q.filter(
-                    or_(
-                        MR.created_at > ctime,
-                        and_(MR.created_at == ctime, MR.id > cursor_id),
-                    )
-                )
-            q = q.order_by(MR.created_at.asc(), MR.id.asc())
+            time_column = MR.created_at
 
-        elif lane == "sleep_due":
+        else:  # sleep_due
             # 有效访问时间回退：last_accessed_at → observed_at → created_at
             eff = func.coalesce(MR.last_accessed_at, MR.observed_at, MR.created_at)
             q = q.filter(
@@ -355,14 +334,14 @@ class MemoryStore:
             # 非 pinned 记录拉进 planner（planner 再用 cooling_days 过滤多数 no_op）。
             if cooling_days is not None:
                 q = q.filter(eff <= now_n - timedelta(days=cooling_days))
-            if ctime is not None:
-                q = q.filter(
-                    or_(
-                        eff > ctime,
-                        and_(eff == ctime, MR.id > cursor_id),
-                    )
-                )
-            q = q.order_by(eff.asc(), MR.id.asc())
+            time_column = eff
+
+        if ctime is not None:
+            if cursor_id is None:
+                q = q.filter(time_column >= ctime)
+            else:
+                q = q.filter(or_(time_column > ctime, and_(time_column == ctime, MR.id > cursor_id)))
+        q = q.order_by(time_column.asc(), MR.id.asc())
 
         # Filter before applying the caller's visible limit: a blocked first page
         # must not hide later valid seeds or stall the lane cursor.

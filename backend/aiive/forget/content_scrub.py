@@ -31,6 +31,7 @@ from aiive.db.models import (
     TaskArtifact,
     TaskEvidence,
     Thread,
+    ToolOperation,
 )
 from aiive.worker.outbox_payload_contract import (
     is_internal_job,
@@ -470,8 +471,29 @@ def scrub_summaries_and_checkpoints(db: Session, scope: ContentScope) -> dict[st
     return counts
 
 
-def scrub_runtime_tables(db: Session, scope: ContentScope) -> dict[str, int]:
-    counts: dict[str, int] = {}
+def scrub_tool_operations(db: Session, scope: ContentScope) -> int:
+    """Lock affected ToolOperations in stable order before touching dependent rows."""
+    count = 0
+    for chunk in _chunks(sorted(tool_operation_ids(db, scope))):
+        locked_ids = db.query(ToolOperation.id).filter(
+            ToolOperation.id.in_(chunk),
+        ).order_by(ToolOperation.id).with_for_update().all()
+        count += _execute_ids(
+            db,
+            "UPDATE tool_operations SET params = '{}', result_payload = NULL, "
+            "effect_receipt = '{}', error_message = NULL WHERE id IN :ids",
+            [row.id for row in locked_ids],
+        )
+    return count
+
+
+def scrub_runtime_tables(
+    db: Session, scope: ContentScope, *, scrubbed_tool_operations: int | None = None,
+) -> dict[str, int]:
+    count = scrubbed_tool_operations
+    if count is None:
+        count = scrub_tool_operations(db, scope)
+    counts = {"tool_operations": count} if count else {}
     working = working_state_ids(db, scope)
     if working:
         counts["working_states"] = _execute_ids(
@@ -517,14 +539,6 @@ def scrub_runtime_tables(db: Session, scope: ContentScope) -> dict[str, int]:
             db,
             "UPDATE attention_states SET focus_topic = NULL, recent_topics = '[]' WHERE id IN :ids",
             attention,
-        )
-    tool_ops = tool_operation_ids(db, scope)
-    if tool_ops:
-        counts["tool_operations"] = _execute_ids(
-            db,
-            "UPDATE tool_operations SET params = '{}', result_payload = NULL, "
-            "effect_receipt = '{}', error_message = NULL WHERE id IN :ids",
-            tool_ops,
         )
     approvals = approval_request_ids(db, scope)
     if approvals:
@@ -1840,12 +1854,16 @@ def scrub_objects_and_verify(
     return verify_scope(db, scope)
 
 
-def scrub_all(db: Session, scope: ContentScope) -> dict[str, int]:
+def scrub_all(
+    db: Session, scope: ContentScope, *, scrubbed_tool_operations: int | None = None,
+) -> dict[str, int]:
+    if scrubbed_tool_operations is None:
+        scrubbed_tool_operations = scrub_tool_operations(db, scope)
     counts: dict[str, int] = {}
     counts.update(scrub_raw_history(db, scope))
     counts.update(scrub_memory_derivations(db, scope))
     counts.update(scrub_summaries_and_checkpoints(db, scope))
-    counts.update(scrub_runtime_tables(db, scope))
+    counts.update(scrub_runtime_tables(db, scope, scrubbed_tool_operations=scrubbed_tool_operations))
     counts.update(scrub_auxiliary_tables(db, scope))
     task_counts, task_refs = scrub_task_runtime(db, scope)
     counts.update(task_counts)

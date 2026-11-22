@@ -316,3 +316,12 @@ Phase A 提交后由调用方 `resume_execution_authorization()` 重新获取（
 - 测试、调用时序、具体函数清单与验收限制见 [V62.6.1 验收报告](../audit/v6261_acceptance.md)。旧版本补记是当时实现记录，以本节为准。
 
 验收结果：默认全量 1716 passed / 118 skipped；PG 全目录 105 passed / 13 skipped（均为既有 live Embedding 用例）；Ruff、basedpyright、前端构建、Alembic upgrade/check 通过。Merge 与维护复制继承真实 Event 来源；来源被遗忘后新派生记录即时关闭。
+
+
+## ToolOperation 与 WorkingState 的事务顺序
+
+Purge 的宽层事务按 ToolOperation ID 顺序锁定并清理操作行，再清理 WorkingState 和其他来源行。持久化工具也先锁操作行，已知终态、终态 Event 和三个工具状态字段在同一事务提交。取消尚未执行的操作复用同一投影。未知结果移除运行中标记，未提交副作用保留到结果可确认。
+
+`_notify` 在提交后唤醒等待者并广播。Agent 等待结束后只清理自身运行标记与已确定的待提交条目，直接执行的工具由 Agent 写入 verified 状态。WorkingState 的读改写先锁行，清理已移除的标记是空操作。Agent 的 WorkingState 写入与 Worker 的终态投影复查 Forget 来源可见性，过期等待结果不会补回被清理的内容。
+
+使用 `AIIVE_PG_TESTS=1` 运行 `tests/integration/pg/test_pg_forget_tool_working_state.py`。测试通过 `pg_blocking_pids` 确认 Purge 已在等待另一个事务持有的操作行，在这个时点放行工具写入，随后验证两个事务均能提交、提交后的三个工作状态字段以及清理后迟到的通知与 Graph 收尾。

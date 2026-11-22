@@ -139,7 +139,8 @@ def build_action_cards(
                 },
                 trace_id=record.trace_id,
             ))
-        elif record.name == "run_memory_maintenance" and record.status == "completed" and record.result.get("ok"):
+        elif (record.name == "run_memory_maintenance" and record.status == "completed"
+              and record.result.get("ok") and inner_raw.get("maintenance_operation_id")):
             maintenance_operation_id = str(inner_raw.get("maintenance_operation_id", "") or "")
             pre_enqueue_scan = inner_raw.get("pre_enqueue_scan", {})
             cards.append(ActionCard(

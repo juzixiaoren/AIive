@@ -1484,12 +1484,10 @@ def handle_forget_purge(claimed: ClaimedJob) -> HandlerResult:
                 reason=f"scrubbed {len(targets)} targets, more pending",
             )
 
-        # event / turn_record 类型目标的正文 scrub（#16：mode=everywhere/history_only
-        # 时按 tombstone 的 source_event_id / source_turn_record_id 清除原文）
-        _scrub_event_turn_targets(db, operation_id)
-
-        # 范围化 scrub（含 Task Runtime / Knowledge / 对象引用登记）。
+        # 宽层事务先清理 ToolOperation，再写入运行时及来源记录。
         scrub_counts = _scrub_wide(db, operation_id)
+        # everywhere/history_only 按 tombstone 清除历史正文并登记物理清理状态。
+        _scrub_event_turn_targets(db, operation_id)
         _record_scrub_content_action(db, operation_id, scrub_counts)
         # 先提交数据库清理与 pending delete_object 动作：对象删除必须在提交之后，
         # 否则回滚会留下「数据库有引用但对象已删除」的不可逆状态。
@@ -1760,7 +1758,7 @@ def _scrub_wide(db: Session, operation_id: str) -> dict[str, int]:
     历史正文只由 _scrub_batch 按「独占来源 Event」处理，不在此扩大范围。
     """
     from aiive.forget.content_scope import load_scope
-    from aiive.forget.content_scrub import scrub_all
+    from aiive.forget.content_scrub import scrub_all, scrub_tool_operations
 
     op = db.query(ForgetOperation).filter_by(id=operation_id).first()
     if op is None:
@@ -1768,6 +1766,9 @@ def _scrub_wide(db: Session, operation_id: str) -> dict[str, int]:
     scope = load_scope(db, operation_id, op.mode)
     if scope is None:
         return {}
+
+    # 工具执行持有 ToolOperation 锁时还可能写 Memory / WorkingState。
+    scrubbed_tool_operations = scrub_tool_operations(db, scope)
 
     # 目标 memory 的窄层清理（记录/证据/提案/维护/图谱/检索）。幂等：Purge 已按
     # 批次处理过，这里保证直接调用 _scrub_wide（canonical_key/scope 等）也完整。
@@ -1798,7 +1799,7 @@ def _scrub_wide(db: Session, operation_id: str) -> dict[str, int]:
             _scrub_batch(db, extra[start:start + BATCH_SIZE], mode=op.mode)
         scope.memory_ids |= set(extra)
 
-    counts = scrub_all(db, scope)
+    counts = scrub_all(db, scope, scrubbed_tool_operations=scrubbed_tool_operations)
     db.flush()
     return counts
 

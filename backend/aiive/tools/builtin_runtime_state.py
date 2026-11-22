@@ -48,7 +48,7 @@ class UpdateWorkingStateTool(DatabaseTool):
         ctx = require_ctx(ctx, "update_working_state")
         payload = payload or {}
         ws_service = WorkingStateService()
-        ws = ws_service.get_or_create(db, ctx.thread_id)
+        ws = ws_service.get_or_create(db, ctx.thread_id, for_update=True)
 
         # 幂等：同一 idempotency_key 仅应用一次
         applied_keys = list(ws.applied_idempotency_keys or [])

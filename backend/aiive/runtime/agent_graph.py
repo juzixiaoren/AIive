@@ -111,17 +111,26 @@ def _tool_batch(message: AIMessage, messages: list[Any]) -> dict[str, Any]:
     }
 
 
-def _ws_commit(mutate: "Callable[[Session], None]") -> None:
+def _ws_commit(mutate: "Callable[[Session], None]", turn_record_id: str, operation_id: str = "") -> None:
     """WorkingState 写入：独立短事务。
 
     惰性导入 SessionLocal，使测试环境对 aiive.db.base.SessionLocal 的 monkeypatch
     能生效（避免直连 Postgres）。写入失败不阻断主流程，仅记录告警。
     """
     from aiive.db.base import SessionLocal
+    from aiive.forget.durable_sources import references_visible
+    from aiive.forget.source_policy import blocked_reference_ids
+    from aiive.worker.outbox_execution_auth import shared_execution_authorization
+
     db = SessionLocal()
     try:
-        mutate(db)
-        db.commit()
+        with shared_execution_authorization():
+            if turn_record_id and not references_visible(db, {"turn_record": [turn_record_id]}):
+                return
+            if operation_id and blocked_reference_ids(db, "tool_operation", {operation_id: None}):
+                return
+            mutate(db)
+            db.commit()
     except Exception:
         db.rollback()
         logger.exception("[TRACE:graph] WorkingState 写入失败（已回滚）")
@@ -841,7 +850,7 @@ class AgentGraph:
                                 description=str(tc.get("name", "") or ""),
                                 risk=reg.safety.risk_level,
                             )
-                _ws_commit(_register)
+                _ws_commit(_register, turn_record_id)
 
             try:
                 result = native_tool_node.invoke(state)
@@ -851,10 +860,13 @@ class AgentGraph:
                 if ws_service is not None and tc_list:
                     ws_b: WorkingStateService = ws_service
                     def _clean(db: Session) -> None:
-                        for tc in tc_list:
-                            ws_b.remove_running_tool(db, thread_id, str(tc.get("id", "") or ""))
-                            ws_b.remove_uncommitted_side_effect(db, thread_id, str(tc.get("id", "") or ""))
-                    _ws_commit(_clean)
+                        calls = [(turn_record_id, str(tc.get("id", "") or "")) for tc in tc_list]
+                        unsettled = ws_b.unsettled_tool_calls(db, calls)
+                        for _, call_id in calls:
+                            ws_b.remove_running_tool(db, thread_id, call_id)
+                            if call_id not in unsettled:
+                                ws_b.remove_uncommitted_side_effect(db, thread_id, call_id)
+                    _ws_commit(_clean, turn_record_id)
                 logger.exception("[TRACE:graph] TOOLS(ns): invoke FAILED")
                 raise
 
@@ -926,17 +938,22 @@ class AgentGraph:
                         _ref: Any = artifact_ref,
                         _err: Any = is_error,
                         _record_status: str = record_status,
+                        _operation_id: str = receipt.operation_id,
                     ) -> None:
-                        ws_c.remove_running_tool(db, thread_id, str(_tc.get("id", "") or ""))
+                        call_id = str(_tc.get("id", "") or "")
+                        tool_name = str(_tc.get("name", "") or "")
+                        # A replay may register new running/effect entries even
+                        # when the durable operation has already completed.
+                        ws_c.remove_running_tool(db, thread_id, call_id)
                         if _record_status != "execution_unknown":
-                            ws_c.remove_uncommitted_side_effect(db, thread_id, str(_tc.get("id", "") or ""))
-                            ws_c.update_verified_tool_state(
-                                db, thread_id, str(_tc.get("name", "") or ""),
-                                {"ok": not _err, "tool_call_id": str(_tc.get("id", "") or "")},
-                            )
+                            ws_c.remove_uncommitted_side_effect(db, thread_id, call_id)
+                            if not _operation_id:
+                                ws_c.update_verified_tool_state(
+                                    db, thread_id, tool_name, {"ok": not _err, "tool_call_id": call_id},
+                                )
                         if _ref:
                             ws_c.add_artifact_ref(db, thread_id, str(_ref), "tool_result", str(_tc.get("name", "") or ""))
-                    _ws_commit(_finalize)
+                    _ws_commit(_finalize, turn_record_id, receipt.operation_id)
 
             if task_status_reads and turn_record_id:
                 from aiive.forget.concurrency import acquire_forget_shared_lock

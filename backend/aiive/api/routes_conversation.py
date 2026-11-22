@@ -119,6 +119,9 @@ def interrupt_turn(
             "turn_record_id": turn.id,
         }
 
+    from aiive.forget.concurrency import acquire_forget_shared_lock
+
+    acquire_forget_shared_lock(db)
     now = datetime.now(UTC)
     affected = db.query(TurnRecord).filter(
         TurnRecord.id == turn.id,

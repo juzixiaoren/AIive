@@ -8,7 +8,8 @@ from typing import Any
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from aiive.db.base import SessionLocal
@@ -57,6 +58,8 @@ _MAX_SCAN_BATCH = 10
 # Phase 4: 维护调度
 _MAINTENANCE_SCAN_INTERVAL = 3600   # 秒：维护轮询周期（Daily 间隔同上）
 _MAINTENANCE_SCOPE_KEY = "all_user_memories"
+# PostgreSQL 事务锁，串行化本库所有维护入队窗口的在途检查和插入。
+_MAINTENANCE_ENQUEUE_LOCK = 0x4149564500000002
 # 知识库维护：有 DB 侧不一致时立即入队；否则保证每天至少一次对象级对账
 _KNOWLEDGE_MAINTENANCE_INTERVAL = 3600
 _KNOWLEDGE_MAINTENANCE_POLICY_VERSION = 1
@@ -520,46 +523,55 @@ def enqueue_maintenance_job(
     now: datetime | None = None,
     source_context: dict[str, str] | None = None,
 ) -> str | None:
-    """真正 enqueue 一个 `memory_maintenance` OutboxJob（确定性执行入口）。
-
-    operation_id = `memory_maintenance:all_user_memories:{policy_version}:{window_bucket}`
-    UNIQUE 保证幂等；window_bucket 用于 Daily/Idle 去重。
-    """
+    """复用同窗口的 Job，包括终态；已有别的窗口在途时跳过。"""
     cfg = MaintenanceConfig()
     now = now or datetime.now(timezone.utc)
     window_bucket = window_bucket or now.strftime("%Y-%m-%d")
-    op_id = (
-        f"memory_maintenance:{_MAINTENANCE_SCOPE_KEY}"
-        f":{cfg.policy_version}:{window_bucket}"
-    )
-    # 幂等去重：无论是否走 OutboxWorker，都先检查是否已存在同 operation_id 的待处理 Job。
-    # 生产态 _outbox_worker 已注册，若不前置此检查，OutboxWorker.enqueue 的裸 db.add
-    # 会在 commit 时触发 operation_id UNIQUE 冲突（IntegrityError），使 run_memory_maintenance 报错。
-    exists = db.query(OutboxJob).filter(
-        OutboxJob.operation_id == op_id,
-        OutboxJob.status.in_(["pending", "running"]),
-    ).count()
-    if exists > 0:
+    prefix = f"memory_maintenance:{_MAINTENANCE_SCOPE_KEY}:{cfg.policy_version}:"
+    op_id = prefix + window_bucket
+
+    if db.get_bind().dialect.name == "postgresql":
+        db.execute(text("SELECT pg_advisory_xact_lock(CAST(:key AS bigint))"),
+                   {"key": _MAINTENANCE_ENQUEUE_LOCK})
+
+    if db.query(OutboxJob.id).filter(OutboxJob.operation_id == op_id).first() is not None:
         return op_id
-    payload = {"schema_version": 1, "operation_id": op_id}
-    payload.update(source_context or {})
-    if _outbox_worker is not None:
-        try:
-            _outbox_worker.enqueue(
-                db, "memory_maintenance", payload,
-                trace_id=payload.get("trace_id") or None,
-                operation_id=op_id,
-            )
-        except ValueError:
-            logger.warning("maintenance enqueue 不在 allowlist，跳过")
-            return None
-    else:
-        db.add(OutboxJob(
-            operation_id=op_id, job_type="memory_maintenance",
-            status="pending", payload=payload,
-            trace_id=payload.get("trace_id") or None,
-            max_retries=3,
-        ))
+    # 接续升级前已使用旧 Idle 键的 UTC 窗口。
+    if window_bucket == now.strftime("%Y-%m-%d"):
+        legacy_id = prefix + f"idle-{window_bucket}"
+        if db.query(OutboxJob.id).filter(OutboxJob.operation_id == legacy_id).first() is not None:
+            return legacy_id
+    if db.query(OutboxJob.id).filter(
+        OutboxJob.job_type == "memory_maintenance",
+        OutboxJob.status.in_(["pending", "running"]),
+    ).first() is not None:
+        return None
+
+    payload = {**(source_context or {}), "schema_version": 1, "operation_id": op_id}
+    # SAVEPOINT 只回滚本次插入，保留调用方事务中的其他写入。
+    db.flush()
+    try:
+        with db.begin_nested():
+            if _outbox_worker is not None:
+                _outbox_worker.enqueue(
+                    db, "memory_maintenance", payload,
+                    trace_id=payload.get("trace_id") or None,
+                    operation_id=op_id,
+                )
+            else:
+                db.add(OutboxJob(
+                    operation_id=op_id, job_type="memory_maintenance",
+                    status="pending", payload=payload,
+                    trace_id=payload.get("trace_id") or None,
+                    max_retries=3,
+                ))
+            db.flush()
+    except ValueError:
+        logger.warning("maintenance enqueue 不在 allowlist，跳过")
+        return None
+    except IntegrityError:
+        if db.query(OutboxJob.id).filter(OutboxJob.operation_id == op_id).first() is None:
+            raise
     return op_id
 
 
@@ -905,20 +917,18 @@ def _knowledge_maintenance_scanner_job() -> None:
             db.close()
 
 
-def _has_dirty_memory(db: Session, cfg: MaintenanceConfig, now: datetime) -> bool:
+def _has_dirty_memory(
+    db: Session, cfg: MaintenanceConfig, now: datetime, last_cutoff: datetime | None,
+) -> bool:
     """轻量 EXISTS 判定：任一 lane 是否存在未处理候选（第 8 点）。
 
     不展开全量；任一 lane 命中即视为有 dirty memory。
     """
     MR = MemoryRecord
-    # changed lane：自上次成功维护以来有记录被更新（真正增量信号）。
-    # 从未维护过则任何记录都视为 dirty；AccessTracker.touch 不更新 updated_at，不会误触发。
-    last_maint = _last_successful_maintenance_at(db)
-    if last_maint is not None and last_maint.tzinfo is None:
-        last_maint = last_maint.replace(tzinfo=timezone.utc)
-    changed_filter: list[Any] = [MR.lifecycle_state.in_(["candidate", "active", "sleeping"])]  # type: ignore[assignment]
-    if last_maint is not None:
-        changed_filter.append(MR.updated_at > last_maint)
+    # 和 Handler 使用相同的增量起点，覆盖上次 Run 执行期间发生的更新。
+    changed_filter: list[Any] = [MR.lifecycle_state.in_(["candidate", "active", "sleeping"])]
+    if last_cutoff is not None:
+        changed_filter.append(MR.updated_at >= last_cutoff)
     if db.query(MR.id).filter(*changed_filter).limit(1).first() is not None:
         return True
     # expired_ephemeral
@@ -951,72 +961,41 @@ def _has_dirty_memory(db: Session, cfg: MaintenanceConfig, now: datetime) -> boo
     return False
 
 
-def _last_successful_maintenance_at(db: Session) -> datetime | None:
-    """最近一次 succeeded 的维护完成时间（第 8 点 due 判定用 completed_at）。"""
-    run = (
-        db.query(MemoryMaintenanceRun)
-        .filter(MemoryMaintenanceRun.status == "succeeded")
-        .order_by(MemoryMaintenanceRun.completed_at.desc())
-        .first()
-    )
-    return run.completed_at if run else None
-
-
 def _maintenance_scanner_job() -> None:
-    """周期扫描并触发记忆维护（Daily / Idle 双条件，第 8 点）。
-
-    - Daily：距上次成功维护超过 24h，且无在途 maintenance Job，且存在 dirty memory。
-    - Idle：存在空闲线程（last_activity_at 超阈值），上次维护后有 dirty memory，
-      且当前 idle window 尚未执行过（operation_id window_bucket 去重）。
-    - 无 dirty memory 不创建空 Run/Job（测试 #3）。
-    """
+    """Daily 和 Idle 扫描 dirty memory，共用同一 UTC 日的自动维护窗口。"""
     cfg = MaintenanceConfig()
     db = SessionLocal()
     try:
         now = datetime.now(timezone.utc)
-
-        has_dirty = _has_dirty_memory(db, cfg, now)
-        if not has_dirty:
+        last_run = (
+            db.query(MemoryMaintenanceRun)
+            .filter(MemoryMaintenanceRun.status == "succeeded")
+            .order_by(MemoryMaintenanceRun.completed_at.desc())
+            .first()
+        )
+        if not _has_dirty_memory(db, cfg, now, last_run.cutoff_updated_at if last_run else None):
             return
 
-        last_ok = _last_successful_maintenance_at(db)
-        # SQLite 读回的 datetime 为 naive，与 aware 的 `now` 比较前补齐 UTC，
-        # 避免 offset-naive/offset-aware 相减报错（与 maintenance_hashes/_parse_dt 一致）。
+        last_ok = last_run.completed_at if last_run else None
         if last_ok is not None and last_ok.tzinfo is None:
             last_ok = last_ok.replace(tzinfo=timezone.utc)
-        pending = db.query(OutboxJob).filter(
-            OutboxJob.job_type == "memory_maintenance",
-            OutboxJob.status.in_(["pending", "running"]),
-        ).count()
-
-        # Daily 条件
         daily_due = (
             last_ok is None
             or (now - last_ok).total_seconds() >= cfg.daily_interval_hours * 3600
         )
-        if daily_due and pending == 0:
-            enqueue_maintenance_job(db, window_bucket=now.strftime("%Y-%m-%d"), now=now)
-            db.commit()
-            return
+        if not daily_due:
+            cutoff = now - timedelta(seconds=cfg.idle_threshold_seconds)
+            if db.execute(
+                select(Thread.id).where(Thread.last_activity_at <= cutoff)
+            ).scalars().first() is None:
+                return
 
-        # Idle 条件：存在空闲线程 + idle window 未执行过
-        cutoff = now - timedelta(seconds=cfg.idle_threshold_seconds)
-        idle_threads = db.execute(
-            select(Thread.id).where(Thread.last_activity_at <= cutoff)
-        ).scalars().first()
-        if idle_threads is not None:
-            idle_bucket = f"idle-{now.strftime('%Y-%m-%d')}"
-            exists = db.query(OutboxJob).filter(
-                OutboxJob.operation_id.like(f"memory_maintenance:{_MAINTENANCE_SCOPE_KEY}:%:{idle_bucket}"),
-                OutboxJob.status.in_(["pending", "running"]),
-            ).count()
-            if exists == 0:
-                enqueue_maintenance_job(db, window_bucket=idle_bucket, now=now)
-                db.commit()
+        enqueue_maintenance_job(db, now=now)
+        db.commit()
     except Exception:
+        db.rollback()
         logger.exception("maintenance_scanner 异常")
     finally:
-        # 统一在 finally 关闭会话，异常路径不再泄漏连接
         db.close()
 
 

@@ -77,10 +77,11 @@ class RunMemoryMaintenanceTool(DatabaseTool):
 
         run_ctx = require_ctx(ctx, "run_memory_maintenance")
         scan = MemoryMaintenance(db).scan()
-        bucket_source = run_ctx.turn_record_id or run_ctx.turn_id or run_ctx.trace_id
+        # 一次显式请求使用一个稳定 attempt ID。换一轮发起补跑才会创建新任务。
+        attempt_id = run_ctx.turn_record_id or run_ctx.turn_id or run_ctx.trace_id
         maintenance_operation_id = enqueue_maintenance_job(
             db,
-            window_bucket=f"manual-{bucket_source}",
+            window_bucket=f"manual-{attempt_id}",
             source_context={
                 "thread_id": run_ctx.thread_id,
                 "turn_id": run_ctx.turn_id,

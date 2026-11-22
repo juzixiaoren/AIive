@@ -176,6 +176,11 @@ def test_tools_node_normalizes_and_maintains_working_state(patched, monkeypatch)
     db = patched
     tid = str(uuid.uuid4())
     turn_id = str(uuid.uuid4())
+    db.add(Thread(id=tid))
+    db.flush()
+    db.add(TurnRecord(id=turn_id, thread_id=tid, turn_id="tool-turn",
+                      request_fingerprint="test", status="running", source="user"))
+    db.commit()
     ws = WorkingStateService()
 
     graph = AgentGraph(FakeLLMClient(), db)
@@ -206,3 +211,85 @@ def test_tools_node_normalizes_and_maintains_working_state(patched, monkeypatch)
     assert ws_row.running_tool_state == []  # 调用后已移除
     assert any(s.get("tool_name") == "big_tool" for s in (ws_row.verified_tool_states or []))
     assert any(a.get("ref") == artifacts[0].ref for a in (ws_row.artifact_refs or []))
+
+
+@pytest.mark.parametrize("status", ["committed", "running"])
+def test_tools_node_keeps_worker_receipt_and_pending_effect(patched, monkeypatch, status):
+    """The graph can receive a durable receipt on replay or stop waiting before completion."""
+    import json
+    from types import SimpleNamespace
+
+    from langchain_core.messages import HumanMessage
+    from langchain_core.tools import StructuredTool
+
+    from aiive.db.models import OutboxJob, ToolOperation, WorkingState
+    from aiive.runtime.agent_graph import AgentGraph
+    from aiive.runtime.working_state import WorkingStateService
+    from aiive.tools.operation_executor import operation_response
+    from aiive.tools.registry import get_tool_registry
+
+    monkeypatch.setattr(
+        "aiive.runtime.agent_graph.check_tool_calls", lambda *args, **kwargs: SimpleNamespace(action="continue"),
+    )
+    db = patched
+    thread_id = str(uuid.uuid4())
+    turn_record_id = str(uuid.uuid4())
+    tool_name = "update_working_state"
+    call_id = "durable-call"
+    db.add(Thread(id=thread_id))
+    db.flush()
+    job = OutboxJob(operation_id="durable-tool-job", job_type="tool_operation",
+                    status="completed" if status == "committed" else "running")
+    db.add_all([
+        job,
+        TurnRecord(id=turn_record_id, thread_id=thread_id, turn_id="durable-turn",
+                   request_fingerprint="test", status="running", source="user"),
+    ])
+    db.flush()
+    operation = ToolOperation(
+        idempotency_key="durable-tool", thread_id=thread_id, turn_record_id=turn_record_id,
+        turn_id="durable-turn", tool_call_id=call_id, capability_id=tool_name, params={},
+        params_hash="hash", descriptor_hash="hash", status=status, effect_mode="db_transactional",
+        outbox_job_id=job.id, trace_id="durable-trace",
+    )
+    db.add(operation)
+    db.flush()
+    operation_id = operation.id
+    receipt = json.dumps(operation_response(operation))
+    ws_service = WorkingStateService()
+    if status == "committed":
+        ws_service.finish_tool_operation(db, operation)
+    db.commit()
+
+    def durable_tool(field: str) -> str:
+        assert field == "current_objective"
+        return receipt
+
+    tool = StructuredTool.from_function(func=durable_tool, name=tool_name, description="Return the durable receipt.")
+
+    class Assistant:
+        def invoke(self, messages):
+            if isinstance(messages[-1], HumanMessage):
+                return AIMessage(content="", tool_calls=[{"id": call_id, "name": tool_name, "args": {"field": "current_objective"}}])
+            return AIMessage(content="done")
+
+    graph = AgentGraph(FakeLLMClient(), db)
+    compiled, records, _ = graph._build_graph(
+        Assistant(), [tool], get_tool_registry(), ws_service=ws_service,
+        thread_id=thread_id, turn_record_id=turn_record_id, execution_id="durable-exec",
+    )
+    compiled.invoke({"messages": [HumanMessage(content="go")]})
+    assert [record["status"] for record in records] == [
+        "completed" if status == "committed" else "execution_unknown",
+    ]
+
+    ws = db.query(WorkingState).filter_by(thread_id=thread_id).one()
+    assert ws.running_tool_state == []
+    if status == "committed":
+        assert ws.uncommitted_side_effects == []
+        assert [item["state"] for item in ws.verified_tool_states] == [
+            {"ok": True, "tool_call_id": call_id, "operation_id": operation_id},
+        ]
+    else:
+        assert [item["ref"] for item in ws.uncommitted_side_effects] == [call_id]
+        assert ws.verified_tool_states == []

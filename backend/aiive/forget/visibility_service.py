@@ -576,7 +576,7 @@ class ForgetVisibilityService:
         """
         from aiive.db.models import (
             MemoryRecord, Event, SegmentSummary, EpochCheckpoint,
-            Segment, Epoch, TurnRecord,
+            Segment, Epoch, ToolOperation, TurnRecord,
         )
         if target_type in {"context_snapshot", "segment"}:
             model = ContextSnapshot if target_type == "context_snapshot" else Segment
@@ -612,10 +612,11 @@ class ForgetVisibilityService:
                  "scope_id": r[2], "canonical_key": r[3], "created_at": r[4]}
                 for r in rows
             ]
-        if target_type == "event":
+        if target_type in {"event", "tool_operation"}:
+            model = Event if target_type == "event" else ToolOperation
             rows = session.query(
-                Event.id, Event.thread_id, Event.created_at,
-            ).filter(Event.id.in_(ids)).all()
+                model.id, model.thread_id, model.created_at,
+            ).filter(model.id.in_(ids)).all()
             return [
                 {"id": r[0], "thread_id": r[1], "scope_type": None,
                  "scope_id": None, "canonical_key": None, "created_at": r[2]}
