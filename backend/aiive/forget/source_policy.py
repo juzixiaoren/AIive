@@ -4,6 +4,8 @@ This module has no Worker DTO dependency and performs no external side effects.
 """
 
 from __future__ import annotations
+from collections import defaultdict
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from sqlalchemy.orm import Session
@@ -47,17 +49,62 @@ class SourceReferences:
 def blocked_reference_ids(
     db: Session,
     target_type: str,
-    ids: dict[str, datetime | None],
+    ids: Mapping[str, datetime | None],
 ) -> set[str]:
     if not ids:
         return set()
-    meta = ForgetVisibilityService.load_target_meta(db, target_type, list(ids))
-    missing = set(ids) - {row["id"] for row in meta if row["created_at"] is not None}
-    return missing | ForgetVisibilityService.blocked_target_ids(
-        db,
-        target_type,
-        list(ids.items()),
+    return ForgetVisibilityService.blocked_target_ids(
+        db, target_type, list(ids.items()), require_resolved=True,
     )
+
+
+DURABLE_SOURCE_TYPES = frozenset({"event", "turn_record", "memory_record"})
+
+
+def turn_source_events(db: Session, tokens: Collection[str]) -> dict[str, dict[str, datetime]]:
+    """Resolve the same physical/logical Turn aliases for every input token."""
+    from aiive.db.models import Event, TurnRecord
+
+    if not tokens:
+        return {}
+    ids = set(tokens)
+    direct = db.query(Event.turn_id.label("token"), Event.id.label("event_id"), Event.created_at).filter(
+        Event.turn_id.in_(ids),
+    )
+    physical = db.query(TurnRecord.id.label("token"), Event.id.label("event_id"), Event.created_at).join(
+        Event, Event.turn_id == TurnRecord.turn_id,
+    ).filter(TurnRecord.id.in_(ids))
+    result: dict[str, dict[str, datetime]] = defaultdict(dict)
+    for row in direct.union_all(physical):
+        result[row.token][row.event_id] = row.created_at
+    return result
+
+
+def blocked_durable_references(
+    db: Session, grouped: Mapping[str, Collection[str]],
+) -> set[tuple[str, str]]:
+    """Return unsafe source keys, including a Turn whose source Event is unsafe."""
+    requested_events = set(grouped.get("event", ()))
+    turns = set(grouped.get("turn_record", ()))
+    try:
+        derived_events = turn_source_events(db, turns)
+        events = {identity: None for identity in requested_events | {
+            identity for rows in derived_events.values() for identity in rows
+        }}
+        blocked_events = blocked_reference_ids(db, "event", events)
+        blocked_turns = blocked_reference_ids(db, "turn_record", dict.fromkeys(turns))
+        blocked_turns.update(token for token, rows in derived_events.items() if blocked_events.intersection(rows))
+        blocked_memories = blocked_reference_ids(db, "memory_record", dict.fromkeys(grouped.get("memory_record", ())))
+        by_type = {"event": blocked_events, "turn_record": blocked_turns, "memory_record": blocked_memories}
+        return {
+            (kind, identity) for kind, ids in grouped.items() for identity in ids
+            if kind not in by_type or identity in by_type[kind]
+        }
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).exception("Durable source visibility lookup failed")
+        return {(kind, identity) for kind, ids in grouped.items() for identity in ids}
 
 
 def blocked_sources_reason(
@@ -69,23 +116,10 @@ def blocked_sources_reason(
     if sources.unresolved:
         return sources.unresolved
     if sources.turns:
-        from sqlalchemy import or_
-        from aiive.db.models import Event, TurnRecord
-
-        turns = (
-            db.query(TurnRecord)
-            .filter(
-                or_(
-                    TurnRecord.id.in_(sources.turns),
-                    TurnRecord.turn_id.in_(sources.turns),
-                )
-            )
-            .all()
-        )
-        tokens = set(sources.turns) | {turn.turn_id for turn in turns}
         events: dict[str, datetime | None] = {
-            row.id: row.created_at
-            for row in db.query(Event).filter(Event.turn_id.in_(tokens)).all()
+            identity: stamp
+            for rows in turn_source_events(db, sources.turns).values()
+            for identity, stamp in rows.items()
         }
         if blocked_reference_ids(db, "event", events):
             return "blocked:turn_source_event"

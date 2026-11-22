@@ -73,7 +73,7 @@ def ensure_read_committed(session: Session) -> None:
     info = session.info
     if info.get(_READ_COMMITTED_FLAG):
         return
-    isolation = session.execute(text("SHOW transaction_isolation")).scalar()
+    isolation = session.execute(text("SELECT current_setting('transaction_isolation')")).scalar()
     if str(isolation or "").strip().lower() != "read committed":
         raise RuntimeError(
             f"Forget/MemoryWrite 并发协议要求 READ COMMITTED，当前为 {isolation!r}，无法保证看到新提交的 Shield"

@@ -9,10 +9,11 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import or_, true
+from sqlalchemy import and_, or_, true, tuple_
 from sqlalchemy.orm import Session
 
 from aiive.db.forget_models import ContentProvenanceRef, ForgetOperation, ForgetShield, ForgetTombstone
@@ -167,6 +168,55 @@ class ForgetVisibilityService:
         return q.first() is not None
 
     @staticmethod
+    def blocked_thread_targets(
+        session: Session, targets: dict[str, tuple[str, datetime | None]],
+    ) -> set[str]:
+        """Batch equivalent of is_shielded(thread_id=..., target_time=...)."""
+        if not targets:
+            return set()
+        try:
+            shields = session.query(
+                ForgetShield.thread_id, ForgetShield.all_user_data, ForgetShield.selector_type,
+                ForgetShield.time_from, ForgetShield.time_to, ForgetShield.cutoff_created_at,
+            ).filter(
+                ForgetShield.status == "active",
+                or_(ForgetShield.thread_id.in_({thread for thread, _ in targets.values()}),
+                    ForgetShield.all_user_data.is_(True), ForgetShield.selector_type == "time_range"),
+            ).all()
+            by_thread: dict[str | None, list[Any]] = defaultdict(list)
+            global_shields = []
+            for shield in shields:
+                if shield.all_user_data or shield.selector_type == "time_range":
+                    global_shields.append(shield)
+                else:
+                    by_thread[shield.thread_id].append(shield)
+
+            normalize = ForgetVisibilityService._as_utc
+            blocked = set()
+            for key, (thread, stamp) in targets.items():
+                stamp = normalize(stamp)
+                if stamp is None:
+                    blocked.add(key)
+                    continue
+                for shield in (*global_shields, *by_thread[thread]):
+                    cutoff = normalize(shield.cutoff_created_at)
+                    if cutoff is None or stamp > cutoff:
+                        continue
+                    start, end = normalize(shield.time_from), normalize(shield.time_to)
+                    if (shield.all_user_data or shield.thread_id == thread
+                            or (shield.selector_type == "time_range"
+                                and (start is None or start <= stamp)
+                                and (end is None or stamp <= end))):
+                        blocked.add(key)
+                        break
+            return blocked
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception("Forget thread visibility lookup failed")
+            return set(targets)
+
+    @staticmethod
     def blocked_attachment_ids(session: Session, ids: list[str]) -> set[str]:
         """Batch Phase A check against the upload's own timestamp; raw history semantics."""
         from aiive.db.models import Attachment
@@ -215,6 +265,7 @@ class ForgetVisibilityService:
         include_tombstones: bool = True,
         _expand_provenance: bool = True,
         _ignore_memory_only: bool = False,
+        require_resolved: bool = False,
     ) -> set[str]:
         """统一读取边界；查询失败时整批关闭，禁止部分解析成功后放行。"""
         try:
@@ -223,6 +274,7 @@ class ForgetVisibilityService:
                 include_tombstones=include_tombstones,
                 _expand_provenance=_expand_provenance,
                 _ignore_memory_only=_ignore_memory_only,
+                require_resolved=require_resolved,
             )
         except Exception:
             import logging
@@ -239,6 +291,7 @@ class ForgetVisibilityService:
         include_tombstones: bool = True,
         _expand_provenance: bool = True,
         _ignore_memory_only: bool = False,
+        require_resolved: bool = False,
     ) -> set[str]:
         """批量返回被 Shield（实体级/选择器级/all_user_data）或 Tombstone 屏蔽的 ID。
 
@@ -277,142 +330,67 @@ class ForgetVisibilityService:
                 ))
             return q
 
-        blocked: set[str] = set()
-
-        # 0) 全局 all_user_data shield：屏蔽 cutoff 之前创建的数据；
-        #    创建时间未知 → fail-closed 屏蔽。
-        global_cutoffs = [
-            _as_utc(r[0]) for r in query(
-                ForgetShield.cutoff_created_at,
-            ).filter(
-                ForgetShield.status == "active",
-                ForgetShield.all_user_data.is_(True),
-            ).all()
-        ]
-        if global_cutoffs:
-            for tid in ids:
-                ct = _created(tid)
-                if ct is None or any(c is None or ct <= c for c in global_cutoffs):
-                    blocked.add(tid)
-
-        # 1) 实体级 Shield（target_type/target_id 直接命中，无 cutoff 语义）
-        shield_rows = (
-            query(ForgetShield.target_id)
-            .filter(
-                ForgetShield.status == "active",
-                ForgetShield.target_type == target_type,
-                ForgetShield.target_id.in_(ids),
-            )
-            .all()
+        blocked = (
+            set(ids) - {m["id"] for m in meta if m["created_at"] is not None}
+            if require_resolved else set()
         )
-        # target_id 列可空；None 不是有效目标，直接跳过（同时收窄为 str）
-        for row in shield_rows:
-            shield_target_id = row[0]
-            if shield_target_id is not None:
-                blocked.add(shield_target_id)
-
-        # 2) 选择器级 Shield（thread / scope / canonical_key / time_range），
-        #    统一比较目标 created_at <= shield.cutoff_created_at。
+        thread_ids = {m["thread_id"] for m in meta if m["thread_id"]}
+        scope_pairs = {(m["scope_type"], m["scope_id"]) for m in meta if m["scope_type"] and m["scope_id"]}
+        keys = {m["canonical_key"] for m in meta if m["canonical_key"]}
+        shield = ForgetShield
+        selectors = [
+            shield.all_user_data.is_(True),
+            and_(shield.target_type == target_type, shield.target_id.in_(ids)),
+        ]
         if meta:
-            def _within_cutoff(ct: datetime | None, cutoff: Any) -> bool:
-                cut = _as_utc(cutoff)
-                if cut is None:
-                    # 正常写入侧总有 cutoff；缺失时 fail-closed（视为覆盖）
-                    return True
-                if ct is None:
-                    return True  # 创建时间未知 → fail-closed
-                return ct <= cut
+            selectors.append(shield.selector_type == "time_range")
+        if thread_ids:
+            selectors.append(and_(shield.selector_type == "thread", shield.thread_id.in_(thread_ids)))
+        if scope_pairs:
+            selectors.append(and_(shield.selector_type == "scope", tuple_(shield.scope_type, shield.scope_id).in_(scope_pairs)))
+        if keys:
+            selectors.append(and_(shield.selector_type == "canonical_key", shield.canonical_key.in_(keys)))
+        shields = query(
+            shield.target_type, shield.target_id, shield.selector_type, shield.all_user_data,
+            shield.thread_id, shield.scope_type, shield.scope_id, shield.canonical_key,
+            shield.time_from, shield.time_to, shield.cutoff_created_at,
+        ).filter(shield.status == "active", or_(*selectors)).all()
 
-            thread_ids = {m["thread_id"] for m in meta if m["thread_id"]}
-            if thread_ids:
-                trows = query(
-                    ForgetShield.thread_id, ForgetShield.cutoff_created_at,
-                ).filter(
-                    ForgetShield.status == "active",
-                    ForgetShield.selector_type == "thread",
-                    ForgetShield.thread_id.in_(thread_ids),
-                ).all()
-                cutoffs_by_thread: dict[str, list[Any]] = {}
-                for tid, cut in trows:
-                    if tid is None:
-                        continue  # 选择器行的 thread_id 可空，空值不构成 shield
-                    cutoffs_by_thread.setdefault(tid, []).append(cut)
-                for m in meta:
-                    cuts = cutoffs_by_thread.get(m["thread_id"] or "")
-                    if not cuts:
-                        continue
-                    ct = _as_utc(m["created_at"])
-                    if any(_within_cutoff(ct, c) for c in cuts):
-                        blocked.add(m["id"])
+        global_cutoffs = []
+        by_thread: dict[str, list[datetime | None]] = defaultdict(list)
+        by_scope: dict[tuple[str, str], list[datetime | None]] = defaultdict(list)
+        by_key: dict[str, list[datetime | None]] = defaultdict(list)
+        time_ranges = []
+        id_set = set(ids)
+        for row in shields:
+            cut = _as_utc(row.cutoff_created_at)
+            if row.target_type == target_type and row.target_id in id_set:
+                blocked.add(row.target_id)
+            if row.all_user_data:
+                global_cutoffs.append(cut)
+            if row.selector_type == "thread" and row.thread_id in thread_ids:
+                by_thread[row.thread_id].append(cut)
+            elif row.selector_type == "scope" and (row.scope_type, row.scope_id) in scope_pairs:
+                by_scope[row.scope_type, row.scope_id].append(cut)
+            elif row.selector_type == "canonical_key" and row.canonical_key in keys:
+                by_key[row.canonical_key].append(cut)
+            elif row.selector_type == "time_range":
+                time_ranges.append((_as_utc(row.time_from), _as_utc(row.time_to), cut))
 
-            scope_pairs = {
-                (m["scope_type"], m["scope_id"])
-                for m in meta if m["scope_type"] and m["scope_id"]
-            }
-            if scope_pairs:
-                srows = query(
-                    ForgetShield.scope_type, ForgetShield.scope_id,
-                    ForgetShield.cutoff_created_at,
-                ).filter(
-                    ForgetShield.status == "active",
-                    ForgetShield.selector_type == "scope",
-                ).all()
-                cutoffs_by_scope: dict[tuple[Any, Any], list[Any]] = {}
-                for st, si, cut in srows:
-                    cutoffs_by_scope.setdefault((st, si), []).append(cut)
-                for m in meta:
-                    cuts = cutoffs_by_scope.get((m["scope_type"], m["scope_id"]))
-                    if not cuts:
-                        continue
-                    ct = _as_utc(m["created_at"])
-                    if any(_within_cutoff(ct, c) for c in cuts):
-                        blocked.add(m["id"])
+        def within_cutoff(ct: datetime | None, cutoffs: list[datetime | None]) -> bool:
+            return any(ct is None or cut is None or ct <= cut for cut in cutoffs)
 
-            cks = {m["canonical_key"] for m in meta if m["canonical_key"]}
-            if cks:
-                krows = query(
-                    ForgetShield.canonical_key, ForgetShield.cutoff_created_at,
-                ).filter(
-                    ForgetShield.status == "active",
-                    ForgetShield.selector_type == "canonical_key",
-                    ForgetShield.canonical_key.in_(cks),
-                ).all()
-                cutoffs_by_ck: dict[str, list[Any]] = {}
-                for ck, cut in krows:
-                    if ck is None:
-                        continue  # 选择器行的 canonical_key 可空，空值不构成 shield
-                    cutoffs_by_ck.setdefault(ck, []).append(cut)
-                for m in meta:
-                    cuts = cutoffs_by_ck.get(m["canonical_key"] or "")
-                    if not cuts:
-                        continue
-                    ct = _as_utc(m["created_at"])
-                    if any(_within_cutoff(ct, c) for c in cuts):
-                        blocked.add(m["id"])
-
-            time_shields = query(
-                ForgetShield.time_from, ForgetShield.time_to,
-                ForgetShield.cutoff_created_at,
-            ).filter(
-                ForgetShield.status == "active",
-                ForgetShield.selector_type == "time_range",
-            ).all()
-            if time_shields:
-                for m in meta:
-                    ct = _as_utc(m["created_at"])
-                    if ct is None:
-                        # 创建时间未知 → fail-closed
-                        blocked.add(m["id"])
-                        continue
-                    for tf, tt, cut in time_shields:
-                        tf_u, tt_u = _as_utc(tf), _as_utc(tt)
-                        if (
-                            (tf_u is None or ct >= tf_u)
-                            and (tt_u is None or ct <= tt_u)
-                            and _within_cutoff(ct, cut)
-                        ):
-                            blocked.add(m["id"])
-                            break
+        if global_cutoffs:
+            blocked.update(tid for tid in ids if within_cutoff(_created(tid), global_cutoffs))
+        for m in meta:
+            ct = _as_utc(m["created_at"])
+            if (within_cutoff(ct, by_thread.get(m["thread_id"], []))
+                    or within_cutoff(ct, by_scope.get((m["scope_type"], m["scope_id"]), []))
+                    or within_cutoff(ct, by_key.get(m["canonical_key"], []))
+                    or any(ct is None or ((start is None or start <= ct)
+                           and (end is None or ct <= end) and (cut is None or ct <= cut))
+                           for start, end, cut in time_ranges)):
+                blocked.add(m["id"])
 
         # 3) Tombstone block_visibility（防重抽判定时排除：Tombstone 的
         #    block_visibility 与 block_reingestion 是独立语义，不能把可见性
@@ -433,25 +411,23 @@ class ForgetVisibilityService:
         #   仅在 target_type == "event" 时做本扩展，故不会递归。
         if _expand_provenance and target_type in {"event", "turn_record"}:
             from aiive.db.models import Event, TurnRecord
+            ref = ContentProvenanceRef
             if target_type == "turn_record":
-                owners = {token: token for token in ids}
+                refs = session.query(ref.owner_id, ref.source_id).filter(ref.owner_id.in_(ids))
             else:
-                owners = {event.id: turn.id for event, turn in session.query(Event, TurnRecord).join(
-                    TurnRecord, (TurnRecord.thread_id == Event.thread_id) & (TurnRecord.turn_id == Event.turn_id)
-                ).filter(Event.id.in_(ids)).all()}
-            refs = session.query(ContentProvenanceRef).filter(
-                ContentProvenanceRef.owner_type == "attachment_context",
-                ContentProvenanceRef.owner_id.in_(set(owners.values())),
-                ContentProvenanceRef.source_type == "event",
+                refs = session.query(Event.id, ref.source_id).join(
+                    TurnRecord, (TurnRecord.thread_id == Event.thread_id) & (TurnRecord.turn_id == Event.turn_id),
+                ).join(ref, ref.owner_id == TurnRecord.id).filter(Event.id.in_(ids))
+            attachment_sources = refs.filter(
+                ref.owner_type == "attachment_context", ref.source_type == "event",
             ).all()
-            source_ids = {r.source_id for r in refs}
+            source_ids = {source_id for _, source_id in attachment_sources}
             if source_ids:
                 source_blocked = ForgetVisibilityService.blocked_target_ids(
                     session, "event", [(i, None) for i in source_ids],
                     include_tombstones=include_tombstones, _expand_provenance=False,
                     _ignore_memory_only=_ignore_memory_only)
-                blocked_owners = {r.owner_id for r in refs if r.source_id in source_blocked}
-                blocked.update(token for token, owner in owners.items() if owner in blocked_owners)
+                blocked.update(identity for identity, source_id in attachment_sources if source_id in source_blocked)
         if target_type == "memory_record" and _expand_provenance:
             blocked.update(ForgetVisibilityService._source_event_blocked_memory_ids(
                 session, ids, include_tombstones=include_tombstones,
@@ -504,19 +480,37 @@ class ForgetVisibilityService:
         """
         from aiive.db.models import Event, MemoryEvidence, MemoryProposal, MemoryRecord
 
-        records = session.query(MemoryRecord).filter(MemoryRecord.id.in_(memory_ids)).all()
-        refs = session.query(ContentProvenanceRef).filter(
+        # Older rows may contain dangling Evidence without a durable reference.
+        has_missing_evidence = session.query(MemoryEvidence.memory_id).outerjoin(
+            Event, Event.id == MemoryEvidence.source_event_id,
+        ).filter(
+            MemoryEvidence.memory_id == MemoryRecord.id,
+            MemoryEvidence.source_event_id.is_not(None),
+            Event.id.is_(None),
+        ).correlate(MemoryRecord).exists()
+        records = session.query(
+            MemoryRecord.id, MemoryRecord.source_event_id, has_missing_evidence.label("missing_evidence"),
+        ).filter(MemoryRecord.id.in_(memory_ids)).all()
+        refs = session.query(
+            ContentProvenanceRef.owner_id, ContentProvenanceRef.source_type, ContentProvenanceRef.source_id,
+        ).filter(
             ContentProvenanceRef.owner_type == "memory_record",
             ContentProvenanceRef.owner_id.in_(memory_ids),
         ).all()
         by_memory: dict[str, set[str]] = {r.id: set() for r in records}
         blocked = set(memory_ids) - set(by_memory)
         for ref in refs:
+            if ref.owner_id not in by_memory:
+                continue
             if ref.source_type != "event" or not ref.source_id.strip():
                 blocked.add(ref.owner_id)
             else:
                 by_memory[ref.owner_id].add(ref.source_id)
-        proposals = session.query(MemoryProposal).filter(
+        proposals = session.query(
+            MemoryProposal.final_memory_id, MemoryProposal.source_event_ids, MemoryProposal.evidence,
+            MemoryProposal.extractor_name, MemoryProposal.execution_mode, MemoryProposal.source_turn_id,
+            MemoryProposal.source_turn_record_id, MemoryProposal.final_operation,
+        ).filter(
             MemoryProposal.final_memory_id.in_(memory_ids),
         ).all()
         proposals_by_memory: dict[str, list[Any]] = {}
@@ -524,7 +518,7 @@ class ForgetVisibilityService:
             proposals_by_memory.setdefault(proposal.final_memory_id or "", []).append(proposal)
         for record in records:
             sources = by_memory[record.id]
-            if record.source_event_id and record.source_event_id not in sources:
+            if record.missing_evidence or (record.source_event_id and record.source_event_id not in sources):
                 blocked.add(record.id)
             proofs = proposals_by_memory.get(record.id, [])
             for proof in proofs:
@@ -536,7 +530,11 @@ class ForgetVisibilityService:
                     elif set(declared) - sources:
                         blocked.add(record.id)
                 if evidence is not None:
-                    if not isinstance(evidence, list) or any(not isinstance(e, dict) for e in evidence):
+                    if not isinstance(evidence, list) or any(
+                        not isinstance(e, dict)
+                        or (e.get("source_event_id") and not isinstance(e["source_event_id"], str))
+                        for e in evidence
+                    ):
                         blocked.add(record.id)
                     elif any(e.get("source_event_id") and e["source_event_id"] not in sources for e in evidence):
                         blocked.add(record.id)
@@ -551,18 +549,11 @@ class ForgetVisibilityService:
                 ):
                     blocked.add(record.id)
         event_ids = set().union(*by_memory.values()) if by_memory else set()
-        # Older rows can have dangling Evidence even when the durable reference was never copied.
-        blocked.update(row[0] for row in session.query(MemoryEvidence.memory_id).outerjoin(
-            Event, Event.id == MemoryEvidence.source_event_id,
-        ).filter(MemoryEvidence.memory_id.in_(memory_ids), MemoryEvidence.source_event_id.is_not(None),
-                 Event.id.is_(None)).distinct().all())
-        events = session.query(Event.id, Event.created_at).filter(Event.id.in_(event_ids)).all() if event_ids else []
-        unsafe = event_ids - {row[0] for row in events if ForgetVisibilityService._as_utc(row[1]) is not None}
-        unsafe.update(ForgetVisibilityService.blocked_target_ids(
-            session, "event", [(row[0], row[1]) for row in events],
+        unsafe = ForgetVisibilityService.blocked_target_ids(
+            session, "event", [(event_id, None) for event_id in event_ids],
             include_tombstones=include_tombstones, _expand_provenance=False,
-            _ignore_memory_only=True,
-        ))
+            _ignore_memory_only=True, require_resolved=True,
+        )
         blocked.update(mid for mid, sources in by_memory.items() if sources & unsafe)
         return blocked
 
@@ -594,10 +585,11 @@ class ForgetVisibilityService:
             rows = session.query(
                 TurnRecord.id, TurnRecord.thread_id, TurnRecord.created_at, TurnRecord.turn_id,
             ).filter(or_(TurnRecord.id.in_(ids), TurnRecord.turn_id.in_(ids))).all()
+            tokens = set(ids)
             return [
                 {"id": token, "thread_id": r[1], "scope_type": None,
                  "scope_id": None, "canonical_key": None, "created_at": r[2]}
-                for r in rows for token in {r[0], r[3]} if token in ids
+                for r in rows for token in {r[0], r[3]} if token in tokens
             ]
         if target_type == "memory_record":
             # MemoryRecord 不带 thread_id（按 scope 归属），故 thread 选择器对
@@ -717,46 +709,32 @@ class ForgetVisibilityService:
         Turn 被遗忘后，其全部子 Event 在清理完成前即须不可见（含 TurnRecord
         Tombstone 映射），而不依赖 Cascade 是否已完成内容清理。
         """
-        tokens_by_event = ForgetVisibilityService._turn_tokens_by_event(
-            session, event_ids,
-        )
-        if not tokens_by_event:
-            return set()
-        all_tokens: set[str] = set()
-        for toks in tokens_by_event.values():
-            all_tokens.update(toks)
-        if not all_tokens:
-            return set()
+        from aiive.db.models import Event, TurnRecord
 
-        shielded = {
-            r[0] for r in session.query(ForgetShield.target_id).filter(
-                ForgetShield.status == "active",
-                ForgetShield.target_type == "turn_record",
-                ForgetShield.target_id.in_(all_tokens),
-                ~ForgetShield.forget_operation_id.in_(session.query(ForgetOperation.id).filter(
-                    ForgetOperation.mode == "memory_only",
-                )) if ignore_memory_only else true(),
-            ).all() if r[0]
-        }
-        tombstoned: set[str] = set()
-        if include_tombstones:
-            tombstoned = {
-                r[0] for r in session.query(ForgetTombstone.target_id).filter(
-                    ForgetTombstone.target_type == "turn_record",
-                    ForgetTombstone.target_id.in_(all_tokens),
-                    ~ForgetTombstone.forget_operation_id.in_(session.query(ForgetOperation.id).filter(
-                        ForgetOperation.mode == "memory_only",
-                    )) if ignore_memory_only else true(),
-                    ForgetTombstone.block_visibility.is_(True),
-                ).all() if r[0]
-            }
-        blocked_tokens = shielded | tombstoned
-        if not blocked_tokens:
+        if not event_ids:
             return set()
-        return {
-            eid for eid, toks in tokens_by_event.items()
-            if toks & blocked_tokens
-        }
+        shield, tombstone = ForgetShield, ForgetTombstone
+        aliases = (Event.turn_id, TurnRecord.id, TurnRecord.turn_id)
+        memory_only = session.query(ForgetOperation.id).filter(ForgetOperation.mode == "memory_only")
+        shielded = session.query(shield.id).filter(
+            shield.target_type == "turn_record",
+            shield.status == "active",
+            shield.target_id.in_(aliases),
+            ~shield.forget_operation_id.in_(memory_only) if ignore_memory_only else true(),
+        ).correlate(Event, TurnRecord).exists()
+        condition = shielded
+        if include_tombstones:
+            tombstoned = session.query(tombstone.id).filter(
+                tombstone.target_type == "turn_record",
+                tombstone.block_visibility.is_(True),
+                tombstone.target_id.in_(aliases),
+                ~tombstone.forget_operation_id.in_(memory_only) if ignore_memory_only else true(),
+            ).correlate(Event, TurnRecord).exists()
+            condition = or_(shielded, tombstoned)
+        rows = session.query(Event.id).outerjoin(
+            TurnRecord, or_(TurnRecord.id == Event.turn_id, TurnRecord.turn_id == Event.turn_id),
+        ).filter(Event.id.in_(event_ids), Event.turn_id.is_not(None), Event.turn_id != "", condition)
+        return {row.id for row in rows.distinct()}
 
     @staticmethod
     def _source_memory_blocked_event_ids(

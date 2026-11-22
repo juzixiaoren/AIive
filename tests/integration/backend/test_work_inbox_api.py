@@ -103,6 +103,15 @@ def test_route_contract(db_session):
     assert client.get("/api/agent-tasks/00000/work-view").status_code == 200
     assert client.get("/api/agent-tasks/missing/timeline").status_code == 404
 
+    invalid_cursors = ("evidence?cursor=garbage", "timeline?before_sequence=2&after_sequence=1")
+    for path in invalid_cursors:
+        assert client.get(f"/api/agent-tasks/00000/{path}").status_code == 400
+    db_session.get(AgentTask, "00000").task_state = {"inputs": ["unproven"]}
+    db_session.flush()
+    for path in invalid_cursors:
+        assert client.get(f"/api/agent-tasks/00000/{path}").status_code == 404
+        assert client.get(f"/api/agent-tasks/missing/{path}").status_code == 404
+
 
 def test_batch_questions_32_and_lifecycle(db_session):
     from datetime import timedelta
@@ -417,3 +426,162 @@ def test_work_view_history_budgets(db_session):
     assert not view["truncated"]["timeline"]
     assert view["history_cursor"] is None
     assert view["last_sequence"] == 600
+
+
+ACTION_STATUSES = ("running", "dispatched", "awaiting_approval", "succeeded", "failed", "unknown")
+
+
+def seed_provenance(db, size):
+    from hashlib import sha256
+
+    from aiive.db.forget_models import ContentProvenanceRef, ForgetOperation, ForgetShield, ForgetTombstone
+    from aiive.db.models import AgentAction, AgentRun, ApprovalRequest, DesktopNode, Event, MemoryRecord, TaskArtifact, TaskEvidence, TurnRecord
+
+    seed(db, 7)
+    task = db.get(AgentTask, "00000")
+    task.status = "blocked_approval"
+    task.task_state = {"goal": {"status": "active", "revision": 2, "steps": [
+        {"id": f"s{i}", "title": "step", "status": "waiting_user"} for i in range(32)
+    ]}}
+    db.add_all([
+        DesktopNode(id="node", name="Desktop", platform="windows", arch="x64"),
+        TurnRecord(id="turn", turn_id="logical-turn", thread_id="thread"),
+        ForgetOperation(id="forget", operation_key="forget", mode="everywhere", selector_type="event", selector_hash="hash"),
+    ])
+    db.add_all(Event(id=key, thread_id="thread", trace_id=key, event_type="user_message",
+                     turn_id="logical-turn" if key == "turn-event" else None, payload={})
+               for key in ("task-input", "plan-input", "turn-event", "memory-source", "shielded", "tombstoned"))
+    db.flush()
+    db.add_all([
+        ForgetShield(forget_operation_id="forget", selector_type="event", target_type="event",
+                     target_id="shielded", cutoff_created_at=datetime.now(UTC)),
+        ForgetTombstone(forget_operation_id="forget", target_type="event", target_id="tombstoned"),
+        MemoryRecord(id="memory", content="source memory", memory_type="fact", scope_type="thread",
+                     scope_id="thread", canonical_key="bench", source_event_id="memory-source"),
+    ])
+
+    def proof(owner, identity, *sources):
+        db.add_all(ContentProvenanceRef(owner_type=owner, owner_id=identity, source_type=kind, source_id=key)
+                   for kind, key in sources)
+
+    proof("memory_record", "memory", ("event", "memory-source"))
+    proof("goal_plan", task.id, ("event", "plan-input"))
+    args_hash = sha256(b"{}").hexdigest()
+    for task_index in range(7):
+        task_id = f"{task_index:05d}"
+        run_id = f"run-{task_index}"
+        db.add(AgentRun(id=run_id, task_id=task_id, run_index=1))
+        proof("agent_task", task_id, ("event", "task-input"), ("turn_record", "turn"))
+        db.flush()
+        statuses = (*ACTION_STATUSES, *(ACTION_STATUSES[i % 6] for i in range(size if not task_index else 0)))
+        for seq, status in enumerate(statuses, 1):
+            key = f"{task_index}-{seq:04d}"
+            action_id, evidence_id, artifact_id = f"a-{key}", f"e-{key}", f"f-{key}"
+            db.add(AgentAction(
+                id=action_id, task_id=task_id, run_id=run_id, sequence=seq,
+                capability_id="run_shell", status=status, arguments_hash=args_hash,
+                descriptor_hash="descriptor", idempotency_key=action_id,
+                target_node_id="node" if status == "running" else None,
+                result_summary={"evidence_id": evidence_id} if status == "succeeded" else None,
+            ))
+            db.add_all([
+                TaskEvidence(id=evidence_id, task_id=task_id, content_hash="hash", inline_payload={"private": "inline"}),
+                TaskArtifact(id=artifact_id, task_id=task_id, name=f"{key}.txt", content_hash="hash",
+                             object_bucket="private", object_key="private"),
+                AgentTaskEvent(id=f"t-{key}", task_id=task_id, sequence=seq, event_type=f"action_{status}",
+                               action_id=action_id, payload={"private": "event"}),
+            ])
+            origin = f"origin-{key}"
+            db.add(Event(id=origin, thread_id="thread", trace_id=origin, event_type="task_input", payload={}))
+            source = {2: "shielded", 5: "tombstoned"}.get(seq, origin)
+            proof("task_evidence", evidence_id, ("event", source), ("memory_record", "memory"))
+            proof("task_artifact", artifact_id, ("event", source), ("turn_record", "turn"))
+            if status == "awaiting_approval" and task_index == 0:
+                db.add(ApprovalRequest(id=f"p-{key}", task_id=task_id, thread_id="thread", action_id=action_id,
+                                       tool_name="run_shell", tool_args={}, tool_args_hash=args_hash,
+                                       descriptor_hash="descriptor"))
+                proof("approval_request", f"p-{key}", ("event", "plan-input"))
+        db.add(AgentTaskEvent(id=f"block-{task_id}", task_id=task_id, sequence=len(statuses)+1,
+                              event_type="task_blocked_user", payload={"question": "blocked?"}))
+        proof("agent_task_event", f"block-{task_id}", ("event", "plan-input"))
+        db.flush()
+    for i in range(32):
+        question_id = f"question-{i}"
+        db.add(AgentTaskEvent(id=question_id, task_id=task.id, sequence=10_000+i*2,
+                              event_type="goal_question_asked", dedupe_key=f"goal_question:{question_id}",
+                              visibility="internal", payload={"question_id": question_id, "step_id": f"s{i}", "question": question_id}))
+        proof("agent_task_event", question_id, ("event", "plan-input"))
+        if i % 2 == 0:
+            db.add(AgentTaskEvent(id=f"resolution-{i}", task_id=task.id, sequence=10_001+i*2,
+                                  event_type="goal_question_resolved", dedupe_key=f"goal_question_resolved:{question_id}",
+                                  visibility="internal", payload={"question_id": question_id}))
+            proof("agent_task_event", f"resolution-{i}", ("event", "plan-input"))
+    db.flush()
+    db.expire_all()
+
+
+@pytest.mark.parametrize("size", [1, 10, 100, 500])
+def test_provenance_query_budget(db_session, size):
+    import re
+    from collections import Counter
+    from time import perf_counter
+    from sqlalchemy import event
+
+    seed_provenance(db_session, size)
+    connection = db_session.connection()
+    statements = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    counts = {}
+
+    def measure(name, read, budget):
+        db_session.expire_all()
+        statements.clear()
+        started = perf_counter()
+        result = read(WorkReadModel(db_session))
+        elapsed = perf_counter() - started
+        verbs = Counter(sql.split()[0].upper() for sql in statements)
+        tables = Counter(re.search(r"\bFROM\s+(\w+)", sql, re.I)[1] for sql in statements)
+        print(f"work-read n={size} {name}: {len(statements)} SQL {elapsed*1000:.1f} ms {dict(verbs)} {dict(tables)}")
+        assert verbs.keys() == {"SELECT"}
+        counts[name] = len(statements)
+        assert counts[name] <= budget, tables
+        assert not any(column in sql for sql in statements for column in (
+            "task_evidence.inline_payload", "task_evidence.object_bucket", "task_evidence.object_key",
+            "task_artifacts.object_bucket", "task_artifacts.object_key",
+        ))
+        return result
+
+    event.listen(connection, "before_cursor_execute", capture)
+    try:
+        inbox = measure("Inbox", lambda model: model.inbox(), 100)
+        detail = measure("WorkView", lambda model: model.work_view("00000"), 100)
+        incremental = measure("Timeline", lambda model: model.timeline("00000"), 30)
+        history = measure("Timeline history", lambda model: model.timeline_history("00000"), 30)
+        if size >= 100:
+            previous = measure("Timeline older", lambda model: model.timeline_history("00000", history["next_sequence"]), 30)
+            assert previous["items"][-1]["sequence"] < history["items"][0]["sequence"]
+            for kind in ("evidence", "artifacts"):
+                page = measure(kind, lambda model: model.metadata_page("00000", kind, detail["metadata_cursors"][kind]), 30)
+                assert len(page["items"]) == 50
+                assert {item["id"] for item in page["items"]}.isdisjoint(item["id"] for item in detail[kind])
+    finally:
+        event.remove(connection, "before_cursor_execute", capture)
+    assert counts["Inbox"] <= 30 and counts["WorkView"] <= 42
+    assert len(inbox["items"]) == 7
+    first = next(item for item in inbox["items"] if item["task_id"] == "00000")
+    assert first["attention_count"] == len(detail["attention_items"])
+    assert first["primary_attention"] == detail["attention_items"][0]
+    assert sum(item["kind"] == "goal_question" for item in detail["attention_items"]) == 16
+    assert {action["status"] for action in detail["actions"]} == set(ACTION_STATUSES)
+    assert history["items"] == detail["timeline"]
+    assert [item["sequence"] for item in incremental["items"]] == sorted(item["sequence"] for item in incremental["items"])
+    assert [item["sequence"] for item in history["items"]] == sorted(item["sequence"] for item in history["items"])
+    for kind, prefix in (("evidence", "e"), ("artifacts", "f")):
+        ids = {item["id"] for item in detail[kind]}
+        assert f"{prefix}-0-0002" not in ids and f"{prefix}-0-0005" not in ids
+        assert len(ids) == min(50, size + 4)
+        if size >= 100:
+            assert detail["metadata_cursors"][kind]

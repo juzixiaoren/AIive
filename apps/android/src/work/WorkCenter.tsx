@@ -122,7 +122,7 @@ function WorkDetail({
   const view = state.view;
   if (!view)
     return (
-      <p>{state.loading ? "正在读取详情…" : "工作不可用，请刷新后重试。"}</p>
+      <p>{state.detailLoading ? "正在读取详情…" : "工作不可用，请刷新后重试。"}</p>
     );
   const goal = view.goal,
     task = view.task;
@@ -306,7 +306,7 @@ function WorkDetail({
         </ol>
         {state.historyMore && (
           <button
-            disabled={state.loading}
+            disabled={state.detailLoading}
             onClick={() => void controller.history()}
           >
             读取更早的记录
@@ -343,10 +343,10 @@ function WorkDetail({
           />
         ))}
         {view.metadata_cursors?.artifacts && (
-          <button disabled={state.loading} onClick={() => void controller.olderFiles("artifacts")}>加载更早的成果</button>
+          <button disabled={state.detailLoading} onClick={() => void controller.olderFiles("artifacts")}>加载更早的成果</button>
         )}
         {view.metadata_cursors?.evidence && (
-          <button disabled={state.loading} onClick={() => void controller.olderFiles("evidence")}>加载更早的证据</button>
+          <button disabled={state.detailLoading} onClick={() => void controller.olderFiles("evidence")}>加载更早的证据</button>
         )}
       </section>
       <details>
@@ -391,13 +391,15 @@ export default function WorkCenter({
           <h1>工作</h1>
         )}
         <button
-          disabled={state.loading}
+          disabled={selected ? state.detailLoading : state.inboxLoading}
           onClick={() => void controller.refresh()}
         >
           刷新
         </button>
       </header>
       {state.error && <p role="alert">{state.error}</p>}
+      {selected && state.detailError && <p role="alert">{state.detailError}</p>}
+      {!selected && state.inboxError && <p role="alert">{state.inboxError}</p>}
       {connectionError && <p role="status">{connectionError}</p>}
       {selected ? (
         <WorkDetail key={selected} state={state} controller={controller} />
@@ -417,9 +419,9 @@ export default function WorkCenter({
             ))}
           </div>
           <div className="mobile-inbox">
-            {!state.items.length && (
+            {!state.items.length && !state.inboxError && (
               <p>
-                {state.loading ? "正在读取工作…" : "这个分类暂时没有工作。"}
+                {state.inboxLoading ? "正在读取工作…" : "这个分类暂时没有工作。"}
               </p>
             )}
             {state.items.map((item) => (
@@ -446,7 +448,7 @@ export default function WorkCenter({
           </div>
           {state.more && (
             <button
-              disabled={state.loading}
+              disabled={state.inboxLoading}
               onClick={() => void controller.more()}
             >
               加载更多

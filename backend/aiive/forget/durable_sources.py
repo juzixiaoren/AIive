@@ -44,13 +44,9 @@ def persist_sources(db: Session, owner_type: str, owner_id: str, *payloads: obje
 
 
 def references_visible(db: Session, grouped: Mapping[str, Collection[str]]) -> bool:
-    if any(kind not in {"event", "memory_record", "turn_record"} for kind in grouped):
-        return False
-    from aiive.forget.source_policy import SourceReferences, blocked_sources_reason
-    sources = SourceReferences(events={i: None for i in grouped.get("event", [])},
-                               memories={i: None for i in grouped.get("memory_record", [])},
-                               turns={i: None for i in grouped.get("turn_record", [])})
-    return not blocked_sources_reason(db, sources)
+    from aiive.forget.source_policy import DURABLE_SOURCE_TYPES, blocked_durable_references
+
+    return grouped.keys() <= DURABLE_SOURCE_TYPES and not blocked_durable_references(db, grouped)
 
 
 def sources_visible(db: Session, owner_type: str, owner_id: str) -> bool:

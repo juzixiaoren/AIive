@@ -1,31 +1,39 @@
-from aiive.db.models import AgentTaskEvent
+import pytest
+
+from aiive.db.forget_models import ContentProvenanceRef
+from aiive.db.models import AgentTask, AgentTaskEvent
 from aiive.task_runtime.goal_questions import list_open_questions_for_tasks
 
 from tests.integration.backend.test_work_inbox_api import seed
 
 
-def test_hidden_children_cannot_supply_question_or_timeline(db_session, monkeypatch):
+def test_hidden_children_cannot_supply_question_or_timeline(db_session):
+    from tests.integration.backend.test_forget_goal_read_bypasses import signal, forget
+
     model = seed(db_session, 1)
-    db_session.add(
-        AgentTaskEvent(
-            task_id="00000",
-            sequence=1,
-            event_type="task_blocked_user",
-            payload={"question": "SECRET"},
-        )
-    )
+    task = db_session.get(AgentTask, "00000")
+    task.status = "blocked_user"
+    origin = signal(db_session, "thread")
+    db_session.add_all([
+        AgentTaskEvent(id="question", task_id=task.id, sequence=1, event_type="task_blocked_user",
+                       payload={"question": "SECRET"}),
+        ContentProvenanceRef(owner_type="agent_task_event", owner_id="question",
+                             source_type="event", source_id=origin.id),
+    ])
     db_session.flush()
-    monkeypatch.setattr(type(model.reader), "visible_child", lambda *args: False)
-    assert model.timeline("00000")["items"] == []
+    assert model.inbox("attention")["items"]
+    forget(db_session, origin)
+    assert model.timeline(task.id)["items"] == []
     assert model.inbox("attention")["items"] == []
-    assert list_open_questions_for_tasks(db_session, ["00000"]) == {"00000": []}
 
 
-def test_hidden_task_omitted(db_session, monkeypatch):
+def test_task_without_legacy_proof_is_omitted(db_session):
     model = seed(db_session, 1)
-    monkeypatch.setattr(type(model.reader), "task_visible", lambda *args: False)
+    task = db_session.get(AgentTask, "00000")
+    task.task_state = {"inputs": ["unproven"]}
+    db_session.flush()
     assert model.inbox("active")["items"] == []
-    assert model.reader.get_task("00000") is None
+    assert model.reader.get_task(task.id) is None
 
 
 def test_real_forget_shield_hides_work_task(db_session):
@@ -229,3 +237,126 @@ def test_reminder_id_mapping_is_batched_and_distinguishes_goal(db_session):
     assert rows["goal_old"]["agent_task_id"] == goal.id
     assert rows["goal_new"]["agent_task_id"] == goal.id
     assert len(queries) == 1
+
+
+@pytest.mark.parametrize("proof_kind", ["unknown", "dangling", "none", "forgotten", "resolution_error"])
+def test_action_and_event_require_visible_evidence_even_with_own_proof(db_session, monkeypatch, proof_kind):
+    from aiive.db.models import AgentAction, AgentRun, TaskEvidence
+    from tests.integration.backend.test_forget_goal_read_bypasses import signal, forget
+
+    model = seed(db_session, 1)
+    origin = signal(db_session, "thread")
+    other = signal(db_session, "thread")
+    db_session.add(AgentRun(id="run", task_id="00000", run_index=1))
+    db_session.flush()
+    db_session.add_all([
+        TaskEvidence(id="evidence", task_id="00000", content_hash="evidence"),
+        AgentAction(id="action", task_id="00000", run_id="run", sequence=1, capability_id="run_shell",
+                    arguments_hash="args", descriptor_hash="descr", idempotency_key="action",
+                    status="succeeded", result_summary={"evidence_id": "evidence"}),
+        AgentTaskEvent(id="event", task_id="00000", action_id="action", sequence=1,
+                       event_type="action_succeeded"),
+        ContentProvenanceRef(owner_type="agent_action", owner_id="action",
+                             source_type="event", source_id=other.id),
+        ContentProvenanceRef(owner_type="agent_task_event", owner_id="event",
+                             source_type="event", source_id=other.id),
+    ])
+    if proof_kind != "none":
+        db_session.add(ContentProvenanceRef(
+            owner_type="task_evidence", owner_id="evidence",
+            source_type="unknown" if proof_kind == "unknown" else "event",
+            source_id="missing" if proof_kind == "dangling" else origin.id,
+        ))
+    db_session.flush()
+    if proof_kind == "forgotten":
+        assert model.timeline("00000")["items"]
+        forget(db_session, origin)
+    if proof_kind == "resolution_error":
+        from aiive.forget.visibility_service import ForgetVisibilityService
+
+        def unavailable(*args):
+            raise RuntimeError("source metadata unavailable")
+
+        monkeypatch.setattr(ForgetVisibilityService, "load_target_meta", staticmethod(unavailable))
+    view = model.work_view("00000")
+    assert view["actions"] == view["timeline"] == view["evidence"] == []
+    assert model.timeline("00000") == {"items": [], "next_sequence": 1, "has_more": False}
+
+
+def test_dangling_memory_proof_does_not_hide_independent_evidence(db_session):
+    from aiive.db.models import MemoryRecord, TaskEvidence
+    from tests.integration.backend.test_forget_goal_read_bypasses import signal
+
+    model = seed(db_session, 1)
+    origin = signal(db_session, "thread")
+    db_session.add(MemoryRecord(id="present", memory_type="fact", content="visible"))
+    for key in ("present", "removed"):
+        db_session.add_all([
+            TaskEvidence(id=key, task_id="00000", content_hash=key),
+            ContentProvenanceRef(owner_type="task_evidence", owner_id=key,
+                                 source_type="memory_record", source_id=key),
+            ContentProvenanceRef(owner_type="memory_record", owner_id=key,
+                                 source_type="event", source_id=origin.id),
+        ])
+    db_session.flush()
+    assert [item["id"] for item in model.metadata_page("00000", "evidence")["items"]] == ["present"]
+
+
+@pytest.mark.parametrize("changes", [1, 2])
+def test_work_read_rechecks_committed_forget(_db_template, tmp_path, changes):
+    from shutil import copyfile
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from sqlalchemy import create_engine, event
+    from sqlalchemy.orm import Session
+
+    from aiive.api.routes_agent_tasks import router
+    from aiive.db.base import get_db
+    from aiive.db.models import Event
+    from tests.integration.backend.test_forget_goal_read_bypasses import forget, signal
+
+    database = tmp_path / "work.db"
+    copyfile(_db_template, database)
+    engine = create_engine(f"sqlite:///{database}")
+    try:
+        with Session(engine) as setup:
+            seed(setup, 1)
+            origin = signal(setup, "thread").id
+            newer = signal(setup, "thread").id
+            setup.add_all([
+                AgentTaskEvent(id="private", task_id="00000", sequence=1, event_type="task_created"),
+                ContentProvenanceRef(owner_type="agent_task_event", owner_id="private",
+                                     source_type="event", source_id=origin),
+            ])
+            setup.commit()
+
+        app = FastAPI()
+        app.include_router(router)
+        with Session(engine) as reading, Session(engine) as writing:
+            app.dependency_overrides[get_db] = lambda: reading
+            revision_queries = 0
+
+            def before_read(conn, cursor, statement, parameters, context, executemany):
+                nonlocal revision_queries
+                if "count(forget_operations.id)" not in statement.lower():
+                    return
+                revision_queries += 1
+                if revision_queries == 2 or (revision_queries == 4 and changes == 2):
+                    identity = origin if revision_queries == 2 else newer
+                    forget(writing, writing.get(Event, identity))
+
+            event.listen(reading.connection(), "before_cursor_execute", before_read)
+            with TestClient(app) as client:
+                result = client.get("/api/agent-tasks/00000/work-view")
+            assert revision_queries == 4
+            if changes == 1:
+                assert result.status_code == 200
+                assert result.json()["timeline"] == []
+                assert result.json()["visibility_revision"] == 1
+            else:
+                assert result.status_code == 503
+                assert result.json() == {"detail": "work_visibility_changed_retry"}
+                assert result.headers["Retry-After"] == "1"
+    finally:
+        engine.dispose()

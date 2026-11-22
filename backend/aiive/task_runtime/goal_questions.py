@@ -20,11 +20,15 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from aiive.db.models import AgentTask, AgentTaskEvent
 from aiive.task_runtime.goal_plan import GoalPlan, GoalStatus, GoalStepStatus
-from aiive.task_runtime.read_repository import TaskReadRepository
+from aiive.task_runtime.read_repository import (
+    TASK_VISIBILITY_COLUMNS,
+    ReadVisibilityContext,
+    TaskReadRepository,
+)
 from aiive.task_runtime.repository import TERMINAL_TASK_STATES, TaskRepository, utcnow
 
 logger = logging.getLogger(__name__)
@@ -153,50 +157,57 @@ def record_question(
     return question_id
 
 
-def _asked_rows(db: Session, *, task_id: str | None = None, thread_id: str | None = None,
-                since: datetime | None = None, task_ids: list[str] | None = None) -> list[tuple[AgentTaskEvent, AgentTask]]:
+def _asked_rows(
+    db: Session, *, task_id: str | None = None, thread_id: str | None = None,
+    since: datetime | None = None,
+) -> list[tuple[AgentTaskEvent, AgentTask]]:
     query = db.query(AgentTaskEvent, AgentTask).join(
         AgentTask, AgentTask.id == AgentTaskEvent.task_id,
     ).filter(AgentTaskEvent.event_type == QUESTION_ASKED_EVENT)
-    if task_ids is not None:
-        query = query.filter(AgentTaskEvent.task_id.in_(task_ids))
     if task_id:
         query = query.filter(AgentTaskEvent.task_id == task_id)
     if thread_id:
         query = query.filter(AgentTask.thread_id == thread_id)
     if since is not None:
         query = query.filter(AgentTaskEvent.created_at >= since)
-    reader = TaskReadRepository(db)
-    return [(event, task) for event, task in query.order_by(AgentTaskEvent.created_at.asc()).all()
-            if reader.visible_child("agent_task_event", event)]
+    return list(query.order_by(AgentTaskEvent.created_at.asc()).all())
 
 
-def _resolution_rows(db: Session, question_ids: list[str]) -> tuple[dict[str, AgentTaskEvent], set[str]]:
-    if not question_ids:
-        return {}, set()
-    reader = TaskReadRepository(db)
-    keys = [_resolved_key(item) for item in question_ids]
-    resolved = {
-        str((row.payload or {}).get("question_id") or ""): row
-        for row in reader.filter_children("agent_task_event",
-            db.query(AgentTaskEvent).filter(AgentTaskEvent.dedupe_key.in_(keys)).all())
-    }
-    expired_keys = {_expired_key(item) for item in question_ids}
-    expired = {
-        str((row.payload or {}).get("question_id") or "")
-        for row in reader.filter_children("agent_task_event",
-            db.query(AgentTaskEvent).filter(AgentTaskEvent.dedupe_key.in_(expired_keys)).all())
-    }
+def _outcome_keys(question_ids: list[str]) -> set[str]:
+    return {key for identity in question_ids if identity for key in (_resolved_key(identity), _expired_key(identity))}
+
+
+def _resolution_candidates(db: Session, question_ids: list[str]) -> list[AgentTaskEvent]:
+    keys = _outcome_keys(question_ids)
+    return list(db.query(AgentTaskEvent).filter(AgentTaskEvent.dedupe_key.in_(keys)).all()) if keys else []
+
+
+def _resolution_rows(rows: list[AgentTaskEvent]) -> tuple[dict[str, AgentTaskEvent], set[str]]:
+    resolved = {}
+    expired = set()
+    for row in rows:
+        question_id = str((row.payload or {}).get("question_id") or "")
+        if (row.dedupe_key or "").startswith("goal_question_expired:"):
+            expired.add(question_id)
+        else:
+            resolved[question_id] = row
     return resolved, expired
 
 
-def _plan_snapshot(db: Session, task: AgentTask) -> tuple[str, dict[str, str]]:
+def _visible_asked(
+    reader: TaskReadRepository, rows: list[tuple[AgentTaskEvent, AgentTask]],
+) -> list[tuple[AgentTaskEvent, AgentTask]]:
+    visible = reader.visible_children_many("agent_task_event", [event for event, _ in rows])
+    return [(event, task) for event, task in rows if event.id in visible]
+
+
+def _plan_snapshot(reader: TaskReadRepository, task: AgentTask) -> tuple[str, dict[str, str]]:
     """读取目标的真实状态与各步骤状态（计划缺失/损坏时返回空 → 问题一律失效）。
 
     目标暂停、结束，或步骤被修改/重置后，历史问题不能再被当作可回答问题注入，
     这些状态全部来自既有的 task_state["goal"]，不需要新增表或事件。
     """
-    if not TaskReadRepository(db).plan_visible(task):
+    if not reader.plan_visible(task):
         return "", {}
     raw = (task.task_state or {}).get("goal")
     if not isinstance(raw, dict):
@@ -333,7 +344,8 @@ def list_open_questions(
         return []
     moment = _as_utc(now) or utcnow()
     cutoff = moment - timedelta(hours=QUESTION_TTL_HOURS)
-    rows = _asked_rows(db, thread_id=thread_id, since=cutoff)
+    reader = TaskReadRepository(db, ReadVisibilityContext(db))
+    rows = _visible_asked(reader, _asked_rows(db, thread_id=thread_id, since=cutoff))
     if not rows:
         return []
     question_ids = []
@@ -342,14 +354,16 @@ def list_open_questions(
         question_id = str(payload.get("question_id") or "")
         if question_id:
             question_ids.append(question_id)
-    resolved, expired = _resolution_rows(db, question_ids)
+    resolved, expired = _resolution_rows(reader.filter_children(
+        "agent_task_event", _resolution_candidates(db, question_ids),
+    ))
     superseded = _superseded_ids(rows)
     snapshots: dict[str, tuple[str, dict[str, str]]] = {}
     open_questions: list[PendingQuestion] = []
     for event, task in rows:
         snapshot = snapshots.get(str(task.id))
         if snapshot is None:
-            snapshot = _plan_snapshot(db, task)
+            snapshot = _plan_snapshot(reader, task)
             snapshots[str(task.id)] = snapshot
         item = _to_question(
             event, task, resolved, expired, moment,
@@ -367,19 +381,21 @@ def load_question(db: Session, question_id: str, *, now: datetime | None = None)
     row = db.query(AgentTaskEvent).filter(
         AgentTaskEvent.dedupe_key == _asked_key(question_id),
     ).one_or_none()
-    reader = TaskReadRepository(db)
+    reader = TaskReadRepository(db, ReadVisibilityContext(db))
     if row is None or not reader.visible_child("agent_task_event", row):
         return None
     task = reader.get_task(row.task_id)
     if task is None:
         return None
     moment = _as_utc(now) or utcnow()
-    resolved, expired = _resolution_rows(db, [question_id])
+    resolved, expired = _resolution_rows(reader.filter_children(
+        "agent_task_event", _resolution_candidates(db, [question_id]),
+    ))
     # 同一 (task, step) 的后续提问会让本问题失效：需要连同该任务近期的问题一起看。
-    recent = _asked_rows(
+    recent = _visible_asked(reader, _asked_rows(
         db, task_id=str(row.task_id), since=moment - timedelta(hours=QUESTION_TTL_HOURS),
-    )
-    plan_status, step_statuses = _plan_snapshot(db, task)
+    ))
+    plan_status, step_statuses = _plan_snapshot(reader, task)
     return _to_question(
         row, task, resolved, expired, moment,
         plan_status=plan_status,
@@ -464,21 +480,61 @@ def render_questions_block(questions: list[PendingQuestion], *, limit_chars: int
     return text
 
 
-def list_open_questions_for_tasks(db: Session, task_ids: list[str], *, now: datetime | None = None) -> dict[str, list[PendingQuestion]]:
-    """Batch inbox read; retains the chat reader's independent five-question budget."""
-    result = {key: [] for key in task_ids}
-    if not task_ids:
-        return result
+@dataclass(frozen=True)
+class TaskQuestionCandidates:
+    asked: list[tuple[AgentTaskEvent, AgentTask]]
+    outcomes: list[AgentTaskEvent]
+
+    @property
+    def events(self) -> list[AgentTaskEvent]:
+        return [event for event, _ in self.asked] + self.outcomes
+
+
+def task_question_candidates(db: Session, tasks: list[AgentTask], now: datetime) -> TaskQuestionCandidates:
+    if not tasks:
+        return TaskQuestionCandidates([], [])
+    by_id = {task.id: task for task in tasks}
+    events = db.query(AgentTaskEvent).filter(
+        AgentTaskEvent.task_id.in_(by_id),
+        AgentTaskEvent.event_type == QUESTION_ASKED_EVENT,
+        AgentTaskEvent.created_at >= now - timedelta(hours=QUESTION_TTL_HOURS),
+    ).order_by(AgentTaskEvent.created_at).all()
+    ids = [str((event.payload or {}).get("question_id") or "") for event in events]
+    return TaskQuestionCandidates(
+        [(event, by_id[event.task_id]) for event in events],
+        _resolution_candidates(db, ids),
+    )
+
+
+def list_open_questions_for_tasks(
+    db: Session, task_ids: list[str], *, now: datetime | None = None,
+    reader: TaskReadRepository | None = None, candidates: TaskQuestionCandidates | None = None,
+) -> dict[str, list[PendingQuestion]]:
+    """Batch Work Center read; the chat reader keeps its five-question budget."""
+    result: dict[str, list[PendingQuestion]] = {key: [] for key in task_ids}
     moment = _as_utc(now) or utcnow()
-    rows = _asked_rows(db, task_ids=task_ids, since=moment - timedelta(hours=QUESTION_TTL_HOURS))
-    ids = [str((event.payload or {}).get("question_id") or "") for event, _ in rows]
-    resolved, expired = _resolution_rows(db, ids)
+    reader = reader or TaskReadRepository(db, ReadVisibilityContext(db))
+    if candidates is None:
+        if not task_ids:
+            return result
+        tasks = db.query(AgentTask).options(load_only(
+            *TASK_VISIBILITY_COLUMNS, AgentTask.status,
+        )).filter(AgentTask.id.in_(task_ids)).all()
+        candidates = task_question_candidates(db, tasks, moment)
+        if reader.visibility is not None:
+            reader.visibility.resolve(tasks, {"agent_task_event": candidates.events})
+    visible = reader.visible_children_many("agent_task_event", candidates.events)
+    rows = [(event, task) for event, task in candidates.asked if event.id in visible]
+    keys = _outcome_keys([str((event.payload or {}).get("question_id") or "") for event, _ in rows])
+    resolved, expired = _resolution_rows([
+        row for row in candidates.outcomes if row.id in visible and row.dedupe_key in keys
+    ])
     superseded = _superseded_ids(rows)
     snapshots = {}
     seen = set()
     for event, task in reversed(rows):
         if task.id not in snapshots:
-            snapshots[task.id] = _plan_snapshot(db, task)
+            snapshots[task.id] = _plan_snapshot(reader, task)
         status, steps = snapshots[task.id]
         question = _to_question(event, task, resolved, expired, moment,
             plan_status=status, step_statuses=steps, superseded=superseded)

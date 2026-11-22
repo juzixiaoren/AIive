@@ -86,6 +86,8 @@ _finalize_turn  ── 事务化落库
 
 **定时工具任务 TODO**：`schedule_tool_task` 当前未实现、未注册且不可用。现有调度链只支持真实提醒任务，不能持久化“到期后调用某个 ToolRegistry 工具”的请求。后续实现必须包含 Task 持久化、到期 Worker 唤醒、权限/风险复核、`ToolRegistry.execute()`、trace/action card 与终态通知的端到端闭环；在闭环完成前不得注册占位或假执行工具。
 
+**工作中心（task_runtime/、shared/work/）** 读取链路复用请求内的 Forget 可见性判定。Inbox 与详情分别投影，Timeline 与元数据使用批量验证和稳定游标。见 [工作中心读取链路](architecture/work_center_read_path.md)。
+
 **遗忘/保留（forget/、retention/）**：Phase 6A 遗忘 Saga（HMAC 指纹、Shield、可见性过滤），Phase 6B 保留治理（安全谓词、真空清理、维护租约）。
 
 **其他**：`knowledge/`（文档摄入 + Qdrant），`mcp/`（能力发现/安装/沙箱），`selfdev/`（补丁计划/槽位提升回滚），`supervisor/`（进程健康）。

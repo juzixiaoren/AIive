@@ -118,7 +118,7 @@ export default function WorkDetail({
   } | null>(null);
   const view = state.view;
   if (!view)
-    return <p>{state.loading ? "正在读取工作…" : "选择一项工作查看详情。"}</p>;
+    return <p>{state.detailLoading ? "正在读取工作…" : "选择一项工作查看详情。"}</p>;
   const task = view.task,
     goal = view.goal;
   const save = (changes: PlanChanges) => {
@@ -307,7 +307,7 @@ export default function WorkDetail({
         </ol>
         {state.historyMore && (
           <button
-            disabled={state.loading}
+            disabled={state.detailLoading}
             onClick={() => void controller.history()}
           >
             读取更早的记录
@@ -346,10 +346,10 @@ export default function WorkDetail({
           />
         ))}
         {view.metadata_cursors?.artifacts && (
-          <button disabled={state.loading} onClick={() => void controller.olderFiles("artifacts")}>加载更早的成果</button>
+          <button disabled={state.detailLoading} onClick={() => void controller.olderFiles("artifacts")}>加载更早的成果</button>
         )}
         {view.metadata_cursors?.evidence && (
-          <button disabled={state.loading} onClick={() => void controller.olderFiles("evidence")}>加载更早的证据</button>
+          <button disabled={state.detailLoading} onClick={() => void controller.olderFiles("evidence")}>加载更早的证据</button>
         )}
       </section>
       <details>

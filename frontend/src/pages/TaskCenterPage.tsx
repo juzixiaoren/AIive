@@ -16,7 +16,7 @@ export default function TaskCenterPage({ taskId = "" }: { taskId?: string }) {
         </div>
         <button
           onClick={() => void controller.refresh()}
-          disabled={state.loading}
+          disabled={state.inboxLoading}
         >
           刷新
         </button>
@@ -37,8 +37,9 @@ export default function TaskCenterPage({ taskId = "" }: { taskId?: string }) {
       </div>
       <div className="work-layout">
         <aside className="work-list" aria-label="工作列表">
-          {!state.items.length && (
-            <p>{state.loading ? "正在读取工作…" : "这个分类暂时没有工作。"}</p>
+          {state.inboxError && <p role="alert">{state.inboxError}</p>}
+          {!state.items.length && !state.inboxError && (
+            <p>{state.inboxLoading ? "正在读取工作…" : "这个分类暂时没有工作。"}</p>
           )}
           {state.items.map((item) => (
             <button
@@ -63,14 +64,17 @@ export default function TaskCenterPage({ taskId = "" }: { taskId?: string }) {
           ))}
           {state.more && (
             <button
-              disabled={state.loading}
+              disabled={state.inboxLoading}
               onClick={() => void controller.more()}
             >
               加载更多工作
             </button>
           )}
         </aside>
-        <WorkDetail key={selected} state={state} controller={controller} />
+        <div>
+          {state.detailError && <p role="alert">{state.detailError}</p>}
+          <WorkDetail key={selected} state={state} controller={controller} />
+        </div>
       </div>
     </div>
   );

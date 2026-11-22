@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import PurePath
 from typing import Any, ClassVar, Literal
 from urllib.parse import quote
@@ -19,6 +21,7 @@ from aiive.task_runtime.repository import TaskRepository
 from aiive.task_runtime.read_repository import TaskReadRepository, TaskContentUnavailable
 from aiive.task_runtime.router import normalize_task_brief
 from aiive.task_runtime.schemas import TaskBrief
+from aiive.task_runtime.work_read_model import WorkReadModel, WorkReadRetry
 
 
 router = APIRouter(prefix="/api/agent-tasks", tags=["agent-tasks"])
@@ -103,6 +106,18 @@ def list_agent_tasks(
     return [repo.summary(task) for task in tasks]
 
 
+@contextmanager
+def work_read_errors() -> Generator[None]:
+    try:
+        yield
+    except WorkReadRetry as error:
+        raise HTTPException(status_code=503, detail=str(error), headers={"Retry-After": "1"}) from error
+    except TaskContentUnavailable as error:
+        raise HTTPException(status_code=404, detail="任务不存在") from error
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
 @router.get("/inbox")
 def get_work_inbox(
     bucket: str = Query(default="attention", pattern="^(attention|active|waiting|ended)$"),
@@ -110,23 +125,14 @@ def get_work_inbox(
     cursor: str | None = Query(default=None, max_length=2048),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    from aiive.task_runtime.work_read_model import WorkReadModel
-    try:
-        with db.no_autoflush:
-            return WorkReadModel(db).inbox(bucket, limit, cursor)
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
+    with work_read_errors():
+        return WorkReadModel(db).inbox(bucket, limit, cursor)
 
 
 @router.get("/{task_id}/work-view")
 def get_work_view(task_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
-    from aiive.task_runtime.work_read_model import WorkReadModel
-    with db.no_autoflush:
-        model = WorkReadModel(db)
-        task = model.reader.get_task(task_id)
-        if task is None:
-            raise HTTPException(status_code=404, detail="任务不存在")
-        return model.work_view(task)
+    with work_read_errors():
+        return WorkReadModel(db).work_view(task_id)
 
 
 @router.get("/{task_id}/timeline")
@@ -134,15 +140,10 @@ def get_work_timeline(task_id: str, after_sequence: int = Query(default=0, ge=0)
                       limit: int = Query(default=50, ge=1, le=50),
                       before_sequence: int | None = Query(default=None, gt=0),
                       db: Session = Depends(get_db)) -> dict[str, Any]:
-    from aiive.task_runtime.work_read_model import WorkReadModel
-    with db.no_autoflush:
+    with work_read_errors():
         model = WorkReadModel(db)
-        if model.reader.get_task(task_id) is None:
-            raise HTTPException(status_code=404, detail="任务不存在")
         if before_sequence is not None:
-            if after_sequence:
-                raise HTTPException(status_code=400, detail="choose_one_timeline_cursor")
-            return model.timeline_history(task_id, before_sequence, limit)
+            return model.timeline_history(task_id, before_sequence, limit, after_sequence=after_sequence)
         return model.timeline(task_id, after_sequence, limit)
 
 
@@ -155,16 +156,9 @@ def list_work_files(
     limit: int = Query(default=50, ge=1, le=50),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    from aiive.task_runtime.work_read_model import WorkReadModel
-
-    model = WorkReadModel(db)
-    if model.reader.get_task(task_id) is None:
-        raise HTTPException(status_code=404, detail="任务不存在")
     kind = request.url.path.rsplit("/", 1)[-1]
-    try:
-        return model.metadata_page(task_id, kind, cursor, limit)
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
+    with work_read_errors():
+        return WorkReadModel(db).metadata_page(task_id, kind, cursor, limit)
 
 
 @router.get("/{task_id}")

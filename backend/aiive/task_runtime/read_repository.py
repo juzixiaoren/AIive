@@ -4,10 +4,13 @@ All API/tool consumers use these domain methods, not Forget internals.
 """
 
 from __future__ import annotations
-from collections.abc import Sequence
+import logging
+from collections import defaultdict
+from collections.abc import Mapping, Sequence
 from datetime import datetime
-from typing import TypeVar
-from sqlalchemy.orm import Session
+from typing import Any, TypeVar, cast
+from sqlalchemy import or_
+from sqlalchemy.orm import InstrumentedAttribute, Session, load_only
 from aiive.db.models import (
     AgentTask,
     ApprovalRequest,
@@ -20,11 +23,17 @@ from aiive.db.models import (
     Event,
 )
 from aiive.db.forget_models import ContentProvenanceRef
-from aiive.forget.durable_sources import sources_visible
-from aiive.forget.source_policy import SourceReferences, blocked_sources_reason
+from aiive.forget.source_policy import blocked_durable_references
+from aiive.forget.visibility_service import ForgetVisibilityService
 
 ChildObject = ApprovalRequest | AgentAction | AgentRun | AgentTaskEvent | AgentTaskCheckpoint | TaskEvidence | TaskArtifact
 Child = TypeVar("Child", bound=ChildObject)
+logger = logging.getLogger(__name__)
+
+TASK_VISIBILITY_COLUMNS = (
+    AgentTask.id, AgentTask.thread_id, AgentTask.source_turn_record_id,
+    AgentTask.created_at, AgentTask.task_state, AgentTask.report,
+)
 
 
 class TaskContentUnavailable(PermissionError):
@@ -85,9 +94,155 @@ def record_input_source(
     return event.id
 
 
-class TaskReadRepository:
+OwnerKey = tuple[str, str]
+
+
+class ReadVisibilityContext:
+    """One read attempt's source and dependency results."""
+
     def __init__(self, db: Session) -> None:
         self.db: Session = db
+        self.proofs: dict[OwnerKey, tuple[bool, bool]] = {}
+        self.sources: dict[OwnerKey, bool] = {}
+        self.tasks: dict[str, bool] = {}
+        self.plans: dict[str, bool] = {}
+        self.children: dict[OwnerKey, bool] = {}
+
+    def _load_proofs(self, owners: set[OwnerKey], turns: set[str]) -> None:
+        by_type: dict[str, set[str]] = defaultdict(set)
+        for kind, identity in owners - self.proofs.keys():
+            by_type[kind].add(identity)
+        refs: dict[OwnerKey, set[OwnerKey]] = defaultdict(set)
+        new_sources: dict[str, set[str]] = defaultdict(set)
+
+        def include(kind: str, identity: str) -> None:
+            if (kind, identity) not in self.sources:
+                new_sources[kind].add(identity)
+
+        for identity in turns:
+            include("turn_record", identity)
+        if by_type:
+            try:
+                rows = self.db.query(
+                    ContentProvenanceRef.owner_type, ContentProvenanceRef.owner_id,
+                    ContentProvenanceRef.source_type, ContentProvenanceRef.source_id,
+                ).filter(or_(*(
+                    (ContentProvenanceRef.owner_type == kind) & ContentProvenanceRef.owner_id.in_(ids)
+                    for kind, ids in by_type.items()
+                ))).all()
+            except Exception:
+                # Failed lookup must never activate a legacy "no source" rule.
+                logger.exception("Task provenance lookup failed")
+                self.proofs.update((key, (True, False)) for key in owners - self.proofs.keys())
+                self.sources.update((("turn_record", identity), False) for identity in turns)
+                return
+            for kind, identity, source_type, source_id in rows:
+                refs[kind, identity].add((source_type, source_id))
+                include(source_type, source_id)
+
+        blocked = blocked_durable_references(self.db, new_sources)
+        for kind, ids in new_sources.items():
+            self.sources.update(((kind, identity), (kind, identity) not in blocked) for identity in ids)
+        for key in owners - self.proofs.keys():
+            self.proofs[key] = (bool(refs[key]), all(self.sources[ref] for ref in refs[key]))
+
+    def _plan_visible(self, task: AgentTask) -> bool:
+        if task.id not in self.plans:
+            has_sources, visible = self.proofs["goal_plan", task.id]
+            if not has_sources:
+                goal = (task.task_state or {}).get("goal") or {}
+                try:
+                    visible = isinstance(goal, dict) and int(goal.get("revision") or 1) <= 1
+                except (TypeError, ValueError):
+                    visible = False
+            self.plans[task.id] = visible
+        return self.plans[task.id]
+
+    def plan_visible(self, task: AgentTask) -> bool:
+        self._load_proofs({("goal_plan", task.id)}, set())
+        return self._plan_visible(task)
+
+    def resolve(
+        self, tasks: Sequence[AgentTask], groups: Mapping[str, Sequence[ChildObject]],
+    ) -> None:
+        children = {
+            (kind, row.id): row for kind, rows in groups.items() for row in rows
+            if (kind, row.id) not in self.children
+        }
+        # Expand Event -> Action -> Evidence in topological order; query each layer once.
+        dependencies: dict[OwnerKey, OwnerKey | None] = {}
+        for key, row in children.items():
+            if isinstance(row, AgentTaskEvent) and row.action_id:
+                dependencies[key] = ("agent_action", row.action_id)
+        self._load_children(children, dependencies, "agent_action", AgentAction, (
+            AgentAction.id, AgentAction.task_id, AgentAction.result_summary,
+        ))
+        for key, row in children.items():
+            if isinstance(row, AgentAction) and row.result_summary:
+                summary = cast(object, row.result_summary)
+                if not isinstance(summary, dict) or "evidence_id" in summary:
+                    evidence_id = summary.get("evidence_id") if isinstance(summary, dict) else None
+                    dependencies[key] = ("task_evidence", evidence_id) if isinstance(evidence_id, str) else None
+        self._load_children(children, dependencies, "task_evidence", TaskEvidence, (
+            TaskEvidence.id, TaskEvidence.task_id,
+        ))
+
+        pending_tasks = {task.id: task for task in tasks if task.id not in self.tasks}
+        missing = {row.task_id for row in children.values() if row.task_id} - self.tasks.keys() - pending_tasks.keys()
+        if missing:
+            pending_tasks.update(
+                (row.id, row) for row in self.db.query(AgentTask)
+                .options(load_only(*TASK_VISIBILITY_COLUMNS)).filter(AgentTask.id.in_(missing))
+            )
+        self._load_proofs(
+            set(children) | {(kind, identity) for identity in pending_tasks for kind in ("agent_task", "goal_plan")},
+            {task.source_turn_record_id for task in pending_tasks.values() if task.source_turn_record_id},
+        )
+        blocked_threads = ForgetVisibilityService.blocked_thread_targets(
+            self.db, {task.id: (task.thread_id, task.created_at) for task in pending_tasks.values()},
+        )
+        for task in pending_tasks.values():
+            has_sources, visible = self.proofs["agent_task", task.id]
+            if not has_sources:
+                state = task.task_state or {}
+                visible = not (state.get("inputs") or state.get("last_decision") or task.report)
+            self.tasks[task.id] = (
+                task.id not in blocked_threads
+                and (not task.source_turn_record_id or self.sources["turn_record", task.source_turn_record_id])
+                and visible and self._plan_visible(task)
+            )
+        # Evidence (and independent children) before Action before Event.
+        for key, row in sorted(children.items(), key=lambda pair: (
+            isinstance(pair[1], AgentTaskEvent), isinstance(pair[1], AgentAction),
+        )):
+            has_sources, visible = self.proofs[key]
+            if not has_sources:
+                visible = not (
+                    isinstance(row, (TaskEvidence, TaskArtifact, AgentTaskCheckpoint))
+                    or (isinstance(row, AgentAction) and row.result_summary and key not in dependencies)
+                )
+            if key in dependencies:
+                dependency = dependencies[key]
+                visible = visible and dependency is not None and self.children.get(dependency, False)
+            self.children[key] = self.tasks.get(row.task_id or "", False) and visible
+
+    def _load_children(
+        self, children: dict[OwnerKey, ChildObject], dependencies: dict[OwnerKey, OwnerKey | None],
+        kind: str, model: type[AgentAction] | type[TaskEvidence], columns: tuple[InstrumentedAttribute[Any], ...],
+    ) -> None:
+        ids = {
+            target[1] for target in dependencies.values()
+            if target and target[0] == kind and target not in children and target not in self.children
+        }
+        if ids:
+            for row in self.db.query(model).options(load_only(*columns)).filter(model.id.in_(ids)):
+                children[kind, row.id] = row
+
+
+class TaskReadRepository:
+    def __init__(self, db: Session, visibility: ReadVisibilityContext | None = None) -> None:
+        self.db: Session = db
+        self.visibility: ReadVisibilityContext | None = visibility
 
     def has_sources(self, owner_type: str, owner_id: str) -> bool:
         return (
@@ -98,31 +253,20 @@ class TaskReadRepository:
         )
 
     def plan_visible(self, task: AgentTask) -> bool:
-        if self.has_sources("goal_plan", task.id):
-            return sources_visible(self.db, "goal_plan", task.id)
-        goal = (task.task_state or {}).get("goal") or {}
-        try:
-            return isinstance(goal, dict) and int(goal.get("revision") or 1) <= 1
-        except (TypeError, ValueError):
-            return False
+        return (self.visibility or ReadVisibilityContext(self.db)).plan_visible(task)
 
     def task_visible(self, task: AgentTask) -> bool:
-        refs = SourceReferences(
-            thread_ids={task.thread_id}, thread_times={task.thread_id: task.created_at}
-        )
-        if task.source_turn_record_id:
-            refs.turns[task.source_turn_record_id] = None
-        if blocked_sources_reason(self.db, refs):
-            return False
-        if self.has_sources("agent_task", task.id):
-            if not sources_visible(self.db, "agent_task", task.id):
-                return False
-        else:
-            state = task.task_state or {}
-            if state.get("inputs") or state.get("last_decision") or task.report:
-                # Legacy merged state cannot be justified by its original Turn.
-                return False
-        return self.plan_visible(task)
+        return task.id in self.task_visible_many([task])
+
+    def task_visible_many(self, tasks: Sequence[AgentTask]) -> set[str]:
+        context = self.visibility or ReadVisibilityContext(self.db)
+        context.resolve(tasks, {})
+        return {task.id for task in tasks if context.tasks.get(task.id)}
+
+    def visible_children_many(self, owner_type: str, items: Sequence[ChildObject]) -> set[str]:
+        context = self.visibility or ReadVisibilityContext(self.db)
+        context.resolve((), {owner_type: items})
+        return {item.id for item in items if context.children.get((owner_type, item.id))}
 
     def get_task(self, task_id: str, *, for_update: bool = False) -> AgentTask | None:
         query = self.db.query(AgentTask).filter(AgentTask.id == task_id)
@@ -135,31 +279,11 @@ class TaskReadRepository:
         return task if task is not None and self.task_visible(task) else None
 
     def visible_child(self, owner_type: str, item: ChildObject) -> bool:
-        task = self.db.get(AgentTask, item.task_id)
-        if task is None or not self.task_visible(task):
-            return False
-        if self.has_sources(owner_type, item.id):
-            return sources_visible(self.db, owner_type, item.id)
-        if isinstance(item, (TaskEvidence, TaskArtifact, AgentTaskCheckpoint)):
-            return False
-        if isinstance(item, AgentAction):
-            if item.result_summary:
-                evidence_id = item.result_summary.get("evidence_id")
-                evidence = (
-                    self.db.get(TaskEvidence, evidence_id)
-                    if isinstance(evidence_id, str)
-                    else None
-                )
-                return evidence is not None and self.visible_child(
-                    "task_evidence", evidence
-                )
-        if isinstance(item, AgentTaskEvent) and item.action_id:
-            action = self.db.get(AgentAction, item.action_id)
-            return action is not None and self.visible_child("agent_action", action)
-        return True
+        return item.id in self.visible_children_many(owner_type, [item])
 
     def filter_children(self, owner_type: str, items: Sequence[Child]) -> list[Child]:
-        return [item for item in items if self.visible_child(owner_type, item)]
+        visible = self.visible_children_many(owner_type, items)
+        return [item for item in items if item.id in visible]
 
     def actions(self, task_id: str, limit: int = 20) -> list[AgentAction]:
         rows = (
@@ -275,12 +399,16 @@ class TaskReadRepository:
         rows = (
             query.order_by(AgentTask.updated_at.desc(), AgentTask.id).limit(4096).all()
         )
-        return [task for task in rows if self.task_visible(task)][:limit]
+        visible = self.task_visible_many(rows)
+        return [task for task in rows if task.id in visible][:limit]
 
 
     def task_candidates(self, thread_id: str, before: tuple[datetime, str] | None = None, limit: int = 128) -> list[AgentTask]:
         from sqlalchemy import and_, or_
-        query = self.db.query(AgentTask).filter_by(thread_id=thread_id)
+        query = self.db.query(AgentTask).options(load_only(
+            *TASK_VISIBILITY_COLUMNS, AgentTask.title, AgentTask.task_type,
+            AgentTask.status, AgentTask.updated_at, AgentTask.target_node_id,
+        )).filter_by(thread_id=thread_id)
         if before is not None:
             stamp, task_id = before
             query = query.filter(or_(AgentTask.updated_at < stamp,

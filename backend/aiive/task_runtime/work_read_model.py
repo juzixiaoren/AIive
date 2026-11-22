@@ -5,14 +5,15 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-from collections import Counter
+from collections import defaultdict
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, TypeVar
 
-from sqlalchemy import func, tuple_
-from sqlalchemy.orm import Session
+from sqlalchemy import and_, func, or_, tuple_
+from sqlalchemy.orm import Session, load_only
 
 from aiive.db.models import (
     AgentAction,
@@ -32,8 +33,17 @@ from aiive.task_runtime.goal_plan import (
 from aiive.task_runtime.goal_questions import (
     PendingQuestion,
     list_open_questions_for_tasks,
+    task_question_candidates,
 )
-from aiive.task_runtime.read_repository import TaskReadRepository
+from aiive.forget.concurrency import forget_revision
+from aiive.task_runtime.read_repository import (
+    TASK_VISIBILITY_COLUMNS,
+    Child,
+    ChildObject,
+    ReadVisibilityContext,
+    TaskContentUnavailable,
+    TaskReadRepository,
+)
 from aiive.task_runtime.repository import TERMINAL_TASK_STATES, canonical_json
 
 class WorkBucket(StrEnum):
@@ -185,19 +195,80 @@ HISTORY_SCAN_LIMIT = 512
 METADATA_LIMIT = 50
 
 
+T = TypeVar("T")
+ACTION_COLUMNS = (
+    AgentAction.id, AgentAction.task_id, AgentAction.sequence, AgentAction.status,
+    AgentAction.capability_id, AgentAction.target_node_id, AgentAction.result_summary,
+    AgentAction.arguments_hash, AgentAction.descriptor_hash, AgentAction.execution_token,
+)
+TIMELINE_COLUMNS = (
+    AgentTaskEvent.id, AgentTaskEvent.task_id, AgentTaskEvent.sequence, AgentTaskEvent.event_type,
+    AgentTaskEvent.visibility, AgentTaskEvent.created_at, AgentTaskEvent.action_id, AgentTaskEvent.run_id,
+)
+
+
+@dataclass
+class WorkProjectionInputs:
+    task: AgentTask
+    actions: list[AgentAction]
+    events: list[AgentTaskEvent]
+    approvals: list[ApprovalRequest]
+    questions: list[PendingQuestion]
+    high_sequence: int
+    action_scan_limited: bool
+
+
+class WorkReadRetry(RuntimeError):
+    """Concurrent Forget invalidated both read attempts."""
+
+
+def group_by_task(rows: list[Child]) -> dict[str, list[Child]]:
+    groups: dict[str, list[Child]] = defaultdict(list)
+    for row in rows:
+        if row.task_id is not None:
+            groups[row.task_id].append(row)
+    return groups
+
+
 class WorkReadModel:
     def __init__(self, db: Session) -> None:
         self.db: Session = db
         self.reader: TaskReadRepository = TaskReadRepository(db)
         self._nodes: dict[str, DesktopNode] = {}
         self._question_steps: set[tuple[str, str]] = set()
+        self._commands: dict[str, str] | None = None
+
+    def _stable_read(self, read: Callable[[WorkReadModel, int], T]) -> T:
+        with self.db.no_autoflush:
+            for _ in range(2):
+                revision = forget_revision(self.db)
+                attempt = WorkReadModel(self.db)
+                attempt.reader = TaskReadRepository(self.db, ReadVisibilityContext(self.db))
+                try:
+                    result = read(attempt, revision)
+                except (TaskContentUnavailable, ValueError):
+                    if revision == forget_revision(self.db):
+                        raise
+                else:
+                    if revision == forget_revision(self.db):
+                        return result
+                # READ COMMITTED sees new rows, but existing ORM identities need refreshing.
+                self.db.expire_all()
+        raise WorkReadRetry("work_visibility_changed_retry")
 
     def project_many(self, tasks: list[AgentTask]) -> list[dict[str, Any]]:
+        return self._stable_read(lambda attempt, _: [
+            attempt._project_detail(inputs) for inputs in attempt._load_projections(tasks, detail=True)
+        ])
+
+    def _load_projections(
+        self, tasks: list[AgentTask], *, detail: bool,
+        extra: dict[str, list[ChildObject]] | None = None, high: dict[str, int] | None = None,
+    ) -> list[WorkProjectionInputs]:
         ids = [task.id for task in tasks]
         if not ids:
             return []
-        # Rank in SQL before any Forget checks: historical size must not increase
-        # the number of ORM visibility queries. Each task/status has a fixed budget.
+        # The existing per-status scan cap also controls the data warning.
         action_rank = (
             self.db.query(
                 AgentAction.id.label("id"),
@@ -223,72 +294,105 @@ class WorkReadModel:
             )
             .subquery()
         )
-        action_candidates = (
-            self.db.query(AgentAction)
+        awaiting_tasks = [task.id for task in tasks if task.status == "blocked_approval"]
+        columns = ACTION_COLUMNS + ((
+            AgentAction.risk_level, AgentAction.requires_approval, AgentAction.created_at,
+            AgentAction.started_at, AgentAction.completed_at,
+        ) if detail else ())
+        action_query = (
+            self.db.query(AgentAction, action_rank.c.rank)
+            .options(load_only(*columns))
             .join(action_rank, action_rank.c.id == AgentAction.id)
             .filter(action_rank.c.rank <= 33)
-            .order_by(AgentAction.sequence.desc())
-            .all()
         )
-        action_counts: Counter[tuple[str, str]] = Counter()
-        retained_actions = []
-        budget_exceeded: set[str] = set()
-        for action in action_candidates:
-            key = (action.task_id, action.status)
-            action_counts[key] += 1
-            if action_counts[key] <= 32:
-                retained_actions.append(action)
-            else:
-                budget_exceeded.add(action.task_id)
-        actions = self.reader.filter_children("agent_action", retained_actions)
+        if not detail:
+            action_query = action_query.filter(or_(
+                action_rank.c.rank == 33,
+                AgentAction.status.in_(("running", "dispatched", "unknown")),
+                and_(AgentAction.status.in_(("succeeded", "failed")), AgentAction.target_node_id.is_not(None)),
+                and_(AgentAction.status == "awaiting_approval", AgentAction.task_id.in_(awaiting_tasks)),
+            ))
+        ranked = action_query.order_by(AgentAction.sequence.desc()).all()
+        budget_exceeded = {action.task_id for action, rank in ranked if rank == 33}
+        action_candidates = [action for action, rank in ranked if rank <= 32]
 
-        event_rank = (
-            self.db.query(
-                AgentTaskEvent.id.label("id"),
-                func.row_number()
-                .over(
-                    partition_by=AgentTaskEvent.task_id,
-                    order_by=AgentTaskEvent.sequence.desc(),
+        blocked_tasks = [
+            task.id for task in tasks if task.status == "blocked_user"
+            and not self._parse_plan(task)[0]
+        ]
+        event_candidates = []
+        if blocked_tasks:
+            event_rank = (
+                self.db.query(
+                    AgentTaskEvent.id.label("id"),
+                    func.row_number().over(
+                        partition_by=AgentTaskEvent.task_id,
+                        order_by=AgentTaskEvent.sequence.desc(),
+                    ).label("rank"),
                 )
-                .label("rank"),
+                .filter(
+                    AgentTaskEvent.task_id.in_(blocked_tasks),
+                    AgentTaskEvent.event_type.in_(["task_blocked_user", "task_watching"]),
+                )
+                .subquery()
             )
-            .filter(
-                AgentTaskEvent.task_id.in_(ids),
-                AgentTaskEvent.event_type.in_(["task_blocked_user", "task_watching"]),
-            )
-            .subquery()
-        )
-        events = self.reader.filter_children(
-            "agent_task_event",
-            self.db.query(AgentTaskEvent)
-            .join(event_rank, event_rank.c.id == AgentTaskEvent.id)
-            .filter(event_rank.c.rank <= 32)
-            .order_by(AgentTaskEvent.sequence.desc())
-            .all(),
-        )
-        approvals = (
-            self.db.query(ApprovalRequest)
-            .filter(
-                ApprovalRequest.action_id.in_(
-                    [a.id for a in actions if a.status == "awaiting_approval"]
-                ),
-                ApprovalRequest.status == "pending",
-            )
-            .all()
-        )
-        node_ids = {a.target_node_id for a in actions if a.target_node_id} | {
-            t.target_node_id for t in tasks if t.target_node_id
-        }
-        self._nodes = (
-            {
-                node.id: node
-                for node in self.db.query(DesktopNode)
-                .filter(DesktopNode.id.in_(node_ids))
+            event_candidates = (
+                self.db.query(AgentTaskEvent)
+                .join(event_rank, event_rank.c.id == AgentTaskEvent.id)
+                .filter(event_rank.c.rank <= 32)
+                .order_by(AgentTaskEvent.sequence.desc())
                 .all()
-            }
-            if node_ids
-            else {}
-        )
+            )
+        awaiting_ids = [
+            action.id for action in action_candidates
+            if action.status == "awaiting_approval" and action.task_id in awaiting_tasks
+        ]
+        approval_candidates = list(self.db.query(ApprovalRequest).options(load_only(
+            ApprovalRequest.id, ApprovalRequest.task_id, ApprovalRequest.action_id, ApprovalRequest.thread_id,
+            ApprovalRequest.tool_name, ApprovalRequest.tool_args, ApprovalRequest.tool_args_hash,
+            ApprovalRequest.descriptor_hash, ApprovalRequest.risk_snapshot, ApprovalRequest.created_at,
+            ApprovalRequest.expires_at,
+        )).filter(
+            ApprovalRequest.action_id.in_(awaiting_ids),
+            ApprovalRequest.status == "pending",
+        ).all()) if awaiting_ids else []
+
+        now = datetime.now(UTC)
+        question_candidates = task_question_candidates(self.db, tasks, now)
+        groups: dict[str, Sequence[ChildObject]] = dict(extra or {})
+        groups["agent_task_event"] = [*groups.get("agent_task_event", ()), *event_candidates, *question_candidates.events]
+        groups["agent_action"] = action_candidates
+        groups["approval_request"] = approval_candidates
+        context = self.reader.visibility
+        assert context is not None
+        context.resolve(tasks, groups)
+        visible_tasks = self.reader.task_visible_many(tasks)
+        tasks = [task for task in tasks if task.id in visible_tasks]
+        actions = group_by_task(self.reader.filter_children("agent_action", action_candidates))
+        events = group_by_task(self.reader.filter_children("agent_task_event", event_candidates))
+        approvals = group_by_task(self.reader.filter_children("approval_request", approval_candidates))
+        node_ids = {
+            node_id for task in tasks for _, node_id, _ in [self._activity(task, actions.get(task.id, []))]
+            if node_id
+        }
+        self._nodes = {
+            node.id: node for node in self.db.query(DesktopNode).options(load_only(
+                DesktopNode.id, DesktopNode.name, DesktopNode.platform, DesktopNode.lease_expires_at,
+            )).filter(DesktopNode.id.in_(node_ids))
+        } if node_ids else {}
+        command_ids = []
+        for task in tasks:
+            reconciliation = [
+                action for action in actions.get(task.id, [])
+                if action.status == "unknown" and not action.target_node_id
+            ]
+            command_ids.extend(action.id for action in (reconciliation if detail else reconciliation[:1])
+                               if action.capability_id == "run_shell")
+        self._commands = {
+            identity: str((arguments or {}).get("command") or "")[:1000]
+            for identity, arguments in self.db.query(AgentAction.id, AgentAction.arguments)
+            .filter(AgentAction.id.in_(command_ids))
+        } if command_ids else {}
         # Existence only: an expired/resolved/forgotten question must not reappear
         # through the legacy step.note fallback. Restrict to the current plan's steps.
         pairs: list[tuple[str, str]] = []
@@ -313,37 +417,58 @@ class WorkReadModel:
             if pairs
             else set()
         )
-        questions = list_open_questions_for_tasks(self.db, ids)
-        high = dict(
-            self.db.query(AgentTaskEvent.task_id, func.max(AgentTaskEvent.sequence))
-            .filter(AgentTaskEvent.task_id.in_(ids))
-            .group_by(AgentTaskEvent.task_id)
-            .all()
+        questions = list_open_questions_for_tasks(
+            self.db, ids, now=now, reader=self.reader, candidates=question_candidates,
         )
-        projections = [
-            self.project(
-                task,
-                [a for a in actions if a.task_id == task.id],
-                [e for e in events if e.task_id == task.id],
-                approvals,
-                questions.get(task.id, []),
-                high.get(task.id, 0),
+        if high is None:
+            high = self._high_water(ids)
+        return [
+            WorkProjectionInputs(
+                task, actions.get(task.id, []), events.get(task.id, []), approvals.get(task.id, []),
+                questions.get(task.id, []), high.get(task.id, 0), task.id in budget_exceeded,
             )
             for task in tasks
         ]
-        for projection in projections:
-            projection["actions"] = [
-                {"id": a.id, "sequence": a.sequence, "capability_id": a.capability_id,
-                 "status": a.status, "risk_level": a.risk_level,
-                 "requires_approval": a.requires_approval, "created_at": a.created_at,
-                 "started_at": a.started_at, "completed_at": a.completed_at}
-                for a in actions if a.task_id == projection["task_id"]
-            ]
-            if projection["task_id"] in budget_exceeded:
-                projection["data_warning"] = (
-                    projection["data_warning"] or "action_history_scan_limit"
-                )
-        return projections
+
+    def _inbox_summaries(self, tasks: list[AgentTask]) -> dict[str, dict[str, Any]]:
+        return {
+            inputs.task.id: self._project_summary(inputs, detail=False)
+            for inputs in self._load_projections(tasks, detail=False)
+        }
+
+    def _project_summary(self, inputs: WorkProjectionInputs, *, detail: bool) -> dict[str, Any]:
+        projection = self.project(
+            inputs.task, inputs.actions, inputs.events, inputs.approvals,
+            inputs.questions, inputs.high_sequence, detail=detail,
+        )
+        if inputs.action_scan_limited:
+            projection["data_warning"] = projection["data_warning"] or "action_history_scan_limit"
+        return projection
+
+    def _project_detail(self, inputs: WorkProjectionInputs) -> dict[str, Any]:
+        projection = self._project_summary(inputs, detail=True)
+        projection["actions"] = [
+            {"id": action.id, "sequence": action.sequence, "capability_id": action.capability_id,
+             "status": action.status, "risk_level": action.risk_level,
+             "requires_approval": action.requires_approval, "created_at": action.created_at,
+             "started_at": action.started_at, "completed_at": action.completed_at}
+            for action in inputs.actions
+        ]
+        return projection
+
+    def _high_water(self, ids: list[str]) -> dict[str, int]:
+        return dict(self.db.query(AgentTaskEvent.task_id, func.max(AgentTaskEvent.sequence))
+                    .filter(AgentTaskEvent.task_id.in_(ids)).group_by(AgentTaskEvent.task_id).all())
+
+    @staticmethod
+    def _parse_plan(task: AgentTask) -> tuple[GoalPlan | None, str | None]:
+        raw = (task.task_state or {}).get("goal")
+        if raw is not None:
+            try:
+                return GoalPlan.model_validate(raw), None
+            except ValueError:
+                return None, "invalid_goal_plan"
+        return None, None
 
     def project(
         self,
@@ -353,18 +478,21 @@ class WorkReadModel:
         approvals: list[ApprovalRequest],
         questions: list[PendingQuestion],
         high: int,
+        *,
+        detail: bool = True,
     ) -> dict[str, Any]:
-        plan = None
-        warning = None
-        raw = (task.task_state or {}).get("goal")
-        if raw is not None:
-            try:
-                plan = GoalPlan.model_validate(raw)
-            except ValueError:
-                warning = "invalid_goal_plan"
+        plan, warning = self._parse_plan(task)
         items = []
+        attention_count = 0
 
-        def add(kind: str, identity: str, text: str, **kwargs: Any) -> None:
+        def add(
+            kind: str, identity: str, text: str, *,
+            preview: Callable[[], dict[str, Any]] | None = None, **kwargs: Any,
+        ) -> None:
+            nonlocal attention_count
+            attention_count += 1
+            if not detail and items:
+                return
             title, allowed = ATTENTION_ACTIONS[kind]
             resource_id = kwargs.pop("resource_id", identity)
             created_at = kwargs.pop("created_at", task.updated_at)
@@ -382,6 +510,7 @@ class WorkReadModel:
                         created_at=created_at,
                         expires_at=expires_at,
                         allowed_actions=list(allowed),
+                        preview=preview() if preview else None,
                         **kwargs,
                     )
                 )
@@ -390,21 +519,27 @@ class WorkReadModel:
         terminal = task.status in TERMINAL_TASK_STATES or (
             plan and plan.status in TERMINAL_GOAL_STATES
         )
+        def reconciliation_preview(action: AgentAction) -> dict[str, Any]:
+            preview = {"tool_name": action.capability_id, "action_id": action.id}
+            if action.capability_id == "run_shell":
+                preview["command"] = (self._commands.get(action.id, "") if self._commands is not None
+                                      else str((action.arguments or {}).get("command") or "")[:1000])
+            return preview
+
         for action in actions:
             if action.status == "unknown" and not action.target_node_id:
-                preview = {"tool_name": action.capability_id, "action_id": action.id}
-                if action.capability_id == "run_shell":
-                    preview["command"] = str((action.arguments or {}).get("command") or "")[:1000]
                 add("action_reconciliation", action.id,
                     "请核对外部操作是否已完成，或确认它从未执行。",
-                    preview=preview, attempt_id=action.execution_token or action.id)
+                    preview=lambda action=action: reconciliation_preview(action),
+                    attempt_id=action.execution_token or action.id)
         if not terminal and not (plan and plan.status == "paused"):
             if plan and plan.status == "proposed":
                 add("goal_confirmation", task.id, plan.summary)
             elif plan and plan.status == "blocked":
                 add("goal_blocked", task.id, plan.blocked_reason)
+            by_action = {action.id: action for action in actions}
             for approval in approvals:
-                action = next((a for a in actions if a.id == approval.action_id), None)
+                action = by_action.get(approval.action_id or "")
                 if (
                     approval.task_id == task.id
                     and approval.thread_id == task.thread_id
@@ -429,7 +564,7 @@ class WorkReadModel:
                         approval.id,
                         "等待执行审批",
                         approval_id=approval.id,
-                        preview=approval_preview(approval),
+                        preview=lambda approval=approval: approval_preview(approval),
                         created_at=approval.created_at,
                         expires_at=approval.expires_at,
                     )
@@ -512,6 +647,51 @@ class WorkReadModel:
                 "blocked_approval",
             }:
                 warning = "unknown_task_status"
+        current, node_id, source = self._activity(task, actions)
+        node = self._nodes.get(node_id) if node_id else None
+        from aiive.desktop.connection_manager import desktop_connection_manager
+
+        device = {
+            "node_id": node_id,
+            "source": source,
+            "relationship": source,
+            "name": node.name if node else None,
+            "platform": node.platform if node else None,
+            "online": bool(
+                node_id
+                and node
+                and node.lease_expires_at
+                and utc(node.lease_expires_at) > datetime.now(UTC)
+                and desktop_connection_manager.is_connected(node_id)
+            ),
+        }
+        return {
+            "task_id": task.id,
+            "title": task.title,
+            "task_type": task.task_type,
+            "task_status": task.status,
+            "bucket": bucket,
+            "bucket_reason": reason,
+            "data_warning": warning,
+            "attention_count": attention_count,
+            "primary_attention": items[0] if items else None,
+            **({"attention_items": items} if detail else {}),
+            "progress": plan.progress() if plan else None,
+            "current_activity": {
+                "action_id": current.id,
+                "capability_id": current.capability_id,
+                "status": current.status,
+            }
+            if current
+            else None,
+            "target_device": device,
+            "last_sequence": high,
+            "created_at": task.created_at,
+            "updated_at": task.updated_at,
+        }
+
+    @staticmethod
+    def _activity(task: AgentTask, actions: list[AgentAction]) -> tuple[AgentAction | None, str | None, str]:
         current = next(
             (a for a in actions if a.status in {"dispatched", "running"}), None
         )
@@ -539,54 +719,13 @@ class WorkReadModel:
             if device_action
             else ("configured" if node_id else "unknown")
         )
-        node = self._nodes.get(node_id) if node_id else None
-        from aiive.desktop.connection_manager import desktop_connection_manager
-
-        device = {
-            "node_id": node_id,
-            "source": source,
-            "relationship": source,
-            "name": node.name if node else None,
-            "platform": node.platform if node else None,
-            "online": bool(
-                node_id
-                and node
-                and node.lease_expires_at
-                and utc(node.lease_expires_at) > datetime.now(UTC)
-                and desktop_connection_manager.is_connected(node_id)
-            ),
-        }
-        return {
-            "task_id": task.id,
-            "title": task.title,
-            "task_type": task.task_type,
-            "task_status": task.status,
-            "bucket": bucket,
-            "bucket_reason": reason,
-            "data_warning": warning,
-            "attention_count": len(items),
-            "primary_attention": items[0] if items else None,
-            "attention_items": items,
-            "progress": plan.progress() if plan else None,
-            "current_activity": {
-                "action_id": current.id,
-                "capability_id": current.capability_id,
-                "status": current.status,
-            }
-            if current
-            else None,
-            "target_device": device,
-            "last_sequence": high,
-            "created_at": task.created_at,
-            "updated_at": task.updated_at,
-        }
+        return current, node_id, source
 
     def project_event(self, event: AgentTaskEvent) -> dict[str, Any] | None:
         """Shared, fail-closed event projection; never copy arbitrary payload strings."""
         if (
             event.visibility == "internal"
             or event.event_type not in TIMELINE_TITLES
-            or not self.reader.visible_child("agent_task_event", event)
         ):
             return None
         title = TIMELINE_TITLES[event.event_type]
@@ -608,50 +747,87 @@ class WorkReadModel:
             "run_id": event.run_id,
         }
 
+    def _load_task(self, task_id: str, *, detail: bool = False) -> AgentTask:
+        columns = TASK_VISIBILITY_COLUMNS
+        if detail:
+            columns = (*columns, AgentTask.title, AgentTask.task_type, AgentTask.status,
+                       AgentTask.target_node_id, AgentTask.updated_at, AgentTask.goal, AgentTask.last_error)
+        task = self.db.query(AgentTask).options(load_only(*columns)).filter(AgentTask.id == task_id).one_or_none()
+        if task is None:
+            raise TaskContentUnavailable("task_unavailable")
+        return task
+
+    def _require_visible(self, task: AgentTask, groups: dict[str, list[ChildObject]]) -> None:
+        context = self.reader.visibility
+        assert context is not None
+        context.resolve([task], groups)
+        if not self.reader.task_visible(task):
+            raise TaskContentUnavailable("task_unavailable")
+
     def timeline(
         self, task_id: str, after_sequence: int = 0, limit: int = 50
     ) -> dict[str, Any]:
+        return self._stable_read(lambda attempt, _: attempt._timeline(task_id, after_sequence, limit))
+
+    def _timeline(self, task_id: str, after_sequence: int, limit: int) -> dict[str, Any]:
+        task = self._load_task(task_id)
         rows = (
-            self.db.query(AgentTaskEvent)
+            self.db.query(AgentTaskEvent).options(load_only(*TIMELINE_COLUMNS))
             .filter(
                 AgentTaskEvent.task_id == task_id,
                 AgentTaskEvent.sequence > after_sequence,
             )
             .order_by(AgentTaskEvent.sequence)
-            .limit(limit)
+            .limit(limit + 1)
             .all()
         )
+        candidates = [row for row in rows[:limit]
+                      if row.visibility != "internal" and row.event_type in TIMELINE_TITLES]
+        self._require_visible(task, {"agent_task_event": list(candidates)})
         items = [
-            item for event in rows if (item := self.project_event(event)) is not None
+            item for row in self.reader.filter_children("agent_task_event", candidates)
+            if (item := self.project_event(row)) is not None
         ]
-        cursor = rows[-1].sequence if rows else after_sequence
-        more = (
-            self.db.query(AgentTaskEvent.id)
-            .filter(AgentTaskEvent.task_id == task_id, AgentTaskEvent.sequence > cursor)
-            .first()
-            is not None
-        )
-        return {"items": items, "next_sequence": cursor, "has_more": more}
+        cursor = rows[min(limit, len(rows)) - 1].sequence if rows and limit else after_sequence
+        return {"items": items, "next_sequence": cursor, "has_more": len(rows) > limit}
 
     def timeline_history(
-        self, task_id: str, before_sequence: int | None = None, limit: int = 50,
+        self, task_id: str, before_sequence: int | None = None, limit: int = 50, *, after_sequence: int = 0,
     ) -> dict[str, Any]:
-        query = self.db.query(AgentTaskEvent).filter(
+        def read(attempt: WorkReadModel, _: int) -> dict[str, Any]:
+            task = attempt._load_task(task_id)
+            if after_sequence:
+                attempt._require_visible(task, {})
+                raise ValueError("choose_one_timeline_cursor")
+            rows = attempt._timeline_history_rows(task_id, before_sequence)
+            attempt._require_visible(task, {"agent_task_event": list(rows[:HISTORY_SCAN_LIMIT])})
+            return attempt._project_history(rows, before_sequence, limit)
+        return self._stable_read(read)
+
+    def _timeline_history_rows(
+        self, task_id: str, before_sequence: int | None,
+    ) -> list[AgentTaskEvent]:
+        query = self.db.query(AgentTaskEvent).options(load_only(*TIMELINE_COLUMNS)).filter(
             AgentTaskEvent.task_id == task_id,
             AgentTaskEvent.visibility != "internal",
             AgentTaskEvent.event_type.in_(TIMELINE_TITLES),
         )
         if before_sequence is not None:
             query = query.filter(AgentTaskEvent.sequence < before_sequence)
-        rows = query.order_by(AgentTaskEvent.sequence.desc()).limit(HISTORY_SCAN_LIMIT + 1).all()
+        return list(query.order_by(AgentTaskEvent.sequence.desc()).limit(HISTORY_SCAN_LIMIT + 1).all())
+
+    def _project_history(
+        self, rows: list[AgentTaskEvent], before_sequence: int | None = None, limit: int = 50,
+    ) -> dict[str, Any]:
+        scanned_rows = rows[:HISTORY_SCAN_LIMIT]
+        visible = self.reader.visible_children_many("agent_task_event", scanned_rows)
         items = []
         cursor = before_sequence
         scanned = 0
-        for row in rows[:HISTORY_SCAN_LIMIT]:
+        for row in scanned_rows:
             cursor = row.sequence
             scanned += 1
-            item = self.project_event(row)
-            if item is not None:
+            if row.id in visible and (item := self.project_event(row)) is not None:
                 items.append(item)
                 if len(items) == limit:
                     break
@@ -660,11 +836,29 @@ class WorkReadModel:
     def metadata_page(
         self, task_id: str, kind: str, cursor: str | None = None, limit: int = METADATA_LIMIT,
     ) -> dict[str, Any]:
-        model, owner, fields = {
+        def read(attempt: WorkReadModel, _: int) -> dict[str, Any]:
+            task = attempt._load_task(task_id)
+            try:
+                owner, fields, rows = attempt._metadata_rows(task_id, kind, cursor)
+            except ValueError:
+                # Hidden and absent tasks have the same response even with a bad cursor.
+                attempt._require_visible(task, {})
+                raise
+            attempt._require_visible(task, {owner: list(rows[:HISTORY_SCAN_LIMIT])})
+            return attempt._project_metadata(task_id, kind, owner, fields, rows, limit)
+        return self._stable_read(read)
+
+    def _metadata_rows(
+        self, task_id: str, kind: str, cursor: str | None = None,
+    ) -> tuple[str, tuple[str, ...], list[TaskArtifact | TaskEvidence]]:
+        model, owner, extras = {
             "artifacts": (TaskArtifact, "task_artifact", ("name", "artifact_type")),
             "evidence": (TaskEvidence, "task_evidence", ("kind",)),
         }[kind]
-        query = self.db.query(model).filter(model.task_id == task_id)
+        fields = ("id", "summary", "mime_type", "content_size", "content_hash", "created_at", *extras)
+        query = self.db.query(model).options(load_only(
+            model.task_id, *(getattr(model, field) for field in fields),
+        )).filter(model.task_id == task_id)
         if cursor:
             try:
                 scope, table, created_at, row_id = json.loads(base64.b64decode(cursor, altchars=b"-_", validate=True))
@@ -675,17 +869,22 @@ class WorkReadModel:
                 raise ValueError("invalid_work_cursor") from None
             query = query.filter(tuple_(model.created_at, model.id) < before)
         rows = query.order_by(model.created_at.desc(), model.id.desc()).limit(HISTORY_SCAN_LIMIT + 1).all()
+        return owner, fields, rows
+
+    def _project_metadata(
+        self, task_id: str, kind: str, owner: str, fields: tuple[str, ...],
+        rows: list[TaskArtifact | TaskEvidence], limit: int = METADATA_LIMIT,
+    ) -> dict[str, Any]:
+        scanned_rows = rows[:HISTORY_SCAN_LIMIT]
+        visible = self.reader.visible_children_many(owner, scanned_rows)
         items = []
         last = None
         scanned = 0
-        for row in rows[:HISTORY_SCAN_LIMIT]:
+        for row in scanned_rows:
             last = row
             scanned += 1
-            if self.reader.visible_child(owner, row):
-                items.append({
-                    key: getattr(row, key)
-                    for key in ("id", "summary", "mime_type", "content_size", "content_hash", "created_at", *fields)
-                })
+            if row.id in visible:
+                items.append({key: getattr(row, key) for key in fields})
                 if len(items) == limit:
                     break
         more = scanned < len(rows)
@@ -697,6 +896,9 @@ class WorkReadModel:
     def inbox(
         self, bucket: str = "attention", limit: int = 30, cursor: str | None = None
     ) -> dict[str, Any]:
+        return self._stable_read(lambda attempt, _: attempt._inbox(bucket, limit, cursor))
+
+    def _inbox(self, bucket: str, limit: int, cursor: str | None) -> dict[str, Any]:
         state = self.db.get(ConversationState, "default")
         thread = state.current_thread_id if state else None
         before = None
@@ -729,12 +931,8 @@ class WorkReadModel:
             batch = self.reader.task_candidates(thread, before)
             if not batch:
                 break
-            projections = {
-                p["task_id"]: p
-                for p in self.project_many(
-                    [t for t in batch if self.reader.task_visible(t)]
-                )
-            }
+            visible = self.reader.task_visible_many(batch)
+            projections = self._inbox_summaries([t for t in batch if t.id in visible])
             for task in batch:
                 scanned += 1
                 p = projections.get(task.id)
@@ -766,16 +964,28 @@ class WorkReadModel:
                     }
                 ).encode()
             ).decode()
-        for p in items:
-            p.pop("attention_items")
-            p.pop("actions")
         return {"items": items, "next_cursor": token, "has_more": more}
 
-    def work_view(self, task: AgentTask) -> dict[str, Any]:
-        from aiive.forget.concurrency import forget_revision
+    def work_view(self, task: str | AgentTask) -> dict[str, Any]:
+        task_id = task if isinstance(task, str) else task.id
+        return self._stable_read(lambda attempt, revision: attempt._work_view(task_id, revision))
 
-        visibility_revision = forget_revision(self.db)
-        projection = self.project_many([task])[0]
+    def _work_view(self, task_id: str, visibility_revision: int) -> dict[str, Any]:
+        task = self._load_task(task_id, detail=True)
+        # Capture the raw high water before loading history so the client can
+        # recover every event that arrives while the rest of the snapshot is read.
+        high = self._high_water([task_id])
+        history_rows = self._timeline_history_rows(task_id, None)
+        artifact_owner, artifact_fields, artifact_rows = self._metadata_rows(task_id, "artifacts")
+        evidence_owner, evidence_fields, evidence_rows = self._metadata_rows(task_id, "evidence")
+        inputs = self._load_projections([task], detail=True, high=high, extra={
+            "agent_task_event": list(history_rows[:HISTORY_SCAN_LIMIT]),
+            artifact_owner: list(artifact_rows[:HISTORY_SCAN_LIMIT]),
+            evidence_owner: list(evidence_rows[:HISTORY_SCAN_LIMIT]),
+        })
+        if not inputs:
+            raise TaskContentUnavailable("task_unavailable")
+        projection = self._project_detail(inputs[0])
         goal = None
         if (task.task_state or {}).get("goal"):
             try:
@@ -787,9 +997,9 @@ class WorkReadModel:
                         step["trigger"].pop("match", None)
             except ValueError:
                 pass
-        history = self.timeline_history(task.id)
-        artifact_page = self.metadata_page(task.id, "artifacts")
-        evidence_page = self.metadata_page(task.id, "evidence")
+        history = self._project_history(history_rows)
+        artifact_page = self._project_metadata(task_id, "artifacts", artifact_owner, artifact_fields, artifact_rows)
+        evidence_page = self._project_metadata(task_id, "evidence", evidence_owner, evidence_fields, evidence_rows)
         artifacts = artifact_page["items"]
         evidence = evidence_page["items"]
         truncation = {

@@ -262,6 +262,7 @@ test("selection races and paginated duplicate items cannot cross tasks or bucket
     timeline: async () => ({ items: [], next_sequence: 5, has_more: false }),
   });
   store.select("old");
+  await tick();
   store.select("new");
   resolve();
   await store.refresh();
@@ -274,6 +275,58 @@ test("selection races and paginated duplicate items cannot cross tasks or bucket
   store.dispose();
   await store.refresh();
   assert.equal(count, 3);
+});
+
+test("detail and incremental timeline render while the inbox is pending", async () => {
+  let finishInbox;
+  const inbox = new Promise(resolve => { finishInbox = resolve; });
+  const deltaCalls = [];
+  const store = new WorkController({
+    inbox: () => inbox,
+    view: async id => view(id),
+    timeline: async (id, after) => {
+      deltaCalls.push([id, after]);
+      return { items: [{ id: "6", sequence: 6 }], next_sequence: 6, has_more: false };
+    },
+  });
+  store.select("task");
+  const refresh = store.refresh();
+  await tick();
+  assert.equal(store.state.view.task.task_id, "task");
+  assert.deepEqual(store.state.timeline.map(row => row.sequence), [1, 6]);
+  assert.deepEqual(deltaCalls, [["task", 5]]);
+  assert.equal(store.state.detailLoading, false);
+  assert.equal(store.state.inboxLoading, true);
+  finishInbox({ items: [{ task_id: "task" }], next_cursor: null, has_more: false });
+  await refresh;
+  assert.equal(store.state.items[0].task_id, "task");
+  assert.equal(store.state.inboxLoading, false);
+});
+
+test("inbox and a newly selected detail can render while the previous detail is pending", async () => {
+  let finishOld;
+  const old = new Promise(resolve => { finishOld = resolve; });
+  const deltaCalls = [];
+  const store = new WorkController({
+    inbox: async () => ({ items: [{ task_id: "new" }], next_cursor: null, has_more: false }),
+    view: id => id === "old" ? old : Promise.resolve(view(id)),
+    timeline: async (id, after) => {
+      deltaCalls.push([id, after]);
+      return { items: [], next_sequence: after, has_more: false };
+    },
+  });
+  store.select("old");
+  await tick();
+  assert.equal(store.state.items[0].task_id, "new");
+  assert.equal(store.state.inboxLoading, false);
+  assert.equal(store.state.detailLoading, true);
+  store.select("new");
+  await tick();
+  assert.equal(store.state.view.task.task_id, "new");
+  finishOld(view("old"));
+  await tick();
+  assert.equal(store.state.view.task.task_id, "new");
+  assert.deepEqual(deltaCalls, [["new", 5]]);
 });
 
 test("work_changed is invalidation only; duplicates and stale versions do not refresh again", async () => {
@@ -742,7 +795,8 @@ test("work snapshots isolate inbox/view/timeline failures", async () => {
     assert.deepEqual(store.state.items.map(i => i.task_id), ["inbox", "both"].includes(failure) ? [] : ["fresh"]);
     assert.equal(store.state.view?.task.task_id, ["view404", "viewNetwork", "both"].includes(failure) ? undefined : "selected");
     assert.equal(store.state.timeline.length, ["view404", "viewNetwork", "both"].includes(failure) ? 0 : 1);
-    assert.ok(store.state.error);
+    assert.equal(Boolean(store.state.inboxError), ["inbox", "both"].includes(failure));
+    assert.equal(Boolean(store.state.detailError), failure !== "inbox");
     store.dispose();
   }
 });
@@ -797,7 +851,7 @@ test("stale pagination rejection cannot replace a newer authoritative snapshot",
   failPage(new Error("stale page failed"));
   await pagination;
   assert.equal(store.state.items[0].task_id, "snapshot-2");
-  assert.equal(store.state.error, "");
+  assert.equal(store.state.inboxError, "");
   store.dispose();
 });
 
