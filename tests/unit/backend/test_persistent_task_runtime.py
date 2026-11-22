@@ -93,6 +93,7 @@ def test_main_agent_has_task_reminder_memory_and_privacy_entrypoints() -> None:
         "get_current_time", "schedule_reminder", "list_reminders", "cancel_reminder",
         "confirm_reminder", "snooze_reminder", "memory_search", "memory_timeline", "remember_or_update",
         "history_search", "get_tool_operation_status", "forget", "forget_status",
+        "web_search",
     }
     assert registry.get("desktop_fs_read_text") is None
     assert registry.get("read_text_file") is None

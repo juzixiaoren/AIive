@@ -147,7 +147,7 @@ class ToolResultNormalizer:
         """
         result = []
         for d in turn_dicts:
-            if d.get("type") == "tool_result":
+            if d.get("type") == "tool_result" and not d.get("web_search_compacted"):
                 tool_name = str(d.get("tool_name") or d.get("name") or "")
                 if tool_name == "get_task_status":
                     result.append(d)
@@ -174,7 +174,7 @@ class ToolResultNormalizer:
         """激进引用化：所有 tool_results 全部替换为引用（无在线内检查）。"""
         result = []
         for d in turn_dicts:
-            if d.get("type") == "tool_result":
+            if d.get("type") == "tool_result" and not d.get("web_search_compacted"):
                 result_text = tool_result_content(
                     d.get("tool_result", {}), str(d.get("tool_name") or d.get("name") or ""),
                 )

@@ -194,11 +194,13 @@ class _ToolGate:
         self.lock: Any = threading.Lock()
         self.cancelled: bool = False
         self.forget_started: bool = False
+        self.invoke_started: bool = False
 
 
 def execute_in_tool_thread(executor: Any, invoke: Callable[[], Any], timeout: float,
                            observe_cancel: Callable[[], bool] | None = None,
-                           await_terminal: bool = False) -> Any:
+                           await_terminal: bool = False,
+                           deadline_managed_preflight: Callable[[], None] | None = None) -> Any:
     """Transfer execution, never Connection ownership, to a pool worker.
 
     The parent releases its own connection before submission. The child acquires
@@ -207,6 +209,8 @@ def execute_in_tool_thread(executor: Any, invoke: Callable[[], Any], timeout: fl
     Timeout revokes permission to *start* Forget under the same gate lock. Once
     Phase A starts, await its definitive commit/rollback rather than report a
     failure while a destructive operation is still executing in the background.
+    Deadline-managed tools finish cancellation and cleanup before returning.
+    Only wait for those tools if they made it past preflight and the start gate.
     """
     parent = _STATE.get()
     claimed = parent.claimed if parent else None
@@ -230,6 +234,12 @@ def execute_in_tool_thread(executor: Any, invoke: Callable[[], Any], timeout: fl
                 _, blocked = guard_job_sources_visible(claimed)
                 if blocked is not None:
                     raise RuntimeError(blocked.reason)
+            if deadline_managed_preflight is not None:
+                deadline_managed_preflight()
+                with gate.lock:
+                    if gate.cancelled:
+                        raise concurrent.futures.CancelledError()
+                    gate.invoke_started = True
             return invoke()
 
     try:
@@ -252,7 +262,7 @@ def execute_in_tool_thread(executor: Any, invoke: Callable[[], Any], timeout: fl
                                 gate.cancelled = True
         except concurrent.futures.TimeoutError:
             with gate.lock:
-                started = gate.forget_started
+                started = gate.forget_started or gate.invoke_started
                 if not started:
                     gate.cancelled = True
             if started or await_terminal:

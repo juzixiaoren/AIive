@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from typing import override, Any
 
 from fastapi.encoders import jsonable_encoder
@@ -14,6 +15,7 @@ from aiive.task_runtime.router import normalize_task_brief
 from aiive.task_runtime.schemas import TaskBudget, ActionProposal
 from aiive.task_runtime.goal_plan import GoalPlan
 from aiive.tools.base import BaseTool
+from aiive.tools.quick_web_search import QUICK_WEB_SEARCH_TIMEOUT_SECONDS, QuickWebSearchTool
 from aiive.tools.registry import CapabilitySafetySchema, ToolDefinition, ToolRegistry
 
 
@@ -464,6 +466,13 @@ def build_main_agent_registry() -> ToolRegistry:
         GetToolOperationStatusTool,
     ))
     builtin = get_tool_registry()
+    search = builtin.get("web_search")
+    assert search is not None
+    registry.register(QuickWebSearchTool(ToolDefinition(
+        safety=replace(search.safety, timeout_seconds=QUICK_WEB_SEARCH_TIMEOUT_SECONDS),
+        description="即时搜索公开网页，最多返回 3 条带来源链接的外部证据。",
+        parameters={"query": {"type": "str", "minLength": 1, "pattern": r"\S", "required": True}},
+    )))
     for name in (
         "get_current_time", "schedule_reminder", "list_reminders", "cancel_reminder",
         "confirm_reminder", "snooze_reminder", "memory_search", "memory_timeline", "remember_or_update",

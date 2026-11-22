@@ -46,7 +46,12 @@ from aiive.core.function_calling import function_definitions
 from aiive.runtime.tool_normalizer import ToolResultNormalizer
 from aiive.runtime.working_state import WorkingStateService
 from aiive.core.assistant_protocol import PROVIDER_METADATA, public_event_payload
-from aiive.runtime.message_normalizer import normalize_tool_call, normalize_tool_result, tool_result_content
+from aiive.runtime.message_normalizer import (
+    compact_web_search_result,
+    normalize_tool_call,
+    normalize_tool_result,
+    tool_result_content,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -752,6 +757,7 @@ class ContextAssembler:
             normalizer=self._normalizer,
             upper_bound_sequence=upper_bound,
             lower_bound_sequence=lower_bound,
+            compact_web_search_results=True,
         )
         return self._filter_forgotten_events(db, history)
 
@@ -929,8 +935,11 @@ class ContextAssembler:
             if e.id not in allowed:
                 continue
             if not (e.payload or {}).get("protocol_only"):
+                payload = public_event_payload(e.payload)
+                if e.event_type == "tool_result" and payload.get("name") == "web_search":
+                    payload = {**payload, "result": compact_web_search_result(payload.get("result"))}
                 lines.append(_json.dumps({
-                    "type": e.event_type, "payload": public_event_payload(e.payload),
+                    "type": e.event_type, "payload": payload,
                 }, ensure_ascii=False, default=str))
         return "\n".join(lines)
 

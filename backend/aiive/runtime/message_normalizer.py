@@ -105,6 +105,44 @@ def tool_result_content(result: object, tool_name: str) -> str:
     return content
 
 
+def compact_web_search_result(result: object) -> dict[str, Any]:
+    """Project a persisted search receipt onto its three history fields."""
+    from aiive.tools.quick_web_search import search_result_domain
+
+    try:
+        payload = json.loads(tool_result_content(result, "web_search"))
+        if isinstance(payload, dict) and "status" not in payload and "result" in payload:
+            inner = payload["result"]
+            payload = json.loads(inner) if isinstance(inner, str) else inner
+    except (ValueError, RecursionError):
+        payload = None
+    if not isinstance(payload, dict):
+        payload = {}
+
+    status = payload.get("status")
+    results = payload.get("results")
+    if status not in ("success", "no_results", "failed", "budget_exhausted"):
+        if payload.get("ok") is True and isinstance(results, list):
+            status = "success" if results else "no_results"
+        else:
+            status = "failed"
+
+    count = 0
+    domain = None
+    if status == "success":
+        count = payload.get("result_count")
+        if type(count) is not int or count < 0:
+            count = len(results) if isinstance(results, list) else 0
+        domain = payload.get("primary_domain")
+        if not isinstance(domain, str) or not domain:
+            domain = next((
+                host for row in (results if isinstance(results, list) else [])
+                if isinstance(row, dict) and isinstance(row.get("url"), str)
+                and (host := search_result_domain(row["url"]))
+            ), None)
+    return {"status": status, "result_count": count, "primary_domain": domain}
+
+
 def _normalize_args(raw_args: Any) -> dict[str, Any]:
     """安全解析工具参数；畸形字符串保留原文而不使历史重建失败。"""
     if isinstance(raw_args, dict):

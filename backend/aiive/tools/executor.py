@@ -14,6 +14,7 @@ from aiive.tools.base import (
     CancellationPolicy,
     CancelResult,
     DatabaseTool,
+    DeadlineManagedTool,
     ToolCancelled,
     ToolError,
     ToolExecutionContext,
@@ -271,7 +272,7 @@ class ToolExecutor:
             deadline=time.monotonic() + timeout,
             action_id=run_context.action_id if run_context else "",
         )
-        if cancellation_requested(context):
+        if not isinstance(tool, DeadlineManagedTool) and cancellation_requested(context):
             return {
                 **ToolError("cancelled", "Cancelled before execution").payload(),
                 "execution_status": "cancelled",
@@ -313,24 +314,36 @@ class ToolExecutor:
             require_execution_authorization,
         )
 
+        managed_deadline = isinstance(tool, DeadlineManagedTool)
+
+        def check_cancel() -> None:
+            if cancellation_requested(context):
+                raise ToolCancelled()
+
         def invoke() -> Any:
             with _active_lock:
                 _active[context.execution_id] = (tool, context)
             try:
-                if cancellation_requested(context):
-                    raise ToolCancelled()
+                if managed_deadline:
+                    context.cancellation.checkpoint()
+                else:
+                    check_cancel()
                 return DirectAdapter.invoke(tool, context, arguments)
             finally:
                 with _active_lock:
                     _active.pop(context.execution_id, None)
 
+        wait_timeout = timeout
+        if managed_deadline and context.deadline is not None:
+            wait_timeout = max(0.0, context.deadline - time.monotonic())
         try:
             result = execute_in_tool_thread(
                 tool_thread_pool,
                 invoke,
-                timeout,
-                observe_cancel=lambda: cancellation_requested(context),
+                wait_timeout,
+                observe_cancel=None if managed_deadline else lambda: cancellation_requested(context),
                 await_terminal=context.channel == "turn_operation",
+                deadline_managed_preflight=check_cancel if managed_deadline else None,
             )
             return {
                 **coerce_tool_result(result).payload(),
@@ -344,6 +357,8 @@ class ToolExecutor:
             }
         except concurrent.futures.TimeoutError:
             tool.request_cancel(context)
+            if isinstance(tool, DeadlineManagedTool):
+                return {**tool.deadline_error().payload(), "execution_id": context.execution_id}
             external = (
                 tool.safety.writes_external_world
                 or tool.executor_kind == "desktop_node"

@@ -34,6 +34,14 @@ Worker 控制函数为 `task_finish`、`task_ask_user`、`task_watch`、`task_se
 
 ActionProposal 不再是模型输出协议。Worker 不使用 JSON mode、文本 JSON 解析或 JSON Repair，不保留旧 JSON 协议回退。模型必须支持 Function Calling；协议不合法时给出结构化纠错，耗尽后安全收敛。
 
+## 联网工具执行与上下文
+
+主 Agent 的 Turn 注册表使用 `QuickWebSearchTool`，安全属性继承全局 `web_search`。工具只接受查询词，用于直接回答简单时效性问题。Worker 通过 Task Scope 和 Broker 使用全局 `WebSearchTool` 与 `fetch_web_page` 完成深度调研，执行仍遵循任务预算、默认网络超时和 Evidence 契约。
+
+两者共用腾讯元宝 SearchPro 的请求构造、响应大小限制和解析。主 Agent 的 HTTP 请求使用可取消的异步传输，从连接到读完响应共 15 秒。工具使用 18 秒整体截止时间，运行中的请求完成取消与连接清理后才返回。每个 Turn 的 `RunContext` 在请求前原子预留额度，跨推理轮次和并行工具调用最多发出两次。发出后即计入额度，适用于无命中、失败和超时。工具用独立状态报告额度耗尽，失败也通过结构化 ToolMessage 反馈。
+
+当前 Turn 的搜索证据内联到 ToolMessage，最多三条，保留完整 URL。序列化内容最多 900 字符，命中时带 `untrusted` 和 `trust_notice`。后续模型上下文在历史预算判断前投影为 `status`、`result_count` 和 `primary_domain`，查询词随原调用参数回放。已编号 Turn、旧版无 Turn ID 的事件、中断记录和 Segment 密封桥接均使用此投影。前端展示从原始 Event 读取结果，Segment 密封判断继续基于原有历史统计。
+
 ## 校验与有界纠错
 
 共享 `normalize_calls` 处理 LangChain tool_calls 和 invalid_tool_calls。损坏的参数字符串转为不可执行诊断，原始损坏文本不复制到错误或修复记录。缺失/重复调用 ID 归一化为可配对 ID，同时标记错误，不能进入执行。

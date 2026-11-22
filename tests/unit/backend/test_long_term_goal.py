@@ -542,6 +542,7 @@ def test_delegate_task_accepts_goal_plan_and_keeps_tool_surface(db_session) -> N
         "schedule_reminder", "list_reminders", "cancel_reminder", "confirm_reminder",
         "snooze_reminder", "memory_search", "memory_timeline", "remember_or_update",
         "history_search", "get_tool_operation_status", "forget", "forget_status",
+        "web_search",
     }
     thread = _thread(db_session)
     handler = tool_method(registry.get('delegate_task'))

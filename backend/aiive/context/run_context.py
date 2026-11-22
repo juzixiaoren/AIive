@@ -7,7 +7,9 @@
 RunContext 通过 _make_handler 闭包捕获 → registry.execute() 注入 handler，
 全程不经过 LLM tool schema，模型不可见。
 """
+from _thread import LockType
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import TYPE_CHECKING
 
 from aiive.memory.recall_models import ScopeContext
@@ -27,6 +29,7 @@ RUN_CTX_OUTBOX_WORKER = "outbox_worker"  # Outbox 异步作业（记忆抽取/�
 RUN_CTX_API = "api"  # 记忆维护类 API 直接触发（archive/sleep 等）
 RUN_CTX_TRUSTED_APPROVAL = "trusted_approval"  # 已服务端审批的可信工具执行
 RUN_CTX_MANUAL_MEMORY_API = "manual_memory_api"  # 手动记忆写入 API 触发
+MAX_WEB_SEARCH_CALLS_PER_TURN = 2
 
 
 def require_ctx(ctx: "RunContext | None", tool_name: str) -> "RunContext":
@@ -89,6 +92,21 @@ class RunContext:
     agent_run_id: str = ""
     action_id: str = ""
     user_timezone: str | None = None
+    web_search_calls: int = field(default=0, init=False)
+    _web_search_lock: LockType = field(default_factory=Lock, init=False, repr=False, compare=False)
+
+    @property
+    def web_search_budget_exhausted(self) -> bool:
+        with self._web_search_lock:
+            return self.web_search_calls >= MAX_WEB_SEARCH_CALLS_PER_TURN
+
+    def reserve_web_search(self) -> bool:
+        """Reserve one Main Agent request across all batches in this Turn."""
+        with self._web_search_lock:
+            if self.web_search_calls >= MAX_WEB_SEARCH_CALLS_PER_TURN:
+                return False
+            self.web_search_calls += 1
+            return True
 
     @property
     def is_valid(self) -> bool:

@@ -316,5 +316,13 @@ class BaseTool(ABC):
         )
 
 
+class DeadlineManagedTool(BaseTool):
+    """Owns cancellation at context.deadline and returns after request cleanup."""
+
+    @abstractmethod
+    def deadline_error(self) -> ToolError:
+        raise NotImplementedError
+
+
 class DatabaseTool(BaseTool, ABC):
     """Business method uses the adapter's execution-thread transaction."""

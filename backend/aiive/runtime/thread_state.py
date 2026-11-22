@@ -8,15 +8,19 @@ Phase 1: keyset-pagination bounded history reading.
 import json as _json
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
 
 from aiive.core.assistant_protocol import PROVIDER_METADATA
-from aiive.db.models import TurnRecord, Event, LLMCall, Thread
+from aiive.db.models import Event, LLMCall, Thread, TurnRecord
 from aiive.forget.visibility_service import ForgetVisibilityService
-from aiive.runtime.message_normalizer import normalize_tool_call, normalize_tool_result, tool_result_content
+from aiive.runtime.message_normalizer import (
+    compact_web_search_result,
+    normalize_tool_call,
+    normalize_tool_result,
+    tool_result_content,
+)
 
 
 @dataclass
@@ -27,6 +31,10 @@ class BoundedReadStats:
     total_bytes: int = 0
     estimated_tokens: int = 0
     stopped_by: str | None = None
+
+
+def _history_bytes(items: list[dict[str, Any]]) -> int:
+    return sum(len(_json.dumps(item, ensure_ascii=False, default=str).encode()) for item in items)
 
 
 class ThreadState:
@@ -64,6 +72,8 @@ class ThreadState:
         max_turns: int = 100,
         max_events: int = 5000,
         max_raw_bytes: int = 2 * 1024 * 1024,
+        *,
+        compact_web_search_results: bool = False,
     ) -> tuple[list[dict[str, Any]], BoundedReadStats]:
         """Keyset DESC pagination, online estimation, stop at any limit."""
         all_turns: list[list[dict[str, Any]]] = []
@@ -75,6 +85,27 @@ class ThreadState:
 
         last_sequence: int | None = upper_bound_sequence
         page_size = 20
+
+        def include_turn(turn_dicts: list[dict[str, Any]], *, interrupted: bool = False) -> None:
+            nonlocal current_tokens, stopped_by
+            if normalizer is not None:
+                turn_dicts = normalizer.normalize_turn(turn_dicts)
+            if interrupted:
+                turn_dicts = self._degrade_interrupted_turn_dicts(turn_dicts)
+                if not turn_dicts:
+                    return
+            turn_msgs = self._dicts_to_token_count_messages(turn_dicts)
+            tc = token_counter.count_messages(model, turn_msgs)
+            if token_budget is not None and current_tokens + tc.safe_tokens > token_budget:
+                if normalizer is not None:
+                    turn_dicts = normalizer.normalize_turn_sparse(turn_dicts)
+                    turn_msgs = self._dicts_to_token_count_messages(turn_dicts)
+                    tc = token_counter.count_messages(model, turn_msgs)
+                if current_tokens + tc.safe_tokens > token_budget:
+                    stopped_by = "token_budget"
+                    return
+            current_tokens += tc.safe_tokens
+            all_turns.append(turn_dicts)
 
         while pages_read < max_pages and len(all_turns) < max_turns:
             # interrupted_unknown Turn 也纳入历史：其中断前已持久化的工具事实
@@ -134,45 +165,40 @@ class ThreadState:
                     db, "event", [(event.id, event.created_at) for event in events],
                 )
                 turn_dicts = self._events_to_dicts([event for event in events if event.id not in blocked], turn.source)
-                turn_bytes = sum(len(_json.dumps(d, ensure_ascii=False, default=str).encode()) for d in turn_dicts)
-                total_bytes += turn_bytes
+                total_bytes += _history_bytes(turn_dicts)
                 if total_bytes > max_raw_bytes:
                     stopped_by = "max_raw_bytes"
                     break
 
-                # Normalize tool results before counting
-                if normalizer is not None:
-                    turn_dicts = normalizer.normalize_turn(turn_dicts)
-
-                if turn.status == "interrupted_unknown":
-                    turn_dicts = self._degrade_interrupted_turn_dicts(turn_dicts)
-                    if not turn_dicts:
-                        continue
-
-                turn_msgs = self._dicts_to_token_count_messages(turn_dicts)
-                tc = token_counter.count_messages(model, turn_msgs)
-                if token_budget is not None and current_tokens + tc.safe_tokens > token_budget:
-                    if normalizer is not None:
-                        turn_dicts_sparse = normalizer.normalize_turn_sparse(turn_dicts)
-                        if turn_dicts_sparse != turn_dicts:
-                            turn_msgs = self._dicts_to_token_count_messages(turn_dicts_sparse)
-                            tc = token_counter.count_messages(model, turn_msgs)
-                            if current_tokens + tc.safe_tokens > token_budget:
-                                stopped_by = "token_budget"
-                                break
-                            turn_dicts = turn_dicts_sparse
-                        else:
-                            stopped_by = "token_budget"
-                            break
-                    else:
-                        stopped_by = "token_budget"
-                        break
-
-                current_tokens += tc.safe_tokens
-                all_turns.append(turn_dicts)
+                if compact_web_search_results:
+                    self._compact_search_results(turn_dicts)
+                include_turn(turn_dicts, interrupted=turn.status == "interrupted_unknown")
+                if stopped_by:
+                    break
 
             if stopped_by:
                 break
+
+        # Legacy events precede numbered turns and have no segment or sequence.
+        if (
+            compact_web_search_results and not stopped_by and pages_read < max_pages
+            and lower_bound_sequence is None and segment_id is None
+            and len(all_turns) < max_turns and total_events < max_events
+        ):
+            legacy = self._query_legacy_groups(
+                thread_id, max_turns - len(all_turns),
+                compact_web_search_results=True, max_events=max_events - total_events,
+            )
+            pages_read += 1
+            for group, raw_bytes in reversed(legacy):
+                total_events += len(group)
+                total_bytes += raw_bytes
+                if total_bytes > max_raw_bytes:
+                    stopped_by = "max_raw_bytes"
+                    break
+                include_turn(group)
+                if stopped_by:
+                    break
 
         all_turns.reverse()
         result: list[dict[str, Any]] = []
@@ -189,6 +215,13 @@ class ThreadState:
             ).estimated_tokens if result else 0),
             stopped_by=stopped_by,
         )
+
+    @staticmethod
+    def _compact_search_results(turn_dicts: list[dict[str, Any]]) -> None:
+        for item in turn_dicts:
+            if item.get("type") == "tool_result" and item.get("tool_name") == "web_search":
+                item["tool_result"] = compact_web_search_result(item["tool_result"])
+                item["web_search_compacted"] = True
 
     @staticmethod
     def _degrade_interrupted_turn_dicts(
@@ -321,7 +354,7 @@ class ThreadState:
         # 到达新 Turn 历史末端时，继续拼接旧版 turn_id=NULL 事件。
         if not has_more:
             legacy_groups = self._query_legacy_groups(thread_id, size)
-            legacy_items = [item for _, group in legacy_groups for item in group]
+            legacy_items = [item for group, _ in legacy_groups for item in group]
             legacy_messages = [
                 {
                     "role": item["type"],
@@ -458,12 +491,10 @@ class ThreadState:
 
     def _query_legacy_groups(
         self, thread_id: str, overscan: int,
-    ) -> list[tuple[tuple[datetime, int], list[dict[str, Any]]]]:
-        """查询 turn_id=NULL 的旧事件并按 user_message 边界分组。
-
-        sort_key = (earliest_created_at, MAX_BIGINT)  用于与新 Turn 合并排序。
-        """
-        events = (
+        *, compact_web_search_results: bool = False, max_events: int | None = None,
+    ) -> list[tuple[list[dict[str, Any]], int]]:
+        """按 user_message 边界分组，模型投影前记录原始字节数。"""
+        query = (
             self._db.query(Event)
             .filter(
                 Event.thread_id == thread_id,
@@ -472,10 +503,14 @@ class ThreadState:
                     "user_message", "tool_call", "tool_result", "llm_response",
                 ]),
             )
-            .order_by(Event.created_at.asc(), Event.id.asc())
-            .limit(overscan * 10)
-            .all()
         )
+        if compact_web_search_results:
+            events = query.order_by(Event.created_at.desc(), Event.id.desc()).limit(
+                min(overscan * 10, max_events) if max_events is not None else overscan * 10,
+            ).all()
+            events.reverse()
+        else:
+            events = query.order_by(Event.created_at.asc(), Event.id.asc()).limit(overscan * 10).all()
         if not events:
             return []
         blocked = ForgetVisibilityService.blocked_target_ids(
@@ -494,11 +529,14 @@ class ThreadState:
         if current:
             groups.append(current)
 
-        MAX_INT = 2 ** 63 - 1
-        result: list[tuple[tuple[datetime, int], list[dict[str, Any]]]] = []
+        result: list[tuple[list[dict[str, Any]], int]] = []
         for g in groups[-overscan:]:
-            earliest = g[0].created_at
-            result.append(((earliest, MAX_INT), self._events_to_dicts(g)))
+            items = self._events_to_dicts(g)
+            raw_bytes = 0
+            if compact_web_search_results:
+                raw_bytes = _history_bytes(items)
+                self._compact_search_results(items)
+            result.append((items, raw_bytes))
         return result
 
     @staticmethod

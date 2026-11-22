@@ -1,10 +1,12 @@
 """带 SSRF、重定向、大小和内容类型约束的网页客户端。"""
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import re
 import socket
+from collections.abc import Callable
 from html.parser import HTMLParser
 from typing import Any, override
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -77,10 +79,14 @@ def _pin_url_to_address(url: str, address: str) -> str:
 def _read_web_body(response: httpx.Response) -> bytes:
     body = bytearray()
     for chunk in response.iter_bytes():
-        if len(body) + len(chunk) > settings.aiive_web_max_response_bytes:
-            raise WebAccessError("web_response_too_large")
-        body.extend(chunk)
+        _append_web_chunk(body, chunk)
     return bytes(body)
+
+
+def _append_web_chunk(body: bytearray, chunk: bytes) -> None:
+    if len(body) + len(chunk) > settings.aiive_web_max_response_bytes:
+        raise WebAccessError("web_response_too_large")
+    body.extend(chunk)
 
 
 def _read_response(
@@ -277,20 +283,39 @@ def _parse_yuanbao_results(data: bytes, limit: int) -> list[dict[str, str]]:
     return results
 
 
+def _yuanbao_search_request(query: str) -> dict[str, Any]:
+    if not settings.aiive_web_search_enabled:
+        raise WebAccessError("web_search_disabled")
+    if not query:
+        raise WebAccessError("empty_search_query")
+    api_key = settings.aiive_yuanbao_search_api_key.get_secret_value().strip()
+    if not api_key:
+        raise WebAccessError("yuanbao_search_api_key_missing: configure AIIVE_YUANBAO_SEARCH_API_KEY")
+    return {
+        "method": "POST",
+        "url": _YUANBAO_SEARCH_URL,
+        "headers": {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json; charset=utf-8",
+            "User-Agent": settings.aiive_web_user_agent,
+        },
+        "json": {"Query": query},
+    }
+
+
+def _check_search_response(response: httpx.Response) -> None:
+    if not response.is_success:
+        raise WebAccessError(f"yuanbao_search_http_error:{response.status_code}")
+
+
 def search_web(
     query: str,
     *,
     limit: int = 5,
     transport: httpx.BaseTransport | None = None,
 ) -> dict[str, Any]:
-    if not settings.aiive_web_search_enabled:
-        raise WebAccessError("web_search_disabled")
     query = query.strip()
-    if not query:
-        raise WebAccessError("empty_search_query")
-    api_key = settings.aiive_yuanbao_search_api_key.get_secret_value().strip()
-    if not api_key:
-        raise WebAccessError("yuanbao_search_api_key_missing: configure AIIVE_YUANBAO_SEARCH_API_KEY")
+    request = _yuanbao_search_request(query)
     limit = max(1, min(limit, 10))
     try:
         with httpx.Client(
@@ -298,18 +323,8 @@ def search_web(
             follow_redirects=False,
             trust_env=False,
             transport=transport,
-        ) as client, client.stream(
-            "POST",
-            _YUANBAO_SEARCH_URL,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json; charset=utf-8",
-                "User-Agent": settings.aiive_web_user_agent,
-            },
-            json={"Query": query},
-        ) as response:
-            if not response.is_success:
-                raise WebAccessError(f"yuanbao_search_http_error:{response.status_code}")
+        ) as client, client.stream(**request) as response:
+            _check_search_response(response)
             data = _read_web_body(response)
     except httpx.RequestError:
         raise WebAccessError("yuanbao_search_request_failed") from None
@@ -319,3 +334,32 @@ def search_web(
         "ok": True, "query": query, "provider": "yuanbao", "results": results,
         "total": len(results), "untrusted": True,
     }
+
+
+async def search_web_with_deadline(
+    query: str,
+    *,
+    limit: int,
+    request_timeout: float,
+    reserve_request: Callable[[], None],
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> list[dict[str, str]]:
+    """Perform a cancellable SearchPro request with an absolute wall-clock limit."""
+    request = _yuanbao_search_request(query.strip())
+    # Include connection, headers and the whole streamed body in the same deadline.
+    # Keep the client context outside it so cancellation also closes the pool.
+    async with httpx.AsyncClient(
+        timeout=None, follow_redirects=False, trust_env=False, transport=transport,
+    ) as client:
+        prepared = client.build_request(**request)
+        async with asyncio.timeout(request_timeout):
+            reserve_request()
+            response = await client.send(prepared, stream=True)
+            try:
+                _check_search_response(response)
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    _append_web_chunk(body, chunk)
+            finally:
+                await response.aclose()
+    return _parse_yuanbao_results(bytes(body), limit)
