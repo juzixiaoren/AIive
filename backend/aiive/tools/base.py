@@ -316,7 +316,7 @@ class BaseTool(ABC):
         )
 
 
-class DeadlineManagedTool(BaseTool):
+class DeadlineManagedTool(BaseTool, ABC):
     """Owns cancellation at context.deadline and returns after request cleanup."""
 
     @abstractmethod

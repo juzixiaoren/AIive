@@ -86,14 +86,14 @@ class ThreadState:
         last_sequence: int | None = upper_bound_sequence
         page_size = 20
 
-        def include_turn(turn_dicts: list[dict[str, Any]], *, interrupted: bool = False) -> None:
-            nonlocal current_tokens, stopped_by
+        def include_turn(turn_dicts: list[dict[str, Any]], *, interrupted: bool = False) -> bool:
+            nonlocal current_tokens
             if normalizer is not None:
                 turn_dicts = normalizer.normalize_turn(turn_dicts)
             if interrupted:
                 turn_dicts = self._degrade_interrupted_turn_dicts(turn_dicts)
                 if not turn_dicts:
-                    return
+                    return True
             turn_msgs = self._dicts_to_token_count_messages(turn_dicts)
             tc = token_counter.count_messages(model, turn_msgs)
             if token_budget is not None and current_tokens + tc.safe_tokens > token_budget:
@@ -102,10 +102,10 @@ class ThreadState:
                     turn_msgs = self._dicts_to_token_count_messages(turn_dicts)
                     tc = token_counter.count_messages(model, turn_msgs)
                 if current_tokens + tc.safe_tokens > token_budget:
-                    stopped_by = "token_budget"
-                    return
+                    return False
             current_tokens += tc.safe_tokens
             all_turns.append(turn_dicts)
+            return True
 
         while pages_read < max_pages and len(all_turns) < max_turns:
             # interrupted_unknown Turn 也纳入历史：其中断前已持久化的工具事实
@@ -172,8 +172,8 @@ class ThreadState:
 
                 if compact_web_search_results:
                     self._compact_search_results(turn_dicts)
-                include_turn(turn_dicts, interrupted=turn.status == "interrupted_unknown")
-                if stopped_by:
+                if not include_turn(turn_dicts, interrupted=turn.status == "interrupted_unknown"):
+                    stopped_by = "token_budget"
                     break
 
             if stopped_by:
@@ -196,8 +196,8 @@ class ThreadState:
                 if total_bytes > max_raw_bytes:
                     stopped_by = "max_raw_bytes"
                     break
-                include_turn(group)
-                if stopped_by:
+                if not include_turn(group):
+                    stopped_by = "token_budget"
                     break
 
         all_turns.reverse()
