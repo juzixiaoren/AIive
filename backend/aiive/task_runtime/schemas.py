@@ -7,6 +7,7 @@ from typing import Annotated, Any, ClassVar, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from aiive.config import WORKER_BUDGET_LIMITS, settings
+from aiive.tool_discovery import DEFAULT_LIMIT, MAX_LIMIT, MAX_QUERY_CHARS
 
 ReportNote = Annotated[str, Field(min_length=1, max_length=500)]
 
@@ -153,13 +154,18 @@ class ActionProposal(BaseModel):
         "action", "finish", "ask_user", "watch", "search_capabilities", "describe_capability",
     ]
     capability_id: str = ""
+    descriptor_hash: str = ""
     arguments: dict[str, Any] = Field(default_factory=dict)
     preconditions: dict[str, Any] = Field(default_factory=dict)
     effects: dict[str, Any] = Field(default_factory=dict)
     summary: str = ""
     progress_draft: str = Field(default="", max_length=8000)
     # search_capabilities 的检索关键词；发现类决策只读，不产生 Action。
-    query: str = ""
+    query: str = Field(default="", max_length=MAX_QUERY_CHARS)
+    namespace_ids: list[Annotated[str, Field(min_length=1, max_length=512)]] = Field(
+        default_factory=list, max_length=MAX_LIMIT,
+    )
+    limit: int = Field(default=DEFAULT_LIMIT, ge=1, le=MAX_LIMIT)
     report_status: Literal["succeeded", "partial", "failed"] = "succeeded"
     risks: list[ReportNote] = Field(default_factory=list, max_length=16)
     unresolved: list[ReportNote] = Field(default_factory=list, max_length=16)

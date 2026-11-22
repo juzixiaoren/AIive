@@ -44,7 +44,7 @@ def test_model_factory_explicitly_disables_hidden_infrastructure_retries():
 def test_main_and_worker_derive_one_effective_contract_without_execution():
     handler = Mock()
     registered = registry(handler)
-    functions = WorkerFunctions({"available": [registered.definition("probe")]})
+    functions = WorkerFunctions({"available": [{**registered.definition("probe"), "in_scope": True}]})
     name = proposal_function_name("probe")
     capability = registered.get("probe")
     canonical = function_definition(capability)["parameters"]
@@ -59,6 +59,8 @@ def test_main_and_worker_derive_one_effective_contract_without_execution():
     assert validate_calls(call, functions.registry, require_one=True).ok
     proposal = functions.proposal(name, call.tool_calls[0]["args"])
     assert proposal.capability_id == "probe" and proposal.arguments == {"rows": [{"count": 2}]}
+    assert proposal.descriptor_hash == capability.safety.descriptor_hash
+    assert "descriptor_hash" not in wrapper["properties"]
     handler.assert_not_called()
     assert not hasattr(functions.registry.get(name), "execute")
     assert not hasattr(functions.registry.get(name), "_run")
@@ -66,7 +68,7 @@ def test_main_and_worker_derive_one_effective_contract_without_execution():
 
 
 def test_wrapped_nested_error_and_safe_actual_type():
-    functions = WorkerFunctions({"resident": [registry().definition("probe")]})
+    functions = WorkerFunctions({"resident": [{**registry().definition("probe"), "in_scope": True}]})
     call = message((proposal_function_name("probe"), {"arguments": {"rows": [{"count": "SECRET"}]}}))
     result = validate_calls(call, functions.registry, require_one=True)
     issue = result.errors["call_0"]["issues"][0]
@@ -120,6 +122,7 @@ def test_duplicate_ids_rejected_and_repair_pairing_is_unambiguous():
     ("task_ask_user", {"question": "what?"}, "ask_user"),
     ("task_watch", {"watch": {"watch_type": "time", "config": {"at": "2026-11-17T00:00:00Z"}}}, "watch"),
     ("task_search_capabilities", {"query": "file"}, "search_capabilities"),
+    ("task_search_capabilities", {"query": "file", "namespace_ids": ["builtin:utilities"], "limit": 8}, "search_capabilities"),
     ("task_describe_capability", {"capability_id": "probe"}, "describe_capability"),
 ])
 def test_controls_map_to_internal_dto(name, args, decision):
@@ -129,11 +132,18 @@ def test_controls_map_to_internal_dto(name, args, decision):
 
 
 def test_only_current_loaded_definitions_are_bound():
-    definition = registry().definition("probe")
+    definition = {**registry().definition("probe"), "in_scope": True}
     functions = WorkerFunctions({"loaded": [{**definition, "status": "definition_changed"}]})
     assert not functions.capabilities
     functions = WorkerFunctions({"loaded": [{**definition, "status": "ready"}]})
     assert set(functions.capabilities.values()) == {"probe"}
+
+
+@pytest.mark.parametrize("group", ["resident", "available", "loaded"])
+@pytest.mark.parametrize("scope", [{}, {"in_scope": False}])
+def test_all_worker_groups_require_scope(group, scope):
+    functions = WorkerFunctions({group: [{**registry().definition("probe"), **scope}]})
+    assert not functions.capabilities
 
 
 def test_same_correction_limit_and_usage_for_both_hosts():

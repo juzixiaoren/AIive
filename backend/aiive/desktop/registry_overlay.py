@@ -10,6 +10,7 @@ from aiive.desktop.connection_manager import desktop_connection_manager
 from aiive.desktop.node_service import desktop_node_service
 from aiive.desktop.protocol import definition_for
 from aiive.desktop.schemas import DesktopCapability
+from aiive.tool_discovery.documents import DiscoveryMetadata
 from aiive.tools.registry import (
     CapabilitySafetySchema,
     ToolDefinition,
@@ -109,5 +110,11 @@ def build_registry_for_thread(
             executor_node_id=node.id,
             cancellation_policy=CancellationPolicy.REMOTE if capability.name == "desktop_exec" and capability.cancellation_policy == "remote" else CancellationPolicy.NONE,
             supports_reconciliation=True,
+            discovery=DiscoveryMetadata(
+                namespace_id=f"desktop:{node.id}",
+                namespace_name=node.name,
+                namespace_description=f"在线桌面节点 {node.name} 提供的本地能力",
+                raw_name=capability.name,
+            ),
         )))
     return registry

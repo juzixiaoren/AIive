@@ -27,6 +27,7 @@ from aiive.mcp.runtime_client import (
 
 from aiive.tools.base import BaseTool
 from aiive.tools.registry import ToolDefinition
+from aiive.tool_discovery.documents import DiscoveryMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +128,7 @@ def register_capability_tools(
     *,
     base_risk_level: str = "medium",
     trust_level: str = "untrusted",
+    namespace_description: str = "",
 ) -> list[str]:
     """把一个 MCP 能力的真实工具列表注册进 ToolRegistry。
 
@@ -137,6 +139,7 @@ def register_capability_tools(
         tools: 真实 tools/list 结果 [{"name", "description", "input_schema"}]
         base_risk_level: 能力级风险评估（planner verdict），工具级按副作用上调
         trust_level: 信任级别（discovery 的 source_trust 映射）
+        namespace_description: MCP Server 在能力目录中的说明
 
     返回:
         注册的 capability_id 列表
@@ -184,6 +187,12 @@ def register_capability_tools(
                 tool.get("input_schema") or {},
             ),
             input_schema=tool.get("input_schema") or {},
+            discovery=DiscoveryMetadata(
+                namespace_id=f"mcp:{capability_name}",
+                namespace_name=capability_name,
+                namespace_description=namespace_description or f"{capability_name} MCP Server",
+                raw_name=tool_name,
+            ),
         ), db_capability_id, tool_name))
         registered.append(cap_id)
     logger.info(
@@ -276,6 +285,7 @@ def activate_capability_tools(registry: Any, cap: Any) -> dict[str, Any]:
         tools=tools,
         base_risk_level=str(definition.get("risk_verdict", "medium")),
         trust_level=str(definition.get("trust_level", "untrusted")),
+        namespace_description=str(definition.get("description") or ""),
     )
     return {"ok": True, "registered": registered, "error": None}
 

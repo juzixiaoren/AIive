@@ -27,7 +27,7 @@ services:
 
   # 可选的本地 Embedding 服务。scripts/start.sh 在以下条件成立时启用：
   # AIIVE_EMBEDDING_PROVIDER=local 且（AIIVE_MEMORY_VECTOR_ENABLED 或
-  # AIIVE_KNOWLEDGE_VECTOR_ENABLED）=true。
+  # AIIVE_KNOWLEDGE_VECTOR_ENABLED 或 AIIVE_TOOL_DISCOVERY_VECTOR_ENABLED）=true。
   # 模型缓存由 scripts/embedding_model.sh 检测：缺失时自动下载，已有则直接复用。
   embedding:
     image: "ghcr.io/huggingface/text-embeddings-inference:${AIIVE_TEI_IMAGE_TAG:-cpu-1.9}"
@@ -71,6 +71,10 @@ services:
       # 置 false 时召回退化为词法路由（route=lexical），不再标记 degraded。
       AIIVE_MEMORY_BM25_ENABLED: "${AIIVE_MEMORY_BM25_ENABLED:-true}"
       AIIVE_MEMORY_BM25_TOP_K: "${AIIVE_MEMORY_BM25_TOP_K:-16}"
+      AIIVE_MEMORY_VECTOR_ENABLED: "${AIIVE_MEMORY_VECTOR_ENABLED:-false}"
+      AIIVE_KNOWLEDGE_VECTOR_ENABLED: "${AIIVE_KNOWLEDGE_VECTOR_ENABLED:-false}"
+      AIIVE_TOOL_DISCOVERY_VECTOR_ENABLED: "${AIIVE_TOOL_DISCOVERY_VECTOR_ENABLED:-false}"
+      AIIVE_EMBEDDING_PROVIDER: "${AIIVE_EMBEDDING_PROVIDER:-openai_compatible}"
       # 宿主机直连用 127.0.0.1:8081；容器内通过 Compose 服务名访问。
       AIIVE_EMBEDDING_BASE_URL: "${AIIVE_DOCKER_EMBEDDING_BASE_URL:-${AIIVE_EMBEDDING_BASE_URL:-http://embedding:80/v1}}"
     depends_on:

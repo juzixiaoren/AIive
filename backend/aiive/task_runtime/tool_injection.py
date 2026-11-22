@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from aiive.tool_discovery import DEFAULT_LIMIT, MAX_LIMIT, MAX_QUERY_CHARS
 from aiive.tools.registry import ToolRegistry
 
 # L0 常驻入口：长期记忆读取、基础搜索、Bash（桌面节点在线时才有该能力）、
@@ -31,11 +32,8 @@ WORKER_RESIDENT_CAPABILITIES: tuple[str, ...] = (
 # 目录规模较小时直接注入完整 Schema（少一次模型调用）；超过阈值改用按需发现。
 FULL_INJECTION_MAX_TOOLS = 12
 FULL_INJECTION_MAX_CHARS = 24_000
-MAX_SEARCH_RESULTS = 5
-MAX_SEARCH_IDS = 10
 MAX_DISCOVERY_QUERIES = 3
 MAX_LOADED_DEFINITIONS = 6
-MAX_QUERY_CHARS = 200
 
 STATE_KEY = "tool_discovery"
 
@@ -67,16 +65,25 @@ def discovery_state(task_state: dict[str, Any] | None) -> dict[str, Any]:
 
 def record_search(
     task_state: dict[str, Any] | None, query: str, capability_ids: list[str],
+    *, namespace_ids: list[str] | None = None, matched_namespace_ids: list[str] | None = None,
+    loaded: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """记录一次目录检索结果（只存 id，Schema 每次重新解析，避免陈旧缓存）。"""
     state = discovery_state(task_state)
     entry = {
         "query": query[:MAX_QUERY_CHARS],
-        "capability_ids": list(dict.fromkeys(capability_ids))[:MAX_SEARCH_IDS],
+        "capability_ids": list(dict.fromkeys(capability_ids))[:MAX_LIMIT],
+        "namespace_ids": sorted(set(namespace_ids or []))[:MAX_LIMIT],
+        "matched_namespace_ids": list(dict.fromkeys(matched_namespace_ids or []))[:MAX_LIMIT],
     }
-    queries = [item for item in state["queries"] if item.get("query") != entry["query"]]
+    queries = [
+        item for item in state["queries"]
+        if (item.get("query"), item.get("namespace_ids") or []) != (entry["query"], entry["namespace_ids"])
+    ]
     queries.append(entry)
     state["queries"] = queries[-MAX_DISCOVERY_QUERIES:]
+    if loaded:
+        _update_loaded(state, loaded)
     return state
 
 
@@ -85,11 +92,14 @@ def record_definition(
 ) -> dict[str, Any]:
     """记录已加载定义，只保存 id 与指纹；Schema 在注入时按当前注册表重建。"""
     state = discovery_state(task_state)
-    entry = {"capability_id": capability_id, "descriptor_hash": descriptor_hash}
-    loaded = [item for item in state["loaded"] if item.get("capability_id") != capability_id]
-    loaded.append(entry)
-    state["loaded"] = loaded[-MAX_LOADED_DEFINITIONS:]
+    _update_loaded(state, [{"capability_id": capability_id, "descriptor_hash": descriptor_hash}])
     return state
+
+
+def _update_loaded(state: dict[str, Any], entries: list[dict[str, str]]) -> None:
+    updated_ids = {item["capability_id"] for item in entries}
+    loaded = [item for item in state["loaded"] if item.get("capability_id") not in updated_ids]
+    state["loaded"] = (loaded + entries)[-MAX_LOADED_DEFINITIONS:]
 
 
 def merge_state(task_state: dict[str, Any] | None, discovery: dict[str, Any]) -> dict[str, Any]:
@@ -99,6 +109,42 @@ def merge_state(task_state: dict[str, Any] | None, discovery: dict[str, Any]) ->
     return merged
 
 
+def _definition_size(definition: dict[str, Any]) -> int:
+    return len(json.dumps({
+        "capability_id": definition["capability_id"],
+        "description": definition.get("description", ""),
+        "input_schema": definition["input_schema"],
+    }, ensure_ascii=False))
+
+
+def select_search_definitions(
+    execution: ToolRegistry, candidates: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """按检索顺序选择能与常驻定义一同绑定的 Schema 引用。"""
+    remaining = FULL_INJECTION_MAX_CHARS
+    resident_ids = set()
+    for definition in resident_definitions(execution):
+        size = _definition_size(definition)
+        if size <= remaining:
+            remaining -= size
+            resident_ids.add(definition["capability_id"])
+    selected = []
+    for candidate in candidates:
+        if candidate.get("in_scope") is not True:
+            continue
+        capability_id = candidate["capability_id"]
+        definition = execution.definition(capability_id)
+        if definition is None or definition["descriptor_hash"] != candidate["descriptor_hash"]:
+            continue
+        size = 0 if capability_id in resident_ids else _definition_size(definition)
+        if size <= remaining:
+            remaining -= size
+            selected.append({"capability_id": capability_id, "descriptor_hash": definition["descriptor_hash"]})
+            if len(selected) == min(DEFAULT_LIMIT, MAX_LOADED_DEFINITIONS):
+                break
+    return selected
+
+
 def build_tool_view(
     execution: ToolRegistry,
     capabilities: list[dict[str, Any]],
@@ -106,19 +152,19 @@ def build_tool_view(
     *,
     discovery_registry: ToolRegistry | None = None,
 ) -> dict[str, Any]:
-    """构造注入给模型的工具视图。
-
-    execution：当前任务可执行的能力视图（restricted 时为授权白名单）。
-    discovery：完整可用能力视图（内置 + 在线桌面 + MCP），用于解析检索/定义结果，
-    因此"看得到"与"能执行"分开表达：条目附带 in_scope 标记。
-    """
+    """从执行视图重建所有 Schema；发现视图只提供摘要。"""
     catalog = execution.catalog()
     executable_ids = frozenset(entry["capability_id"] for entry in catalog)
     mode = _injection_mode(execution, catalog)
-    resident = [
-        {**item, "in_scope": str(item.get("capability_id")) in executable_ids}
-        for item in capabilities
-    ]
+    discovery_registry = discovery_registry or execution
+    resident = []
+    for item in capabilities:
+        capability_id = str(item.get("capability_id", ""))
+        definition = execution.definition(capability_id)
+        if definition is not None:
+            resident.append({**definition, "in_scope": True})
+        elif (summary := discovery_registry.summary(capability_id)) is not None:
+            resident.append({**summary, "description": summary["description"][:500], "in_scope": False})
     resident_ids = {str(item.get("capability_id")) for item in resident}
     available: list[dict[str, Any]] = []
     if mode == "full":
@@ -127,24 +173,49 @@ def build_tool_view(
                 continue
             definition = execution.definition(entry["capability_id"])
             if definition is not None:
-                available.append(definition)
-    discovery_registry = discovery_registry or execution
-    discovery_catalog = {entry["capability_id"]: entry for entry in discovery_registry.catalog()}
+                available.append({**definition, "in_scope": True})
+    loaded = _resolve_loaded(discovery, execution, discovery_registry)
     view: dict[str, Any] = {
         "mode": mode,
         "resident": resident,
         "available": available,
-        "discovered": _resolve_queries(discovery, discovery_catalog, executable_ids),
-        "loaded": _resolve_loaded(discovery, discovery_registry, executable_ids),
+        "discovered": _resolve_queries(discovery, discovery_registry, executable_ids),
+        "loaded": loaded,
     }
-    # Remove entire definitions, never truncate their JSON structure.
-    omitted = []
-    for key in ("available", "resident", "loaded"):
-        while view[key] and len(json.dumps(view, ensure_ascii=False)) > FULL_INJECTION_MAX_CHARS:
-            omitted.append(view[key].pop()["capability_id"])
-            view["mode"] = "discovery"
-    view["omitted_capability_ids"] = omitted
+    _fit_definitions(view)
     return view
+
+
+def _fit_definitions(view: dict[str, Any]) -> None:
+    omitted = []
+    latest = view["loaded"][-1] if view["loaded"] else {}
+    # A definition this large can reach loaded only through an explicit describe
+    # (or if the task predates batch loading). Give it a dedicated binding round.
+    explicit_large = latest if "input_schema" in latest and _definition_size(latest) > FULL_INJECTION_MAX_CHARS else None
+    remaining = FULL_INJECTION_MAX_CHARS
+    selected = set()
+    for group in ("resident", "loaded", "available"):
+        entries = list(reversed(view[group])) if group == "loaded" else view[group]
+        kept = []
+        for entry in entries:
+            key = entry["capability_id"]
+            if "input_schema" not in entry:
+                kept.append(entry)
+                continue
+            size = 0 if key in selected else _definition_size(entry)
+            fits = key == explicit_large["capability_id"] if explicit_large else size <= remaining
+            if fits:
+                remaining -= size
+                selected.add(key)
+                kept.append(entry)
+                continue
+            omitted.append(key)
+            if group == "loaded":
+                kept.append({"capability_id": key, "status": "budget_exceeded", "in_scope": True})
+        view[group] = list(reversed(kept)) if group == "loaded" else kept
+    if omitted:
+        view["mode"] = "discovery"
+    view["omitted_capability_ids"] = list(dict.fromkeys(omitted))
 
 
 def _injection_mode(registry: ToolRegistry, catalog: list[dict[str, Any]]) -> str:
@@ -156,7 +227,7 @@ def _injection_mode(registry: ToolRegistry, catalog: list[dict[str, Any]]) -> st
         definition = registry.definition(entry["capability_id"])
         if definition is None:
             continue
-        total += len(json.dumps(definition, ensure_ascii=False, default=str))
+        total += _definition_size(definition)
         if total > FULL_INJECTION_MAX_CHARS:
             return "discovery"
     return "full"
@@ -164,22 +235,30 @@ def _injection_mode(registry: ToolRegistry, catalog: list[dict[str, Any]]) -> st
 
 def _resolve_queries(
     discovery: dict[str, Any],
-    catalog_by_id: dict[str, dict[str, Any]],
+    registry: ToolRegistry,
     executable_ids: frozenset[str],
 ) -> list[dict[str, Any]]:
     """把历史检索结果对账到当前目录，已卸载的工具显式列为 removed。"""
     resolved: list[dict[str, Any]] = []
+    groups = registry.discovery_index().groups if discovery.get("queries") else {}
     for item in discovery.get("queries") or []:
         results: list[dict[str, Any]] = []
         removed: list[str] = []
         for capability_id in item.get("capability_ids") or []:
-            entry = catalog_by_id.get(str(capability_id))
+            entry = registry.summary(str(capability_id))
             if entry is None:
                 removed.append(str(capability_id))
             else:
-                results.append({**entry, "in_scope": str(capability_id) in executable_ids})
+                results.append({
+                    **entry, "description": entry["description"][:500],
+                    "in_scope": str(capability_id) in executable_ids,
+                })
         resolved.append({
             "query": item.get("query", ""),
+            "namespace_ids": item.get("namespace_ids") or [],
+            "namespaces": [
+                groups[key].summary(key) for key in (item.get("matched_namespace_ids") or []) if key in groups
+            ],
             "results": results,
             "removed": removed,
         })
@@ -188,17 +267,24 @@ def _resolve_queries(
 
 def _resolve_loaded(
     discovery: dict[str, Any],
-    registry: ToolRegistry,
-    executable_ids: frozenset[str],
+    execution: ToolRegistry,
+    discovery_registry: ToolRegistry,
 ) -> list[dict[str, Any]]:
     """按当前注册表重建已加载定义；指纹不一致时不返回旧 Schema。"""
     resolved: list[dict[str, Any]] = []
     for item in discovery.get("loaded") or []:
         capability_id = str(item.get("capability_id") or "")
         expected = str(item.get("descriptor_hash") or "")
-        definition = registry.definition(capability_id) if capability_id else None
+        definition = execution.definition(capability_id) if capability_id else None
         if definition is None:
-            resolved.append({"capability_id": capability_id, "status": "unavailable"})
+            summary = discovery_registry.summary(capability_id)
+            if summary is not None:
+                resolved.append({
+                    **summary, "description": summary["description"][:500],
+                    "in_scope": False, "status": "out_of_scope",
+                })
+            else:
+                resolved.append({"capability_id": capability_id, "status": "unavailable"})
             continue
         if definition["descriptor_hash"] != expected:
             resolved.append({
@@ -209,7 +295,7 @@ def _resolve_loaded(
             continue
         resolved.append({
             **definition,
-            "in_scope": capability_id in executable_ids,
+            "in_scope": True,
             "status": "ready",
         })
     return resolved

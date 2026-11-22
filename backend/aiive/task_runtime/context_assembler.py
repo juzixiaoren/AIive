@@ -43,6 +43,9 @@ class TaskContextAssembler:
         tool_view = {}
         if not reporting:
             execution, available = self._registries(task, registry, discovery_registry)
+            from aiive.tool_discovery.service import get_discovery_service
+
+            get_discovery_service().warm(available)
             tool_view = build_tool_view(
                 execution,
                 capabilities,
@@ -54,8 +57,11 @@ class TaskContextAssembler:
         evidence = list(reversed(reader.evidence(task.id)[-20:]))
         page_actions = {a.id for a in actions if a.capability_id in FULL_OBSERVATION_TOOLS}
         artifacts = reader.artifacts(task.id)
-        events = reader.signals(task.id, ["user_input_received", "watch_triggered", "watch_failed", "approval_denied",
-            "task_recovered", "action_invalidated"])
+        event_types = ["user_input_received", "watch_triggered", "watch_failed", "approval_denied",
+                       "task_recovered", "action_invalidated"]
+        if not reporting:
+            event_types.extend(("tool_search", "tool_describe"))
+        events = reader.signals(task.id, event_types)
         return {
             "task": {
                 "id": task.id,
@@ -170,9 +176,10 @@ class TaskContextAssembler:
         from aiive.control.capability_broker import CapabilityBroker
 
         broker = CapabilityBroker(self.db)
+        available = discovery_registry if discovery_registry is not None else broker.available_registry(task)
         return (
-            registry if registry is not None else broker.registry_for(task),
-            discovery_registry if discovery_registry is not None else broker.available_registry(task),
+            registry if registry is not None else broker.registry_for(task, available=available),
+            available,
         )
 
     @staticmethod

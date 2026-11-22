@@ -30,11 +30,11 @@ from aiive.task_runtime.schemas import (
     TaskStatus,
 )
 from aiive.task_runtime.tool_injection import (
-    MAX_SEARCH_RESULTS,
+    WORKER_RESIDENT_CAPABILITIES,
+    discovery_state,
     merge_state,
     record_definition,
     record_search,
-    resident_definitions,
 )
 from aiive.tools.base import outcome_is_unknown
 
@@ -156,11 +156,10 @@ class PersistentTaskRuntime:
                 continue
 
             broker = CapabilityBroker(self.db)
-            # 常驻入口按"全部可用能力"解析：即使任务显式收窄了授权，L0 入口仍可见，
-            # 由注入视图里的 in_scope 标记说明当前是否可执行。
             available = broker.available_registry(task)
             catalog = available.catalog()
-            resident = resident_definitions(available)
+            entries = {item["capability_id"]: item for item in catalog}
+            resident = [entries[key] for key in WORKER_RESIDENT_CAPABILITIES if key in entries]
             if not catalog:
                 self.repo.transition_task(
                     task, TaskStatus.BLOCKED_NODE.value,
@@ -375,24 +374,29 @@ class PersistentTaskRuntime:
 
             prepared = broker.prepare(task, proposal.capability_id, proposal.arguments)
             registration = prepared.registration
+            current_hash = registration.safety.descriptor_hash if registration else "unavailable"
+            stale = bool(registration and proposal.descriptor_hash and proposal.descriptor_hash != current_hash)
+            block_reason = "descriptor_changed" if stale else (
+                prepared.decision.reason if prepared.decision.outcome == "block" else None
+            )
             action = self.repo.create_action(
                 task=task,
                 run=run,
                 capability_id=proposal.capability_id,
                 arguments=proposal.arguments,
-                descriptor_hash=registration.safety.descriptor_hash if registration else "unavailable",
+                descriptor_hash=proposal.descriptor_hash or current_hash,
                 risk_level=registration.safety.risk_level if registration else "critical",
-                requires_approval=prepared.decision.outcome == "approval",
+                requires_approval=not stale and prepared.decision.outcome == "approval",
                 preconditions=proposal.preconditions,
                 effects=proposal.effects,
                 target_node_id=registration.executor_node_id if registration and registration.executor_kind == "desktop_node" else None,
             )
             self.repo.transition_action(action, ActionStatus.VALIDATED.value)
-            if prepared.decision.outcome == "block":
+            if block_reason is not None:
                 self.repo.transition_action(
                     action, ActionStatus.FAILED.value,
-                    error=prepared.decision.reason,
-                    payload={"reason": prepared.decision.reason},
+                    error=block_reason,
+                    payload={"reason": block_reason},
                 )
                 self.db.commit()
                 completed_this_run += 1
@@ -543,28 +547,41 @@ class PersistentTaskRuntime:
         注册表重新解析；因此注册、卸载或定义变化会立刻反映到注入结果里。
         """
         state = dict(task.task_state or {})
+        payload: dict[str, Any]
         if proposal.decision == "search_capabilities":
-            results = broker.search_capabilities(task, proposal.query, limit=MAX_SEARCH_RESULTS)
+            namespace_ids = sorted(set(proposal.namespace_ids))
+            query = proposal.query.strip()
+            search = broker.search_capabilities(task, query, namespace_ids=namespace_ids, limit=proposal.limit)
+            matched = [item["capability_id"] for item in search["tools"]]
+            namespaces = [item["namespace_id"] for item in search["namespaces"]]
             discovery = record_search(
-                state, proposal.query, [item["capability_id"] for item in results],
+                state, query, matched, namespace_ids=namespace_ids, matched_namespace_ids=namespaces,
+                loaded=search["loaded"],
             )
             payload = {
-                "query": proposal.query,
-                "matched": [item["capability_id"] for item in results],
+                "query": query,
+                "namespace_ids": namespace_ids,
+                "matched": matched,
+                "matched_namespace_ids": namespaces,
+                "loaded": [item["capability_id"] for item in search["loaded"]],
+                "mode": search["mode"],
+                "status": search["status"],
             }
             event_type = "tool_search"
         else:
-            definition = broker.describe_capability(task, proposal.capability_id)
-            discovery = record_definition(
-                state,
-                proposal.capability_id,
-                definition["descriptor_hash"] if definition else "",
-            )
+            capability_id = proposal.capability_id.strip()
+            definition = broker.describe_capability(task, capability_id)
+            discovery = discovery_state(state)
+            in_scope = bool(definition and definition.get("in_scope"))
+            if definition is not None and in_scope:
+                discovery = record_definition(state, capability_id, definition["descriptor_hash"])
             payload = {
-                "capability_id": proposal.capability_id,
+                "capability_id": capability_id,
                 "found": definition is not None,
-                "in_scope": bool(definition and definition.get("in_scope")),
+                "in_scope": in_scope,
             }
+            if definition is not None and not in_scope:
+                payload["summary"] = definition
             event_type = "tool_describe"
         task.task_state = merge_state(state, discovery)
         usage = dict(task.usage or {})

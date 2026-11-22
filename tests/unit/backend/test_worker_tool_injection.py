@@ -111,12 +111,13 @@ def test_discovery_covers_tools_outside_restricted_scope(db_session) -> None:
     task = _task(db_session, {"allowed_capabilities": ["get_current_time"]})
     broker = CapabilityBroker(db_session)
     results = broker.search_capabilities(task, "web", limit=5)
-    web = next(item for item in results if item["capability_id"] == "web_search")
+    web = next(item for item in results["tools"] if item["capability_id"] == "web_search")
     assert web["in_scope"] is False
+    assert results["loaded"] == []
     definition = broker.describe_capability(task, "web_search")
     assert definition is not None
     assert definition["in_scope"] is False
-    assert "input_schema" in definition
+    assert "input_schema" not in definition and "parameters" not in definition
     assert broker.describe_capability(task, "not_a_capability") is None
 
 
@@ -231,7 +232,7 @@ def test_runtime_discovery_creates_no_action_and_injects_results(db_session) -> 
     discovery = task.task_state["tool_discovery"]
     assert discovery["queries"][0]["query"] == "web"
     assert "web_search" in discovery["queries"][0]["capability_ids"]
-    assert discovery["loaded"][0]["capability_id"] == "web_search"
+    assert discovery["loaded"] == []
     assert int(task.usage["discovery_steps"]) == 2
 
     broker = CapabilityBroker(db_session)
@@ -241,7 +242,10 @@ def test_runtime_discovery_creates_no_action_and_injects_results(db_session) -> 
     )
     discovered = snapshot["tools"]["discovered"][0]
     assert "web_search" in [item["capability_id"] for item in discovered["results"]]
-    assert snapshot["tools"]["loaded"][0]["status"] == "ready"
+    assert snapshot["tools"]["loaded"] == []
+    describe = next(signal["payload"] for signal in snapshot["signals"] if signal["event_type"] == "tool_describe")
+    assert describe["found"] and not describe["in_scope"]
+    assert "input_schema" not in describe["summary"]
 
 
 def test_action_proposal_requires_discovery_payload() -> None:
@@ -290,7 +294,7 @@ def test_dynamically_registered_tool_is_discoverable_without_prompt_change(db_se
         task = _task(db_session, {"capability_policy": "unified"})
         broker = CapabilityBroker(db_session)
         hits = broker.search_capabilities(task, "probe")
-        assert "probe_tool" in [item["capability_id"] for item in hits]
+        assert "probe_tool" in [item["capability_id"] for item in hits["tools"]]
         definition = broker.describe_capability(task, "probe_tool")
         assert definition is not None
         assert definition["descriptor_hash"]
@@ -311,3 +315,67 @@ def test_resident_entries_stay_visible_when_scope_is_restricted(db_session) -> N
     entries = {item["capability_id"]: item for item in snapshot["tools"]["resident"]}
     assert "memory_search" in entries
     assert entries["memory_search"]["in_scope"] is False
+    assert "input_schema" not in entries["memory_search"]
+
+
+def test_historical_loaded_definition_respects_current_scope(db_session) -> None:
+    from aiive.task_runtime.function_decisions import WorkerFunctions
+
+    task = _task(db_session, {"allowed_capabilities": ["echo"]})
+    broker = CapabilityBroker(db_session)
+    discovered = broker.available_registry(task)
+    executed = broker.registry_for(task)
+    summary = discovered.summary("web_search")
+    state = record_definition({}, "web_search", summary["descriptor_hash"])
+    view = build_tool_view(executed, [summary], state, discovery_registry=discovered)
+    assert view["loaded"][0]["status"] == "out_of_scope"
+    assert all("input_schema" not in item for item in view["resident"] + view["loaded"])
+    assert "web_search" not in WorkerFunctions(view).capabilities.values()
+
+
+def test_auto_load_budget_and_explicit_oversized_definition():
+    from aiive.tool_discovery.documents import DiscoveryMetadata
+    from aiive.tool_discovery.service import DiscoveryService
+    from aiive.task_runtime.function_decisions import WorkerFunctions
+    from aiive.task_runtime.tool_injection import select_search_definitions
+
+    class BudgetTool(BaseTool):
+        def _run(self, **kwargs):
+            return kwargs
+
+    registry = ToolRegistry()
+    for index in range(8):
+        key = f"budget_{index}"
+        registry.register(BudgetTool(ToolDefinition(
+            CapabilitySafetySchema(key, "local_builtin", "trusted", "low"),
+            parameters={"text": {"type": "str", "description": "x" * (25_000 if index == 0 else 2_000)}},
+            discovery=DiscoveryMetadata(aliases=("find budget test",)),
+        )))
+    candidates = DiscoveryService().search(registry, "find budget test", limit=8)["tools"]
+    selected = select_search_definitions(registry, [{**item, "in_scope": True} for item in candidates])
+    assert len(selected) == 5
+    assert "budget_0" not in {item["capability_id"] for item in selected}
+
+    oversized = registry.definition("budget_0")
+    state = record_definition({}, "budget_0", oversized["descriptor_hash"])
+    view = build_tool_view(registry, [], state)
+    assert set(WorkerFunctions(view).capabilities.values()) == {"budget_0"}
+    assert view["loaded"][0]["input_schema"] == oversized["input_schema"]
+
+
+def test_worker_discovery_does_not_change_main_turn_definitions(db_session):
+    from aiive.core.function_calling import function_definitions
+    from aiive.runtime.turn_tool_surface import build_turn_tool_registry
+
+    def main_definitions():
+        return [function_definitions(build_turn_tool_registry(questions)) for questions in ([], [object()])]
+
+    before = main_definitions()
+    registry = get_tool_registry()
+    registry.register(_probe_registration())
+    try:
+        task = _task(db_session, {"capability_policy": "unified"})
+        assert CapabilityBroker(db_session).search_capabilities(task, "probe_tool")["loaded"]
+        assert main_definitions() == before
+    finally:
+        registry.unregister("probe_tool")

@@ -18,6 +18,8 @@ from aiive.mcp.bootstrap import registered_tool_ids
 from aiive.task_runtime.resource_locks import ResourceBusyError, ResourceLockService
 from aiive.tools.base import BaseTool, outcome_is_unknown
 from aiive.tools.registry import ToolRegistry
+from aiive.tool_discovery import DEFAULT_LIMIT
+from aiive.tool_discovery.service import get_discovery_service
 
 
 @dataclass(frozen=True)
@@ -40,10 +42,10 @@ class CapabilityBroker:
         self.policy: TaskPolicyEngine = policy or TaskPolicyEngine()
         self.locks: ResourceLockService = locks or ResourceLockService()
 
-    def registry_for(self, task: AgentTask) -> ToolRegistry:
+    def registry_for(self, task: AgentTask, *, available: ToolRegistry | None = None) -> ToolRegistry:
         """执行视图：restricted 时裁剪到授权白名单，unified 时返回全部可用能力。"""
         scope = TaskScope.from_brief(task.task_brief or {})
-        registry = build_registry_for_thread(self.db, task.thread_id, task.target_node_id)
+        registry = available if available is not None else self.available_registry(task)
         if scope.capability_policy == "unified":
             return registry
         return registry.scoped(scope.allowed_capabilities | TASK_READ_CAPABILITIES)
@@ -57,22 +59,30 @@ class CapabilityBroker:
         return build_registry_for_thread(self.db, task.thread_id, task.target_node_id)
 
     def search_capabilities(
-        self, task: AgentTask, query: str, *, limit: int = 5,
-    ) -> list[dict[str, Any]]:
-        """关键词检索全量可用能力，附带 in_scope 标记（授权信息，不是授权本身）。"""
-        scope = TaskScope.from_brief(task.task_brief or {})
-        return [
-            {**entry, "in_scope": scope.allows_capability(entry["capability_id"])}
-            for entry in self.available_registry(task).search(query, limit=limit)
-        ]
+        self, task: AgentTask, query: str, *, namespace_ids: list[str] | None = None,
+        limit: int = DEFAULT_LIMIT,
+    ) -> dict[str, Any]:
+        """检索同一快照中的目录，为 Worker 选择预算内的执行定义引用。"""
+        from aiive.task_runtime.tool_injection import select_search_definitions
+
+        available = self.available_registry(task).snapshot()
+        execution = self.registry_for(task, available=available)
+        result = get_discovery_service().search(available, query, namespace_ids=namespace_ids, limit=limit)
+        for entry in result["tools"]:
+            entry["in_scope"] = execution.get(entry["capability_id"]) is not None
+        result["loaded"] = select_search_definitions(execution, result["tools"])
+        return result
 
     def describe_capability(self, task: AgentTask, capability_id: str) -> dict[str, Any] | None:
-        """查询单个能力的完整定义；不存在时返回 None。"""
-        scope = TaskScope.from_brief(task.task_brief or {})
-        definition = self.available_registry(task).definition(capability_id)
-        if definition is None:
-            return None
-        return {**definition, "in_scope": scope.allows_capability(capability_id)}
+        """从执行视图读取定义，授权范围外仅返回目录摘要。"""
+        available = self.available_registry(task).snapshot()
+        definition = self.registry_for(task, available=available).definition(capability_id)
+        if definition is not None:
+            return {**definition, "in_scope": True}
+        summary = available.summary(capability_id)
+        if summary is not None:
+            return {**summary, "description": summary["description"][:500], "in_scope": False}
+        return None
 
     def list_capabilities(self, task: AgentTask) -> list[dict[str, Any]]:
         return self.registry_for(task).list_all()

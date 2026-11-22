@@ -18,7 +18,7 @@ DeepSeek 在带工具的请求中遇到缺失推理字段的 Thinking 历史、�
 
 ToolRegistry 是有效工具契约的唯一入口。显式 `input_schema`（包括 MCP/Desktop 原始定义）优先；否则从已有 Pydantic 参数模型、handler 类型注解和 parameters 元数据派生 Canonical JSON Schema。领域模型的 `model_json_schema()` 可作为嵌套字段来源，本地 `$defs` 引用随包装提升到根节点。
 
-`delegate_task.budgets` 复用 TaskBudget，保留额外字段禁止、类型、默认值和约束；没有 `max_steps` 别名。注册时保存有效契约并重新计算 descriptor_hash，覆盖完整 Schema、描述、安全属性与执行节点。注入、发现、参数校验使用同一份契约。
+`delegate_task.budgets` 复用 TaskBudget，保留额外字段禁止、类型、默认值和约束；没有 `max_steps` 别名。注册时保存有效契约并重新计算 `descriptor_hash`，覆盖完整 Schema、描述、安全属性与执行节点。发现元数据独立生成 `discovery_hash`，用于检索文档和向量缓存。
 
 统一 `validate_tool_params` 使用 Draft 2020-12；整数严格检查，不转换字符串，也不把 bool/float 当成整数。错误只返回路径、期望约束和实际值类型。default 是 Schema 注释，handler 与领域模型继续应用原有默认值。
 
@@ -26,7 +26,7 @@ ToolRegistry 是有效工具契约的唯一入口。显式 `input_schema`（包�
 
 Main 的 `build_langchain_tools` 从共享 `function_definition` 获取 Schema，生成 StructuredTool。模型返回的有效调用经过本地校验与策略处理后，继续由既有 ToolNode/Registry 执行。普通文本回答合法；批量参数无效时整批不执行。真实 ToolCall ID 与业务参数分离，执行结果保留 error_type、execution_status、operation_id、retryable 和 issues。
 
-Worker 的 `WorkerFunctions` 只从当前 TaskContext 选中的 resident/available/ready-loaded 定义生成提案函数，没有绑定任何真实 handler。所有提案注册项只有拒绝执行的防御 stub；模型只接收原生函数定义字典，Worker 不使用 ToolNode 或 Registry.execute。
+Worker 的 `WorkerFunctions` 从当前 TaskContext 选中的 resident、available、ready-loaded 定义生成提案函数，每组都要求 `in_scope=true`。模型只接收原生函数定义字典，真实 handler 由 Broker 与 ToolExecutor 调度。
 
 每个能力有一个稳定的 `propose_<能力前缀>_<哈希>` 函数，函数描述包含真实 capability_id。其参数为 `{arguments: 原始完整工具Schema, preconditions, effects, summary}`，包装层禁止额外字段。真实参数与决策元数据隔离，不维护第二份工具定义。函数名限定于供应商允许的字符与长度，并检查映射冲突。
 
@@ -64,6 +64,8 @@ Worker 执行链：Function Calling → 共享参数校验 → 内部 ActionProp
 
 ## 上下文与发现
 
-工具选择按完整定义进行预算控制，超限省略整个定义并切换 discovery。绑定函数与上下文元数据从同一个 snapshot 构建；完整参数 Schema 只通过 Function Calling 传递，System/User Prompt 不再重复注入 Schema 或 ActionProposal 输出契约。TaskContext 内仍保留 in_scope、指纹、发现状态等选择信息。定义变化或卸载会使旧 loaded 定义失效。
+Worker 的工具搜索接受 `query`、可选 `namespace_ids` 和 `limit`（默认 5，最大 8）。Discovery Service 融合 Exact、BM25 和可用的 Dense 排名，并返回轻量摘要。授权范围内的候选按顺序加载最多五个定义；自动加载与常驻定义共用 24,000 字符预算，显式 describe 可单独加载较大的定义。
 
-没有新增数据库字段或迁移。对外 Task API、ActionProposal 内部字段、事件和执行审计语义保持兼容。验收采用离线 LangChain AIMessage、真实数据库事务与真实 handle_agent_task_run；生产 PostgreSQL 并发锁及在线模型/MCP/Desktop 执行仍由既有专项验证覆盖。
+执行视图是完整 Schema 的唯一来源。TaskContext 与 Function Calling 使用同一份选择快照。System/User Prompt 传递摘要、状态和指纹，参数 Schema 通过 Function Calling 传递。`task_state.tool_discovery` 保存查询、Namespace ID、能力 ID 和执行契约指纹。恢复时以当前执行视图重建定义，范围变化、卸载和指纹变化使旧引用失效。Worker 在内部 ActionProposal 上写入已绑定定义的指纹。若定义在模型调用期间发生变化，Runtime 以 `descriptor_changed` 拒绝旧提案，Broker 在分派时继续复核执行指纹。
+
+V2 复用现有 Task 状态和事件，无需迁移。离线集成测试通过 LangChain AIMessage 调用真实 `handle_agent_task_run`，覆盖中文语义检索、成批绑定、Broker 执行和 Evidence 写入。索引及配置见 [工具注入方案分析](工具注入方案分析.md)。

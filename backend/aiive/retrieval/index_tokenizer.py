@@ -11,8 +11,8 @@ from aiive.memory.automatic_recall import tokenize_cjk_aware
 _CJK = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]")
 
 
-def tokenize_for_index(text: str) -> list[tuple[str, str]]:
-    """返回 (token, token_kind) 列表，去重。
+def tokenize_for_index(text: str, *, unique: bool = True) -> list[tuple[str, str]]:
+    """返回 (token, token_kind) 列表，默认去重。
 
     token_kind ∈ {cjk_bigram, word}：CJK 二元走 cjk_bigram，英文/数字走 word。
     """
@@ -23,7 +23,7 @@ def tokenize_for_index(text: str) -> list[tuple[str, str]]:
     for tok in tokenize_cjk_aware(text.lower()):
         kind = "cjk_bigram" if _CJK.search(tok) else "word"
         key = (tok, kind)
-        if key not in seen:
+        if not unique or key not in seen:
             seen.add(key)
             out.append(key)
     return out

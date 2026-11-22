@@ -101,6 +101,42 @@ def test_single_online_node_is_implicitly_available(db_session) -> None:
     assert resolved is not None and resolved.id == node_id
 
 
+def test_discovery_desktop_namespace_tracks_online_nodes_and_capabilities(db_session, monkeypatch):
+    from aiive.tool_discovery.service import DiscoveryService
+    from aiive.tools.registry import get_tool_registry
+
+    thread = Thread()
+    db_session.add(thread)
+    db_session.flush()
+    first, second = str(uuid.uuid4()), str(uuid.uuid4())
+    namespace = f"desktop:{first}"
+    desktop_node_service.register_online(db_session, _hello(first))
+    desktop_node_service.register_online(db_session, _hello(second))
+    db_session.flush()
+    monkeypatch.setattr(desktop_connection_manager, "is_connected", lambda _: True)
+    base = get_tool_registry().discovery_index()
+    snapshot = build_registry_for_thread(db_session, thread.id, first)
+    other = build_registry_for_thread(db_session, thread.id, second)
+    assert snapshot.discovery_index().tools.documents["web_search"] is base.tools.documents["web_search"]
+    service = DiscoveryService()
+    assert service.search(snapshot, "desktop_fs_stat")["tools"][0]["namespace_id"] == namespace
+    assert service.search(other, "desktop_fs_stat", namespace_ids=[namespace])["tools"] == []
+
+    hello = _hello(first)
+    hello.capabilities = [item for item in hello.capabilities if item.name != "desktop_fs_stat"]
+    desktop_node_service.register_online(db_session, hello)
+    db_session.flush()
+    changed = build_registry_for_thread(db_session, thread.id, first)
+    assert "desktop_fs_stat" not in changed.discovery_index().groups[namespace].members
+    assert service.search(snapshot, "desktop_fs_stat", namespace_ids=[namespace])["tools"][0]["capability_id"] == "desktop_fs_stat"
+
+    desktop_node_service.mark_offline(db_session, first)
+    db_session.flush()
+    offline = build_registry_for_thread(db_session, thread.id, first)
+    assert namespace not in offline.discovery_index().groups
+    assert offline.discovery_index() is base
+
+
 def test_registry_overlay_injects_node_tools_with_remote_executor(db_session, monkeypatch) -> None:
     node_id = str(uuid.uuid4())
     thread = Thread()

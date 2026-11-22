@@ -300,6 +300,10 @@ def create_app() -> FastAPI:
             restore_active_capabilities(get_tool_registry())
         except Exception:
             logger.exception("MCP 已激活能力恢复注册失败")
+        from aiive.tool_discovery.service import close_discovery_service, get_discovery_service
+        from aiive.tools.registry import get_tool_registry
+        if settings.aiive_tool_discovery_vector_enabled:
+            get_discovery_service().warm(get_tool_registry())
         try:
             start_daemon()
         except Exception:
@@ -363,6 +367,7 @@ def create_app() -> FastAPI:
             logger.info("Scheduler daemon stopped (wait_active)")
         except Exception:
             logger.exception("调度器关闭失败")
+        close_discovery_service()
         try:
             heartbeat.stop()
             logger.info("OutboxHeartbeat stopped")

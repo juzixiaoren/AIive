@@ -11,14 +11,16 @@
 import hashlib
 import json
 import logging
-import re
 from dataclasses import dataclass, field, replace
+from threading import RLock
 from typing import Any
 
 from aiive.tools.base import BaseTool, CancellationPolicy
 
 from aiive.config import settings
 from aiive.context.run_context import RunContext
+from aiive.tool_discovery.documents import DiscoveryMetadata, tool_document
+from aiive.tool_discovery.index import DiscoveryIndex
 
 logger = logging.getLogger(__name__)
 
@@ -97,66 +99,14 @@ class ToolDefinition:
     cancellation_policy: CancellationPolicy = CancellationPolicy.NONE
     idempotent: bool = False
     supports_reconciliation: bool = False
+    discovery: DiscoveryMetadata = field(default_factory=DiscoveryMetadata)
+    discovery_hash: str = ""
 
 
 def canonical_schema(reg: BaseTool) -> dict[str, Any]:
     from aiive.tools.tool_validation import canonical_tool_schema
     return canonical_tool_schema(reg)
 
-
-_CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
-
-
-def _search_tokens(query: str) -> list[str]:
-    """把查询拆成可匹配词元；中文长词额外展开为二元组，提高召回。"""
-    normalized = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", " ", query.casefold()).strip()
-    if not normalized:
-        return []
-    tokens: list[str] = []
-    for part in normalized.split():
-        if len(part) > 2 and _CJK_PATTERN.search(part):
-            tokens.extend(part[index:index + 2] for index in range(len(part) - 1))
-        tokens.append(part)
-    unique: list[str] = []
-    for token in tokens:
-        if token not in unique:
-            unique.append(token)
-    return unique
-
-
-def _parameter_names(reg: BaseTool) -> list[str]:
-    """收集参数名，供检索命中参数维度（不返回任何 Schema 内容）。"""
-    names: list[str] = []
-    if isinstance(reg.parameters, dict):
-        names.extend(str(name) for name in reg.parameters)
-    schema = reg.input_schema
-    if isinstance(schema, dict) and isinstance(schema.get("properties"), dict):
-        names.extend(str(name) for name in schema["properties"])
-    return names
-
-
-def _score_registration(reg: BaseTool, tokens: list[str]) -> int:
-    """确定性的本地相关性打分：id > 描述 > 参数名。"""
-    capability_id = reg.safety.capability_id.casefold()
-    description = (reg.description or "").casefold()
-    parameter_names = " ".join(_parameter_names(reg)).casefold()
-    score = 0
-    for token in tokens:
-        if token == capability_id:
-            score += 60
-        elif token in capability_id:
-            score += 24
-        position = description.find(token)
-        if position >= 0:
-            # 描述开头通常就是该能力的主语，位置越靠前越可能是主题词。
-            score += 10 + (8 if position == 0 else 4 if position < 20 else 0)
-        if token in parameter_names:
-            score += 4
-    return score
-
-# ---------------------------------------------------------------------------
-# 工具调用辅助函数（在独立线程中执行，支持超时中断）
-# ---------------------------------------------------------------------------
 
 class ToolRegistry:
     """工具注册表：管理所有工具能力的注册、查询和执行。
@@ -172,6 +122,8 @@ class ToolRegistry:
     def __init__(self):
         """初始化空的工具注册表。"""
         self._tools: dict[str, BaseTool] = {}
+        self._index: DiscoveryIndex | None = DiscoveryIndex()
+        self._lock: RLock = RLock()
 
     def register(self, reg: object) -> None:
         """注册工具，保存规范契约并重新计算完整定义指纹。
@@ -213,9 +165,25 @@ class ToolRegistry:
                 reg.safety,
                 descriptor_hash=compute_descriptor_hash(safety_payload),
             ),
-        )
-        )
-        self._tools[reg.safety.capability_id] = reg
+        ))
+        metadata, document = tool_document(reg)
+        reg = reg.with_definition(replace(reg.definition, discovery=metadata, discovery_hash=document.discovery_hash))
+        capability_id = reg.safety.capability_id
+        with self._lock:
+            if self._index is not None:
+                self._index = self._index.updated(capability_id, document, metadata)
+            self._tools = {**self._tools, capability_id: reg}
+
+    def discovery_index(self) -> DiscoveryIndex:
+        """返回当前版本的索引。执行专用裁剪视图仅在实际检索时构建索引。"""
+        with self._lock:
+            if self._index is None:
+                index = DiscoveryIndex()
+                for reg in self._tools.values():
+                    metadata, document = tool_document(reg)
+                    index = index.updated(reg.safety.capability_id, document, metadata)
+                self._index = index
+            return self._index
 
     def get(self, capability_id: str) -> BaseTool | None:
         """按 ID 查询已注册工具。
@@ -243,7 +211,9 @@ class ToolRegistry:
         快照注册或覆盖工具不会影响进程级基础注册表。
         """
         cloned = ToolRegistry()
-        cloned._tools = dict(self._tools)
+        with self._lock:
+            cloned._tools = self._tools
+            cloned._index = self._index
         return cloned
 
     def scoped(self, capability_ids: set[str] | frozenset[str]) -> "ToolRegistry":
@@ -254,6 +224,7 @@ class ToolRegistry:
             for capability_id, registration in self._tools.items()
             if capability_id in capability_ids
         }
+        cloned._index = None
         return cloned
 
     def list_all(self) -> list[dict[str, Any]]:
@@ -289,10 +260,17 @@ class ToolRegistry:
     def unregister(self, capability_id: str) -> bool:
         """移除一个能力（如 MCP server 卸载、桌面节点离线）。
 
-        目录与检索每次都读取实时注册映射，不维护独立缓存，因此卸载后不会再
-        被搜索或注入。返回是否确实移除了条目。
+        注册映射与索引一起发布，已取得的快照继续使用各自版本。
         """
-        return self._tools.pop(capability_id, None) is not None
+        with self._lock:
+            if capability_id not in self._tools:
+                return False
+            tools = self._tools.copy()
+            del tools[capability_id]
+            if self._index is not None:
+                self._index = self._index.updated(capability_id, None, None)
+            self._tools = tools
+            return True
 
     def catalog(self) -> list[dict[str, Any]]:
         """轻量能力目录：只含选择所需的最小元数据，绝不含参数 Schema。
@@ -303,26 +281,15 @@ class ToolRegistry:
         """
         return [self._catalog_entry(reg) for reg in self._tools.values()]
 
-    def search(self, query: str, *, limit: int = 5) -> list[dict[str, Any]]:
-        """本地关键词检索能力目录（确定性、无外部服务、无向量库）。
+    def summary(self, capability_id: str) -> dict[str, Any] | None:
+        reg = self.get(capability_id)
+        return self._catalog_entry(reg) if reg is not None else None
 
-        打分规则固定：capability_id 命中权重最高，其次描述，最后参数名。
-        相同分数按 capability_id 排序，保证同一注册表状态下结果完全可复现。
-        每次调用都基于当前注册映射，注册/卸载/重注册后立即可见。
-        """
-        tokens = _search_tokens(query)
-        if not tokens or limit <= 0:
-            return []
-        scored: list[tuple[int, str, BaseTool]] = []
-        for reg in self._tools.values():
-            score = _score_registration(reg, tokens)
-            if score > 0:
-                scored.append((score, reg.safety.capability_id, reg))
-        scored.sort(key=lambda item: (-item[0], item[1]))
-        return [
-            {**self._catalog_entry(reg), "score": score}
-            for score, _, reg in scored[:limit]
-        ]
+    def search(self, query: str, *, limit: int = 5) -> list[dict[str, Any]]:
+        """兼容同步目录调用，复用 V2 的 Exact + BM25。"""
+        from aiive.tool_discovery.service import DiscoveryService
+
+        return DiscoveryService().search(self, query, limit=limit)["tools"]
 
     def definition(self, capability_id: str) -> dict[str, Any] | None:
         """单个能力的完整定义（含参数 Schema），供按需加载使用。
@@ -355,6 +322,9 @@ class ToolRegistry:
             "can_delete": reg.safety.can_delete,
             "uses_network": reg.safety.uses_network,
             "descriptor_hash": reg.safety.descriptor_hash,
+            "discovery_hash": reg.definition.discovery_hash,
+            "namespace_id": reg.definition.discovery.namespace_id,
+            "namespace_name": reg.definition.discovery.namespace_name,
             "executor_kind": reg.executor_kind,
             "executor_node_id": reg.executor_node_id,
             "cancellation_policy": reg.definition.cancellation_policy,
@@ -382,6 +352,7 @@ class ToolRegistry:
 
 # 全局单例
 _registry: ToolRegistry | None = None
+_registry_lock = RLock()
 
 
 def get_tool_registry() -> ToolRegistry:
@@ -393,10 +364,12 @@ def get_tool_registry() -> ToolRegistry:
         ToolRegistry 全局单例
     """
     global _registry
-    if _registry is None:
-        _registry = ToolRegistry()
-        _register_builtins(_registry)
-    return _registry
+    with _registry_lock:
+        if _registry is None:
+            registry = ToolRegistry()
+            _register_builtins(registry)
+            _registry = registry
+        return _registry
 
 
 def _register_builtins(registry: ToolRegistry) -> None:

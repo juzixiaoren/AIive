@@ -136,6 +136,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         registry: 目标 ToolRegistry 实例
     """
     from aiive.tools.attachment_tools import register_attachment_tools
+    from aiive.tool_discovery.builtins import builtin_discovery
     from aiive.tools.builtin_knowledge import ReadKnowledgeChunkTool
     from aiive.memory.recall_config import RecallConfig
     from aiive.tools.task_file_tools import ListTaskFilesTool, ReadTaskArtifactTool, ReadTaskEvidenceTool
@@ -442,4 +443,5 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             effect_mode=external_effect_modes.get(cap_id, "db_transactional"),
         )
         registry.register(tool_type(ToolDefinition(safety=safety, description=desc, parameters=params,
+                                                   discovery=builtin_discovery(cap_id),
                                                    cancellation_policy=CancellationPolicy.TRANSACTIONAL if issubclass(tool_type, DatabaseTool) else CancellationPolicy.COOPERATIVE if cap_id == "run_shell" else CancellationPolicy.NONE)))

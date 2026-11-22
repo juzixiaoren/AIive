@@ -106,7 +106,7 @@ AIive（再次召回，fail-closed 校验）：
 # 1. 配置环境变量
 cp .env.example .env
 # 编辑 .env 填入 LLM API Key 等信息
-# 如需本地向量召回，将 AIIVE_MEMORY_VECTOR_ENABLED / AIIVE_KNOWLEDGE_VECTOR_ENABLED 改为 true
+# 按需设置各功能的向量开关（记忆、知识库、Worker 工具发现）
 # 记忆 BM25 稀疏召回（AIIVE_MEMORY_BM25_ENABLED）默认开启，依赖 postgres 服务自带的
 # pg_search 扩展（deploy/pg/Dockerfile）；扩展缺失时召回自动降级为词法并标记 degraded
 # 旧数据卷（已有 PGDATA）升级时，镜像入口脚本会自动补齐 shared_preload_libraries，不需删卷
@@ -209,10 +209,13 @@ stdout/stderr 由后台线程边读边写日志（`SHELL_MAX_LOG_BYTES`，默认
 `TOOL_OUTPUT_CLEANUP_INTERVAL_HOURS`（默认 5 小时）清理一次，只删该目录内的日志。
 
 启用本地 Embedding 时应通过 `./scripts/start.sh` 启动模型服务。脚本读取 `.env` 中的
-`AIIVE_MEMORY_VECTOR_ENABLED` / `AIIVE_KNOWLEDGE_VECTOR_ENABLED` 与
+`AIIVE_MEMORY_VECTOR_ENABLED`、`AIIVE_KNOWLEDGE_VECTOR_ENABLED`、
+`AIIVE_TOOL_DISCOVERY_VECTOR_ENABLED` 与
 `AIIVE_EMBEDDING_PROVIDER`：任一向量检索开启且 provider 为 `local` 时，先检查
 `.data/models/embeddings/` 下固定 revision 的模型是否完整，缺失则自动下载
 （`BAAI/bge-small-zh-v1.5`，约 92MB），已有缓存直接复用，随后启动 TEI 并等待就绪。
+
+Worker 工具发现默认使用 Exact 与 BM25。设置 `AIIVE_TOOL_DISCOVERY_VECTOR_ENABLED=true` 可启用语义召回，即使两个持久化向量开关均关闭。工具文档向量仅保存在进程内。仅启用工具向量时，TEI 启动失败后后端仍可启动并提供词汇检索。配置远端 Provider 时，工具文档和搜索查询会发往配置的 Embedding 端点。
 
 - 下载源：`AIIVE_HF_ENDPOINT_CANDIDATES`（逗号分隔，按顺序尝试，默认官方源 + `hf-mirror`）；
   只用一个源时设置 `AIIVE_HF_ENDPOINT`。

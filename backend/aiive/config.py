@@ -79,6 +79,8 @@ class Settings(BaseSettings):
 
     # 记忆向量召回（本地/远端 OpenAI-compatible Embeddings + pgvector）
     aiive_memory_vector_enabled: bool = False
+    # Worker 工具发现用进程内向量，独立于持久化记忆与知识库投影。
+    aiive_tool_discovery_vector_enabled: bool = False
     aiive_embedding_provider: Literal["local", "openai_compatible"] = "openai_compatible"
     aiive_embedding_api_key: str = ""
     aiive_embedding_base_url: str = "https://api.openai.com/v1"

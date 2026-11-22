@@ -8,7 +8,7 @@ from sqlalchemy import and_, delete, or_, text
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
-from aiive.config import settings
+from aiive.config import Settings, settings
 from aiive.db.models import MemoryRecord, MemoryVectorProjection
 from aiive.forget.visibility_service import ForgetVisibilityService
 from aiive.memory.embedding_provider import OpenAIEmbeddingProvider
@@ -47,16 +47,16 @@ def validate_vector_runtime(db: Session) -> None:
         provider.embed("AIive 本地向量服务启动检查", input_type="query")
 
 
-def build_embedding_provider() -> OpenAIEmbeddingProvider:
+def build_embedding_provider(config: Settings = settings) -> OpenAIEmbeddingProvider:
     """按当前运行配置构造 OpenAI-compatible Embeddings provider。"""
     return OpenAIEmbeddingProvider(
-        api_key=settings.aiive_embedding_api_key,
-        base_url=settings.aiive_embedding_base_url,
-        model=settings.aiive_embedding_model,
-        dimensions=settings.aiive_embedding_dimensions,
-        timeout_seconds=settings.aiive_embedding_timeout_seconds,
-        provider=settings.aiive_embedding_provider,
-        query_prefix=settings.aiive_embedding_query_prefix,
+        api_key=config.aiive_embedding_api_key,
+        base_url=config.aiive_embedding_base_url,
+        model=config.aiive_embedding_model,
+        dimensions=config.aiive_embedding_dimensions,
+        timeout_seconds=config.aiive_embedding_timeout_seconds,
+        provider=config.aiive_embedding_provider,
+        query_prefix=config.aiive_embedding_query_prefix,
     )
 
 

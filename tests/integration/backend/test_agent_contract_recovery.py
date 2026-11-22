@@ -10,7 +10,7 @@ import uuid
 
 import pytest
 
-from aiive.db.models import AgentAction, AgentRun, AgentTask, AgentTaskEvent, Thread
+from aiive.db.models import AgentAction, AgentRun, AgentTask, AgentTaskEvent, TaskEvidence, Thread
 from aiive.task_runtime.agent_executor import TaskAgentExecutor
 from aiive.task_runtime.repository import TaskRepository, utcnow
 from aiive.task_runtime.schemas import TaskBudget
@@ -103,11 +103,13 @@ class Model:
     def __init__(self, outputs):
         self.outputs = iter(outputs)
         self.messages = []
+        self.bound_names = []
 
     def bind_tools(self, definitions, **kwargs):
         from aiive.runtime.context_budget import ContextBudget
 
         self.definitions = definitions
+        self.bound_names.append({item["function"]["name"] for item in definitions})
         assert kwargs == {"tool_choice": "auto", "parallel_tool_calls": False,
                           "max_tokens": ContextBudget.default().reserved_output_tokens}
         return self
@@ -279,7 +281,7 @@ def test_unknown_effect_recovery_does_not_replay(durable_db, monkeypatch):
 
 def test_correction_cannot_expand_scope(durable_db, monkeypatch):
     task_id, claimed = setup_job(durable_db)
-    wire_model(monkeypatch, [
+    model = wire_model(monkeypatch, [
         '{"decision":"action","capability_id":"list_reminders","arguments":{"bad":1}}',
         '{"decision":"action","capability_id":"list_reminders"}',
         '{"decision":"finish","report_status":"failed"}',
@@ -287,8 +289,8 @@ def test_correction_cannot_expand_scope(durable_db, monkeypatch):
     assert handle_agent_task_run(claimed).outcome == HandlerOutcome.COMPLETED
     durable_db.expire_all()
     actions = durable_db.query(AgentAction).filter_by(task_id=task_id).all()
-    assert len(actions) == 1 and actions[0].status == "failed"
-    assert actions[0].error_message == "unknown_capability"  # restricted registry hides out-of-scope tools
+    assert actions == []
+    assert all(proposal_function_name("list_reminders") not in names for names in model.bound_names)
 
 
 def test_validation_tokens_survive_following_timeout(durable_db, monkeypatch):
@@ -400,6 +402,157 @@ def test_discovery_via_control_functions_creates_no_actions(durable_db, monkeypa
     task = durable_db.get(AgentTask, task_id)
     assert task.status == "succeeded" and task.usage["discovery_steps"] == 2
     assert durable_db.query(AgentAction).filter_by(task_id=task_id).count() == 0
+
+
+@pytest.fixture
+def worker_discovery(monkeypatch):
+    from aiive.tool_discovery.dense import DenseIndex, ModelIdentity
+    from aiive.tool_discovery.service import DiscoveryService
+
+    class Provider:
+        fail = False
+
+        def embed(self, text, *, input_type="document"):
+            return [1, 0] if any(term in text for term in ("报销", "invoice", "spreadsheet")) else [0, 1]
+
+        def embed_batch(self, texts, *, batch_size):
+            if self.fail:
+                raise RuntimeError("offline mock outage")
+            return [self.embed(text) for text in texts]
+
+    provider = Provider()
+    index = DenseIndex(ModelIdentity("local", "http://embedding/v1", "mock", "r1", 2, ""),
+                       lambda: provider, batch_size=4)
+    service = DiscoveryService(index)
+    monkeypatch.setattr("aiive.control.capability_broker.get_discovery_service", lambda: service)
+    monkeypatch.setattr("aiive.tool_discovery.service.get_discovery_service", lambda: service)
+    try:
+        yield service, provider
+    finally:
+        index.close()
+
+
+def _wait_for_discovery(service, registry, status):
+    from time import monotonic, sleep
+
+    deadline = monotonic() + 5
+    while monotonic() < deadline:
+        if service.search(registry, "报销")["status"] == status:
+            return
+        sleep(0.01)
+    pytest.fail(f"Tool discovery did not reach {status}")
+
+
+def test_worker_semantic_search_binds_batch_and_broker_creates_evidence(durable_db, monkeypatch, worker_discovery):
+    from aiive.tool_discovery.documents import DiscoveryMetadata
+    from aiive.tools.registry import get_tool_registry
+
+    class DocumentTool(BaseTool):
+        def _run(self, **params):
+            return {"records": 2, "format": params["format"]}
+
+    registry = get_tool_registry()
+    reader, exporter = "test_semantic_reader", "test_semantic_export"
+    try:
+        for key, description, namespace in (
+            (reader, "Read invoice pages", "test:pdf"),
+            (exporter, "Extract a spreadsheet", "test:tables"),
+        ):
+            registry.register(DocumentTool(ToolDefinition(
+                CapabilitySafetySchema(key, "local_builtin", "trusted", "low", effect_mode="pure"),
+                description=description,
+                parameters={"format": {"type": "str", "required": True}},
+                discovery=DiscoveryMetadata(namespace_id=namespace),
+            )))
+        _wait_for_discovery(worker_discovery[0], registry, "ready")
+        task_id, claimed = setup_job(durable_db)
+        task = durable_db.get(AgentTask, task_id)
+        task.task_brief = {"scope": {"capability_policy": "unified"}}
+        durable_db.commit()
+        model = wire_model(monkeypatch, [
+            json.dumps({"decision": "search_capabilities", "query": "整理报销金额", "limit": 5}, ensure_ascii=False),
+            json.dumps({"decision": "action", "capability_id": exporter, "arguments": {"format": "csv"}}),
+            '{"decision":"finish","summary":"extracted two records"}',
+        ])
+        assert handle_agent_task_run(claimed).outcome == HandlerOutcome.COMPLETED
+        durable_db.expire_all()
+        task = durable_db.get(AgentTask, task_id)
+        assert task.status == "succeeded"
+        expected = {proposal_function_name(reader), proposal_function_name(exporter)}
+        assert not expected & model.bound_names[0]
+        assert expected <= model.bound_names[1]
+        search = durable_db.query(AgentTaskEvent).filter_by(task_id=task_id, event_type="tool_search").one().payload
+        assert search["mode"] == "hybrid" and search["status"] == "ready"
+        assert set(search["matched"]) == set(search["loaded"]) == {reader, exporter}
+        assert set(search["matched_namespace_ids"]) == {"test:pdf", "test:tables"}
+        saved = task.task_state["tool_discovery"]["loaded"]
+        assert {item["capability_id"] for item in saved} == {reader, exporter}
+        assert all(set(item) == {"capability_id", "descriptor_hash"} for item in saved)
+        action = durable_db.query(AgentAction).filter_by(task_id=task_id).one()
+        assert action.status == "succeeded" and action.capability_id == exporter
+        evidence = durable_db.query(TaskEvidence).filter_by(task_id=task_id, action_id=action.id).one()
+        assert "records" in evidence.summary and "csv" in evidence.summary
+    finally:
+        registry.unregister(reader)
+        registry.unregister(exporter)
+
+
+def test_worker_resident_stays_bound_during_embedding_failure(durable_db, monkeypatch, worker_discovery):
+    from sqlalchemy.orm import Session
+
+    from aiive.tools.registry import get_tool_registry
+
+    service, provider = worker_discovery
+    provider.fail = True
+    _wait_for_discovery(service, get_tool_registry(), "embedding_unavailable")
+    task_id, claimed = setup_job(durable_db)
+    task = durable_db.get(AgentTask, task_id)
+    task.task_brief = {"scope": {"allowed_capabilities": ["list_reminders"]}}
+    durable_db.commit()
+    # The database tool owns a separate session, as it does in production.
+    monkeypatch.setattr("aiive.tools.builtin_tools.SessionLocal", lambda: Session(durable_db.get_bind()))
+    model = wire_model(monkeypatch, [
+        '{"decision":"search_capabilities","query":"list_reminders"}',
+        '{"decision":"action","capability_id":"list_reminders"}',
+        '{"decision":"finish","summary":"listed reminders"}',
+    ])
+    assert handle_agent_task_run(claimed).outcome == HandlerOutcome.COMPLETED
+    durable_db.expire_all()
+    task = durable_db.get(AgentTask, task_id)
+    assert task.status == "succeeded"
+    assert proposal_function_name("list_reminders") in model.bound_names[0]
+    assert durable_db.query(AgentAction).filter_by(task_id=task_id).one().status == "succeeded"
+
+
+def test_worker_refuses_definition_changed_during_model_call(durable_db, monkeypatch):
+    from dataclasses import replace
+
+    from aiive.tools.registry import get_tool_registry
+
+    task_id, claimed = setup_job(durable_db)
+    registry = get_tool_registry()
+    original = registry.get("get_current_time")
+    model = wire_model(monkeypatch, [
+        '{"decision":"action","capability_id":"get_current_time"}',
+        '{"decision":"finish","report_status":"partial","summary":"tool changed"}',
+    ])
+    invoke = model.invoke
+
+    def invoke_during_update(messages, **kwargs):
+        response = invoke(messages, **kwargs)
+        if any(call["name"] == proposal_function_name("get_current_time") for call in response.tool_calls):
+            registry.register(original.with_definition(replace(original.definition, description="Updated clock contract")))
+        return response
+
+    monkeypatch.setattr(model, "invoke", invoke_during_update)
+    try:
+        assert handle_agent_task_run(claimed).outcome == HandlerOutcome.COMPLETED
+        action = durable_db.query(AgentAction).filter_by(task_id=task_id).one()
+        assert action.status == "failed" and action.error_message == "descriptor_changed"
+        assert action.descriptor_hash == original.safety.descriptor_hash
+        assert durable_db.query(TaskEvidence).filter_by(task_id=task_id, action_id=action.id).count() == 0
+    finally:
+        registry.register(original)
 
 
 def test_model_boundary_preserves_content_unavailable(durable_db, monkeypatch):

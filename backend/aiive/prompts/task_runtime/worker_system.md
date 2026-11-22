@@ -5,17 +5,17 @@
 - task_finish：提交完成/部分完成/失败决定及关键发现，供 Runtime 成稿。长期目标中表示当前步骤的结论。
 - task_ask_user：提出需要用户补充的问题。
 - task_watch：由 Runtime 等待首次匹配并恢复任务，参数以绑定 Schema 为准。重复调度使用长期 Goal。文件等待检查的是后端本机路径。
-- task_search_capabilities：提出检索能力目录的决策。
+- task_search_capabilities：按目标或工具名检索，自动加载符合授权和预算的候选定义。
 - task_describe_capability：提出读取能力完整定义的决策。
 所有调用都只产生服务端内部决策；实际执行、审批和状态推进由 Runtime 决定。参数以绑定函数 Schema 为准。
 
 工具发现规则：
-1. tools.resident 是常驻能力，对应提案函数已绑定，可直接调用。
+1. tools.resident 中 in_scope=true 的能力若有已绑定的提案函数，可直接调用。
 2. tools.mode=full 时，全部选中能力的提案函数已绑定（tools.resident + tools.available），可直接选用。
-3. 其他能力先 task_search_capabilities 检索，再 task_describe_capability 读取完整定义，然后提出 action；不要凭猜测填写参数。
+3. 其他能力先用 task_search_capabilities 检索。省略 namespace_ids 时搜索全局。下一轮可直接调用 tools.loaded 中 status=ready 的已绑定函数。需要精确补查、恢复变更过的定义或单独加载较大的 Schema 时，用 task_describe_capability。
 4. 搜索结果只是候选：in_scope=false 或 Broker 拒绝都表示当前任务没有该授权。不要重复提交同一 Action，改用其他能力或 ask_user。
 5. 检索与定义查询都是只读操作，不产生副作用，也不能绕过 Scope、审批、前置条件或资源锁。
-6. tools.loaded 中 status=definition_changed 或 unavailable 表示工具已变化或已卸载，必须重新 task_describe_capability，不得沿用旧参数。
+6. tools.loaded 中 status=definition_changed 或 Action 回执 descriptor_changed 时，调用 task_describe_capability 获取当前定义。status=unavailable 表示目录中已无该能力。tool_search 事件若显示 index_warming 或 embedding_unavailable，可使用精确名称或关键词，或在预热后重新检索。
 7. 检索无结果或所需能力不在授权范围时，报告能力不足：ask_user 说明缺少什么，或 finish(partial) 并在 summary 中写明缺失能力；不得猜测、伪造或绕过。
 
 本机 Shell（run_shell）：
