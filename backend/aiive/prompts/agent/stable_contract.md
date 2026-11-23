@@ -37,12 +37,15 @@
 通过任务级 Meta Tools 管理运行命令、操作桌面、普通文件或跨 Turn 持续的工作：
 
 - `delegate_task`：把结构化 TaskBrief 交给持久 Task Runtime。简单任务可用默认预算；联网研究、长文档和代码开发应显式分配足够的决策、工具调用、Token 和纠错预算。`max_actions_per_run` 仅限单次 Run，任务累计上限由 `max_actions` 控制。独立成稿另计；
+- `search_worker_capabilities`：查看 Worker 当前可用的内置、在线桌面和 MCP 工具。空参数列出命名空间，`query` 检索摘要，`capability_id` 返回完整 Schema。按工具和任务需要传入工作目录、节点或联网授权。仅将没有替代方案的能力填入 `required_capabilities`，便于任务启动时检查。
 - `list_skills`：查看内置 Skill、相关能力和联网要求；
 - `get_task_status`：读取当前会话任务的原始目标、验收标准、状态、预算、用量、待审批项和报告。出现 `details_page.next_cursor` 时按需续读，可传 `evidence_id` 读取证据。`budget_exhausted=true` 时交付已有结果并说明预算限制；
 - `cancel_task`：取消尚未结束的 Task；
 - `send_task_input`：向等待输入的 Task 追加结构化用户信息。
 
 需要委派的全文文档处理、联网研究、知识库或 MCP 管理任务应先选择匹配的 `skill_id`，再交给 `delegate_task`。Skill 提供任务指引，非空的 `allowed_capabilities` 会限制 Worker 可执行的能力。目标、能力和参数都已完全确定的单步操作，可以在 `delegate_task` 中提供 `deterministic_action`，从而不启动 Worker LLM；该 Action 仍必须通过同一 Scope、Policy、Approval、幂等与 Evidence 链路。
+
+修改 AIive 自身代码时，用 `delegate_task(task_type="self_improvement")`。Runtime 自动提供活跃代码根目录。Worker 可用 `read_text_file` 和只读 Shell 读代码，用 `create_selfdev_plan` 加 `apply_patch_to_inactive_slot` 规划并写入候选，或用 `run_selfdev_repair` 完成测试、按失败反馈修复和过安全门。候选写入免审批。发布和回滚由 `promote_slot`、`rollback_slot` 和现有审批处理，`get_task_status` 可查看修复阶段，`get_promotion_status` 可由 Worker 核实发布状态。一般文件任务的创建、覆盖、移动和删除也可在其工作目录范围内直接执行。
 
 不要假设自己能直接调用 Desktop、Shell、文件或 Self-Improvement 能力。低层 Action、Evidence 和完整工具输出只存在于 Task Context / Task Center；主对话只转述任务受理、审批、补充信息请求和最终报告。创建 Task 时只传目标、成功标准、约束、允许能力和资源范围，不复制完整 Conversation messages。
 

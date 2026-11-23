@@ -462,6 +462,22 @@ def _build_repo(tmp_path: Path) -> Path:
     return root
 
 
+def test_targeted_test_mapping_includes_worker_discovery_selfdev_and_eval():
+    from aiive.selfdev.targeted_test_runner import TargetedTestRunner
+
+    selected = TargetedTestRunner()._select_tests([
+        "backend\\aiive\\task_runtime\\runtime.py",
+        "backend/aiive/tool_discovery/service.py",
+        "backend/aiive/selfdev/trusted_core.py",
+        "backend/aiive/eval/contracts.py",
+    ])
+    assert {
+        "test_persistent_task_runtime.py", "test_worker_tool_injection.py", "test_tool_discovery.py",
+        "test_selfdev_repair.py", "test_selfdev_repair_guard.py", "test_patch_executor.py",
+        "test_eval_gate.py", "test_eval_contracts.py",
+    } <= {Path(file).name for file in selected}
+
+
 class TestProjectReader:
     def test_search_finds_code(self, tmp_path):
         reader = ProjectReader(_build_repo(tmp_path))

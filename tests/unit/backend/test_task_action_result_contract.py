@@ -92,13 +92,12 @@ def _register(tool_type, capability_id: str):
 
 
 def test_failed_tool_action_is_not_recorded_as_succeeded(db_session, tmp_path) -> None:
-    target = tmp_path / "outside.txt"
-    target.write_text("secret", encoding="utf-8")
+    target = tmp_path / "missing.txt"
     task = _task(db_session, _thread(db_session), ["read_text_file"], [str(tmp_path)])
     agent = SequenceAgent(
         ActionProposal(
             decision="action", capability_id="read_text_file",
-            arguments={"path": str(target)}, summary="读取任务范围外的文件",
+            arguments={"path": str(target)}, summary="读取不存在的文件",
         ),
         ActionProposal(decision="finish", summary="工具失败", report_status="partial"),
     )
@@ -110,7 +109,7 @@ def test_failed_tool_action_is_not_recorded_as_succeeded(db_session, tmp_path) -
     stored = db_session.get(type(task), task.id)
 
     assert action.status == ActionStatus.FAILED.value
-    assert "access_denied" in (action.error_message or "") or action.error_message
+    assert action.error_message == "File not found"
     assert stored.status == TaskStatus.PARTIAL.value
     evidence_kinds = {
         row[0] for row in db_session.query(TaskEvidence.kind).filter(TaskEvidence.task_id == task.id)

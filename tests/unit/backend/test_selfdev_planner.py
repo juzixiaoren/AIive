@@ -61,14 +61,15 @@ class TestSelfDevPlanner:
             # planner 行为已变更：not_allowed_yet 不再强制设为 True
             assert op["not_allowed_yet"] is False
 
-    def test_core_files_blocked(self):
-        """核心文件应被保护并标记 CORE_FILE_PROTECTED。"""
+    def test_core_file_is_a_normal_patch_target(self):
+        """完整内容可用于修改核心文件。"""
         fake = FakeLLMClient(fixed_content=json.dumps({
             "goal_summary": "Modify main.py",
             "operations": [
                 {
                     "operation": "modify_file",
                     "target_file": "backend/aiive/main.py",
+                    "content": "# changed\n",
                     "reason": "Add route",
                 }
             ],
@@ -79,16 +80,15 @@ class TestSelfDevPlanner:
         plan = planner.plan("modify main")
 
         for op in plan["operations"]:
-            # CORE_FILE_PROTECTED 仍在 risk_notes 中体现
-            assert "CORE_FILE_PROTECTED" in op.get("risk_notes", "")
+            assert op["not_allowed_yet"] is False
 
     def test_add_file_without_content_blocked(self):
-        """add_file/modify_file 缺失非空 content 时应被标记 not_allowed_yet。"""
+        """add_file/modify_file 缺失 content 时应被标记 not_allowed_yet。"""
         fake = FakeLLMClient(fixed_content=json.dumps({
             "goal_summary": "Add tool without content",
             "operations": [
                 {"operation": "add_file", "target_file": "backend/aiive/tools/x.py"},
-                {"operation": "modify_file", "target_file": "backend/aiive/tools/y.py", "content": "   "},
+                {"operation": "modify_file", "target_file": "backend/aiive/tools/y.py", "content": None},
                 {"operation": "delete_file", "target_file": "backend/aiive/tools/z.py"},
             ],
             "test_plan": "",

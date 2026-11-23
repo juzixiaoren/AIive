@@ -33,7 +33,7 @@ from aiive.db.models import (
 )
 from aiive.desktop.reconciliation import _hash_result, desktop_reconciliation_service
 from aiive.desktop.connection_manager import DesktopDispatchError, desktop_connection_manager
-from aiive.selfdev.trusted_core import protected_reason, validate_operations
+from aiive.selfdev.trusted_core import invalid_path_reason, validate_operations
 from aiive.task_runtime.agent_executor import AgentDecision
 from aiive.task_runtime.context_assembler import TaskContextAssembler
 from aiive.task_runtime.evidence import EvidenceStore
@@ -88,7 +88,7 @@ def _task(db_session, thread: Thread, **kwargs):
 def test_main_agent_has_task_reminder_memory_and_privacy_entrypoints() -> None:
     registry = build_main_agent_registry()
     assert {item["capability_id"] for item in registry.list_all()} == {
-        "list_skills", "delegate_task", "get_task_status", "cancel_task", "send_task_input",
+        "list_skills", "search_worker_capabilities", "delegate_task", "get_task_status", "cancel_task", "send_task_input",
         "list_thread_attachments", "read_attachment",
         "get_current_time", "schedule_reminder", "list_reminders", "cancel_reminder",
         "confirm_reminder", "snooze_reminder", "memory_search", "memory_timeline", "remember_or_update",
@@ -513,18 +513,41 @@ def test_task_context_bounds_large_state_and_exposes_capability_schema(db_sessio
     assert "parameters" in current_time and "input_schema" in current_time
 
 
+@pytest.fixture
+def approved_tool(monkeypatch):
+    from dataclasses import replace
+    from aiive.tools.registry import get_tool_registry
+
+    capability_id = "test_approval_required_action"
+    original = CapabilityBroker.available_registry
+    base = get_tool_registry().get("safe_delete")
+    assert base is not None
+    registration = base.with_definition(replace(
+        base.definition, safety=replace(base.safety, capability_id=capability_id,
+                                        descriptor_hash="", requires_confirmation=True),
+    ))
+
+    def registered(broker, task):
+        registry = original(broker, task)
+        registry.register(registration)
+        return registry
+
+    monkeypatch.setattr(CapabilityBroker, "available_registry", registered)
+    return capability_id
+
+
 def test_high_risk_action_blocks_for_hours_and_resumes_as_new_run(
-    db_session, tmp_path, monkeypatch,
+    db_session, tmp_path, monkeypatch, approved_tool,
 ) -> None:
     thread = _thread(db_session)
     target = tmp_path / "old.txt"
     target.write_text("keep until approved")
     task = _task(
         db_session, thread, task_type="file_operation",
-        task_brief={"scope": {"allowed_capabilities": ["safe_delete"], "allowed_roots": [str(tmp_path)]}},
+        task_brief={"scope": {"allowed_capabilities": [approved_tool], "allowed_roots": [str(tmp_path)]}},
     )
     agent = SequenceAgent(ActionProposal(
-        decision="action", capability_id="safe_delete",
+        decision="action", capability_id=approved_tool,
         arguments={"path": str(target), "scope_id": "test_artifacts", "mode": "trash"},
         effects={"delete": str(target)}, summary="删除文件",
     ))
@@ -568,17 +591,17 @@ def test_high_risk_action_blocks_for_hours_and_resumes_as_new_run(
     assert action.execution_run_id == runs[1].id
 
 
-def test_toctou_change_invalidates_approved_action(db_session, tmp_path) -> None:
+def test_toctou_change_invalidates_approved_action(db_session, tmp_path, approved_tool) -> None:
     thread = _thread(db_session)
     target = tmp_path / "changing.txt"
     target.write_text("v1")
     original_hash = hashlib.sha256(target.read_bytes()).hexdigest()
     task = _task(
         db_session, thread, task_type="file_operation",
-        task_brief={"scope": {"allowed_capabilities": ["safe_delete"], "allowed_roots": [str(tmp_path)]}},
+        task_brief={"scope": {"allowed_capabilities": [approved_tool], "allowed_roots": [str(tmp_path)]}},
     )
     PersistentTaskRuntime(db_session, agent_executor=SequenceAgent(ActionProposal(
-        decision="action", capability_id="safe_delete",
+        decision="action", capability_id=approved_tool,
         arguments={"path": str(target), "scope_id": "test_artifacts", "mode": "trash"},
         preconditions={"exists": True, "sha256": original_hash},
     ))).run(task.id)
@@ -622,18 +645,18 @@ def test_source_file_metadata_preconditions_are_enforced(db_session, tmp_path) -
     assert CapabilityBroker.validate_preconditions(action)
 
 
-def test_expired_task_approval_is_requeued_by_scheduler_service(db_session, tmp_path) -> None:
+def test_expired_task_approval_is_requeued_by_scheduler_service(db_session, tmp_path, approved_tool) -> None:
     target = tmp_path / "expired.txt"
     target.write_text("keep", encoding="utf-8")
     task = _task(
         db_session,
         _thread(db_session),
         task_type="file_operation",
-        task_brief={"scope": {"allowed_capabilities": ["safe_delete"], "allowed_roots": [str(tmp_path)]}},
+        task_brief={"scope": {"allowed_capabilities": [approved_tool], "allowed_roots": [str(tmp_path)]}},
     )
     PersistentTaskRuntime(db_session, agent_executor=SequenceAgent(ActionProposal(
         decision="action",
-        capability_id="safe_delete",
+        capability_id=approved_tool,
         arguments={"path": str(target), "scope_id": "test_artifacts", "mode": "trash"},
     ))).run(task.id)
     approval = db_session.query(ApprovalRequest).filter(ApprovalRequest.task_id == task.id).one()
@@ -648,17 +671,17 @@ def test_expired_task_approval_is_requeued_by_scheduler_service(db_session, tmp_
     assert approval.status == "failed"
 
 
-def test_task_approval_rejects_tampered_frozen_arguments(db_session, tmp_path) -> None:
+def test_task_approval_rejects_tampered_frozen_arguments(db_session, tmp_path, approved_tool) -> None:
     target = tmp_path / "approved.txt"
     target.write_text("approved")
     other = tmp_path / "not-approved.txt"
     other.write_text("do not touch")
     task = _task(
         db_session, _thread(db_session), task_type="file_operation",
-        task_brief={"scope": {"allowed_capabilities": ["safe_delete"], "allowed_roots": [str(tmp_path)]}},
+        task_brief={"scope": {"allowed_capabilities": [approved_tool], "allowed_roots": [str(tmp_path)]}},
     )
     PersistentTaskRuntime(db_session, agent_executor=SequenceAgent(ActionProposal(
-        decision="action", capability_id="safe_delete",
+        decision="action", capability_id=approved_tool,
         arguments={"path": str(target), "scope_id": "test_artifacts", "mode": "trash"},
     ))).run(task.id)
     approval = db_session.query(ApprovalRequest).filter(ApprovalRequest.task_id == task.id).one()
@@ -1003,17 +1026,247 @@ def test_action_budget_stops_new_action_without_losing_completed_evidence(db_ses
     assert result["report"]["summary"].endswith("预算已达上限终止")
 
 
-def test_self_improvement_trusted_core_is_immutable() -> None:
-    assert protected_reason("backend/aiive/task_runtime/runtime.py")
-    assert protected_reason("../backend/aiive/main.py")
-    assert protected_reason("../frontend/src/App.tsx") == "invalid_or_parent_traversal_path"
-    assert protected_reason("/tmp/absolute.py") == "invalid_or_parent_traversal_path"
-    assert validate_operations([
-        {"operation": "modify_file", "target_file": "backend/aiive/control/task_policy.py"},
-    ])
-    assert validate_operations([
-        {"operation": "modify_file", "target_file": "frontend/src/pages/TaskCenterPage.tsx"},
-    ]) == []
+def test_selfdev_path_validation_accepts_core_code_and_rejects_invalid_paths() -> None:
+    targets = [
+        "backend/aiive/task_runtime/runtime.py",
+        "backend/aiive/selfdev/trusted_core.py",
+        "backend/aiive/control/task_policy.py",
+        "frontend/src/pages/TaskCenterPage.tsx",
+        ".github/workflows/check.yml",
+    ]
+    assert validate_operations([{"target_file": target} for target in targets]) == []
+    for target in ("../backend/aiive/main.py", "/tmp/absolute.py", "C:/absolute.py", "C:drive-relative.py", "."):
+        assert invalid_path_reason(target) == "invalid_or_parent_traversal_path"
+
+
+@pytest.mark.parametrize(("capability_id", "outcome"), [
+    ("missing_action_probe", "capability_unavailable"),
+    ("web_search", "policy_denied"),
+])
+def test_repeated_broker_rejections_stop_across_runs(db_session, capability_id, outcome) -> None:
+    task = _task(db_session, _thread(db_session), budgets={
+        "max_actions_per_run": 1, "max_runs": 10, "max_model_calls": 12,
+    })
+    proposal = ActionProposal(decision="action", capability_id=capability_id, arguments={"query": "blocked"})
+    agent = SequenceAgent(proposal, proposal, proposal)
+    agent.generate_report = lambda *_args, **_kwargs: pytest.fail("stalled task spent a report call")
+    runtime = PersistentTaskRuntime(db_session, agent_executor=agent)
+
+    assert runtime.run(task.id)["status"] == "queued"
+    assert runtime.run(task.id)["status"] == "queued"
+    result = runtime.run(task.id)
+
+    assert result["status"] == "partial"
+    assert result["report"]["stop_reason"] == "no_progress"
+    assert result["report"]["unresolved"][0].startswith(f"{outcome}:{capability_id}:")
+    assert task.usage["model_calls"] == task.usage["tool_failures"] == 3
+    events = db_session.query(AgentTaskEvent).filter_by(task_id=task.id, event_type="action_failed").all()
+    assert len(events) == 3
+    assert all(event.payload["outcome"] == outcome for event in events)
+
+
+def test_missing_required_tool_stops_before_the_first_model_call(db_session) -> None:
+    task = _task(db_session, _thread(db_session), task_brief={
+        "required_capabilities": ["missing_action_probe"],
+        "scope": {"capability_policy": "unified"},
+    })
+    result = PersistentTaskRuntime(db_session, agent_executor=SequenceAgent()).run(task.id)
+    assert result["status"] == "partial"
+    assert result["report"]["stop_reason"] == "required_capability_unavailable"
+    assert result["report"]["unresolved"] == ["capability_unavailable:missing_action_probe"]
+    assert task.usage["model_calls"] == 0
+
+
+def test_worker_can_delete_with_the_task_workspace_without_approval(db_session, tmp_path) -> None:
+    path = tmp_path / "old.txt"
+    path.write_text("remove", encoding="utf-8")
+    task = _task(db_session, _thread(db_session), task_brief={"scope": {
+        "allowed_roots": [str(tmp_path)], "allowed_capabilities": ["safe_delete"],
+    }})
+    agent = SequenceAgent(
+        ActionProposal(decision="action", capability_id="safe_delete", arguments={"path": str(path)}),
+        ActionProposal(decision="finish", summary="deleted"),
+    )
+    assert PersistentTaskRuntime(db_session, agent_executor=agent).run(task.id)["status"] == "succeeded"
+    assert not path.exists()
+    assert db_session.query(ApprovalRequest).filter_by(task_id=task.id).count() == 0
+
+
+def test_desktop_file_actions_dispatch_without_approval(db_session, tmp_path, monkeypatch) -> None:
+    capabilities = ["desktop_fs_write_text", "desktop_fs_move", "desktop_fs_delete", "desktop_exec"]
+    node = DesktopNode(
+        id=str(uuid.uuid4()), name="node", platform="win32", arch="x64", app_version="1",
+        status="online", lease_expires_at=utcnow() + timedelta(minutes=5),
+        capabilities=[{"name": name, "description": name, "input_schema": {"type": "object"}} for name in capabilities],
+    )
+    db_session.add(node)
+    db_session.flush()
+    monkeypatch.setattr(desktop_connection_manager, "is_connected", lambda node_id: node_id == node.id)
+    called = []
+
+    def dispatch(**envelope):
+        assert envelope["scope"]["allowed_roots"] == [str(tmp_path)]
+        called.append(envelope["capability_id"])
+        return {"ok": True, "result": {"capability_id": envelope["capability_id"]}}
+
+    monkeypatch.setattr(desktop_connection_manager, "dispatch_action_sync", dispatch)
+    task = _task(db_session, _thread(db_session), target_node_id=node.id, task_brief={"scope": {
+        "allowed_roots": [str(tmp_path)], "allowed_capabilities": capabilities,
+    }})
+    first, second = str(tmp_path / "a.txt"), str(tmp_path / "b.txt")
+    agent = SequenceAgent(
+        ActionProposal(decision="action", capability_id="desktop_fs_write_text", arguments={"path": first, "content": "new"}),
+        ActionProposal(decision="action", capability_id="desktop_fs_move", arguments={"source": first, "destination": second}),
+        ActionProposal(decision="action", capability_id="desktop_fs_delete", arguments={"path": second}),
+        ActionProposal(decision="action", capability_id="desktop_exec", arguments={"command": "rm local.txt", "cwd": str(tmp_path)}),
+        ActionProposal(decision="finish", summary="finished"),
+    )
+    assert PersistentTaskRuntime(db_session, agent_executor=agent).run(task.id)["status"] == "succeeded"
+    assert called == capabilities
+    assert db_session.query(ApprovalRequest).filter_by(task_id=task.id).count() == 0
+
+
+@pytest.fixture
+def selfdev_slots(tmp_path, monkeypatch):
+    from aiive.supervisor import slot_manager
+
+    manager = slot_manager.SlotManager(tmp_path / "slots")
+    manager.init_slots()
+    monkeypatch.setattr(slot_manager, "SLOTS_ROOT", manager.base_dir)
+    monkeypatch.setattr(slot_manager, "ACTIVE_SLOT_FILE", manager.runtime_dir / "active_slot")
+    return manager
+
+
+def test_worker_patches_runtime_and_trusted_core_in_candidate(db_session, selfdev_slots, monkeypatch) -> None:
+    from aiive.context.run_context import RunContext
+    from aiive.selfdev.targeted_test_runner import TargetedTestRunner
+    from aiive.tools.executor import ToolExecutor
+
+    active = selfdev_slots.active_app_root()
+    targets = [
+        "backend/aiive/task_runtime/runtime.py",
+        "backend/aiive/task_runtime/tool_injection.py",
+        "backend/aiive/task_runtime/agent_executor.py",
+        "backend/aiive/selfdev/trusted_core.py",
+    ]
+    for target in targets:
+        path = active / target
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("original", encoding="utf-8")
+
+    def targeted(self, changed):
+        assert changed == targets
+        return {"ok": True}
+
+    monkeypatch.setattr(TargetedTestRunner, "run_for_changed_files", targeted)
+    thread = _thread(db_session)
+    db_session.commit()
+    main_tools = ToolExecutor(build_main_agent_registry())
+    ctx = RunContext(thread_id=thread.id, trace_id="selfdev-candidate", source="trusted_user_command")
+    lookup = main_tools.execute(
+        "search_worker_capabilities", {"capability_id": "apply_patch_to_inactive_slot"},
+        "trusted_user_command", ctx,
+    )
+    assert lookup["result"]["definition"]["input_schema"]["properties"]["operations"]["type"] == "array"
+    delegated = main_tools.execute(
+        "delegate_task", {"goal": "修复 AIive Runtime", "task_type": "self_improvement"},
+        "trusted_user_command", ctx,
+    )
+    task = db_session.get(AgentTask, delegated["result"]["task_id"])
+    assert task.task_type == "self_improvement"
+    assert task.task_brief["scope"]["allowed_roots"] == [str(active)]
+    agent = SequenceAgent(
+        ActionProposal(decision="action", capability_id="read_text_file", arguments={"path": str(active / targets[0])}),
+        ActionProposal(decision="action", capability_id="apply_patch_to_inactive_slot", arguments={
+            "operations": [{"operation": "modify_file", "target_file": target, "content": "patched"} for target in targets],
+        }),
+        ActionProposal(decision="finish", summary="candidate patched"),
+    )
+    assert CapabilityBroker(db_session).prepare(task, "run_shell", {
+        "cwd": str(active), "command": "rm backend/aiive/task_runtime/runtime.py",
+    }).decision.reason == "selfdev_shell_requires_read_only_command"
+    assert PersistentTaskRuntime(db_session, agent_executor=agent).run(task.id)["status"] == "succeeded"
+    actions = db_session.query(AgentAction).filter_by(task_id=task.id).order_by(AgentAction.sequence).all()
+    assert [action.status for action in actions] == ["succeeded", "succeeded"]
+    assert db_session.query(ApprovalRequest).filter_by(task_id=task.id).count() == 0
+    candidate = selfdev_slots.base_dir / "B" / "app"
+    for target in targets:
+        assert (active / target).read_text(encoding="utf-8") == "original"
+        assert (candidate / target).read_text(encoding="utf-8") == "patched"
+
+
+def test_worker_selfdev_executes_candidate_tests_repairs_and_passes_real_gate(
+    db_session, selfdev_slots, monkeypatch,
+) -> None:
+    import shutil
+    from types import SimpleNamespace
+
+    from aiive.control import capability_broker
+    from aiive.core import llm_client
+    from aiive.eval import gate
+    from aiive.selfdev.repair_guard import RepairJournal, default_state_dir
+    from aiive.supervisor.slot_manager import read_candidate_state
+
+    active = selfdev_slots.active_app_root()
+    repo = Path(__file__).resolve().parents[3]
+    shutil.copytree(repo / "backend" / "aiive", active / "backend" / "aiive", ignore=shutil.ignore_patterns("__pycache__"))
+    target = "backend/aiive/worker_repair_probe.py"
+    (active / target).write_text("VALUE = 0\n", encoding="utf-8")
+    fixture_test = active / "tests" / "unit" / "backend" / "test_health.py"
+    fixture_test.parent.mkdir(parents=True)
+    fixture_test.write_text(
+        "from aiive.worker_repair_probe import VALUE\n\n"
+        "def test_repair_probe():\n    assert VALUE == 2, 'worker repair probe mismatch'\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    class PlannerLLM:
+        def chat(self, messages, **kwargs):
+            calls.append(messages[0]["content"])
+            return SimpleNamespace(content=json.dumps({"operations": [{
+                "operation": "modify_file", "target_file": target, "content": f"VALUE = {len(calls)}\n",
+            }]}))
+
+    monkeypatch.setattr(llm_client, "default_llm_client", lambda: PlannerLLM())
+    monkeypatch.setattr(capability_broker, "SELFDEV_HEARTBEAT_SECONDS", 0)
+    renewals = []
+    renew_run = TaskRepository.renew_run
+
+    def renew(self, run, *, lease_seconds=180):
+        renewals.append(lease_seconds)
+        return renew_run(self, run, lease_seconds=lease_seconds)
+
+    monkeypatch.setattr(TaskRepository, "renew_run", renew)
+    evaluate = gate.evaluate_promotion_gate
+    monkeypatch.setattr(gate, "evaluate_promotion_gate", lambda candidate: evaluate(candidate, persist=False))
+    task = _task(db_session, _thread(db_session), task_type="self_improvement", task_brief={})
+    action = ActionProposal(decision="action", capability_id="run_selfdev_repair", arguments={
+        "goal": "Repair worker_repair_probe.py", "files": [target], "max_rounds": 1,
+    })
+    agent = SequenceAgent(action, ActionProposal(decision="finish", summary="candidate ready"))
+
+    result = PersistentTaskRuntime(db_session, agent_executor=agent).run(task.id)
+
+    assert result["status"] == "succeeded"
+    stored = db_session.query(AgentAction).filter_by(task_id=task.id).one()
+    assert stored.status == "succeeded", stored.error_message
+    assert not stored.requires_approval
+    assert db_session.query(ApprovalRequest).filter_by(task_id=task.id).count() == 0
+    assert renewals.count(900) > 1
+    assert len(calls) == 2 and "VALUE = 0" in calls[0] and "worker repair probe mismatch" in calls[1]
+    assert (active / target).read_text(encoding="utf-8") == "VALUE = 0\n"
+    candidate = selfdev_slots.base_dir / "B"
+    assert (candidate / "app" / target).read_text(encoding="utf-8") == "VALUE = 2\n"
+    candidate_state = read_candidate_state(candidate)
+    assert candidate_state["promotable"] and candidate_state["gate_ok"]
+    record = RepairJournal(default_state_dir(selfdev_slots) / "runs").read(stored.id)
+    assert record["status"] == "tests_passed" and "tests_failed" in record["phases"]
+    assert selfdev_slots.get_active_slot() == "A"
+    broker = CapabilityBroker(db_session)
+    assert broker.prepare(task, "promote_slot", {}).decision.outcome == "approval"
+    assert broker.prepare(task, "rollback_slot", {}).decision.outcome == "approval"
+    assert broker.prepare(task, "run_selfdev_repair", {"promote": True}).decision.outcome == "approval"
 
 
 def test_explicit_git_worktree_isolation_rewrites_task_scope(db_session, tmp_path, monkeypatch) -> None:

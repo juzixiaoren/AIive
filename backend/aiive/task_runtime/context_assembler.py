@@ -244,6 +244,8 @@ def _compact_task_state(state: dict[str, Any]) -> dict[str, Any]:
     compact = dict(state)
     # 工具发现状态已在 snapshot.tools 中按当前注册表重建，这里不重复注入原始记录。
     compact.pop("tool_discovery", None)
+    compact.pop("searched_tool_queries", None)
+    compact.pop("seen_tool_definitions", None)
     compact.pop("validation_feedback", None)
     compact.pop("validation_messages", None)
     inputs = state.get("inputs")

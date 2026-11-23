@@ -4,16 +4,17 @@
 > 晋升后的进程切换、健康检查、观察窗与失败回滚仍由现有 Supervisor / ReleaseManager 负责。
 > 不涉及 Model Router、Reranker、Temporal Graph。
 
-## 1. 为什么需要闭环
+## 1. Worker 入口
 
-现有自进化能力是**分段**的：
+Main Agent 将 AIive 自身代码改动委派为 `self_improvement`。`selfdev`、`lifecycle` 任务也自动
+将活跃槽位根加入 Task Scope，并绑定 `create_selfdev_plan`、`apply_patch_to_inactive_slot`、
+`run_selfdev_repair`、`promote_slot`、`get_promotion_status`、`rollback_slot` 的函数定义。
+Main Agent 可用 `search_worker_capabilities` 检索这些能力和当前 Worker 的其他工具。
 
-- `selfdev/planner.py` 只接收一段目标文本，不知道仓库里真实的文件内容；
-- `selfdev/patch_executor.py` 能把补丁写进非活跃槽位，但不会判断补丁是否真的修好了问题；
-- `selfdev/targeted_test_runner.py` 能跑定向测试，但测试失败后没有"根据错误继续修"的环节；
-- `eval/gate.py` 与 `supervisor/release_manager.py` 已经能阻断不合格候选，但需要人把前面的步骤串起来。
-
-缺的不是新组件，而是**编排 + 真实反馈 + 有界重试 + 可追溯记录**。本轮只补这一层。
+Worker 可先读取活跃代码，再自行提交候选补丁，或调用 `run_selfdev_repair` 完成整个闭环。
+补丁写入和普通候选修复免审批。正式晋升和回滚继续使用原有审批。
+部署需要初始化 A/B 槽位并准备活跃代码树。未部署时 Worker 可读取开发仓库，PatchExecutor 要求已初始化的槽位目录。
+从槽位启动的 Worker 会定位到同一部署根，读取当前 active_slot 状态。
 
 ## 2. 执行链
 
@@ -34,6 +35,7 @@
   │                   记录活跃槽位基线指纹 → 标记候选不可晋升 → 只写非活跃槽位
   │
   ├─ 4. 定向测试      TargetedTestRunner(candidate_root).run_for_changed_files(...)
+  │                   从候选槽位导入代码，回传失败堆栈和断言
   │
   ├─ 5. 有限修复      测试失败 → 真实错误回灌 → 重新规划 → 重新应用 → 重新测试
   │                   最多 max_rounds 轮；补丁指纹相同即停止
@@ -50,17 +52,10 @@
 除上述步骤外，`after_tests`、`after_gate`、`before_promote` 三处各做一次候选指纹复核
 （`tree_fingerprint` 必须等于登记值），任一处不符即以 `candidate_changed` 阻断，不晋升。
 
-## 3. 代码理解：为什么新增 ProjectReader
+## 3. 活跃槽位代码读取
 
-要求是"复用现有文件读取、搜索和本机 Shell 能力，只有确实不足才补 Project Reader"。核查结论：
-
-| 现有能力 | 是否可复用 | 原因 |
-|---|---|---|
-| `read_text_file` | 否 | 硬限定在 `~/Documents`，无法读取仓库源码 |
-| `run_shell` | 不适合 | Task 工具，受 TaskScope/审批约束；服务端自进化流水线没有 Task 上下文 |
-| `read_document` | 否 | 面向用户文档的多格式提取，不是仓库代码检索 |
-
-因此新增 `selfdev/project_reader.py`，只做**仓库范围内的只读、有界**读取：
+Worker 可用 `read_text_file` 或只读 Shell 读取已授权的项目根。
+自动规划复用 `ProjectReader`，从活跃代码树收集有界上下文：
 
 - `search(keywords)`：大小写不敏感子串检索，返回 `path:line:text`；
 - `read(relative_path)`：单文件读取，默认上限 40KB；
@@ -88,7 +83,7 @@
 - `failure_feedback`：上一轮测试失败的真实输出。
 
 三者被拼进 `goal` 变量，作为"待规划数据"。模型仍然必须输出完整最终文件内容；
-`_validate` 继续阻断未知操作、缺失 content、Trusted Core 路径。
+`_validate` 继续阻断未知操作、缺失 content 和无效仓库相对路径。显式空字符串可创建空文件。
 
 补丁应用保持原有隔离语义：
 
@@ -96,8 +91,7 @@
 - 只写非活跃槽位的 `app/`；
 - 路径必须落在 `app/` 内；
 - 删除只走 `safe_delete`（scope 限定在非活跃槽位 app）；
-- Trusted Core 路径（`db/`、`control/`、`task_runtime/`、`supervisor/`、`api/routes_selfdev.py` 等）
-  在规划与执行两层都被拒绝。
+- 所有项目路径均可提交补丁，包括 `trusted_core.py`、Task Runtime、工具、数据库迁移和 CI 配置。
 
 ## 5. 有限修复循环
 
@@ -159,12 +153,14 @@
 - 若 Supervisor 返回 `switch_requested`，记录为 `promote_requested`，**不声称已晋升**；
 - 回滚仍走 `ReleaseManager.rollback()`，是紧急逃生通道，刻意不设闸门。
 
-不存在"因为 Agent 有本机 Shell 就绕过补丁执行器/晋升门"的路径：
-本模块没有直接写文件或执行 shell 的代码，写入只经 `PatchExecutor`，晋升只经 `ReleaseManager`。
+自进化任务中的 Shell 用于只读检查。项目文件写入经 `PatchExecutor`，发布经 `ReleaseManager`。
 
 ## 8. 状态与可追溯性
 
-一次运行返回结构化记录，并落库到 `SelfDevRequest.plan["repair"]`：
+Worker 修复复用持久 Task、Action 和 Outbox。工具同步等待各阶段结果，沿用 LLM、测试和安全门的阶段超时，
+等待时续 AgentRun 和资源锁。Outbox Heartbeat 继续维持作业租约。修复日志以 Action ID 为索引，
+Main Agent 可通过 `get_task_status` 查看阶段。Worker 的最终回执进入 Evidence。进程中断导致的未知 Action
+进入现有对账，后续修复由 RepairJournal 恢复候选。REST 修复接口将同一格式落库到 `SelfDevRequest.plan["repair"]`：
 
 ```json
 {

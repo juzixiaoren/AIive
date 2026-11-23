@@ -195,16 +195,15 @@ def test_expired_question_rejected_without_creating_input(db_session):
     assert db_session.query(Event).filter_by(event_type="task_input").count() == before
 
 
-def test_active_goal_action_approval_uses_existing_service(db_session,tmp_path):
+def test_active_goal_action_approval_uses_existing_service(db_session):
     from aiive.control.approval_service import TaskApprovalService
     from aiive.db.models import ApprovalRequest, Thread
     from aiive.task_runtime.runtime import PersistentTaskRuntime
     from aiive.task_runtime.schemas import ActionProposal
     from tests.unit.backend.test_persistent_task_runtime import _task, SequenceAgent
-    target = tmp_path / "delete.txt"
-    target.write_text("data")
-    task = _task(db_session,db_session.get(Thread,_thread(db_session)),task_type="file_operation",task_brief={"scope":{"allowed_capabilities":["safe_delete"],"allowed_roots":[str(tmp_path)]}})
-    PersistentTaskRuntime(db_session,agent_executor=SequenceAgent(ActionProposal(decision="action",capability_id="safe_delete",arguments={"path":str(target),"scope_id":"test_artifacts","mode":"trash"}))).run(task.id)
+    task = _task(db_session,db_session.get(Thread,_thread(db_session)),task_brief={"scope":{"allowed_capabilities":["rollback_slot"]}})
+    agent = SequenceAgent(ActionProposal(decision="action", capability_id="rollback_slot"))
+    PersistentTaskRuntime(db_session, agent_executor=agent).run(task.id)
     approval = db_session.query(ApprovalRequest).filter_by(task_id=task.id).one()
     task.task_type = "long_term_goal"
     task.task_state = {**task.task_state,"goal":{"status":"active","steps":[{"id":"step","title":"step"}]}}

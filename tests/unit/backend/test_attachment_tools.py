@@ -1,4 +1,5 @@
 
+from tests.support import isolate_object_store
 from tests.tool_helpers import invoke_test_tool
 import uuid
 from contextlib import contextmanager
@@ -15,7 +16,7 @@ from aiive.tools import attachment_tools as tools
 
 @pytest.fixture
 def attachment(db_session, tmp_path, monkeypatch):
-    monkeypatch.setattr(object_store, "ROOT", tmp_path / "objects")
+    isolate_object_store(monkeypatch, tmp_path / "objects")
 
     @contextmanager
     def session():

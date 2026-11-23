@@ -7,6 +7,7 @@
 """
 
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -24,14 +25,33 @@ TEST_MAPPING = {
     "backend/aiive/": ["tests/unit/backend/test_health.py"],
     "backend/aiive/core/": ["tests/unit/backend/test_agent_graph.py", "tests/unit/backend/test_identity_memory.py"],
     "backend/aiive/memory/": ["tests/unit/backend/test_memory_store.py", "tests/unit/backend/test_memory_gate.py", "tests/unit/backend/test_memory_extractor.py", "tests/unit/backend/test_memory_types.py", "tests/unit/backend/test_steward_signal_extractor.py"],
-    "backend/aiive/tools/": ["tests/unit/backend/test_tool_registry.py", "tests/unit/backend/test_safe_delete.py"],
+    "backend/aiive/tools/": [
+        "tests/unit/backend/test_tool_registry.py", "tests/unit/backend/test_safe_delete.py",
+        "tests/unit/backend/test_local_shell.py",
+    ],
     "backend/aiive/mcp/": ["tests/unit/backend/test_mcp_discovery.py", "tests/unit/backend/test_mcp_installer.py", "tests/unit/backend/test_mcp_runtime_client.py"],
     "backend/aiive/supervisor/": ["tests/unit/backend/test_slot_manager.py", "tests/unit/backend/test_supervisor_health.py"],
-    "backend/aiive/selfdev/": ["tests/unit/backend/test_selfdev_planner.py"],
+    "backend/aiive/selfdev/": [
+        "tests/unit/backend/test_selfdev_planner.py", "tests/unit/backend/test_selfdev_repair.py",
+        "tests/unit/backend/test_patch_executor.py", "tests/unit/backend/test_selfdev_repair_guard.py",
+    ],
+    "backend/aiive/eval/": [
+        "tests/unit/backend/test_eval_gate.py", "tests/unit/backend/test_eval_contracts.py",
+    ],
     "backend/aiive/prompts/": ["tests/unit/backend/test_prompt_registry.py"],
-    "backend/aiive/task_runtime/": ["tests/unit/backend/test_persistent_task_runtime.py"],
+    "backend/aiive/task_runtime/": [
+        "tests/unit/backend/test_persistent_task_runtime.py", "tests/unit/backend/test_worker_tool_injection.py",
+        "tests/unit/backend/test_tool_discovery.py",
+    ],
+    "backend/aiive/tool_discovery/": [
+        "tests/unit/backend/test_tool_discovery.py", "tests/unit/backend/test_worker_tool_injection.py",
+    ],
     "backend/aiive/control/": ["tests/unit/backend/test_persistent_task_runtime.py", "tests/integration/backend/test_approval_security.py"],
     "backend/aiive/desktop/": ["tests/unit/backend/test_desktop_nodes.py", "tests/unit/backend/test_persistent_task_runtime.py"],
+    "backend/aiive/db/": ["tests/unit/backend/test_schema_migrations.py"],
+    "backend/alembic/": ["tests/unit/backend/test_schema_migrations.py"],
+    "alembic.ini": ["tests/unit/backend/test_schema_migrations.py"],
+    ".github/": ["tests/unit/backend/test_health.py", "tests/unit/backend/test_runtime_module_boundaries.py"],
     "frontend/": [],
 }
 
@@ -126,7 +146,11 @@ class TargetedTestRunner:
             去重排序后的测试文件路径列表。
         """
         selected: set[str] = set()
-        for f in files:
+        for raw in files:
+            f = raw.replace("\\", "/").removeprefix("./")
+            if f.startswith("tests/") and Path(f).name.startswith("test_") and f.endswith(".py"):
+                if (self._repo_root / f).is_file():
+                    selected.add(f)
             for prefix, test_files in TEST_MAPPING.items():
                 if f.startswith(prefix):
                     selected.update(test_files)
@@ -136,7 +160,7 @@ class TargetedTestRunner:
         """
         执行指定的测试文件列表，收集结果。
 
-        每个测试文件独立运行，超时时间为 30 秒。
+        每个测试文件在候选代码环境中独立运行。
         测试报告可选地写入 artifact_dir。
 
         参数:
@@ -149,6 +173,8 @@ class TargetedTestRunner:
         results = []
         passed = 0
         failed = 0
+        env = {**os.environ, "PYTHONPATH": str((self._repo_root / "backend").resolve()),
+               "PYTHONIOENCODING": "utf-8"}
 
         for tf in test_files:
             test_path = self._repo_root / tf
@@ -161,11 +187,14 @@ class TargetedTestRunner:
             try:
                 # 用当前解释器（sys.executable）而非硬编码 "python3"（Windows 不存在）
                 proc = subprocess.run(
-                    [sys.executable, "-m", "pytest", str(test_path), "-q", "--tb=no"],
+                    [sys.executable, "-m", "pytest", str(test_path), "-q", "--tb=short"],
                     cwd=str(self._repo_root),
                     capture_output=True,
                     text=True,
-                    timeout=30,  # 单个测试文件超时 30 秒
+                    encoding="utf-8",
+                    errors="replace",
+                    env=env,
+                    timeout=120,
                 )
                 ok = proc.returncode == 0
                 if ok:

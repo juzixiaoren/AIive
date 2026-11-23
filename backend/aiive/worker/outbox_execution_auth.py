@@ -197,10 +197,11 @@ class _ToolGate:
         self.invoke_started: bool = False
 
 
-def execute_in_tool_thread(executor: Any, invoke: Callable[[], Any], timeout: float,
+def execute_in_tool_thread(executor: Any, invoke: Callable[[], Any], timeout: float | None,
                            observe_cancel: Callable[[], bool] | None = None,
                            await_terminal: bool = False,
-                           deadline_managed_preflight: Callable[[], None] | None = None) -> Any:
+                           deadline_managed_preflight: Callable[[], None] | None = None,
+                           on_wait: Callable[[], None] | None = None) -> Any:
     """Transfer execution, never Connection ownership, to a pool worker.
 
     The parent releases its own connection before submission. The child acquires
@@ -244,6 +245,17 @@ def execute_in_tool_thread(executor: Any, invoke: Callable[[], Any], timeout: fl
 
     try:
         future = executor.submit(child)
+        if timeout is None:
+            # The handler owns its stage timeouts. Keep the durable caller alive
+            # until the handler has recorded its terminal outcome.
+            while True:
+                try:
+                    return future.result(timeout=1)
+                except concurrent.futures.TimeoutError:
+                    if future.done():
+                        return future.result()
+                    if on_wait is not None:
+                        on_wait()
         try:
             import time
             deadline = time.monotonic() + timeout

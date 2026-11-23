@@ -1,6 +1,6 @@
 """测试 PolicyEngine（策略引擎）的批次判定逻辑。
 
-删除、高风险和显式确认工具进入审批；未知工具混入批次时阻止整批次。
+高风险和显式确认工具进入审批；未知工具混入批次时阻止整批次。
 """
 
 from aiive.tools.base import BaseTool, DatabaseTool
@@ -68,7 +68,7 @@ class TestPolicyBatchBlocking:
         assert result.blocked_tools == ["unknown_tool"]
 
     def test_registered_risk_metadata_requires_confirmation(self):
-        """高风险、删除和显式确认元数据应进入审批，普通写入保持高权限直通。"""
+        """高风险和显式确认进入审批，can_delete 仅描述能力。"""
         registry = ToolRegistry()
         _register(registry, "normal")
         _register(registry, "high_risk", risk_level="high")
@@ -87,7 +87,7 @@ class TestPolicyBatchBlocking:
         )
         assert result.action == PolicyAction.CONFIRM
         assert result.allowed_tools == tool_names
-        assert result.confirm_tools == ["high_risk", "destructive", "confirmation_marked"]
+        assert result.confirm_tools == ["high_risk", "confirmation_marked"]
         assert result.blocked_tools == []
 
     def test_only_registered_tool_allowed(self):

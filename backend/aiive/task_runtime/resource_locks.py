@@ -73,6 +73,16 @@ class ResourceLockService:
             TaskResourceLock.lease_token == grant.token,
         ).delete(synchronize_session=False)
 
+    def renew(self, db: Session, grant: LockGrant, *, lease_seconds: int = 180) -> int:
+        if not grant.resource_keys:
+            return 0
+        return db.query(TaskResourceLock).filter(
+            TaskResourceLock.resource_key.in_(grant.resource_keys),
+            TaskResourceLock.lease_token == grant.token,
+        ).update({
+            TaskResourceLock.lease_expires_at: datetime.now(timezone.utc) + timedelta(seconds=lease_seconds),
+        }, synchronize_session=False)
+
     def release_action(self, db: Session, *, task_id: str, action_id: str) -> int:
         """对账确认 Action 终态后提前释放其遗留租约。"""
         return db.query(TaskResourceLock).filter(

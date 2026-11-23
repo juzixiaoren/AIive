@@ -11,7 +11,8 @@ import shutil
 from pathlib import Path
 
 from aiive.supervisor.slot_manager import SlotManager, sync_app_tree
-from aiive.tools.safe_delete import get_scope_registry, safe_delete
+from aiive.selfdev.trusted_core import normalize_repo_path, validate_operations
+from aiive.tools.safe_delete import SafeDeleteScopeRegistry, safe_delete
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -42,14 +43,12 @@ class PatchExecutor:
             包含 active_slot、inactive_slot、operations_applied、
             operations_failed 的结果字典。
         """
-        from aiive.selfdev.trusted_core import validate_operations
-
-        trusted_core_issues = validate_operations(operations)
-        if trusted_core_issues:
+        path_issues = validate_operations(operations)
+        if path_issues:
             return {
                 "ok": False,
-                "error": "trusted_core_policy_denied",
-                "issues": trusted_core_issues,
+                "error": "invalid_patch_target",
+                "issues": path_issues,
                 "operations_applied": [],
                 # 失败项必须是带 reason 的诊断记录；直接回填原始 operations 会丢失
                 # 拒绝原因，调用方只能看到一堆没有 reason 的入参副本。
@@ -59,7 +58,7 @@ class PatchExecutor:
                         "target_file": issue.get("target_file", ""),
                         "reason": issue.get("reason", "policy_denied"),
                     }
-                    for issue in trusted_core_issues
+                    for issue in path_issues
                 ],
             }
         slots = self._manager.list_slots()
@@ -70,10 +69,20 @@ class PatchExecutor:
         inactive_slot = next((s for s in slots if s.name == inactive_name), None)
         if not active_slot or not inactive_slot:
             return {"ok": False, "error": "Slots not initialized"}
+        if not self._manager.has_local_slot_paths(active_name):
+            return {"ok": False, "error": "invalid_active_slot_path"}
+        if not self._manager.has_local_slot_paths(inactive_name):
+            return {"ok": False, "error": "invalid_inactive_slot_path"}
+        src_app = active_slot.root / "app"
+        dst_app = inactive_slot.root / "app"
+        if not src_app.is_dir() or not dst_app.is_dir():
+            return {"ok": False, "error": "Slots not initialized"}
 
         # 第一步：从活跃槽位复制 manifest 到非活跃槽位
         src_manifest = active_slot.root / "version_manifest.json"
         dst_manifest = inactive_slot.root / "version_manifest.json"
+        if dst_manifest.resolve() != inactive_slot.root.resolve() / dst_manifest.name:
+            return {"ok": False, "error": "invalid_inactive_slot_manifest_path"}
         if src_manifest.exists():
             dst_manifest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src_manifest, dst_manifest)
@@ -81,8 +90,6 @@ class PatchExecutor:
         # 第二步：每次 apply 前从活跃槽位重新同步基线，避免上一次 apply 的
         # 残留文件叠加到本次结果（apply 本身保持幂等：同一操作列表重复应用
         # 总是得到 "active 基线 + 本次操作" 的确定结果）。
-        src_app = active_slot.root / "app"
-        dst_app = inactive_slot.root / "app"
         # 与 CandidateSlotGuard.restore 共用同一份"整树同步"实现，
         # 保证"应用补丁"和"失败回滚"得到完全相同的基线语义。
         sync_app_tree(src_app, dst_app)
@@ -101,13 +108,14 @@ class PatchExecutor:
 
             # 路径安全校验：拒绝绝对路径与 ../ 穿越，目标必须落在 dst_app 内
             try:
-                candidate = (dst_app / raw_target).resolve()
+                candidate = (dst_app / normalize_repo_path(raw_target)).resolve()
             except Exception:
                 candidate = None
             if (
                 not raw_target
                 or Path(raw_target).is_absolute()
                 or candidate is None
+                or candidate == dst_app_resolved
                 or not candidate.is_relative_to(dst_app_resolved)
             ):
                 results.append({
@@ -121,12 +129,11 @@ class PatchExecutor:
             try:
                 if op_type in ("add_file", "modify_file"):
                     content = op.get("content")
-                    # 契约：add/modify 必须携带非空 content，缺失则拒绝执行而非写空文件
-                    if not isinstance(content, str) or not content:
+                    if not isinstance(content, str):
                         results.append({
                             "ok": False,
                             "file": str(target),
-                            "reason": "missing_content: add_file/modify_file requires a non-empty 'content' field",
+                            "reason": "missing_content: add_file/modify_file requires a 'content' string",
                         })
                         continue
                     if op_type == "modify_file" and not target.exists():
@@ -139,7 +146,7 @@ class PatchExecutor:
                     if target.exists():
                         # 删除必须走 safe_delete 唯一入口：scope 仅放行 inactive
                         # 槽位的 app 目录，可拦截 ../ 路径穿越与符号链接删除。
-                        registry = get_scope_registry()
+                        registry = SafeDeleteScopeRegistry()
                         scope_id = f"inactive_slot_app_{inactive_name}"
                         registry.register(scope_id, inactive_slot.root / "app")
                         decision = safe_delete(

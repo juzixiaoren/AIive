@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+import ntpath
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,7 +13,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from aiive.context.run_context import RunContext
-from aiive.control.scope import TASK_READ_CAPABILITIES, TaskScope, action_resource_keys
+from aiive.control.scope import PATH_ARGUMENTS, TASK_READ_CAPABILITIES, TaskScope, action_resource_keys, path_within
 from aiive.control.task_policy import ActionPolicyDecision, TaskPolicyEngine
 from aiive.db.models import AgentAction, AgentRun, AgentTask, TaskEvidence
 from aiive.desktop.registry_overlay import build_registry_for_thread
@@ -21,6 +24,9 @@ from aiive.tools.registry import ToolRegistry
 from aiive.tool_discovery import DEFAULT_LIMIT
 from aiive.tool_discovery.service import get_discovery_service
 
+logger = logging.getLogger(__name__)
+SELFDEV_LONG_ACTIONS = frozenset({"create_selfdev_plan", "apply_patch_to_inactive_slot", "run_selfdev_repair"})
+SELFDEV_HEARTBEAT_SECONDS = 30
 
 @dataclass(frozen=True)
 class PreparedCapability:
@@ -61,21 +67,26 @@ class CapabilityBroker:
     def search_capabilities(
         self, task: AgentTask, query: str, *, namespace_ids: list[str] | None = None,
         limit: int = DEFAULT_LIMIT,
+        available: ToolRegistry | None = None,
     ) -> dict[str, Any]:
         """检索同一快照中的目录，为 Worker 选择预算内的执行定义引用。"""
-        from aiive.task_runtime.tool_injection import select_search_definitions
+        from aiive.task_runtime.tool_injection import select_search_definitions, worker_resident_ids
 
-        available = self.available_registry(task).snapshot()
+        available = (available if available is not None else self.available_registry(task)).snapshot()
         execution = self.registry_for(task, available=available)
         result = get_discovery_service().search(available, query, namespace_ids=namespace_ids, limit=limit)
         for entry in result["tools"]:
             entry["in_scope"] = execution.get(entry["capability_id"]) is not None
-        result["loaded"] = select_search_definitions(execution, result["tools"])
+        result["loaded"] = select_search_definitions(
+            execution, result["tools"], resident_ids=worker_resident_ids(task.task_type),
+        )
         return result
 
-    def describe_capability(self, task: AgentTask, capability_id: str) -> dict[str, Any] | None:
+    def describe_capability(
+        self, task: AgentTask, capability_id: str, *, available: ToolRegistry | None = None,
+    ) -> dict[str, Any] | None:
         """从执行视图读取定义，授权范围外仅返回目录摘要。"""
-        available = self.available_registry(task).snapshot()
+        available = (available if available is not None else self.available_registry(task)).snapshot()
         definition = self.registry_for(task, available=available).definition(capability_id)
         if definition is not None:
             return {**definition, "in_scope": True}
@@ -87,10 +98,17 @@ class CapabilityBroker:
     def list_capabilities(self, task: AgentTask) -> list[dict[str, Any]]:
         return self.registry_for(task).list_all()
 
-    def prepare(self, task: AgentTask, capability_id: str, arguments: dict[str, Any]) -> PreparedCapability:
+    def prepare(
+        self, task: AgentTask, capability_id: str, arguments: dict[str, Any],
+        *, available: ToolRegistry | None = None,
+    ) -> PreparedCapability:
         scope = TaskScope.from_brief(task.task_brief or {})
-        registration = self.registry_for(task).get(capability_id)
-        lifecycle_block = self._lifecycle_block(task, capability_id, arguments)
+        available = available if available is not None else self.available_registry(task)
+        registration = available.get(capability_id)
+        if registration is None:
+            reason = "capability_disabled" if self._is_disabled(capability_id=capability_id) else "unknown_capability"
+            return PreparedCapability(None, ActionPolicyDecision("block", reason))
+        lifecycle_block = self._lifecycle_block(task, registration, capability_id, arguments)
         if lifecycle_block:
             return PreparedCapability(
                 registration=registration,
@@ -101,15 +119,48 @@ class CapabilityBroker:
             decision=self.policy.decide(registration, scope, capability_id, arguments),
         )
 
-    def _lifecycle_block(self, task: AgentTask, capability_id: str, arguments: dict[str, Any]) -> str | None:
-        if task.task_type not in {"self_improvement", "selfdev", "lifecycle"}:
-            return None
-        if capability_id == "apply_patch_to_inactive_slot":
-            from aiive.selfdev.trusted_core import validate_operations
+    def _lifecycle_block(
+        self, task: AgentTask, registration: BaseTool, capability_id: str, arguments: dict[str, Any],
+    ) -> str | None:
+        from aiive.task_runtime.router import SELFDEV_TASK_TYPES
+        from aiive.tools.shell_policy import SHELL_CAPABILITIES, classify_shell_command, shell_path_violations
 
-            operations = arguments.get("operations")
-            issues = validate_operations(operations if isinstance(operations, list) else [])
-            return "trusted_core_policy_denied" if issues else None
+        lifecycle = task.task_type in SELFDEV_TASK_TYPES
+        if capability_id in SHELL_CAPABILITIES:
+            from aiive.supervisor.slot_manager import SlotManager
+
+            command = str(arguments.get("command") or "")
+            cwd = str(arguments.get("cwd") or "")
+            remote = capability_id == "desktop_exec"
+            verdict = classify_shell_command(command, windows_shell=remote and bool(ntpath.splitdrive(cwd)[0]))
+            if not verdict.read_only and cwd:
+                manager = SlotManager()
+                active_root = manager.active_app_root()
+                if lifecycle or active_root.is_dir():
+                    protected = str(manager.base_dir.parent.resolve() if lifecycle else active_root)
+                    working_dir = cwd if remote else str(Path(cwd).resolve())
+                    if path_within(working_dir, protected):
+                        return "selfdev_shell_requires_read_only_command"
+                    paths, _ = shell_path_violations(
+                        command, cwd=cwd, allowed_roots=None, excluded_root=protected, remote=remote,
+                    )
+                    if paths:
+                        return "selfdev_shell_requires_read_only_command"
+        if not lifecycle:
+            return None
+        if registration.safety.writes_external_world and capability_id not in SHELL_CAPABILITIES:
+            from aiive.supervisor.slot_manager import SlotManager
+
+            manager = SlotManager()
+            root = str(manager.base_dir.parent.resolve())
+            for name, value in arguments.items():
+                if name not in PATH_ARGUMENTS or not isinstance(value, str) or not value:
+                    continue
+                if name == "source" and capability_id == "desktop_fs_copy":
+                    continue
+                local = str(Path(value).resolve()) if registration.executor_kind != "desktop_node" else value
+                if path_within(local, root) or path_within(root, local):
+                    return "selfdev_project_changes_require_inactive_slot"
         if capability_id == "promote_slot":
             import json
 
@@ -123,6 +174,9 @@ class CapabilityBroker:
                     report = value.get("targeted_test_report")
                     if isinstance(report, dict) and report.get("ok") is True:
                         return True
+                    if value.get("status") == "tests_passed" and value.get("ok") is True:
+                        gate = value.get("gate")
+                        return isinstance(gate, dict) and gate.get("ok") is True
                     return any(passed(item) for item in value.values())
                 if isinstance(value, list):
                     return any(passed(item) for item in value)
@@ -211,8 +265,10 @@ class CapabilityBroker:
         if not task_sources_visible(self.db, task.id) or not TaskReadRepository(self.db).visible_child("agent_action", action):
             return {"ok": False, "error": "forget_source_blocked", "error_type": "source_blocked"}
         scope = TaskScope.from_brief(task.task_brief or {})
-        registry = self.registry_for(task)
-        registration = registry.get(action.capability_id)
+        available = self.available_registry(task)
+        registry = self.registry_for(task, available=available)
+        prepared = self.prepare(task, action.capability_id, action.arguments or {}, available=available)
+        registration = prepared.registration
         if registration is None:
             # 停用与"从未存在"必须区分：停用是用户显式动作，任务应按可恢复错误处理，
             # 不能当成工具名写错（unknown_tool）。
@@ -225,6 +281,10 @@ class CapabilityBroker:
             return {"ok": False, "error": "capability_unavailable", "error_type": "unknown_tool"}
         if registration.safety.descriptor_hash != action.descriptor_hash:
             return {"ok": False, "error": "descriptor_changed", "error_type": "descriptor_changed"}
+        if prepared.decision.outcome == "block" or (
+            prepared.decision.outcome == "approval" and not action.requires_approval
+        ):
+            return {"ok": False, "error": prepared.decision.reason, "error_type": "policy_denied"}
         issues = scope.validate_arguments(action.capability_id, action.arguments or {})
         issues.extend(self.validate_preconditions(action))
         if issues:
@@ -255,12 +315,31 @@ class CapabilityBroker:
         release_grant = True
         try:
             from aiive.tools.executor import ToolExecutor
+            from aiive.task_runtime.repository import TaskRepository
+
+            next_heartbeat = time.monotonic() + SELFDEV_HEARTBEAT_SECONDS
+
+            def renew_execution() -> None:
+                nonlocal next_heartbeat
+                if time.monotonic() < next_heartbeat:
+                    return
+                next_heartbeat = time.monotonic() + SELFDEV_HEARTBEAT_SECONDS
+                try:
+                    TaskRepository(self.db).renew_run(run, lease_seconds=900)
+                    if self.locks.renew(self.db, grant, lease_seconds=900) != len(grant.resource_keys):
+                        logger.error("SelfDev Action %s lost a resource lease", action.id)
+                    self.db.commit()
+                except Exception:
+                    self.db.rollback()
+                    logger.exception("Failed to renew SelfDev Action lease")
+
             result = ToolExecutor(registry).execute(
                 action.capability_id, action.arguments or {}, "task_runtime",
                 RunContext(thread_id=task.thread_id, trace_id=task.id, source="task_runtime",
                            task_id=task.id, agent_run_id=run.id, action_id=action.id,
                            user_timezone=(task.task_brief.get("initial_input") or {}).get("user_timezone")),
                 expected_descriptor_hash=action.descriptor_hash, channel="task_action",
+                on_wait=renew_execution if action.capability_id in SELFDEV_LONG_ACTIONS else None,
                 authorization={
                     "node_id": registration.executor_node_id, "task_id": task.id, "run_id": run.id,
                     "action_id": action.id, "idempotency_key": action.idempotency_key,

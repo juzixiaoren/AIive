@@ -13,12 +13,12 @@ Conversation Plane                Task Plane
 Epoch / Segment / Turn            Task / AgentRun / Action
 人格、关系、历史与记忆             状态、事件、证据与产物
 Main Agent                        Worker Agent
-4 个 Task Meta Tools              Task-scoped Capabilities
+Task Meta Tools / 能力检索         Task-scoped Capabilities
 ```
 
-Main Agent 固定只暴露 `delegate_task`、`get_task_status`、`cancel_task`、
-`send_task_input`。Desktop、文件、Shell 和 Self-Improvement 能力只能由 Task
-Worker 提议，并通过 Capability Broker 执行。Main Conversation 通过
+Main Agent 通过 `delegate_task`、`get_task_status`、`cancel_task` 和 `send_task_input` 管理持久任务。
+`search_worker_capabilities` 查询内置工具、在线桌面和已启用的 MCP，支持关键词检索和按能力 ID 读取完整 Schema。
+Desktop、工作目录文件操作、Shell 和 SelfDev 执行由 Worker 经 Capability Broker 发起。Main Conversation 通过
 `agent_task_created` 卡片关联委派工作。任务终态可以唤醒 Main Agent 验收结果，最终答复进入对话时间线。工作中心展示执行过程、证据和产物。
 
 ## 持久化事实模型
@@ -62,6 +62,23 @@ descriptor、risk policy、资源锁和执行前 precondition。审批冻结 Act
 descriptor、preconditions、effects、checkpoint、有效期与 approval hash。批准不会直接执行；
 它重新验证冻结内容和可观察前置条件，然后将 Action 置为 `ready` 并创建新的 AgentRun。
 如果资源在批准后变化，Action 进入 `invalidated`，旧审批不可复用。
+
+工作目录内的文件创建、修改、覆盖、移动和删除免审批。策略覆盖本机文件工具、Desktop 文件工具、
+可静态识别且路径在范围内的 Shell 文件操作，以及非活跃槽位补丁和候选修复。无法从命令中判定的
+Shell 行为继续使用现有审批，显式越界路径由 Scope 拒绝。正式晋升、回滚和其他受控业务的审批继续生效。
+
+## Worker 工具发现与无进展终止
+
+小目录直接绑定工具 Schema。较大目录常驻核心函数，其他能力通过 `task_search_capabilities` 或
+`task_describe_capability` 加载。发现视图用于检索，执行视图按 Task Scope 授权。
+`required_capabilities` 声明无替代的工具。确定性任务也会预检其工具 ID，能力缺失时在首次 LLM
+调用前生成部分报告。
+
+每个任务最多执行三次实际检索。去重键包含 Unicode 规范化、大小写和空白折叠后的查询及命名空间。
+同一可用工具快照下的重复查询被跳过。成功 Action 或首次实际绑定某一工具版本会重置无进展计数。
+无结果、无授权、已验证失败和重复发现等会保留分类回执。状态跨 Run 保存，连续三次无进展后直接
+生成 `partial` 报告，包含缺失能力与失败原因，不调用成稿模型。结果未知仍进入 `reconciling`，
+由既有对账流程处理。
 
 ## Desktop Protocol v2
 
@@ -109,7 +126,7 @@ Main Agent 通过 `get_task_status` 查看原始目标、验收标准、报告�
 | `max_model_calls` | 32 | 512 | Worker 决策调用，包含发现与纠错 |
 | `max_actions` | 24 | 256 | 累计创建的 Action，包含已进入审批或被策略拦截的 Action |
 | `max_actions_per_run` | 8 | 32 | 单 Run 批大小，能力发现也占用批位置 |
-| `max_tool_failures` | 6 | 64 | 已计入的工具执行失败，审批、取消、失效和未知结果不计 |
+| `max_tool_failures` | 6 | 64 | 已知的执行失败、Broker 拒绝、能力缺失和前置条件失败等。审批等待、取消和未知结果不计 |
 | `max_total_tokens` | 512,000 | 8,000,000 | Worker 决策的累计输入和输出。缺少供应商用量时按预估保守计入。成稿用量在 `report.report_usage` |
 | `max_wall_time_seconds` | 7,776,000（90 天） | 31,536,000（365 天） | 从创建起计时，含排队、等待审批和用户输入。在 Worker 执行检查点生效 |
 | `max_cost_usd` | 无 | 1,000,000 | 仅按配置好的输入和输出 Token 价格估算 Worker 决策费用。缺少价格时，带美元上限的决策以 `cost_pricing_unavailable` 停止 |
@@ -127,12 +144,15 @@ Action timeline、审批、Evidence、Artifact、错误和 TaskReport，并通�
 
 ## Lifecycle / Trusted Core
 
-Self-Improvement 也必须作为 Task 运行，并遵循 Candidate -> targeted tests/eval ->
-isolated health check -> promote -> rollback。普通 Main/Worker 都不能直接写 Trusted Core。
-服务端在规划和应用两处阻止修改 authentication、Capability Broker、Policy、Approval、
-Release/Rollback、数据库迁移和 Task Runtime 等受保护路径；promotion 还要求已有通过的
-目标测试 Evidence。旧 Selfdev 直写 API 需要独立 Trusted Core 管理 token，force promote
-被禁用。
+Main Agent 使用 `self_improvement` 委派 AIive 代码改动。`selfdev` 和 `lifecycle` 也使用
+同一入口策略。Task 自动获得活跃槽位的代码根目录，常驻六个 SelfDev 工具的 Function Calling Schema。
+Worker 可读取活跃槽位代码，补丁由 `PatchExecutor` 写入非活跃槽位。普通 Shell 访问受管理的代码目录时只用于读取。
+`trusted_core.py` 负责仓库相对路径校验，整个项目的代码都可以成为候选补丁目标。
+
+候选补丁应用后运行定向测试并验证候选指纹。自动修复和正式晋升还会运行隔离安全门。长时间修复继续在现有 Outbox Action 内同步等待，
+运行期间续 AgentRun 和资源锁，保留每阶段超时、候选日志与中断恢复。Main Agent 可用
+`get_task_status` 查询修复阶段。正式发布沿用审批、健康检查、安全门、Supervisor 观察与回滚流程。
+旧 SelfDev 管理 API 继续使用 Trusted Core 管理 token，force promote 被禁用。
 
 ## 兼容性与运维要求
 
@@ -146,7 +166,7 @@ Release/Rollback、数据库迁移和 Task Runtime 等受保护路径；promotio
 
 自动化覆盖 Main 工具隔离、Conversation/Task Context 隔离、简单与多 Action Task、
 数小时审批后新 AgentRun、重启恢复、Desktop unknown Journal 对账、TOCTOU invalidation、
-GUI/path lease、Watcher 唤醒、大输出 Evidence range read，以及 Trusted Core 不可变性。
+GUI/path lease、Watcher 唤醒、大输出 Evidence range read，以及自进化核心路径补丁、文件免审批与无进展终止。
 
 
 

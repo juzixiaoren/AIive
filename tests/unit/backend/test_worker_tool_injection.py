@@ -248,6 +248,79 @@ def test_runtime_discovery_creates_no_action_and_injects_results(db_session) -> 
     assert "input_schema" not in describe["summary"]
 
 
+@pytest.mark.parametrize(("queries", "executed"), [
+    (["unfindableqzx", "  UNFINDABLEQZX ", "ＵＮＦＩＮＤＡＢＬＥＱＺＸ"], 1),
+    (["unfindableqzx", "zzzxqj", "yyzkcq"], 3),
+])
+def test_empty_discovery_stops_without_report_model(db_session, queries, executed) -> None:
+    task = _task(db_session, {"capability_policy": "unified"})
+    agent = _ScriptedAgent(*(ActionProposal(decision="search_capabilities", query=query) for query in queries))
+    agent.generate_report = lambda *_args, **_kwargs: pytest.fail("stalled task spent a report call")
+
+    result = PersistentTaskRuntime(db_session, agent_executor=agent).run(task.id)
+
+    assert result["status"] == "partial"
+    assert result["report"]["stop_reason"] == "no_progress"
+    assert any("capability_unavailable" in reason for reason in result["report"]["unresolved"])
+    assert task.usage["discovery_queries"] == executed
+    assert task.usage["model_calls"] == 3
+
+
+def test_discovery_budget_is_consumed_even_when_search_loads_tools(db_session) -> None:
+    task = _task(db_session, {"capability_policy": "unified"})
+    registry = get_tool_registry()
+    existing = registry.catalog()
+    names = ["zqx_budgettool_a", "zqx_budgettool_b", "zqx_budgettool_c", "zqx_budgettool_d"]
+    tool = _probe_registration()
+    from dataclasses import replace
+
+    for name in names:
+        registry.register(tool.with_definition(replace(
+            tool.definition, safety=replace(tool.safety, capability_id=name, descriptor_hash=""),
+        )))
+    try:
+        agent = _ScriptedAgent(*(
+            ActionProposal(decision="search_capabilities", query=query, limit=1)
+            for query in [*names, "zqx_budgettool_e", "zqx_budgettool_f"]
+        ))
+        result = PersistentTaskRuntime(db_session, agent_executor=agent).run(task.id)
+        assert result["report"]["stop_reason"] == "no_progress"
+        assert result["report"]["unresolved"][0].endswith("discovery_query_budget_exhausted")
+        assert task.usage["discovery_queries"] == 3
+        assert task.usage["model_calls"] == 6
+    finally:
+        for name in names:
+            registry.unregister(name)
+    assert registry.catalog() == existing
+
+
+@pytest.mark.parametrize("task_type", ["self_improvement", "selfdev", "lifecycle"])
+def test_selfdev_functions_are_bound_on_the_first_decision(db_session, task_type) -> None:
+    from langchain_core.messages import AIMessage
+    from aiive.task_runtime.agent_executor import TaskAgentExecutor
+    from aiive.task_runtime.function_decisions import proposal_function_name
+    from aiive.task_runtime.router import SELFDEV_CAPABILITIES
+
+    class Model:
+        def bind_tools(self, definitions, **kwargs):
+            names = {item["function"]["name"] for item in definitions}
+            assert {proposal_function_name(key) for key in SELFDEV_CAPABILITIES} <= names
+            return self
+
+        def invoke(self, messages, **kwargs):
+            assert "selfdev_project_root" in messages[-1].content
+            return AIMessage(content="", tool_calls=[{
+                "name": "task_finish", "args": {"summary": "verified"}, "id": "finish",
+            }])
+
+    task = _task(db_session, {})
+    task.task_type = task_type
+    agent = TaskAgentExecutor(db_session, chat_model=Model())
+    agent.generate_report = lambda *args, **kwargs: ("verified", {}, False)
+    result = PersistentTaskRuntime(db_session, agent_executor=agent).run(task.id)
+    assert result["status"] == "succeeded"
+
+
 def test_action_proposal_requires_discovery_payload() -> None:
     """发现类决策必须携带检索词或能力 id，避免空转。"""
     with pytest.raises(ValidationError):

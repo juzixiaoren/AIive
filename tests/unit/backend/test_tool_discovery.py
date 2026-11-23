@@ -37,6 +37,15 @@ def ids(result):
     return [item["capability_id"] for item in result["tools"]]
 
 
+def test_selfdev_is_discoverable_without_embeddings():
+    from aiive.tools.registry import get_tool_registry
+
+    service = DiscoveryService()
+    registry = get_tool_registry()
+    assert ids(service.search(registry, "patch worker runtime"))[0] == "apply_patch_to_inactive_slot"
+    assert ids(service.search(registry, "自主修复"))[0] == "run_selfdev_repair"
+
+
 def search_until(service, registry, query, status="ready", **kwargs):
     deadline = monotonic() + 5
     while monotonic() < deadline:

@@ -215,9 +215,9 @@ def test_run_shell_never_falls_back_when_bash_missing(tmp_path, monkeypatch) -> 
         ("git log --oneline -3", True, False),
         ("cat README.md", True, False),
         ("rm -rf build", False, False),
-        ("git push origin main", False, False),
+        ("git push origin main", False, True),
         ("cat a; rm -rf b", False, False),
-        ("ls | grep x", False, False),
+        ("ls | grep x", True, False),
         ("curl https://example.com", False, True),
         ("wget https://example.com/a", False, True),
         ("", False, False),
@@ -229,21 +229,34 @@ def test_shell_command_classification(command: str, read_only: bool, uses_networ
     assert verdict.uses_network is uses_network
 
 
-def test_task_policy_allows_read_only_and_requires_approval_for_write() -> None:
+def test_task_policy_allows_scoped_file_commands(tmp_path) -> None:
     registry = get_tool_registry()
     registration = registry.get(SHELL_CAPABILITY_ID)
     assert registration is not None
-    scope = TaskScope.from_brief({"scope": {"capability_policy": "unified", "allowed_roots": ["/tmp"]}})
+    cwd = str(tmp_path)
+    scope = TaskScope.from_brief({"scope": {"capability_policy": "unified", "allowed_roots": [cwd]}})
     policy = TaskPolicyEngine()
-    read_only = policy.decide(registration, scope, SHELL_CAPABILITY_ID, {"command": "ls", "cwd": "/tmp"})
+    read_only = policy.decide(registration, scope, SHELL_CAPABILITY_ID, {"command": "ls", "cwd": cwd})
     assert read_only.outcome == "allow"
-    write = policy.decide(registration, scope, SHELL_CAPABILITY_ID, {"command": "rm -rf x", "cwd": "/tmp"})
-    assert write.outcome == "approval"
+    write = policy.decide(registration, scope, SHELL_CAPABILITY_ID, {"command": "rm -rf x", "cwd": cwd})
+    assert write.outcome == "allow"
     network = policy.decide(
-        registration, scope, SHELL_CAPABILITY_ID, {"command": "curl https://example.com", "cwd": "/tmp"},
+        registration, scope, SHELL_CAPABILITY_ID, {"command": "curl https://example.com", "cwd": cwd},
     )
     assert network.outcome == "block"
     assert network.reason == "network_access_not_in_task_scope"
+
+
+def test_desktop_windows_shell_flags_and_paths_use_the_desktop_scope() -> None:
+    from aiive.tools.shell_policy import shell_path_violations
+
+    root = "C:\\Project"
+    assert shell_path_violations(
+        "del /q .\\old.txt", cwd=root, allowed_roots=[root], remote=True,
+    ) == ([], False)
+    assert shell_path_violations(
+        "move .\\old.txt ..\\other.txt", cwd=root, allowed_roots=[root], remote=True,
+    ) == (["..\\other.txt"], False)
 
 
 def test_run_shell_is_resident_core_capability() -> None:
@@ -273,22 +286,30 @@ def test_task_executes_read_only_shell_without_desktop_node(db_session, tmp_path
     assert action.status == "succeeded"
 
 
-def test_destructive_shell_requires_approval(db_session, tmp_path) -> None:
+def test_shell_creates_overwrites_moves_and_deletes_without_approval(db_session, tmp_path) -> None:
+    from aiive.db.models import ApprovalRequest
+
     _require_bash()
     task = _task(db_session, {"capability_policy": "unified", "allowed_roots": [str(tmp_path)]})
     agent = _ScriptedAgent(
         ActionProposal(
-            decision="action",
-            capability_id="run_shell",
-            arguments={"command": "rm -rf build", "cwd": str(tmp_path)},
+            decision="action", capability_id="run_shell",
+            arguments={
+                "command": "mkdir build && printf old > build/a && printf new > build/a && mv build/a build/b && rm build/b",
+                "cwd": str(tmp_path),
+            },
         ),
+        ActionProposal(decision="finish", summary="done"),
     )
     result = PersistentTaskRuntime(db_session, agent_executor=agent).run(task.id)
 
-    assert result["status"] == TaskStatus.BLOCKED_APPROVAL.value
+    assert result["status"] == TaskStatus.SUCCEEDED.value
     action = db_session.query(AgentAction).filter(AgentAction.task_id == task.id).one()
-    assert action.status == "awaiting_approval"
-    assert action.requires_approval is True
+    assert action.status == "succeeded"
+    assert action.requires_approval is False
+    assert (tmp_path / "build").is_dir()
+    assert list((tmp_path / "build").iterdir()) == []
+    assert db_session.query(ApprovalRequest).filter_by(task_id=task.id).count() == 0
 
 
 def test_shell_cwd_outside_allowed_roots_is_blocked(db_session, tmp_path) -> None:

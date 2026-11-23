@@ -161,8 +161,9 @@ def test_structural_exhaustion_real_handler(durable_db, monkeypatch, limit):
     task = durable_db.get(AgentTask, task_id)
     run = durable_db.get(AgentRun, task.current_run_id)
     calls = min(limit, 3)
-    assert task.status == ("partial" if limit <= 2 else "failed")
-    assert run.status == ("completed" if limit <= 2 else "failed") and run.lease_expires_at is None
+    assert task.status == "partial"
+    assert run.status == "completed" and run.lease_expires_at is None
+    assert task.report["stop_reason"] == ("model_call_budget_exhausted" if limit <= 2 else "no_progress")
     assert task.usage["model_calls"] == calls
     assert len(model.messages) == calls + int(limit <= 2)
     assert task.usage["prompt_tokens"] == calls * 10
@@ -240,7 +241,8 @@ def test_bad_parameters_exhaust_without_action(durable_db, monkeypatch):
     model = wire_model(monkeypatch, ['{"decision":"action","capability_id":"get_current_time","arguments":{"max_steps":2}}'] * 3)
     assert handle_agent_task_run(claimed).outcome == HandlerOutcome.COMPLETED
     durable_db.expire_all()
-    assert durable_db.get(AgentTask, task_id).status == "failed"
+    task = durable_db.get(AgentTask, task_id)
+    assert task.status == "partial" and task.report["stop_reason"] == "no_progress"
     assert durable_db.query(AgentAction).filter_by(task_id=task_id).count() == 0
     assert len(model.messages) == 3
     assert "max_steps" in model.messages[1][-1].content
@@ -253,7 +255,8 @@ def test_exhaustion_after_progress_is_partial(durable_db, monkeypatch):
     durable_db.expire_all()
     task = durable_db.get(AgentTask, task_id)
     assert task.status == "partial"
-    assert durable_db.get(AgentRun, task.current_run_id).status == "failed"
+    assert durable_db.get(AgentRun, task.current_run_id).status == "completed"
+    assert task.report["stop_reason"] == "no_progress"
     assert task.usage["model_calls"] == 4
 
 
@@ -349,7 +352,7 @@ def test_infrastructure_retry_does_not_reset_corrections(durable_db, monkeypatch
     assert handle_agent_task_run(claimed).outcome == HandlerOutcome.COMPLETED
     durable_db.expire_all()
     task = durable_db.get(AgentTask, task_id)
-    assert task.status == "failed"
+    assert task.status == "partial" and task.report["stop_reason"] == "no_progress"
     assert task.usage["model_calls"] == 4
     assert len(model.messages) == 2
 
@@ -369,7 +372,8 @@ def test_native_fc_protocol_errors_exhaust_without_actions(durable_db, monkeypat
     assert handle_agent_task_run(claimed).outcome == HandlerOutcome.COMPLETED
     durable_db.expire_all()
     task = durable_db.get(AgentTask, task_id)
-    assert task.status == "failed" and task.usage["model_calls"] == 3
+    assert task.status == "partial" and task.usage["model_calls"] == 3
+    assert task.report["stop_reason"] == "no_progress"
     assert task.usage["prompt_tokens"] == 30
     assert durable_db.get(AgentRun, task.current_run_id).token_usage["total_tokens"] == 45
     assert durable_db.query(AgentAction).filter_by(task_id=task_id).count() == 0

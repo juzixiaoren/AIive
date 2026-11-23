@@ -198,7 +198,13 @@ class TaskRepository:
             if not references_visible(self.db, {"turn_record": [source_turn_record_id]}):
                 raise ValueError("task_source_unavailable")
         # ``goal`` 是 API/Meta Tool 的权威用户输入，不能被 task_brief 内同名字段覆盖。
-        brief = TaskBrief.model_validate({**(task_brief or {}), "goal": goal})
+        from aiive.task_runtime.router import normalize_task_brief, SELFDEV_TASK_TYPES
+
+        task_type = task_type.strip() or "general"
+        raw_brief = dict(task_brief or {})
+        if task_type in SELFDEV_TASK_TYPES:
+            raw_brief = normalize_task_brief(task_type, raw_brief)
+        brief = TaskBrief.model_validate({**raw_brief, "goal": goal})
         from aiive.runtime.attachment_access import validate_task_attachments
         authorized_attachments = validate_task_attachments(self.db, thread_id, brief.initial_input or {})
         budget = TaskBudget.for_new_task(budgets)
@@ -207,7 +213,7 @@ class TaskRepository:
         task = AgentTask(
             thread_id=thread_id,
             source_turn_record_id=source_turn_record_id,
-            task_type=task_type.strip() or "general",
+            task_type=task_type,
             title=(title or goal.strip().splitlines()[0])[:255],
             goal=goal.strip(),
             status=TaskStatus.QUEUED.value,
@@ -221,6 +227,7 @@ class TaskRepository:
                 "model_calls": 0,
                 "actions": 0,
                 "tool_failures": 0,
+                "discovery_queries": 0,
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "cost_usd": 0.0,
@@ -611,6 +618,10 @@ class TaskRepository:
         from aiive.forget.concurrency import acquire_forget_shared_lock
         acquire_forget_shared_lock(self.db)
         ensure_transition("action", action.status, status)
+        if action.status == ActionStatus.UNKNOWN.value and status == ActionStatus.SUCCEEDED.value:
+            task = self.db.get(AgentTask, action.task_id)
+            if task is not None and (task.task_state or {}).get("no_progress"):
+                task.task_state = {**task.task_state, "no_progress": []}
         action.status = status
         action.updated_at = utcnow()
         if status in {ActionStatus.DISPATCHED.value, ActionStatus.RUNNING.value} and action.started_at is None:

@@ -24,6 +24,7 @@ from aiive.runtime.conversation_state import get_current_thread_id
 from aiive.runtime.turn_execution import TurnExecutionService
 from aiive.core.llm_client import FakeLLMClient
 from aiive.storage import object_store
+from tests.support import isolate_object_store
 
 
 @pytest.fixture
@@ -65,7 +66,7 @@ def db_session(_db_template, tmp_path, monkeypatch):
 @pytest.fixture
 def client(db_session, monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "aiive_auth_enabled", False)
-    monkeypatch.setattr(object_store, "ROOT", tmp_path / "objects")
+    isolate_object_store(monkeypatch, tmp_path / "objects")
     app = create_app()
     app.dependency_overrides[get_db] = lambda: db_session
     return TestClient(app)

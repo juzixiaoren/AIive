@@ -13,9 +13,10 @@
 - 当前阶段只生成计划，不执行补丁、不切换运行槽位，也不直接修改活动槽位或非活动槽位。
 - `operation` 只能是 `add_file`、`modify_file` 或 `delete_file`。
 - `target_file` 必须是项目内的相对路径，不得使用绝对路径、`..` 或项目外路径。
+- 项目中的 Runtime、工具、提示词、测试、迁移及自进化代码都可以作为候选补丁目标。
 - `add_file` 和 `modify_file` 的 `content` 必须是完整的最终文件内容，不能是 diff、片段、说明或省略号。
 - 不得假装知道未提供的现有文件内容。修改现有文件所需信息不足时，仍可说明计划，但必须将 `not_allowed_yet` 设为 `true`，并在 `risk_notes` 中明确缺少什么信息。
-- `delete_file` 不应包含 `content`，并且必须填写范围明确的 `safe_delete_scope`。
+- `delete_file` 不应包含 `content`，执行器会将删除范围限定在非活跃槽位。
 - 涉及数据库结构变化时，对应操作及顶层 `requires_schema_change` 都设为 `true`。
 - `not_allowed_yet` 表示该操作目前缺乏安全执行条件；不要仅仅因为当前阶段“不执行”就把所有操作都标记为不可执行。
 - 需要安装外部工具或 MCP 能力时，只能规划通过 MCP 沙箱完成，并在 `risk_notes` 中说明权限与供应链风险。

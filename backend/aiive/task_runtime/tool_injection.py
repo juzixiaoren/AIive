@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from typing import Any
 
 from aiive.tool_discovery import DEFAULT_LIMIT, MAX_LIMIT, MAX_QUERY_CHARS
 from aiive.tools.registry import ToolRegistry
+from aiive.task_runtime.router import SELFDEV_CAPABILITIES, SELFDEV_TASK_TYPES
 
 # L0 常驻入口：长期记忆读取、基础搜索、Bash（桌面节点在线时才有该能力）、
 # 任务管理。常驻只代表入口始终可见，不代表执行授权——网络、路径、密钥、
@@ -36,6 +38,16 @@ MAX_DISCOVERY_QUERIES = 3
 MAX_LOADED_DEFINITIONS = 6
 
 STATE_KEY = "tool_discovery"
+
+
+def worker_resident_ids(task_type: str) -> tuple[str, ...]:
+    if task_type in SELFDEV_TASK_TYPES:
+        return (*SELFDEV_CAPABILITIES, "read_text_file", *WORKER_RESIDENT_CAPABILITIES)
+    return WORKER_RESIDENT_CAPABILITIES
+
+
+def normalize_query(query: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", query).casefold().split())[:MAX_QUERY_CHARS]
 
 
 def resident_definitions(
@@ -71,7 +83,7 @@ def record_search(
     """记录一次目录检索结果（只存 id，Schema 每次重新解析，避免陈旧缓存）。"""
     state = discovery_state(task_state)
     entry = {
-        "query": query[:MAX_QUERY_CHARS],
+        "query": normalize_query(query),
         "capability_ids": list(dict.fromkeys(capability_ids))[:MAX_LIMIT],
         "namespace_ids": sorted(set(namespace_ids or []))[:MAX_LIMIT],
         "matched_namespace_ids": list(dict.fromkeys(matched_namespace_ids or []))[:MAX_LIMIT],
@@ -119,15 +131,16 @@ def _definition_size(definition: dict[str, Any]) -> int:
 
 def select_search_definitions(
     execution: ToolRegistry, candidates: list[dict[str, Any]],
+    *, resident_ids: tuple[str, ...] = WORKER_RESIDENT_CAPABILITIES,
 ) -> list[dict[str, str]]:
     """按检索顺序选择能与常驻定义一同绑定的 Schema 引用。"""
     remaining = FULL_INJECTION_MAX_CHARS
-    resident_ids = set()
-    for definition in resident_definitions(execution):
+    bound_resident = set()
+    for definition in resident_definitions(execution, resident_ids):
         size = _definition_size(definition)
         if size <= remaining:
             remaining -= size
-            resident_ids.add(definition["capability_id"])
+            bound_resident.add(definition["capability_id"])
     selected = []
     for candidate in candidates:
         if candidate.get("in_scope") is not True:
@@ -136,7 +149,9 @@ def select_search_definitions(
         definition = execution.definition(capability_id)
         if definition is None or definition["descriptor_hash"] != candidate["descriptor_hash"]:
             continue
-        size = 0 if capability_id in resident_ids else _definition_size(definition)
+        if capability_id in bound_resident:
+            continue
+        size = _definition_size(definition)
         if size <= remaining:
             remaining -= size
             selected.append({"capability_id": capability_id, "descriptor_hash": definition["descriptor_hash"]})
@@ -203,7 +218,8 @@ def _fit_definitions(view: dict[str, Any]) -> None:
                 kept.append(entry)
                 continue
             size = 0 if key in selected else _definition_size(entry)
-            fits = key == explicit_large["capability_id"] if explicit_large else size <= remaining
+            required = group == "resident" and key in SELFDEV_CAPABILITIES
+            fits = required or (key == explicit_large["capability_id"] if explicit_large else size <= remaining)
             if fits:
                 remaining -= size
                 selected.add(key)

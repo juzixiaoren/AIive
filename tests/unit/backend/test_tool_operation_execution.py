@@ -1,4 +1,5 @@
 """副作用工具持久化 operation、幂等执行和未知终态回归测试。"""
+import sys
 import uuid
 
 import pytest
@@ -31,18 +32,28 @@ from aiive.worker.outbox_worker import OutboxWorker
 @pytest.fixture
 def operation_session_factory(tmp_path, monkeypatch):
     """为 operation 与 Worker 提供可跨线程访问的独立 SQLite 数据库。"""
+    from aiive.db import base
+
     engine = create_engine(
         f"sqlite:///{tmp_path / 'tool-operation.db'}",
         connect_args={"check_same_thread": False},
     )
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
+    previous = base.SessionLocal
     monkeypatch.setattr("aiive.db.base.SessionLocal", factory)
     monkeypatch.setattr("aiive.tools.operation_executor.SessionLocal", factory)
     monkeypatch.setattr("aiive.worker.outbox_worker.SessionLocal", factory)
     monkeypatch.setattr("aiive.tools.builtin_tools.SessionLocal", factory)
-    yield factory
-    engine.dispose()
+    try:
+        yield factory
+    finally:
+        # Outbox registration lazily imports handlers that bind SessionLocal.
+        # Restore those imports before disposing the database for this test.
+        for name, module in list(sys.modules.items()):
+            if name.startswith("aiive.") and getattr(module, "SessionLocal", None) is factory:
+                setattr(module, "SessionLocal", previous)
+        engine.dispose()
 
 
 def _source_context(factory, *, source="user", with_request=True) -> RunContext:

@@ -126,7 +126,12 @@ class ProjectReader:
         max_files: int = MAX_CONTEXT_FILES,
         max_matches: int = MAX_MATCHES,
     ) -> None:
-        self._root: Path = (repo_root or _DEFAULT_REPO_ROOT).resolve()
+        if repo_root is None:
+            from aiive.supervisor.slot_manager import SlotManager
+
+            active = SlotManager().active_app_root()
+            repo_root = active if (active / "backend" / "aiive").is_dir() else _DEFAULT_REPO_ROOT
+        self._root: Path = repo_root.resolve()
         self._max_file_bytes: int = max(1, int(max_file_bytes))
         self._max_files: int = max(1, int(max_files))
         self._max_matches: int = max(1, int(max_matches))

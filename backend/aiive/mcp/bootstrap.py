@@ -158,7 +158,8 @@ def register_capability_tools(
         risk = base_risk_level
         if writes:
             risk = _max_risk(risk, "medium")
-        if can_delete:
+        filesystem = _sanitize_identifier(capability_name) in {"server_filesystem", "filesystem"}
+        if can_delete and not filesystem:
             risk = _max_risk(risk, "high")
 
         cap_id = mcp_tool_capability_id(capability_name, tool_name)
@@ -167,7 +168,7 @@ def register_capability_tools(
             definition_source="remote_mcp",
             definition_trust_level=trust_level,
             risk_level=risk,
-            requires_confirmation=risk in ("high", "critical"),
+            requires_confirmation=not filesystem and risk in ("high", "critical"),
             writes_external_world=writes,
             can_access_secret=False,
             can_delete=can_delete,

@@ -308,19 +308,19 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
          }, "low", False, False),
         # 文件操作
         ("safe_delete", SafeDeleteTool, "在允许范围内安全删除文件",
-         {"path": {"type": "str", "minLength": 1},
-          "scope_id": {"type": "str", "description": "默认 test_artifacts"},
+         {"path": {"type": "str", "minLength": 1, "required": True},
+          "scope_id": {"type": "str", "description": "直接调用默认 test_artifacts；持久任务使用任务工作目录授权"},
           "mode": {
               "type": "str",
               "description": "trash / quarantine / hard_delete_for_test_only",
               "enum": ["trash", "quarantine", "hard_delete_for_test_only"],
-          }}, "high", True, True),
+          }}, "medium", True, True),
         ("read_text_file", ReadTextFileTool,
-         "分页读取文本文件（限 ~/Documents 与工具输出日志目录）。"
+         "分页读取任务工作目录中的文本文件。直接调用时使用 ~/Documents 或工具日志目录。"
          + "单页受字符预算约束，返回 total_lines/total_chars/next_offset；"
          + "大文件或大日志必须用 offset/limit 分页读取，不要一次读全文。",
          {
-             "path": {"type": "str", "description": "文件路径（~/Documents 或工具日志目录）", "minLength": 1, "required": True},
+             "path": {"type": "str", "description": "已授权的文件路径", "minLength": 1, "required": True},
              "offset": {"type": "int", "description": "起始行号，从 0 开始；默认 0", "minimum": 0},
              "limit": {"type": "int", "description": "本次最多读取行数，默认 50，上限 1000", "minimum": 1, "maximum": 1000},
              "max_chars": {"type": "int", "description": "单页字符预算，默认 1000，上限 8000", "minimum": 1, "maximum": 8000},
@@ -375,7 +375,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         ("apply_patch_to_inactive_slot", ApplyPatchToInactiveSlotTool, "仅将补丁应用到非活跃槽位",
          {"operations": {
              "type": "list",
-             "description": "补丁操作列表，来自 create_selfdev_plan 返回的 plan.operations",
+             "description": "基于活跃槽位的完整补丁列表，可自行生成或使用 plan.operations；每次调用重建候选基线",
              "items": {"type": "object", "required": ["target_file"],
                        "properties": {"operation": {"type": "string", "enum": ["add_file", "modify_file", "delete_file"], "default": "add_file"},
                                       "target_file": {"type": "string", "minLength": 1},
@@ -383,19 +383,20 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                                       "not_allowed_yet": {"type": "boolean"}},
                        "additionalProperties": True},
              "required": True,
-         }}, "high", True, False),
+         }}, "medium", True, False),
         ("promote_slot", PromoteSlotTool, "健康检查通过后提升非活跃槽位为活跃", {}, "high", True, False),
         ("get_promotion_status", PromotionStatusTool, "读取本任务晋升 Action 的实际启动、观察、成功或回滚结果。",
          {"action_id": {"type": "str", "minLength": 1, "required": True}}, "low", False, False),
         ("rollback_slot", RollbackSlotTool, "回滚到上一个活跃槽位", {}, "high", True, False),
         ("run_selfdev_repair", RunSelfdevRepairTool,
          "自主修复闭环：读取相关代码 → 生成补丁 → 应用到非活跃槽位 → 定向测试 → "
-         + "失败时按真实错误有限次修复 → 安全门；promote=True 才提交受控晋升",
+         + "失败时按真实错误有限次修复 → 安全门；默认候选就绪后返回，promote=True 另需发布审批",
          {
              "goal": {"type": "str", "minLength": 1, "required": True},
              "max_rounds": {"type": "int", "minimum": 0, "maximum": 5, "description": "默认 3"},
+             "files": {"type": "list", "items": {"type": "string"}, "description": "已知相关文件的项目相对路径"},
              "promote": {"type": "bool", "description": "默认 false；true 时仍走安全门"},
-         }, "high", True, False),
+         }, "medium", True, False),
         # 节奏 / 注意力
         ("query_rhythm", QueryRhythmTool, "获取每日节奏摘要", {}, "low", False, False),
         ("query_attention", QueryAttentionTool, "只读查询当前注意力状态与空闲评估",

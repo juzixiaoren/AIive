@@ -306,6 +306,7 @@ class SelfDevRepairLoop:
         files: list[str] | None = None,
         promote: bool = False,
         run_gate: bool = True,
+        run_id: str | None = None,
     ) -> dict[str, Any]:
         """执行一次完整的自主修复闭环，返回可审计的结构化记录。
 
@@ -318,6 +319,8 @@ class SelfDevRepairLoop:
         标记为 interrupted*，绝不会被记为成功。
         """
         record = self._new_record(goal, trace_id)
+        if run_id is not None:
+            record["run_id"] = run_id
         run_id = str(record["run_id"])
         handle = self._lock.acquire(run_id=run_id)
         if handle is None:
@@ -370,6 +373,7 @@ class SelfDevRepairLoop:
         attempts = self._max_rounds + 1
 
         for attempt in range(attempts):
+            self._write_journal(record, phase="planning")
             plan = self._safe_plan(
                 goal,
                 trace_id,
@@ -619,6 +623,7 @@ class SelfDevRepairLoop:
             return self._abort(record, "candidate_changed", str(verified["reason"]))
 
         if run_gate:
+            self._write_journal(record, phase="gate")
             try:
                 gate_result = self._gate_runner(candidate_root)
             except Exception as exc:

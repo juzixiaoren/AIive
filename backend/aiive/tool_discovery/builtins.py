@@ -45,6 +45,22 @@ _DETAILS = {
     },
     "get_current_time": {"aliases": ("现在几点", "current time"), "tags": ("timezone",)},
     "web_search": {"aliases": ("上网搜索", "internet search"), "tags": ("web research",)},
+    "create_selfdev_plan": {
+        "aliases": ("补丁计划", "plan a code change", "self improvement"),
+        "output_concepts": ("patch operations", "candidate test plan"),
+    },
+    "apply_patch_to_inactive_slot": {
+        "aliases": ("修改 AIive 源码", "应用补丁", "patch worker runtime", "edit AIive code"),
+        "output_concepts": ("inactive slot", "candidate tests"),
+    },
+    "run_selfdev_repair": {
+        "aliases": ("AIive 自进化", "自主修复", "self repair", "repair AIive itself"),
+        "use_cases": ("读取活跃槽位、修改候选代码、运行测试并按失败反馈自动修复",),
+        "output_concepts": ("candidate ready", "evaluation gate"),
+    },
+    "promote_slot": {"aliases": ("发布候选", "promote candidate", "switch active slot")},
+    "get_promotion_status": {"aliases": ("部署进度", "promotion status", "deployment status")},
+    "rollback_slot": {"aliases": ("回滚部署", "release rollback", "revert active slot")},
 }
 
 

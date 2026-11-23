@@ -1,7 +1,7 @@
 """
 运行时层 - 策略引擎。
 
-策略按注册表安全元数据执行：未知工具阻止；删除、高危或显式标记的工具进入
+策略按注册表安全元数据和 Action 类型执行：未知工具阻止；高危或显式标记的工具进入
 服务端冻结参数的审批路径；其余已注册工具直接执行。
 """
 
@@ -12,7 +12,7 @@ from enum import Enum
 from typing import Any
 
 from aiive.tools.registry import ToolRegistry, get_tool_registry
-from aiive.tools.shell_policy import SHELL_CAPABILITY_ID, classify_shell_command
+from aiive.control.task_policy import approval_reason
 
 
 class PolicyAction(str, Enum):
@@ -81,17 +81,7 @@ def check_tool_calls(
             blocked.append(tool_name)
         else:
             allowed.append(tool_name)
-            safety = registration.safety
-            if tool_name == SHELL_CAPABILITY_ID and not classify_shell_command(
-                str((tc.get("args") or {}).get("command") or "")
-            ).read_only:
-                # 对话侧若绑定本机 Shell，同样按命令内容决定是否确认。
-                confirm.append(tool_name)
-            elif (
-                safety.requires_confirmation
-                or safety.can_delete
-                or safety.risk_level in ("high", "critical")
-            ):
+            if approval_reason(registration, tool_name, tc.get("args") or {}):
                 confirm.append(tool_name)
 
     if blocked:

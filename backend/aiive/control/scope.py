@@ -134,6 +134,6 @@ def action_resource_keys(
         })
     if any(marker in capability_id for marker in ("gui", "foreground", "screen", "keyboard", "mouse")):
         keys.add(prefix + "gui:foreground")
-    if capability_id.startswith("selfdev_") or "slot" in capability_id:
+    if capability_id.startswith("selfdev_") or "slot" in capability_id or capability_id == "run_selfdev_repair":
         keys.add("server:selfdev:lifecycle")
     return sorted(keys)

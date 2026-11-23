@@ -92,14 +92,15 @@ def test_evidence_artifact_and_task_copies_block_before_object_reads(
     from aiive.control.capability_broker import CapabilityBroker
 
     task.task_type = "selfdev"
-    assert CapabilityBroker(db)._lifecycle_block(task, "promote_slot", {}) is None
+    task.task_brief = {**task.task_brief, "scope": {"capability_policy": "unified"}}
+    assert CapabilityBroker(db).prepare(task, "promote_slot", {}).decision.outcome == "approval"
     shield(db, event)
     spy = Mock(
         side_effect=AssertionError("authorization must precede external byte read")
     )
     monkeypatch.setattr(module, "get_range", spy)
     assert (
-        CapabilityBroker(db)._lifecycle_block(task, "promote_slot", {})
+        CapabilityBroker(db).prepare(task, "promote_slot", {}).decision.reason
         == "promotion_requires_passing_isolated_evaluation"
     )
     assert TaskReadRepository(db).task_visible(task)  # E1 remains visible.

@@ -28,25 +28,16 @@ from aiive.knowledge.maintenance import (
 )
 from aiive.storage import object_store
 from aiive.storage.object_store import ObjectRef
-from aiive.tools.safe_delete import get_scope_registry
 from aiive.worker.handlers_knowledge import handle_knowledge_maintenance
 from aiive.worker.job_types import ENABLED_OUTBOX_JOB_TYPES
 from aiive.worker.outbox_dto import ClaimedJob, HandlerOutcome
+from tests.support import isolate_object_store
 
 
 @pytest.fixture
 def store(tmp_path, monkeypatch):
     """把对象存储根目录隔离到 tmp_path，并让 safe_delete 认可该范围。"""
-    root = tmp_path / "object_store"
-    monkeypatch.setattr(object_store, "ROOT", root)
-    registry = get_scope_registry()
-    previous = registry.get_scope_root("object_store")
-    registry.register("object_store", root)
-    try:
-        yield root
-    finally:
-        if previous is not None:
-            registry.register("object_store", previous)
+    return isolate_object_store(monkeypatch, tmp_path / "object_store")
 
 
 def _write(path: Path, text: str) -> Path:

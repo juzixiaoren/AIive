@@ -1,13 +1,14 @@
 """Action 的确定性策略决策；LLM 不参与授权。"""
 from __future__ import annotations
 
+import ntpath
 from dataclasses import dataclass
 from typing import Any
 
 from aiive.control.scope import TaskScope
 from aiive.tools.base import BaseTool
 from aiive.tools.shell_policy import (
-    SHELL_CAPABILITY_ID,
+    SHELL_CAPABILITIES,
     classify_shell_command,
     shell_path_violations,
 )
@@ -20,9 +21,34 @@ class ActionPolicyDecision:
 
 
 ALWAYS_APPROVE = frozenset({
-    "desktop_fs_delete", "desktop_exec", "apply_patch_to_inactive_slot",
     "promote_slot", "rollback_slot",
 })
+FILE_MUTATIONS = frozenset({
+    "safe_delete", "apply_patch_to_inactive_slot", "run_selfdev_repair",
+})
+
+
+def approval_reason(registration: BaseTool, capability_id: str, arguments: dict[str, Any]) -> str | None:
+    if capability_id in ALWAYS_APPROVE or (
+        capability_id == "run_selfdev_repair" and arguments.get("promote") is True
+    ):
+        return "release_change_requires_approval"
+    if (
+        capability_id in FILE_MUTATIONS or capability_id.startswith("desktop_fs_")
+        or (registration.safety.definition_source == "remote_mcp"
+            and capability_id.startswith(("mcp_server_filesystem_", "mcp_filesystem_")))
+    ):
+        return None
+    if capability_id in SHELL_CAPABILITIES:
+        verdict = classify_shell_command(
+            str(arguments.get("command") or ""),
+            windows_shell=capability_id == "desktop_exec" and bool(ntpath.splitdrive(str(arguments.get("cwd") or ""))[0]),
+        )
+        return None if verdict.read_only or verdict.file_only else f"shell_{verdict.reason}"
+    safety = registration.safety
+    if safety.requires_confirmation or safety.risk_level in {"high", "critical"}:
+        return "high_risk_action_requires_approval"
+    return None
 
 
 class TaskPolicyEngine:
@@ -45,32 +71,26 @@ class TaskPolicyEngine:
             return ActionPolicyDecision("block", "mcp_environment_access_not_in_task_scope")
         if safety.uses_network and not scope.allow_network:
             return ActionPolicyDecision("block", "network_access_not_in_task_scope")
-        if capability_id == SHELL_CAPABILITY_ID:
-            # 本机 Shell 按命令内容分级：只读命令放行，其余进入审批；
-            # 涉及网络的命令还必须显式允许联网；命令里出现的路径必须落在
-            # allowed_roots 内（否则只读白名单会变成任意路径读取的通道）。
+        if capability_id in SHELL_CAPABILITIES:
             command = str(arguments.get("command") or "")
-            verdict = classify_shell_command(command)
+            cwd = str(arguments.get("cwd") or "")
+            remote = capability_id == "desktop_exec"
+            if not cwd or not scope.allowed_roots:
+                return ActionPolicyDecision("block", "shell_requires_scoped_cwd")
+            verdict = classify_shell_command(command, windows_shell=remote and bool(ntpath.splitdrive(cwd)[0]))
             if verdict.uses_network and not scope.allow_network:
                 return ActionPolicyDecision("block", "network_access_not_in_task_scope")
             violations, dynamic_path = shell_path_violations(
                 command,
-                cwd=str(arguments.get("cwd") or ""),
+                cwd=cwd,
                 allowed_roots=scope.allowed_roots,
+                remote=remote,
             )
             if violations:
                 detail = ",".join(violations[:3])
                 return ActionPolicyDecision("block", f"shell_path_outside_task_scope:{detail}")
-            if not verdict.read_only:
-                return ActionPolicyDecision("approval", f"shell_{verdict.reason}")
             if dynamic_path:
-                # 含 $VAR/反引号等无法静态判定的路径，不能按只读直接放行。
                 return ActionPolicyDecision("approval", "shell_dynamic_path_requires_approval")
-        if (
-            capability_id in ALWAYS_APPROVE
-            or safety.requires_confirmation
-            or safety.can_delete
-            or safety.risk_level in {"high", "critical"}
-        ):
-            return ActionPolicyDecision("approval", "high_risk_action_requires_approval")
+        if reason := approval_reason(registration, capability_id, arguments):
+            return ActionPolicyDecision("approval", reason)
         return ActionPolicyDecision("allow", "task_scope_and_policy_allow")

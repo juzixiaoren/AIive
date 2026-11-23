@@ -141,6 +141,7 @@ class TaskBrief(BaseModel):
     goal: str = Field(min_length=1, max_length=20_000)
     acceptance_criteria: list[str] = Field(default_factory=list, max_length=64)
     constraints: list[str] = Field(default_factory=list, max_length=64)
+    required_capabilities: list[str] = Field(default_factory=list, max_length=128)
     scope: TaskScopeModel = Field(default_factory=TaskScopeModel)
     initial_input: dict[str, Any] = Field(default_factory=dict)
 

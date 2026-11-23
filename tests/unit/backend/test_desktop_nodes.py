@@ -166,7 +166,7 @@ def test_registry_overlay_injects_node_tools_with_remote_executor(db_session, mo
     assert readonly.executor_kind == writer.executor_kind == "desktop_node"
     assert writer.safety.writes_external_world is True
     assert deleter.safety.risk_level == "high"
-    assert deleter.safety.requires_confirmation is True
+    assert deleter.safety.requires_confirmation is False
     assert deleter.safety.can_delete is True
     assert "读取本机文件状态" not in readonly.description
     assert "读取目标电脑文件或目录的元数据" in readonly.description
@@ -178,7 +178,7 @@ def test_registry_overlay_injects_node_tools_with_remote_executor(db_session, mo
     }
     assert check_tool_calls([
         {"name": "desktop_fs_delete", "args": {"path": "C:\\Users\\me\\old.txt"}, "id": "delete-1"},
-    ], registry).action is PolicyAction.CONFIRM
+    ], registry).action is PolicyAction.ALLOW
     # Desktop 能力不再接受 Turn 审批入口；只能由 Task CapabilityBroker 使用
     # execute_brokered 进入持久 Action 链。
     approved = registry.execute_brokered(

@@ -16,6 +16,7 @@ aiive 业务模块 import）安装一个稳定的分发函数：运行期查当�
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import aiive.db.base as _db_base
 from sqlalchemy.orm import Session
@@ -48,6 +49,16 @@ def set_current_test_session(session: Session | None) -> None:
     """注册/注销当前测试会话（仅单元与流程测试使用）。"""
     global _current_test_session
     _current_test_session = session
+
+
+def isolate_object_store(monkeypatch, root: Path) -> Path:
+    """Redirect object paths and their deletion registry for the same test."""
+    from aiive.storage import object_store
+    from aiive.tools import safe_delete
+
+    monkeypatch.setattr(object_store, "ROOT", root)
+    monkeypatch.setattr(safe_delete, "_default_registry", safe_delete._build_default_registry())
+    return root
 
 
 def persist_running_job(

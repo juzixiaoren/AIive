@@ -2,7 +2,7 @@
 
 from typing import override
 
-from aiive.tools.base import BaseTool
+from aiive.tools.base import BaseTool, ToolExecutionContext
 
 import logging
 
@@ -10,12 +10,23 @@ logger = logging.getLogger(__name__)
 
 import os
 from collections.abc import Iterator
+from pathlib import Path
 from typing import TextIO
+
+
+def _task_roots(execution: ToolExecutionContext | None) -> list[str] | None:
+    if execution is None or execution.channel != "task_action":
+        return None
+    scope = (execution.authorization or {}).get("scope") or {}
+    return [os.path.normcase(os.path.realpath(root)) for root in scope.get("allowed_roots", [])]
 
 
 class SafeDeleteTool(BaseTool):
     @override
-    def _run(self, path: str, scope_id: str = "test_artifacts", mode: str = "trash"):
+    def _run(
+        self, path: str, scope_id: str = "test_artifacts", mode: str = "trash",
+        _execution: ToolExecutionContext | None = None,
+    ):
         """安全删除文件，仅允许删除已注册 scope 内的文件。
 
         参数:
@@ -26,8 +37,17 @@ class SafeDeleteTool(BaseTool):
         返回:
             包含 allowed、reason、resolved_path 的字典
         """
-        from aiive.tools.safe_delete import safe_delete as do_safe_delete
-        decision = do_safe_delete(path, scope_id, mode)
+        from aiive.tools.safe_delete import SafeDeleteScopeRegistry, safe_delete as do_safe_delete
+        roots = _task_roots(_execution)
+        registry = None
+        if roots is not None:
+            root = next((root for root in roots if _within_roots(os.path.realpath(path), [root])), None)
+            if root is None:
+                return {"ok": False, "allowed": False, "error_type": "access_denied", "reason": "path_outside_task_scope"}
+            registry = SafeDeleteScopeRegistry()
+            scope_id = "task_workspace"
+            registry.register(scope_id, Path(root))
+        decision = do_safe_delete(path, scope_id, mode, registry=registry)
         # 关键：必须带 ok 键。operation_executor 依赖 ok/allowed 判定失败，
         # 否则删除被拒绝时会被记成 committed 成功（审计假成功）。
         return {
@@ -98,6 +118,7 @@ class ReadTextFileTool(BaseTool):
         limit: int = 50,
         max_chars: int = FILE_PAGE_CHAR_BUDGET,
         char_offset: int = 0,
+        _execution: ToolExecutionContext | None = None,
     ):
         """分页读取文本文件，单页回填受字符预算约束。
 
@@ -117,7 +138,8 @@ class ReadTextFileTool(BaseTool):
             line_range / content / next_offset / next_char_offset / has_more / hint
         """
         real_path = os.path.realpath(path)
-        if not _within_roots(real_path, _allowed_roots()):
+        roots = _task_roots(_execution)
+        if not _within_roots(real_path, _allowed_roots() if roots is None else roots):
             return {"ok": False, "error": "Access denied", "error_type": "access_denied", "path": path}
         if not os.path.isfile(real_path):
             return {"ok": False, "error": "File not found", "error_type": "not_found", "path": path}

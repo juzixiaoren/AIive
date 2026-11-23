@@ -44,11 +44,6 @@ from aiive.supervisor.slot_manager import (
 
 logger = logging.getLogger(__name__)
 
-# 仓库根：本文件位于 backend/aiive/selfdev/repair_guard.py
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-# 修复运行状态目录（runtime/ 已在 .gitignore 中）
-DEFAULT_STATE_DIR = _REPO_ROOT / "runtime" / "selfdev"
-
 # 本进程当前真正持有的锁 token。
 # 用于区分"同进程内另一个线程正在跑修复"（不可抢占）与
 # "同进程上一轮遗留的孤儿锁"（可接管）。
@@ -83,7 +78,7 @@ def _now() -> str:
 
 def project_lock_key(root: Path | str | None = None) -> str:
     """项目级锁名：同一套槽位目录下所有改写候选代码的入口共用一个锁。"""
-    base = Path(root) if root is not None else _REPO_ROOT
+    base = Path(root) if root is not None else SlotManager().base_dir
     return hashlib.sha256(str(base).encode("utf-8")).hexdigest()[:12]
 
 
@@ -93,9 +88,7 @@ def default_state_dir(manager: SlotManager | None = None) -> Path:
     生产环境（默认 SlotManager）落在仓库 runtime/selfdev；测试或自定义
     槽位目录时随之落到该槽位的 runtime 目录，互不干扰。
     """
-    if manager is None:
-        return DEFAULT_STATE_DIR
-    return manager.runtime_dir / "selfdev"
+    return (manager or SlotManager()).runtime_dir / "selfdev"
 
 
 def default_repair_lock(manager: SlotManager | None = None) -> RepairLock:
@@ -324,7 +317,8 @@ class CandidateSlotGuard:
     def candidate_slot(self) -> SlotInfo | None:
         """当前候选槽位（非活跃槽位）。"""
         active = self._manager.get_active_slot()
-        return self._slot("B" if active == "A" else "A")
+        name = "B" if active == "A" else "A"
+        return self._slot(name) if self._manager.has_local_slot_paths(name) else None
 
     def candidate_app_root(self) -> Path | None:
         """候选槽位的 app 目录；槽位不存在时返回 None。"""
@@ -337,7 +331,7 @@ class CandidateSlotGuard:
         """记录活跃槽位的版本与代码指纹；槽位未初始化/无 app 目录时返回 None。"""
         active = self._manager.get_active_slot()
         slot = self._slot(active)
-        if slot is None:
+        if slot is None or not self._manager.has_local_slot_paths(active):
             return None
         fingerprint = tree_fingerprint(slot.root / "app")
         if fingerprint is None:
@@ -379,10 +373,12 @@ class CandidateSlotGuard:
             return {"ok": False, "reason": "candidate_slot_missing"}
         target_app = candidate.root / "app"
         try:
-            sync_app_tree(baseline.app_root, target_app)
             source_manifest = baseline.slot_root / "version_manifest.json"
+            target_manifest = candidate.root / "version_manifest.json"
+            if target_manifest.resolve() != candidate.root.resolve() / target_manifest.name:
+                return {"ok": False, "reason": "invalid_inactive_slot_manifest_path"}
+            sync_app_tree(baseline.app_root, target_app)
             if source_manifest.exists():
-                target_manifest = candidate.root / "version_manifest.json"
                 target_manifest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source_manifest, target_manifest)
         except Exception as exc:  # 恢复失败必须显式隔离，不能静默
@@ -736,6 +732,7 @@ def apply_candidate_patch(
         }
     baseline: Baseline | None = None
     slot: SlotInfo | None = None
+    fingerprint = None
     result: dict[str, Any] = {
         "ok": False,
         "error": "patch executor did not run",
@@ -760,6 +757,7 @@ def apply_candidate_patch(
                 "operations_failed": [],
             }
         )
+        fingerprint = guard.fingerprint_candidate()
     except Exception as exc:
         logger.exception("候选补丁应用异常")
         result = {
@@ -780,7 +778,7 @@ def apply_candidate_patch(
             "baseline": baseline.to_dict() if baseline else None,
             "candidate_slot": candidate_slot,
             "candidate_root": candidate_root,
-            "candidate_fingerprint": guard.fingerprint_candidate(),
+            "candidate_fingerprint": fingerprint,
         },
     }
 
@@ -801,29 +799,19 @@ def finalize_candidate_patch(
     run_id = str(result.get("run_id") or "")
     slot_name = str(candidate.get("candidate_slot") or "")
     fingerprint = str(candidate.get("candidate_fingerprint") or "")
-    if not slot_name:
+    lock = default_repair_lock(guard.manager)
+    handle = lock.acquire(run_id=run_id)
+    if handle is None:
+        return {"ok": False, "promotable": False, "reason": "concurrent_repair_in_progress"}
+    try:
         slot = guard.candidate_slot()
-        slot_name = slot.name if slot else ""
-    if not slot_name:
-        return {"ok": False, "promotable": False, "skipped": "no_candidate_slot"}
-    if tests_ok:
-        if not fingerprint:
-            # 无法指纹化（槽位未初始化/目录缺失）：不冒充"已验证"。
-            return {
-                "ok": False,
-                "promotable": False,
-                "slot": slot_name,
-                "skipped": "fingerprint_unavailable",
-            }
-        guard.mark_promotable(
-            slot_name, run_id=run_id, fingerprint=fingerprint, gate_ok=False,
-        )
-        return {
-            "ok": True,
-            "promotable": True,
-            "slot": slot_name,
-            "fingerprint": fingerprint,
-        }
-    failure = reason or "targeted_tests_failed"
-    guard.mark_not_promotable(slot_name, reason=failure, run_id=run_id)
-    return {"ok": False, "promotable": False, "slot": slot_name, "reason": failure}
+        if slot is None or slot.name != slot_name or guard.read_state(slot_name).get("run_id") != run_id:
+            return {"ok": False, "promotable": False, "reason": "candidate_superseded"}
+        if tests_ok and fingerprint and guard.fingerprint_candidate() == fingerprint:
+            state = guard.mark_promotable(slot_name, run_id=run_id, fingerprint=fingerprint, gate_ok=False)
+            return {**state, "slot": slot_name}
+        failure = "candidate_changed" if tests_ok else reason or "targeted_tests_failed"
+        guard.mark_not_promotable(slot_name, reason=failure, run_id=run_id)
+        return {"ok": False, "promotable": False, "slot": slot_name, "reason": failure}
+    finally:
+        lock.release(handle)

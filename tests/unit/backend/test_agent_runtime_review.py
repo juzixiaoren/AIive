@@ -74,11 +74,11 @@ def test_run_limit_only_opens_an_unmetered_report_run(db_session, monkeypatch):
 
 def test_shell_log_survives_temporary_file_and_respects_task_boundary(db_session, tmp_path, monkeypatch):
     from aiive.runtime import tool_output_store
-    from aiive.storage import object_store
     from aiive.tools.task_file_tools import ReadTaskArtifactTool
+    from tests.support import isolate_object_store
 
     monkeypatch.setattr(tool_output_store, "tool_output_root", lambda: tmp_path)
-    monkeypatch.setattr(object_store, "ROOT", tmp_path / "objects")
+    isolate_object_store(monkeypatch, tmp_path / "objects")
     logfile = tmp_path / "stdout.log"
     logfile.write_text("完整输出" * 100, encoding="utf-8")
     task = _task(db_session)

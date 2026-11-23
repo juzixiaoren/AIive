@@ -19,8 +19,9 @@ class CreateSelfdevPlanTool(BaseTool):
         """
         from aiive.core.llm_client import default_llm_client
         from aiive.selfdev.planner import SelfDevPlanner
+        from aiive.selfdev.project_reader import ProjectReader
         llm = default_llm_client()
-        return SelfDevPlanner(llm).plan(goal)
+        return SelfDevPlanner(llm).plan(goal, context=ProjectReader().collect_context(goal))
 
 
 class ApplyPatchToInactiveSlotTool(BaseTool):
@@ -79,7 +80,8 @@ class PromoteSlotTool(BaseTool):
 class RunSelfdevRepairTool(BaseTool):
     @override
     def _run(self,
-        goal: str = "", max_rounds: int = 3, promote: bool = False
+        goal: str = "", max_rounds: int = 3, promote: bool = False,
+        files: list[str] | None = None, ctx: Any = None,
     ):
         """自主修复闭环：读码 → 规划 → 补丁 → 定向测试 → 有限修复 → 安全门。
 
@@ -88,7 +90,8 @@ class RunSelfdevRepairTool(BaseTool):
         """
         from aiive.selfdev.repair_loop import SelfDevRepairLoop
         return SelfDevRepairLoop(max_rounds=max_rounds).run(
-            goal, promote=promote,
+            goal, promote=promote, files=files, trace_id=ctx.trace_id if ctx else None,
+            run_id=(ctx.action_id or None) if ctx else None,
         )
 
 

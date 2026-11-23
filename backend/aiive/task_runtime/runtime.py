@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import json
+import hashlib
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,7 +16,7 @@ from aiive.control.approval_service import TaskApprovalService
 from aiive.control.capability_broker import CapabilityBroker
 from aiive.db.models import AgentAction, AgentRun, AgentTask, TaskArtifact, TaskEvidence
 from aiive.task_runtime.agent_executor import TaskAgentExecutor
-from aiive.task_runtime.errors import AgentOutputValidationError, TaskModelBudgetError
+from aiive.task_runtime.errors import AgentOutputValidationError, TaskModelBudgetError, TaskNotRunnableError
 from aiive.tools.tool_validation import validate_tool_params
 from aiive.core.function_calling import correction_allowed, CallValidation, output_error
 from aiive.task_runtime.evidence import EvidenceStore
@@ -30,15 +31,22 @@ from aiive.task_runtime.schemas import (
     TaskStatus,
 )
 from aiive.task_runtime.tool_injection import (
-    WORKER_RESIDENT_CAPABILITIES,
+    MAX_DISCOVERY_QUERIES,
+    build_tool_view,
     discovery_state,
     merge_state,
+    normalize_query,
     record_definition,
     record_search,
+    worker_resident_ids,
 )
+from aiive.control.scope import TaskScope
+from aiive.task_runtime.router import with_selfdev_scope
 from aiive.tools.base import outcome_is_unknown
+from aiive.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
+NO_PROGRESS_LIMIT = 3
 
 
 def action_outcome(result: dict[str, Any]) -> str:
@@ -47,10 +55,10 @@ def action_outcome(result: dict[str, Any]) -> str:
     成功 / 确定性失败 / 已确认取消 / 外部副作用未知必须互斥，未确认的结果
     一律优先判为 unknown，不能被降级成成功或普通失败。
     """
-    if result.get("ok"):
-        return "succeeded"
     if outcome_is_unknown(result):
         return "unknown"
+    if result.get("ok"):
+        return "succeeded"
     error_type = str(result.get("error_type") or "")
     if error_type == "cancelled":
         return "cancelled"
@@ -77,16 +85,18 @@ class PersistentTaskRuntime:
         candidate = self.repo.get_task(task_id, for_update=True)
         pending_report = None
         initial_budget_issue = None
+        already_stalled = False
         if candidate is not None and candidate.status == TaskStatus.QUEUED.value:
             budget = TaskBudget.from_stored(candidate.budgets)
             pending_report = (candidate.task_state or {}).get("pending_report")
+            already_stalled = len((candidate.task_state or {}).get("no_progress") or []) >= NO_PROGRESS_LIMIT
             if budget.max_runs is not None and int((candidate.usage or {}).get("runs", 0)) >= budget.max_runs:
                 initial_budget_issue = "run_budget_exhausted"
             else:
                 initial_budget_issue = self._budget_issue(
                     candidate, budget, before_model=self.repo.ready_action(candidate.id) is None,
                 )
-        report_only = pending_report is not None or initial_budget_issue is not None
+        report_only = pending_report is not None or initial_budget_issue is not None or already_stalled
         task, run = self.repo.start_run(
             task_id, trigger="report" if report_only else trigger, count_toward_budget=not report_only,
         )
@@ -94,8 +104,11 @@ class PersistentTaskRuntime:
         self.db.commit()
         if pending_report is not None:
             return self._finish_report(task, run, pending_report)
+        if stalled := self._stop_if_stalled(task, run):
+            return stalled
         if initial_budget_issue:
             return self._stop_for_budget(task, run, initial_budget_issue)
+        task.task_brief = with_selfdev_scope(task.task_type, task.task_brief or {})
         self._ensure_isolation(task, run)
         self.db.commit()
         budget = TaskBudget.from_stored(task.budgets)
@@ -144,6 +157,9 @@ class PersistentTaskRuntime:
                 self.repo.finish_run(run, status=RunStatus.INTERRUPTED.value, error="task_cancelled")
                 self.db.commit()
                 return {"status": task.status, "task_id": task.id}
+            stalled = self._stop_if_stalled(task, run)
+            if stalled:
+                return stalled
             ready = self.repo.ready_action(task.id)
             budget_issue = self._budget_issue(task, budget, before_model=ready is None)
             if budget_issue:
@@ -159,21 +175,34 @@ class PersistentTaskRuntime:
             available = broker.available_registry(task)
             catalog = available.catalog()
             entries = {item["capability_id"]: item for item in catalog}
-            resident = [entries[key] for key in WORKER_RESIDENT_CAPABILITIES if key in entries]
-            if not catalog:
-                self.repo.transition_task(
-                    task, TaskStatus.BLOCKED_NODE.value,
-                    event_type="task_blocked_node",
-                    event_payload={"reason": "no_scoped_capabilities_or_node_offline"},
-                    visibility="conversation",
-                )
-                self.repo.finish_run(run, summary={"blocked": "node"})
-                self.repo.checkpoint(task.id, reason="blocked_node")
-                self.db.commit()
-                return {"status": task.status, "task_id": task.id}
+            resident = [entries[key] for key in worker_resident_ids(task.task_type) if key in entries]
+            deterministic = self._deterministic_proposal(task)
+            if int((task.usage or {}).get("model_calls", 0)) == 0:
+                brief = task.task_brief or {}
+                scope = TaskScope.from_brief(brief)
+                required = set(brief.get("required_capabilities") or [])
+                if deterministic is not None:
+                    required.add(deterministic.capability_id)
+                missing = [
+                    f"{'policy_denied' if key in entries else 'capability_unavailable'}:{key}"
+                    for key in sorted(required) if key not in entries or not scope.allows_capability(key)
+                ]
+                for key in sorted(required & entries.keys()):
+                    if not scope.allows_capability(key):
+                        continue
+                    registration = available.get(key)
+                    if registration is not None and registration.safety.uses_network and not scope.allow_network:
+                        missing.append(f"policy_denied:{key}:network_access_not_in_task_scope")
+                if not missing and scope.allowed_capabilities and not (scope.allowed_capabilities & entries.keys()):
+                    missing = [f"capability_unavailable:{key}" for key in sorted(scope.allowed_capabilities)]
+                if missing or not catalog:
+                    return self._complete(
+                        task, run, status="partial", summary="启动任务所需的执行能力不可用。",
+                        unresolved=missing or ["capability_unavailable:no_registered_tools"],
+                        stop_reason="required_capability_unavailable",
+                    )
 
             decision = None
-            deterministic = self._deterministic_proposal(task)
             if deterministic is not None:
                 proposal = deterministic
                 state = dict(task.task_state or {})
@@ -222,12 +251,19 @@ class PersistentTaskRuntime:
                     run.token_usage = run_tokens
                     run.model = last_model
                     correction_failures += 1
+                    payload = error.payload()
+                    self._record_outcome(
+                        task, "invalid_proposal", str(payload.get("capability_id") or "worker_function"),
+                        str(error.issues[0].get("code", "agent_output_validation_error")) if error.issues else str(error),
+                    )
+                    if stalled := self._stop_if_stalled(task, run):
+                        return stalled
                     budget_issue = self._budget_issue(task, budget, before_model=True)
                     if budget_issue:
                         return self._stop_for_budget(task, run, budget_issue)
                     if not correction_allowed(correction_failures):
                         return self._validation_failed(task, run, run_tokens, last_model)
-                    task.task_state = {**(task.task_state or {}), "validation_feedback": error.payload(), "validation_failures": correction_failures, "validation_messages": error.feedback}
+                    task.task_state = {**(task.task_state or {}), "validation_feedback": payload, "validation_failures": correction_failures, "validation_messages": error.feedback}
                     self.db.commit()
                     continue
                 self.repo.renew_run(run, lease_seconds=180)
@@ -253,6 +289,9 @@ class PersistentTaskRuntime:
                     validation = validate_tool_params(registration, proposal.arguments)
                     if not validation.ok:
                         correction_failures += 1
+                        self._record_outcome(task, "invalid_proposal", proposal.capability_id, "invalid_tool_arguments")
+                        if stalled := self._stop_if_stalled(task, run):
+                            return stalled
                         budget_issue = self._budget_issue(task, budget, before_model=True)
                         if budget_issue:
                             return self._stop_for_budget(task, run, budget_issue)
@@ -276,6 +315,9 @@ class PersistentTaskRuntime:
                     WatcherService(self.db).create_from_proposal(task, proposal.watch)
                 except (ValueError, OSError, RuntimeError) as error:
                     correction_failures += 1
+                    self._record_outcome(task, "invalid_proposal", "task_watch", str(error))
+                    if stalled := self._stop_if_stalled(task, run):
+                        return stalled
                     budget_issue = self._budget_issue(task, budget, before_model=True)
                     if budget_issue:
                         return self._stop_for_budget(task, run, budget_issue)
@@ -309,7 +351,7 @@ class PersistentTaskRuntime:
             )
 
             if proposal.decision in {"search_capabilities", "describe_capability"}:
-                self._record_discovery(task, run, proposal, broker)
+                self._record_discovery(task, run, proposal, broker, available, resident)
                 completed_this_run += 1
                 continue
 
@@ -393,10 +435,16 @@ class PersistentTaskRuntime:
             )
             self.repo.transition_action(action, ActionStatus.VALIDATED.value)
             if block_reason is not None:
+                outcome = (
+                    "definition_changed" if stale else
+                    "capability_unavailable" if prepared.decision.reason in {"unknown_capability", "capability_disabled"}
+                    else "policy_denied"
+                )
+                self._record_outcome(task, outcome, proposal.capability_id, block_reason)
                 self.repo.transition_action(
                     action, ActionStatus.FAILED.value,
                     error=block_reason,
-                    payload={"reason": block_reason},
+                    payload={"reason": block_reason, "outcome": outcome, "error_type": outcome},
                 )
                 self.db.commit()
                 completed_this_run += 1
@@ -444,6 +492,9 @@ class PersistentTaskRuntime:
             self.repo.finish_run(run, status=RunStatus.INTERRUPTED.value, error="task_cancelled")
             self.db.commit()
             return {"status": task.status, "task_id": task.id}
+        stalled = self._stop_if_stalled(task, run)
+        if stalled:
+            return stalled
         budget_issue = self._budget_issue(task, budget, before_model=self.repo.ready_action(task.id) is None)
         if budget_issue:
             return self._stop_for_budget(task, run, budget_issue)
@@ -464,6 +515,32 @@ class PersistentTaskRuntime:
             "budget_exhausted": reason.endswith("_budget_exhausted") or reason == "deadline_exceeded",
             "unresolved": [reason],
         })
+
+    @staticmethod
+    def _record_outcome(
+        task: AgentTask, outcome: str, subject: str, reason: str, *, progress: bool = False,
+    ) -> None:
+        state = dict(task.task_state or {})
+        recent = state.get("no_progress") or []
+        state["no_progress"] = [] if progress else [
+            *recent[-(NO_PROGRESS_LIMIT - 1):], f"{outcome}:{subject}:{reason}"[:600],
+        ]
+        task.task_state = state
+        if outcome in {"policy_denied", "capability_unavailable", "execution_failed",
+                       "definition_changed", "precondition_failed"}:
+            usage = dict(task.usage or {})
+            usage["tool_failures"] = int(usage.get("tool_failures", 0)) + 1
+            task.usage = usage
+
+    def _stop_if_stalled(self, task: AgentTask, run: AgentRun) -> dict[str, Any] | None:
+        recent = (task.task_state or {}).get("no_progress") or []
+        if len(recent) < NO_PROGRESS_LIMIT:
+            return None
+        return self._complete(
+            task, run, status="partial", summary="连续三步未取得进展，任务已终止。",
+            unresolved=recent, stop_reason="no_progress",
+            model=run.model, token_usage=run.token_usage,
+        )
 
     def _finish_report(self, task: AgentTask, run: AgentRun, outcome: dict[str, Any]) -> dict[str, Any]:
         from aiive.task_runtime.read_repository import TaskReadRepository
@@ -540,6 +617,8 @@ class PersistentTaskRuntime:
         run: AgentRun,
         proposal: ActionProposal,
         broker: CapabilityBroker,
+        available: ToolRegistry,
+        resident: list[dict[str, Any]],
     ) -> None:
         """处理只读的能力发现决策：不创建 Action、不调用任何工具 handler。
 
@@ -547,34 +626,76 @@ class PersistentTaskRuntime:
         注册表重新解析；因此注册、卸载或定义变化会立刻反映到注入结果里。
         """
         state = dict(task.task_state or {})
+        discovery = discovery_state(state)
+        usage = dict(task.usage or {})
+        execution = broker.registry_for(task, available=available)
+        seen = dict(state.get("seen_tool_definitions") or {})
+
+        def bound_definitions() -> dict[str, str]:
+            view = build_tool_view(execution, resident, discovery, discovery_registry=available)
+            return {
+                item["capability_id"]: item["descriptor_hash"]
+                for group in ("resident", "available", "loaded")
+                for item in view[group] if "input_schema" in item
+            }
+
+        seen.update(bound_definitions())
+        outcome = "no_progress"
         payload: dict[str, Any]
         if proposal.decision == "search_capabilities":
             namespace_ids = sorted(set(proposal.namespace_ids))
-            query = proposal.query.strip()
-            search = broker.search_capabilities(task, query, namespace_ids=namespace_ids, limit=proposal.limit)
-            matched = [item["capability_id"] for item in search["tools"]]
-            namespaces = [item["namespace_id"] for item in search["namespaces"]]
-            discovery = record_search(
-                state, query, matched, namespace_ids=namespace_ids, matched_namespace_ids=namespaces,
-                loaded=search["loaded"],
+            query = normalize_query(proposal.query)
+            subject = query
+            count = int(usage.get("discovery_queries", len(discovery["queries"])))
+            fingerprint = hashlib.sha256(json.dumps(
+                sorted((item["capability_id"], item["descriptor_hash"], execution.get(item["capability_id"]) is not None)
+                       for item in available.catalog()),
+            ).encode()).hexdigest()
+            searched = dict(state.get("searched_tool_queries") or {})
+            key = json.dumps([query, namespace_ids], ensure_ascii=False)
+            already_searched = key not in searched and any(
+                normalize_query(str(item.get("query") or "")) == query
+                and (item.get("namespace_ids") or []) == namespace_ids for item in discovery["queries"]
             )
-            payload = {
-                "query": query,
-                "namespace_ids": namespace_ids,
-                "matched": matched,
-                "matched_namespace_ids": namespaces,
-                "loaded": [item["capability_id"] for item in search["loaded"]],
-                "mode": search["mode"],
-                "status": search["status"],
-            }
+            payload = {"query": query, "namespace_ids": namespace_ids}
+            if searched.get(key) == fingerprint or already_searched:
+                reason = "duplicate_query"
+            elif count >= MAX_DISCOVERY_QUERIES:
+                reason = "discovery_query_budget_exhausted"
+            else:
+                search = broker.search_capabilities(
+                    task, query, namespace_ids=namespace_ids, limit=proposal.limit, available=available,
+                )
+                usage["discovery_queries"] = count + 1
+                searched[key] = fingerprint
+                state["searched_tool_queries"] = searched
+                matched = [item["capability_id"] for item in search["tools"]]
+                namespaces = [item["namespace_id"] for item in search["namespaces"]]
+                discovery = record_search(
+                    state, query, matched, namespace_ids=namespace_ids, matched_namespace_ids=namespaces,
+                    loaded=search["loaded"],
+                )
+                payload.update(matched=matched, matched_namespace_ids=namespaces, mode=search["mode"],
+                               status=search["status"])
+                if not matched:
+                    outcome, reason = "capability_unavailable", "no_search_results"
+                elif not any(item["in_scope"] for item in search["tools"]):
+                    outcome, reason = "policy_denied", "search_results_out_of_scope"
+                else:
+                    reason = "no_new_definition"
             event_type = "tool_search"
         else:
             capability_id = proposal.capability_id.strip()
-            definition = broker.describe_capability(task, capability_id)
-            discovery = discovery_state(state)
+            subject = capability_id
+            definition = broker.describe_capability(task, capability_id, available=available)
             in_scope = bool(definition and definition.get("in_scope"))
             if definition is not None and in_scope:
                 discovery = record_definition(state, capability_id, definition["descriptor_hash"])
+                reason = "no_new_definition"
+            elif definition is not None:
+                outcome, reason = "policy_denied", "capability_not_in_task_scope"
+            else:
+                outcome, reason = "capability_unavailable", "unknown_capability"
             payload = {
                 "capability_id": capability_id,
                 "found": definition is not None,
@@ -583,10 +704,16 @@ class PersistentTaskRuntime:
             if definition is not None and not in_scope:
                 payload["summary"] = definition
             event_type = "tool_describe"
+        bound = bound_definitions()
+        loaded = [key for key, descriptor in bound.items() if seen.get(key) != descriptor]
+        state["seen_tool_definitions"] = {**seen, **bound}
+        if loaded:
+            outcome, reason = "succeeded", "new_definition_loaded"
+        payload.update(outcome=outcome, reason=reason, loaded=loaded)
         task.task_state = merge_state(state, discovery)
-        usage = dict(task.usage or {})
         usage["discovery_steps"] = int(usage.get("discovery_steps", 0)) + 1
         task.usage = usage
+        self._record_outcome(task, outcome, subject, reason, progress=bool(loaded))
         self.repo.append_event(
             task.id, event_type, payload, visibility="internal", run_id=run.id,
         )
@@ -598,9 +725,10 @@ class PersistentTaskRuntime:
         broker = CapabilityBroker(self.db)
         issues = broker.validate_preconditions(action)
         if issues:
+            self._record_outcome(task, "precondition_failed", action.capability_id, ";".join(issues))
             self.repo.transition_action(
                 action, ActionStatus.INVALIDATED.value,
-                error=";".join(issues), payload={"issues": issues},
+                error=";".join(issues), payload={"issues": issues, "outcome": "precondition_failed"},
             )
             self.db.commit()
             return "continue"
@@ -625,11 +753,14 @@ class PersistentTaskRuntime:
             raise RuntimeError("task_or_action_disappeared_after_dispatch")
         self.db.refresh(refreshed_task)
         self.db.refresh(refreshed_action)
+        if refreshed_task.current_run_id != run.id or refreshed_action.status != ActionStatus.DISPATCHED.value:
+            raise TaskNotRunnableError("action_dispatch_owner_changed")
         task = refreshed_task
         action = refreshed_action
         outcome = action_outcome(result)
         error_type = str(result.get("error_type", ""))
         if outcome == "succeeded":
+            self._record_outcome(task, outcome, action.capability_id, "", progress=True)
             evidence = self.evidence.capture_result(
                 self.db, task_id=task.id, run_id=run.id, action=action, result=result,
             )
@@ -649,6 +780,7 @@ class PersistentTaskRuntime:
             self.repo.transition_action(
                 action, ActionStatus.UNKNOWN.value,
                 error=str(result.get("error", "execution_unknown")),
+                payload={"outcome": "execution_unknown", "error_type": error_type},
             )
             if task.status == TaskStatus.CANCELLED.value:
                 self.repo.finish_run(
@@ -677,14 +809,19 @@ class PersistentTaskRuntime:
                 error=str(result.get("error") or "execution_cancelled"),
             )
         elif outcome == "invalidated":
+            self._record_outcome(task, "precondition_failed", action.capability_id, str(result.get("error", "")))
             self.repo.transition_action(
                 action, ActionStatus.INVALIDATED.value,
                 error=str(result.get("error", "precondition_failed")),
+                payload={"outcome": "precondition_failed", "error_type": error_type},
             )
         else:
-            usage = dict(task.usage or {})
-            usage["tool_failures"] = int(usage.get("tool_failures", 0)) + 1
-            task.usage = usage
+            category = {
+                "unknown_tool": "capability_unavailable", "capability_disabled": "capability_unavailable",
+                "policy_denied": "policy_denied", "access_denied": "policy_denied",
+                "descriptor_changed": "definition_changed",
+            }.get(error_type, "execution_failed")
+            self._record_outcome(task, category, action.capability_id, str(result.get("error", error_type)))
             evidence = self.evidence.capture_result(
                 self.db, task_id=task.id, run_id=run.id, action=action, result=result,
                 kind="tool_error",
@@ -695,6 +832,7 @@ class PersistentTaskRuntime:
                 payload={
                     "evidence_id": evidence.id,
                     "error_type": error_type,
+                    "outcome": category,
                     # 失败与"是否已产生外部影响"是两个独立事实，事件里都要保留。
                     "outcome_known": bool(result.get("outcome_known", True)),
                     "side_effect_started": bool(result.get("side_effect_started", False)),

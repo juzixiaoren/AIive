@@ -21,7 +21,13 @@ from typing import Any
 # 仓库根：本文件位于 backend/aiive/supervisor/slot_manager.py
 # parents[3] = supervisor -> aiive -> backend -> 仓库根（与 manifest excludes
 # 中 slots/、runtime/ 的相对目录约定一致，且已被 .gitignore 覆盖）
-_REPO_ROOT = Path(__file__).resolve().parents[3]
+_APP_ROOT = Path(__file__).resolve().parents[3]
+_REPO_ROOT = (
+    _APP_ROOT.parents[2]
+    if _APP_ROOT.name == "app" and _APP_ROOT.parent.name in {"A", "B"}
+    and _APP_ROOT.parent.parent.name == "slots"
+    else _APP_ROOT
+)
 # 槽位根目录
 SLOTS_ROOT = _REPO_ROOT / "slots"
 # 活跃槽位标记文件
@@ -60,6 +66,14 @@ class SlotManager:
     def runtime_dir(self) -> Path:
         """运行时目录：与 active_slot 标记文件同级。"""
         return self._active_file.parent
+
+    def active_app_root(self) -> Path:
+        return (self.base_dir / self.get_active_slot() / "app").resolve()
+
+    def has_local_slot_paths(self, name: str) -> bool:
+        root = self.base_dir / name
+        expected = self.base_dir.resolve() / name
+        return root.resolve() == expected and (root / "app").resolve() == expected / "app"
 
     def get_active_slot(self) -> str:
         """

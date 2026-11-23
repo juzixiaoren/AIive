@@ -40,6 +40,7 @@ class DelegateTaskTool(BaseTool):
         constraints: list[str] | None = None,
         allowed_roots: list[str] | None = None,
         allowed_capabilities: list[str] | None = None,
+        required_capabilities: list[str] | None = None,
         allowed_hosts: list[str] | None = None,
         allow_network: bool | None = None,
         allow_secrets: bool = False,
@@ -92,6 +93,7 @@ class DelegateTaskTool(BaseTool):
         raw_brief = {
             "acceptance_criteria": acceptance_criteria or [],
             "constraints": constraints or [],
+            "required_capabilities": required_capabilities or [],
             "scope": {
                 "allowed_roots": allowed_roots or [],
                 "allowed_capabilities": effective_capabilities,
@@ -128,6 +130,7 @@ class DelegateTaskTool(BaseTool):
                 "task_id": task.id,
                 "status": task.status,
                 "title": task.title,
+                "task_type": task.task_type,
                 "skill_id": selected_skill.skill_id if selected_skill else None,
                 "summary": "任务已进入持久执行队列；结束后对话会跟进，状态、审批和产物也可在任务中心查看。",
             }
@@ -235,6 +238,17 @@ class GetTaskStatusTool(BaseTool):
                 "artifact_count": len(detail["artifacts"]),
             }
             report = task.report or {}
+            repair = next((action for action in reversed(detail["actions"])
+                           if action["capability_id"] == "run_selfdev_repair"
+                           and action["status"] in {"dispatched", "running", "unknown"}), None)
+            if repair is not None:
+                from aiive.selfdev.repair_guard import RepairJournal, default_state_dir
+
+                journal = RepairJournal(default_state_dir() / "runs").read(repair["id"])
+                result["selfdev_progress"] = {
+                    "action_id": repair["id"], "action_status": repair["status"],
+                    **{key: journal[key] for key in ("phase", "status", "updated_at") if key in journal},
+                }
             for key in ("budget_exhausted", "stop_reason"):
                 if key in report:
                     result[key] = report[key]
@@ -356,6 +370,28 @@ class ListSkillsTool(BaseTool):
         }
 
 
+class SearchWorkerCapabilitiesTool(BaseTool):
+    @override
+    def _run(
+        self, query: str = "", capability_id: str = "", target_node_id: str = "",
+        ctx: RunContext | None = None,
+    ) -> dict[str, Any]:
+        from aiive.desktop.registry_overlay import build_registry_for_thread
+        from aiive.tool_discovery.service import get_discovery_service
+
+        run_ctx = _require_context(ctx)
+        with SessionLocal() as db:
+            registry = build_registry_for_thread(db, run_ctx.thread_id, target_node_id or None)
+            if capability_id:
+                definition = registry.definition(capability_id)
+                return {"capability_id": capability_id, "available": definition is not None, "definition": definition}
+            if query.strip():
+                return get_discovery_service().search(registry, query)
+            return {"namespaces": [
+                group.summary(key) for key, group in sorted(registry.discovery_index().groups.items())
+            ]}
+
+
 
 def build_main_agent_registry() -> ToolRegistry:
     """User-facing task, attachment, reminder, memory and privacy controls."""
@@ -373,11 +409,23 @@ def build_main_agent_registry() -> ToolRegistry:
         ListSkillsTool,
     ))
     registry.register(_registration(
+        "search_worker_capabilities",
+        "查看当前 Worker 工具命名空间，按关键词搜索可用能力，或按 capability_id 查看完整参数。"
+        + "包含内置工具、在线桌面与已启用的 MCP。结果可用于 delegate_task，实际执行受任务范围约束。",
+        {
+            "query": {"type": "str", "description": "工具关键词、用途或命名空间名称"},
+            "capability_id": {"type": "str", "description": "精确能力 ID，返回完整定义"},
+            "target_node_id": {"type": "str", "description": "可选，与 delegate_task 的桌面节点一致"},
+        },
+        SearchWorkerCapabilitiesTool,
+    ))
+    registry.register(_registration(
         "delegate_task",
         "创建可跨会话、审批和重启持续执行的任务。复杂、全文文档或跨轮工作委托为任务；普通聊天附件问题可直接使用 read_attachment。",
         {
             "goal": {"type": "str", "required": True, "minLength": 1},
-            "task_type": {"type": "str", "default": "general"},
+            "task_type": {"type": "str", "default": "general",
+                          "description": "修改 AIive 自身代码用 self_improvement，自动授权活跃槽位读取并注入 SelfDev 工具。"},
             "skill_id": {
                 "type": "str",
                 "description": "可选内置 Skill ID；先用 list_skills 查询。",
@@ -394,6 +442,10 @@ def build_main_agent_registry() -> ToolRegistry:
             "allowed_capabilities": {
                 "type": "list",
                 "description": "非空时为任务的能力授权白名单；留空时由 Worker 在统一工具目录按需发现，仍受任务范围和审批约束。",
+            },
+            "required_capabilities": {
+                "type": "list", "items": {"type": "string"},
+                "description": "可选，只列没有替代方案的必需工具 ID。缺失时立即返回部分报告，无需调用 Worker 模型。",
             },
             "allowed_hosts": {"type": "list", "description": "可选联网域名白名单"},
             "allow_network": {"type": "bool", "default": False},

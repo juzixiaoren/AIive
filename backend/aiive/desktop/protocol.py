@@ -136,8 +136,8 @@ DESKTOP_CAPABILITIES: dict[str, DesktopCapabilityDefinition] = {
             "path": _PATH,
             "mode": {"type": "string", "enum": ["trash", "permanent"], "default": "trash"},
         }, ("path",)),
-        risk_level="high", requires_confirmation=True, writes_external_world=True,
-        can_delete=True, effect_mode="non_repeatable_external",
+        risk_level="high", writes_external_world=True, can_delete=True,
+        effect_mode="non_repeatable_external",
     ),
     "desktop_exec": DesktopCapabilityDefinition(
         description="在目标电脑指定工作目录运行 Shell 命令。",
@@ -147,7 +147,7 @@ DESKTOP_CAPABILITIES: dict[str, DesktopCapabilityDefinition] = {
             "env": {"type": "object"},
         }, ("command", "cwd")),
         risk_level="high", requires_confirmation=True, writes_external_world=True,
-        can_access_secret=True, effect_mode="non_repeatable_external", resource_kind="shell",
+        effect_mode="non_repeatable_external", resource_kind="shell",
         timeout_seconds=660,
     ),
 }

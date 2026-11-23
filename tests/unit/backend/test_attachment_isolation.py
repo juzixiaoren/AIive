@@ -1,5 +1,6 @@
 """Explicit Worker grants, cache correctness and the real Vision transaction boundary."""
 
+from tests.support import isolate_object_store
 from tests.tool_helpers import invoke_test_tool
 
 from concurrent.futures import ThreadPoolExecutor
@@ -22,7 +23,7 @@ from aiive.tools import attachment_tools as tools
 
 @pytest.fixture
 def files(db_session, tmp_path, monkeypatch):
-    monkeypatch.setattr(object_store, "ROOT", tmp_path / "objects")
+    isolate_object_store(monkeypatch, tmp_path / "objects")
     monkeypatch.setattr(cache, "DOCUMENT_CACHE", cache.DocumentParseCache())
 
     @contextmanager

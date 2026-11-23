@@ -5,6 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 from aiive.context.run_context import RunContext
@@ -226,6 +227,7 @@ class ToolExecutor:
         expected_descriptor_hash: str | None = None,
         channel: str = "direct",
         authorization: Any = None,
+        on_wait: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         tool = self.registry.get(capability_id)
         if tool is None:
@@ -269,7 +271,7 @@ class ToolExecutor:
             run_context,
             channel=channel,
             authorization=authorization,
-            deadline=time.monotonic() + timeout,
+            deadline=time.monotonic() + timeout if on_wait is None else None,
             action_id=run_context.action_id if run_context else "",
         )
         if not isinstance(tool, DeadlineManagedTool) and cancellation_requested(context):
@@ -300,6 +302,8 @@ class ToolExecutor:
                     **ToolError("cancelled", "Cancelled before enqueue").payload(),
                     "execution_status": "cancelled",
                 }
+        if on_wait is not None:
+            return self.execute_direct(tool, context, arguments, None, on_wait=on_wait)
         return self.execute_direct(tool, context, arguments, timeout)
 
     @staticmethod
@@ -307,7 +311,9 @@ class ToolExecutor:
         tool: BaseTool,
         context: ToolExecutionContext,
         arguments: dict[str, Any],
-        timeout: float,
+        timeout: float | None,
+        *,
+        on_wait: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         from aiive.worker.outbox_execution_auth import (
             execute_in_tool_thread,
@@ -344,6 +350,7 @@ class ToolExecutor:
                 observe_cancel=None if managed_deadline else lambda: cancellation_requested(context),
                 await_terminal=context.channel == "turn_operation",
                 deadline_managed_preflight=check_cancel if managed_deadline else None,
+                on_wait=on_wait,
             )
             return {
                 **coerce_tool_result(result).payload(),
@@ -355,7 +362,9 @@ class ToolExecutor:
                 "execution_status": "cancelled",
                 "execution_id": context.execution_id,
             }
-        except concurrent.futures.TimeoutError:
+        except concurrent.futures.TimeoutError as error:
+            if timeout is None:
+                return {**tool.normalize_error(error, context).payload(), "execution_id": context.execution_id}
             tool.request_cancel(context)
             if isinstance(tool, DeadlineManagedTool):
                 return {**tool.deadline_error().payload(), "execution_id": context.execution_id}

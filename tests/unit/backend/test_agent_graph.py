@@ -186,7 +186,7 @@ class TestPolicyEngine:
         from aiive.runtime.policy_engine import check_tool_calls, PolicyAction
 
         tool_calls = [
-            {"name": "safe_delete", "args": {"path": "/tmp/test"}, "id": "call_1"},
+            {"name": "promote_slot", "args": {}, "id": "call_1"},
         ]
 
         # 导入注册表来检查
@@ -194,9 +194,7 @@ class TestPolicyEngine:
         registry = get_tool_registry()
 
         result = check_tool_calls(tool_calls, registry)
-        # safe_delete 的 risk_level="high" 且 can_delete=True
-        assert result.action in (PolicyAction.BLOCK, PolicyAction.CONFIRM), \
-            f"高风险工具应被拦截或需确认，实际得到 {result.action}"
+        assert result.action is PolicyAction.CONFIRM
 
     def test_policy_allows_low_risk(self):
         """低风险只读工具应被放行。"""

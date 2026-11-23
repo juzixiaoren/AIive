@@ -3,7 +3,7 @@
 
 使用 LLM 根据用户需求生成结构化的补丁计划（patch plan）。
 计划包含操作列表、测试方案等，最终由 PatchExecutor 在各槽位中执行。
-非法操作、缺少完整内容及 Trusted Core 路径都会标记为不可执行。
+非法操作、缺少内容及无效路径都会标记为不可执行。
 """
 
 import json
@@ -14,7 +14,7 @@ from json_repair import repair_json
 
 from aiive.core.llm_client import LLMClient, LLMResponse
 from aiive.prompts import get_prompt_registry
-from aiive.selfdev.trusted_core import protected_reason
+from aiive.selfdev.trusted_core import invalid_path_reason
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +157,7 @@ class SelfDevPlanner:
         验证并规范化计划内容，包括：
         - 为缺失字段设置默认值
         - 阻断非法操作类型和缺失完整内容的写操作
-        - 对 Trusted Core 核心文件标记 not_allowed_yet
+        - 对无效的仓库相对路径标记 not_allowed_yet
 
         参数:
             plan: 待验证的计划字典。
@@ -193,25 +193,22 @@ class SelfDevPlanner:
                     + f" UNKNOWN_OPERATION: {original}; operation blocked."
                 )
 
-            # 契约校验：add_file / modify_file 必须携带非空完整 content，
-            # 否则执行阶段会把文件写空。缺失时标记为不可执行。
+            # 显式空字符串可以创建空文件，缺失内容则不可执行。
             if op["operation"] in ("add_file", "modify_file"):
                 content = op.get("content")
-                if not isinstance(content, str) or not content.strip():
+                if not isinstance(content, str):
                     op["not_allowed_yet"] = True
                     op["risk_notes"] = (
                         op.get("risk_notes", "")
-                        + " MISSING_CONTENT: add_file/modify_file requires full non-empty content; "
-                        + "operation blocked to avoid writing empty files."
+                        + " MISSING_CONTENT: add_file/modify_file requires an explicit content string."
                     )
 
-            # Trusted Core 使用规范化仓库路径精确判定，禁止子串误报和 ../ 绕过。
-            reason = protected_reason(str(op.get("target_file", "")))
+            reason = invalid_path_reason(str(op.get("target_file") or ""))
             if reason:
                 op["not_allowed_yet"] = True
                 op["risk_notes"] = (
                     op.get("risk_notes", "")
-                    + f" CORE_FILE_PROTECTED: {reason}."
+                    + f" INVALID_TARGET: {reason}."
                 )
             operations.append(op)
 
