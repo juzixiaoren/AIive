@@ -48,7 +48,7 @@ def _summary(
 
 
 FULL_OBSERVATION_TOOLS = frozenset({
-    "read_file", "run_shell", "shell_session", "run_selfdev_repair",
+    "read_file", "shell_session", "run_selfdev_repair",
     "read_attachment", "list_thread_attachments", "record_attachment_progress",
     "list_task_files", "read_task_artifact", "read_task_evidence",
     "read_document", "read_knowledge_chunk",

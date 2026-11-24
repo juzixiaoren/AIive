@@ -48,6 +48,7 @@ TEST_MAPPING = {
         "tests/unit/backend/test_persistent_task_runtime.py", "tests/unit/backend/test_worker_tool_injection.py",
         "tests/unit/backend/test_tool_discovery.py",
     ],
+    "backend/aiive/task_runtime/evidence.py": ["tests/unit/backend/test_worker_tool_result_backfill.py"],
     "backend/aiive/tool_discovery/": [
         "tests/unit/backend/test_tool_discovery.py", "tests/unit/backend/test_worker_tool_injection.py",
     ],
