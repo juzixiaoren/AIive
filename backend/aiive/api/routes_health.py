@@ -10,7 +10,7 @@ router = APIRouter()
 
 
 @router.get("/health")
-async def health_check():
+async def health_check(runtime: bool = False):
     """健康检查接口
 
     返回服务名称和版本信息，用于确认服务是否正常运行。
@@ -18,8 +18,17 @@ async def health_check():
     Returns:
         包含 ok、service、version 的 JSON 响应
     """
-    return {
+    response = {
         "ok": True,
         "service": settings.app_name,
         "version": settings.app_version,
     }
+
+    if runtime:
+        from aiive.project_paths import runtime_identity
+
+        actual = runtime_identity()
+        response["runtime"] = {key: actual[key] for key in (
+            "pid", "parent_pid", "loaded_slot", "system_contract_module", "stable_contract_audit_ref", "prompt_catalog_sha256",
+        )}
+    return response

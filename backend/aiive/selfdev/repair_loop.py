@@ -382,10 +382,8 @@ class SelfDevRepairLoop:
                 feedback,
             )
             if plan is None:
-                return self._finish(
-                    record, "planner_failed",
-                    "planner_failed_or_returned_invalid_plan",
-                )
+                return self._abort(record, "planner_failed", "planner_failed_or_returned_invalid_plan",
+                                   dirty=attempt > 0)
 
             raw_operations = plan.get("operations")
             operations = (
@@ -401,7 +399,9 @@ class SelfDevRepairLoop:
                 "test_plan": str(plan.get("test_plan") or ""),
                 "requires_schema_change": bool(plan.get("requires_schema_change")),
             }
-            record["final_operations"] = _summarize_operations(operations)
+            by_file = {item["target_file"]: item for item in record["final_operations"]}
+            by_file.update({item["target_file"]: item for item in _summarize_operations(operations)})
+            record["final_operations"] = list(by_file.values())
             if not executable:
                 return self._finish(
                     record, "blocked", "planner_produced_no_executable_operations",
@@ -409,7 +409,7 @@ class SelfDevRepairLoop:
 
             fingerprint = patch_fingerprint(operations)
             if fingerprint == previous_fingerprint:
-                return self._finish(
+                return self._abort(
                     record, "tests_failed", "repeated_patch_fingerprint",
                 )
             previous_fingerprint = fingerprint
@@ -421,12 +421,15 @@ class SelfDevRepairLoop:
             # 应用前必须落日志（required）：写不进去就不改代码。
             self._write_journal(record, phase="applying", required=True)
 
-            apply_result = self._apply(operations)
+            apply_result = self._apply(operations, reuse_candidate=attempt > 0)
             changed_files = [
                 str(item.get("target_file") or "")
                 for item in executable
                 if item.get("target_file")
             ]
+            changed_files = list(dict.fromkeys([*changed_files,
+                *(item["target_file"] for item in record["final_operations"] if item["target_file"]),
+            ]))
             round_data = RepairRound(
                 round_index=attempt,
                 patch_fingerprint=fingerprint,
@@ -482,6 +485,11 @@ class SelfDevRepairLoop:
             round_data.failure_reason = "tests_failed"
             record["rounds"].append(round_data.to_dict())
             feedback = _extract_failure_feedback(test_report)
+            if candidate_root and Path(candidate_root).is_dir():
+                context = self._collect_context(
+                    goal, list(dict.fromkeys([*(files or []), *changed_files])), record,
+                    reader=ProjectReader(Path(candidate_root)),
+                )
             self._write_journal(record, phase="tests_failed")
 
         # 轮次耗尽：候选槽位里是最后一轮失败的代码，必须回滚到基线。
@@ -528,11 +536,11 @@ class SelfDevRepairLoop:
         }
 
     def _collect_context(
-        self, goal: str, files: list[str] | None, record: dict[str, Any]
+        self, goal: str, files: list[str] | None, record: dict[str, Any], *, reader: ProjectReader | None = None
     ) -> ProjectContext:
         """收集只读代码上下文；失败时降级为无上下文（不阻断规划）。"""
         try:
-            context = self._reader.collect_context(goal, explicit_files=files)
+            context = (reader or self._reader).collect_context(goal, explicit_files=files)
         except Exception:
             logger.exception("代码上下文收集失败，降级为无上下文规划")
             context = ProjectContext()
@@ -574,10 +582,13 @@ class SelfDevRepairLoop:
             logger.exception("自进化修复规划失败")
             return None
 
-    def _apply(self, operations: list[dict[str, Any]]) -> dict[str, Any]:
+    def _apply(self, operations: list[dict[str, Any]], *, reuse_candidate: bool = False) -> dict[str, Any]:
         """把补丁应用到非活跃槽位（唯一写入路径）。"""
         try:
-            result = self._executor.apply_to_inactive(operations)
+            if type(self._executor) is PatchExecutor:
+                result = self._executor.apply_to_inactive(operations, reuse_candidate=reuse_candidate)
+            else:
+                result = self._executor.apply_to_inactive(operations)
         except Exception as exc:
             logger.exception("补丁应用异常")
             return {

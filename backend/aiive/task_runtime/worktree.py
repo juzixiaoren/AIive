@@ -86,8 +86,11 @@ class WorktreeIsolation:
         _run_git(command[1:], self.repo_root, check=True)
         return destination
 
-    def remove(self, task_id: str) -> None:
+    def remove(self, task_id: str, *, force: bool = False) -> None:
         destination = self.path_for(task_id)
         if not destination.exists():
             return
-        _run_git(["worktree", "remove", str(destination)], self.repo_root, check=True)
+        flags = ["--force"] if force else []
+        _run_git(["worktree", "remove", *flags, str(destination)], self.repo_root, check=True)
+        if force:
+            _run_git(["branch", "-D", f"aiive/task-{self._safe_task_id(task_id)}"], self.repo_root, check=False)

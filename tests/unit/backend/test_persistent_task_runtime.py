@@ -1126,147 +1126,40 @@ def test_desktop_file_actions_dispatch_without_approval(db_session, tmp_path, mo
     assert db_session.query(ApprovalRequest).filter_by(task_id=task.id).count() == 0
 
 
-@pytest.fixture
-def selfdev_slots(tmp_path, monkeypatch):
-    from aiive.supervisor import slot_manager
-
-    manager = slot_manager.SlotManager(tmp_path / "slots")
-    manager.init_slots()
-    monkeypatch.setattr(slot_manager, "SLOTS_ROOT", manager.base_dir)
-    monkeypatch.setattr(slot_manager, "ACTIVE_SLOT_FILE", manager.runtime_dir / "active_slot")
-    return manager
-
-
-def test_worker_patches_runtime_and_trusted_core_in_candidate(db_session, selfdev_slots, monkeypatch) -> None:
+def test_worker_delegates_selfdev_to_task_workspace(db_session, tmp_path, monkeypatch) -> None:
+    from aiive.config import settings
     from aiive.context.run_context import RunContext
-    from aiive.selfdev.targeted_test_runner import TargetedTestRunner
     from aiive.tools.executor import ToolExecutor
 
-    active = selfdev_slots.active_app_root()
-    targets = [
-        "backend/aiive/task_runtime/runtime.py",
-        "backend/aiive/task_runtime/tool_injection.py",
-        "backend/aiive/task_runtime/agent_executor.py",
-        "backend/aiive/selfdev/trusted_core.py",
-    ]
-    for target in targets:
-        path = active / target
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("original", encoding="utf-8")
-
-    def targeted(self, changed):
-        assert changed == targets
-        return {"ok": True}
-
-    monkeypatch.setattr(TargetedTestRunner, "run_for_changed_files", targeted)
+    source = tmp_path / "source"
+    source.mkdir()
+    target = source / "backend/aiive/runtime/system_contract.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("original", encoding="utf-8")
+    monkeypatch.setenv("AIIVE_SOURCE_ROOT", str(source))
+    monkeypatch.setenv("AIIVE_SLOTS_ROOT", str(tmp_path / "slots"))
+    monkeypatch.setattr(settings, "aiive_data_dir", str(tmp_path / "data"))
     thread = _thread(db_session)
     db_session.commit()
-    main_tools = ToolExecutor(build_main_agent_registry())
-    ctx = RunContext(thread_id=thread.id, trace_id="selfdev-candidate", source="trusted_user_command")
-    lookup = main_tools.execute(
-        "search_worker_capabilities", {"capability_id": "apply_patch_to_inactive_slot"},
-        "trusted_user_command", ctx,
-    )
-    assert lookup["result"]["definition"]["input_schema"]["properties"]["operations"]["type"] == "array"
-    delegated = main_tools.execute(
-        "delegate_task", {"goal": "修复 AIive Runtime", "task_type": "self_improvement"},
-        "trusted_user_command", ctx,
+    tools = ToolExecutor(build_main_agent_registry())
+    ctx = RunContext(thread_id=thread.id, trace_id="selfdev-workspace", source="trusted_user_command")
+    delegated = tools.execute(
+        "delegate_task", {"goal": "修复 AIive Runtime", "task_type": "self_improvement"}, "trusted_user_command", ctx,
     )
     task = db_session.get(AgentTask, delegated["result"]["task_id"])
-    assert task.task_type == "self_improvement"
-    assert task.task_brief["scope"]["allowed_roots"] == [str(active)]
+    assert task.task_brief["scope"]["isolation_mode"] == "git_worktree"
+    assert task.budgets["max_actions"] >= 64 and task.budgets["max_model_calls"] >= 80
     agent = SequenceAgent(
-        ActionProposal(decision="action", capability_id="read_text_file", arguments={"path": str(active / targets[0])}),
-        ActionProposal(decision="action", capability_id="apply_patch_to_inactive_slot", arguments={
-            "operations": [{"operation": "modify_file", "target_file": target, "content": "patched"} for target in targets],
+        ActionProposal(decision="action", capability_id="edit_file", arguments={
+            "path": "backend/aiive/runtime/system_contract.py", "old_text": "original", "new_text": "patched",
         }),
-        ActionProposal(decision="finish", summary="candidate patched"),
+        ActionProposal(decision="finish", summary="workspace patched", report_status="partial"),
     )
-    assert CapabilityBroker(db_session).prepare(task, "run_shell", {
-        "cwd": str(active), "command": "rm backend/aiive/task_runtime/runtime.py",
-    }).decision.reason == "selfdev_shell_requires_read_only_command"
-    assert PersistentTaskRuntime(db_session, agent_executor=agent).run(task.id)["status"] == "succeeded"
-    actions = db_session.query(AgentAction).filter_by(task_id=task.id).order_by(AgentAction.sequence).all()
-    assert [action.status for action in actions] == ["succeeded", "succeeded"]
+    assert PersistentTaskRuntime(db_session, agent_executor=agent).run(task.id)["status"] == "partial"
+    edited = Path(task.task_state["worktree_path"]) / target.relative_to(source)
+    assert edited.read_text(encoding="utf-8") == "patched"
+    assert target.read_text(encoding="utf-8") == "original"
     assert db_session.query(ApprovalRequest).filter_by(task_id=task.id).count() == 0
-    candidate = selfdev_slots.base_dir / "B" / "app"
-    for target in targets:
-        assert (active / target).read_text(encoding="utf-8") == "original"
-        assert (candidate / target).read_text(encoding="utf-8") == "patched"
-
-
-def test_worker_selfdev_executes_candidate_tests_repairs_and_passes_real_gate(
-    db_session, selfdev_slots, monkeypatch,
-) -> None:
-    import shutil
-    from types import SimpleNamespace
-
-    from aiive.control import capability_broker
-    from aiive.core import llm_client
-    from aiive.eval import gate
-    from aiive.selfdev.repair_guard import RepairJournal, default_state_dir
-    from aiive.supervisor.slot_manager import read_candidate_state
-
-    active = selfdev_slots.active_app_root()
-    repo = Path(__file__).resolve().parents[3]
-    shutil.copytree(repo / "backend" / "aiive", active / "backend" / "aiive", ignore=shutil.ignore_patterns("__pycache__"))
-    target = "backend/aiive/worker_repair_probe.py"
-    (active / target).write_text("VALUE = 0\n", encoding="utf-8")
-    fixture_test = active / "tests" / "unit" / "backend" / "test_health.py"
-    fixture_test.parent.mkdir(parents=True)
-    fixture_test.write_text(
-        "from aiive.worker_repair_probe import VALUE\n\n"
-        "def test_repair_probe():\n    assert VALUE == 2, 'worker repair probe mismatch'\n",
-        encoding="utf-8",
-    )
-    calls = []
-
-    class PlannerLLM:
-        def chat(self, messages, **kwargs):
-            calls.append(messages[0]["content"])
-            return SimpleNamespace(content=json.dumps({"operations": [{
-                "operation": "modify_file", "target_file": target, "content": f"VALUE = {len(calls)}\n",
-            }]}))
-
-    monkeypatch.setattr(llm_client, "default_llm_client", lambda: PlannerLLM())
-    monkeypatch.setattr(capability_broker, "SELFDEV_HEARTBEAT_SECONDS", 0)
-    renewals = []
-    renew_run = TaskRepository.renew_run
-
-    def renew(self, run, *, lease_seconds=180):
-        renewals.append(lease_seconds)
-        return renew_run(self, run, lease_seconds=lease_seconds)
-
-    monkeypatch.setattr(TaskRepository, "renew_run", renew)
-    evaluate = gate.evaluate_promotion_gate
-    monkeypatch.setattr(gate, "evaluate_promotion_gate", lambda candidate: evaluate(candidate, persist=False))
-    task = _task(db_session, _thread(db_session), task_type="self_improvement", task_brief={})
-    action = ActionProposal(decision="action", capability_id="run_selfdev_repair", arguments={
-        "goal": "Repair worker_repair_probe.py", "files": [target], "max_rounds": 1,
-    })
-    agent = SequenceAgent(action, ActionProposal(decision="finish", summary="candidate ready"))
-
-    result = PersistentTaskRuntime(db_session, agent_executor=agent).run(task.id)
-
-    assert result["status"] == "succeeded"
-    stored = db_session.query(AgentAction).filter_by(task_id=task.id).one()
-    assert stored.status == "succeeded", stored.error_message
-    assert not stored.requires_approval
-    assert db_session.query(ApprovalRequest).filter_by(task_id=task.id).count() == 0
-    assert renewals.count(900) > 1
-    assert len(calls) == 2 and "VALUE = 0" in calls[0] and "worker repair probe mismatch" in calls[1]
-    assert (active / target).read_text(encoding="utf-8") == "VALUE = 0\n"
-    candidate = selfdev_slots.base_dir / "B"
-    assert (candidate / "app" / target).read_text(encoding="utf-8") == "VALUE = 2\n"
-    candidate_state = read_candidate_state(candidate)
-    assert candidate_state["promotable"] and candidate_state["gate_ok"]
-    record = RepairJournal(default_state_dir(selfdev_slots) / "runs").read(stored.id)
-    assert record["status"] == "tests_passed" and "tests_failed" in record["phases"]
-    assert selfdev_slots.get_active_slot() == "A"
-    broker = CapabilityBroker(db_session)
-    assert broker.prepare(task, "promote_slot", {}).decision.outcome == "approval"
-    assert broker.prepare(task, "rollback_slot", {}).decision.outcome == "approval"
-    assert broker.prepare(task, "run_selfdev_repair", {"promote": True}).decision.outcome == "approval"
 
 
 def test_explicit_git_worktree_isolation_rewrites_task_scope(db_session, tmp_path, monkeypatch) -> None:

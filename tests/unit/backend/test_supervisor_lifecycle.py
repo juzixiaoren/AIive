@@ -177,7 +177,7 @@ def test_promote_switches_real_process_and_keeps_state_consistent(make_superviso
     assert "candidate_healthy" in kinds
     assert "switch_completed" in kinds
 
-    release_state = json.loads((tmp_path / "release_state.json").read_text(encoding="utf-8"))
+    release_state = json.loads((supervisor.slots.runtime_dir / "release_state.json").read_text(encoding="utf-8"))
     assert release_state["active_slot"] == "B"
     assert release_state["status"] == "monitoring"
     request_id = state["promotion_request_id"]

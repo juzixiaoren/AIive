@@ -72,7 +72,8 @@ class WorkerFunctions:
             properties = {"arguments": arguments, **{
                 key: deepcopy(fields[key]) for key in ("effects", "summary", "progress_draft")
             }}
-            if {"path", "source", "file_path"}.intersection(arguments.get("properties", {})):
+            if (definition.get("writes_external_world") and capability_id not in {"edit_file", "write_file"}
+                    and {"path", "source", "file_path"}.intersection(arguments.get("properties", {}))):
                 properties["preconditions"] = FilePreconditions.model_json_schema()
             schema = {"type": "object", "additionalProperties": False, "required": ["arguments"],
                       "properties": properties}

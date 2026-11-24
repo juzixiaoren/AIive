@@ -47,7 +47,7 @@ def request_cancel(execution_id: str) -> CancelResult:
 def cancellation_requested(context: ToolExecutionContext) -> bool:
     """Read persistent intent in a fresh execution-thread session, never a caller Session."""
     run = context.run_context
-    if run is None:
+    if run is None or not (run.task_id or run.turn_record_id):
         return context.cancellation.requested
     from aiive.db.base import SessionLocal
     from aiive.db.models import AgentTask, TurnRecord
@@ -266,6 +266,10 @@ class ToolExecutor:
             return validation.error_payload(capability_id)
         arguments = validation.validated_params
         timeout = tool.safety.timeout_seconds or DEFAULT_TOOL_TIMEOUT
+        if capability_id == "run_shell" and not arguments.get("background"):
+            from aiive.tools.local_shell import shell_timeout
+
+            timeout = shell_timeout(arguments.get("timeout_seconds")) + 45
         context = ToolExecutionContext(
             capability_id,
             run_context,
@@ -320,6 +324,9 @@ class ToolExecutor:
             require_execution_authorization,
         )
 
+        if tool.safety.capability_id == "run_shell" and not arguments.get("background"):
+            # The command owns its deadline; settle the action after process-tree cleanup.
+            timeout = None
         managed_deadline = isinstance(tool, DeadlineManagedTool)
 
         def check_cancel() -> None:

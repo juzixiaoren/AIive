@@ -142,12 +142,16 @@ class ProcessController:
         command = self.command_for(slot=slot, slot_root=slot_root, port=port)
         self._paths.ensure()
         log_path = self._paths.logs_dir / f"{slot}-{port}.log"
-        env = dict(os.environ)
+        from aiive.project_paths import slot_environment
+        from aiive.supervisor.slot_manager import SlotManager
+
+        manager = SlotManager()
+        env = {**os.environ, **slot_environment(backend_dir.parent, slot, slots=slot_root.parent,
+                                                runtime=manager.runtime_dir)}
         env.update({
             "HOST": self._host,
             "PORT": str(port),
             "PYTHONUNBUFFERED": "1",
-            "PYTHONPATH": str(backend_dir),
             "AIIVE_MANAGED_BY_SUPERVISOR": "1",
             "AIIVE_PROCESS_ROLE": role,
             "AIIVE_SLOT": slot,

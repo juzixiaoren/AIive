@@ -94,6 +94,9 @@ class PromptRegistry:
             content=content,
         )
 
+    def resource_path(self, prompt_id: str) -> str:
+        return str(self._root.joinpath(self._loaded[prompt_id].spec.file))
+
     def audit_refs(self) -> tuple[str, ...]:
         return tuple(
             f"{item.spec.prompt_id}@{item.spec.version}#{item.sha256[:12]}"

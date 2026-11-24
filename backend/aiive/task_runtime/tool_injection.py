@@ -7,9 +7,9 @@ from typing import Any
 
 from aiive.tool_discovery import DEFAULT_LIMIT, MAX_LIMIT, MAX_QUERY_CHARS
 from aiive.tools.registry import ToolRegistry
-from aiive.task_runtime.router import SELFDEV_CAPABILITIES, SELFDEV_TASK_TYPES
+from aiive.task_runtime.router import CODING_CAPABILITIES, CODING_TASK_TYPES, SELFDEV_CAPABILITIES, SELFDEV_TASK_TYPES
 
-# L0 常驻入口：长期记忆读取、基础搜索、Bash（桌面节点在线时才有该能力）、
+# L0 常驻入口：长期记忆读取、基础搜索、本机 Bash 和可用的桌面能力、
 # 任务管理。常驻只代表入口始终可见，不代表执行授权——网络、路径、密钥、
 # 审批与策略仍由 CapabilityBroker / TaskPolicyEngine 判定。
 WORKER_RESIDENT_CAPABILITIES: tuple[str, ...] = (
@@ -40,9 +40,11 @@ MAX_LOADED_DEFINITIONS = 6
 STATE_KEY = "tool_discovery"
 
 
-def worker_resident_ids(task_type: str) -> tuple[str, ...]:
+def worker_resident_ids(task_type: str, *, has_workspace: bool = False) -> tuple[str, ...]:
     if task_type in SELFDEV_TASK_TYPES:
-        return (*SELFDEV_CAPABILITIES, "read_text_file", *WORKER_RESIDENT_CAPABILITIES)
+        return (*CODING_CAPABILITIES, *SELFDEV_CAPABILITIES, *WORKER_RESIDENT_CAPABILITIES)
+    if has_workspace or task_type in CODING_TASK_TYPES:
+        return (*CODING_CAPABILITIES, *WORKER_RESIDENT_CAPABILITIES)
     return WORKER_RESIDENT_CAPABILITIES
 
 

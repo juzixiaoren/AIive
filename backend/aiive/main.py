@@ -118,9 +118,12 @@ def _ensure_schema():
     env_ini = os.environ.get("ALEMBIC_INI_PATH")
     if env_ini:
         candidates.append(Path(env_ini))
-    candidates.append(Path("/app/alembic.ini"))
-    candidates.append(Path.cwd() / "alembic.ini")
-    candidates.append(Path(__file__).resolve().parent.parent.parent / "alembic.ini")
+    from aiive.project_paths import source_root
+
+    runtime_app = os.environ.get("AIIVE_RUNTIME_APP_ROOT")
+    if runtime_app:
+        candidates.append(Path(runtime_app) / "alembic.ini")
+    candidates.append(source_root() / "alembic.ini")
 
     ini_path = next((p for p in candidates if p.exists()), None)
     if ini_path is None:
@@ -216,6 +219,18 @@ def create_app() -> FastAPI:
         try:
             from aiive.prompts import validate_prompt_catalog
             validate_prompt_catalog()
+            loaded_slot = os.environ.get("AIIVE_SLOT")
+            if loaded_slot:
+                from aiive.project_paths import runtime_identity
+                from aiive.supervisor.slot_manager import SlotManager
+
+                manager = SlotManager()
+                manifest = next((item.manifest for item in manager.list_slots() if item.name == loaded_slot), {})
+                if manifest.get("source_snapshot"):
+                    identity = runtime_identity()
+                    if any(identity[key] != manifest[key] for key in
+                           ("prompt_catalog_sha256", "stable_contract_audit_ref")):
+                        raise RuntimeError("slot_prompt_catalog_mismatch")
         except Exception:
             logger.exception("Prompt 目录校验失败，阻断启动")
             raise

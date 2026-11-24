@@ -11,6 +11,8 @@ import json
 import logging
 import os
 import shutil
+
+from aiive.project_paths import runtime_root, slots_root
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
@@ -18,21 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-# 仓库根：本文件位于 backend/aiive/supervisor/slot_manager.py
-# parents[3] = supervisor -> aiive -> backend -> 仓库根（与 manifest excludes
-# 中 slots/、runtime/ 的相对目录约定一致，且已被 .gitignore 覆盖）
-_APP_ROOT = Path(__file__).resolve().parents[3]
-_REPO_ROOT = (
-    _APP_ROOT.parents[2]
-    if _APP_ROOT.name == "app" and _APP_ROOT.parent.name in {"A", "B"}
-    and _APP_ROOT.parent.parent.name == "slots"
-    else _APP_ROOT
-)
-# 槽位根目录
-SLOTS_ROOT = _REPO_ROOT / "slots"
-# 活跃槽位标记文件
-ACTIVE_SLOT_FILE = _REPO_ROOT / "runtime" / "active_slot"
-
+SLOTS_ROOT = slots_root()
+ACTIVE_SLOT_FILE = runtime_root() / "active_slot"
 
 @dataclass
 class SlotInfo:
@@ -54,8 +43,8 @@ class SlotManager:
         参数:
             base_dir: 槽位基础目录，默认使用 SLOTS_ROOT。
         """
-        self._base_dir: Path = base_dir or SLOTS_ROOT
-        self._active_file: Path = base_dir.parent / "runtime" / "active_slot" if base_dir else ACTIVE_SLOT_FILE
+        self._base_dir: Path = base_dir.resolve() if base_dir else slots_root()
+        self._active_file: Path = base_dir.parent / "runtime" / "active_slot" if base_dir else runtime_root() / "active_slot"
 
     @property
     def base_dir(self) -> Path:

@@ -48,6 +48,7 @@ def _summary(
 
 
 FULL_OBSERVATION_TOOLS = frozenset({
+    "read_file", "run_shell", "shell_session", "run_selfdev_repair",
     "read_attachment", "list_thread_attachments", "record_attachment_progress",
     "list_task_files", "read_task_artifact", "read_task_evidence",
     "read_document", "read_knowledge_chunk",
@@ -84,7 +85,7 @@ class EvidenceStore:
         if not references_visible(db, grouped):
             raise ValueError("forget_source_blocked")
         result = result if isinstance(result, dict) else {"value": result}
-        if action.capability_id == "run_shell":
+        if action.capability_id in {"run_shell", "shell_session"}:
             result = self._capture_shell_logs(db, task_id, action, result)
         data = _json_bytes(result)
         digest = hashlib.sha256(data).hexdigest()
@@ -136,14 +137,14 @@ class EvidenceStore:
             "content_size": evidence.content_size,
         }
         shell_result = result.get("result", result.get("details", result))
-        if action.capability_id == "run_shell" and isinstance(shell_result, dict) and shell_result.get("output_artifacts"):
+        if action.capability_id in {"run_shell", "shell_session"} and isinstance(shell_result, dict) and shell_result.get("output_artifacts"):
             summary["output_artifacts"] = shell_result["output_artifacts"]
         if action.capability_id in {"promote_slot", "run_selfdev_repair"} and isinstance(shell_result, dict):
             promotion = shell_result.get("promotion") if action.capability_id == "run_selfdev_repair" else shell_result
             if isinstance(promotion, dict):
                 if promotion.get("status") == "switch_requested" and promotion.get("request_id"):
                     summary["promotion_request_id"] = promotion["request_id"]
-                elif promotion.get("ok") and promotion.get("release_status") == "monitoring":
+                elif promotion.get("ok") and promotion.get("release_status") in {"monitoring", "restart_required"}:
                     summary["deployment_confirmation_required"] = True
         action.result_summary = summary
         self._capture_declared_artifacts(db, task_id, action, result)

@@ -194,3 +194,29 @@ class TestSelfDevPlanner:
         ops = db_session.query(PatchOperation).filter(PatchOperation.request_id == req.id).all()
         assert len(ops) == 1
         assert ops[0].not_allowed_yet is True
+
+
+def test_project_reader_discovers_runtime_hidden_paths_and_pages(tmp_path):
+    from aiive.selfdev.project_reader import ProjectReader
+
+    runtime = tmp_path / "backend" / "aiive" / "runtime" / "system_contract.py"
+    runtime.parent.mkdir(parents=True)
+    source = "def marker():\n    return '测试内容'\n" * 2
+    runtime.write_bytes(source.encode("utf-8"))
+    workflow = tmp_path / ".github" / "wrapped.mjs"
+    workflow.parent.mkdir()
+    workflow.write_text("export function marker() {}\n", encoding="utf-8")
+
+    reader = ProjectReader(tmp_path, max_file_bytes=5)
+    relative = runtime.relative_to(tmp_path).as_posix()
+    assert reader.search_paths("wrapped.mjs") == [".github/wrapped.mjs"]
+    assert reader.search_paths(relative) == [relative]
+    assert reader.search_symbols("marker")
+    assert reader.search(["wrapped.mjs"]) == []
+    offset = 0
+    pages = []
+    while offset is not None:
+        page = reader.read(relative, byte_offset=offset)
+        pages.append(page.content)
+        offset = page.next_byte_offset
+    assert "".join(pages) == source

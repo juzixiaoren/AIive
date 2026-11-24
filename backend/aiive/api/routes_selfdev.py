@@ -44,9 +44,9 @@ class RepairRequest(BaseModel):
     """自主修复闭环请求体。"""
 
     goal: str = Field(..., min_length=1)
-    max_rounds: int = Field(3, ge=0, le=5, description="测试失败后的最大修复轮次")
+    max_rounds: int = Field(3, ge=0, le=5, description="旧请求兼容字段，Worker 使用任务执行预算")
     promote: bool = Field(False, description="安全门通过后是否提交晋升（仍走 ReleaseManager）")
-    run_gate: bool = Field(True, description="是否在晋升前运行 Replay Eval + 内核契约")
+    run_gate: bool = Field(True, description="旧请求兼容字段，候选验证始终使用 SafetyGate")
     files: list[str] = Field(default_factory=list, description="可选的仓库相对路径提示")
 
 
@@ -71,6 +71,15 @@ def list_slots():
     """
     launcher = Launcher()
     return launcher.get_status()
+
+
+@router.get("/runtime")
+def loaded_runtime():
+    from aiive.project_paths import runtime_identity
+    from aiive.supervisor.slot_manager import SlotManager
+
+    manager = SlotManager()
+    return {**runtime_identity(), "active_slot_pointer": manager.get_active_slot()}
 
 
 @router.get("/supervisor")
@@ -147,41 +156,18 @@ def create_plan(request: PlanRequest, db: Session = Depends(get_db)):
     }
 
 
-@router.post("/repair")
+@router.post("/repair", status_code=202)
 def run_repair(
     request: RepairRequest,
     db: Session = Depends(get_db),
     _authorized: None = Depends(require_trusted_core_admin),
 ) -> dict[str, Any]:
-    """执行自主修复闭环并落库。
+    """Queue SelfDev on the persistent Worker and return its task ID."""
+    from aiive.task_runtime.router import enqueue_selfdev_task
 
-    流程：读取相关代码 → 生成补丁 → 应用到非活跃槽位 → 定向测试 →
-    失败时按真实错误有限次修复 → 安全门（内核契约 + Replay Eval）→
-    可选受控晋升（仍由 ReleaseManager / Supervisor 执行健康检查与回滚）。
-
-    所有代码修改只进入非活跃槽位；未通过测试或安全门的候选版本不会晋升。
-
-    并发：同一项目同一时间只允许一个修复流程。已有修复在跑时不排队、不覆盖，
-    直接返回 ``status="repair_busy"``（ok=False，``lock.holder`` 给出持有者），
-    调用方可稍后重试。中断恢复：上一次运行若在任意阶段被强杀，本次调用会先
-    按运行日志把候选槽位回滚到基线（或显式隔离），再开始新一轮。
-    """
-    from aiive.selfdev.repair_loop import SelfDevRepairLoop, persist_repair_run
-
-    trace = Trace.new()
-    loop = SelfDevRepairLoop(
-        llm_client=_build_llm_client(),
-        max_rounds=request.max_rounds,
-    )
-    record = loop.run(
-        request.goal,
-        trace_id=trace.trace_id,
-        files=request.files or None,
-        promote=request.promote,
-        run_gate=request.run_gate,
-    )
-    persist_repair_run(db, record)
-    return record
+    task = enqueue_selfdev_task(db, request.goal, files=request.files, promote=request.promote)
+    db.commit()
+    return {"ok": True, "status": task.status, "task_id": task.id}
 
 
 # ===================== V45: 运行证据驱动的改进候选 =====================
@@ -229,11 +215,7 @@ def accept_improvement_candidate(
     db: Session = Depends(get_db),
     _authorized: None = Depends(require_trusted_core_admin),
 ) -> dict[str, Any]:
-    """接受候选：作为明确目标接入既有 SelfDevRepairLoop。
-
-    仍然走既有的读码→补丁→定向测试→安全门流程，只改非活跃槽位；
-    本接口固定不晋升（promote=False），晋升仍需显式调用 /{request_id}/promote。
-    """
+    """Queue the accepted improvement with its evidence and acceptance criteria."""
     from aiive.selfdev.improvement_discovery import (
         CandidateNotFound,
         CandidateStateError,

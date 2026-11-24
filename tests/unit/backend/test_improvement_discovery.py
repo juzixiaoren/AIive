@@ -23,7 +23,6 @@ from aiive.selfdev.improvement_discovery import (
     CandidateNotFound,
     CandidateStateError,
     ImprovementDiscovery,
-    _default_repair_runner,
     dedupe_key_for,
 )
 from aiive.selfdev.improvement_evidence import EvidenceCollector
@@ -397,23 +396,20 @@ def test_repair_rows_are_not_listed_as_candidates(db_session, tmp_path) -> None:
         ImprovementDiscovery.get_candidate(db_session, "not-a-candidate")
 
 
-def test_default_repair_runner_never_promotes(monkeypatch) -> None:
-    captured: dict = {}
+def test_accept_queues_worker_with_candidate_evidence(db_session, tmp_path) -> None:
+    from aiive.db.models import AgentTask
 
-    class FakeLoop:
-        def __init__(self, *args, **kwargs) -> None:
-            captured["init"] = kwargs
-
-        def run(self, goal, **kwargs):
-            captured["run"] = {"goal": goal, **kwargs}
-            return {"run_id": "r"}
-
-    monkeypatch.setattr("aiive.selfdev.repair_loop.SelfDevRepairLoop", FakeLoop)
-
-    _default_repair_runner("目标", trace_id="t")
-
-    assert captured["run"]["promote"] is False
-    assert captured["run"]["run_gate"] is True
+    ids = _seed_failures(db_session)
+    discovery = _discovery(ScriptedLLM(_response([_candidate(ids)])), tmp_path)
+    candidate_id = discovery.run(db=db_session, now=_now())["candidate_ids"][0]
+    result = discovery.accept(db_session, candidate_id)
+    task = db_session.get(AgentTask, result["task_id"])
+    assert task.status == "queued" and task.task_type == "selfdev"
+    assert task.task_brief["acceptance_criteria"]
+    initial = task.task_brief["initial_input"]
+    assert initial["improvement_candidate_id"] == candidate_id
+    assert initial["improvement_evidence"]["acceptance_criteria"]
+    assert initial["promote_requested"] is False
 
 
 def test_accept_endpoint_requires_trusted_core_admin() -> None:

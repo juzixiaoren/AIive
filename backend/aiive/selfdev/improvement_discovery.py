@@ -14,7 +14,7 @@ status 使用 candidate_* 前缀与修复运行的 failed/applied 等状态区�
 plan["candidate"] 保存候选正文与证据，plan["decision"] 保存接受/拒绝结果。
 
 本模块不修改代码、不晋升、不触碰活跃槽位：接受候选只是把候选变成
-SelfDevRepairLoop 的明确目标，其余权限与安全门全部沿用既有实现。
+Worker SelfDev 任务的明确目标，其余权限与安全门全部沿用既有实现。
 """
 from __future__ import annotations
 
@@ -675,7 +675,7 @@ class ImprovementDiscovery:
         trace_id: str | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
-        """接受候选：把它作为明确目标交给既有 SelfDevRepairLoop（不自动晋升）。"""
+        """接受候选并将其目标与验证标准交给 Worker。"""
         now = _as_utc(now) or _utcnow()
         row = db.get(SelfDevRequest, candidate_id)
         if row is None or not is_candidate_row(row):
@@ -687,9 +687,22 @@ class ImprovementDiscovery:
         if not goal:
             raise CandidateStateError("candidate_goal_missing")
 
-        runner = repair_runner or _default_repair_runner
-        record = runner(goal, trace_id=trace_id or row.trace_id)
+        if repair_runner is None:
+            from aiive.task_runtime.router import enqueue_selfdev_task
 
+            task = enqueue_selfdev_task(
+                db, goal, acceptance_criteria=payload.get("acceptance_criteria"),
+                initial_input={"improvement_candidate_id": candidate_id, "improvement_evidence": payload},
+            )
+            row.status = CANDIDATE_STATUS_ACCEPTED
+            row.plan = {**(row.plan or {}), "decision": {
+                "status": "accepted", "decided_at": now.isoformat(), "task_id": task.id, "promote": False,
+            }}
+            db.commit()
+            return {"candidate_id": candidate_id, "status": row.status, "goal": goal,
+                    "task_id": task.id, "repair": {"status": task.status, "task_id": task.id}}
+
+        record = repair_runner(goal, trace_id=trace_id or row.trace_id)
         from aiive.selfdev.repair_loop import persist_repair_run
 
         plan = dict(row.plan or {})
@@ -824,11 +837,3 @@ def _parse_iso(value: Any) -> datetime | None:
         return datetime.fromisoformat(value)
     except ValueError:
         return None
-
-
-def _default_repair_runner(goal: str, *, trace_id: str | None = None) -> dict[str, Any]:
-    """默认修复执行器：既有闭环，显式关闭自动晋升。"""
-    from aiive.selfdev.repair_loop import SelfDevRepairLoop
-
-    loop = SelfDevRepairLoop()
-    return loop.run(goal, trace_id=trace_id, promote=False, run_gate=True)

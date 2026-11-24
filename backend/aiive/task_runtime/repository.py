@@ -198,15 +198,26 @@ class TaskRepository:
             if not references_visible(self.db, {"turn_record": [source_turn_record_id]}):
                 raise ValueError("task_source_unavailable")
         # ``goal`` 是 API/Meta Tool 的权威用户输入，不能被 task_brief 内同名字段覆盖。
-        from aiive.task_runtime.router import normalize_task_brief, SELFDEV_TASK_TYPES
+        from aiive.task_runtime.router import normalize_task_brief, CODING_TASK_TYPES
 
         task_type = task_type.strip() or "general"
         raw_brief = dict(task_brief or {})
-        if task_type in SELFDEV_TASK_TYPES:
+        if task_type in CODING_TASK_TYPES:
             raw_brief = normalize_task_brief(task_type, raw_brief)
         brief = TaskBrief.model_validate({**raw_brief, "goal": goal})
         from aiive.runtime.attachment_access import validate_task_attachments
         authorized_attachments = validate_task_attachments(self.db, thread_id, brief.initial_input or {})
+        if task_type in CODING_TASK_TYPES or brief.scope.isolation_mode == "git_worktree":
+            from aiive.config import settings
+
+            budgets = {
+                "max_actions": settings.aiive_coding_max_actions,
+                "max_model_calls": settings.aiive_coding_max_model_calls,
+                "max_runs": settings.aiive_coding_max_runs,
+                "max_tool_failures": settings.aiive_coding_max_tool_failures,
+                "max_total_tokens": settings.aiive_coding_max_total_tokens,
+                **{key: value for key, value in (budgets or {}).items() if value is not None},
+            }
         budget = TaskBudget.for_new_task(budgets)
         from aiive.task_runtime.router import select_executor_type
 
@@ -697,6 +708,10 @@ class TaskRepository:
             ApprovalRequest.decided_at: utcnow(),
             ApprovalRequest.completed_at: utcnow(),
         }, synchronize_session=False)
+        if (task.task_state or {}).get("worktree_path"):
+            from aiive.tools.shell_sessions import cancel_task_sessions
+
+            cancel_task_sessions(task.id)
         self.checkpoint(task.id, reason="cancelled")
         return task
 

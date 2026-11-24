@@ -45,6 +45,7 @@ class DelegateTaskTool(BaseTool):
         allow_network: bool | None = None,
         allow_secrets: bool = False,
         isolation_mode: str = "shared",
+        env: dict[str, str | None] | None = None,
         deterministic_action: dict[str, Any] | None = None,
         target_node_id: str = "",
         budgets: dict[str, Any] | None = None,
@@ -67,7 +68,7 @@ class DelegateTaskTool(BaseTool):
                 scope={
                     "allowed_roots": allowed_roots or [], "allowed_capabilities": allowed_capabilities or [],
                     "allowed_hosts": allowed_hosts or [], "allow_network": bool(allow_network),
-                    "allow_secrets": allow_secrets, "isolation_mode": isolation_mode,
+                    "allow_secrets": allow_secrets, "isolation_mode": isolation_mode, "env": env or {},
                 },
             )
         selected_skill = None
@@ -104,6 +105,7 @@ class DelegateTaskTool(BaseTool):
                 ),
                 "allow_secrets": allow_secrets,
                 "isolation_mode": isolation_mode,
+                "env": env or {},
             },
             "initial_input": {
                 "attachment_ids": attachment_ids if attachment_ids is not None else [],
@@ -425,7 +427,7 @@ def build_main_agent_registry() -> ToolRegistry:
         {
             "goal": {"type": "str", "required": True, "minLength": 1},
             "task_type": {"type": "str", "default": "general",
-                          "description": "修改 AIive 自身代码用 self_improvement，自动授权活跃槽位读取并注入 SelfDev 工具。"},
+                          "description": "一般编程用 coding，修改 AIive 自身用 self_improvement。两者自动创建独立工作区。"},
             "skill_id": {
                 "type": "str",
                 "description": "可选内置 Skill ID；先用 list_skills 查询。",
@@ -454,6 +456,7 @@ def build_main_agent_registry() -> ToolRegistry:
                 "type": "str", "enum": ["shared", "git_worktree"], "default": "shared",
                 "description": "代码任务可显式要求独立 Git worktree",
             },
+            "env": {"type": "dict", "description": "当前代码任务的 Bash 环境变量覆盖，null 表示移除"},
             "deterministic_action": {
                 "schema": deterministic_schema,
                 "type": "dict",

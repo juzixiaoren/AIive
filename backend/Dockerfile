@@ -1,6 +1,11 @@
+FROM node:22-bookworm-slim AS node_runtime
 FROM python:3.12-slim
 
 WORKDIR /app
+ENV AIIVE_SOURCE_ROOT=/app AIIVE_SLOTS_ROOT=/app/.data/slots AIIVE_RUNTIME_DIR=/app/.data/runtime
+COPY --from=node_runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=node_runtime /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm
 
 # 构建期镜像源：默认国内镜像（本地与国内服务器），CI 用 build-arg 切到官方源。
 # 境外 runner 访问国内镜像会因跨境网络超时导致 docker compose build 失败。
@@ -14,16 +19,24 @@ RUN if [ "$APT_MIRROR" != "deb.debian.org" ]; then \
             /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true; \
     fi; \
     apt-get update && apt-get install -y --no-install-recommends \
-    build-essential gcc curl \
+    build-essential gcc curl bash git ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
 # 先复制依赖声明与迁移文件，最大化利用 Docker 层缓存
 COPY pyproject.toml ./
 COPY backend ./backend
 COPY alembic.ini ./
+COPY frontend ./frontend
+COPY apps ./apps
+COPY tests ./tests
+COPY scripts ./scripts
+COPY deploy ./deploy
+COPY shared ./shared
+COPY .github ./.github
+COPY .gitignore .dockerignore docker-compose.yml ./
 
 # 安装依赖（默认腾讯云 PyPI 镜像加速，适配国内服务器）
-RUN pip install --no-cache-dir -i "$PIP_INDEX_URL" .
+RUN pip install --no-cache-dir -i "$PIP_INDEX_URL" ".[dev]"
 
 # pydantic-settings 默认会读取 .env；放一个空文件消除告警。
 # 真实密钥由 compose 的 env_file 以环境变量形式注入，不会写进镜像层。
@@ -31,4 +44,4 @@ RUN : > /app/.env
 
 EXPOSE 8000
 
-CMD ["uvicorn", "aiive.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "aiive.supervisor.standalone", "--host", "0.0.0.0", "--port", "8000"]

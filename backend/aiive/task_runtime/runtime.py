@@ -1,9 +1,10 @@
 """Persistent Task Runtime：每次 wake 创建 AgentRun，并推进有界 Action 循环。"""
 from __future__ import annotations
 
-import logging
-import json
 import hashlib
+import json
+import logging
+import subprocess
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -47,6 +48,7 @@ from aiive.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 NO_PROGRESS_LIMIT = 3
+CODING_NO_PROGRESS_LIMIT = 8
 
 
 def action_outcome(result: dict[str, Any]) -> str:
@@ -89,7 +91,7 @@ class PersistentTaskRuntime:
         if candidate is not None and candidate.status == TaskStatus.QUEUED.value:
             budget = TaskBudget.from_stored(candidate.budgets)
             pending_report = (candidate.task_state or {}).get("pending_report")
-            already_stalled = len((candidate.task_state or {}).get("no_progress") or []) >= NO_PROGRESS_LIMIT
+            already_stalled = len((candidate.task_state or {}).get("no_progress") or []) >= self._progress_limit(candidate)
             if budget.max_runs is not None and int((candidate.usage or {}).get("runs", 0)) >= budget.max_runs:
                 initial_budget_issue = "run_budget_exhausted"
             else:
@@ -109,7 +111,11 @@ class PersistentTaskRuntime:
         if initial_budget_issue:
             return self._stop_for_budget(task, run, initial_budget_issue)
         task.task_brief = with_selfdev_scope(task.task_type, task.task_brief or {})
-        self._ensure_isolation(task, run)
+        try:
+            self._ensure_isolation(task, run)
+        except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            return self._complete(task, run, status="failed", summary="无法创建任务工作区。",
+                                  unresolved=[str(exc)], stop_reason="workspace_unavailable")
         self.db.commit()
         budget = TaskBudget.from_stored(task.budgets)
 
@@ -175,7 +181,7 @@ class PersistentTaskRuntime:
             available = broker.available_registry(task)
             catalog = available.catalog()
             entries = {item["capability_id"]: item for item in catalog}
-            resident = [entries[key] for key in worker_resident_ids(task.task_type) if key in entries]
+            resident = [entries[key] for key in worker_resident_ids(task.task_type, has_workspace=bool((task.task_state or {}).get("worktree_path"))) if key in entries]
             deterministic = self._deterministic_proposal(task)
             if int((task.usage or {}).get("model_calls", 0)) == 0:
                 brief = task.task_brief or {}
@@ -355,6 +361,8 @@ class PersistentTaskRuntime:
                 completed_this_run += 1
                 continue
 
+            if proposal.decision == "finish" and proposal.report_status == "succeeded":
+                proposal = self._verify_selfdev_delivery(task, proposal)
             if proposal.decision == "finish":
                 if goals is None:
                     return self._finish_report(task, run, {
@@ -517,13 +525,23 @@ class PersistentTaskRuntime:
         })
 
     @staticmethod
+    def _progress_limit(task: AgentTask) -> int:
+        from aiive.task_runtime.router import CODING_TASK_TYPES
+
+        scope = (task.task_brief or {}).get("scope") or {}
+        coding = task.task_type in CODING_TASK_TYPES or scope.get("isolation_mode") == "git_worktree"
+        return CODING_NO_PROGRESS_LIMIT if coding else NO_PROGRESS_LIMIT
+
+    @staticmethod
     def _record_outcome(
         task: AgentTask, outcome: str, subject: str, reason: str, *, progress: bool = False,
     ) -> None:
         state = dict(task.task_state or {})
         recent = state.get("no_progress") or []
+        if progress:
+            state.pop("workspace_observations", None)
         state["no_progress"] = [] if progress else [
-            *recent[-(NO_PROGRESS_LIMIT - 1):], f"{outcome}:{subject}:{reason}"[:600],
+            *recent[-(PersistentTaskRuntime._progress_limit(task) - 1):], f"{outcome}:{subject}:{reason}"[:600],
         ]
         task.task_state = state
         if outcome in {"policy_denied", "capability_unavailable", "execution_failed",
@@ -534,10 +552,10 @@ class PersistentTaskRuntime:
 
     def _stop_if_stalled(self, task: AgentTask, run: AgentRun) -> dict[str, Any] | None:
         recent = (task.task_state or {}).get("no_progress") or []
-        if len(recent) < NO_PROGRESS_LIMIT:
+        if len(recent) < self._progress_limit(task):
             return None
         return self._complete(
-            task, run, status="partial", summary="连续三步未取得进展，任务已终止。",
+            task, run, status="partial", summary=f"连续 {self._progress_limit(task)} 步未取得进展，任务已终止。",
             unresolved=recent, stop_reason="no_progress",
             model=run.model, token_usage=run.token_usage,
         )
@@ -759,8 +777,32 @@ class PersistentTaskRuntime:
         action = refreshed_action
         outcome = action_outcome(result)
         error_type = str(result.get("error_type", ""))
+        if action.capability_id == "run_selfdev_repair":
+            stage = result.get("result") or result.get("details") or {}
+            if stage.get("workspace_hash"):
+                task.task_state = {**(task.task_state or {}), "workspace_delivery": {
+                    "hash": stage["workspace_hash"], "verified": outcome == "succeeded",
+                }}
         if outcome == "succeeded":
-            self._record_outcome(task, outcome, action.capability_id, "", progress=True)
+            if not (task.task_state or {}).get("worktree_path"):
+                self._record_outcome(task, outcome, action.capability_id, "", progress=True)
+            else:
+                payload = result.get("result") or {}
+                changed = isinstance(payload, dict) and (
+                    payload.get("changed") is True
+                    or (action.capability_id in {"run_selfdev_repair", "promote_slot"} and payload.get("ok") is True)
+                )
+                if changed:
+                    self._record_outcome(task, outcome, action.capability_id, "", progress=True)
+                else:
+                    # New observations are neutral. Only actual changes clear the streak.
+                    state = dict(task.task_state or {})
+                    seen = state.get("workspace_observations") or []
+                    key = f"{action.capability_id}:{action.arguments_hash}"
+                    if key in seen:
+                        self._record_outcome(task, "repeated_observation", action.capability_id, "")
+                    else:
+                        task.task_state = {**state, "workspace_observations": [*seen[-127:], key]}
             evidence = self.evidence.capture_result(
                 self.db, task_id=task.id, run_id=run.id, action=action, result=result,
             )
@@ -1053,14 +1095,25 @@ class PersistentTaskRuntime:
             return
         state = dict(task.task_state or {})
         if state.get("worktree_path"):
+            path = state["worktree_path"]
+            scope["allowed_roots"] = [path, *(root for root in scope.get("allowed_roots", [])
+                                              if root not in {path, state.get("source_repository")})]
+            task.task_brief = {**brief, "scope": scope}
             return
         roots = [str(value) for value in scope.get("allowed_roots", []) if value]
         if not roots:
             raise ValueError("git_worktree_requires_repository_root")
-        from aiive.task_runtime.worktree import WorktreeIsolation
+        from aiive.task_runtime.router import SELFDEV_TASK_TYPES
+        from aiive.task_runtime.workspace import create_workspace
 
         repository_root = Path(roots[0]).expanduser().resolve()
-        workspace = WorktreeIsolation(repository_root).create(task.id)
+        selfdev = task.task_type in SELFDEV_TASK_TYPES
+        try:
+            workspace, _ = create_workspace(task.id, repository_root, selfdev=selfdev)
+        except (OSError, subprocess.SubprocessError):
+            # A partial Git checkout can be reused on the next attempt.
+            logger.info("Retrying interrupted workspace creation for %s", task.id, exc_info=True)
+            workspace, _ = create_workspace(task.id, repository_root, selfdev=selfdev)
         scope["allowed_roots"] = [str(workspace), *roots[1:]]
         brief["scope"] = scope
         task.task_brief = brief
@@ -1074,6 +1127,30 @@ class PersistentTaskRuntime:
             visibility="task",
             run_id=run.id,
         )
+
+    @staticmethod
+    def _verify_selfdev_delivery(task: AgentTask, proposal: ActionProposal) -> ActionProposal:
+        from aiive.task_runtime.router import SELFDEV_TASK_TYPES
+        from aiive.task_runtime.workspace import changes, inventory, read_metadata, snapshot_hash
+
+        state = task.task_state or {}
+        if task.task_type not in SELFDEV_TASK_TYPES or not state.get("worktree_path"):
+            return proposal
+        workspace = Path(state["worktree_path"])
+        metadata = read_metadata(workspace)
+        files = inventory(workspace, git=metadata["git"])
+        if not changes(workspace, metadata, files):
+            return proposal
+        previous = state.get("workspace_delivery") or {}
+        if previous.get("hash") != snapshot_hash(files):
+            return ActionProposal(decision="action", capability_id="run_selfdev_repair",
+                                  arguments={"goal": task.goal}, summary="验证任务工作区并同步候选槽位")
+        if not previous.get("verified"):
+            return proposal.model_copy(update={
+                "report_status": "partial",
+                "unresolved": [*proposal.unresolved, "workspace_candidate_unverified"],
+            })
+        return proposal
 
     @staticmethod
     def _deterministic_proposal(task: AgentTask) -> ActionProposal | None:

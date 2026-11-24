@@ -31,7 +31,7 @@ class PatchExecutor:
         self._manager: SlotManager = manager or SlotManager()
 
     def apply_to_inactive(
-        self, operations: list[dict[str, Any]]
+        self, operations: list[dict[str, Any]], *, reuse_candidate: bool = False
     ) -> dict[str, Any]:
         """
         将活跃槽位的 manifest 和 app 目录复制到非活跃槽位，然后应用操作列表。
@@ -92,7 +92,8 @@ class PatchExecutor:
         # 总是得到 "active 基线 + 本次操作" 的确定结果）。
         # 与 CandidateSlotGuard.restore 共用同一份"整树同步"实现，
         # 保证"应用补丁"和"失败回滚"得到完全相同的基线语义。
-        sync_app_tree(src_app, dst_app)
+        if not reuse_candidate:
+            sync_app_tree(src_app, dst_app)
         dst_app_resolved = dst_app.resolve()
 
         # 第三步：逐一应用操作

@@ -281,6 +281,9 @@ def _agent_task_scanner_job() -> None:
 
         recover_stale_tasks(db)
         reconcile_queued_tasks(db)
+        from aiive.task_runtime.workspace import reap_workspaces
+
+        reap_workspaces(db)
         TaskApprovalService(db).expire_due()
         ResourceLockService().expire(db)
         WatcherService(db).poll_due()

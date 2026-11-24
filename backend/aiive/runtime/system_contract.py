@@ -52,3 +52,14 @@ def build_stable_contract(
             parts.append(f"- {p.get('content', '')}")
 
     return "\n".join(parts)
+
+
+def stable_contract_audit() -> dict[str, Any]:
+    registry = get_prompt_registry()
+    prompt = registry.render("agent.stable_contract")
+    return {
+        "stable_contract_resource": registry.resource_path(prompt.prompt_id),
+        "stable_contract_audit_ref": prompt.audit_ref,
+        "prompt_catalog_sha256": registry.catalog_sha256,
+        "system_prompt_order": [prompt.prompt_id, "runtime_identity", "active_policies", "core_memory"],
+    }

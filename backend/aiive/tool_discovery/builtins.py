@@ -9,7 +9,7 @@ _GROUPS = (
     ("task-files", "任务成果", "查找和读取当前任务的证据、成果与日志",
      ("list_task_files", "read_task_evidence", "read_task_artifact")),
     ("utilities", "后端实用工具", "获取当前时间、回显消息、运行后端命令或操作文件",
-     ("echo", "get_current_time", "run_shell", "safe_delete", "read_text_file")),
+     ("echo", "get_current_time", "run_shell", "shell_session", "read_file", "edit_file", "write_file", "apply_patch", "safe_delete", "read_text_file")),
     ("reminders", "提醒与通知", "创建、确认或取消提醒，管理通知和旧调度任务",
      ("schedule_reminder", "remind_alert", "confirm_reminder", "snooze_reminder",
       "list_reminders", "cancel_reminder", "list_tasks", "cancel_task",
@@ -25,7 +25,7 @@ _GROUPS = (
      ("search_mcp", "install_mcp_sandbox", "plan_capability")),
     ("selfdev", "AIive 维护", "维护 AIive 自身的补丁与部署槽位",
      ("create_selfdev_plan", "apply_patch_to_inactive_slot", "promote_slot",
-      "get_promotion_status", "rollback_slot", "run_selfdev_repair")),
+      "get_promotion_status", "get_runtime_identity", "rollback_slot", "run_selfdev_repair")),
     ("runtime-state", "运行状态", "查询节奏和注意力，记录工作状态",
      ("query_rhythm", "query_attention", "update_working_state")),
 )

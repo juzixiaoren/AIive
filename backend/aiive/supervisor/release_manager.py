@@ -13,7 +13,6 @@ from aiive.eval.gate import SafetyGate, evaluate_promotion_gate
 from aiive.supervisor.client import SupervisorClient
 from aiive.supervisor.health_probe import HealthProbe
 from aiive.supervisor.slot_manager import (
-    ACTIVE_SLOT_FILE,
     SlotManager,
     candidate_promotion_block,
     read_candidate_state,
@@ -47,7 +46,7 @@ class ReleaseManager:
     ) -> None:
         self._manager: SlotManager = manager or SlotManager()
         self._probe: HealthProbe = probe or HealthProbe()
-        self._state_file: Path = state_file or (ACTIVE_SLOT_FILE.parent / "release_state.json")
+        self._state_file: Path = state_file or (self._manager.runtime_dir / "release_state.json")
         self._monitor_seconds: int = max(60, monitor_seconds)
         # 闸门可注入（测试替身）；默认构造真实 SafetyGate。
         self._gate: SafetyGate = gate or SafetyGate()
@@ -66,6 +65,8 @@ class ReleaseManager:
             blocked = self._candidate_block(current)
             if blocked is not None:
                 return blocked
+            candidate_root = self._manager.base_dir / current
+            fingerprint = read_candidate_state(candidate_root).get("fingerprint")
             pre_switch_health = self._check_slot(current)
             if not pre_switch_health["healthy"]:
                 return {
@@ -90,6 +91,11 @@ class ReleaseManager:
                         "error": "Safety gate failed: promote blocked",
                         "gate": gate_result.to_summary(),
                     }
+            if (self._manager.get_active_slot() != previous or
+                    read_candidate_state(candidate_root).get("fingerprint") != fingerprint):
+                return {"ok": False, "error": "candidate_or_active_slot_changed"}
+            if blocked := self._candidate_block(current):
+                return blocked
             # Supervisor 托管：真正启动候选进程并验证，切换由守护进程完成。
             # 本进程随后会被替换，因此只提交请求并返回 accepted，不等待结果。
             if self._client is not None:
@@ -97,7 +103,8 @@ class ReleaseManager:
                     return {"ok": False, "error": "supervisor_unavailable", "previous_active": previous}
                 accepted = self._client.submit(
                     "promote",
-                    {"target": current, "gate_ok": bool(run_gate)},
+                    {"target": current, "gate_ok": bool(run_gate),
+                     "fingerprint": fingerprint},
                     idempotency_key=str(uuid4()),
                 )
                 if not accepted.get("ok"):
@@ -123,12 +130,13 @@ class ReleaseManager:
                     "new_active": current,
                 }
 
+            manifest = self._manager._read_manifest(candidate_root)
             self._manager.set_active_slot(current)
             result = {"ok": True, "previous_active": previous, "new_active": current}
             now = _now()
             state: dict[str, Any] = {
                 "release_id": str(uuid4()),
-                "status": "monitoring",
+                "status": "restart_required" if manifest.get("source_snapshot") else "monitoring",
                 "previous_active": previous,
                 "active_slot": current,
                 "activated_at": now.isoformat(),
@@ -149,7 +157,8 @@ class ReleaseManager:
                 return {**result, "ok": False, "auto_rollback": rollback, "health": health}
             state["successful_checks"] = 1
             self._write_state(state)
-            return {**result, "release_id": state["release_id"], "release_status": "monitoring"}
+            return {**result, "release_id": state["release_id"], "release_status": state["status"],
+                    "status": "restart_required", "runtime_reloaded": False}
 
     def monitor_once(self) -> dict[str, Any]:
         with _release_lock:
@@ -157,7 +166,7 @@ class ReleaseManager:
             if self._client is not None and self._client.available():
                 # 守护进程负责进程级健康监测与自动回滚，应用侧不得重复干预。
                 return {"ok": True, "action": "supervised", "state": state}
-            if state.get("status") != "monitoring":
+            if state.get("status") not in {"monitoring", "restart_required"}:
                 return {"ok": True, "action": "noop", "state": state}
             current = str(state.get("active_slot") or "")
             previous = str(state.get("previous_active") or "")
@@ -169,6 +178,20 @@ class ReleaseManager:
                 state.update({"status": "superseded", "completed_at": _now().isoformat()})
                 self._write_state(state)
                 return {"ok": True, "action": "superseded", "state": state}
+            if state["status"] == "restart_required":
+                from aiive.project_paths import runtime_identity
+
+                actual = runtime_identity()
+                manifest = self._manager._read_manifest(self._manager.base_dir / current)
+                expected = self._manager.active_app_root() / "backend" / "aiive" / "runtime" / "system_contract.py"
+                module = Path(actual.get("system_contract_module") or "")
+                if (actual.get("loaded_slot") != current or module.resolve() != expected.resolve()
+                        or actual.get("stable_contract_audit_ref") != manifest.get("stable_contract_audit_ref")
+                        or actual.get("prompt_catalog_sha256") != manifest.get("prompt_catalog_sha256")):
+                    return {"ok": True, "action": "awaiting_runtime_restart", "state": state}
+                state.update(status="monitoring", runtime_pid=actual["pid"],
+                             monitor_until=(_now() + timedelta(seconds=self._monitor_seconds)).isoformat())
+                self._write_state(state)
             health = self._check_slot(current)
             if not health["healthy"]:
                 rollback = self._rollback_to(previous)

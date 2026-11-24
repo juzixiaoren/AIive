@@ -4,6 +4,21 @@
 > 晋升后的进程切换、健康检查、观察窗与失败回滚仍由现有 Supervisor / ReleaseManager 负责。
 > 不涉及 Model Router、Reranker、Temporal Graph。
 
+## 当前 Worker 工作流
+
+一般开发使用 `delegate_task(task_type="coding")`，并通过 `allowed_roots` 指定项目根。AIive 自身改动使用 `self_improvement` 或 `selfdev`。管理端 `POST /api/selfdev/repair` 返回 HTTP 202 和任务 ID。接受改进候选也会创建 Worker 任务并传入验收标准与证据。
+
+Task Runtime 优先创建 Git worktree，缺少 Git 元数据时创建文件系统副本。Worker 在同一目录调用 `run_shell`、`read_file`、`edit_file`、`write_file` 和 `apply_patch`。任务目录内的这些调用无需人工审批。后台 Bash 会话通过 `shell_session` 查询、续读或取消。终态工作区默认保留七天，清理前将变更文件和删除清单归档为任务 Artifact。
+
+SelfDev 保存创建工作区时的活跃版本信息。Worker 用当前代码和测试错误迭代，`run_selfdev_repair` 冻结工作区并验证非活跃槽位。定向测试和 SafetyGate 通过后才登记可晋升的候选指纹。发布和回滚仍使用现有发布流程。
+
+- `AIIVE_SOURCE_ROOT` 指向真实源码目录。未设置时从启动目录查找项目标记。
+- `AIIVE_SLOTS_ROOT` 指向 A/B 槽位目录。 `AIIVE_RUNTIME_DIR` 指向活跃指针和发布状态目录。
+- Supervisor 启动新 Python 进程并核实加载路径和 Prompt 审计引用。外部托管使用 `python -m aiive.supervisor.standalone` 启动，晋升后由服务管理器重启。容器已使用该入口。
+- `GET /api/selfdev/runtime` 与 `get_runtime_identity` 返回实际 Python 模块路径、Prompt 资源、审计引用和组装顺序。
+
+以下章节记录旧版管理端 Planner、补丁操作列表和修复日志格式。
+
 ## 1. Worker 入口
 
 Main Agent 将 AIive 自身代码改动委派为 `self_improvement`。`selfdev`、`lifecycle` 任务也自动

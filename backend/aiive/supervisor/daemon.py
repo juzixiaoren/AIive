@@ -287,6 +287,18 @@ class Supervisor:
 
     # ── promote ──────────────────────────────────────────────
     def _handle_promote(self, request: dict[str, Any]) -> dict[str, Any]:
+        from aiive.selfdev.repair_guard import default_repair_lock
+
+        lock = default_repair_lock(self.slots)
+        handle = lock.acquire(run_id=str(request.get("id") or "supervisor"))
+        if handle is None:
+            return {"ok": False, "status": "rejected", "error": "concurrent_repair_in_progress"}
+        try:
+            return self._promote_locked(request)
+        finally:
+            lock.release(handle)
+
+    def _promote_locked(self, request: dict[str, Any]) -> dict[str, Any]:
         payload = request.get("payload") or {}
         active = self.slots.get_active_slot()
         target = str(payload.get("target") or ("B" if active == "A" else "A")).upper()
@@ -305,6 +317,13 @@ class Supervisor:
                 "ok": True, "status": "already_active", "active_slot": active, "pid": record.pid,
             }
 
+        from aiive.supervisor.slot_manager import candidate_promotion_block, read_candidate_state
+
+        target_root = self._slot_root(target)
+        blocked = candidate_promotion_block(target_root)
+        expected = payload.get("fingerprint")
+        if blocked or (expected and read_candidate_state(target_root).get("fingerprint") != expected):
+            return {"ok": False, "status": "rejected", "error": blocked or "candidate_changed"}
         static = self._static_health(target)
         if not static["healthy"]:
             self._event("switch_failed", target=target, reason="candidate_static_health_failed")
@@ -342,6 +361,8 @@ class Supervisor:
         self._event("candidate_started", slot=target, pid=candidate.pid, port=staging_port)
 
         staging_wait = self._wait_process_healthy(candidate, staging_port)
+        if staging_wait["ok"]:
+            staging_wait = self._verify_loaded_candidate(candidate, target_root, staging_wait)
         if not staging_wait["ok"]:
             self.controller.stop(candidate)
             reason = (
@@ -383,6 +404,8 @@ class Supervisor:
                 "detail": error, "rollback": restore, "active_slot": self.slots.get_active_slot(),
             }
         health = self._wait_process_healthy(new_record, self.config.port)
+        if health["ok"]:
+            health = self._verify_loaded_candidate(new_record, target_root, health)
         if not health["ok"]:
             self.controller.stop(new_record)
             reason = (
@@ -418,6 +441,34 @@ class Supervisor:
             "ok": True, "status": "switched", "active_slot": target, "previous_slot": active,
             "pid": new_record.pid, "health": health, "monitor_until": monitor_until,
         }
+
+    def _verify_loaded_candidate(self, record: ProcessRecord, slot_root: Path, health: dict) -> dict:
+        manifest = self.slots._read_manifest(slot_root)
+        if not manifest.get("source_snapshot"):
+            return health
+        import json
+        import urllib.request
+
+        request = urllib.request.Request(
+            f"http://{self.config.host}:{record.port}/health?runtime=true",
+        )
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(request, timeout=3) as response:
+                actual = json.load(response)["runtime"]
+            expected_module = slot_root / "app" / "backend" / "aiive" / "runtime" / "system_contract.py"
+            # A Windows venv launcher can retain the Popen PID as the Python child's parent.
+            process_matches = record.pid in {actual.get("pid"), actual.get("parent_pid")}
+            if (process_matches and actual.get("loaded_slot") == record.slot
+                    and Path(actual["system_contract_module"]).resolve() == expected_module.resolve()
+                    and actual.get("stable_contract_audit_ref") == manifest["stable_contract_audit_ref"]
+                    and actual.get("prompt_catalog_sha256") == manifest["prompt_catalog_sha256"]):
+                return {**health, "runtime": actual}
+            details = {"runtime": actual, "expected_process_pid": record.pid}
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            details = {"runtime_probe_error": str(exc)}
+        return {**health, "ok": False, "reason": "candidate_runtime_identity_mismatch",
+                "health": {**health["health"], **details}}
 
     def _fail_switch(self, active: str, reason: str, **detail: Any) -> None:
         self._write_state(phase="running", active_slot=active, candidate=None, last_error=reason)
@@ -677,7 +728,7 @@ class Supervisor:
 
     # ── 发布状态（与 active_slot 保持一致） ───────────────────
     def _write_release_state(self, **updates: Any) -> None:
-        path = self.paths.base.parent / "release_state.json"
+        path = self.slots.runtime_dir / "release_state.json"
         state = read_json(path)
         state.update(updates)
         state["updated_at"] = iso_now()

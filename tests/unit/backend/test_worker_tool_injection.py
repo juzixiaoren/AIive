@@ -295,7 +295,14 @@ def test_discovery_budget_is_consumed_even_when_search_loads_tools(db_session) -
 
 
 @pytest.mark.parametrize("task_type", ["self_improvement", "selfdev", "lifecycle"])
-def test_selfdev_functions_are_bound_on_the_first_decision(db_session, task_type) -> None:
+def test_selfdev_functions_are_bound_on_the_first_decision(db_session, task_type, tmp_path, monkeypatch) -> None:
+    from aiive.config import settings
+
+    source = tmp_path / "source"
+    source.mkdir()
+    monkeypatch.setenv("AIIVE_SOURCE_ROOT", str(source))
+    monkeypatch.setenv("AIIVE_SLOTS_ROOT", str(tmp_path / "slots"))
+    monkeypatch.setattr(settings, "aiive_data_dir", str(tmp_path / "data"))
     from langchain_core.messages import AIMessage
     from aiive.task_runtime.agent_executor import TaskAgentExecutor
     from aiive.task_runtime.function_decisions import proposal_function_name

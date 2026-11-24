@@ -1,19 +1,4 @@
-"""仓库只读上下文读取器（Project Reader）。
-
-自进化规划阶段需要"理解代码"，但现有工具不适合直接复用：
-- ``read_text_file`` 硬限定在 ``~/Documents``，无法读取仓库源码；
-- ``run_shell`` 是 Task 工具，受 TaskScope 与审批约束，不适合服务端自进化流水线。
-
-因此这里补一个仓库范围内、只读、有界的读取器；它**不提供任何写能力**，
-所有修改仍必须经过 ``PatchExecutor`` 写入非活跃槽位。
-
-安全边界：
-- 只读，绝不写文件；
-- 拒绝绝对路径、``..`` 穿越与符号链接逃逸；
-- 拒绝密钥、环境配置、数据库与运行数据目录；
-- 单文件、单次搜索与上下文总量都有上限。
-"""
-
+"""Bounded path, symbol and content discovery in a project workspace."""
 from __future__ import annotations
 
 import logging
@@ -27,10 +12,6 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# 仓库根：本文件位于 backend/aiive/selfdev/project_reader.py
-# parents[3] = selfdev -> aiive -> backend -> 仓库根
-_DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[3]
-
 MAX_FILE_BYTES = 40_000
 MAX_TOTAL_CONTEXT_CHARS = 120_000
 MAX_SCAN_FILES = 20_000
@@ -43,7 +24,7 @@ MAX_CONTEXT_FILES = 8
 DENIED_DIR_PARTS: frozenset[str] = frozenset({
     ".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache",
     ".mypy_cache", ".ruff_cache", "dist", "build", ".next", "coverage",
-    "data", "runtime", "slots", ".data", "postgres", "qdrant",
+    ".data", "postgres", "qdrant",
     "object_store", "logs",
 })
 
@@ -56,7 +37,7 @@ DENIED_SUFFIXES: tuple[str, ...] = (
 )
 
 TEXT_SUFFIXES: frozenset[str] = frozenset({
-    ".py", ".ts", ".tsx", ".js", ".jsx", ".json", ".toml", ".yaml", ".yml",
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".toml", ".yaml", ".yml",
     ".md", ".txt", ".css", ".html", ".sql", ".ini", ".cfg", ".sh",
 })
 
@@ -80,6 +61,7 @@ class ContextFile:
     truncated: bool
     bytes: int
     reason: str
+    next_byte_offset: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """序列化为可 JSON 化的字典。"""
@@ -89,6 +71,7 @@ class ContextFile:
             "truncated": self.truncated,
             "bytes": self.bytes,
             "reason": self.reason,
+            "next_byte_offset": self.next_byte_offset,
         }
 
 
@@ -127,10 +110,9 @@ class ProjectReader:
         max_matches: int = MAX_MATCHES,
     ) -> None:
         if repo_root is None:
-            from aiive.supervisor.slot_manager import SlotManager
+            from aiive.project_paths import source_root
 
-            active = SlotManager().active_app_root()
-            repo_root = active if (active / "backend" / "aiive").is_dir() else _DEFAULT_REPO_ROOT
+            repo_root = source_root()
         self._root: Path = repo_root.resolve()
         self._max_file_bytes: int = max(1, int(max_file_bytes))
         self._max_files: int = max(1, int(max_files))
@@ -164,7 +146,8 @@ class ProjectReader:
     @staticmethod
     def _is_denied(relative: PurePosixPath) -> bool:
         """判断路径是否属于禁止读取的目录/文件。"""
-        if any(part in DENIED_DIR_PARTS for part in relative.parts[:-1]):
+        if ((relative.parts and relative.parts[0] in {"runtime", "slots"})
+                or any(part in DENIED_DIR_PARTS for part in relative.parts[:-1])):
             return True
         name = relative.name
         if name in DENIED_FILE_NAMES:
@@ -179,7 +162,7 @@ class ProjectReader:
         for dirpath, dirnames, filenames in os.walk(self._root):
             dirnames[:] = sorted(
                 name for name in dirnames
-                if name not in DENIED_DIR_PARTS and not name.startswith(".")
+                if not self._is_denied(PurePosixPath((Path(dirpath) / name / "_").relative_to(self._root).as_posix()))
             )
             for name in sorted(filenames):
                 if scanned >= MAX_SCAN_FILES:
@@ -190,7 +173,7 @@ class ProjectReader:
                     relative = PurePosixPath(self._relative(path, self._root))
                 except ValueError:
                     continue
-                if self._is_denied(relative):
+                if self._is_denied(relative) or not path.resolve().is_relative_to(self._root):
                     continue
                 if path.suffix.lower() not in TEXT_SUFFIXES:
                     continue
@@ -204,7 +187,7 @@ class ProjectReader:
 
     # ── 读取与搜索 ────────────────────────────────────────────────
 
-    def read(self, relative_path: str) -> ContextFile | None:
+    def read(self, relative_path: str, *, byte_offset: int = 0) -> ContextFile | None:
         """读取单个仓库文件（有界）；越界、被拒绝或不存在时返回 None。"""
         try:
             path = self._resolve(relative_path)
@@ -216,6 +199,7 @@ class ProjectReader:
         try:
             size = path.stat().st_size
             with path.open("rb") as stream:
+                stream.seek(byte_offset)
                 data = stream.read(self._max_file_bytes + 1)
         except OSError:
             logger.debug("读取仓库文件失败：%s", relative_path, exc_info=True)
@@ -223,22 +207,48 @@ class ProjectReader:
         truncated = len(data) > self._max_file_bytes
         if truncated:
             data = data[: self._max_file_bytes]
+            # Keep the next page on a UTF-8 codepoint boundary.
+            try:
+                data.decode("utf-8")
+            except UnicodeDecodeError as error:
+                if error.end == len(data) and error.start > 0 and error.reason == "unexpected end of data":
+                    data = data[:error.start]
         return ContextFile(
             path=normalized.as_posix(),
             content=data.decode("utf-8", errors="replace"),
             truncated=truncated,
             bytes=size,
             reason="read",
+            next_byte_offset=byte_offset + len(data) if truncated else None,
         )
 
+    def search_paths(self, query: str, *, limit: int | None = None) -> list[str]:
+        normalized = query.replace("\\", "/").removeprefix("./")
+        if not normalized:
+            return []
+        try:
+            exact = self._resolve(normalized)
+        except ValueError:
+            exact = None
+        if exact is not None and exact.is_file() and not self._is_denied(PurePosixPath(normalized)):
+            return [normalized]
+        from itertools import islice
+
+        return list(islice((name for name, _ in self._iter_files() if normalized.casefold() in name.casefold()),
+                           limit or self._max_matches))
+
+    def search_symbols(self, symbol: str, *, limit: int | None = None) -> list[dict[str, Any]]:
+        return self.search([symbol], limit=limit, exact_word=True)
+
     def search(
-        self, keywords: list[str], *, limit: int | None = None
+        self, keywords: list[str], *, limit: int | None = None, exact_word: bool = False
     ) -> list[dict[str, Any]]:
         """在仓库文本文件中做大小写不敏感的子串检索。"""
         needles = [item for item in keywords if item]
         if not needles:
             return []
-        patterns = [re.compile(re.escape(item), re.IGNORECASE) for item in needles]
+        patterns = [re.compile(rf"\b{re.escape(item)}\b" if exact_word else re.escape(item), re.IGNORECASE)
+                    for item in needles]
         cap = max(1, int(limit or self._max_matches))
         results: list[dict[str, Any]] = []
         for relative, path in self._iter_files():
@@ -273,7 +283,7 @@ class ProjectReader:
             ordered.append(key)
 
         for match in re.findall(
-            r"[A-Za-z0-9_./-]+\.(?:py|ts|tsx|js|jsx|json|toml|md|ya?ml)", goal
+            r"[A-Za-z0-9_./-]+\.(?:py|ts|tsx|js|jsx|mjs|cjs|json|toml|md|ya?ml)", goal
         ):
             push(match)
         for match in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{3,}\b", goal):
@@ -310,12 +320,15 @@ class ProjectReader:
     ) -> ProjectContext:
         """根据目标收集相关代码、命中行与相关测试。"""
         keywords = self._keywords(goal)
+        path_matches = [path for word in keywords if "." in word for path in self.search_paths(word, limit=5)]
         explicit = [item for item in (explicit_files or []) if item]
         matches = self.search(keywords, limit=self._max_matches) if keywords else []
 
         selected: list[str] = []
         if explicit:
             selected = explicit[: self._max_files]
+        elif path_matches:
+            selected = list(dict.fromkeys(path_matches))[: self._max_files]
         elif matches:
             counts = Counter(str(item["path"]) for item in matches)
             selected = [

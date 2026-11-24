@@ -91,6 +91,9 @@ class RunContext:
     task_id: str = ""
     agent_run_id: str = ""
     action_id: str = ""
+    task_workspace: str = ""
+    canonical_source_root: str = ""
+    workspace_env: dict[str, str | None] = field(default_factory=dict)
     user_timezone: str | None = None
     web_search_calls: int = field(default=0, init=False)
     _web_search_lock: LockType = field(default_factory=Lock, init=False, repr=False, compare=False)

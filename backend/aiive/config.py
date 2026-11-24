@@ -4,6 +4,7 @@
 - 提供统一的 Settings 单例，供整个后端项目引用
 - 涵盖 LLM、数据库、服务器和应用元信息等配置项
 """
+import os
 from typing import ClassVar, Literal
 
 from pydantic import Field, SecretStr, model_validator
@@ -61,6 +62,12 @@ class Settings(BaseSettings):
     # Set the uncached input and output rates of the configured Worker model.
     aiive_worker_input_usd_per_million: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     aiive_worker_output_usd_per_million: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    aiive_coding_max_actions: int = Field(default=64, ge=1, le=WORKER_BUDGET_LIMITS["max_actions"])
+    aiive_coding_max_model_calls: int = Field(default=80, ge=1, le=WORKER_BUDGET_LIMITS["max_model_calls"])
+    aiive_coding_max_tool_failures: int = Field(default=16, ge=1, le=WORKER_BUDGET_LIMITS["max_tool_failures"])
+    aiive_coding_max_runs: int = Field(default=16, ge=1, le=WORKER_BUDGET_LIMITS["max_runs"])
+    aiive_coding_max_total_tokens: int = Field(default=1_000_000, ge=1000, le=WORKER_BUDGET_LIMITS["max_total_tokens"])
+    aiive_coding_workspace_retention_days: int = Field(default=7, ge=1)
     aiive_worker_default_max_runs: int = Field(default=8, ge=1, le=WORKER_BUDGET_LIMITS["max_runs"])
     aiive_worker_default_max_model_calls: int = Field(default=32, ge=1, le=WORKER_BUDGET_LIMITS["max_model_calls"])
     aiive_worker_default_max_actions: int = Field(default=24, ge=1, le=WORKER_BUDGET_LIMITS["max_actions"])
@@ -389,4 +396,4 @@ class Settings(BaseSettings):
         return self
 
 
-settings = Settings()
+settings = Settings(_env_file=os.environ.get("AIIVE_ENV_FILE", ".env"))

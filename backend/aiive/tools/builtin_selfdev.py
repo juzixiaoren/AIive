@@ -6,27 +6,35 @@ from pathlib import Path
 from typing import override, Any
 
 
+def _reader(ctx, workspace):
+    from aiive.selfdev.project_reader import ProjectReader
+    from aiive.tools.workspace_files import workspace_path
+
+    if ctx and ctx.task_id:
+        if ctx.task_workspace:
+            return ProjectReader(workspace_path(ctx, workspace or "."))
+        if not ctx.canonical_source_root or workspace:
+            raise ValueError("task_workspace_required")
+        return ProjectReader(Path(ctx.canonical_source_root))
+    return ProjectReader(Path(workspace) if workspace else None)
+
+
 class CreateSelfdevPlanTool(BaseTool):
     @override
-    def _run(self, goal: str = ""):
-        """生成自进化补丁计划。
-
-        参数:
-            goal: 改进目标描述
-
-        返回:
-            SelfDevPlanner 的计划结果
-        """
+    def _run(self, goal: str = "", files: list[str] | None = None, workspace: str = "", ctx: Any = None):
+        reader = _reader(ctx, workspace)
+        context = reader.collect_context(goal, explicit_files=files)
+        if ctx and ctx.task_id:
+            return {"goal": goal, "workspace": str(reader.repo_root), "context": context.to_dict()}
         from aiive.core.llm_client import default_llm_client
         from aiive.selfdev.planner import SelfDevPlanner
-        from aiive.selfdev.project_reader import ProjectReader
-        llm = default_llm_client()
-        return SelfDevPlanner(llm).plan(goal, context=ProjectReader().collect_context(goal))
+
+        return SelfDevPlanner(default_llm_client()).plan(goal, context=context)
 
 
 class ApplyPatchToInactiveSlotTool(BaseTool):
     @override
-    def _run(self, operations: list[dict[str, Any]] | None = None):
+    def _run(self, operations: list[dict[str, Any]] | None = None, ctx: Any = None):
         """将补丁应用到非活跃槽位（不影响当前运行版本）。
 
         参数:
@@ -42,6 +50,27 @@ class ApplyPatchToInactiveSlotTool(BaseTool):
         from aiive.selfdev.targeted_test_runner import TargetedTestRunner
 
         frozen = operations or []
+        if ctx and ctx.task_id:
+            from aiive.tools.workspace_files import WriteFileTool, workspace_path
+
+            if not ctx.task_workspace:
+                return {"ok": False, "error": "task_workspace_required"}
+
+            applied = []
+            for operation in frozen:
+                relative = operation["target_file"]
+                action = operation.get("operation", "add_file")
+                if operation.get("not_allowed_yet"):
+                    continue
+                if action == "delete_file":
+                    workspace_path(ctx, relative).unlink()
+                elif action in {"add_file", "modify_file"}:
+                    WriteFileTool._run(self, relative, operation["content"], ctx=ctx)
+                else:
+                    return {"ok": False, "error": "unsupported_file_operation", "operations_applied": applied}
+                applied.append(relative)
+            return {"operations_applied": applied, "changed": bool(applied),
+                    "workspace": ctx.task_workspace}
         executor = PatchExecutor()
         # 与自主修复闭环共用同一把候选代码互斥锁与候选状态标记。
         result = apply_candidate_patch(executor, frozen)
@@ -81,15 +110,23 @@ class RunSelfdevRepairTool(BaseTool):
     @override
     def _run(self,
         goal: str = "", max_rounds: int = 3, promote: bool = False,
-        files: list[str] | None = None, ctx: Any = None,
+        files: list[str] | None = None, workspace: str = "", ctx: Any = None,
     ):
-        """自主修复闭环：读码 → 规划 → 补丁 → 定向测试 → 有限修复 → 安全门。
+        """For a Worker, validate and stage the workspace. Legacy callers retain the planner."""
+        if ctx and ctx.task_id:
+            from aiive.selfdev.workspace_delivery import deliver_workspace
+            from aiive.tools.workspace_files import workspace_path
 
-        所有修改只进入非活跃槽位；promote=True 时仍需通过现有安全门与
-        ReleaseManager（健康检查、Supervisor 切换、观察窗回滚）。
-        """
+            root = workspace_path(ctx, workspace or ".")
+            if root != workspace_path(ctx):
+                return {"ok": False, "error": "workspace_must_be_task_root"}
+            result = deliver_workspace(root, task_id=ctx.task_id, run_id=ctx.action_id, files=files)
+            if result.get("ok") and promote:
+                result["promotion"] = PromoteSlotTool._run(self)
+                result["ok"] = result["promotion"].get("ok", False)
+            return result
         from aiive.selfdev.repair_loop import SelfDevRepairLoop
-        return SelfDevRepairLoop(max_rounds=max_rounds).run(
+        return SelfDevRepairLoop(max_rounds=max_rounds, reader=_reader(ctx, workspace)).run(
             goal, promote=promote, files=files, trace_id=ctx.trace_id if ctx else None,
             run_id=(ctx.action_id or None) if ctx else None,
         )
@@ -123,3 +160,11 @@ class PromotionStatusTool(DatabaseTool):
         if not isinstance(request_id, str):
             raise ValueError("promotion_has_no_supervisor_request")
         return {"request_id": request_id, "status": promotion_status(request_id)}
+
+
+class RuntimeIdentityTool(BaseTool):
+    def _run(self):
+        from aiive.project_paths import runtime_identity
+        from aiive.supervisor.slot_manager import SlotManager
+
+        return {**runtime_identity(), "active_slot_pointer": SlotManager().get_active_slot()}

@@ -3,7 +3,7 @@
 约束：
 - 只用真实 bash（PATH / 显式配置 / 常见 Git Bash 安装路径），找不到时返回
   shell_unavailable，绝不静默回退到 cmd / powershell。
-- 每次执行使用最小环境变量白名单，不把密钥类变量传给子进程。
+- 继承启动环境，允许任务和命令覆盖环境变量。
 - stdout / stderr 由后台线程边读边写入受控日志（tool_output_store 的同一目录），
   内存只保留有界预览；不在内存里先截断再把截断结果当成完整日志。
 - 日志容量受 shell_max_log_bytes 限制，超出后停止写盘并标记 capture_truncated，
@@ -41,11 +41,6 @@ _WINDOWS_BASH_CANDIDATES = (
     r"C:\Program Files\Git\mingw64\bin\bash.exe",
 )
 
-# 只透传运行 bash 与常见只读命令所需的最小环境；其余变量（含密钥）一律不带入。
-_ENV_ALLOWLIST = (
-    "PATH", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "TMPDIR", "TEMP", "TMP",
-    "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "LANG", "TERM",
-)
 
 _VERSION_CACHE: dict[str, str] = {}
 
@@ -87,7 +82,7 @@ def bash_version(path: str) -> str:
         proc = subprocess.run(
             [path, "--version"], capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=3, check=False, stdin=subprocess.DEVNULL,
-            env=isolated_env(),
+            env=shell_env(),
         )
         if proc.returncode != 0:
             return ""
@@ -101,22 +96,28 @@ def bash_version(path: str) -> str:
     return version
 
 
-def isolated_env() -> dict[str, str]:
-    """构造子进程环境：只保留运行必需的白名单变量。"""
-    env: dict[str, str] = {}
-    for name in _ENV_ALLOWLIST:
-        value = os.environ.get(name)
-        if value:
-            env[name] = value
-    for name, value in os.environ.items():
-        if name.startswith("LC_") and value:
+def shell_env(overlay: dict[str, str | None] | None = None) -> dict[str, str]:
+    env = dict(os.environ)
+    for name, value in (overlay or {}).items():
+        if value is None:
+            env.pop(name, None)
+        else:
             env[name] = value
     if "HOME" not in env and env.get("USERPROFILE"):
         env["HOME"] = env["USERPROFILE"]
     return env
 
 
-def run_bash(command: str, *, cwd: str, timeout_seconds: float | None = None, cancel_check: Callable[[], bool] | None = None) -> dict[str, Any]:
+def shell_timeout(timeout_seconds: float | None = None) -> float:
+    return max(1.0, min(float(timeout_seconds or settings.shell_default_timeout_seconds),
+                        float(settings.shell_max_timeout_seconds)))
+
+
+def run_bash(
+    command: str, *, cwd: str, timeout_seconds: float | None = None,
+    cancel_check: Callable[[], bool] | None = None, env: dict[str, str | None] | None = None,
+    keep_logs: bool = False, on_start: Callable[[dict[str, str]], None] | None = None,
+) -> dict[str, Any]:
     """在真实 bash 中执行单条命令并返回结构化结果。"""
     started = time.monotonic()
     bash = resolve_bash()
@@ -130,8 +131,7 @@ def run_bash(command: str, *, cwd: str, timeout_seconds: float | None = None, ca
     if not workdir.is_dir():
         return _failure("cwd_not_found", f"工作目录不存在或不是目录: {cwd}", started)
 
-    timeout = float(timeout_seconds or settings.shell_default_timeout_seconds)
-    timeout = max(1.0, min(timeout, float(settings.shell_max_timeout_seconds)))
+    timeout = shell_timeout(timeout_seconds)
     output_limit = max(1, int(settings.shell_max_output_bytes))
     memory_limit = max(1024, output_limit)
     # 预览同时受 shell_output_preview_chars 与 shell_max_output_bytes 约束：
@@ -142,11 +142,11 @@ def run_bash(command: str, *, cwd: str, timeout_seconds: float | None = None, ca
     windows = sys.platform.startswith("win")
     out_capture = _Capture(
         "run_shell_stdout", max_bytes=max_log_bytes, memory_limit=memory_limit,
-        keep_bytes=preview_chars,
+        keep_bytes=0 if keep_logs else preview_chars,
     )
     err_capture = _Capture(
         "run_shell_stderr", max_bytes=max_log_bytes, memory_limit=memory_limit,
-        keep_bytes=preview_chars,
+        keep_bytes=0 if keep_logs else preview_chars,
     )
     timed_out = False
     cancelled = False
@@ -156,7 +156,8 @@ def run_bash(command: str, *, cwd: str, timeout_seconds: float | None = None, ca
         proc = subprocess.Popen(
             argv,
             cwd=str(workdir),
-            env=isolated_env(),
+            env=shell_env(env),
+            bufsize=0,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -174,6 +175,10 @@ def run_bash(command: str, *, cwd: str, timeout_seconds: float | None = None, ca
         for pump in pumps:
             pump.start()
         try:
+            if on_start:
+                on_start({key: str(capture._log.tmp_path)
+                          for key, capture in (("stdout", out_capture), ("stderr", err_capture))
+                          if capture._log is not None})
             deadline = time.monotonic() + timeout
             while proc.poll() is None:
                 if cancel_check is not None and cancel_check():
@@ -190,6 +195,9 @@ def run_bash(command: str, *, cwd: str, timeout_seconds: float | None = None, ca
         except subprocess.TimeoutExpired:
             timed_out = True
             terminated = _terminate_tree(proc)
+        except BaseException:
+            _terminate_tree(proc)
+            raise
         for pump in pumps:
             pump.join(timeout=_JOIN_TIMEOUT)
     finally:
@@ -198,7 +206,7 @@ def run_bash(command: str, *, cwd: str, timeout_seconds: float | None = None, ca
 
     out_text, out_next, out_next_char = out_capture.preview(preview_chars)
     err_text, err_next, err_next_char = err_capture.preview(preview_chars)
-    exit_code = None if timed_out else proc.returncode
+    exit_code = None if timed_out and not keep_logs else proc.returncode
     result: dict[str, Any] = {
         "ok": (not timed_out) and exit_code == 0,
         "exit_code": exit_code,
@@ -228,6 +236,8 @@ def run_bash(command: str, *, cwd: str, timeout_seconds: float | None = None, ca
         "cwd": str(workdir),
         "shell": {"kind": "bash", "path": bash, "version": bash_version(bash)},
     }
+    if exit_code not in (None, 0):
+        result.update(error_type="shell_exit_nonzero", error=f"Bash exited with code {exit_code}")
     if out_capture.log_error or err_capture.log_error:
         result["log_error"] = out_capture.log_error or err_capture.log_error
     if cancelled:
@@ -317,6 +327,8 @@ class _Capture:
         log = self._log
         if log is not None:
             log.write(chunk)
+            if self._keep_bytes == 0:
+                log.flush()
             self.capture_truncated = log.capture_truncated
             return
         remaining = self._memory_limit - len(self._memory)

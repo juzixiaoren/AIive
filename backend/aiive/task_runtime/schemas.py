@@ -131,6 +131,7 @@ class TaskScopeModel(BaseModel):
     allow_network: bool = False
     allow_secrets: bool = False
     isolation_mode: Literal["shared", "git_worktree"] = "shared"
+    env: dict[str, str | None] = Field(default_factory=dict)
     # unified：不按任务类型/技能收窄能力面；restricted：allowed_capabilities 为授权白名单。
     capability_policy: Literal["unified", "restricted"] = "restricted"
 

@@ -70,7 +70,8 @@ from aiive.tools.builtin_basic import (
     EchoTool,
     GetCurrentTimeTool,
 )
-from aiive.tools.builtin_shell import RunShellTool
+from aiive.tools.builtin_shell import RunShellTool, ShellSessionTool
+from aiive.tools.workspace_files import ApplyPatchTool, EditFileTool, ReadFileTool, WriteFileTool
 from aiive.tools.builtin_files import (
     ReadTextFileTool,
     SafeDeleteTool,
@@ -117,7 +118,7 @@ from aiive.tools.builtin_selfdev import (
     ApplyPatchToInactiveSlotTool,
     CreateSelfdevPlanTool,
     PromoteSlotTool,
-    PromotionStatusTool,
+    PromotionStatusTool, RuntimeIdentityTool,
     RollbackSlotTool,
     RunSelfdevRepairTool,
 )
@@ -163,7 +164,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         # 本机 Shell（常驻核心能力）：真实 bash，无需 Desktop Node。
         ("run_shell", RunShellTool,
          "在 AIive 所在主机上用真实 bash 执行一条命令，返回退出码、stdout、stderr 与超时状态。"
-         + "cwd 必须位于任务允许的根目录内；只读命令可直接执行，其余命令需要审批。"
+         + "代码任务默认在当前工作区运行，支持相对 cwd、完整 Bash 和后台会话。"
          + "stdout/stderr 会流式写入日志，结果里只回填有限预览与总字节数（truncated 标记预览被截）；"
          + "任务通过结果中的 artifact_id 和 read_task_artifact 续读日志。"
          + "capture_truncated 为 true 表示日志达到容量上限；无法确认超时进程终止时返回 execution_unknown。",
@@ -176,9 +177,8 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
              },
              "cwd": {
                  "type": "str",
-                 "description": "工作目录绝对路径，必须在任务 allowed_roots 内",
+                 "description": "代码任务默认工作区根，可用相对路径；共享任务须指定作用域内的绝对路径。",
                  "minLength": 1,
-                 "required": True,
              },
              "timeout_seconds": {
                  "type": "int",
@@ -186,7 +186,30 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                  "minimum": 0,
                  "maximum": 300,
              },
+             "env": {"type": "dict", "description": "在任务环境之上覆盖变量，null 移除变量"},
+             "background": {"type": "bool", "description": "立即返回 session_id，使用 shell_session 查询或取消"},
          }, "medium", True, False),
+        ("shell_session", ShellSessionTool, "查询本任务的 Bash 会话、按字符偏移续读输出，或请求取消。",
+         {"session_id": {"type": "str", "required": True},
+          "stdout_offset": {"type": "int", "minimum": 0}, "stderr_offset": {"type": "int", "minimum": 0},
+          "limit": {"type": "int", "minimum": 1, "maximum": 16000}, "cancel": {"type": "bool"}},
+         "low", False, False),
+        ("read_file", ReadFileTool, "读取工作区文件、SHA256、字节数和 mtime_ns。行号从 1 开始，字节偏移从 0 开始。按返回的 next 字段续读。",
+         {"path": {"type": "str", "required": True}, "encoding": {"type": "str"},
+          "start_line": {"type": "int", "minimum": 1}, "end_line": {"type": "int", "minimum": 1},
+          "char_offset": {"type": "int", "minimum": 0}, "byte_offset": {"type": "int", "minimum": 0},
+          "byte_length": {"type": "int", "minimum": 1, "maximum": 16000},
+          "limit": {"type": "int", "minimum": 1, "maximum": 16000}}, "low", False, False),
+        ("edit_file", EditFileTool, "精确替换一段唯一匹配的文本。插入时保留锚点并拼接新文本，删除时将 new_text 设为空。文件变化后仍会在最新内容中重新匹配。",
+         {"path": {"type": "str", "required": True}, "old_text": {"type": "str", "minLength": 1, "required": True},
+          "new_text": {"type": "str", "required": True}, "expected_sha256": {"type": "str"}, "encoding": {"type": "str"}},
+         "medium", True, False),
+        ("write_file", WriteFileTool, "创建或完整写入工作区文件。",
+         {"path": {"type": "str", "required": True}, "content": {"type": "str", "required": True},
+          "encoding": {"type": "str"}, "expected_sha256": {"type": "str"}}, "medium", True, False),
+        ("apply_patch", ApplyPatchTool, "在工作区应用标准 Unified Diff，支持创建、编辑、重命名和删除。",
+         {"patch": {"type": "str", "required": True}, "strip": {"type": "int", "minimum": 0}},
+         "medium", True, False),
         # 提醒 / 任务
         ("schedule_reminder", ScheduleReminderTool,
          "创建一次性提醒。选 at（ISO 8601，可带偏移）或 delay_minutes；无偏移的 at 按指定 timezone_name 或用户时区解析。",
@@ -370,12 +393,13 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         ("plan_capability", PlanCapabilityTool, "在本地 MCP 白名单目录中查找候选并生成风险与安装计划。",
          {"goal": {"type": "str", "minLength": 1, "required": True}}, "low", False, False),
         # 自进化
-        ("create_selfdev_plan", CreateSelfdevPlanTool, "生成自进化补丁计划",
-         {"goal": {"type": "str", "minLength": 1, "required": True}}, "low", False, False),
-        ("apply_patch_to_inactive_slot", ApplyPatchToInactiveSlotTool, "仅将补丁应用到非活跃槽位",
+        ("create_selfdev_plan", CreateSelfdevPlanTool, "收集当前工作区的规划上下文，Worker 负责制定计划。",
+         {"goal": {"type": "str", "minLength": 1, "required": True},
+          "files": {"type": "list", "items": {"type": "string"}}, "workspace": {"type": "str"}}, "low", False, False),
+        ("apply_patch_to_inactive_slot", ApplyPatchToInactiveSlotTool, "应用旧版文件操作列表到当前任务工作区。优先使用 edit_file 或 apply_patch。",
          {"operations": {
              "type": "list",
-             "description": "基于活跃槽位的完整补丁列表，可自行生成或使用 plan.operations；每次调用重建候选基线",
+             "description": "项目相对路径的文件操作列表，修改累积于工作区",
              "items": {"type": "object", "required": ["target_file"],
                        "properties": {"operation": {"type": "string", "enum": ["add_file", "modify_file", "delete_file"], "default": "add_file"},
                                       "target_file": {"type": "string", "minLength": 1},
@@ -385,15 +409,16 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
              "required": True,
          }}, "medium", True, False),
         ("promote_slot", PromoteSlotTool, "健康检查通过后提升非活跃槽位为活跃", {}, "high", True, False),
+        ("get_runtime_identity", RuntimeIdentityTool, "查询实际运行进程、模块加载位置、Prompt 资源和审计引用。", {}, "low", False, False),
         ("get_promotion_status", PromotionStatusTool, "读取本任务晋升 Action 的实际启动、观察、成功或回滚结果。",
          {"action_id": {"type": "str", "minLength": 1, "required": True}}, "low", False, False),
         ("rollback_slot", RollbackSlotTool, "回滚到上一个活跃槽位", {}, "high", True, False),
         ("run_selfdev_repair", RunSelfdevRepairTool,
-         "自主修复闭环：读取相关代码 → 生成补丁 → 应用到非活跃槽位 → 定向测试 → "
-         + "失败时按真实错误有限次修复 → 安全门；默认候选就绪后返回，promote=True 另需发布审批",
+         "同步当前工作区到非活跃槽位并运行定向测试及安全门。失败后在同一工作区修复并重新提交。promote=True 请求发布。",
          {
              "goal": {"type": "str", "minLength": 1, "required": True},
-             "max_rounds": {"type": "int", "minimum": 0, "maximum": 5, "description": "默认 3"},
+             "workspace": {"type": "str", "description": "当前任务工作区根，省略时自动选择"},
+             "max_rounds": {"type": "int", "minimum": 0, "maximum": 5, "description": "旧管理端规划器参数；Worker 使用任务预算"},
              "files": {"type": "list", "items": {"type": "string"}, "description": "已知相关文件的项目相对路径"},
              "promote": {"type": "bool", "description": "默认 false；true 时仍走安全门"},
          }, "medium", True, False),
@@ -424,7 +449,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
     ]
 
     external_effect_modes = {
-        "run_shell": "non_repeatable_external",
+        **dict.fromkeys(("run_shell", "edit_file", "write_file", "apply_patch"), "non_repeatable_external"),
         "install_mcp_sandbox": "non_repeatable_external",
         "forget": "externally_reconcilable",
         "safe_delete": "non_repeatable_external",

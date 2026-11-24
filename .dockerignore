@@ -18,3 +18,13 @@ backend/aiive.egg-info
 
 # 密钥文件：仅由 compose 的 env_file 在宿主机读取，禁止进入构建上下文/镜像层
 .env
+
+.venv
+**/dist
+**/build
+slots
+runtime
+.env.*
+!.env.example
+**/*.jks
+**/*.keystore

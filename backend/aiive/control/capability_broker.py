@@ -78,7 +78,7 @@ class CapabilityBroker:
         for entry in result["tools"]:
             entry["in_scope"] = execution.get(entry["capability_id"]) is not None
         result["loaded"] = select_search_definitions(
-            execution, result["tools"], resident_ids=worker_resident_ids(task.task_type),
+            execution, result["tools"], resident_ids=worker_resident_ids(task.task_type, has_workspace=bool((task.task_state or {}).get("worktree_path"))),
         )
         return result
 
@@ -108,6 +108,19 @@ class CapabilityBroker:
         if registration is None:
             reason = "capability_disabled" if self._is_disabled(capability_id=capability_id) else "unknown_capability"
             return PreparedCapability(None, ActionPolicyDecision("block", reason))
+        workspace = self.workspace_context(task)
+        from aiive.task_runtime.router import CODING_CAPABILITIES
+
+        if capability_id in CODING_CAPABILITIES and not workspace["task_workspace"]:
+            return PreparedCapability(registration, ActionPolicyDecision("block", "task_workspace_required"))
+        if workspace["task_workspace"] and capability_id in {*CODING_CAPABILITIES, "run_shell"}:
+            if not scope.allows_capability(capability_id):
+                return PreparedCapability(registration, ActionPolicyDecision("block", "capability_not_in_task_scope"))
+            try:
+                self.workspace_arguments(workspace["task_workspace"], capability_id, arguments)
+            except ValueError as exc:
+                return PreparedCapability(registration, ActionPolicyDecision("block", str(exc)))
+            return PreparedCapability(registration, ActionPolicyDecision("allow", "task_workspace"))
         lifecycle_block = self._lifecycle_block(task, registration, capability_id, arguments)
         if lifecycle_block:
             return PreparedCapability(
@@ -118,6 +131,28 @@ class CapabilityBroker:
             registration=registration,
             decision=self.policy.decide(registration, scope, capability_id, arguments),
         )
+
+    @staticmethod
+    def workspace_context(task: AgentTask) -> dict[str, Any]:
+        state = task.task_state or {}
+        brief = task.task_brief or {}
+        return {
+            "task_workspace": state.get("worktree_path") or "",
+            "canonical_source_root": state.get("source_repository") or "",
+            "workspace_env": (brief.get("scope") or {}).get("env") or {},
+        }
+
+    @staticmethod
+    def workspace_arguments(workspace: str, capability_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        root = Path(workspace).resolve()
+        resolved = dict(arguments)
+        key = "cwd" if capability_id == "run_shell" else "path"
+        if key in arguments or key == "cwd":
+            target = (root / (arguments.get(key) or ".")).resolve()
+            if not target.is_relative_to(root):
+                raise ValueError("path_outside_task_workspace")
+            resolved[key] = str(target)
+        return resolved
 
     def _lifecycle_block(
         self, task: AgentTask, registration: BaseTool, capability_id: str, arguments: dict[str, Any],
@@ -162,6 +197,13 @@ class CapabilityBroker:
                 if path_within(local, root) or path_within(root, local):
                     return "selfdev_project_changes_require_inactive_slot"
         if capability_id == "promote_slot":
+            from aiive.supervisor.slot_manager import SlotManager
+
+            manager = SlotManager()
+            candidate = next(item for item in manager.list_slots() if not item.active)
+            if candidate.manifest.get("source_snapshot"):
+                if candidate.manifest.get("workspace_task_id") != task.id:
+                    return "candidate_belongs_to_another_task"
             import json
 
             from aiive.task_runtime.evidence import EvidenceStore
@@ -211,6 +253,8 @@ class CapabilityBroker:
 
         Desktop 文件仍会在 Node 紧邻副作用前重验同一 preconditions。
         """
+        if action.capability_id in {"read_file", "edit_file", "write_file"}:
+            return []  # Workspace file tools verify their own versions at execution.
         issues: list[str] = []
         pre = action.preconditions or {}
         if set(pre) - {"exists", "sha256", "size", "mtime_ns", "file_id"}:
@@ -285,17 +329,24 @@ class CapabilityBroker:
             prepared.decision.outcome == "approval" and not action.requires_approval
         ):
             return {"ok": False, "error": prepared.decision.reason, "error_type": "policy_denied"}
-        issues = scope.validate_arguments(action.capability_id, action.arguments or {})
-        issues.extend(self.validate_preconditions(action))
+        workspace = self.workspace_context(task)
+        arguments = action.arguments or {}
+        if prepared.decision.reason == "task_workspace":
+            resource_arguments = self.workspace_arguments(workspace["task_workspace"], action.capability_id, arguments)
+        else:
+            resource_arguments = arguments
+        issues = self.validate_preconditions(action)
         if issues:
             return {"ok": False, "error": ";".join(issues), "error_type": "precondition_failed"}
 
         resources = action_resource_keys(
             action.capability_id,
-            action.arguments or {},
+            resource_arguments,
             action.target_node_id,
             mutates_resources=registration.safety.writes_external_world,
         )
+        if workspace["task_workspace"] and registration.safety.writes_external_world:
+            resources = sorted(set(resources) | {f"server:workspace:{task.id}"})
         try:
             grant = self.locks.acquire(
                 self.db,
@@ -337,9 +388,9 @@ class CapabilityBroker:
                 action.capability_id, action.arguments or {}, "task_runtime",
                 RunContext(thread_id=task.thread_id, trace_id=task.id, source="task_runtime",
                            task_id=task.id, agent_run_id=run.id, action_id=action.id,
-                           user_timezone=(task.task_brief.get("initial_input") or {}).get("user_timezone")),
+                           **workspace, user_timezone=(task.task_brief.get("initial_input") or {}).get("user_timezone")),
                 expected_descriptor_hash=action.descriptor_hash, channel="task_action",
-                on_wait=renew_execution if action.capability_id in SELFDEV_LONG_ACTIONS else None,
+                on_wait=renew_execution if action.capability_id in SELFDEV_LONG_ACTIONS | {"run_shell"} else None,
                 authorization={
                     "node_id": registration.executor_node_id, "task_id": task.id, "run_id": run.id,
                     "action_id": action.id, "idempotency_key": action.idempotency_key,

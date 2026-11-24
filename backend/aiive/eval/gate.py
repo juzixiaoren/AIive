@@ -147,16 +147,20 @@ class SafetyGate:
             env = dict(os.environ)
             env["PYTHONPATH"] = str(backend) + os.pathsep + env.get("PYTHONPATH", "")
             env["AIIVE_MEMORY_VECTOR_ENABLED"] = "false"
+            env["AIIVE_TOOL_DISCOVERY_VECTOR_ENABLED"] = "false"
+            env["DATABASE_URL"] = f"sqlite:///{(Path(tmp_dir) / 'candidate-eval.db').as_posix()}"
+            env["AIIVE_DATA_DIR"] = str(Path(tmp_dir) / "data")
+            env["PYTHONIOENCODING"] = "utf-8"
             try:
                 proc = subprocess.run(
                     [sys.executable, "-m", "aiive.eval", "run", "--json", "--out", str(out_file)],
-                    cwd=str(backend), env=env, capture_output=True, text=True,
+                    cwd=str(backend), env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
                     timeout=600, check=False,
                 )
             except Exception as exc:  # noqa: BLE001 - fail-closed gate
                 return EvalRunResult(error="candidate subprocess error: " + str(exc))
 
-            if proc.returncode != 0 or not out_file.exists():
+            if not out_file.exists():
                 tail = (proc.stderr or proc.stdout or "")[-1500:]
                 return EvalRunResult(
                     error="candidate subprocess exit=" + str(proc.returncode) + " :: " + tail,
@@ -185,6 +189,6 @@ class SafetyGate:
         return EvalRunResult(
             passed=data.get("passed", 0),
             failed=data.get("failed", 0),
-            error=data.get("error", ""),
+            error=data.get("error") or (f"candidate subprocess exit={proc.returncode}" if proc.returncode else ""),
             cases=cases,
         )

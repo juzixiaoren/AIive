@@ -171,18 +171,19 @@ def test_run_shell_truncates_large_output(tmp_path, monkeypatch) -> None:
     assert result["truncated"]["stdout"] is True
 
 
-def test_run_shell_isolates_secret_environment(tmp_path, monkeypatch) -> None:
+def test_run_shell_inherits_and_overlays_environment(tmp_path, monkeypatch) -> None:
     _require_bash()
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-should-not-leak")
-    monkeypatch.setenv("AIIVE_TEST_SECRET", "leak")
-    monkeypatch.setenv("AIIVE_VISIBLE_FLAG", "hidden")
+    monkeypatch.setenv("AIIVE_TEST_INHERITED", "parent")
+    monkeypatch.setenv("AIIVE_TEST_REPLACED", "parent")
+    monkeypatch.setenv("AIIVE_TEST_REMOVED", "parent")
     result = run_bash(
-        'printf "%s|%s|%s" "$OPENAI_API_KEY" "$AIIVE_TEST_SECRET" "$AIIVE_VISIBLE_FLAG"',
+        'printf "%s|%s|%s" "$AIIVE_TEST_INHERITED" "$AIIVE_TEST_REPLACED" "$AIIVE_TEST_REMOVED"',
         cwd=str(tmp_path),
         timeout_seconds=20,
+        env={"AIIVE_TEST_REPLACED": "task", "AIIVE_TEST_REMOVED": None},
     )
     assert result["ok"] is True
-    assert result["stdout"] == "||"
+    assert result["stdout"] == "parent|task|"
 
 
 def test_run_shell_missing_cwd_returns_structured_error(tmp_path) -> None:
@@ -459,10 +460,10 @@ def test_bash_probe_timeout_is_retryable_and_success_is_cached(monkeypatch):
         return SimpleNamespace(returncode=0, stdout="GNU bash, version 5\n", stderr="")
 
     monkeypatch.setattr(local_shell.subprocess, "run", run)
-    monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-probe")
+    monkeypatch.setenv("AIIVE_TEST_BASH_PROBE", "inherited")
     assert bash_version("fake-bash") == ""
     assert bash_version("fake-bash") == "GNU bash, version 5"
     assert bash_version("fake-bash") == "GNU bash, version 5"
     assert len(calls) == 2
     assert calls[0]["timeout"] == 3
-    assert "OPENAI_API_KEY" not in calls[0]["env"]
+    assert calls[0]["env"]["AIIVE_TEST_BASH_PROBE"] == "inherited"

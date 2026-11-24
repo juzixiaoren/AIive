@@ -121,7 +121,7 @@ class ReplayRunner:
     def _exec_tool(self, step: ToolStep, _session: Session) -> StepResult:
         ctx = RunContext(
             thread_id="eval-replay", trace_id="eval-replay",
-            turn_id="eval-replay", turn_record_id="eval-replay", source="user_chat",
+            turn_id="eval-replay", source="user_chat",
         )
         reg = get_tool_registry()
         res = reg.execute(step.call, step.args, step.source, run_context=ctx, tool_call_id="eval")

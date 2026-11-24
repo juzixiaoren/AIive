@@ -62,7 +62,23 @@ class TaskContextAssembler:
         if not reporting:
             event_types.extend(("tool_search", "tool_describe"))
         events = reader.signals(task.id, event_types)
+        workspace = None
+        if (task.task_state or {}).get("worktree_path"):
+            from aiive.project_paths import runtime_identity
+            from aiive.supervisor.slot_manager import SlotManager
+
+            manager = SlotManager()
+            active = manager.get_active_slot()
+            inactive = "B" if active == "A" else "A"
+            workspace = {
+                **runtime_identity(),
+                "canonical_source_root": task.task_state["source_repository"],
+                "task_workspace": task.task_state["worktree_path"],
+                "active_slot_pointer": active,
+                "inactive_slot": str(manager.base_dir / inactive / "app"),
+            }
         return {
+            "workspace": workspace,
             "task": {
                 "id": task.id,
                 "type": task.task_type,
@@ -246,6 +262,8 @@ def _compact_task_state(state: dict[str, Any]) -> dict[str, Any]:
     compact.pop("tool_discovery", None)
     compact.pop("searched_tool_queries", None)
     compact.pop("seen_tool_definitions", None)
+    compact.pop("workspace_observations", None)
+    compact.pop("workspace_delivery", None)
     compact.pop("validation_feedback", None)
     compact.pop("validation_messages", None)
     inputs = state.get("inputs")
