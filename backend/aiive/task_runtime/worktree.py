@@ -58,7 +58,7 @@ class WorktreeIsolation:
             and Path(probe.stdout.strip()).resolve() == destination.resolve()
         )
 
-    def create(self, task_id: str, base_ref: str = "HEAD") -> Path:
+    def create(self, task_id: str, base_ref: str = "HEAD", *, checkout: bool = True) -> Path:
         destination = self.path_for(task_id)
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.exists():
@@ -80,6 +80,8 @@ class WorktreeIsolation:
                 stderr=branch_probe.stderr,
             )
         command = ["git", "worktree", "add"]
+        if not checkout:
+            command.append("--no-checkout")
         if branch_probe.returncode == 1:
             command.extend(["-b", branch])
         command.extend([str(destination), branch if branch_probe.returncode == 0 else base_ref])

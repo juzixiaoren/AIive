@@ -15,6 +15,7 @@
 """
 
 import logging
+from dataclasses import replace
 from typing import Any
 
 from aiive.context.run_context import require_ctx as require_ctx
@@ -71,6 +72,7 @@ from aiive.tools.builtin_basic import (
     GetCurrentTimeTool,
 )
 from aiive.tools.builtin_shell import RunShellTool, ShellSessionTool
+from aiive.tools.shell_sessions import DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS
 from aiive.tools.workspace_files import ApplyPatchTool, EditFileTool, ReadFileTool, WriteFileTool
 from aiive.tools.builtin_files import (
     ReadTextFileTool,
@@ -189,10 +191,13 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
              "env": {"type": "dict", "description": "在任务环境之上覆盖变量，null 移除变量"},
              "background": {"type": "bool", "description": "立即返回 session_id，使用 shell_session 查询或取消"},
          }, "medium", True, False),
-        ("shell_session", ShellSessionTool, "查询本任务的 Bash 会话、按字符偏移续读输出，或请求取消。",
+        ("shell_session", ShellSessionTool, "等待本任务的 Bash 会话输出或结束，按字符偏移续读 stdout/stderr，或请求取消。",
          {"session_id": {"type": "str", "required": True},
           "stdout_offset": {"type": "int", "minimum": 0}, "stderr_offset": {"type": "int", "minimum": 0},
-          "limit": {"type": "int", "minimum": 1, "maximum": 16000}, "cancel": {"type": "bool"}},
+          "limit": {"type": "int", "minimum": 1, "maximum": 16000},
+          "wait_seconds": {"type": "int", "minimum": 1, "maximum": MAX_WAIT_SECONDS,
+                           "description": f"默认 {DEFAULT_WAIT_SECONDS} 秒；有新输出、结束或取消立即返回"},
+          "cancel": {"type": "bool", "description": "发出取消请求并立即返回"}},
          "low", False, False),
         ("read_file", ReadFileTool, "读取工作区文件、SHA256、字节数和 mtime_ns。行号从 1 开始，字节偏移从 0 开始。按返回的 next 字段续读。",
          {"path": {"type": "str", "required": True}, "encoding": {"type": "str"},
@@ -468,6 +473,9 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             can_delete=can_del,
             effect_mode=external_effect_modes.get(cap_id, "db_transactional"),
         )
+        if cap_id == "shell_session":
+            # The bounded wait fits inside the ordinary Action and resource leases.
+            safety = replace(safety, timeout_seconds=MAX_WAIT_SECONDS + 10)
         registry.register(tool_type(ToolDefinition(safety=safety, description=desc, parameters=params,
                                                    discovery=builtin_discovery(cap_id),
-                                                   cancellation_policy=CancellationPolicy.TRANSACTIONAL if issubclass(tool_type, DatabaseTool) else CancellationPolicy.COOPERATIVE if cap_id == "run_shell" else CancellationPolicy.NONE)))
+                                                   cancellation_policy=CancellationPolicy.TRANSACTIONAL if issubclass(tool_type, DatabaseTool) else CancellationPolicy.COOPERATIVE if cap_id in {"run_shell", "shell_session"} else CancellationPolicy.NONE)))

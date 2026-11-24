@@ -95,7 +95,7 @@ class ApplyPatchToInactiveSlotTool(BaseTool):
 
 class PromoteSlotTool(BaseTool):
     @override
-    def _run(self):
+    def _run(self, ctx: Any = None):
         """健康检查通过后将非活跃槽位提升为活跃版本。
 
         启用 Supervisor 时切换由守护进程执行，返回 status=switch_requested；
@@ -103,7 +103,7 @@ class PromoteSlotTool(BaseTool):
         """
         from aiive.supervisor.client import supervisor_client_from_settings
         from aiive.supervisor.release_manager import ReleaseManager
-        return ReleaseManager(client=supervisor_client_from_settings()).promote()
+        return ReleaseManager(client=supervisor_client_from_settings()).promote(task_id=ctx.task_id if ctx else None)
 
 
 class RunSelfdevRepairTool(BaseTool):
@@ -122,7 +122,7 @@ class RunSelfdevRepairTool(BaseTool):
                 return {"ok": False, "error": "workspace_must_be_task_root"}
             result = deliver_workspace(root, task_id=ctx.task_id, run_id=ctx.action_id, files=files)
             if result.get("ok") and promote:
-                result["promotion"] = PromoteSlotTool._run(self)
+                result["promotion"] = PromoteSlotTool._run(self, ctx=ctx)
                 result["ok"] = result["promotion"].get("ok", False)
             return result
         from aiive.selfdev.repair_loop import SelfDevRepairLoop

@@ -29,11 +29,14 @@ COPY alembic.ini ./
 COPY frontend ./frontend
 COPY apps ./apps
 COPY tests ./tests
+COPY docs ./docs
+COPY assets ./assets
+COPY conftest.py ./
 COPY scripts ./scripts
 COPY deploy ./deploy
 COPY shared ./shared
 COPY .github ./.github
-COPY .gitignore .dockerignore docker-compose.yml ./
+COPY .gitignore .gitattributes .dockerignore .env.example docker-compose.yml LICENSE README.md ./
 
 # 安装依赖（默认腾讯云 PyPI 镜像加速，适配国内服务器）
 RUN pip install --no-cache-dir -i "$PIP_INDEX_URL" ".[dev]"

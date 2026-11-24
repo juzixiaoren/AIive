@@ -9,6 +9,7 @@ from pathlib import Path
 from aiive.context.run_context import RunContext
 from aiive.tools.base import BaseTool, ToolExecutionContext
 from aiive.tools.local_shell import run_bash, shell_timeout
+from aiive.tools.shell_sessions import DEFAULT_WAIT_SECONDS, read_session
 from aiive.tools.workspace_files import workspace_path
 
 
@@ -50,13 +51,16 @@ class RunShellTool(BaseTool):
 class ShellSessionTool(BaseTool):
     def _run(
         self, session_id: str, stdout_offset: int = 0, stderr_offset: int = 0,
-        limit: int = 4000, cancel: bool = False, ctx: RunContext | None = None,
+        limit: int = 4000, cancel: bool = False, wait_seconds: int = DEFAULT_WAIT_SECONDS,
+        ctx: RunContext | None = None, _execution: ToolExecutionContext | None = None,
     ) -> dict:
         if not ctx or not ctx.task_id:
             raise ValueError("task_id_required")
-        from aiive.tools.shell_sessions import read_session
-
-        return read_session(ctx.task_id, session_id, stdout_offset, stderr_offset, limit, cancel)
+        return read_session(
+            ctx.task_id, session_id, stdout_offset, stderr_offset, limit, cancel,
+            wait_seconds=max(1, wait_seconds) if ctx.task_workspace else wait_seconds,
+            cancel_check=_cancel_check(_execution) if _execution else None,
+        )
 
 
 def _stamp(workspace: Path | None):

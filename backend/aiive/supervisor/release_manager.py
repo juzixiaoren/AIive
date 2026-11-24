@@ -54,7 +54,7 @@ class ReleaseManager:
         # None 表示未启用 Supervisor（例如 docker compose 由容器编排负责重启）。
         self._client: SupervisorClient | None = client
 
-    def promote(self, run_gate: bool = True) -> dict[str, Any]:
+    def promote(self, run_gate: bool = True, *, task_id: str | None = None) -> dict[str, Any]:
         with _release_lock:
             previous = self._manager.get_active_slot()
             if previous not in {"A", "B"}:
@@ -62,11 +62,12 @@ class ReleaseManager:
             current = "B" if previous == "A" else "A"
             # 候选版本核对（fail-closed）：被修复流程标记为不可晋升的槽位、
             # 或验证之后代码又被改动的槽位，一律不得晋升。
-            blocked = self._candidate_block(current)
+            blocked = self._candidate_block(current, task_id=task_id)
             if blocked is not None:
                 return blocked
             candidate_root = self._manager.base_dir / current
-            fingerprint = read_candidate_state(candidate_root).get("fingerprint")
+            candidate_state = read_candidate_state(candidate_root)
+            fingerprint = candidate_state.get("fingerprint")
             pre_switch_health = self._check_slot(current)
             if not pre_switch_health["healthy"]:
                 return {
@@ -91,20 +92,21 @@ class ReleaseManager:
                         "error": "Safety gate failed: promote blocked",
                         "gate": gate_result.to_summary(),
                     }
-            if (self._manager.get_active_slot() != previous or
-                    read_candidate_state(candidate_root).get("fingerprint") != fingerprint):
-                return {"ok": False, "error": "candidate_or_active_slot_changed"}
-            if blocked := self._candidate_block(current):
-                return blocked
+            if self._client is not None:
+                if (self._manager.get_active_slot() != previous
+                        or read_candidate_state(candidate_root) != candidate_state):
+                    return {"ok": False, "error": "candidate_or_active_slot_changed"}
+                if blocked := self._candidate_block(current, task_id=task_id):
+                    return blocked
             # Supervisor 托管：真正启动候选进程并验证，切换由守护进程完成。
             # 本进程随后会被替换，因此只提交请求并返回 accepted，不等待结果。
-            if self._client is not None:
                 if not self._client.available():
                     return {"ok": False, "error": "supervisor_unavailable", "previous_active": previous}
                 accepted = self._client.submit(
                     "promote",
                     {"target": current, "gate_ok": bool(run_gate),
-                     "fingerprint": fingerprint},
+                     "fingerprint": fingerprint, "task_id": task_id,
+                     "candidate_run_id": candidate_state.get("run_id")},
                     idempotency_key=str(uuid4()),
                 )
                 if not accepted.get("ok"):
@@ -130,8 +132,22 @@ class ReleaseManager:
                     "new_active": current,
                 }
 
-            manifest = self._manager._read_manifest(candidate_root)
-            self._manager.set_active_slot(current)
+            from aiive.selfdev.repair_guard import default_repair_lock
+
+            lock = default_repair_lock(self._manager)
+            handle = lock.acquire(run_id=str(uuid4()))
+            if handle is None:
+                return {"ok": False, "error": "concurrent_repair_in_progress"}
+            try:
+                if (self._manager.get_active_slot() != previous
+                        or read_candidate_state(candidate_root) != candidate_state):
+                    return {"ok": False, "error": "candidate_or_active_slot_changed"}
+                if blocked := self._candidate_block(current, task_id=task_id):
+                    return blocked
+                manifest = self._manager._read_manifest(candidate_root)
+                self._manager.set_active_slot(current)
+            finally:
+                lock.release(handle)
             result = {"ok": True, "previous_active": previous, "new_active": current}
             now = _now()
             state: dict[str, Any] = {
@@ -273,7 +289,7 @@ class ReleaseManager:
         except (OSError, ValueError):
             return {}
 
-    def _candidate_block(self, name: str) -> dict[str, Any] | None:
+    def _candidate_block(self, name: str, *, task_id: str | None = None) -> dict[str, Any] | None:
         """晋升前的候选版本核对：返回阻断结果，或 None 表示放行。
 
         只对"由修复流程登记过状态"的槽位生效（无状态文件的槽位保持原有行为）：
@@ -285,7 +301,7 @@ class ReleaseManager:
         )
         if slot is None:
             return None
-        blocked = candidate_promotion_block(slot.root)
+        blocked = candidate_promotion_block(slot.root, task_id=task_id)
         if blocked is None:
             return None
         return {

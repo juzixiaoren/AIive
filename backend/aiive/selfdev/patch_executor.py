@@ -7,7 +7,6 @@
 """
 
 import logging
-import shutil
 from pathlib import Path
 
 from aiive.supervisor.slot_manager import SlotManager, sync_app_tree
@@ -84,8 +83,11 @@ class PatchExecutor:
         if dst_manifest.resolve() != inactive_slot.root.resolve() / dst_manifest.name:
             return {"ok": False, "error": "invalid_inactive_slot_manifest_path"}
         if src_manifest.exists():
-            dst_manifest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_manifest, dst_manifest)
+            from aiive.supervisor.control import write_json_atomic
+
+            manifest = {key: value for key, value in active_slot.manifest.items()
+                        if not key.startswith("workspace_")}
+            write_json_atomic(dst_manifest, {**manifest, "slot": inactive_name})
 
         # 第二步：每次 apply 前从活跃槽位重新同步基线，避免上一次 apply 的
         # 残留文件叠加到本次结果（apply 本身保持幂等：同一操作列表重复应用

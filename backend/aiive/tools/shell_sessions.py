@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import codecs
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from threading import Thread
 from uuid import UUID, uuid4
@@ -16,6 +19,10 @@ from aiive.tools.local_shell import run_bash
 
 # Files let a different Outbox worker poll or cancel the owning process session.
 RETENTION_SECONDS = 7 * 86400
+DEFAULT_WAIT_SECONDS = 15
+MAX_WAIT_SECONDS = 20
+_POLL_INTERVAL = 0.15
+_LIVE_STATES = {"starting", "running"}
 
 
 def _directory(task_id: str, session_id: str) -> Path:
@@ -92,48 +99,89 @@ def _run_session(task_id: str, session_id: str) -> None:
         )
     except Exception as exc:
         result = {"ok": False, "error": str(exc), "exit_code": None}
-    _save(state_path, {"status": "finished", "result": result})
+    streams = _read(state_path).get("streams", {})
+    _save(state_path, {"status": "finished", "result": result, "streams": streams})
+
+
+def _read_stream(path: str, offset: int, limit: int, *, live: bool) -> str:
+    # A background writer may be between the bytes of a UTF-8 character or CRLF.
+    decoder = io.IncrementalNewlineDecoder(codecs.getincrementaldecoder("utf-8")("replace"), True)
+    pages: list[str] = []
+    remaining = limit
+    try:
+        with open(path, "rb") as handle:
+            while remaining:
+                raw = handle.read(16384)
+                text = decoder.decode(raw, final=not raw and not live)
+                skipped = min(offset, len(text))
+                offset -= skipped
+                page = text[skipped:skipped + remaining]
+                pages.append(page)
+                remaining -= len(page)
+                if not raw:
+                    break
+    except FileNotFoundError:
+        # The owner may be renaming the live log to the final artifact.
+        return ""
+    return "".join(pages)
 
 
 def read_session(
     task_id: str, session_id: str, stdout_offset: int = 0, stderr_offset: int = 0,
-    limit: int = 4000, cancel: bool = False,
+    limit: int = 4000, cancel: bool = False, *, wait_seconds: int = 0,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict:
     directory = _directory(task_id, session_id)
-    try:
-        state = _read(directory / "state.json")
-    except FileNotFoundError:
-        return {"ok": False, "error": "shell_session_not_found"}
-    if state["status"] != "finished" and not _owner_alive(state["pid"]):
-        state["status"] = "interrupted"
-    if cancel and state["status"] in {"starting", "running"}:
-        (directory / "cancel").touch()
-    result = dict(state.get("result") or {})
-    response = {"session_id": session_id, "status": state["status"], "cancel_requested": cancel}
-    for stream, offset in (("stdout", stdout_offset), ("stderr", stderr_offset)):
-        path = result.get(f"{stream}_log") or (state.get("streams") or {}).get(stream)
-        content = ""
-        if path:
-            try:
-                with open(path, encoding="utf-8", errors="replace") as handle:
-                    handle.read(offset)
-                    content = handle.read(limit)
-            except FileNotFoundError:
-                # Finalization atomically renames the live stream to its artifact path.
-                updated = _read(directory / "state.json")
-                final = (updated.get("result") or {}).get(f"{stream}_log")
-                if final:
-                    with open(final, encoding="utf-8", errors="replace") as handle:
-                        handle.read(offset)
-                        content = handle.read(limit)
-        response[stream] = content
-        response[f"{stream}_next_offset"] = offset + len(content)
-    if result:
-        response.update(command_ok=result.get("ok"), exit_code=result.get("exit_code"),
-                        timed_out=result.get("timed_out", False), cancelled=result.get("cancelled", False),
-                        error=result.get("error"), capture_truncated=result.get("capture_truncated"),
-                        stdout_log=result.get("stdout_log"), stderr_log=result.get("stderr_log"))
-    return response
+    deadline = time.monotonic() + min(max(wait_seconds, 0), MAX_WAIT_SECONDS)
+    cancel_file = directory / "cancel"
+    cancelling = cancel_file.exists()
+    observed: dict[str, tuple[str, int]] = {}
+    while True:
+        if cancel_check is not None and cancel_check():
+            if directory.is_dir():
+                cancel_file.touch()
+            from aiive.tools.base import ToolCancelled
+
+            raise ToolCancelled()
+        try:
+            state = _read(directory / "state.json")
+        except FileNotFoundError:
+            return {"ok": False, "error": "shell_session_not_found"}
+        status = state["status"]
+        if status in _LIVE_STATES and not _owner_alive(state["pid"]):
+            status = "interrupted"
+        live = status in _LIVE_STATES
+        if cancel and live:
+            cancel_file.touch()
+        result = state.get("result") or {}
+        response = {"session_id": session_id, "status": status, "cancel_requested": cancel_file.exists()}
+        for stream, offset in (("stdout", stdout_offset), ("stderr", stderr_offset)):
+            path = result.get(f"{stream}_log") or (state.get("streams") or {}).get(stream)
+            content = ""
+            if path:
+                try:
+                    stamp = (path, Path(path).stat().st_size)
+                except FileNotFoundError:
+                    stamp = (path, -1)
+                if not live or stamp != observed.get(stream):
+                    observed[stream] = stamp
+                    content = _read_stream(path, offset, limit, live=live)
+            response[stream] = content
+            response[f"{stream}_next_offset"] = offset + len(content)
+        if result:
+            response.update(command_ok=result.get("ok"), exit_code=result.get("exit_code"),
+                            timed_out=result.get("timed_out", False), cancelled=result.get("cancelled", False),
+                            error=result.get("error"), capture_truncated=result.get("capture_truncated"),
+                            stdout_log=result.get("stdout_log"), stderr_log=result.get("stderr_log"))
+        if not live or response["stdout"] or response["stderr"] or cancel or (
+            response["cancel_requested"] and not cancelling
+        ):
+            return response
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            response["wait_timed_out"] = wait_seconds > 0
+            return response
+        time.sleep(min(_POLL_INTERVAL, remaining))
 
 
 def task_has_live_sessions(task_id: str) -> bool:

@@ -13,6 +13,18 @@ from aiive.auth.security import signing_secret
 from aiive.mcp.installer import SANDBOX_ROOT
 from aiive.knowledge.access import allowed_knowledge_roots
 from aiive.runtime.tool_output_store import tool_output_root
+from aiive.supervisor.slot_manager import SlotManager
+
+slots = SlotManager()
+assert slots.get_active_slot() == 'A'
+assert (slots.runtime_dir / 'active_slot').read_text() == 'A'
+assert (slots.active_app_root() / 'backend/aiive/main.py').is_file()
+assert (slots.active_app_root() / 'backend/aiive/runtime/system_contract.py').is_file()
+assert (slots.active_app_root() / 'tests/unit/backend/test_coding_workspace.py').is_file()
+assert (slots.active_app_root() / '.env.example').is_file()
+assert not (slots.active_app_root() / '.env').exists()
+assert (slots.base_dir / 'B/app').is_dir()
+assert [slot.manifest['slot'] for slot in slots.list_slots()] == ['A', 'B']
 root = data_root()
 assert root == Path('/app/.data'), root
 assert object_store.ROOT == root / 'object_store'
@@ -49,6 +61,9 @@ def main():
         probe = subprocess.run(['docker', 'compose', 'exec', '-T', 'backend',
                                 'curl', '-fsS', 'http://localhost:8000/health'], capture_output=True)
         if probe.returncode == 0:
+            runtime = json.loads(compose('exec', '-T', 'backend', 'curl', '-fsS',
+                                         'http://localhost:8000/health?runtime=true'))['runtime']
+            assert runtime['loaded_slot'] == 'A', runtime
             break
         time.sleep(3)
     else:

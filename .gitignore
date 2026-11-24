@@ -91,6 +91,31 @@ coverage/
 # -----------------------------------------------------------------------------
 /.data/
 /pgdata/
+/data/
+postgres/
+qdrant/
+object_store/
+logs/
+*.pem
+*.key
+*.p12
+*.pfx
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+*.log
+id_rsa
+id_ed25519
+credentials.json
+.netrc
+.npmrc
+.pypirc
 # 检索评测与内存实测的生成产物（脚本与数据集本身入库）
 /scripts/rag_eval/last_run.json
 /.tmp_v46/

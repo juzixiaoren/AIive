@@ -6,7 +6,7 @@ from pathlib import Path
 
 from aiive.selfdev.repair_guard import CandidateSlotGuard, default_repair_lock
 from aiive.supervisor.slot_manager import create_version_manifest, tree_fingerprint
-from aiive.task_runtime.workspace import changes, copy_files, inventory, read_metadata, snapshot_hash, source_files
+from aiive.task_runtime.workspace import changes, copy_files, inventory, read_metadata, snapshot_hash
 from aiive.task_runtime.worktree import _run_git
 from aiive.tools.shell_sessions import task_has_live_sessions
 
@@ -20,6 +20,7 @@ def deliver_workspace(workspace: Path, *, task_id: str, run_id: str, files: list
         return {"ok": False, "error": "wait_for_workspace_shell_sessions"}
     metadata = read_metadata(workspace)
     before = inventory(workspace, git=metadata["git"])
+    workspace_hash = snapshot_hash(before)
     changed = changes(workspace, metadata, before)
     if not changed:
         return {"ok": False, "error": "workspace_has_no_changes"}
@@ -46,8 +47,8 @@ def deliver_workspace(workspace: Path, *, task_id: str, run_id: str, files: list
         with tempfile.TemporaryDirectory(prefix="candidate-", dir=candidate.root) as staging:
             staged = Path(staging) / "app"
             staged.mkdir()
-            copy_files(workspace, staged, source_files(workspace, git=metadata["git"]))
-            if inventory(staged, paths=before) != before:
+            copy_files(workspace, staged, list(before))
+            if inventory(staged) != before:
                 return {"ok": False, "error": "workspace_changed_during_copy"}
             fingerprint = tree_fingerprint(staged)
             if guard.manager.get_active_slot() != active:
@@ -58,15 +59,17 @@ def deliver_workspace(workspace: Path, *, task_id: str, run_id: str, files: list
             staged.replace(target)
         report = TargetedTestRunner(repo_root=target).run_for_changed_files(verification_files)
         output = {"candidate_root": str(target), "candidate_slot": candidate.name, "run_id": run_id,
-                  "changed_files": changed, "workspace_hash": snapshot_hash(before), "targeted_test_report": report}
+                  "changed_files": changed, "workspace_hash": workspace_hash, "targeted_test_report": report}
         if not report.get("ok"):
             if metadata.get("base_commit"):
-                diff = _run_git(["diff", "--no-ext-diff", metadata["base_commit"], "--"], workspace, check=False)
+                diff = _run_git(["diff", "--no-ext-diff", metadata["base_commit"], "--", *changed], workspace, check=False)
                 if diff.returncode == 0:
                     output["git_diff"] = diff.stdout[:8000]
                     output["git_diff_truncated"] = len(diff.stdout) > 8000
-            guard.mark_not_promotable(candidate.name, reason="targeted_tests_failed", run_id=run_id)
-            return {**output, "ok": False, "error": "targeted_tests_failed"}
+            reason = ("targeted_validation_deferred" if report.get("status") == "deferred"
+                      else "targeted_tests_failed")
+            guard.mark_not_promotable(candidate.name, reason=reason, run_id=run_id)
+            return {**output, "ok": False, "error": reason}
         gate = evaluate_promotion_gate(candidate.root)
         output["gate"] = gate.to_summary()
         if not gate.ok:
@@ -81,11 +84,13 @@ def deliver_workspace(workspace: Path, *, task_id: str, run_id: str, files: list
         manifest = create_version_manifest(candidate.name)
         manifest["prompt_catalog_sha256"] = prompts.catalog_sha256
         manifest["stable_contract_audit_ref"] = prompts.render("agent.stable_contract").audit_ref
-        manifest.update(source_snapshot=True, workspace_task_id=task_id, workspace_action_id=run_id)
+        manifest.update(source_snapshot=True, workspace_task_id=task_id, workspace_action_id=run_id,
+                        workspace_hash=workspace_hash)
         from aiive.supervisor.control import write_json_atomic
 
         write_json_atomic(candidate.root / "version_manifest.json", manifest)
-        guard.mark_promotable(candidate.name, run_id=run_id, fingerprint=fingerprint, gate_ok=True)
+        guard.mark_promotable(candidate.name, run_id=run_id, fingerprint=fingerprint, gate_ok=True,
+                              workspace_task_id=task_id, workspace_hash=workspace_hash)
         return {**output, "ok": True, "status": "tests_passed", "fingerprint": fingerprint}
     finally:
         lock.release(handle)

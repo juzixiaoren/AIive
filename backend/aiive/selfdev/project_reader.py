@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from aiive.source_snapshot import excluded_source_path
+
 logger = logging.getLogger(__name__)
 
 MAX_FILE_BYTES = 40_000
@@ -19,22 +21,6 @@ MAX_SCAN_BYTES = 1_000_000
 MAX_MATCHES = 200
 MAX_MATCHES_IN_PROMPT = 30
 MAX_CONTEXT_FILES = 8
-
-# 这些目录不参与代码理解：版本控制、虚拟环境、依赖、缓存、运行数据与数据库。
-DENIED_DIR_PARTS: frozenset[str] = frozenset({
-    ".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache",
-    ".mypy_cache", ".ruff_cache", "dist", "build", ".next", "coverage",
-    ".data", "postgres", "qdrant",
-    "object_store", "logs",
-})
-
-DENIED_FILE_NAMES: frozenset[str] = frozenset({
-    "id_rsa", "id_ed25519", "credentials.json", ".netrc", ".npmrc", ".pypirc",
-})
-
-DENIED_SUFFIXES: tuple[str, ...] = (
-    ".pem", ".key", ".p12", ".pfx", ".sqlite", ".sqlite3", ".db", ".log",
-)
 
 TEXT_SUFFIXES: frozenset[str] = frozenset({
     ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".toml", ".yaml", ".yml",
@@ -136,6 +122,8 @@ class ProjectReader:
         resolved = (self._root / relative).resolve()
         if not resolved.is_relative_to(self._root):
             raise ValueError(f"path escapes repo root: {value}")
+        if self._is_denied(PurePosixPath(resolved.relative_to(self._root).as_posix())):
+            raise ValueError(f"excluded repo path: {value}")
         return resolved
 
     @staticmethod
@@ -146,15 +134,7 @@ class ProjectReader:
     @staticmethod
     def _is_denied(relative: PurePosixPath) -> bool:
         """判断路径是否属于禁止读取的目录/文件。"""
-        if ((relative.parts and relative.parts[0] in {"runtime", "slots"})
-                or any(part in DENIED_DIR_PARTS for part in relative.parts[:-1])):
-            return True
-        name = relative.name
-        if name in DENIED_FILE_NAMES:
-            return True
-        if name.startswith(".env") and name != ".env.example":
-            return True
-        return name.lower().endswith(DENIED_SUFFIXES)
+        return excluded_source_path(relative)
 
     def _iter_files(self) -> Iterator[tuple[str, Path]]:
         """遍历仓库内可读的文本文件，跳过禁止目录与超大文件。"""
@@ -173,7 +153,9 @@ class ProjectReader:
                     relative = PurePosixPath(self._relative(path, self._root))
                 except ValueError:
                     continue
-                if self._is_denied(relative) or not path.resolve().is_relative_to(self._root):
+                try:
+                    self._resolve(relative.as_posix())
+                except (ValueError, OSError, RuntimeError):
                     continue
                 if path.suffix.lower() not in TEXT_SUFFIXES:
                     continue

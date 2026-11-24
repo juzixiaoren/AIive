@@ -11,36 +11,50 @@ import tempfile
 import time
 from collections.abc import Iterable
 from datetime import timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+
+from aiive.source_snapshot import excluded_source_path
 
 from aiive.storage.data_paths import data_path, data_root
 from aiive.task_runtime.worktree import WorktreeIsolation, _run_git
 
-# Generated directories are omitted from snapshots, not from development operations.
-GENERATED = {".git", "__pycache__", "node_modules", ".venv", ".pytest_cache",
-             ".ruff_cache", ".mypy_cache", "dist", "build", "coverage"}
-ROOT_STATE = {".data", "slots", "runtime", "pgdata"}
 TERMINAL = {"succeeded", "failed", "partial", "cancelled", "expired"}
 _last_scan = 0.0
 
 
 def source_files(root: Path, *, git: bool = False) -> list[str]:
-    if git:
-        entries = _run_git(["ls-files", "-z", "--cached", "--others", "--exclude-standard"], root, check=True)
-        return sorted({name for name in entries.stdout.split("\0") if name and
-                       ((root / name).is_file() or (root / name).is_symlink())})
     from aiive.project_paths import runtime_root, slots_root
 
-    excluded_roots = {data_root(), slots_root(), runtime_root()}
+    root = root.resolve()
+    excluded_roots = {folder for folder in (data_root(), slots_root(), runtime_root())
+                      if folder != root and folder.is_relative_to(root)}
+
+    def allowed(name: str) -> bool:
+        path = root / name
+        if excluded_source_path(PurePosixPath(name)):
+            return False
+        if not path.is_file() and not path.is_symlink():
+            return False
+        try:
+            resolved = path.resolve()
+        except (OSError, RuntimeError):
+            return False
+        return (resolved.is_relative_to(root)
+                and not excluded_source_path(PurePosixPath(resolved.relative_to(root).as_posix()),
+                                             directory=resolved.is_dir())
+                and not any(resolved.is_relative_to(folder) for folder in excluded_roots)
+                and not (path.is_symlink() and Path(os.readlink(path)).is_absolute()))
+
+    if git:
+        entries = _run_git(["ls-files", "-z", "--cached", "--others", "--exclude-standard"], root, check=True)
+        return sorted({name for name in entries.stdout.split("\0") if name and allowed(name)})
     files = []
     for directory, dirs, names in os.walk(root):
         base = Path(directory)
-        excluded = GENERATED | (ROOT_STATE if base == root else set())
-        dirs[:] = [name for name in dirs if name not in excluded and (base / name) not in excluded_roots]
-        files.extend((base / name).relative_to(root).as_posix() for name in names
-                     if name not in GENERATED and not name.endswith((".pyc", ".pyo"))
-                     and (name == ".env.example" or not name.startswith(".env"))
-                     and ((base / name).is_file() or (base / name).is_symlink()))
+        dirs[:] = [name for name in dirs if (base / name) not in excluded_roots
+                   and not excluded_source_path(PurePosixPath((base / name).relative_to(root).as_posix()),
+                                                directory=True)]
+        files.extend(relative for name in names if allowed(relative := (base / name).relative_to(root).as_posix()))
     return sorted(files)
 
 
@@ -87,8 +101,24 @@ def snapshot_hash(files: dict[str, str]) -> str:
 def changes(workspace: Path, metadata: dict, current: dict[str, str] | None = None) -> list[str]:
     if current is None:
         current = inventory(workspace, git=metadata["git"])
-    original = metadata["files"]
+    original = {name: value for name, value in metadata["files"].items()
+                if not excluded_source_path(PurePosixPath(name))}
     return sorted(name for name in current.keys() | original.keys() if current.get(name) != original.get(name))
+
+
+def verified_workspace_hash(task_id: str) -> str | None:
+    from aiive.tools.shell_sessions import task_has_live_sessions
+
+    try:
+        if task_has_live_sessions(task_id):
+            return None
+        workspace = data_path("task-worktrees", WorktreeIsolation._safe_task_id(task_id))
+        metadata = read_metadata(workspace)
+        if not workspace.is_dir():
+            return None
+        return snapshot_hash(inventory(workspace, git=metadata["git"]))
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        return None
 
 
 def metadata_path(workspace: Path) -> Path:
@@ -97,6 +127,23 @@ def metadata_path(workspace: Path) -> Path:
 
 def read_metadata(workspace: Path) -> dict:
     return json.loads(metadata_path(workspace).read_text(encoding="utf-8"))
+
+
+def _checkout_workspace(workspace: Path) -> None:
+    """Populate a Git worktree without materializing excluded tracked files."""
+    _run_git(["read-tree", "HEAD"], workspace, check=True)
+    tracked = _run_git(["ls-files", "-z"], workspace, check=True).stdout.split("\0")
+    paths = [name for name in tracked if name and not excluded_source_path(PurePosixPath(name))]
+    if paths:
+        subprocess.run(
+            ["git", "checkout-index", "--force", "-z", "--stdin"], cwd=workspace, check=True,
+            input=("\0".join(paths) + "\0").encode("utf-8"), capture_output=True, timeout=30,
+        )
+    copied = set(source_files(workspace, git=True))
+    for name in set(paths) - copied:
+        path = workspace / name
+        if path.is_symlink() or path.is_file():
+            path.unlink()
 
 
 def create_workspace(task_id: str, canonical: Path, *, selfdev: bool = False) -> tuple[Path, dict]:
@@ -109,7 +156,8 @@ def create_workspace(task_id: str, canonical: Path, *, selfdev: bool = False) ->
     except (ValueError, FileNotFoundError):
         isolation = None
     if isolation is not None:
-        isolation.create(task_id)
+        isolation.create(task_id, checkout=False)
+        _checkout_workspace(workspace)
     else:
         if workspace.exists():
             # A missing receipt means no task actions were dispatched from this copy.
@@ -121,20 +169,23 @@ def create_workspace(task_id: str, canonical: Path, *, selfdev: bool = False) ->
         from aiive.supervisor.slot_manager import SlotManager, tree_fingerprint
 
         manager = SlotManager()
+        if (canonical / "backend" / "aiive" / "main.py").is_file():
+            manager.ensure_initialized(canonical)
         active = manager.active_app_root()
         slot = manager.get_active_slot()
-        full_snapshot = manager._read_manifest(active.parent).get("source_snapshot") is True
+        manifest = manager._read_manifest(active.parent)
+        full_snapshot = manifest.get("source_snapshot") is True or manifest.get("bootstrap_snapshot") is True
         if (active / "backend" / "aiive").is_dir():
             active_files = source_files(active)
             if full_snapshot:
                 for name in set(source_files(workspace, git=isolation is not None)) - set(active_files):
                     (workspace / name).unlink()
             copy_files(active, workspace, active_files)
-            if isolation is not None and _run_git(["status", "--porcelain"], workspace, check=True).stdout:
-                _run_git(["add", "-A"], workspace, check=True)
-                _run_git(["-c", "user.name=AIive", "-c", "user.email=worker@aiive.local",
-                          "commit", "-m", "Record deployed workspace baseline"], workspace, check=True)
         deployment = {"active_slot": slot, "active_fingerprint": tree_fingerprint(active)}
+    if isolation is not None and _run_git(["status", "--porcelain"], workspace, check=True).stdout:
+        _run_git(["add", "-A"], workspace, check=True)
+        _run_git(["-c", "user.name=AIive", "-c", "user.email=worker@aiive.local",
+                  "commit", "-m", "Record task workspace baseline"], workspace, check=True)
     base_commit = _run_git(["rev-parse", "HEAD"], workspace, check=True).stdout.strip() if isolation else None
     metadata = {"git": isolation is not None, "base_commit": base_commit,
                 "source": str(canonical), "deployment": deployment,

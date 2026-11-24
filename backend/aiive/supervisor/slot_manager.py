@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import shutil
+import tempfile
 
 from aiive.project_paths import runtime_root, slots_root
 from uuid import uuid4
@@ -126,6 +127,47 @@ class SlotManager:
             ))
         return result
 
+    def ensure_initialized(self, canonical: Path) -> None:
+        """Seed the first deployed version without resetting or replacing an existing slot."""
+        from filelock import FileLock
+
+        from aiive.supervisor.control import write_json_atomic
+        from aiive.task_runtime.workspace import copy_files, source_files
+
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        with FileLock(str(self.runtime_dir / "slot-bootstrap.lock"), timeout=120):
+            active = self.get_active_slot()
+            if active not in {"A", "B"}:
+                raise ValueError("invalid_active_slot")
+            populated: list[str] = []
+            for name in ("A", "B"):
+                if not self.has_local_slot_paths(name):
+                    raise ValueError("invalid_slot_path")
+                root = self.base_dir / name
+                app = root / "app"
+                app.mkdir(parents=True, exist_ok=True)
+                if any(app.iterdir()):
+                    populated.append(name)
+                manifest = root / "version_manifest.json"
+                if not manifest.exists():
+                    write_json_atomic(manifest, create_version_manifest(name))
+            if not populated:
+                if not (canonical / "backend" / "aiive" / "main.py").is_file():
+                    raise ValueError("canonical_source_missing")
+                root = self.base_dir / active
+                with tempfile.TemporaryDirectory(prefix="bootstrap-", dir=self.base_dir) as directory:
+                    staged = Path(directory) / "app"
+                    staged.mkdir()
+                    copy_files(canonical, staged, source_files(canonical, git=(canonical / ".git").exists()))
+                    if not (staged / "backend" / "aiive" / "main.py").is_file():
+                        raise ValueError("canonical_snapshot_incomplete")
+                    manifest = self._read_manifest(root)
+                    write_json_atomic(root / "version_manifest.json", {**manifest, "bootstrap_snapshot": True})
+                    (root / "app").rmdir()
+                    staged.replace(root / "app")
+            if not self._active_file.exists():
+                self.set_active_slot(active if not populated or active in populated else populated[0])
+
     def init_slots(self) -> None:
         """
         初始化 A/B 槽位结构。
@@ -222,10 +264,13 @@ def tree_fingerprint(root: Path | str | None) -> str | None:
 
 def sync_app_tree(source_app: Path, target_app: Path) -> None:
     """把 source_app 完整同步为 target_app（先删旧树，再整树复制）。"""
+    from aiive.task_runtime.workspace import copy_files, source_files
+
     if source_app.exists():
+        paths = source_files(source_app, git=(source_app / ".git").exists())
         if target_app.exists():
             shutil.rmtree(target_app)
-        shutil.copytree(source_app, target_app)
+        copy_files(source_app, target_app, paths)
     target_app.mkdir(parents=True, exist_ok=True)
 
 
@@ -263,22 +308,37 @@ def clear_candidate_state(slot_root: Path | str) -> None:
     candidate_state_path(slot_root).unlink(missing_ok=True)
 
 
-def candidate_promotion_block(slot_root: Path | str) -> str | None:
+def candidate_promotion_block(slot_root: Path | str, *, task_id: str | None = None) -> str | None:
     """晋升前的候选状态核对（fail-closed）：返回阻断原因，None 表示放行。
 
     - 状态标记 promotable=false：槽位里是失败/未验证的代码，禁止晋升；
     - 登记的代码指纹与当前 app/ 不一致：验证之后代码被改动，禁止晋升。
     没有状态文件时返回 None，保持未接入修复流程的槽位原有行为。
     """
-    state = read_candidate_state(slot_root)
-    if not state:
-        return None
-    if state.get("promotable") is False:
+    from aiive.supervisor.control import read_json
+
+    root = Path(slot_root)
+    state = read_candidate_state(root)
+    manifest = read_json(root / "version_manifest.json")
+    if not state and candidate_state_path(root).exists():
+        return "candidate_state_unreadable"
+    if state and state.get("promotable") is not True:
         return "candidate_not_promotable: " + str(state.get("reason") or "unknown")
     expected = str(state.get("fingerprint") or "")
-    if not expected:
-        return None
-    if tree_fingerprint(Path(slot_root) / "app") != expected:
+    owner = manifest.get("workspace_task_id")
+    if owner or state.get("workspace_hash"):
+        if not task_id or owner != task_id or state.get("workspace_task_id") != task_id:
+            return "candidate_belongs_to_another_task"
+        if (not expected or not state.get("run_id") or state.get("gate_ok") is not True
+                or manifest.get("workspace_action_id") != state.get("run_id")
+                or not state.get("workspace_hash")
+                or manifest.get("workspace_hash") != state["workspace_hash"]):
+            return "workspace_candidate_requires_redelivery"
+        from aiive.task_runtime.workspace import verified_workspace_hash
+
+        if verified_workspace_hash(task_id) != state["workspace_hash"]:
+            return "workspace_changed_since_validation: deliver and validate the current workspace"
+    if expected and tree_fingerprint(root / "app") != expected:
         return (
             "candidate_fingerprint_mismatch: candidate code changed after verification"
         )

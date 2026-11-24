@@ -175,7 +175,10 @@ class Supervisor:
 
     def recover(self) -> dict[str, Any]:
         """Supervisor 启动时的状态收敛：接管、清理、必要时回滚。"""
+        from aiive.project_paths import source_root
+
         self.paths.ensure()
+        self.slots.ensure_initialized(source_root())
         # 上一实例若在切换中途崩溃，switch.lock 会残留；此时我们是唯一实例，可安全清理。
         self.paths.switch_lock.unlink(missing_ok=True)
         state = self.state()
@@ -320,9 +323,12 @@ class Supervisor:
         from aiive.supervisor.slot_manager import candidate_promotion_block, read_candidate_state
 
         target_root = self._slot_root(target)
-        blocked = candidate_promotion_block(target_root)
+        candidate_state = read_candidate_state(target_root)
+        blocked = candidate_promotion_block(target_root, task_id=payload.get("task_id"))
         expected = payload.get("fingerprint")
-        if blocked or (expected and read_candidate_state(target_root).get("fingerprint") != expected):
+        expected_run = payload.get("candidate_run_id")
+        if (blocked or (expected and candidate_state.get("fingerprint") != expected)
+                or (expected_run and candidate_state.get("run_id") != expected_run)):
             return {"ok": False, "status": "rejected", "error": blocked or "candidate_changed"}
         static = self._static_health(target)
         if not static["healthy"]:
@@ -420,6 +426,13 @@ class Supervisor:
                 "health": health.get("health"), "rollback": restore,
                 "active_slot": self.slots.get_active_slot(),
             }
+
+        if candidate_state.get("workspace_hash"):
+            blocked = candidate_promotion_block(target_root, task_id=payload.get("task_id"))
+            if blocked:
+                self.controller.stop(new_record)
+                restore = self._restore_previous(active, reason=blocked)
+                return {"ok": False, "status": "switch_failed", "error": blocked, "rollback": restore}
 
         self.slots.set_active_slot(target)
         monitor_until = (

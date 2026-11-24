@@ -26,5 +26,6 @@ slots
 runtime
 .env.*
 !.env.example
+!**/.env.example
 **/*.jks
 **/*.keystore

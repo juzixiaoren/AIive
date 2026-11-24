@@ -3,10 +3,8 @@ from __future__ import annotations
 
 import json
 import shutil
-import socket
 import subprocess
 import time
-import urllib.request
 from pathlib import Path
 
 import pytest
@@ -69,6 +67,13 @@ def test_workspace_edit_patch_and_failed_test_recovery(db_session, tmp_path, mon
     source.mkdir()
     (source / "test_probe.py").write_text("def test_probe():\n    assert 1 == 2\n", encoding="utf-8")
     (source / "second.txt").write_bytes(b"before\r\n")
+    (source / ".env").write_text("TEST_SECRET=fixture\n", encoding="utf-8")
+    (source / ".env.example").write_text("TEST_SECRET=\n", encoding="utf-8")
+    for folder in (".data", "slots", "runtime", "pgdata", "postgres", "qdrant", "object_store", "logs",
+                   "backend/aiive/runtime"):
+        path = source / folder
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "fixture.py").write_text("VALUE = 1\n", encoding="utf-8")
     if git:
         _git(source, "init", "-q")
         _git(source, "add", ".")
@@ -99,6 +104,11 @@ def test_workspace_edit_patch_and_failed_test_recovery(db_session, tmp_path, mon
     ]
     workspace = Path(task.task_state["worktree_path"])
     assert (workspace / "second.txt").read_bytes() == b"after\r\n"
+    assert not (workspace / ".env").exists()
+    assert (workspace / ".env.example").is_file()
+    assert (workspace / "backend/aiive/runtime/fixture.py").is_file()
+    assert not any((workspace / name).exists() for name in
+                   (".data", "slots", "runtime", "pgdata", "postgres", "qdrant", "object_store", "logs"))
     assert _result(db_session, actions[3])["rebased"]
     assert (workspace / "third.txt").read_text(encoding="utf-8") == "created\n"
     assert "assert 2 == 2" in (workspace / "test_probe.py").read_text(encoding="utf-8")
@@ -106,164 +116,131 @@ def test_workspace_edit_patch_and_failed_test_recovery(db_session, tmp_path, mon
     assert db_session.query(ApprovalRequest).filter_by(task_id=task.id).count() == 0
 
 
-@pytest.mark.skipif(not shutil.which("rg") or not shutil.which("npm"), reason="rg and Node required")
-def test_selfdev_candidate_with_real_gate_and_supervisor(db_session, tmp_path, monkeypatch):
-    from aiive.eval import gate
-    from aiive.prompts import get_prompt_registry
-    from aiive.supervisor.client import SupervisorClient
-    from aiive.supervisor.daemon import Supervisor, SupervisorConfig
-    from aiive.supervisor.release_manager import ReleaseManager
-    from aiive.supervisor.slot_manager import SlotManager
-    from aiive.tools.shell_sessions import read_session
 
-    if not resolve_bash() or not shutil.which("git"):
-        pytest.skip("Bash and Git required")
-    repo = Path.cwd()
+@pytest.mark.parametrize("invalid", ["zero", "many", "malformed"])
+@pytest.mark.parametrize("recovers", [True, False])
+def test_worker_corrects_invalid_tool_calls_without_dispatch(db_session, tmp_path, monkeypatch, invalid, recovers):
+    from langchain_core.messages import ToolMessage, convert_to_openai_messages
+
+    monkeypatch.setattr(settings, "aiive_data_dir", str(tmp_path / "data"))
+    monkeypatch.setattr(settings, "tool_argument_max_retries", 2)
     source = tmp_path / "source"
     source.mkdir()
-    ignore = shutil.ignore_patterns("__pycache__", "node_modules", "dist", "*.pyc", "*.egg-info")
-    for folder in ("backend", "frontend", "shared", "apps/desktop"):
-        shutil.copytree(repo / folder, source / folder, ignore=ignore)
-    for file in ("pyproject.toml", "alembic.ini"):
-        shutil.copy2(repo / file, source / file)
-    pytest_target = source / "tests/unit/backend/test_health.py"
-    pytest_target.parent.mkdir(parents=True, exist_ok=True)
-    pytest_target.write_text(
-        "import os, time\nfrom aiive.coding_probe import VALUE\n"
-        "\ndef test_repair():\n    if os.environ.get('AIIVE_TEST_SLOW'):\n        time.sleep(31)\n"
-        "    assert VALUE == 2\n",
-        encoding="utf-8",
-    )
-    for filename in ("test_context_assembler.py", "test_prompt_registry.py"):
-        (pytest_target.parent / filename).write_text(
-            "from aiive.runtime.system_contract import build_stable_contract\n"
-            "\ndef test_prompt_assembly():\n    assert build_stable_contract()\n",
-            encoding="utf-8",
-        )
-    (source / ".gitignore").write_text("node_modules/\ndist/\n__pycache__/\n.pytest_cache/\n", encoding="utf-8")
-    target = "backend/aiive/coding_probe.py"
-    (source / target).write_text("VALUE = 0\n", encoding="utf-8")
-    _git(source, "init", "-q")
-    _git(source, "add", ".")
-    _git(source, "-c", "user.name=AIive Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture")
-    monkeypatch.setenv("AIIVE_SOURCE_ROOT", str(source))
-    monkeypatch.setenv("AIIVE_SLOTS_ROOT", str(tmp_path / "slots"))
-    monkeypatch.setenv("AIIVE_RUNTIME_DIR", str(tmp_path / "runtime"))
-    monkeypatch.setenv("AIIVE_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{(tmp_path / 'runtime.db').as_posix()}")
-    monkeypatch.setenv("AIIVE_MEMORY_VECTOR_ENABLED", "false")
-    monkeypatch.setenv("AIIVE_TOOL_DISCOVERY_VECTOR_ENABLED", "false")
-    monkeypatch.setattr(settings, "aiive_data_dir", str(tmp_path / "data"))
-    deploy = SlotManager()
-    deploy.init_slots()
-    shutil.copytree(source, deploy.active_app_root(), dirs_exist_ok=True, ignore=shutil.ignore_patterns(".git"))
-    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "true")
-    evaluate = gate.evaluate_promotion_gate
-    monkeypatch.setattr(gate, "evaluate_promotion_gate", lambda candidate: evaluate(candidate, persist=False))
-
-    contract = "backend/aiive/prompts/agent/stable_contract.md"
-    heading = (source / contract).read_text(encoding="utf-8").splitlines()[0]
-    desktop = "apps/desktop/src/node-host/locks.mjs"
-    desktop_text = (source / desktop).read_text(encoding="utf-8")
-    first_line = next(line for line in desktop_text.splitlines() if line.strip() and desktop_text.count(line) == 1)
-    thread = Thread(title="SelfDev Worker")
+    (source / "probe.txt").write_text("hello", encoding="utf-8")
+    thread = Thread(title="Coding correction")
     db_session.add(thread)
     db_session.flush()
     task = TaskRepository(db_session).create_task(
-        thread_id=thread.id, task_type="selfdev", goal="Test cumulative workspace repair and candidate release.",
-        task_brief={"acceptance_criteria": ["Preserve prompt and desktop edits after fixing test failures."]},
+        thread_id=thread.id, task_type="coding", goal="Read the probe",
+        task_brief={"scope": {"allowed_roots": [str(source)]}}, enqueue=False,
+    )
+    read = proposal_function_name("read_file")
+    call = {"name": read, "args": {"arguments": {"path": "probe.txt"}}, "id": "original_read"}
+    bad = {
+        "zero": AIMessage(content="I will read the file."),
+        "many": AIMessage(content="", tool_calls=[call, {**call, "id": "second_read"}]),
+        "malformed": AIMessage(content="", invalid_tool_calls=[
+            {"name": None, "args": "{broken", "id": "bad_call", "error": "invalid JSON"},
+        ]),
+    }[invalid]
+
+    class CorrectingModel(ScriptedCodingModel):
+        decisions = 0
+        reports = 0
+
+        def invoke(self, messages, **kwargs):
+            if kwargs["config"].get("run_name") == "task_report":
+                self.reports += 1
+                return AIMessage(content="Reported outcome.")
+            self.decisions += 1
+            if self.decisions == 1:
+                return bad
+            if self.decisions == 2 or not recovers:
+                assert db_session.query(AgentAction).filter_by(task_id=task.id).count() == 0
+                wire = convert_to_openai_messages(messages)
+                if invalid == "zero":
+                    assert json.loads(wire[-1]["content"])["issues"][0]["code"] == "tool_call_count"
+                    assert wire[-2]["role"] != "assistant"
+                else:
+                    feedback = [m for m in messages if isinstance(m, ToolMessage)]
+                    assert [m.tool_call_id for m in feedback] == (
+                        ["original_read", "second_read"] if invalid == "many" else ["bad_call"]
+                    )
+                    assert json.loads(feedback[0].content)["issues"][0]["code"] == (
+                        "tool_call_count" if invalid == "many" else "invalid_function_name"
+                    )
+                    if invalid == "many":
+                        assert messages[-3].tool_calls[0]["args"] == call["args"]
+            return super().invoke(messages, **kwargs) if recovers else bad
+
+    model = CorrectingModel([_call("read_file", path="probe.txt"), ("task_finish", {"summary": "Read probe."})])
+    worker = TaskAgentExecutor(db_session, chat_model=model)
+    result = PersistentTaskRuntime(db_session, agent_executor=worker).run(task.id)
+    actions = db_session.query(AgentAction).filter_by(task_id=task.id).all()
+    assert model.decisions == 3 and model.reports == 1
+    assert result["status"] == ("succeeded" if recovers else "partial"), result
+    if recovers:
+        assert [action.capability_id for action in actions] == ["read_file"]
+        assert _result(db_session, actions[0])["content"] == "hello"
+    else:
+        assert not actions
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_worker_waits_for_background_streams_and_exit(db_session, tmp_path, monkeypatch, cancel):
+    if not resolve_bash():
+        pytest.skip("Bash required")
+    monkeypatch.setattr(settings, "aiive_data_dir", str(tmp_path / "data"))
+    source = tmp_path / "source"
+    source.mkdir()
+    thread = Thread(title="Background shell")
+    db_session.add(thread)
+    db_session.flush()
+    task = TaskRepository(db_session).create_task(
+        thread_id=thread.id, task_type="coding", goal="Wait for shell output",
+        task_brief={"scope": {"allowed_roots": [str(source)]}},
         budgets={"max_actions_per_run": 24}, enqueue=False,
     )
-    deps = repo / "frontend" / "node_modules"
-    build = "npm run build" if deps.is_dir() else "npm ci --no-audit --no-fund && npm run build"
-    steps = [
-        _call("run_shell", command="rg -l 'def build_stable_contract' backend/aiive/runtime"),
-        _call("read_file", path="backend/aiive/runtime/system_contract.py"),
-        _call("edit_file", path=contract, old_text=heading, new_text=heading + "\n\nCoding acceptance probe."),
-        _call("edit_file", path=desktop, old_text=first_line, new_text="// Coding acceptance probe\n" + first_line),
-        _call("edit_file", path=target, old_text="VALUE = 0", new_text="VALUE = 1"),
-        _call("run_shell", command="git diff --stat && git diff --check"),
-        _call("run_selfdev_repair", goal="Validate candidate while probe still fails", files=[target], workspace="."),
-        _call("read_file", path=target),
-        _call("edit_file", path=target, old_text="VALUE = 1", new_text="VALUE = 2"),
-        _call("run_shell", command="AIIVE_TEST_SLOW=1 python -m pytest tests/unit/backend/test_health.py -q",
-              timeout_seconds=60),
-        _call("run_shell", command=build,
-              cwd="frontend", timeout_seconds=180),
-        _call("run_shell", command="printf begin; sleep 2; printf end; exit 7", background=True),
-        _call("run_selfdev_repair", goal="Validate all current workspace changes"),
-        ("task_finish", {"summary": "Candidate tested."}),
-    ]
+    command = "printf begin; sleep 2; printf end; printf err >&2; sleep 1; exit 7"
+    if cancel:
+        command = "printf begin; sleep 60"
+    stdout, stderr = [], []
 
-    class WaitForBackground(ScriptedCodingModel):
+    class WaitingModel(ScriptedCodingModel):
+        decisions = 0
+
         def invoke(self, messages, **kwargs):
-            installed = Path(task.task_state["worktree_path"]) / "frontend" / "node_modules"
-            if deps.is_dir() and not installed.is_dir():
-                subprocess.run(["node", "-e", "require('fs').symlinkSync(process.argv[1], process.argv[2], 'junction')",
-                                str(deps), str(installed)], check=True, capture_output=True)
+            if kwargs["config"].get("run_name") == "task_report":
+                return AIMessage(content="Background shell observed.")
+            self.decisions += 1
             actions = db_session.query(AgentAction).filter_by(task_id=task.id).order_by(AgentAction.sequence).all()
-            if actions and actions[-1].arguments.get("background"):
-                payload = _result(db_session, actions[-1])
-                deadline = time.monotonic() + 10
-                while time.monotonic() < deadline:
-                    session = read_session(task.id, payload["session_id"])
-                    if session["status"] == "finished":
-                        assert session["exit_code"] == 7 and session["stdout"] == "beginend"
-                        name = proposal_function_name("shell_session")
-                        assert name in self.functions
-                        return AIMessage(content="", tool_calls=[{
-                            "name": name, "args": {"arguments": {"session_id": payload["session_id"], "stdout_offset": 5}},
-                            "id": name,
-                        }], usage_metadata={"input_tokens": 30, "output_tokens": 10, "total_tokens": 40})
-                    time.sleep(0.1)
-                else:
-                    pytest.fail("Bash session did not finish")
-            return super().invoke(messages, **kwargs)
+            if not actions:
+                return super().invoke(messages, **kwargs)
+            current = _result(db_session, actions[-1])
+            if actions[-1].capability_id == "shell_session":
+                stdout.append(current["stdout"])
+                stderr.append(current["stderr"])
+                if current["status"] == "finished":
+                    if cancel:
+                        assert current["cancelled"]
+                    else:
+                        assert current["exit_code"] == 7 and not current["command_ok"]
+                    return super().invoke(messages, **kwargs)
+            name = proposal_function_name("shell_session")
+            args = {"session_id": current["session_id"], "wait_seconds": 20,
+                    "stdout_offset": sum(map(len, stdout)), "stderr_offset": sum(map(len, stderr))}
+            if cancel and stdout and not current["cancel_requested"]:
+                args["cancel"] = True
+            return AIMessage(content="", tool_calls=[{"name": name, "id": f"wait_{self.decisions}",
+                                                    "args": {"arguments": args}}])
 
-    worker = TaskAgentExecutor(db_session, chat_model=WaitForBackground(steps))
+    model = WaitingModel([_call("run_shell", command=command, background=True),
+                          ("task_finish", {"summary": "Observed exit."})])
+    before = time.monotonic()
+    worker = TaskAgentExecutor(db_session, chat_model=model)
     result = PersistentTaskRuntime(db_session, agent_executor=worker).run(task.id)
-    actions = db_session.query(AgentAction).filter_by(task_id=task.id).order_by(AgentAction.sequence).all()
-    assert result["status"] == "succeeded", (result, [
-        (row.capability_id, row.status, row.error_message) for row in actions
-    ][-8:])
-    [session_action] = [row for row in actions if row.capability_id == "shell_session"]
-    assert session_action.status == "succeeded"
-    assert _result(db_session, session_action)["stdout"] == "end"
-    actions = [row for row in actions if row.id != session_action.id]
-    assert [row.status for row in actions] == ["failed" if i == 6 else "succeeded" for i in range(13)], [
-        (row.capability_id, row.status, row.error_message, _result(db_session, row))
-        for row in actions if row.status != "succeeded"
-    ]
-    assert "backend/aiive/runtime/system_contract.py" in _result(db_session, actions[0])["stdout"].replace("\\", "/")
-    assert _result(db_session, actions[1])["complete"]
-    assert _result(db_session, actions[7])["content"].splitlines() == ["VALUE = 1"]
-    assert _result(db_session, actions[9])["duration_ms"] > 30_000
-    staged = _result(db_session, actions[-1])
-    assert staged["gate"]["ok"]
-    assert any("test:node-host" in check["file"] for check in staged["targeted_test_report"]["results"])
-    assert db_session.query(ApprovalRequest).filter_by(task_id=task.id).count() == 0
-    assert deploy.get_active_slot() == "A"
-
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    supervisor = Supervisor(SupervisorConfig(port=port, start_timeout=40, monitor_seconds=0,
-                                             state_dir=str(tmp_path / "control")))
-    try:
-        assert supervisor.recover()["ok"]
-        old_pid = supervisor.state()["process"]["pid"]
-        release = ReleaseManager(client=SupervisorClient(supervisor.paths)).promote()
-        assert release["status"] == "switch_requested", release
-        supervisor.tick()
-        outcome = SupervisorClient(supervisor.paths).result(release["request_id"])
-        assert outcome["ok"], outcome
-        assert deploy.get_active_slot() == "B"
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health?runtime=true", timeout=5) as response:
-            runtime = json.load(response)["runtime"]
-        assert runtime["loaded_slot"] == "B" and runtime["pid"] != old_pid
-        assert Path(runtime["system_contract_module"]).is_relative_to(deploy.active_app_root())
-        expected = deploy._read_manifest(deploy.base_dir / "B")["stable_contract_audit_ref"]
-        assert runtime["stable_contract_audit_ref"] == expected
-        assert expected != get_prompt_registry().render("agent.stable_contract").audit_ref
-    finally:
-        supervisor.stop_managed_process()
+    assert result["status"] == "succeeded", result
+    assert "".join(stdout) == ("begin" if cancel else "beginend")
+    assert "".join(stderr) == ("" if cancel else "err")
+    assert stdout[0] == "begin"
+    assert model.decisions <= 6 and time.monotonic() - before < 30

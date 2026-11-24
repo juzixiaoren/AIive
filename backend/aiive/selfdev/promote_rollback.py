@@ -82,8 +82,22 @@ class PromoteRollback:
                     "gate": gate_result.to_summary(),
                 }
 
-        # 切换活跃槽位指针
-        self._manager.set_active_slot(inactive)
+        from uuid import uuid4
+
+        from aiive.selfdev.repair_guard import default_repair_lock
+
+        lock = default_repair_lock(self._manager)
+        handle = lock.acquire(run_id=str(uuid4()))
+        if handle is None:
+            return {"ok": False, "error": "concurrent_repair_in_progress"}
+        try:
+            if self._manager.get_active_slot() != active:
+                return {"ok": False, "error": "candidate_or_active_slot_changed"}
+            if blocked := candidate_promotion_block(inactive_slot.root):
+                return {"ok": False, "error": blocked}
+            self._manager.set_active_slot(inactive)
+        finally:
+            lock.release(handle)
         return {
             "ok": True,
             "previous_active": active,

@@ -5,6 +5,7 @@ No execution, database transactions, or hidden model retry loop lives here.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -81,11 +82,26 @@ def normalize_calls(message: AIMessage) -> AIMessage:
         seen.add(call_id)
         call.pop("error", None)
         call.update(id=call_id, type="tool_call")
+        name = call.get("name")
+        if not isinstance(name, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", name):
+            call["name"] = "invalid_function"
+            errors[call_id] = output_error("invalid_function_name", path="name", expected="function name",
+                                           received=type(name).__name__)
         if invalid or not isinstance(call.get("args"), dict):
-            errors[call_id] = output_error("invalid_tool_arguments", path="arguments", expected="JSON object", received=type(call.get("args")).__name__)
+            issue = output_error("invalid_tool_arguments", path="arguments", expected="JSON object",
+                                 received=type(call.get("args")).__name__)
+            if call_id in errors:
+                errors[call_id]["issues"].extend(issue["issues"])
+            else:
+                errors[call_id] = issue
             call["args"] = {}
-        elif not original_id or call_id != original_id:
-            errors[call_id] = output_error("invalid_tool_call_id", expected="unique nonempty tool_call_id", received="str")
+        if not original_id or call_id != original_id:
+            issue = output_error("invalid_tool_call_id", path="id", expected="unique nonempty tool_call_id",
+                                 received=original_id)
+            if call_id in errors:
+                errors[call_id]["issues"].extend(issue["issues"])
+            else:
+                errors[call_id] = issue
         calls.append(call)
     return message.model_copy(update={"tool_calls": calls, "invalid_tool_calls": [],
                                       "additional_kwargs": {**message.additional_kwargs, "aiive_call_errors": errors}})
@@ -107,12 +123,16 @@ class CallValidation:
 
     def retry_turn(self, message: AIMessage) -> list[dict[str, Any]]:
         # Keep only a bounded repair exchange, never a conversation transcript.
+        if not message.tool_calls:
+            return [message_to_dict(item) for item in self.feedback(message)]
         calls: list[ToolCall] = []
         for call in message.tool_calls:
             error = self.errors.get(str(call["id"]))
             if error and error.get("error_type") != "batch_aborted_due_to_invalid_arguments":
-                call = call.copy()
-                call["args"] = {}
+                issues = error.get("issues", [])
+                if not (len(issues) == 1 and issues[0]["code"] == "tool_call_count"):
+                    call = call.copy()
+                    call["args"] = {}
             calls.append(call)
         safe = AIMessage(content="", tool_calls=calls,
                          **assistant_message_kwargs(assistant_metadata(message)))
@@ -122,9 +142,6 @@ class CallValidation:
 def validate_calls(message: AIMessage, registry: ToolRegistry | FunctionSpecs, *, require_one: bool = False) -> CallValidation:
     errors = dict(message.additional_kwargs.get("aiive_call_errors", {}))
     calls = message.tool_calls
-    if require_one and len(calls) != 1:
-        payload = output_error("tool_call_count", received=str(len(calls)))
-        errors = {str(call["id"]): dict(payload) for call in calls} or {"$": payload}
     for call in calls:
         call_id = str(call["id"])
         if call_id in errors:
@@ -136,6 +153,14 @@ def validate_calls(message: AIMessage, registry: ToolRegistry | FunctionSpecs, *
         result = validate_tool_params(registration, call["args"])
         if not result.ok:
             errors[call_id] = result.error_payload(call["name"])
+    if require_one and len(calls) != 1:
+        count = output_error("tool_call_count", received=str(len(calls)))
+        errors = {
+            str(call["id"]): {
+                **count, "issues": [*count["issues"], *errors.get(str(call["id"]), {}).get("issues", [])],
+            }
+            for call in calls
+        } or {"$": count}
     if errors:
         for call in calls:
             errors.setdefault(str(call["id"]), {

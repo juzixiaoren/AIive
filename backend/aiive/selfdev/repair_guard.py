@@ -431,6 +431,8 @@ class CandidateSlotGuard:
         run_id: str,
         fingerprint: str,
         gate_ok: bool,
+        workspace_task_id: str = "",
+        workspace_hash: str = "",
     ) -> dict[str, Any]:
         """记录候选已通过测试/闸门，并绑定其代码指纹。"""
         slot = self._slot(slot_name)
@@ -444,6 +446,8 @@ class CandidateSlotGuard:
             "gate_ok": bool(gate_ok),
             "updated_at": _now(),
         }
+        if workspace_task_id:
+            payload.update(workspace_task_id=workspace_task_id, workspace_hash=workspace_hash)
         write_candidate_state(slot.root, payload)
         return {"ok": True, **payload}
 

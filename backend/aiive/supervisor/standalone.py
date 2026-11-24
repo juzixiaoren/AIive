@@ -10,6 +10,7 @@ from aiive.supervisor.slot_manager import SlotManager
 
 def main() -> None:
     manager = SlotManager()
+    manager.ensure_initialized(source_root())
     slot = manager.get_active_slot()
     app = manager.active_app_root()
     if not (app / "backend" / "aiive" / "main.py").is_file():

@@ -3,7 +3,9 @@
 验证根据变更文件自动选择相关测试的能力，包括映射匹配、去重和空输入处理。
 """
 
-from aiive.selfdev.targeted_test_runner import TargetedTestRunner
+import shutil
+
+from aiive.selfdev.targeted_test_runner import CODING_TEST, SELFDEV_FLOW_TEST, TargetedTestRunner
 
 
 class TestTargetedTestRunner:
@@ -75,3 +77,37 @@ class TestTargetedTestRunner:
         assert result["ok"] is False
         assert result["failed"] == 1
         assert any(item["file"].endswith("missing.py") for item in result["results"])
+
+    def test_coding_and_release_workflows_are_mapped_selectively(self):
+        runner = TargetedTestRunner()
+        assert CODING_TEST in runner._select_tests(["backend/aiive/task_runtime/runtime.py"])
+        assert SELFDEV_FLOW_TEST in runner._select_tests(["backend/aiive/selfdev/workspace_delivery.py"])
+        assert SELFDEV_FLOW_TEST in runner._select_tests(["backend/aiive/supervisor/standalone.py"])
+        assert SELFDEV_FLOW_TEST not in runner._select_tests(["backend/aiive/memory/memory_store.py"])
+
+    def test_docker_unavailable_defers_candidate_validation(self, tmp_path, monkeypatch):
+        (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+        (tmp_path / "compose.yaml").write_text("services: {}\n", encoding="utf-8")
+        monkeypatch.setattr(shutil, "which", lambda name: None)
+        result = TargetedTestRunner(tmp_path).run_for_changed_files(["Dockerfile", "compose.yaml"])
+        assert result["ok"] is False
+        assert result["status"] == "deferred" and result["failed"] == 0 and result["deferred"] == 2
+        assert result["missing_capabilities"] == ["docker_cli"]
+
+    def test_docker_validation_failure_is_distinct_from_missing_buildx(self, tmp_path, monkeypatch):
+        runner = TargetedTestRunner(tmp_path)
+        monkeypatch.setattr(shutil, "which", lambda name: "docker")
+        commands = []
+
+        def command(name, argv, **kwargs):
+            commands.append(argv)
+            if argv[-1] == "--help" and "compose" in argv:
+                return {"result": "passed", "stdout": "--no-env-resolution"}
+            return {"file": name, "result": "failed", "stdout": "validation failed"}
+
+        monkeypatch.setattr(runner, "_command", command)
+        result = runner.run_for_changed_files(["Dockerfile", "infra/compose.custom.yml"])
+        assert result["ok"] is False and result["status"] == "failed"
+        assert result["failed"] == 1 and result["deferred"] == 1
+        assert result["missing_capabilities"] == ["docker_buildx"]
+        assert any(argv[1:5] == ["compose", "-f", "infra/compose.custom.yml", "config"] for argv in commands)

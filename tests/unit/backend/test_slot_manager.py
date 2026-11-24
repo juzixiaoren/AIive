@@ -110,3 +110,37 @@ class TestVersionManifest:
         m1 = create_version_manifest("A")
         m2 = create_version_manifest("B")
         assert _compute_manifest_checksum(m1) != _compute_manifest_checksum(m2)
+
+def test_concurrent_bootstrap_preserves_existing_active_slot(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    source = tmp_path / "source"
+    (source / "backend" / "aiive").mkdir(parents=True)
+    (source / "backend" / "aiive" / "main.py").write_text("VERSION = 1\n", encoding="utf-8")
+    (source / ".env").write_text("FIXTURE_ONLY=1\n", encoding="utf-8")
+    (source / ".env.example").write_text("FIXTURE_ONLY=\n", encoding="utf-8")
+    manager = SlotManager(tmp_path / "slots")
+    env = {**os.environ, "AIIVE_SOURCE_ROOT": str(source), "AIIVE_SLOTS_ROOT": str(manager.base_dir),
+           "AIIVE_RUNTIME_DIR": str(manager.runtime_dir), "AIIVE_DATA_DIR": str(tmp_path / "data"),
+           "PYTHONPATH": str(Path.cwd() / "backend")}
+    command = [sys.executable, "-c",
+               "from aiive.project_paths import source_root; "
+               "from aiive.supervisor.slot_manager import SlotManager; "
+               "SlotManager().ensure_initialized(source_root())"]
+    workers = [subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+               for _ in range(2)]
+    for worker in workers:
+        _, errors = worker.communicate(timeout=30)
+        assert worker.returncode == 0, errors.decode(errors="replace")
+    assert manager.get_active_slot() == "A"
+    assert (manager.active_app_root() / "backend/aiive/main.py").is_file()
+    assert (manager.active_app_root() / ".env.example").is_file()
+    assert not (manager.active_app_root() / ".env").exists()
+    assert not list((manager.base_dir / "B/app").iterdir())
+    before = manager.list_slots()
+    manager.set_active_slot("B")
+    manager.ensure_initialized(source)
+    assert manager.get_active_slot() == "B"
+    assert [slot.manifest for slot in manager.list_slots()] == [slot.manifest for slot in before]

@@ -258,18 +258,13 @@ class PersistentTaskRuntime:
                     run.model = last_model
                     correction_failures += 1
                     payload = error.payload()
-                    self._record_outcome(
-                        task, "invalid_proposal", str(payload.get("capability_id") or "worker_function"),
-                        str(error.issues[0].get("code", "agent_output_validation_error")) if error.issues else str(error),
-                    )
-                    if stalled := self._stop_if_stalled(task, run):
-                        return stalled
+                    task.task_state = {**(task.task_state or {}), "validation_feedback": payload,
+                                       "validation_failures": correction_failures, "validation_messages": error.feedback}
+                    if not correction_allowed(correction_failures):
+                        return self._validation_failed(task, run, run_tokens, last_model)
                     budget_issue = self._budget_issue(task, budget, before_model=True)
                     if budget_issue:
                         return self._stop_for_budget(task, run, budget_issue)
-                    if not correction_allowed(correction_failures):
-                        return self._validation_failed(task, run, run_tokens, last_model)
-                    task.task_state = {**(task.task_state or {}), "validation_feedback": payload, "validation_failures": correction_failures, "validation_messages": error.feedback}
                     self.db.commit()
                     continue
                 self.repo.renew_run(run, lease_seconds=180)
@@ -624,10 +619,18 @@ class PersistentTaskRuntime:
         )
 
     def _validation_failed(self, task: AgentTask, run: AgentRun, tokens: dict[str, int], model: str | None) -> dict[str, Any]:
-        progress = self.db.query(AgentAction).filter_by(task_id=task.id, status=ActionStatus.SUCCEEDED.value).count()
-        return self._complete(task, run, status="partial" if progress else "failed",
-                               summary="模型输出或工具参数校验纠错已耗尽。",
-                               unresolved=["agent_validation_exhausted"], token_usage=tokens, model=model, failed_run=True)
+        issues = ((task.task_state or {}).get("validation_feedback") or {}).get("issues", [])
+        unresolved = ["agent_validation_exhausted", *[issue["code"] for issue in issues if "code" in issue]]
+        summary = "模型输出或工具参数校验纠错已耗尽。"
+        if task.executor_type == "deterministic":
+            return self._complete(task, run, status="partial", summary=summary,
+                                  unresolved=unresolved, token_usage=tokens, model=model, failed_run=True)
+        run.token_usage = tokens
+        run.model = model
+        return self._finish_report(task, run, {
+            "status": "partial", "summary": summary, "unresolved": unresolved,
+            "stop_reason": "agent_validation_exhausted",
+        })
 
     def _record_discovery(
         self,
@@ -792,9 +795,11 @@ class PersistentTaskRuntime:
                     payload.get("changed") is True
                     or (action.capability_id in {"run_selfdev_repair", "promote_slot"} and payload.get("ok") is True)
                 )
+                shell_live = (action.capability_id == "shell_session" and isinstance(payload, dict)
+                              and payload.get("status") in {"starting", "running"})
                 if changed:
                     self._record_outcome(task, outcome, action.capability_id, "", progress=True)
-                else:
+                elif not shell_live:
                     # New observations are neutral. Only actual changes clear the streak.
                     state = dict(task.task_state or {})
                     seen = state.get("workspace_observations") or []
