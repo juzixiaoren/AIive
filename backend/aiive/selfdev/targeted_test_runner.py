@@ -20,11 +20,16 @@ logger = logging.getLogger(__name__)
 from aiive.project_paths import source_root
 
 CODING_TEST = "tests/unit/backend/test_coding_workspace.py"
+WORKER_CONTRACT_TEST = "tests/integration/backend/test_agent_contract_recovery.py"
 SELFDEV_FLOW_TEST = "tests/integration/backend/test_selfdev_workspace_release.py"
 TEST_MAPPING = {
     "backend/aiive/source_snapshot.py": [CODING_TEST, SELFDEV_FLOW_TEST],
-    "backend/aiive/core/function_calling.py": [CODING_TEST, "tests/unit/backend/test_function_calling.py"],
+    "backend/aiive/core/function_calling.py": [
+        CODING_TEST, WORKER_CONTRACT_TEST, "tests/unit/backend/test_function_calling.py",
+    ],
     "backend/aiive/task_runtime/workspace.py": [SELFDEV_FLOW_TEST],
+    "backend/aiive/task_runtime/agent_executor.py": [WORKER_CONTRACT_TEST],
+    "backend/aiive/task_runtime/runtime.py": [WORKER_CONTRACT_TEST],
     "backend/aiive/tools/builtin_shell.py": [CODING_TEST],
     "backend/aiive/tools/shell_sessions.py": [CODING_TEST],
     "backend/aiive/tools/workspace_files.py": [CODING_TEST],

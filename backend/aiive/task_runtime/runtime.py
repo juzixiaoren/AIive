@@ -138,7 +138,10 @@ class PersistentTaskRuntime:
         completed_this_run = 0
         last_model: str | None = None
         run_tokens: dict[str, int] = {}
-        while completed_this_run < (budget.max_actions_per_run or 8):
+
+        def run_step() -> dict[str, Any] | None:
+            nonlocal correction_failures, completed_this_run, last_model, run_tokens
+
             from aiive.worker.outbox_execution_auth import require_execution_authorization
             from aiive.worker.job_source_guard import task_sources_visible
 
@@ -175,7 +178,7 @@ class PersistentTaskRuntime:
                 completed_this_run += 1
                 if outcome in {"blocked", "terminal"}:
                     return {"status": task.status, "task_id": task.id, "action_id": ready.id}
-                continue
+                return None
 
             broker = CapabilityBroker(self.db)
             available = broker.available_registry(task)
@@ -266,7 +269,7 @@ class PersistentTaskRuntime:
                     if budget_issue:
                         return self._stop_for_budget(task, run, budget_issue)
                     self.db.commit()
-                    continue
+                    return None
                 self.repo.renew_run(run, lease_seconds=180)
                 last_model = decision.model
                 run_tokens = self._merge_usage(run_tokens, decision.token_usage)
@@ -307,7 +310,7 @@ class PersistentTaskRuntime:
                         task.task_state = {**(task.task_state or {}), "validation_feedback": payload,
                                            "validation_failures": correction_failures, "validation_messages": repair}
                         self.db.commit()
-                        continue
+                        return None
                     proposal.arguments = validation.validated_params
             if proposal.decision == "watch":
                 from aiive.task_runtime.watchers import WatcherService
@@ -337,7 +340,7 @@ class PersistentTaskRuntime:
                     task.task_state = {**(task.task_state or {}), "validation_feedback": payload,
                                        "validation_failures": correction_failures, "validation_messages": repair}
                     self.db.commit()
-                    continue
+                    return None
             correction_failures = 0
             state = dict(task.task_state or {})
             state.pop("validation_feedback", None)
@@ -354,7 +357,7 @@ class PersistentTaskRuntime:
             if proposal.decision in {"search_capabilities", "describe_capability"}:
                 self._record_discovery(task, run, proposal, broker, available, resident)
                 completed_this_run += 1
-                continue
+                return None
 
             if proposal.decision == "finish" and proposal.report_status == "succeeded":
                 proposal = self._verify_selfdev_delivery(task, proposal)
@@ -451,7 +454,7 @@ class PersistentTaskRuntime:
                 )
                 self.db.commit()
                 completed_this_run += 1
-                continue
+                return None
             if prepared.decision.outcome == "approval":
                 self.repo.transition_action(action, ActionStatus.AWAITING_APPROVAL.value)
                 self.repo.transition_task(
@@ -487,6 +490,12 @@ class PersistentTaskRuntime:
                 }
             self.repo.transition_action(action, ActionStatus.READY.value)
             self.db.commit()
+            return None
+
+        while completed_this_run < (budget.max_actions_per_run or 8):
+            result = run_step()
+            if result is not None:
+                return result
 
         # 单 Run 的推理/执行步数耗尽，checkpoint 后以新 Run 继续。
         self.db.refresh(task)

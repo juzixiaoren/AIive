@@ -29,7 +29,7 @@ from aiive.memory.memory_types import MEMORY_KEY_GUIDE
 
 logger = logging.getLogger(__name__)
 from aiive.tools.forget_tool import ForgetTool, ForgetStatusTool
-from aiive.tools.base import CancellationPolicy, DatabaseTool
+from aiive.tools.base import BaseTool, CancellationPolicy, DatabaseTool
 from aiive.tools.registry import (
     CapabilitySafetySchema,
     ToolDefinition,
@@ -150,7 +150,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         "max_bytes": {"type": "int", "minimum": 16, "maximum": 4096, "description": "片段大小，默认 4096 字节。"},
     }
     recall = RecallConfig()
-    tools = [
+    tools: list[tuple[str, type[BaseTool], str, dict[str, Any], str, bool, bool]] = [
         ("list_task_files", ListTaskFilesTool, "分页列出本任务成果或证据，使用 next_cursor 续页。",
          {"kind": {"type": "str", "enum": ["artifacts", "evidence"], "required": True},
           "cursor": {"type": "str", "maxLength": 512}, "limit": {"type": "int", "minimum": 1, "maximum": 10}}, "low", False, False),

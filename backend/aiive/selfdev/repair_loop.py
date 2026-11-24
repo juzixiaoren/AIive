@@ -427,9 +427,8 @@ class SelfDevRepairLoop:
                 for item in executable
                 if item.get("target_file")
             ]
-            changed_files = list(dict.fromkeys([*changed_files,
-                *(item["target_file"] for item in record["final_operations"] if item["target_file"]),
-            ]))
+            changed_files.extend(str(item["target_file"]) for item in record["final_operations"] if item["target_file"])
+            changed_files = list(dict.fromkeys(changed_files))
             round_data = RepairRound(
                 round_index=attempt,
                 patch_fingerprint=fingerprint,
@@ -486,8 +485,9 @@ class SelfDevRepairLoop:
             record["rounds"].append(round_data.to_dict())
             feedback = _extract_failure_feedback(test_report)
             if candidate_root and Path(candidate_root).is_dir():
+                related_files = [*(files or []), *changed_files]
                 context = self._collect_context(
-                    goal, list(dict.fromkeys([*(files or []), *changed_files])), record,
+                    goal, list(dict.fromkeys(related_files)), record,
                     reader=ProjectReader(Path(candidate_root)),
                 )
             self._write_journal(record, phase="tests_failed")

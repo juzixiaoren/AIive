@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from sqlalchemy.orm import Session
+
 SELFDEV_TASK_TYPES = frozenset({"self_improvement", "selfdev", "lifecycle"})
 CODING_TASK_TYPES = SELFDEV_TASK_TYPES | {"coding", "code"}
 CODING_CAPABILITIES = ("read_file", "edit_file", "write_file", "apply_patch", "shell_session")
@@ -59,7 +61,7 @@ def select_executor_type(task_brief: dict[str, Any]) -> str:
 
 
 def enqueue_selfdev_task(
-    db, goal: str, *, files: list[str] | None = None, promote: bool = False,
+    db: Session, goal: str, *, files: list[str] | None = None, promote: bool = False,
     acceptance_criteria: list[str] | None = None, initial_input: dict[str, Any] | None = None,
 ):
     from aiive.runtime.conversation_state import get_current_thread_id

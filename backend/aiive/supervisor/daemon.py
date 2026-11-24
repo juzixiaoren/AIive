@@ -455,8 +455,8 @@ class Supervisor:
             "pid": new_record.pid, "health": health, "monitor_until": monitor_until,
         }
 
-    def _verify_loaded_candidate(self, record: ProcessRecord, slot_root: Path, health: dict) -> dict:
-        manifest = self.slots._read_manifest(slot_root)
+    def _verify_loaded_candidate(self, record: ProcessRecord, slot_root: Path, health: dict[str, Any]) -> dict[str, Any]:
+        manifest = self.slots.read_manifest(slot_root)
         if not manifest.get("source_snapshot"):
             return health
         import json

@@ -3,15 +3,16 @@ from __future__ import annotations
 import shutil
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from aiive.selfdev.repair_guard import CandidateSlotGuard, default_repair_lock
 from aiive.supervisor.slot_manager import create_version_manifest, tree_fingerprint
 from aiive.task_runtime.workspace import changes, copy_files, inventory, read_metadata, snapshot_hash
-from aiive.task_runtime.worktree import _run_git
+from aiive.task_runtime.worktree import run_git
 from aiive.tools.shell_sessions import task_has_live_sessions
 
 
-def deliver_workspace(workspace: Path, *, task_id: str, run_id: str, files: list[str] | None = None) -> dict:
+def deliver_workspace(workspace: Path, *, task_id: str, run_id: str, files: list[str] | None = None) -> dict[str, Any]:
     """Validate a frozen copy of the task's cumulative changes under the existing release lock."""
     from aiive.eval.gate import evaluate_promotion_gate
     from aiive.selfdev.targeted_test_runner import TargetedTestRunner
@@ -51,6 +52,8 @@ def deliver_workspace(workspace: Path, *, task_id: str, run_id: str, files: list
             if inventory(staged) != before:
                 return {"ok": False, "error": "workspace_changed_during_copy"}
             fingerprint = tree_fingerprint(staged)
+            if fingerprint is None:
+                return {"ok": False, "error": "candidate_fingerprint_unavailable"}
             if guard.manager.get_active_slot() != active:
                 return {"ok": False, "error": "workspace_deployment_baseline_changed"}
             guard.mark_not_promotable(candidate.name, reason="workspace_validation_in_progress", run_id=run_id)
@@ -58,11 +61,11 @@ def deliver_workspace(workspace: Path, *, task_id: str, run_id: str, files: list
                 shutil.rmtree(target)
             staged.replace(target)
         report = TargetedTestRunner(repo_root=target).run_for_changed_files(verification_files)
-        output = {"candidate_root": str(target), "candidate_slot": candidate.name, "run_id": run_id,
+        output: dict[str, Any] = {"candidate_root": str(target), "candidate_slot": candidate.name, "run_id": run_id,
                   "changed_files": changed, "workspace_hash": workspace_hash, "targeted_test_report": report}
         if not report.get("ok"):
             if metadata.get("base_commit"):
-                diff = _run_git(["diff", "--no-ext-diff", metadata["base_commit"], "--", *changed], workspace, check=False)
+                diff = run_git(["diff", "--no-ext-diff", metadata["base_commit"], "--", *changed], workspace, check=False)
                 if diff.returncode == 0:
                     output["git_diff"] = diff.stdout[:8000]
                     output["git_diff_truncated"] = len(diff.stdout) > 8000

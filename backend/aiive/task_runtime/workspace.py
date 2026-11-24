@@ -10,13 +10,19 @@ import tarfile
 import tempfile
 import time
 from collections.abc import Iterable
-from datetime import timezone
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
+
+    from aiive.db.models import AgentTask
 
 from aiive.source_snapshot import excluded_source_path
 
 from aiive.storage.data_paths import data_path, data_root
-from aiive.task_runtime.worktree import WorktreeIsolation, _run_git
+from aiive.task_runtime.worktree import WorktreeIsolation, run_git
 
 TERMINAL = {"succeeded", "failed", "partial", "cancelled", "expired"}
 _last_scan = 0.0
@@ -46,7 +52,7 @@ def source_files(root: Path, *, git: bool = False) -> list[str]:
                 and not (path.is_symlink() and Path(os.readlink(path)).is_absolute()))
 
     if git:
-        entries = _run_git(["ls-files", "-z", "--cached", "--others", "--exclude-standard"], root, check=True)
+        entries = run_git(["ls-files", "-z", "--cached", "--others", "--exclude-standard"], root, check=True)
         return sorted({name for name in entries.stdout.split("\0") if name and allowed(name)})
     files = []
     for directory, dirs, names in os.walk(root):
@@ -98,7 +104,7 @@ def snapshot_hash(files: dict[str, str]) -> str:
     return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
 
 
-def changes(workspace: Path, metadata: dict, current: dict[str, str] | None = None) -> list[str]:
+def changes(workspace: Path, metadata: dict[str, Any], current: dict[str, str] | None = None) -> list[str]:
     if current is None:
         current = inventory(workspace, git=metadata["git"])
     original = {name: value for name, value in metadata["files"].items()
@@ -112,7 +118,7 @@ def verified_workspace_hash(task_id: str) -> str | None:
     try:
         if task_has_live_sessions(task_id):
             return None
-        workspace = data_path("task-worktrees", WorktreeIsolation._safe_task_id(task_id))
+        workspace = WorktreeIsolation.path_for(task_id)
         metadata = read_metadata(workspace)
         if not workspace.is_dir():
             return None
@@ -125,14 +131,14 @@ def metadata_path(workspace: Path) -> Path:
     return workspace.with_suffix(".json")
 
 
-def read_metadata(workspace: Path) -> dict:
+def read_metadata(workspace: Path) -> dict[str, Any]:
     return json.loads(metadata_path(workspace).read_text(encoding="utf-8"))
 
 
 def _checkout_workspace(workspace: Path) -> None:
     """Populate a Git worktree without materializing excluded tracked files."""
-    _run_git(["read-tree", "HEAD"], workspace, check=True)
-    tracked = _run_git(["ls-files", "-z"], workspace, check=True).stdout.split("\0")
+    run_git(["read-tree", "HEAD"], workspace, check=True)
+    tracked = run_git(["ls-files", "-z"], workspace, check=True).stdout.split("\0")
     paths = [name for name in tracked if name and not excluded_source_path(PurePosixPath(name))]
     if paths:
         subprocess.run(
@@ -146,8 +152,8 @@ def _checkout_workspace(workspace: Path) -> None:
             path.unlink()
 
 
-def create_workspace(task_id: str, canonical: Path, *, selfdev: bool = False) -> tuple[Path, dict]:
-    workspace = data_path("task-worktrees", WorktreeIsolation._safe_task_id(task_id))
+def create_workspace(task_id: str, canonical: Path, *, selfdev: bool = False) -> tuple[Path, dict[str, Any]]:
+    workspace = WorktreeIsolation.path_for(task_id)
     workspace.parent.mkdir(parents=True, exist_ok=True)
     if metadata_path(workspace).is_file() and workspace.is_dir():
         return workspace, read_metadata(workspace)
@@ -173,7 +179,7 @@ def create_workspace(task_id: str, canonical: Path, *, selfdev: bool = False) ->
             manager.ensure_initialized(canonical)
         active = manager.active_app_root()
         slot = manager.get_active_slot()
-        manifest = manager._read_manifest(active.parent)
+        manifest = manager.read_manifest(active.parent)
         full_snapshot = manifest.get("source_snapshot") is True or manifest.get("bootstrap_snapshot") is True
         if (active / "backend" / "aiive").is_dir():
             active_files = source_files(active)
@@ -182,11 +188,11 @@ def create_workspace(task_id: str, canonical: Path, *, selfdev: bool = False) ->
                     (workspace / name).unlink()
             copy_files(active, workspace, active_files)
         deployment = {"active_slot": slot, "active_fingerprint": tree_fingerprint(active)}
-    if isolation is not None and _run_git(["status", "--porcelain"], workspace, check=True).stdout:
-        _run_git(["add", "-A"], workspace, check=True)
-        _run_git(["-c", "user.name=AIive", "-c", "user.email=worker@aiive.local",
+    if isolation is not None and run_git(["status", "--porcelain"], workspace, check=True).stdout:
+        run_git(["add", "-A"], workspace, check=True)
+        run_git(["-c", "user.name=AIive", "-c", "user.email=worker@aiive.local",
                   "commit", "-m", "Record task workspace baseline"], workspace, check=True)
-    base_commit = _run_git(["rev-parse", "HEAD"], workspace, check=True).stdout.strip() if isolation else None
+    base_commit = run_git(["rev-parse", "HEAD"], workspace, check=True).stdout.strip() if isolation else None
     metadata = {"git": isolation is not None, "base_commit": base_commit,
                 "source": str(canonical), "deployment": deployment,
                 "files": inventory(workspace, git=isolation is not None)}
@@ -197,7 +203,7 @@ def create_workspace(task_id: str, canonical: Path, *, selfdev: bool = False) ->
     return workspace, metadata
 
 
-def _archive_changes(db, task, workspace: Path, metadata: dict) -> None:
+def _archive_changes(db: Session, task: AgentTask, workspace: Path, metadata: dict[str, Any]) -> None:
     import io
 
     from aiive.db.models import TaskArtifact
@@ -241,11 +247,11 @@ def _archive_changes(db, task, workspace: Path, metadata: dict) -> None:
             archive.unlink(missing_ok=True)
 
 
-def _timestamp(value) -> float:
+def _timestamp(value: datetime) -> float:
     return (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).timestamp()
 
 
-def reap_workspaces(db) -> None:
+def reap_workspaces(db: Session) -> None:
     global _last_scan
     now = time.time()
     if now - _last_scan < 60:

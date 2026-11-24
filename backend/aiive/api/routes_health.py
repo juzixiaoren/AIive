@@ -2,6 +2,8 @@
 API路由模块：健康检查
 - 提供服务健康检查端点，用于探测服务是否正常运行
 """
+from typing import Any
+
 from fastapi import APIRouter
 
 from aiive.config import settings
@@ -18,7 +20,7 @@ async def health_check(runtime: bool = False):
     Returns:
         包含 ok、service、version 的 JSON 响应
     """
-    response = {
+    response: dict[str, Any] = {
         "ok": True,
         "service": settings.app_name,
         "version": settings.app_version,

@@ -8,10 +8,12 @@ import re
 import stat
 import subprocess
 import tempfile
+from abc import ABC
 from pathlib import Path
+from typing import Any, override
 
 from aiive.context.run_context import RunContext
-from aiive.tools.base import BaseTool, ToolError
+from aiive.tools.base import BaseTool, ToolError, ToolExecutionContext
 
 
 def workspace_path(ctx: RunContext | None, path: str = ".") -> Path:
@@ -40,7 +42,7 @@ def read_page(
     path: Path, *, start_line: int = 1, end_line: int | None = None,
     char_offset: int = 0, byte_offset: int | None = None, byte_length: int = 8000,
     limit: int = 8000, encoding: str | None = None,
-) -> dict:
+) -> dict[str, Any]:
     with path.open("rb") as stream:
         data = stream.read()
         info = os.fstat(stream.fileno())
@@ -99,22 +101,25 @@ def _atomic_write(path: Path, data: bytes) -> None:
 
 
 class ReadFileTool(BaseTool):
-    def _run(self, path: str, ctx: RunContext | None = None, **ranges) -> dict:
+    @override
+    def _run(self, path: str, ctx: RunContext | None = None, **ranges: Any) -> dict[str, Any]:
         return read_page(workspace_path(ctx, path), **ranges)
 
 
-class WorkspaceMutationTool(BaseTool):
-    def normalize_error(self, error, context):
+class WorkspaceMutationTool(BaseTool, ABC):
+    @override
+    def normalize_error(self, error: Exception, context: ToolExecutionContext) -> ToolError:
         if isinstance(error, (OSError, ValueError, LookupError)):
             return ToolError("workspace_file_error", str(error), retry_hint="correct_arguments")
         return super().normalize_error(error, context)
 
 
 class EditFileTool(WorkspaceMutationTool):
+    @override
     def _run(
         self, path: str, old_text: str, new_text: str, expected_sha256: str = "",
         encoding: str | None = None, ctx: RunContext | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         target = workspace_path(ctx, path)
         for _ in range(3):
             original = target.read_bytes()
@@ -142,26 +147,35 @@ class EditFileTool(WorkspaceMutationTool):
         return {"ok": False, "error_type": "edit_conflict", "error": "File changed during edit. Read the current file and retry."}
 
 
+def write_workspace_file(
+    path: str, content: str, encoding: str | None = None,
+    expected_sha256: str = "", ctx: RunContext | None = None,
+) -> dict[str, Any]:
+    target = workspace_path(ctx, path)
+    exists = target.exists()
+    original = target.read_bytes() if exists else b""
+    if expected_sha256 and hashlib.sha256(original).hexdigest() != expected_sha256:
+        return {"ok": False, "error_type": "edit_conflict", "error": "Read the current file before overwriting it."}
+    text, codec, bom = _decode(original, encoding)
+    data = bom + _normalize(content).replace("\n", _newline(text)).encode(codec)
+    changed = not exists or data != original
+    if changed:
+        _atomic_write(target, data)
+    return {"path": path, "sha256": hashlib.sha256(data).hexdigest(), "changed": changed}
+
+
 class WriteFileTool(WorkspaceMutationTool):
+    @override
     def _run(
         self, path: str, content: str, encoding: str | None = None,
         expected_sha256: str = "", ctx: RunContext | None = None,
-    ) -> dict:
-        target = workspace_path(ctx, path)
-        exists = target.exists()
-        original = target.read_bytes() if exists else b""
-        if expected_sha256 and hashlib.sha256(original).hexdigest() != expected_sha256:
-            return {"ok": False, "error_type": "edit_conflict", "error": "Read the current file before overwriting it."}
-        text, codec, bom = _decode(original, encoding)
-        data = bom + _normalize(content).replace("\n", _newline(text)).encode(codec)
-        changed = not exists or data != original
-        if changed:
-            _atomic_write(target, data)
-        return {"path": path, "sha256": hashlib.sha256(data).hexdigest(), "changed": changed}
+    ) -> dict[str, Any]:
+        return write_workspace_file(path, content, encoding, expected_sha256, ctx)
 
 
 class ApplyPatchTool(WorkspaceMutationTool):
-    def _run(self, patch: str, strip: int | None = None, ctx: RunContext | None = None) -> dict:
+    @override
+    def _run(self, patch: str, strip: int | None = None, ctx: RunContext | None = None) -> dict[str, Any]:
         cwd = workspace_path(ctx)
         diff = patch
         if strip is None:

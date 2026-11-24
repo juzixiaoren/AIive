@@ -5,7 +5,7 @@
 - 涵盖 LLM、数据库、服务器和应用元信息等配置项
 """
 import os
-from typing import ClassVar, Literal
+from typing import Any, ClassVar, Literal
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -396,4 +396,5 @@ class Settings(BaseSettings):
         return self
 
 
-settings = Settings(_env_file=os.environ.get("AIIVE_ENV_FILE", ".env"))
+_settings_source: dict[str, Any] = {"_env_file": os.environ.get("AIIVE_ENV_FILE", ".env")}
+settings = Settings(**_settings_source)

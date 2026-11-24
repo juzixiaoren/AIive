@@ -10,6 +10,7 @@ import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 from threading import Thread
 from uuid import UUID, uuid4
 
@@ -29,7 +30,7 @@ def _directory(task_id: str, session_id: str) -> Path:
     return data_path("shell-sessions", str(UUID(task_id)), str(UUID(session_id)))
 
 
-def _save(path: Path, data: dict) -> None:
+def _save(path: Path, data: dict[str, Any]) -> None:
     temp = path.with_name(f".{uuid4().hex}.json")
     try:
         temp.write_text(json.dumps(data), encoding="utf-8")
@@ -38,25 +39,23 @@ def _save(path: Path, data: dict) -> None:
         temp.unlink(missing_ok=True)
 
 
-def _read(path: Path) -> dict:
+def _read(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _owner_alive(pid: int) -> bool:
-    from aiive.supervisor.process_control import pid_alive
+    from aiive.supervisor.control import pid_alive
 
     return pid_alive(pid)
 
 
-def start_session(task_id: str, command: str, cwd: str, timeout: float, env: dict) -> dict:
+def start_session(task_id: str, command: str, cwd: str, timeout: float, env: dict[str, Any]) -> dict[str, Any]:
     session_id = str(uuid4())
     directory = _directory(task_id, session_id)
     directory.mkdir(parents=True)
     state_path = directory / "state.json"
     _save(state_path, {"status": "starting", "pid": os.getpid()})
-    from importlib.util import find_spec
-
-    backend = str(Path(find_spec("aiive").origin).resolve().parent.parent)
+    backend = str(Path(__file__).resolve().parents[2])
     try:
         process = subprocess.Popen(
             [sys.executable, "-m", "aiive.tools.shell_sessions", task_id, session_id],
@@ -70,8 +69,10 @@ def start_session(task_id: str, command: str, cwd: str, timeout: float, env: dic
         return {"ok": False, "error": "shell_session_start_failed", "session_id": session_id}
     try:
         _save(state_path, {"status": "starting", "pid": process.pid})
-        process.stdin.write(json.dumps({"command": command, "cwd": cwd, "timeout": timeout, "env": env}).encode())
-        process.stdin.close()
+        stdin = process.stdin
+        assert stdin is not None  # Popen was configured with stdin=PIPE.
+        stdin.write(json.dumps({"command": command, "cwd": cwd, "timeout": timeout, "env": env}).encode())
+        stdin.close()
     except OSError:
         process.terminate()
         process.wait()
@@ -130,7 +131,7 @@ def read_session(
     task_id: str, session_id: str, stdout_offset: int = 0, stderr_offset: int = 0,
     limit: int = 4000, cancel: bool = False, *, wait_seconds: int = 0,
     cancel_check: Callable[[], bool] | None = None,
-) -> dict:
+) -> dict[str, Any]:
     directory = _directory(task_id, session_id)
     deadline = time.monotonic() + min(max(wait_seconds, 0), MAX_WAIT_SECONDS)
     cancel_file = directory / "cancel"

@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any, override
 
 from aiive.context.run_context import RunContext
 from aiive.tools.base import BaseTool, ToolExecutionContext
@@ -14,11 +15,12 @@ from aiive.tools.workspace_files import workspace_path
 
 
 class RunShellTool(BaseTool):
+    @override
     def _run(
         self, command: str, cwd: str = "", timeout_seconds: int = 0,
         env: dict[str, str | None] | None = None, background: bool = False,
         ctx: RunContext | None = None, _execution: ToolExecutionContext | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         workspace = None
         if ctx and ctx.task_workspace:
             workspace = workspace_path(ctx)
@@ -49,11 +51,12 @@ class RunShellTool(BaseTool):
 
 
 class ShellSessionTool(BaseTool):
+    @override
     def _run(
         self, session_id: str, stdout_offset: int = 0, stderr_offset: int = 0,
         limit: int = 4000, cancel: bool = False, wait_seconds: int = DEFAULT_WAIT_SECONDS,
         ctx: RunContext | None = None, _execution: ToolExecutionContext | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         if not ctx or not ctx.task_id:
             raise ValueError("task_id_required")
         return read_session(

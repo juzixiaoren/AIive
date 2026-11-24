@@ -8,8 +8,6 @@ import subprocess
 import urllib.request
 from pathlib import Path
 
-import pytest
-
 from aiive.config import settings
 from aiive.db.models import AgentAction, ApprovalRequest, Thread
 from aiive.task_runtime.agent_executor import TaskAgentExecutor
@@ -19,7 +17,6 @@ from aiive.tools.local_shell import resolve_bash
 from tests.unit.backend.test_coding_workspace import ScriptedCodingModel, _call, _git, _result
 
 
-@pytest.mark.skipif(not shutil.which("rg") or not shutil.which("npm"), reason="rg and Node required")
 def test_selfdev_candidate_with_real_gate_and_supervisor(db_session, tmp_path, monkeypatch):
     from aiive.eval import gate
     from aiive.prompts import get_prompt_registry
@@ -28,8 +25,7 @@ def test_selfdev_candidate_with_real_gate_and_supervisor(db_session, tmp_path, m
     from aiive.supervisor.release_manager import ReleaseManager
     from aiive.supervisor.slot_manager import SlotManager
 
-    if not resolve_bash() or not shutil.which("git"):
-        pytest.skip("Bash and Git required")
+    assert resolve_bash() and shutil.which("git") and shutil.which("npm"), "Bash, Git and npm required"
     repo = Path.cwd()
     source = tmp_path / "source"
     source.mkdir()
@@ -75,7 +71,7 @@ def test_selfdev_candidate_with_real_gate_and_supervisor(db_session, tmp_path, m
     assert (deploy.active_app_root() / target).read_text(encoding="utf-8") == "VALUE = 0\n"
     assert not (deploy.active_app_root() / ".env").exists()
     assert (deploy.active_app_root() / ".env.example").is_file()
-    assert deploy._read_manifest(deploy.base_dir / "B")["slot"] == "B"
+    assert deploy.read_manifest(deploy.base_dir / "B")["slot"] == "B"
     monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "true")
     evaluate = gate.evaluate_promotion_gate
     monkeypatch.setattr(gate, "evaluate_promotion_gate", lambda candidate: evaluate(candidate, persist=False))
@@ -96,7 +92,7 @@ def test_selfdev_candidate_with_real_gate_and_supervisor(db_session, tmp_path, m
     deps = repo / "frontend" / "node_modules"
     build = "npm run build" if deps.is_dir() else "npm ci --no-audit --no-fund && npm run build"
     steps = [
-        _call("run_shell", command="rg -l 'def build_stable_contract' backend/aiive/runtime"),
+        _call("run_shell", command="git grep -l 'def build_stable_contract' -- backend/aiive/runtime"),
         _call("read_file", path="backend/aiive/runtime/system_contract.py"),
         _call("edit_file", path=contract, old_text=heading, new_text=heading + "\n\nCoding acceptance probe."),
         _call("edit_file", path=desktop, old_text=first_line, new_text="// Coding acceptance probe\n" + first_line),
@@ -198,7 +194,7 @@ def test_selfdev_candidate_with_real_gate_and_supervisor(db_session, tmp_path, m
             runtime = json.load(response)["runtime"]
         assert runtime["loaded_slot"] == "B" and runtime["pid"] != old_pid
         assert Path(runtime["system_contract_module"]).is_relative_to(deploy.active_app_root())
-        expected = deploy._read_manifest(deploy.base_dir / "B")["stable_contract_audit_ref"]
+        expected = deploy.read_manifest(deploy.base_dir / "B")["stable_contract_audit_ref"]
         assert runtime["stable_contract_audit_ref"] == expected
         assert expected != get_prompt_registry().render("agent.stable_contract").audit_ref
         deploy.ensure_initialized(source)

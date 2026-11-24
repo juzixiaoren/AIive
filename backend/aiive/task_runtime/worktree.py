@@ -13,7 +13,7 @@ from pathlib import Path
 GIT_TIMEOUT_SECONDS = 30
 
 
-def _run_git(args: list[str], cwd: Path, *, check: bool) -> subprocess.CompletedProcess[str]:
+def run_git(args: list[str], cwd: Path, *, check: bool) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", *args],
         cwd=cwd,
@@ -31,7 +31,7 @@ class WorktreeIsolation:
 
     def __init__(self, repo_root: Path):
         self.repo_root: Path = repo_root.resolve()
-        probe = _run_git(["rev-parse", "--show-toplevel"], self.repo_root, check=False)
+        probe = run_git(["rev-parse", "--show-toplevel"], self.repo_root, check=False)
         if probe.returncode != 0 or Path(probe.stdout.strip()).resolve() != self.repo_root:
             raise ValueError("workspace_is_not_git_repository")
 
@@ -42,8 +42,9 @@ class WorktreeIsolation:
             raise ValueError("invalid_task_id")
         return safe
 
-    def path_for(self, task_id: str) -> Path:
-        safe = self._safe_task_id(task_id)
+    @staticmethod
+    def path_for(task_id: str) -> Path:
+        safe = WorktreeIsolation._safe_task_id(task_id)
         from aiive.storage.data_paths import data_path
 
         return data_path("task-worktrees", safe)
@@ -51,7 +52,7 @@ class WorktreeIsolation:
     def _is_registered_worktree(self, destination: Path) -> bool:
         if not destination.is_dir():
             return False
-        probe = _run_git(["rev-parse", "--show-toplevel"], destination, check=False)
+        probe = run_git(["rev-parse", "--show-toplevel"], destination, check=False)
         return (
             probe.returncode == 0
             and bool(probe.stdout.strip())
@@ -69,7 +70,7 @@ class WorktreeIsolation:
         safe_task_id = self._safe_task_id(task_id)
         branch = f"aiive/task-{safe_task_id}"
         branch_ref = f"refs/heads/{branch}"
-        branch_probe = _run_git(
+        branch_probe = run_git(
             ["show-ref", "--verify", "--quiet", branch_ref], self.repo_root, check=False,
         )
         if branch_probe.returncode not in (0, 1):
@@ -85,7 +86,7 @@ class WorktreeIsolation:
         if branch_probe.returncode == 1:
             command.extend(["-b", branch])
         command.extend([str(destination), branch if branch_probe.returncode == 0 else base_ref])
-        _run_git(command[1:], self.repo_root, check=True)
+        run_git(command[1:], self.repo_root, check=True)
         return destination
 
     def remove(self, task_id: str, *, force: bool = False) -> None:
@@ -93,6 +94,6 @@ class WorktreeIsolation:
         if not destination.exists():
             return
         flags = ["--force"] if force else []
-        _run_git(["worktree", "remove", *flags, str(destination)], self.repo_root, check=True)
+        run_git(["worktree", "remove", *flags, str(destination)], self.repo_root, check=True)
         if force:
-            _run_git(["branch", "-D", f"aiive/task-{self._safe_task_id(task_id)}"], self.repo_root, check=False)
+            run_git(["branch", "-D", f"aiive/task-{self._safe_task_id(task_id)}"], self.repo_root, check=False)

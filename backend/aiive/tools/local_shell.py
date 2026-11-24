@@ -176,9 +176,8 @@ def run_bash(
             pump.start()
         try:
             if on_start:
-                on_start({key: str(capture._log.tmp_path)
-                          for key, capture in (("stdout", out_capture), ("stderr", err_capture))
-                          if capture._log is not None})
+                on_start({key: path for key, capture in (("stdout", out_capture), ("stderr", err_capture))
+                          if (path := capture.live_path) is not None})
             deadline = time.monotonic() + timeout
             while proc.poll() is None:
                 if cancel_check is not None and cancel_check():
@@ -319,6 +318,10 @@ class _Capture:
         self.total_bytes: int = 0
         self.capture_truncated: bool = False
         self.path: str = ""
+
+    @property
+    def live_path(self) -> str | None:
+        return str(self._log.tmp_path) if self._log is not None else None
 
     def write(self, chunk: bytes) -> None:
         if not chunk:

@@ -4,6 +4,7 @@ import os
 import sys
 from importlib.util import find_spec
 from pathlib import Path
+from typing import Any
 
 
 def source_root() -> Path:
@@ -28,7 +29,7 @@ def runtime_root() -> Path:
     return Path(os.environ.get("AIIVE_RUNTIME_DIR") or slots_root().parent / "runtime").expanduser().resolve()
 
 
-def runtime_identity() -> dict:
+def runtime_identity() -> dict[str, Any]:
     from aiive.runtime.system_contract import stable_contract_audit
 
     package = find_spec("aiive")

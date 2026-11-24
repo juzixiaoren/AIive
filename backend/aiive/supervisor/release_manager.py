@@ -144,7 +144,7 @@ class ReleaseManager:
                     return {"ok": False, "error": "candidate_or_active_slot_changed"}
                 if blocked := self._candidate_block(current, task_id=task_id):
                     return blocked
-                manifest = self._manager._read_manifest(candidate_root)
+                manifest = self._manager.read_manifest(candidate_root)
                 self._manager.set_active_slot(current)
             finally:
                 lock.release(handle)
@@ -198,7 +198,7 @@ class ReleaseManager:
                 from aiive.project_paths import runtime_identity
 
                 actual = runtime_identity()
-                manifest = self._manager._read_manifest(self._manager.base_dir / current)
+                manifest = self._manager.read_manifest(self._manager.base_dir / current)
                 expected = self._manager.active_app_root() / "backend" / "aiive" / "runtime" / "system_contract.py"
                 module = Path(actual.get("system_contract_module") or "")
                 if (actual.get("loaded_slot") != current or module.resolve() != expected.resolve()

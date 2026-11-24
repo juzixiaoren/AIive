@@ -1,12 +1,13 @@
 """Domain tool handlers (implementation) split from builtin_tools."""
 
+from aiive.context.run_context import RunContext
 from aiive.tools.base import BaseTool, DatabaseTool
 
 from pathlib import Path
 from typing import override, Any
 
 
-def _reader(ctx, workspace):
+def _reader(ctx: RunContext | None, workspace: str):
     from aiive.selfdev.project_reader import ProjectReader
     from aiive.tools.workspace_files import workspace_path
 
@@ -51,7 +52,7 @@ class ApplyPatchToInactiveSlotTool(BaseTool):
 
         frozen = operations or []
         if ctx and ctx.task_id:
-            from aiive.tools.workspace_files import WriteFileTool, workspace_path
+            from aiive.tools.workspace_files import workspace_path, write_workspace_file
 
             if not ctx.task_workspace:
                 return {"ok": False, "error": "task_workspace_required"}
@@ -65,7 +66,7 @@ class ApplyPatchToInactiveSlotTool(BaseTool):
                 if action == "delete_file":
                     workspace_path(ctx, relative).unlink()
                 elif action in {"add_file", "modify_file"}:
-                    WriteFileTool._run(self, relative, operation["content"], ctx=ctx)
+                    write_workspace_file(relative, operation["content"], ctx=ctx)
                 else:
                     return {"ok": False, "error": "unsupported_file_operation", "operations_applied": applied}
                 applied.append(relative)
@@ -93,6 +94,13 @@ class ApplyPatchToInactiveSlotTool(BaseTool):
         return result
 
 
+def _promote_slot(task_id: str | None) -> dict[str, Any]:
+    from aiive.supervisor.client import supervisor_client_from_settings
+    from aiive.supervisor.release_manager import ReleaseManager
+
+    return ReleaseManager(client=supervisor_client_from_settings()).promote(task_id=task_id)
+
+
 class PromoteSlotTool(BaseTool):
     @override
     def _run(self, ctx: Any = None):
@@ -101,9 +109,7 @@ class PromoteSlotTool(BaseTool):
         启用 Supervisor 时切换由守护进程执行，返回 status=switch_requested；
         此时"已晋升"必须由后续读取（/api/selfdev/supervisor 或新进程状态）确认。
         """
-        from aiive.supervisor.client import supervisor_client_from_settings
-        from aiive.supervisor.release_manager import ReleaseManager
-        return ReleaseManager(client=supervisor_client_from_settings()).promote(task_id=ctx.task_id if ctx else None)
+        return _promote_slot(ctx.task_id if ctx else None)
 
 
 class RunSelfdevRepairTool(BaseTool):
@@ -122,7 +128,7 @@ class RunSelfdevRepairTool(BaseTool):
                 return {"ok": False, "error": "workspace_must_be_task_root"}
             result = deliver_workspace(root, task_id=ctx.task_id, run_id=ctx.action_id, files=files)
             if result.get("ok") and promote:
-                result["promotion"] = PromoteSlotTool._run(self, ctx=ctx)
+                result["promotion"] = _promote_slot(ctx.task_id)
                 result["ok"] = result["promotion"].get("ok", False)
             return result
         from aiive.selfdev.repair_loop import SelfDevRepairLoop
@@ -163,6 +169,7 @@ class PromotionStatusTool(DatabaseTool):
 
 
 class RuntimeIdentityTool(BaseTool):
+    @override
     def _run(self):
         from aiive.project_paths import runtime_identity
         from aiive.supervisor.slot_manager import SlotManager

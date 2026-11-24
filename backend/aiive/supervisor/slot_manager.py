@@ -116,7 +116,7 @@ class SlotManager:
         result: list[SlotInfo] = []
         for name in ("A", "B"):
             root = self._base_dir / name
-            manifest = self._read_manifest(root)
+            manifest = self.read_manifest(root)
             checksum = _compute_manifest_checksum(manifest) if manifest else ""
             result.append(SlotInfo(
                 name=name,
@@ -161,7 +161,7 @@ class SlotManager:
                     copy_files(canonical, staged, source_files(canonical, git=(canonical / ".git").exists()))
                     if not (staged / "backend" / "aiive" / "main.py").is_file():
                         raise ValueError("canonical_snapshot_incomplete")
-                    manifest = self._read_manifest(root)
+                    manifest = self.read_manifest(root)
                     write_json_atomic(root / "version_manifest.json", {**manifest, "bootstrap_snapshot": True})
                     (root / "app").rmdir()
                     staged.replace(root / "app")
@@ -183,7 +183,7 @@ class SlotManager:
 
         self.set_active_slot("A")
 
-    def _read_manifest(self, slot_root: Path) -> dict[str, Any]:
+    def read_manifest(self, slot_root: Path) -> dict[str, Any]:
         """
         读取槽位的 version_manifest.json。
 
