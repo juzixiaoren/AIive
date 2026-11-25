@@ -11,6 +11,7 @@ import pytest
 from langchain_core.messages import AIMessage
 
 from aiive.config import settings
+from aiive.control.tool_trust import ToolTrustPolicy
 from aiive.db.models import AgentAction, ApprovalRequest, Thread
 from aiive.task_runtime.agent_executor import TaskAgentExecutor
 from aiive.task_runtime.evidence import EvidenceStore
@@ -62,6 +63,7 @@ def _result(db, action):
 def test_workspace_edit_patch_and_failed_test_recovery(db_session, tmp_path, monkeypatch, git):
     if not resolve_bash() or not shutil.which("git"):
         pytest.skip("Bash and Git required")
+    ToolTrustPolicy.save(db_session, "full_trust", None)
     monkeypatch.setattr(settings, "aiive_data_dir", str(tmp_path / "data"))
     source = tmp_path / "source"
     source.mkdir()
@@ -190,6 +192,7 @@ def test_worker_corrects_invalid_tool_calls_without_dispatch(db_session, tmp_pat
 def test_worker_waits_for_background_streams_and_exit(db_session, tmp_path, monkeypatch, cancel):
     if not resolve_bash():
         pytest.skip("Bash required")
+    ToolTrustPolicy.save(db_session, "full_trust", None)
     monkeypatch.setattr(settings, "aiive_data_dir", str(tmp_path / "data"))
     source = tmp_path / "source"
     source.mkdir()

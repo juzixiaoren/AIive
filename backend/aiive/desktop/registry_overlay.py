@@ -7,6 +7,7 @@ from typing import override, Any
 from sqlalchemy.orm import Session
 
 from aiive.desktop.connection_manager import desktop_connection_manager
+from aiive.db.models import DesktopNode
 from aiive.desktop.node_service import desktop_node_service
 from aiive.desktop.protocol import definition_for
 from aiive.desktop.schemas import DesktopCapability
@@ -73,7 +74,11 @@ def build_registry_for_thread(
         return registry
     if node is None or not desktop_connection_manager.is_connected(node.id):
         return registry
+    register_desktop_tools(registry, node)
+    return registry
 
+
+def register_desktop_tools(registry: ToolRegistry, node: DesktopNode) -> None:
     for raw_capability in node.capabilities or []:
         try:
             capability = DesktopCapability.model_validate(raw_capability)
@@ -117,4 +122,3 @@ def build_registry_for_thread(
                 raw_name=capability.name,
             ),
         )))
-    return registry

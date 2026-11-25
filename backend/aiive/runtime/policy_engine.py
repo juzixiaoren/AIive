@@ -12,7 +12,7 @@ from enum import Enum
 from typing import Any
 
 from aiive.tools.registry import ToolRegistry, get_tool_registry
-from aiive.control.task_policy import approval_reason
+from aiive.control.tool_trust import ToolTrustPolicy
 
 
 class PolicyAction(str, Enum):
@@ -40,16 +40,11 @@ class PolicyResult:
     allowed_tools: list[str] = field(default_factory=list)
 
 
-EFFECT_TYPE_RULES = {
-    "destructive_write": PolicyAction.CONFIRM,
-    "external_communication": PolicyAction.CONFIRM,
-    "shell_execution": PolicyAction.CONFIRM,
-}
-
-
 def check_tool_calls(
     tool_calls: list[dict[str, Any]],
     registry: ToolRegistry | None = None,
+    *,
+    trust: ToolTrustPolicy | None = None,
 ) -> PolicyResult:
     """批量校验 AIMessage.tool_calls 的注册状态与审批元数据。
 
@@ -69,6 +64,7 @@ def check_tool_calls(
 
     if registry is None:
         registry = get_tool_registry()
+    trust = trust or ToolTrustPolicy()
 
     allowed: list[str] = []
     blocked: list[str] = []
@@ -81,7 +77,7 @@ def check_tool_calls(
             blocked.append(tool_name)
         else:
             allowed.append(tool_name)
-            if approval_reason(registration, tool_name, tc.get("args") or {}):
+            if trust.approval_reason(registration, tc.get("args") or {}):
                 confirm.append(tool_name)
 
     if blocked:

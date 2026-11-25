@@ -10,6 +10,10 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react"
 import { BASE_PATH } from "./lib/base";
 import { useNotificationCount } from "./hooks/useNotificationSocket";
 import { AuthProvider, useAuth } from "./hooks/useAuth";
+import { apiFetch } from "./api/client";
+import { ToolTrustControl } from "../../shared/settings/ToolTrustControl";
+
+const fetchSettings = (path: string, init?: RequestInit) => apiFetch(`${BASE_PATH}api/${path}`, init);
 
 const ChatPage = lazy(() => import("./pages/ChatPage"));
 const EventTimeline = lazy(() => import("./pages/EventTimeline"));
@@ -164,18 +168,18 @@ function AuthenticatedApp({ username }: { username: string }) {
       }
     >
       {/* 顶部导航栏 */}
-      <header className="border-b border-divider bg-surface px-4 sm:px-6 py-4 flex items-center justify-between gap-3 shadow-sm">
-        <div className="flex items-center gap-3 shrink-0">
+      <header className="border-b border-divider bg-surface px-3 sm:px-6 py-3 sm:py-4 flex flex-wrap sm:flex-nowrap items-center justify-between gap-3 shadow-sm">
+        <div className="flex items-center gap-2 sm:gap-3 shrink-0">
           <img
             src={`${BASE_PATH}aiive-logo.png`}
             alt="AIive Logo"
-            className="h-10 w-10 object-contain drop-shadow-sm"
+            className="h-8 w-8 sm:h-10 sm:w-10 object-contain drop-shadow-sm"
           />
           <h1 className="text-xl font-bold tracking-tight text-content">AIive</h1>
           <span className="hidden sm:inline text-xs text-faint bg-surface-muted px-2 py-0.5 rounded">个人管家</span>
         </div>
         {/* Tab 切换按钮组 */}
-        <div className="flex gap-1 bg-surface-muted rounded-lg p-1 overflow-x-auto">
+        <div className="order-last w-full sm:order-none sm:w-auto flex gap-1 bg-surface-muted rounded-lg p-1 overflow-x-auto">
           {tabs.map(t => (
             <button
               key={t.key}
@@ -192,6 +196,7 @@ function AuthenticatedApp({ username }: { username: string }) {
         </div>
 
         <div className="flex items-center gap-2 shrink-0">
+          <ToolTrustControl apiFetch={fetchSettings} />
           {/* 账号标识与退出登录 */}
           <span className="hidden md:inline max-w-[10rem] truncate text-xs text-muted" title={username}>
             {username}

@@ -5,6 +5,7 @@ import { apiFetch as attachmentApiFetch, getToken as attachmentToken } from "./a
 const attachmentFetch = (path: string, init?: RequestInit) => attachmentApiFetch(path, init);
 import { App as CapacitorApp } from "@capacitor/app";
 import { workCardsFrom } from "../../../shared/work/types";
+import { ToolTrustControl } from "../../../shared/settings/ToolTrustControl";
 import WorkCenter from "./work/WorkCenter";
 import { useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
@@ -471,6 +472,7 @@ export function ChatApp({ username, onLogout, active, onOpenWork }: { username: 
           </div>
         </div>
         <div className="header-actions">
+          <ToolTrustControl apiFetch={attachmentApiFetch} />
           <span className="account-chip" title={username}>{username}</span>
           <button
             type="button"

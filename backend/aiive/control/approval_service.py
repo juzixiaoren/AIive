@@ -146,6 +146,8 @@ class TaskApprovalService:
         precondition_issues = CapabilityBroker.validate_preconditions(action)
         integrity_ok = (
             action.arguments_hash == approval.tool_args_hash
+            and hashlib.sha256(canonical_json(action.arguments or {}).encode("utf-8")).hexdigest()
+            == approval.tool_args_hash
             and hashlib.sha256(canonical_json(approval.tool_args or {}).encode("utf-8")).hexdigest()
             == approval.tool_args_hash
             and action.descriptor_hash == approval.descriptor_hash
@@ -156,7 +158,7 @@ class TaskApprovalService:
             and approval.approval_hash == expected_hash
             and prepared.registration is not None
             and prepared.registration.safety.descriptor_hash == action.descriptor_hash
-            and prepared.decision.outcome == "approval"
+            and prepared.decision.outcome != "block"
             and not precondition_issues
         )
         if not integrity_ok:

@@ -10,6 +10,7 @@ import pytest
 from aiive.config import settings
 from aiive.control.scope import TaskScope
 from aiive.control.task_policy import TaskPolicyEngine
+from aiive.control.tool_trust import ToolTrustPolicy
 from aiive.db.models import AgentAction, Thread
 from aiive.task_runtime.agent_executor import AgentDecision
 from aiive.task_runtime.repository import TaskRepository
@@ -230,7 +231,7 @@ def test_shell_command_classification(command: str, read_only: bool, uses_networ
     assert verdict.uses_network is uses_network
 
 
-def test_task_policy_allows_scoped_file_commands(tmp_path) -> None:
+def test_task_policy_requires_approval_for_scoped_file_mutations(tmp_path) -> None:
     registry = get_tool_registry()
     registration = registry.get(SHELL_CAPABILITY_ID)
     assert registration is not None
@@ -240,7 +241,7 @@ def test_task_policy_allows_scoped_file_commands(tmp_path) -> None:
     read_only = policy.decide(registration, scope, SHELL_CAPABILITY_ID, {"command": "ls", "cwd": cwd})
     assert read_only.outcome == "allow"
     write = policy.decide(registration, scope, SHELL_CAPABILITY_ID, {"command": "rm -rf x", "cwd": cwd})
-    assert write.outcome == "allow"
+    assert write.outcome == "approval"
     network = policy.decide(
         registration, scope, SHELL_CAPABILITY_ID, {"command": "curl https://example.com", "cwd": cwd},
     )
@@ -287,10 +288,11 @@ def test_task_executes_read_only_shell_without_desktop_node(db_session, tmp_path
     assert action.status == "succeeded"
 
 
-def test_shell_creates_overwrites_moves_and_deletes_without_approval(db_session, tmp_path) -> None:
+def test_full_trust_shell_creates_overwrites_moves_and_deletes(db_session, tmp_path) -> None:
     from aiive.db.models import ApprovalRequest
 
     _require_bash()
+    ToolTrustPolicy.save(db_session, "full_trust", None)
     task = _task(db_session, {"capability_policy": "unified", "allowed_roots": [str(tmp_path)]})
     agent = _ScriptedAgent(
         ActionProposal(

@@ -26,7 +26,7 @@ from aiive.mcp.runtime_client import (
 )
 
 from aiive.tools.base import BaseTool
-from aiive.tools.registry import ToolDefinition
+from aiive.tools.registry import ToolDefinition, compute_descriptor_hash
 from aiive.tool_discovery.documents import DiscoveryMetadata
 
 logger = logging.getLogger(__name__)
@@ -37,7 +37,7 @@ MCP_TOOL_TIMEOUT_SECONDS = 60.0
 # 工具名中暗示外部写副作用 / 删除的关键词（保守启发式）
 _WRITE_HINTS = (
     "write", "create", "update", "move", "put", "post", "send", "insert",
-    "set", "add", "fill", "click", "navigate", "execute", "apply",
+    "set", "add", "fill", "click", "navigate", "execute", "apply", "edit", "rename", "mkdir", "copy",
 )
 _DELETE_HINTS = ("delete", "remove", "drop", "clear")
 # `search` 本身并不代表联网：memory/search_nodes、filesystem/search_files 都是
@@ -102,10 +102,11 @@ def _input_schema_to_parameters(input_schema: dict[str, Any]) -> dict[str, Any]:
 
 
 class MCPTool(BaseTool):
-    def __init__(self, definition: ToolDefinition, db_capability_id: str, tool_name: str):
+    def __init__(self, definition: ToolDefinition, db_capability_id: str, tool_name: str, execution_identity: str = ""):
         super().__init__(definition)
         self.db_capability_id: str = db_capability_id
         self.tool_name: str = tool_name
+        self.execution_identity: str = execution_identity or db_capability_id
 
     @override
     def _run(self, **params: Any) -> dict[str, Any]:
@@ -129,6 +130,7 @@ def register_capability_tools(
     base_risk_level: str = "medium",
     trust_level: str = "untrusted",
     namespace_description: str = "",
+    execution_identity: str = "",
 ) -> list[str]:
     """把一个 MCP 能力的真实工具列表注册进 ToolRegistry。
 
@@ -158,8 +160,7 @@ def register_capability_tools(
         risk = base_risk_level
         if writes:
             risk = _max_risk(risk, "medium")
-        filesystem = _sanitize_identifier(capability_name) in {"server_filesystem", "filesystem"}
-        if can_delete and not filesystem:
+        if can_delete:
             risk = _max_risk(risk, "high")
 
         cap_id = mcp_tool_capability_id(capability_name, tool_name)
@@ -168,7 +169,7 @@ def register_capability_tools(
             definition_source="remote_mcp",
             definition_trust_level=trust_level,
             risk_level=risk,
-            requires_confirmation=not filesystem and risk in ("high", "critical"),
+            requires_confirmation=risk in ("high", "critical"),
             writes_external_world=writes,
             can_access_secret=False,
             can_delete=can_delete,
@@ -194,7 +195,7 @@ def register_capability_tools(
                 namespace_description=namespace_description or f"{capability_name} MCP Server",
                 raw_name=tool_name,
             ),
-        ), db_capability_id, tool_name))
+        ), db_capability_id, tool_name, execution_identity))
         registered.append(cap_id)
     logger.info(
         "MCP 能力已注册进 ToolRegistry: %s tools=%d", capability_name, len(registered),
@@ -287,6 +288,9 @@ def activate_capability_tools(registry: Any, cap: Any) -> dict[str, Any]:
         base_risk_level=str(definition.get("risk_verdict", "medium")),
         trust_level=str(definition.get("trust_level", "untrusted")),
         namespace_description=str(definition.get("description") or ""),
+        execution_identity=compute_descriptor_hash({
+            "installation_id": cap.id, "descriptor_hash": cap.descriptor_hash, "launch": launch,
+        }),
     )
     return {"ok": True, "registered": registered, "error": None}
 

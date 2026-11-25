@@ -178,7 +178,7 @@ def test_registry_overlay_injects_node_tools_with_remote_executor(db_session, mo
     }
     assert check_tool_calls([
         {"name": "desktop_fs_delete", "args": {"path": "C:\\Users\\me\\old.txt"}, "id": "delete-1"},
-    ], registry).action is PolicyAction.ALLOW
+    ], registry).action is PolicyAction.CONFIRM
     # Desktop 能力不再接受 Turn 审批入口；只能由 Task CapabilityBroker 使用
     # execute_brokered 进入持久 Action 链。
     approved = registry.execute_brokered(

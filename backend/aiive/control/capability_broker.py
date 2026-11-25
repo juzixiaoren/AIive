@@ -15,12 +15,14 @@ from sqlalchemy.orm import Session
 from aiive.context.run_context import RunContext
 from aiive.control.scope import PATH_ARGUMENTS, TASK_READ_CAPABILITIES, TaskScope, action_resource_keys, path_within
 from aiive.control.task_policy import ActionPolicyDecision, TaskPolicyEngine
-from aiive.db.models import AgentAction, AgentRun, AgentTask, TaskEvidence
+from aiive.control.tool_trust import ToolTrustPolicy
+from aiive.db.models import AgentAction, AgentRun, AgentTask, ApprovalRequest, Capability, TaskEvidence
 from aiive.desktop.registry_overlay import build_registry_for_thread
-from aiive.mcp.bootstrap import registered_tool_ids
+from aiive.mcp.bootstrap import MCPTool, registered_tool_ids
 from aiive.task_runtime.resource_locks import ResourceBusyError, ResourceLockService
 from aiive.tools.base import BaseTool, outcome_is_unknown
 from aiive.tools.registry import ToolRegistry
+from aiive.tools.tool_validation import validate_tool_params
 from aiive.tool_discovery import DEFAULT_LIMIT
 from aiive.tool_discovery.service import get_discovery_service
 
@@ -32,6 +34,7 @@ SELFDEV_HEARTBEAT_SECONDS = 30
 class PreparedCapability:
     registration: BaseTool | None
     decision: ActionPolicyDecision
+    workspace_arguments: dict[str, Any] | None = None
 
 
 class CapabilityBroker:
@@ -100,7 +103,7 @@ class CapabilityBroker:
 
     def prepare(
         self, task: AgentTask, capability_id: str, arguments: dict[str, Any],
-        *, available: ToolRegistry | None = None,
+        *, available: ToolRegistry | None = None, trust: ToolTrustPolicy | None = None,
     ) -> PreparedCapability:
         scope = TaskScope.from_brief(task.task_brief or {})
         available = available if available is not None else self.available_registry(task)
@@ -108,20 +111,28 @@ class CapabilityBroker:
         if registration is None:
             reason = "capability_disabled" if self._is_disabled(capability_id=capability_id) else "unknown_capability"
             return PreparedCapability(None, ActionPolicyDecision("block", reason))
+        if isinstance(registration, MCPTool) and self.db.query(Capability.id).filter(
+            Capability.capability_id == registration.db_capability_id, Capability.state == "disabled",
+        ).first() is not None:
+            return PreparedCapability(None, ActionPolicyDecision("block", "capability_disabled"))
+        if not validate_tool_params(registration, arguments).ok:
+            return PreparedCapability(registration, ActionPolicyDecision("block", "invalid_tool_arguments"))
         workspace = self.workspace_context(task)
         from aiive.task_runtime.router import CODING_CAPABILITIES
 
         if capability_id in CODING_CAPABILITIES and not workspace["task_workspace"]:
             return PreparedCapability(registration, ActionPolicyDecision("block", "task_workspace_required"))
-        if workspace["task_workspace"] and capability_id in {*CODING_CAPABILITIES, "run_shell"}:
+        workspace_root = workspace["task_workspace"] if capability_id in {*CODING_CAPABILITIES, "run_shell"} else None
+        workspace_arguments = None
+        if workspace_root:
             if not scope.allows_capability(capability_id):
                 return PreparedCapability(registration, ActionPolicyDecision("block", "capability_not_in_task_scope"))
             try:
-                self.workspace_arguments(workspace["task_workspace"], capability_id, arguments)
-            except ValueError as exc:
+                workspace_arguments = self.workspace_arguments(workspace_root, capability_id, arguments)
+            except (ValueError, OSError, RuntimeError) as exc:
                 return PreparedCapability(registration, ActionPolicyDecision("block", str(exc)))
-            return PreparedCapability(registration, ActionPolicyDecision("allow", "task_workspace"))
-        lifecycle_block = self._lifecycle_block(task, registration, capability_id, arguments)
+        # Workspace paths are resolved against the isolated copy, including when it lives under the project root.
+        lifecycle_block = None if workspace_root else self._lifecycle_block(task, registration, capability_id, arguments)
         if lifecycle_block:
             return PreparedCapability(
                 registration=registration,
@@ -129,7 +140,11 @@ class CapabilityBroker:
             )
         return PreparedCapability(
             registration=registration,
-            decision=self.policy.decide(registration, scope, capability_id, arguments),
+            decision=self.policy.decide(
+                registration, scope, capability_id, workspace_arguments if workspace_arguments is not None else arguments,
+                trust=trust or ToolTrustPolicy.load(self.db), workspace_root=workspace_root,
+            ),
+            workspace_arguments=workspace_arguments,
         )
 
     @staticmethod
@@ -237,8 +252,6 @@ class CapabilityBroker:
 
     def _is_disabled(self, *, capability_id: str) -> bool:
         """该工具是否属于某个已被显式停用的能力。"""
-        from aiive.db.models import Capability
-
         rows = (
             self.db.query(Capability)
             .filter(Capability.state == "disabled")
@@ -246,6 +259,13 @@ class CapabilityBroker:
             .all()
         )
         return any(capability_id in registered_tool_ids(cap) for cap in rows)
+
+    def has_approval(self, action: AgentAction) -> bool:
+        return action.requires_approval and self.db.query(ApprovalRequest.id).filter(
+            ApprovalRequest.action_id == action.id,
+            ApprovalRequest.status == "succeeded",
+            ApprovalRequest.decision == "approve",
+        ).first() is not None
 
     @staticmethod
     def validate_preconditions(action: AgentAction) -> list[str]:
@@ -300,7 +320,9 @@ class CapabilityBroker:
                 issues.append("precondition_file_id_changed")
         return issues
 
-    def dispatch(self, task: AgentTask, run: AgentRun, action: AgentAction) -> dict[str, Any]:
+    def dispatch(
+        self, task: AgentTask, run: AgentRun, action: AgentAction, *, trust: ToolTrustPolicy | None = None,
+    ) -> dict[str, Any]:
         from aiive.worker.outbox_execution_auth import require_execution_authorization
         from aiive.worker.job_source_guard import task_sources_visible
 
@@ -311,12 +333,12 @@ class CapabilityBroker:
         scope = TaskScope.from_brief(task.task_brief or {})
         available = self.available_registry(task)
         registry = self.registry_for(task, available=available)
-        prepared = self.prepare(task, action.capability_id, action.arguments or {}, available=available)
+        prepared = self.prepare(task, action.capability_id, action.arguments or {}, available=available, trust=trust)
         registration = prepared.registration
         if registration is None:
             # 停用与"从未存在"必须区分：停用是用户显式动作，任务应按可恢复错误处理，
             # 不能当成工具名写错（unknown_tool）。
-            if self._is_disabled(capability_id=action.capability_id):
+            if prepared.decision.reason == "capability_disabled":
                 return {
                     "ok": False,
                     "error": "capability_disabled",
@@ -326,15 +348,12 @@ class CapabilityBroker:
         if registration.safety.descriptor_hash != action.descriptor_hash:
             return {"ok": False, "error": "descriptor_changed", "error_type": "descriptor_changed"}
         if prepared.decision.outcome == "block" or (
-            prepared.decision.outcome == "approval" and not action.requires_approval
+            prepared.decision.outcome == "approval" and not self.has_approval(action)
         ):
             return {"ok": False, "error": prepared.decision.reason, "error_type": "policy_denied"}
         workspace = self.workspace_context(task)
         arguments = action.arguments or {}
-        if prepared.decision.reason == "task_workspace":
-            resource_arguments = self.workspace_arguments(workspace["task_workspace"], action.capability_id, arguments)
-        else:
-            resource_arguments = arguments
+        resource_arguments = prepared.workspace_arguments if prepared.workspace_arguments is not None else arguments
         issues = self.validate_preconditions(action)
         if issues:
             return {"ok": False, "error": ";".join(issues), "error_type": "precondition_failed"}

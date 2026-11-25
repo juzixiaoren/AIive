@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from aiive.control.approval_service import TaskApprovalService
 from aiive.control.capability_broker import CapabilityBroker
+from aiive.control.tool_trust import ToolTrustPolicy
 from aiive.db.models import AgentAction, AgentRun, AgentTask, TaskArtifact, TaskEvidence
 from aiive.task_runtime.agent_executor import TaskAgentExecutor
 from aiive.task_runtime.errors import AgentOutputValidationError, TaskModelBudgetError, TaskNotRunnableError
@@ -174,8 +175,10 @@ class PersistentTaskRuntime:
             if budget_issue:
                 return self._stop_for_budget(task, run, budget_issue)
             if ready is not None:
-                outcome = self._dispatch_ready(task, run, ready)
+                outcome = self._dispatch_ready(task, run, ready, token_usage=run_tokens, model=last_model)
                 completed_this_run += 1
+                if isinstance(outcome, dict):
+                    return outcome
                 if outcome in {"blocked", "terminal"}:
                     return {"status": task.status, "task_id": task.id, "action_id": ready.id}
                 return None
@@ -456,38 +459,7 @@ class PersistentTaskRuntime:
                 completed_this_run += 1
                 return None
             if prepared.decision.outcome == "approval":
-                self.repo.transition_action(action, ActionStatus.AWAITING_APPROVAL.value)
-                self.repo.transition_task(
-                    task, TaskStatus.BLOCKED_APPROVAL.value,
-                )
-                self.repo.checkpoint(
-                    task.id, reason="blocked_approval", pending_action_refs=[action.id],
-                )
-                approval = TaskApprovalService(self.db).create(task, action)
-                self.repo.append_event(
-                    task.id,
-                    "task_blocked_approval",
-                    {
-                        "approval_id": approval.id, "action_id": action.id,
-                        "capability_id": action.capability_id,
-                        "arguments": action.arguments,
-                        "risk_level": action.risk_level,
-                        "preconditions": action.preconditions,
-                        "effects": action.effects,
-                    },
-                    visibility="conversation",
-                    run_id=run.id,
-                    action_id=action.id,
-                )
-                self.repo.finish_run(
-                    run, summary={"blocked": "approval", "approval_id": approval.id},
-                    token_usage=run_tokens, model=last_model,
-                )
-                self.db.commit()
-                return {
-                    "status": task.status, "task_id": task.id,
-                    "approval_id": approval.id, "action_id": action.id,
-                }
+                return self._request_approval(task, run, action, token_usage=run_tokens, model=last_model)
             self.repo.transition_action(action, ActionStatus.READY.value)
             self.db.commit()
             return None
@@ -749,7 +721,36 @@ class PersistentTaskRuntime:
         )
         self.db.commit()
 
-    def _dispatch_ready(self, task: AgentTask, run: AgentRun, action: AgentAction) -> str:
+    def _request_approval(
+        self, task: AgentTask, run: AgentRun, action: AgentAction, *,
+        token_usage: dict[str, int] | None = None, model: str | None = None,
+    ) -> dict[str, Any]:
+        action.requires_approval = True
+        self.repo.transition_action(action, ActionStatus.AWAITING_APPROVAL.value)
+        self.repo.transition_task(task, TaskStatus.BLOCKED_APPROVAL.value)
+        self.repo.checkpoint(task.id, reason="blocked_approval", pending_action_refs=[action.id])
+        approval = TaskApprovalService(self.db).create(task, action)
+        self.repo.append_event(
+            task.id, "task_blocked_approval",
+            {
+                "approval_id": approval.id, "action_id": action.id,
+                "capability_id": action.capability_id, "arguments": action.arguments,
+                "risk_level": action.risk_level, "preconditions": action.preconditions,
+                "effects": action.effects,
+            },
+            visibility="conversation", run_id=run.id, action_id=action.id,
+        )
+        self.repo.finish_run(
+            run, summary={"blocked": "approval", "approval_id": approval.id},
+            token_usage=token_usage, model=model,
+        )
+        self.db.commit()
+        return {"status": task.status, "task_id": task.id, "approval_id": approval.id, "action_id": action.id}
+
+    def _dispatch_ready(
+        self, task: AgentTask, run: AgentRun, action: AgentAction, *,
+        token_usage: dict[str, int] | None = None, model: str | None = None,
+    ) -> str | dict[str, Any]:
         self.repo.renew_run(run, lease_seconds=900)
         self.db.commit()
         broker = CapabilityBroker(self.db)
@@ -771,11 +772,21 @@ class PersistentTaskRuntime:
         if task.status == TaskStatus.CANCELLED.value or action.status == ActionStatus.CANCELLED.value:
             self.db.commit()
             return "terminal"
+        # Freeze the mode at dispatch intent. The broker still rechecks tool identity and execution constraints.
+        trust = ToolTrustPolicy.load(self.db, lock_for_dispatch=True)
+        prepared = broker.prepare(task, action.capability_id, action.arguments or {}, trust=trust)
+        if (
+            prepared.decision.outcome == "approval"
+            and prepared.registration is not None
+            and prepared.registration.safety.descriptor_hash == action.descriptor_hash
+            and not broker.has_approval(action)
+        ):
+            return self._request_approval(task, run, action, token_usage=token_usage, model=model)
         action.execution_run_id = run.id
         action.execution_token = str(uuid.uuid4())
         self.repo.transition_action(action, ActionStatus.DISPATCHED.value)
         self.db.commit()
-        result = broker.dispatch(task, run, action)
+        result = broker.dispatch(task, run, action, trust=trust)
         # Broker 会 commit/reload 边界，重新绑定实体。
         refreshed_task = self.db.get(AgentTask, task.id)
         refreshed_action = self.db.get(AgentAction, action.id)

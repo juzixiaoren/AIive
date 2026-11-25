@@ -9,6 +9,7 @@ import urllib.request
 from pathlib import Path
 
 from aiive.config import settings
+from aiive.control.tool_trust import ToolTrustPolicy
 from aiive.db.models import AgentAction, ApprovalRequest, Thread
 from aiive.task_runtime.agent_executor import TaskAgentExecutor
 from aiive.task_runtime.repository import TaskRepository
@@ -26,6 +27,7 @@ def test_selfdev_candidate_with_real_gate_and_supervisor(db_session, tmp_path, m
     from aiive.supervisor.slot_manager import SlotManager
 
     assert resolve_bash() and shutil.which("git") and shutil.which("npm"), "Bash, Git and npm required"
+    ToolTrustPolicy.save(db_session, "full_trust", None)
     repo = Path.cwd()
     source = tmp_path / "source"
     source.mkdir()

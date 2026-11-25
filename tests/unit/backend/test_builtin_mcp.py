@@ -54,7 +54,9 @@ def test_generic_search_tool_is_not_mistaken_for_network_access() -> None:
     result = activate_capability_tools(
         registry,
         SimpleNamespace(
+            id="test-memory-installation",
             capability_id="mcp:memory",
+            descriptor_hash=None,
             name="memory",
             definition={
                 "launch": {

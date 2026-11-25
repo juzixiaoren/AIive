@@ -271,7 +271,7 @@ def test_mcp_enable_update_and_unload_during_embedding_outage(vector_search, mon
     search_until(service, registry, "resident", "embedding_unavailable")
     client = SimpleNamespace(configure=lambda *args: None)
     monkeypatch.setattr("aiive.mcp.bootstrap.get_runtime_client", lambda: client)
-    cap = SimpleNamespace(name="pdf-mcp", capability_id="mcp:pdf-mcp", definition={
+    cap = SimpleNamespace(id="pdf-mcp-installation", name="pdf-mcp", capability_id="mcp:pdf-mcp", descriptor_hash=None, definition={
         "launch": {"runner": "python_builtin", "entry_py": str(Path(bootstrap.__file__).with_name("builtin_server.py"))},
         "tools": [{"name": "RenderPage", "description": "Parse PDF", "input_schema": {}}],
         "description": "Document conversion",

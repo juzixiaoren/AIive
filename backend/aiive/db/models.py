@@ -29,6 +29,15 @@ class Base(DeclarativeBase):
     """SQLAlchemy 声明式基类，所有 ORM 模型均继承此类。"""
 
 
+class ToolTrustSetting(Base):
+    __tablename__: str = "tool_trust_settings"
+    __table_args__: tuple[CheckConstraint] = (CheckConstraint("id = 1", name="ck_tool_trust_settings_singleton"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=False)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    approval_exempt_capabilities: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
+
+
 def _utcnow() -> datetime:
     """返回当前 UTC 时间，作为时间戳字段的默认值工厂函数。"""
     return datetime.now(UTC)

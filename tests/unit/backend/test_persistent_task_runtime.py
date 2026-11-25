@@ -12,6 +12,7 @@ import pytest
 
 from aiive.control.approval_service import TaskApprovalService
 from aiive.control.capability_broker import CapabilityBroker
+from aiive.control.tool_trust import ToolTrustPolicy
 from aiive.control.scope import (
     TaskScope,
     _normalize_remote_path,
@@ -575,7 +576,7 @@ def test_high_risk_action_blocks_for_hours_and_resumes_as_new_run(
     monkeypatch.setattr(
         CapabilityBroker,
         "dispatch",
-        lambda _broker, _task, _run, _action: {"ok": True, "result": {"deleted": True}},
+        lambda _broker, _task, _run, _action, **_kwargs: {"ok": True, "result": {"deleted": True}},
     )
     resumed = PersistentTaskRuntime(
         db_session,
@@ -758,6 +759,7 @@ def test_desktop_unknown_reconciles_from_node_journal(db_session) -> None:
 def test_unknown_desktop_action_retains_lock_until_journal_reconciliation(
     db_session, tmp_path, monkeypatch,
 ) -> None:
+    ToolTrustPolicy.save(db_session, "full_trust", None)
     thread = _thread(db_session)
     node = DesktopNode(
         id=str(uuid.uuid4()), name="node", platform="darwin", arch="arm64",
@@ -1077,7 +1079,7 @@ def test_missing_required_tool_stops_before_the_first_model_call(db_session) -> 
     assert task.usage["model_calls"] == 0
 
 
-def test_worker_can_delete_with_the_task_workspace_without_approval(db_session, tmp_path) -> None:
+def test_worker_deletes_only_after_standard_approval(db_session, tmp_path) -> None:
     path = tmp_path / "old.txt"
     path.write_text("remove", encoding="utf-8")
     task = _task(db_session, _thread(db_session), task_brief={"scope": {
@@ -1087,12 +1089,19 @@ def test_worker_can_delete_with_the_task_workspace_without_approval(db_session, 
         ActionProposal(decision="action", capability_id="safe_delete", arguments={"path": str(path)}),
         ActionProposal(decision="finish", summary="deleted"),
     )
-    assert PersistentTaskRuntime(db_session, agent_executor=agent).run(task.id)["status"] == "succeeded"
+    runtime = PersistentTaskRuntime(db_session, agent_executor=agent)
+    pending = runtime.run(task.id)
+    assert pending["status"] == "blocked_approval"
+    assert path.exists()
+    assert TaskApprovalService(db_session).decide(pending["approval_id"], "approve")["ok"]
+    db_session.commit()
+    assert runtime.run(task.id, trigger="approval_granted")["status"] == "succeeded"
     assert not path.exists()
-    assert db_session.query(ApprovalRequest).filter_by(task_id=task.id).count() == 0
+    assert db_session.query(ApprovalRequest).filter_by(task_id=task.id).one().status == "succeeded"
 
 
-def test_desktop_file_actions_dispatch_without_approval(db_session, tmp_path, monkeypatch) -> None:
+def test_full_trust_desktop_file_and_shell_actions_dispatch(db_session, tmp_path, monkeypatch) -> None:
+    ToolTrustPolicy.save(db_session, "full_trust", None)
     capabilities = ["desktop_fs_write_text", "desktop_fs_move", "desktop_fs_delete", "desktop_exec"]
     node = DesktopNode(
         id=str(uuid.uuid4()), name="node", platform="win32", arch="x64", app_version="1",
@@ -1131,6 +1140,7 @@ def test_worker_delegates_selfdev_to_task_workspace(db_session, tmp_path, monkey
     from aiive.context.run_context import RunContext
     from aiive.tools.executor import ToolExecutor
 
+    ToolTrustPolicy.save(db_session, "full_trust", None)
     source = tmp_path / "source"
     source.mkdir()
     target = source / "backend/aiive/runtime/system_contract.py"

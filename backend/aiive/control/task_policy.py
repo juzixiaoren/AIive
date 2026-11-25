@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from aiive.control.scope import TaskScope
+from aiive.control.tool_trust import ToolTrustPolicy
 from aiive.tools.base import BaseTool
 from aiive.tools.shell_policy import (
     SHELL_CAPABILITIES,
@@ -20,37 +21,6 @@ class ActionPolicyDecision:
     reason: str
 
 
-ALWAYS_APPROVE = frozenset({
-    "promote_slot", "rollback_slot",
-})
-FILE_MUTATIONS = frozenset({
-    "safe_delete", "apply_patch_to_inactive_slot", "run_selfdev_repair",
-})
-
-
-def approval_reason(registration: BaseTool, capability_id: str, arguments: dict[str, Any]) -> str | None:
-    if capability_id in ALWAYS_APPROVE or (
-        capability_id == "run_selfdev_repair" and arguments.get("promote") is True
-    ):
-        return "release_change_requires_approval"
-    if (
-        capability_id in FILE_MUTATIONS or capability_id.startswith("desktop_fs_")
-        or (registration.safety.definition_source == "remote_mcp"
-            and capability_id.startswith(("mcp_server_filesystem_", "mcp_filesystem_")))
-    ):
-        return None
-    if capability_id in SHELL_CAPABILITIES:
-        verdict = classify_shell_command(
-            str(arguments.get("command") or ""),
-            windows_shell=capability_id == "desktop_exec" and bool(ntpath.splitdrive(str(arguments.get("cwd") or ""))[0]),
-        )
-        return None if verdict.read_only or verdict.file_only else f"shell_{verdict.reason}"
-    safety = registration.safety
-    if safety.requires_confirmation or safety.risk_level in {"high", "critical"}:
-        return "high_risk_action_requires_approval"
-    return None
-
-
 class TaskPolicyEngine:
     def decide(
         self,
@@ -58,6 +28,9 @@ class TaskPolicyEngine:
         scope: TaskScope,
         capability_id: str,
         arguments: dict[str, Any],
+        *,
+        trust: ToolTrustPolicy | None = None,
+        workspace_root: str | None = None,
     ) -> ActionPolicyDecision:
         if registration is None:
             return ActionPolicyDecision("block", "unknown_capability")
@@ -80,17 +53,15 @@ class TaskPolicyEngine:
             verdict = classify_shell_command(command, windows_shell=remote and bool(ntpath.splitdrive(cwd)[0]))
             if verdict.uses_network and not scope.allow_network:
                 return ActionPolicyDecision("block", "network_access_not_in_task_scope")
-            violations, dynamic_path = shell_path_violations(
+            violations, _ = shell_path_violations(
                 command,
                 cwd=cwd,
-                allowed_roots=scope.allowed_roots,
+                allowed_roots=(workspace_root,) if workspace_root else scope.allowed_roots,
                 remote=remote,
             )
             if violations:
                 detail = ",".join(violations[:3])
                 return ActionPolicyDecision("block", f"shell_path_outside_task_scope:{detail}")
-            if dynamic_path:
-                return ActionPolicyDecision("approval", "shell_dynamic_path_requires_approval")
-        if reason := approval_reason(registration, capability_id, arguments):
+        if reason := (trust or ToolTrustPolicy()).approval_reason(registration, arguments):
             return ActionPolicyDecision("approval", reason)
         return ActionPolicyDecision("allow", "task_scope_and_policy_allow")

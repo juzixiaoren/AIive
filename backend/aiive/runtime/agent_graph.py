@@ -55,6 +55,7 @@ from aiive.memory.extraction_policy import MemoryExtractionPolicy, MemorySignalA
 from aiive.runtime.context_assembler import ContextSnapshotData, ContextSnapshotItem
 from aiive.runtime.execution_context import TurnExecutionContext
 from aiive.runtime.policy_engine import check_tool_calls, PolicyAction
+from aiive.control.tool_trust import ToolTrustPolicy
 from aiive.runtime.thread_state import ThreadState
 from aiive.runtime.action_cards import ActionCard, PendingOperation
 from aiive.runtime.tool_executor import ToolCallRecord, build_action_cards, build_pending_operations
@@ -652,7 +653,7 @@ class AgentGraph:
                 for tc in last_msg.tool_calls
             ]
             logger.info("[TRACE:graph] POLICY_CHECK(ns): %d tool_calls=%s", len(tool_calls_raw), [tc["name"] for tc in tool_calls_raw])
-            result = check_tool_calls(tool_calls_raw, registry)
+            result = check_tool_calls(tool_calls_raw, registry, trust=ToolTrustPolicy.load(self._db))
             if result.action == PolicyAction.CONFIRM and registry is not None and not validate_calls(last_msg, registry).ok:
                 return "continue"  # Invalid parameters must be repaired before creating an approval.
             if result.action == PolicyAction.CONFIRM:

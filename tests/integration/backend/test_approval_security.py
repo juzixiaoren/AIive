@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from aiive.api import routes_approval
 from aiive.api.routes_approval import ApprovalRespondRequest
+from aiive.control.tool_trust import ToolTrustPolicy
 from aiive.db.models import ApprovalRequest, Event, Thread, TurnRecord
 from aiive.runtime.policy_engine import PolicyAction, check_tool_calls
 from aiive.runtime.working_state import WorkingStateService
@@ -114,6 +115,9 @@ def test_approval_uses_server_payload_and_is_idempotent(db, monkeypatch) -> None
     calls: list[dict[str, str]] = []
     registry = _registry(calls)
     monkeypatch.setattr(routes_approval, "get_tool_registry", lambda: registry)
+    ToolTrustPolicy.save(db, "full_trust", None)
+    db.commit()
+    assert calls == []
 
     first = routes_approval.respond_approval(ApprovalRespondRequest(
         approval_id="approval-1", action="approve",

@@ -153,7 +153,7 @@ def test_same_correction_limit_and_usage_for_both_hosts():
     assert response_usage(AIMessage(content="", response_metadata={"token_usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}}))["total_tokens"] == 8
 
 
-def test_main_native_invalid_call_repairs_before_handler():
+def test_main_native_invalid_call_repairs_before_handler(db_session):
     from langchain_core.messages import HumanMessage
     from aiive.runtime.agent_graph import AgentGraph
     calls = []
@@ -170,12 +170,12 @@ def test_main_native_invalid_call_repairs_before_handler():
                 return message(("probe", {"rows": [{"count": 1}]}))
             return AIMessage(content="done")
     assistant = Assistant()
-    compiled, _, _ = AgentGraph(FakeLLMClient(), Mock())._build_graph(assistant, build_langchain_tools(registered), registered)
+    compiled, _, _ = AgentGraph(FakeLLMClient(), db_session)._build_graph(assistant, build_langchain_tools(registered), registered)
     compiled.invoke({"messages": [HumanMessage(content="probe")], "tool_records": []})
     assert calls == [[{"count": 1}]] and assistant.count == 3
 
 
-def test_main_invalid_high_risk_arguments_repair_before_approval():
+def test_main_invalid_high_risk_arguments_repair_before_approval(db_session):
     from dataclasses import replace
     from langchain_core.messages import HumanMessage
     from aiive.runtime.agent_graph import AgentGraph
@@ -189,7 +189,7 @@ def test_main_invalid_high_risk_arguments_repair_before_approval():
             self.count += 1
             return message(("probe", {"rows": [{"count": "invalid"}]}))
     assistant = Assistant()
-    compiled, _, approvals = AgentGraph(FakeLLMClient(), Mock())._build_graph(assistant, build_langchain_tools(registered), registered)
+    compiled, _, approvals = AgentGraph(FakeLLMClient(), db_session)._build_graph(assistant, build_langchain_tools(registered), registered)
     compiled.invoke({"messages": [HumanMessage(content="probe")], "tool_records": []})
     assert assistant.count == 3 and approvals == []
     handler.assert_not_called()
