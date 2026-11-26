@@ -8,8 +8,8 @@ _GROUPS = (
      ("list_thread_attachments", "read_attachment", "record_attachment_progress")),
     ("task-files", "任务成果", "查找和读取当前任务的证据、成果与日志",
      ("list_task_files", "read_task_evidence", "read_task_artifact")),
-    ("utilities", "后端实用工具", "获取当前时间、回显消息、运行后端命令或操作文件",
-     ("echo", "get_current_time", "run_shell", "shell_session", "read_file", "edit_file", "write_file", "apply_patch", "safe_delete", "read_text_file")),
+    ("utilities", "后端实用工具", "回显消息、运行后端命令或操作文件",
+     ("echo", "run_shell", "shell_session", "read_file", "edit_file", "write_file", "apply_patch", "safe_delete", "read_text_file")),
     ("reminders", "提醒与通知", "创建、确认或取消提醒，管理通知和旧调度任务",
      ("schedule_reminder", "remind_alert", "confirm_reminder", "snooze_reminder",
       "list_reminders", "cancel_reminder", "list_tasks", "cancel_task",
@@ -43,8 +43,12 @@ _DETAILS = {
         "output_concepts": ("纯文本", "文件元数据"),
         "tags": ("document extraction",),
     },
-    "get_current_time": {"aliases": ("现在几点", "current time"), "tags": ("timezone",)},
     "web_search": {"aliases": ("上网搜索", "internet search"), "tags": ("web research",)},
+    "fetch_web_page": {
+        "aliases": ("读取网页正文", "open web page"),
+        "output_concepts": ("网页正文", "next_offset", "content_hash"),
+        "tags": ("web research", "pagination"),
+    },
     "create_selfdev_plan": {
         "aliases": ("补丁计划", "plan a code change", "self improvement"),
         "output_concepts": ("patch operations", "candidate test plan"),
@@ -60,6 +64,10 @@ _DETAILS = {
     },
     "promote_slot": {"aliases": ("发布候选", "promote candidate", "switch active slot")},
     "get_promotion_status": {"aliases": ("部署进度", "promotion status", "deployment status")},
+    "get_runtime_identity": {
+        "aliases": ("运行版本", "runtime identity", "loaded slot"),
+        "output_concepts": ("active slot pointer", "deployment state", "prompt fingerprint"),
+    },
     "rollback_slot": {"aliases": ("回滚部署", "release rollback", "revert active slot")},
 }
 

@@ -377,7 +377,7 @@ V2 新增：`base.py`（统一类/Context/取消/结果）、`executor.py`（协
 
 | 领域模块 | 类工具对应的 capability_id |
 |---|---|
-| `builtin_basic.py` | `echo`、`get_current_time` |
+| `builtin_basic.py` | `echo` |
 | `builtin_reminders.py` | `schedule_reminder`、`remind_alert`、`confirm_reminder`、`snooze_reminder`、`list_tasks`、`cancel_task`、`dismiss_notifications`、`show_notifications` |
 | `builtin_memory_write.py` | `remember_or_update`、`run_memory_maintenance` |
 | `builtin_memory_recall.py` | `memory_search`、`memory_timeline`、`memory_event_log`、`history_search` |
@@ -385,15 +385,19 @@ V2 新增：`base.py`（统一类/Context/取消/结果）、`executor.py`（协
 | `builtin_knowledge.py` | `read_document`、`ingest_document`、`reindex_document`、`search_knowledge` |
 | `builtin_web.py` | `web_search`、`fetch_web_page` |
 | `builtin_mcp.py` | `search_mcp`、`install_mcp_sandbox`、`plan_capability` |
-| `builtin_selfdev.py` | `create_selfdev_plan`、`apply_patch_to_inactive_slot`、`promote_slot`、`rollback_slot` |
+| `builtin_selfdev.py` | `get_runtime_identity`、`create_selfdev_plan`、`apply_patch_to_inactive_slot`、`promote_slot`、`rollback_slot` |
 | `builtin_runtime_state.py` | `query_rhythm`、`query_attention`、`update_working_state` |
 | `forget_tool.py`（同属内置工具实现，非 `builtin_*` 命名） | `forget`、`forget_status` |
 
 **统一执行**：三个入口共享 ToolExecutor 校验与执行。DirectAdapter、TurnOperationAdapter、DesktopAdapter 保留实际环境边界；Task 仍先经 CapabilityBroker / Scope / Approval / Resource Lock。取消与迁移见 [Tool System V2](architecture/tool-system-v2.md)。
 
 **38 个内置工具清单**（由 `builtin_tools.py::register_builtin_tools` 注册，业务实现位于上表领域工具类）：
-基础：`echo`、`get_current_time`；本机 Shell：`run_shell`；提醒/任务：`schedule_reminder`、`remind_alert`、`confirm_reminder`、`snooze_reminder`、`list_tasks`、`cancel_task`、`show_notifications`、`dismiss_notifications`；记忆写入：`remember_or_update`、`forget`、`forget_status`、`run_memory_maintenance`；记忆召回：`memory_search`、`memory_timeline`、`memory_event_log`、`history_search`；文件：`safe_delete`、`read_text_file`、`read_document`；知识库：`ingest_document`、`reindex_document`、`search_knowledge`；联网：`web_search`、`fetch_web_page`；MCP：`search_mcp`、`install_mcp_sandbox`、`plan_capability`；自进化：`create_selfdev_plan`、`apply_patch_to_inactive_slot`、`promote_slot`、`rollback_slot`、`run_selfdev_repair`；节奏/注意力：`query_rhythm`、`query_attention`；WorkingState：`update_working_state`。
+基础：`echo`；本机 Shell：`run_shell`；提醒/任务：`schedule_reminder`、`remind_alert`、`confirm_reminder`、`snooze_reminder`、`list_tasks`、`cancel_task`、`show_notifications`、`dismiss_notifications`；记忆写入：`remember_or_update`、`forget`、`forget_status`、`run_memory_maintenance`；记忆召回：`memory_search`、`memory_timeline`、`memory_event_log`、`history_search`；文件：`safe_delete`、`read_text_file`、`read_document`；知识库：`ingest_document`、`reindex_document`、`search_knowledge`；联网：`web_search`、`fetch_web_page`；MCP：`search_mcp`、`install_mcp_sandbox`、`plan_capability`；自进化：`create_selfdev_plan`、`apply_patch_to_inactive_slot`、`promote_slot`、`rollback_slot`、`run_selfdev_repair`；节奏/注意力：`query_rhythm`、`query_attention`；WorkingState：`update_working_state`。
 动态补充：桌面节点 14 个 `desktop_*` 能力（`desktop/protocol.py::DESKTOP_CAPABILITIES`）+ MCP 桥接工具（`mcp/bootstrap.py`）。
+
+Main Agent 可直接调用 `get_runtime_identity` 核对已加载的代码和 Prompt、活动槽位指针、版本和重启状态。`fetch_web_page` 可接收 `url`、`offset`、`max_chars` 和 `expected_content_hash`，用返回的 `next_offset` 和 `content_hash` 续读。正文经过工具结果预算限制，搜索预算由 `web_search` 单独维护。Worker 在任务授权范围内发现并使用同一实现。
+
+消息时间来自持久化事件。模型输入及 ContextSnapshot 使用带偏移的 ISO 8601 和已验证的时区名，缺少可信时区时使用 UTC。Worker 的 Task Context 使用 `temporal`、Action 和 Signal 时间描述执行过程。
 
 ### 3.7 `skills/` 与 `mcp/` 与 `selfdev/`
 
@@ -424,7 +428,7 @@ V2 新增：`base.py`（统一类/Context/取消/结果）、`executor.py`（协
 - `task_runtime/runtime.py`：`PersistentTaskRuntime.run` L43、`_dispatch_ready` L262、`_complete` L346、`_budget_issue` L425（LLM 只提案不执行，Broker 统一派发）
 - `task_runtime/repository.py`：`TaskRepository` 唯一写入口：`create_task` L121、`transition_task` L185、`append_event` L217、`checkpoint` L265、`enqueue_run` L310、`start_run` L329、`create_action` L400、`ready_action` L481、`cancel_task` L487、`send_input` L526、`detail` L570；`recover_stale_tasks` L660 / `reconcile_queued_tasks` L704（scheduler 调用）；commit 后 WS 广播 L46（SAVEPOINT 水位防幽灵消息）
 - `task_runtime/tool_injection.py`：`WORKER_RESIDENT_CAPABILITIES`（L0 常驻清单）、`FULL_INJECTION_MAX_TOOLS=12`、`discovery_state/record_search/record_definition/merge_state`（只存 id + 指纹）、`build_tool_view`（执行视图与发现视图分离，`in_scope` 标注；loaded 按当前注册表重建，`definition_changed`/`unavailable` 不返回旧 Schema）
-- `task_runtime/agent_executor.py`（`decide` L31，JSON 修复解析）、`context_assembler.py`（L20，绝不加载会话 raw history；`_bounded_value` 超限降级 sha256+preview；`snapshot` 输出 `tools.*` 而非全量 capabilities）、`tools.py`（`build_main_agent_registry`：主 Agent 固定面为 delegate/status/cancel/input/list_skills、Thread 附件读取，以及 get_current_time、提醒的创建/查询/取消/确认/延期、memory/history 检索与 forget）、`router.py`、`state_machine.py`、`resource_locks.py`（`ResourceLockService` L30，固定顺序获取防死锁）、`evidence.py`（`EvidenceStore` L30 内容寻址）、`watchers.py`（time/file/node 三类，`wake_node_tasks` L95）、`worktree.py`（Git 隔离）、`schemas.py`
+- `task_runtime/agent_executor.py`（`decide` L31，JSON 修复解析）、`context_assembler.py`（L20，绝不加载会话 raw history；`_bounded_value` 超限降级 sha256+preview；`snapshot` 输出 `tools.*` 而非全量 capabilities）、`tools.py`（`build_main_agent_registry`：主 Agent 固定面为 delegate/status/cancel/input/list_skills、Thread 附件读取，以及 get_runtime_identity、web_search、fetch_web_page、提醒的创建/查询/取消/确认/延期、memory/history 检索与 forget）、`router.py`、`state_machine.py`、`resource_locks.py`（`ResourceLockService` L30，固定顺序获取防死锁）、`evidence.py`（`EvidenceStore` L30 内容寻址）、`watchers.py`（time/file/node 三类，`wake_node_tasks` L95）、`worktree.py`（Git 隔离）、`schemas.py`
 - `task_runtime/goal_plan.py`：`GoalPlan`（status/summary/deadline/timezone/acceptance/steps/current_step_id/revision/reminder/missed_streak）、
   `GoalStep`（id/kind/status/depends_on/acceptance/schedule/requires_evidence/evidence_refs/attempts/missed_count/next_trigger_at/approved_at，
   以及 V50 触发字段 trigger/trigger_count/last_trigger_key/last_trigger_at/armed_at/expired_at/cooldown_until/opportunistic_hits/last_message_key）、

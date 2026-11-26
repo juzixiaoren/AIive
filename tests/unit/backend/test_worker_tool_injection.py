@@ -108,7 +108,7 @@ def test_unregister_removes_tool_from_catalog_and_search() -> None:
 
 def test_discovery_covers_tools_outside_restricted_scope(db_session) -> None:
     """发现范围不按任务能力白名单收窄，但结果带 in_scope 标记。"""
-    task = _task(db_session, {"allowed_capabilities": ["get_current_time"]})
+    task = _task(db_session, {"allowed_capabilities": ["get_runtime_identity"]})
     broker = CapabilityBroker(db_session)
     results = broker.search_capabilities(task, "web", limit=5)
     web = next(item for item in results["tools"] if item["capability_id"] == "web_search")
@@ -198,14 +198,14 @@ def test_worker_prompt_uses_discovery_mode_and_hides_non_resident_tools(db_sessi
 
 def test_small_catalog_injects_full_schemas(db_session) -> None:
     """目录较小时直接注入完整 Schema，避免多余模型调用。"""
-    task = _task(db_session, {"allowed_capabilities": ["echo", "get_current_time"]})
+    task = _task(db_session, {"allowed_capabilities": ["echo", "get_runtime_identity"]})
     broker = CapabilityBroker(db_session)
     messages, snapshot, _refs = TaskContextAssembler(db_session).messages(
         task, [], registry=broker.registry_for(task),
     )
     assert snapshot["tools"]["mode"] == "full"
     available_ids = {item["capability_id"] for item in snapshot["tools"]["available"]}
-    assert available_ids == {"echo", "get_current_time"} | set(TASK_READ_CAPABILITIES)
+    assert available_ids == {"echo", "get_runtime_identity"} | set(TASK_READ_CAPABILITIES)
     assert '"input_schema"' not in messages[1]["content"]
     from aiive.task_runtime.function_decisions import WorkerFunctions
     functions = WorkerFunctions(snapshot["tools"])
@@ -215,18 +215,18 @@ def test_small_catalog_injects_full_schemas(db_session) -> None:
 
 def test_runtime_discovery_creates_no_action_and_injects_results(db_session) -> None:
     """发现决策只读：不产生 AgentAction，结果进入下一轮上下文。"""
-    task = _task(db_session, {"allowed_capabilities": ["get_current_time"]})
+    task = _task(db_session, {"allowed_capabilities": ["get_runtime_identity"]})
     agent = _ScriptedAgent(
         ActionProposal(decision="search_capabilities", query="web"),
         ActionProposal(decision="describe_capability", capability_id="web_search"),
-        ActionProposal(decision="action", capability_id="get_current_time"),
+        ActionProposal(decision="action", capability_id="get_runtime_identity"),
         ActionProposal(decision="finish", summary="done", report_status="succeeded"),
     )
     result = PersistentTaskRuntime(db_session, agent_executor=agent).run(task.id)
 
     assert result["status"] == TaskStatus.SUCCEEDED.value
     actions = db_session.query(AgentAction).filter(AgentAction.task_id == task.id).all()
-    assert [item.capability_id for item in actions] == ["get_current_time"]
+    assert [item.capability_id for item in actions] == ["get_runtime_identity"]
 
     db_session.refresh(task)
     discovery = task.task_state["tool_discovery"]
@@ -341,14 +341,14 @@ def test_execution_does_not_depend_on_injection(db_session) -> None:
     """统一策略下，未注入的能力仍可执行：权限由 Broker 判定，不由上下文决定。"""
     task = _task(db_session, {"capability_policy": "unified"})
     agent = _ScriptedAgent(
-        ActionProposal(decision="action", capability_id="get_current_time"),
+        ActionProposal(decision="action", capability_id="get_runtime_identity"),
         ActionProposal(decision="finish", summary="done"),
     )
     result = PersistentTaskRuntime(db_session, agent_executor=agent).run(task.id)
 
     assert result["status"] == TaskStatus.SUCCEEDED.value
     action = db_session.query(AgentAction).filter(AgentAction.task_id == task.id).one()
-    assert action.capability_id == "get_current_time"
+    assert action.capability_id == "get_runtime_identity"
     assert action.status == "succeeded"
 
 
@@ -356,14 +356,14 @@ def test_restricted_scope_still_blocks_unlisted_capability(db_session) -> None:
     """显式授权白名单仍是真实约束：越权提案在执行前被拦截。"""
     task = _task(db_session, {"allowed_capabilities": ["echo"]})
     agent = _ScriptedAgent(
-        ActionProposal(decision="action", capability_id="get_current_time"),
+        ActionProposal(decision="action", capability_id="get_runtime_identity"),
         ActionProposal(decision="finish", summary="blocked"),
     )
     PersistentTaskRuntime(db_session, agent_executor=agent).run(task.id)
 
     action = db_session.query(AgentAction).filter(AgentAction.task_id == task.id).one()
     assert action.status == "failed"
-    assert action.error_message in {"unknown_capability", "capability_not_in_task_scope:get_current_time"}
+    assert action.error_message in {"unknown_capability", "capability_not_in_task_scope:get_runtime_identity"}
 
 
 def test_dynamically_registered_tool_is_discoverable_without_prompt_change(db_session) -> None:
@@ -385,7 +385,7 @@ def test_dynamically_registered_tool_is_discoverable_without_prompt_change(db_se
 
 def test_resident_entries_stay_visible_when_scope_is_restricted(db_session) -> None:
     """常驻入口始终可见；restricted 时用 in_scope=false 表达当前不可执行。"""
-    task = _task(db_session, {"allowed_capabilities": ["get_current_time"]})
+    task = _task(db_session, {"allowed_capabilities": ["get_runtime_identity"]})
     broker = CapabilityBroker(db_session)
     registry = broker.registry_for(task)
     resident = resident_definitions(broker.available_registry(task))

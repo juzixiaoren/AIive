@@ -493,6 +493,7 @@ class AutomaticRecallEngine:
         return MemoryRecallItem(
             memory_id=r.id,
             content=content,
+            observed_at=r.observed_at,
             memory_type=r.memory_type or "",
             canonical_key=r.canonical_key or "",
             scope_type=r.scope_type or "global",

@@ -39,9 +39,11 @@ def web_search(query: str, limit: int = 5) -> dict[str, Any]:
 
 
 @mcp.tool()
-def web_fetch(url: str, max_chars: int = 100_000) -> dict[str, Any]:
+def web_fetch(
+    url: str, max_chars: int = 12_000, offset: int = 0, expected_content_hash: str | None = None,
+) -> dict[str, Any]:
     """Fetch readable text from a public web page with SSRF protection."""
-    return fetch_web_page(url, max_chars=max_chars)
+    return fetch_web_page(url, max_chars=max_chars, offset=offset, expected_content_hash=expected_content_hash)
 
 
 if __name__ == "__main__":

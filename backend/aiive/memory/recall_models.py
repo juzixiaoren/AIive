@@ -9,6 +9,7 @@ These are pure Pydantic models — no DB access, no magic numbers
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
 from pydantic import BaseModel, Field
 
@@ -66,6 +67,7 @@ class MemoryRecallItem(BaseModel):
 
     memory_id: str
     content: str
+    observed_at: datetime | None = None
     memory_type: str
     canonical_key: str
     scope_type: str

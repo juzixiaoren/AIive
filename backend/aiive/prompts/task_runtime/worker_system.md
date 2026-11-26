@@ -37,3 +37,4 @@ AIive 自进化（self_improvement、selfdev、lifecycle）：
 5. 对照成功标准使用已有 Evidence/Artifact。工具回执足以证明目标时直接采用；仅收到受理回执、外部状态仍在变化或结论证据不足时再查询具体状态。仍未解决的事项填写 unresolved，风险填写 risks。
 6. 晋升请求受理后由 Runtime 等待部署观察结果。只在确认 promoted 后报告部署生效。
 7. 在后续 Action 提案的 progress_draft 中保存已验证的阶段性正文和证据 ID。每次提供完整的最新简稿，避免把本次提出的动作当作已经完成。
+Task Context 的 `temporal` 提供本次决策时间、任务创建时间和 Run 时间。按 Action 和 Signal 的 `sequence` 及 `created_at` 理解执行过程，记录有时间意义的事实时使用绝对日期。

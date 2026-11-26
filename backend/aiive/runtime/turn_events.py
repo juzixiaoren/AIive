@@ -235,12 +235,6 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _iso(value: datetime) -> str:
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc).isoformat()
-
-
 def _bounded(text: Any, limit: int) -> str:
     value = str(text or "")
     return value if len(value) <= limit else value[:limit] + "…"
@@ -714,8 +708,10 @@ def _task_snapshot(db: Session, task_id: str) -> dict[str, Any]:
     }
 
 
-def build_internal_context(db: Session, rows: list[TurnEventInbox]) -> str:
+def build_internal_context(db: Session, rows: list[TurnEventInbox], *, zone: str = "UTC") -> str:
     """构造注入给现有 LLM 的内部系统上下文（不写入聊天时间线）。"""
+    from aiive.core.message_time import message_stamp
+
     rows = [row for row in rows if _inbox_visible(db, row)]
     if not rows:
         return ""
@@ -729,6 +725,7 @@ def build_internal_context(db: Session, rows: list[TurnEventInbox]) -> str:
         payload = dict(row.payload or {})
         lines.append(f"事件 {index}（event_id={row.id}）")
         lines.append(f"- 类型: {row.event_type}")
+        lines.append(message_stamp(row.created_at, "runtime_event", zone))
         if row.event_type == MAIN_AGENT_TASK_TERMINAL:
             lines.append(f"- task_id: {payload['task_id']} · Worker 状态: {payload['status']}")
             lines.append("- 本轮已取得状态结果。" if row.task_status_read_at else "- 本轮尚未取得状态结果，先调用 get_task_status。")
@@ -756,7 +753,6 @@ def build_internal_context(db: Session, rows: list[TurnEventInbox]) -> str:
             lines.append(f"- 当前目标状态: {task['status']}")
         if task.get("evidence"):
             lines.append("- 相关证据: " + "；".join(task["evidence"]))
-        lines.append(f"- 到达时间: {_iso(row.created_at) if row.created_at else ''}")
         lines.append("")
 
     if any(row.event_type == MAIN_AGENT_TASK_TERMINAL for row in rows):

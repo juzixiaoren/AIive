@@ -30,11 +30,13 @@ import time
 import uuid as _uuid
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Annotated, Any
 
 logger = logging.getLogger(__name__)
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import convert_to_openai_messages
 from langchain_core.runnables import Runnable
 from langchain_core.tools import StructuredTool
 from langchain_openai import ChatOpenAI
@@ -52,7 +54,8 @@ from aiive.core.llm_client import normalize_llm_error
 from aiive.core.function_calling import build_chat_model, normalize_calls, validate_calls, correction_allowed
 from aiive.core.llm_client import LLMClient
 from aiive.memory.extraction_policy import MemoryExtractionPolicy, MemorySignalAction
-from aiive.runtime.context_assembler import ContextSnapshotData, ContextSnapshotItem
+from aiive.runtime.context_assembler import ContextBudgetExceededError, ContextSnapshotData, ContextSnapshotItem
+from aiive.core.message_time import message_stamp, timestamp, with_message_stamp
 from aiive.runtime.execution_context import TurnExecutionContext
 from aiive.runtime.policy_engine import check_tool_calls, PolicyAction
 from aiive.control.tool_trust import ToolTrustPolicy
@@ -84,6 +87,8 @@ from aiive.runtime.turn_events import (
     task_terminal_turn_live,
 )
 from aiive.worker.job_types import MAIN_AGENT_TASK_TERMINAL
+
+_RECORDED_AT = "aiive_recorded_at"
 
 
 def _tool_calls_paired(messages: list[Any]) -> bool:
@@ -235,6 +240,8 @@ class ToolRecord:
     assistant_content: str = ""
     protocol_only: bool = False
     batch_position: int = 0
+    called_at: datetime | None = None
+    resulted_at: datetime | None = None
 
 
 @dataclass
@@ -471,6 +478,9 @@ class AgentGraph:
         context_forget_revision: int | None = None,
         cancel_check: Callable[[], bool] | None = None,
         task_terminal_wakeup: bool = False,
+        input_snapshot: ContextSnapshotData | None = None,
+        tools_schema: list[dict[str, Any]] | None = None,
+        input_limit: int | None = None,
     ) -> tuple[Any, list[dict[str, Any]], list[dict[str, Any]]]:
         """构建并返回编译后的 StateGraph、工具记录引用列表和待审批列表。
 
@@ -480,6 +490,64 @@ class AgentGraph:
         tool_records: list[dict[str, Any]] = []
         _pending_approval_list: list[dict[str, Any]] = []
         args_by_id: dict[str, dict[str, Any]] = {}
+        zone = self._user_timezone or "UTC"
+        counter = LiteLLMTokenCounter()
+        model_requests = 0
+
+        def _model_input(
+            msgs: list[BaseMessage], injection: str | None, injected: list[dict[str, Any]],
+        ) -> list[BaseMessage]:
+            nonlocal model_requests
+            call_messages: list[BaseMessage] = []
+            timings: list[dict[str, Any]] = []
+            for index, msg in enumerate(msgs):
+                at = msg.response_metadata.get(_RECORDED_AT)
+                if at is None:
+                    call_messages.append(msg)
+                    continue
+                if isinstance(msg, AIMessage):
+                    ids = [call["id"] for call in msg.tool_calls]
+                    stamp = message_stamp(at, "tool_call", zone)
+                    lines = "\n".join(f"{call_id} {stamp}" for call_id in ids)
+                elif isinstance(msg, ToolMessage):
+                    ids = [msg.tool_call_id]
+                    lines = message_stamp(at, "tool_result", zone)
+                else:
+                    ids = []
+                    lines = message_stamp(at, "runtime_event", zone)
+                call_messages.append(msg.model_copy(update={"content": with_message_stamp(str(msg.content or ""), lines)}))
+                timings.append({
+                    "message_index": index, "tool_call_ids": ids, "timestamp_utc": timestamp(at),
+                    "projection": lines,
+                })
+            if injection:
+                call_messages.append(SystemMessage(content=injection))
+
+            if input_snapshot is not None and (timings or injection):
+                wire = convert_to_openai_messages(call_messages)
+                for msg, record in zip(call_messages, wire, strict=True):
+                    if isinstance(msg, AIMessage):
+                        record[PROVIDER_METADATA] = assistant_metadata(msg)
+                count = counter.count_messages(_model, wire, tools_schema)
+                if input_limit is not None and count.safe_tokens > input_limit:
+                    raise ContextBudgetExceededError(count.safe_tokens, input_limit, hard_input_limit=input_limit)
+                runtime_times = [
+                    {"event_id": item["event_id"], "timestamp_utc": item["created_at"],
+                     "projection": item["time_projection"]}
+                    for item in injected if f"event_id={item['event_id']}）" in (injection or "")
+                ]
+                content = _json.dumps({
+                    "message_times": timings, "runtime_event_times": runtime_times,
+                    "input_tokens": count.estimated_tokens,
+                }, ensure_ascii=False)
+                item_id = f"model_request_times:{model_requests}"
+                input_snapshot.full_contents[item_id] = content
+                input_snapshot.items.append(ContextSnapshotItem.from_content(
+                    item_id, "model_request_times", "runtime", "trusted", content,
+                    token_estimate=counter.count_text(content, _model, padded=False),
+                ))
+            model_requests += 1
+            return call_messages
 
         def _ensure_not_cancelled() -> None:
             """节点边界检查持久化取消信号：同步/流式两条链路都在下一节点前停止。"""
@@ -506,11 +574,13 @@ class AgentGraph:
                     # 结束本次只读事务，避免长 Turn 持有跨多轮的旧快照。
                     db.commit()
                     return None, []
-                text = build_internal_context(db, rows)
+                text = build_internal_context(db, rows, zone=zone)
                 snapshot = [
                     {
                         "event_id": row.id,
                         "event_type": row.event_type,
+                        "created_at": timestamp(row.created_at),
+                        "time_projection": message_stamp(row.created_at, "runtime_event", zone),
                         "priority": int(row.priority or 0),
                         "payload": dict(row.payload or {}),
                     }
@@ -586,12 +656,13 @@ class AgentGraph:
             if task_terminal_wakeup and not injection_text:
                 # A foreground Turn may have already drained the Inbox before we acquired the lease.
                 return {"messages": [AIMessage(content="", response_metadata={"provider": "aiive"})]}
-            call_messages = [*msgs, SystemMessage(content=injection_text)] if injection_text else msgs
             from aiive.forget.concurrency import forget_revision
             if context_forget_revision is not None and forget_revision(self._db) != context_forget_revision:
                 return {"messages": [AIMessage(content="上下文因遗忘操作失效，本轮已停止。请重新发送消息。",
                                                response_metadata={"provider": "aiive"})]}
-            resp = normalize_calls(llm_with_tools.invoke(call_messages))
+            resp = normalize_calls(llm_with_tools.invoke(_model_input(msgs, injection_text, injected)))
+            if resp.tool_calls:
+                resp.response_metadata[_RECORDED_AT] = datetime.now(timezone.utc)
             tc_count = len(getattr(resp, "tool_calls", None) or [])
             content_len = len(str(resp.content or ""))
             logger.info("[TRACE:graph] ASSISTANT(ns) tool_calls=%d content_len=%d", tc_count, content_len)
@@ -660,7 +731,8 @@ class AgentGraph:
                 batch = _tool_batch(last_msg, msgs)
                 _pending_approval_list[:] = [
                     {"name": tc["name"], "args": tc.get("args", {}), "id": tc.get("id", ""),
-                     "safe_tool_calls": tool_calls_raw, **batch}
+                     "safe_tool_calls": tool_calls_raw, "called_at": last_msg.response_metadata.get(_RECORDED_AT),
+                     "resulted_at": datetime.now(timezone.utc), **batch}
                     for tc in last_msg.tool_calls
                 ]
                 for pos, approval in enumerate(_pending_approval_list):
@@ -687,6 +759,8 @@ class AgentGraph:
                         "tool_call_id": str(tc.get("id", "") or ""),
                         "protocol_only": not blocked,
                         "batch_position": pos,
+                        "called_at": last_msg.response_metadata.get(_RECORDED_AT),
+                        "resulted_at": datetime.now(timezone.utc),
                         **batch,
                     })
                 return "finalize"
@@ -724,6 +798,9 @@ class AgentGraph:
             attempts = int(state.get("tool_validation_attempts", 0) or 0) + 1
             batch = _tool_batch(last_msg, msgs)
             feedback = validation.feedback(last_msg)
+            feedback_at = datetime.now(timezone.utc)
+            for msg in feedback:
+                msg.response_metadata[_RECORDED_AT] = feedback_at
             validation_records: list[dict[str, Any]] = []
             for pos, tc in enumerate(last_msg.tool_calls):
                 call_id = str(tc.get("id", "") or "")
@@ -744,6 +821,8 @@ class AgentGraph:
                     "trace_id": trace_id,
                     "tool_call_id": call_id,
                     "batch_position": pos,
+                    "called_at": last_msg.response_metadata.get(_RECORDED_AT),
+                    "resulted_at": feedback_at,
                     **batch,
                 }
                 validation_records.append(record)
@@ -827,7 +906,13 @@ class AgentGraph:
               若有 artifact 引用则写入 artifact_refs。
             """
             _ensure_not_cancelled()
-            native_tool_node = ToolNode(tools)
+            def record_completion(request: Any, execute: Callable[..., Any]) -> Any:
+                result = execute(request)
+                if isinstance(result, ToolMessage):
+                    result.response_metadata[_RECORDED_AT] = datetime.now(timezone.utc)
+                return result
+
+            native_tool_node = ToolNode(tools, wrap_tool_call=record_completion)
             last_msg = state["messages"][-1]
             tc_list = (last_msg.tool_calls or []) if isinstance(last_msg, AIMessage) else []
             tc_names = [tc.get("name", "") for tc in tc_list]
@@ -927,6 +1012,8 @@ class AgentGraph:
                     "trace_id": trace_id,
                     "tool_call_id": str(tc.get("id", "") or ""),
                     "batch_position": pos,
+                    "called_at": last_msg.response_metadata.get(_RECORDED_AT),
+                    "resulted_at": tm.response_metadata.get(_RECORDED_AT) if tm is not None else None,
                     **batch,
                 })
 
@@ -1064,6 +1151,9 @@ class AgentGraph:
             context_forget_revision=getattr(assembled_ctx, "forget_revision", None),
             cancel_check=cancel_check,
             task_terminal_wakeup=exec_ctx.task_terminal_wakeup,
+            input_snapshot=context_snapshot,
+            tools_schema=getattr(assembled_ctx, "tools_schema", None),
+            input_limit=getattr(assembled_ctx, "hard_input_limit", None),
         )
         return {
             "trace": trace,
@@ -1179,6 +1269,8 @@ class AgentGraph:
                     provider_metadata=pa.get(PROVIDER_METADATA, {}),
                     assistant_content=pa.get("assistant_content", ""),
                     batch_position=int(pa.get("batch_position", 0)),
+                    called_at=pa.get("called_at"),
+                    resulted_at=pa.get("resulted_at"),
                 ))
             if not reply and pending_approvals:
                 tool_names = [str(pa.get("name", "")) for pa in pending_approvals]
@@ -1210,7 +1302,8 @@ class AgentGraph:
             tool_records=tool_records, action_cards=action_cards,
             pending_operations=pending_operations,
             pending_approvals=[
-                {key: val for key, val in item.items() if key not in (PROVIDER_METADATA, "assistant_content")}
+                {key: val for key, val in item.items()
+                 if key not in (PROVIDER_METADATA, "assistant_content", "called_at", "resulted_at")}
                 for item in pending_approvals
             ],
             context_snapshot=result_snapshot, memory_signal=signal,
@@ -1394,7 +1487,10 @@ class AgentGraph:
                                 stream_matcher.register_batch(stream_message.tool_calls)
                                 batch = _tool_batch(stream_message, tool_calls)
                                 stream_batches_by_id.update({
-                                    str(call["id"]): {**batch, "batch_position": pos}
+                                    str(call["id"]): {
+                                        **batch, "batch_position": pos,
+                                        "called_at": stream_message.response_metadata.get(_RECORDED_AT),
+                                    }
                                     for pos, call in enumerate(stream_message.tool_calls)
                                 })
                                 break
@@ -1494,12 +1590,15 @@ class AgentGraph:
                         tool_call_id = str(getattr(first, "tool_call_id", "") or "")
                     tool_call_id = stream_matcher.finish(run_id, tool_call_id)
                     batch = stream_batches_by_id.get(tool_call_id, {})
+                    result_time = first.response_metadata.get(_RECORDED_AT) if isinstance(first, ToolMessage) else None
                     completed_stream_records.append(ToolRecord(
                         tool_call_id=tool_call_id,
                         batch_index=batch.get("batch_index", 0),
                         provider_metadata=batch.get(PROVIDER_METADATA, {}),
                         assistant_content=batch.get("assistant_content", ""),
                         batch_position=batch.get("batch_position", 0),
+                        called_at=batch.get("called_at"),
+                        resulted_at=result_time or datetime.now(timezone.utc),
                         name=evt_name,
                         params=stream_params_by_id.get(tool_call_id, {}),
                         result={
@@ -1622,6 +1721,8 @@ class AgentGraph:
                 provider_metadata=r.get(PROVIDER_METADATA, {}),
                 assistant_content=r.get("assistant_content", ""),
                 batch_position=int(r.get("batch_position", 0)),
+                called_at=r.get("called_at"),
+                resulted_at=r.get("resulted_at"),
             ))
         if not reply and blocked_raw:
             names = ", ".join(sorted({str(r.get("name", "") or "") for r in blocked_raw}))
@@ -1645,6 +1746,8 @@ class AgentGraph:
                 assistant_content=record.get("assistant_content", ""),
                 protocol_only=bool(record.get("protocol_only")),
                 batch_position=int(record.get("batch_position", 0)),
+                called_at=record.get("called_at"),
+                resulted_at=record.get("resulted_at"),
             )
             for index, record in enumerate(records)
         ]

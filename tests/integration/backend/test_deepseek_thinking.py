@@ -21,8 +21,9 @@ from aiive.core.action_planner import MemorySignalDecision
 from aiive.core.assistant_protocol import LEGACY_FALLBACK
 from aiive.core.deepseek_chat import AIiveChatDeepSeek
 from aiive.core.llm_client import LLMClient
+from aiive.core.message_time import message_stamp
 from aiive.db.forget_models import ForgetOperation, ForgetShield
-from aiive.db.models import AgentTask, Event, LLMCall, OutboxJob, Thread, TurnRecord
+from aiive.db.models import AgentTask, ContextSnapshot, Event, LLMCall, OutboxJob, Thread, TurnRecord
 from aiive.runtime.agent_graph import AgentGraph
 from aiive.runtime.context_assembler import ContextAssembler
 from aiive.runtime.conversation_state import get_current_thread_id
@@ -101,6 +102,68 @@ def wire(monkeypatch):
 
 def assistants(wire_body):
     return [msg for msg in wire_body["messages"] if msg["role"] == "assistant"]
+
+
+def test_wire_message_times_match_persisted_events_and_snapshot(db, wire, monkeypatch):
+    from aiive.config import settings
+
+    monkeypatch.setattr(settings, "aiive_user_timezone", "")
+    client, responses, requests = wire
+    thread = Thread(title="message time wire")
+    db.add(thread)
+    db.commit()
+    thread_id = thread.id
+    responses.extend([
+        reply(PRIVATE + "timed", calls=[call("identity", "get_runtime_identity"), call("reminders", "list_reminders")]),
+        reply(PRIVATE + "reply", text="已检查。"),
+        reply(PRIVATE + "history", text="收到。"),
+    ])
+    zone = "Asia/Shanghai"
+    service = TurnExecutionService(llm_client=client, device_timezone=zone)
+    service.execute_turn("请检查运行状态和提醒。", thread_id=thread_id)
+    turn = db.query(TurnRecord).filter_by(thread_id=thread_id).one()
+    events = db.query(Event).filter_by(thread_id=thread_id, turn_id=turn.turn_id).all()
+    current = next(event for event in events if event.id == turn.request_event_id)
+    first_input = requests[0]["messages"][-1]["content"]
+    assert first_input == message_stamp(current.created_at, "user", zone) + "\n" + current.payload["content"]
+    names = {item["function"]["name"] for item in requests[0]["tools"]}
+    assert {"get_runtime_identity", "fetch_web_page", "web_search"} <= names
+    assert "get_current_time" not in names
+    live = requests[1]["messages"]
+    snapshot = db.query(ContextSnapshot).filter_by(thread_id=thread_id).one()
+    full = snapshot.meta["full_contents"]
+    assert full["user_message"] == first_input
+    audited = json.loads(full["model_request_times:1"])
+    for row in audited["message_times"]:
+        assert live[row["message_index"]]["content"].startswith(row["projection"])
+    assert audited["input_tokens"] > 0
+
+    batch = next(message for message in live if "tool_calls" in message)
+    assert batch["reasoning_content"] == PRIVATE + "timed"
+    for tool in batch["tool_calls"]:
+        tool_id = tool["id"]
+        started = next(e for e in events if e.event_type == "tool_call" and e.payload["tool_call_id"] == tool_id)
+        ended = next(e for e in events if e.event_type == "tool_result" and e.payload["tool_call_id"] == tool_id)
+        assert tool_id + " " + message_stamp(started.created_at, "tool_call", zone) in batch["content"]
+        result = next(m for m in live if m.get("tool_call_id") == tool_id)
+        assert result["content"].startswith(message_stamp(ended.created_at, "tool_result", zone) + "\n")
+        assert started.created_at <= ended.created_at
+        assert tool["function"]["arguments"] == "{}"
+        assert "[time=" not in str(ended.payload)
+    identity = json.loads(next(m["content"] for m in live if m.get("tool_call_id") == "identity").split("\n", 1)[1])
+    assert identity["stable_contract_audit_ref"].startswith("agent.stable_contract@")
+
+    response = next(e for e in events if e.event_type == "llm_response")
+    assert response.payload["content"] == "已检查。"
+    service.execute_turn("继续。", thread_id=thread_id)
+    replay = requests[2]["messages"]
+    assert sum(m.get("content") == first_input for m in replay) == 1
+    assert any(m["content"] == message_stamp(response.created_at, "assistant", zone) + "\n已检查。" for m in replay)
+    replay_tools = [m for m in replay if m.get("tool_call_id")]
+    assert [m["tool_call_id"] for m in replay_tools] == [tool["id"] for tool in batch["tool_calls"]]
+    assert [m["content"].split("\n", 1)[0] for m in replay_tools] == [
+        m["content"].split("\n", 1)[0] for m in live if m.get("tool_call_id")
+    ]
 
 
 def test_sync_protocol_and_legacy_fallback(wire):
@@ -212,7 +275,7 @@ async def test_chat_memory_write_and_fallback_are_shared_by_sync_and_stream(db, 
         assert db.query(MemoryRecord).filter_by(id=receipt.result_payload["memory_id"]).count() == 1
         assert db.query(MemoryProposal).filter_by(source_turn_record_id=turn.id).one().source_event_ids == [turn.request_event_id]
         tool_message = next(msg for msg in requests[-1]["messages"] if msg["role"] == "tool")
-        assert json.loads(tool_message["content"])["written"] is True
+        assert json.loads(tool_message["content"].split("\n", 1)[1])["written"] is True
     else:
         assert len(classified) == 1
         job = db.query(OutboxJob).filter_by(job_type="memory_extraction").one()
@@ -370,7 +433,7 @@ def test_unexecuted_batch_retains_metadata_without_a_public_tool_result(db, wire
     results = [m for m in requests[1]["messages"] if m["role"] == "tool"]
     assert len(results) == 1 and results[0]["tool_call_id"] == "policy-call"
     if approval:
-        assert results[0]["content"] == "approved receipt"
+        assert results[0]["content"].endswith("\napproved receipt")
 
 
 @pytest.mark.asyncio

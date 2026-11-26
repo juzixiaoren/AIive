@@ -51,7 +51,7 @@ def test_main_and_worker_registrations(search):
     assert isinstance(quick_tool, quick.QuickWebSearchTool)
     assert isinstance(worker_tool, WebSearchTool)
     assert isinstance(worker.get("fetch_web_page"), FetchWebPageTool)
-    assert main.get("fetch_web_page") is None
+    assert isinstance(main.get("fetch_web_page"), FetchWebPageTool)
     assert set(quick_tool.input_schema["properties"]) == {"query"}
     assert set(worker_tool.input_schema["properties"]) == {"query", "limit"}
     assert worker_tool.input_schema["properties"]["limit"]["maximum"] == 10

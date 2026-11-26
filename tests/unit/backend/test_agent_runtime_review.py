@@ -200,12 +200,12 @@ def test_token_budget_preflights_and_delivers_unmetered_continued_report(db_sess
     from aiive.task_runtime.function_decisions import proposal_function_name
 
     task = _task(db_session, budgets={"max_total_tokens": 300_000}, task_brief={
-        "scope": {"allowed_capabilities": ["get_current_time"]},
+        "scope": {"allowed_capabilities": ["get_runtime_identity"]},
     })
     task.usage = {**task.usage, "prompt_tokens": 280_000}
     model = Mock()
     model.bind_tools.return_value.invoke.return_value = AIMessage(
-        content="", tool_calls=[{"id": "clock", "name": proposal_function_name("get_current_time"),
+        content="", tool_calls=[{"id": "clock", "name": proposal_function_name("get_runtime_identity"),
                                   "args": {"arguments": {}}}],
         usage_metadata={"input_tokens": 9600, "output_tokens": 400, "total_tokens": 10_000},
     )

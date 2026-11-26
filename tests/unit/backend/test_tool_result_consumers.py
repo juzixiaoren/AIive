@@ -55,11 +55,11 @@ def test_langchain_success_content_is_unchanged() -> None:
     # 纯字符串结果保持原样，不被包装成 JSON 信封（模型侧协议不变）。
     assert tool.invoke({"message": "hello"}) == "hello"
 
-    dict_tool = _langchain_tool(registry, "get_current_time")
+    dict_tool = _langchain_tool(registry, "get_runtime_identity")
     parsed = json.loads(dict_tool.invoke({}))
 
     # 成功结果的业务字典仍直接作为内容，不额外包一层 ok 信封。
-    assert "utc" in parsed
+    assert "deployment_state" in parsed
     assert parse_tool_execution_receipt(json.dumps(parsed)).ok is True
 
 

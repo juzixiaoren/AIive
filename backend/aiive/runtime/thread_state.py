@@ -8,6 +8,7 @@ Phase 1: keyset-pagination bounded history reading.
 import json as _json
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -17,6 +18,7 @@ from aiive.db.models import Event, LLMCall, Thread, TurnRecord
 from aiive.forget.visibility_service import ForgetVisibilityService
 from aiive.runtime.message_normalizer import (
     compact_web_search_result,
+    event_stamp,
     normalize_tool_call,
     normalize_tool_result,
     tool_result_content,
@@ -74,6 +76,7 @@ class ThreadState:
         max_raw_bytes: int = 2 * 1024 * 1024,
         *,
         compact_web_search_results: bool = False,
+        zone: str = "UTC",
     ) -> tuple[list[dict[str, Any]], BoundedReadStats]:
         """Keyset DESC pagination, online estimation, stop at any limit."""
         all_turns: list[list[dict[str, Any]]] = []
@@ -91,7 +94,7 @@ class ThreadState:
             if normalizer is not None:
                 turn_dicts = normalizer.normalize_turn(turn_dicts)
             if interrupted:
-                turn_dicts = self._degrade_interrupted_turn_dicts(turn_dicts)
+                turn_dicts = self._degrade_interrupted_turn_dicts(turn_dicts, zone)
                 if not turn_dicts:
                     return True
             turn_msgs = self._dicts_to_token_count_messages(turn_dicts)
@@ -152,7 +155,7 @@ class ThreadState:
                             "llm_response",
                         ]),
                     )
-                    .order_by(Event.turn_event_index.asc())
+                    .order_by(Event.turn_event_index.asc().nulls_last(), Event.created_at.asc(), Event.id.asc())
                     .limit(max_events - total_events + 1)
                     .all()
                 )
@@ -164,7 +167,9 @@ class ThreadState:
                 blocked = ForgetVisibilityService.blocked_target_ids(
                     db, "event", [(event.id, event.created_at) for event in events],
                 )
-                turn_dicts = self._events_to_dicts([event for event in events if event.id not in blocked], turn.source)
+                turn_dicts = self._events_to_dicts(
+                    [event for event in events if event.id not in blocked], turn.source, turn.created_at,
+                )
                 total_bytes += _history_bytes(turn_dicts)
                 if total_bytes > max_raw_bytes:
                     stopped_by = "max_raw_bytes"
@@ -226,6 +231,7 @@ class ThreadState:
     @staticmethod
     def _degrade_interrupted_turn_dicts(
         turn_dicts: list[dict[str, Any]],
+        zone: str = "UTC",
     ) -> list[dict[str, Any]]:
         """保留有协议元数据的中断批次，旧批次用有界说明记录副作用。"""
         if any(item.get("type") == "tool_call" and item.get(PROVIDER_METADATA) for item in turn_dicts):
@@ -235,6 +241,7 @@ class ThreadState:
                 "type": "system",
                 "content": "[上一轮 Turn 在工具调用后中断，已记录的工具副作用可能已生效，请勿盲目重复执行]",
                 "turn_id": turn_dicts[0].get("turn_id"),
+                "message_source": "runtime_event",
                 "protected": True,
             }]
         tool_lines: list[str] = []
@@ -252,19 +259,23 @@ class ThreadState:
             if rd is not None:
                 normalized = normalize_tool_result(rd)
                 result_text = tool_result_content(normalized["result"], name)
-            tool_lines.append(f"- {name} -> {status}: {result_text}")
+            stamps = event_stamp(d, "tool_call", zone)
+            if rd is not None:
+                stamps += " " + event_stamp(rd, "tool_result", zone)
+            tool_lines.append(f"- {stamps} {name} -> {status}: {result_text}")
         if not tool_lines:
             return []
-        user_line = next(
-            (str(d.get("content") or "") for d in turn_dicts if d.get("type") in ("user", "system")),
-            "",
+        request = next(
+            (d for d in turn_dicts if d.get("type") in ("user", "system")),
+            None,
         )
         parts = ["[上一轮 Turn 被中断，以下工具调用在中断前已实际执行，其副作用可能已生效，请勿盲目重复执行]"]
-        if user_line:
-            parts.append(f"当时的请求: {user_line}")
+        if request and request.get("content"):
+            stamp = event_stamp(request, request.get("message_source") or request["type"], zone)
+            parts.append(f"当时的请求: {stamp} {request['content']}")
         parts.extend(tool_lines)
         return [{"type": "system", "content": "\n".join(parts),
-                 "turn_id": turn_dicts[0].get("turn_id"), "protected": True}]
+                 "turn_id": turn_dicts[0].get("turn_id"), "message_source": "runtime_event", "protected": True}]
 
     @staticmethod
     def _dicts_to_token_count_messages(turn_dicts: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -543,6 +554,7 @@ class ThreadState:
     def _events_to_dicts(
         events: list[Event],
         turn_source: str | None = None,
+        turn_created_at: datetime | None = None,
     ) -> list[dict[str, Any]]:
         from sqlalchemy.orm import object_session
         from aiive.runtime.attachments import event_attachment_refs
@@ -579,12 +591,18 @@ class ThreadState:
         for event in events:
             p = event.payload or {}
             etype = event.event_type
-            common: dict[str, Any] = {"event_id": event.id, "trace_id": event.trace_id, "turn_id": event.turn_id}
+            common: dict[str, Any] = {
+                "event_id": event.id, "trace_id": event.trace_id, "turn_id": event.turn_id,
+                "turn_event_index": event.turn_event_index, "created_at": event.created_at,
+                "turn_created_at": turn_created_at,
+                "message_source": p.get("message_source") or turn_source,
+            }
             if etype == "user_message":
                 content = p.get("content", "")
                 if content or refs.get(event.id):
                     source = turn_source or p.get("message_source")
                     role = "user" if source in (None, "user") else "system"
+                    common["message_source"] = source or "user"
                     messages.append({"type": role, "content": content, "attachments": refs.get(event.id, []), **common})
                 continue
             metadata = p.get(PROVIDER_METADATA)
@@ -611,6 +629,7 @@ class ThreadState:
                     common.update(tool_result=p.get("result", {}), tool_status=p.get("status", "unknown"))
                 messages.append(common)
             elif etype == "llm_response" and (p.get("content") or p.get(PROVIDER_METADATA)):
+                common["message_source"] = "runtime_event" if p.get("proactive") else "assistant"
                 message = {"type": "assistant", "content": p.get("content", ""), "action_cards": p.get("action_cards", []), **common}
                 if metadata:
                     message[PROVIDER_METADATA] = metadata

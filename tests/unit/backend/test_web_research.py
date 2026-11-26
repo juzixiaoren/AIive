@@ -49,6 +49,38 @@ def test_web_fetch_extracts_visible_text(monkeypatch) -> None:
     assert result["untrusted"] is True
 
 
+def test_web_fetch_paginates_decoded_characters_and_rejects_changed_content(monkeypatch):
+    monkeypatch.setattr(web_client, "_resolve_public_host", _public_dns)
+    body = "第一段 café " * 4000
+
+    def serve(request):
+        if request.url.path == "/start":
+            return httpx.Response(302, headers={"Location": "/article"})
+        return httpx.Response(200, headers={"content-type": "text/plain; charset=cp1252"},
+                              content=body.encode("cp1252", errors="replace"))
+
+    transport = httpx.MockTransport(serve)
+    url = "https://example.com/start"
+    first = fetch_web_page(url, transport=transport)
+    assert first["url"] == "https://example.com/article"
+    assert "café" in first["text"] and first["next_offset"] == 12_000
+    second = fetch_web_page(url, offset=first["next_offset"], max_chars=20_000,
+                            expected_content_hash=first["content_hash"], transport=transport)
+    assert second["content_hash"] == first["content_hash"] and second["next_offset"] == 32_000
+    body = "Changed"
+    changed = fetch_web_page(url, offset=second["next_offset"], expected_content_hash=first["content_hash"],
+                             transport=transport)
+    assert changed["ok"] is False and changed["error"] == "content_changed"
+    assert changed["restart_offset"] == 0 and changed["text"] == ""
+
+
+def test_web_fetch_checks_redirect_targets(monkeypatch):
+    monkeypatch.setattr(web_client, "_resolve_public_host", _public_dns)
+    transport = httpx.MockTransport(lambda _: httpx.Response(302, headers={"Location": "http://localhost/"}))
+    with pytest.raises(WebAccessError, match="private_host_blocked"):
+        fetch_web_page("https://example.com/redirect", transport=transport)
+
+
 @pytest.fixture
 def yuanbao_settings(monkeypatch) -> None:
     monkeypatch.setattr(settings, "aiive_web_search_enabled", True)

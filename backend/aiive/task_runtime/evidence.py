@@ -52,6 +52,7 @@ FULL_OBSERVATION_TOOLS = frozenset({
     "read_attachment", "list_thread_attachments", "record_attachment_progress",
     "list_task_files", "read_task_artifact", "read_task_evidence",
     "read_document", "read_knowledge_chunk",
+    "fetch_web_page", "get_runtime_identity",
 })
 
 

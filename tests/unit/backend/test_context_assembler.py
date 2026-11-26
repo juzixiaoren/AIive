@@ -104,7 +104,7 @@ def test_replay_uses_old_status_preview_without_repeating_the_file_read_hint():
 
     assert len(_dump(events[2]["tool_result"])) > 1000
     messages = ContextAssembler._dicts_to_prompt_messages(events)
-    content = json.loads(next(msg["content"] for msg in messages if msg["role"] == "tool"))
+    content = json.loads(next(msg["content"] for msg in messages if msg["role"] == "tool").split("\n", 1)[1])
     assert content["full_length"] == 1249
     assert content["preview"] == old_content["preview"]
     assert "get_task_status" in content["hint"]
@@ -327,3 +327,17 @@ def test_global_budget_windows(monkeypatch, window):
     monkeypatch.setattr(settings, "aiive_llm_max_output_tokens", 4096)
     budget = ContextBudget.default()
     assert budget.hard_input_limit == window - 4096
+def test_model_projection_uses_legacy_turn_time_then_unknown():
+    from datetime import UTC, datetime
+
+    from aiive.core.message_time import timestamp
+
+    naive = datetime(2026, 11, 25, 12, 26)
+    aware = naive.replace(tzinfo=UTC)
+    assert timestamp(naive, "Asia/Shanghai") == timestamp(aware, "Asia/Shanghai")
+    messages = ContextAssembler._dicts_to_prompt_messages([
+        {"type": "user", "content": "旧消息", "turn_created_at": naive},
+        {"type": "assistant", "content": "旧回复"},
+    ], "Asia/Shanghai")
+    assert messages[0]["content"] == "[time=2026-11-25T20:26:00+08:00 zone=Asia/Shanghai source=user basis=turn]\n旧消息"
+    assert messages[1]["content"] == "[time=unknown zone=Asia/Shanghai source=assistant]\n旧回复"

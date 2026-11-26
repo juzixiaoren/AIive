@@ -33,13 +33,13 @@ def _cancelled_task(factory) -> tuple[str, str, str]:
             goal="取消后崩溃恢复",
             title="取消恢复",
             task_type="general",
-            task_brief={"scope": {"allowed_capabilities": ["get_current_time"]}},
+            task_brief={"scope": {"allowed_capabilities": ["get_runtime_identity"]}},
             enqueue=False,
         )
         repo = TaskRepository(db)
         task, run = repo.start_run(task.id, trigger="dispatch")
         action = repo.create_action(
-            task=task, run=run, capability_id="get_current_time", arguments={},
+            task=task, run=run, capability_id="get_runtime_identity", arguments={},
             descriptor_hash="descriptor", risk_level="low", requires_approval=False,
         )
         repo.transition_action(action, ActionStatus.VALIDATED.value)

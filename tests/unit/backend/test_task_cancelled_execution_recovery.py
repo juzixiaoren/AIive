@@ -32,7 +32,7 @@ def _cancelled_task_with_dispatched_action(db_session, *, lease_seconds: float =
         goal="取消后崩溃恢复",
         title="取消恢复",
         task_type="general",
-        task_brief={"scope": {"allowed_capabilities": ["get_current_time"]}},
+        task_brief={"scope": {"allowed_capabilities": ["get_runtime_identity"]}},
         enqueue=False,
     )
     repo = TaskRepository(db_session)
@@ -40,7 +40,7 @@ def _cancelled_task_with_dispatched_action(db_session, *, lease_seconds: float =
     action = repo.create_action(
         task=task,
         run=run,
-        capability_id="get_current_time",
+        capability_id="get_runtime_identity",
         arguments={},
         descriptor_hash="descriptor",
         risk_level="low",
@@ -136,7 +136,7 @@ def test_existing_successful_action_is_preserved(db_session) -> None:
     succeeded = repo.create_action(
         task=task,
         run=run,
-        capability_id="get_current_time",
+        capability_id="get_runtime_identity",
         arguments={"note": "already done"},
         descriptor_hash="descriptor",
         risk_level="low",

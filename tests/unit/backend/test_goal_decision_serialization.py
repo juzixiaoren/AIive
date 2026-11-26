@@ -112,7 +112,7 @@ def _confirmed(db: Session, thread_id: str, steps: list[dict[str, Any]], **overr
         goal="串行化测试",
         title="串行化测试",
         task_type="long_term_goal",
-        task_brief={"scope": {"allowed_capabilities": ["get_current_time"]}},
+        task_brief={"scope": {"allowed_capabilities": ["get_runtime_identity"]}},
         enqueue=False,
     )
     GoalService(db).attach_plan(task, plan)

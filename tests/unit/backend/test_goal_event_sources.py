@@ -83,7 +83,7 @@ def _confirmed(db, thread_id: str, plan: dict) -> str:
         goal="事件源测试",
         title="事件源测试",
         task_type="long_term_goal",
-        task_brief={"scope": {"allowed_capabilities": ["get_current_time"]}},
+        task_brief={"scope": {"allowed_capabilities": ["get_runtime_identity"]}},
         enqueue=False,
     )
     task_id = task.id
@@ -102,7 +102,7 @@ def _complete_task(db, thread_id: str, *, status: str = TaskStatus.SUCCEEDED.val
         goal="普通后台任务",
         title="普通后台任务",
         task_type="general",
-        task_brief={"scope": {"allowed_capabilities": ["get_current_time"]}},
+        task_brief={"scope": {"allowed_capabilities": ["get_runtime_identity"]}},
         enqueue=False,
     )
     task_id = task.id

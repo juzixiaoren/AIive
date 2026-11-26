@@ -62,7 +62,7 @@ def _goal(db: Session, thread_id: str, steps: list[dict[str, Any]]) -> str:
         goal="提问闭环测试",
         title="提问闭环测试",
         task_type="long_term_goal",
-        task_brief={"scope": {"allowed_capabilities": ["get_current_time"]}},
+        task_brief={"scope": {"allowed_capabilities": ["get_runtime_identity"]}},
         enqueue=False,
     )
     GoalService(db).attach_plan(task, plan)
@@ -469,7 +469,7 @@ def _stub_assembler(monkeypatch):
         "recall_text": "",
     }
     assembler._load_history_bounded = lambda *a, **k: []
-    assembler._dicts_to_prompt_messages = lambda events: list(events)
+    assembler._dicts_to_prompt_messages = lambda events, zone='UTC': list(events)
     assembler._load_epoch_checkpoint = lambda *a, **k: ""
     assembler._load_segment_summaries = lambda *a, **k: ""
     assembler._load_sealing_bridge = lambda *a, **k: ""

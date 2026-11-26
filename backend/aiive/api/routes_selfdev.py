@@ -76,10 +76,8 @@ def list_slots():
 @router.get("/runtime")
 def loaded_runtime():
     from aiive.project_paths import runtime_identity
-    from aiive.supervisor.slot_manager import SlotManager
 
-    manager = SlotManager()
-    return {**runtime_identity(), "active_slot_pointer": manager.get_active_slot()}
+    return runtime_identity()
 
 
 @router.get("/supervisor")

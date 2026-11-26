@@ -87,7 +87,7 @@ def test_context_injects_system_role_for_system_source(db) -> None:
     )
     msgs = ContextAssembler._dicts_to_prompt_messages(result)
 
-    roles = [(m["role"], m["content"]) for m in msgs]
+    roles = [(m["role"], m["content"].split("\n", 1)[1]) for m in msgs]
     assert ("system", "系统指令") in roles
     assert ("assistant", "系统回复") in roles
     assert ("user", "普通提问") in roles
@@ -106,7 +106,8 @@ def test_runtime_event_source_classified_as_system(db) -> None:
         token_counter=_FakeTokenCounter(), model="deepseek-chat",
     )
     msgs = ContextAssembler._dicts_to_prompt_messages(result)
-    assert ("system", "[Reminder triggered]") in [(m["role"], m["content"]) for m in msgs]
+    trigger = next(m for m in msgs if m["role"] == "system")
+    assert "source=runtime_event]\n[Reminder triggered]" in trigger["content"]
 
     page = ThreadState(db).list_thread_messages_page(thread.id, page_size=10)
     contents = [m["content"] for m in page["messages"]]

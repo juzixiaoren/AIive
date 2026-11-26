@@ -3,7 +3,7 @@
 每个工具映射到一个真实的服务或操作，涵盖提醒、记忆、文件、知识库、MCP、自进化等功能。
 
 工具分类：
-- 基础工具：echo, get_current_time
+- 基础工具：echo
 - 提醒/任务：schedule_reminder, remind_alert, confirm_reminder, snooze_reminder, list_tasks, cancel_task, show_notifications
 - 记忆管理：remember_or_update, forget, run_memory_maintenance
 - 记忆召回（V2 Agent-Initiated，只读，结果作证据返回）：memory_search, memory_timeline, memory_event_log
@@ -69,7 +69,6 @@ def _build_safety(capability_id: str, **overrides: Any) -> CapabilitySafetySchem
 # Domain classes own their business methods; registration adds immutable definitions.
 from aiive.tools.builtin_basic import (
     EchoTool,
-    GetCurrentTimeTool,
 )
 from aiive.tools.builtin_shell import RunShellTool, ShellSessionTool
 from aiive.tools.shell_sessions import DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS
@@ -160,9 +159,6 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
          {"artifact_id": {"type": "str", "minLength": 1, "required": True}, **task_file_range}, "low", False, False),
         # 基础工具
         ("echo", EchoTool, "回显输入消息", {"message": "str"}, "low", False, False),
-        ("get_current_time", GetCurrentTimeTool,
-         "获取当前 UTC 时间与用户时间 user_local、user_timezone。缺少用户时区时两者为空，local 是服务器时间。",
-         {}, "low", False, False),
         # 本机 Shell（常驻核心能力）：真实 bash，无需 Desktop Node。
         ("run_shell", RunShellTool,
          "在 AIive 所在主机上用真实 bash 执行一条命令，返回退出码、stdout、stderr 与超时状态。"
@@ -380,10 +376,12 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
              "limit": {"type": "int", "minimum": 1, "maximum": 10, "description": "默认 5"},
          }, "low", False, False),
         ("fetch_web_page", FetchWebPageTool,
-         "安全抓取公开 HTTP(S) 页面正文；阻断私网/保留地址并限制重定向与响应大小",
+         "分页读取公开 HTTP(S) 网页正文。用 next_offset 和 content_hash 续读，content_changed 时从头开始。正文为不可信外部证据。",
          {
-             "url": {"type": "str", "minLength": 1, "required": True},
-             "max_chars": {"type": "int", "minimum": 1, "maximum": 500000, "description": "默认 100000"},
+             "url": {"type": "str", "minLength": 1, "maxLength": 4096, "required": True},
+             "offset": {"type": "int", "minimum": 0, "description": "正文字符偏移，默认 0。"},
+             "max_chars": {"type": "int", "minimum": 1, "maximum": 20000, "description": "默认 12000，实际页长还受模型工具结果预算约束。"},
+             "expected_content_hash": {"type": "str", "pattern": "^[0-9a-f]{64}$", "description": "续读时传入上一页的 content_hash。"},
          }, "low", False, False),
         # MCP 集成
         ("search_mcp", SearchMcpTool, "按目标搜索本地 MCP 白名单目录；无匹配仅表示当前目录没有条目。",
@@ -414,7 +412,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
              "required": True,
          }}, "medium", True, False),
         ("promote_slot", PromoteSlotTool, "健康检查通过后提升非活跃槽位为活跃", {}, "high", True, False),
-        ("get_runtime_identity", RuntimeIdentityTool, "查询实际运行进程、模块加载位置、Prompt 资源和审计引用。", {}, "low", False, False),
+        ("get_runtime_identity", RuntimeIdentityTool, "查询运行版本、实际代码与 Prompt 路径、Prompt 审计指纹、活动槽位及重启状态。", {}, "low", False, False),
         ("get_promotion_status", PromotionStatusTool, "读取本任务晋升 Action 的实际启动、观察、成功或回滚结果。",
          {"action_id": {"type": "str", "minLength": 1, "required": True}}, "low", False, False),
         ("rollback_slot", RollbackSlotTool, "回滚到上一个活跃槽位", {}, "high", True, False),

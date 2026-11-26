@@ -6,11 +6,20 @@ import json
 import logging
 from typing import Any
 
+from aiive.core.message_time import message_stamp
 from aiive.runtime.tool_output_guard import UNTRUSTED_NOTE
 
 logger = logging.getLogger(__name__)
 
 _TOOL_RECORD_RESULT_KEYS = {"ok", "result", "operation_id", "execution_status", "error_type"}
+
+
+def event_stamp(event: dict[str, Any], source: str, zone: str) -> str:
+    at = event.get("created_at")
+    fallback = event.get("turn_created_at") if at is None else None
+    return message_stamp(
+        at if at is not None else fallback, source, zone, from_turn=fallback is not None,
+    )
 
 
 def stable_tool_call_id(data: dict[str, Any]) -> str:

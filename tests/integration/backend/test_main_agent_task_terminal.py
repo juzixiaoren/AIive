@@ -63,7 +63,7 @@ class ReportReviewer:
         assert "get_task_status" in context
         # Tool history can contain earlier Turns. Read exactly the IDs in this injection.
         task_ids = [line.split()[2] for line in context.splitlines() if line.startswith("- task_id:")]
-        views = [json.loads(str(m.content)) for m in messages if isinstance(m, ToolMessage)
+        views = [json.loads(str(m.content).split("\n", 1)[1]) for m in messages if isinstance(m, ToolMessage)
                  and m.name == "get_task_status"]
         reports = {v.get("task_id"): v for v in views if "report" in v}
         if not all(task_id in reports for task_id in task_ids):
@@ -172,7 +172,7 @@ def test_active_turn_is_reused_at_tool_boundary_or_outbox_recovers(db, reviewer,
             assert db.query(TurnRecord).count() == 1
             if not handle_in_foreground:
                 return AIMessage(content="原问题已回答")
-            return AIMessage(content="", tool_calls=[_tool_call("get_current_time", "clock")])
+            return AIMessage(content="", tool_calls=[_tool_call("get_runtime_identity", "clock")])
         assert task_id in _injection(messages)
         return reviewer.review(messages)
 

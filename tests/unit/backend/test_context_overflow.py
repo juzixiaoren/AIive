@@ -65,8 +65,8 @@ def test_packer_recounts_complete_turns_and_preserves_tool_pairs():
         history = ContextAssembler._dicts_to_prompt_messages([e for turn in c.history for e in turn.events])
         return [{"role": "system", "content": "contract"}, *history, {"role": "user", "content": "CURRENT"}], []
     counter = CharacterCounter()
-    msgs, _, count, safe = ContextOverflowPacker().pack(c, render, counter, "test", 600, 20)
-    assert safe and count.safe_tokens + 20 <= 600
+    msgs, _, count, safe = ContextOverflowPacker().pack(c, render, counter, "test", 800, 20)
+    assert safe and count.safe_tokens + 20 <= 800
     assert len(counter.calls) == 2
     assert [turn.turn_id for turn in c.history] == ["new"]
     assert [m["tool_call_id"] for m in msgs if m["role"] == "tool"] == ["new"]

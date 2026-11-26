@@ -105,8 +105,8 @@ def _scn(scenario_id: str, description: str, steps: list[object]) -> None:
 _scn("eval.s01_echo", "echo returns the echoed message", [
     ToolStep("echo", {"message": "hello-eval-s01"}, expect_ok=True, result_contains="hello-eval-s01"),
 ])
-_scn("eval.s02_current_time", "get_current_time returns without error", [
-    ToolStep("get_current_time", {}, expect_ok=True),
+_scn("eval.s02_runtime_identity", "get_runtime_identity returns runtime audit fields", [
+    ToolStep("get_runtime_identity", {}, expect_ok=True),
 ])
 _scn("eval.s03_list_tasks", "list_tasks tool returns without error", [
     ToolStep("list_tasks", {}, expect_ok=True),

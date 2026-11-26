@@ -74,7 +74,7 @@ def _propose(db, thread: Thread, plan: dict | None = None) -> AgentTask:
         title="求职计划",
         task_type="long_term_goal",
         # 测试只需要一个确定可执行的能力；真实提案走 unified 能力面。
-        task_brief={"scope": {"allowed_capabilities": ["get_current_time"]}},
+        task_brief={"scope": {"allowed_capabilities": ["get_runtime_identity"]}},
         enqueue=False,
     )
     GoalService(db).attach_plan(task, plan or _plan())
@@ -131,7 +131,7 @@ def _run(db, task_id: str, *proposals: ActionProposal) -> dict:
 
 
 def _action() -> ActionProposal:
-    return ActionProposal(decision="action", capability_id="get_current_time", summary="读取时间")
+    return ActionProposal(decision="action", capability_id="get_runtime_identity", summary="读取运行身份")
 
 
 def _finish(status: str = "succeeded") -> ActionProposal:
@@ -538,11 +538,11 @@ def test_delegate_task_accepts_goal_plan_and_keeps_tool_surface(db_session) -> N
     registry = build_main_agent_registry()
     assert {item["capability_id"] for item in registry.list_all()} == {
         "list_skills", "search_worker_capabilities", "delegate_task", "get_task_status", "cancel_task", "send_task_input",
-        "list_thread_attachments", "read_attachment", "get_current_time",
+        "list_thread_attachments", "read_attachment", "get_runtime_identity",
         "schedule_reminder", "list_reminders", "cancel_reminder", "confirm_reminder",
         "snooze_reminder", "memory_search", "memory_timeline", "remember_or_update",
         "history_search", "get_tool_operation_status", "forget", "forget_status",
-        "web_search",
+        "web_search", "fetch_web_page",
     }
     thread = _thread(db_session)
     handler = tool_method(registry.get('delegate_task'))

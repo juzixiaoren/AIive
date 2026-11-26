@@ -996,6 +996,7 @@ class TurnExecutionService:
                     db.add(Event(
                         id=str(_uuid.uuid4()), trace_id=trace_id, thread_id=turn.thread_id,
                         turn_id=turn.turn_id, event_type=phase, turn_event_index=index, payload=payload,
+                        created_at=record.called_at if phase == "tool_call" else record.resulted_at,
                     ))
                     index += 1
         return index
@@ -1625,6 +1626,8 @@ class TurnExecutionService:
                 upper_bound_sequence=turn.turn_sequence or 1,
                 trace_id=exec_ctx.trace_id,
                 current_turn_id=turn.turn_id,
+                request_event_id=exec_ctx.request_event_id,
+                user_timezone=self._user_timezone,
             )
             from aiive.forget.durable_sources import persist_sources
             source_events = assembled.agent_ctx.get("attachment_source_event_ids", [])

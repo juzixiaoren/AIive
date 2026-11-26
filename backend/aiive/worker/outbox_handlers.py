@@ -1508,10 +1508,16 @@ def _extract_json(text: str) -> dict[str, Any]:
 
 def _reconstruct_source_turns(db: Session, event_manifest: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """根据 event_manifest 重建 source_turns（供 LLM 概要用）。"""
+    from aiive.core.message_time import timestamp
+
     event_ids = [m["event_id"] for m in event_manifest]
     if not event_ids:
         return []
     events = db.query(Event).filter(Event.id.in_(event_ids)).all()
+    missing_time = {e.turn_id for e in events if not e.created_at and e.turn_id}
+    turn_times = dict(db.query(TurnRecord.turn_id, TurnRecord.created_at).filter(
+        TurnRecord.turn_id.in_(missing_time),
+    ).all()) if missing_time else {}
     event_order = {
         manifest["event_id"]: index
         for index, manifest in enumerate(event_manifest)
@@ -1524,6 +1530,7 @@ def _reconstruct_source_turns(db: Session, event_manifest: list[dict[str, Any]])
         pl = e.payload or {}
         if pl.get("protocol_only"):
             continue
+        at = timestamp(e.created_at or turn_times.get(e.turn_id or ""))
         turn = by_turn.setdefault(e.turn_id or "", {
             "turn_id": e.turn_id,
             "user_message": "",
@@ -1533,15 +1540,18 @@ def _reconstruct_source_turns(db: Session, event_manifest: list[dict[str, Any]])
         })
         if et == "user_message":
             turn["user_message"] = pl.get("content", "")
+            turn["user_message_at"] = at
         elif et == "llm_response":
             turn["assistant_reply"] = pl.get("content", "")
+            turn["assistant_reply_at"] = at
         elif et == "tool_call":
-            turn["tool_calls"].append({"name": pl.get("name"), "params": pl.get("params")})
+            turn["tool_calls"].append({"name": pl.get("name"), "params": pl.get("params"), "created_at": at})
         elif et == "tool_result":
             turn["tool_results"].append({
                 "name": pl.get("name"),
                 "status": pl.get("status"),
                 "tool_call_id": pl.get("tool_call_id"),
+                "created_at": at,
             })
     return list(by_turn.values())
 
@@ -1672,19 +1682,24 @@ def _build_summary_prompt(source_turns: list[dict[str, Any]], tool_items: list[d
 
 def _build_extract_fallback_summary(source_turns: list[dict[str, Any]]) -> dict[str, Any]:
     """最终重试仍失败时生成无推断的抽取式摘要，避免 sealing 永久阻塞。"""
-    user_parts = [
-        str(turn.get("user_message", "")).strip()
-        for turn in source_turns
-        if str(turn.get("user_message", "")).strip()
-    ]
-    assistant_parts = [
-        str(turn.get("assistant_reply", "")).strip()
-        for turn in source_turns
-        if str(turn.get("assistant_reply", "")).strip()
-    ]
+    def excerpts(key: str) -> str:
+        parts: list[str] = []
+        remaining = 4000
+        for turn in reversed(source_turns):
+            content = str(turn.get(key, "")).strip()
+            if not content:
+                continue
+            label = f"[{turn[key + '_at']}] " if turn.get(key + "_at") else ""
+            if remaining <= len(label):
+                break
+            entry = label + content[:remaining - len(label)]
+            parts.append(entry)
+            remaining -= len(entry) + 1
+        return "\n".join(reversed(parts))
+
     return {
-        "goal": "\n".join(user_parts)[-4000:],
-        "outcome": "\n".join(assistant_parts)[-4000:],
+        "goal": excerpts("user_message"),
+        "outcome": excerpts("assistant_reply"),
         "decisions": [],
         "entities": [],
         "tool_result_summaries": [],

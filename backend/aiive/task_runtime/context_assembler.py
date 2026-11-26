@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import json
 import hashlib
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session
 
-from aiive.db.models import AgentTask
+from aiive.core.message_time import as_utc, timestamp
+from aiive.core.scheduling_time import user_timezone
+from aiive.db.models import AgentRun, AgentTask
 from aiive.prompts import get_prompt_registry
 from aiive.skills import SkillDefinition
 from aiive.task_runtime.repository import TaskRepository
@@ -39,6 +42,21 @@ class TaskContextAssembler:
         reader = TaskReadRepository(self.db)
         if not reader.task_visible(task):
             raise TaskContentUnavailable("task_unavailable")
+        initial = (task.task_brief or {}).get("initial_input") or {}
+        device_zone = initial.get("user_timezone") if isinstance(initial, dict) else None
+        zone = user_timezone(device_zone if isinstance(device_zone, str) else None) or "UTC"
+        current_run = self.db.get(AgentRun, task.current_run_id) if task.current_run_id else None
+        if current_run is not None and (current_run.task_id != task.id or current_run.completed_at is not None):
+            current_run = None
+        previous_runs = self.db.query(AgentRun).filter(
+            AgentRun.task_id == task.id, AgentRun.completed_at.is_not(None),
+        )
+        if current_run is not None:
+            previous_runs = previous_runs.filter(AgentRun.run_index < current_run.run_index)
+        runs = reader.filter_children(
+            "agent_run", previous_runs.order_by(AgentRun.run_index.desc()).limit(20).all(),
+        )[:5]
+        now = datetime.now(timezone.utc)
         skill = self._active_skill(task)
         tool_view = {}
         if not reporting:
@@ -68,17 +86,25 @@ class TaskContextAssembler:
             from aiive.supervisor.slot_manager import SlotManager
 
             manager = SlotManager()
-            active = manager.get_active_slot()
-            inactive = "B" if active == "A" else "A"
+            identity = runtime_identity()
+            active = identity["active_slot_pointer"]
+            inactive = "B" if active == "A" else "A" if active == "B" else None
             workspace = {
-                **runtime_identity(),
-                "canonical_source_root": task.task_state["source_repository"],
+                **identity,
+                "source_repository": task.task_state["source_repository"],
                 "task_workspace": task.task_state["worktree_path"],
-                "active_slot_pointer": active,
-                "inactive_slot": str(manager.base_dir / inactive / "app"),
+                "inactive_slot": str(manager.base_dir / inactive / "app") if inactive else None,
             }
         return {
             "workspace": workspace,
+            "temporal": {
+                "current_time": timestamp(now, zone),
+                "timezone": zone,
+                "task_created_at": timestamp(task.created_at, zone),
+                "task_age_seconds": max(0, int((now - as_utc(task.created_at)).total_seconds())) if task.created_at else None,
+                "current_run": _run_time(current_run, zone) if current_run is not None else None,
+                "completed_runs": [_run_time(run, zone) for run in runs],
+            },
             "task": {
                 "id": task.id,
                 "type": task.task_type,
@@ -99,6 +125,7 @@ class TaskContextAssembler:
                 {
                     "id": item.id,
                     "sequence": item.sequence,
+                    "created_at": timestamp(item.created_at, zone),
                     "capability_id": item.capability_id,
                     "status": item.status,
                     "arguments": _bounded_value(item.arguments, 3000),
@@ -116,7 +143,8 @@ class TaskContextAssembler:
                 for item in reversed(artifacts)
             ],
             "signals": [
-                {"id": item.id, "event_type": item.event_type, "payload": _bounded_value(item.payload, 4000)}
+                {"id": item.id, "sequence": item.sequence, "created_at": timestamp(item.created_at, zone),
+                 "event_type": item.event_type, "payload": _bounded_value(item.payload, 4000)}
                 for item in reversed(events)
             ],
             "tools": tool_view,
@@ -241,6 +269,18 @@ class TaskContextAssembler:
         from aiive.skills import get_skill
 
         return get_skill(skill_id)
+
+
+def _run_time(run: AgentRun, zone: str) -> dict[str, Any]:
+    start, end = run.started_at, run.completed_at
+    return {
+        "run_index": run.run_index,
+        "status": run.status,
+        "created_at": timestamp(run.created_at, zone),
+        "started_at": timestamp(start, zone),
+        "completed_at": timestamp(end, zone),
+        "duration_seconds": (as_utc(end) - as_utc(start)).total_seconds() if start and end else None,
+    }
 
 
 def _bounded_value(value: Any, max_chars: int) -> Any:

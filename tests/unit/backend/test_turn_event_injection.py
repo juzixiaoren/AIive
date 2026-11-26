@@ -429,7 +429,7 @@ def _confirmed_goal(db, thread: Thread) -> AgentTask:
         goal="事件注入测试",
         title="事件注入测试",
         task_type="long_term_goal",
-        task_brief={"scope": {"allowed_capabilities": ["get_current_time"]}},
+        task_brief={"scope": {"allowed_capabilities": ["get_runtime_identity"]}},
         enqueue=False,
     )
     GoalService(db).attach_plan(task, _plan([

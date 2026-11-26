@@ -35,6 +35,7 @@ from aiive.retrieval.retrieval_types import (
 )
 from aiive.retrieval.source_version import epoch_checkpoint_source_hashes_hash
 from aiive.runtime.token_counter import LiteLLMTokenCounter
+from aiive.core.message_time import timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -738,6 +739,7 @@ class UnifiedRetriever:
                 "route": it.route,
                 "record_version": it.record_version,
                 "memory_type": it.memory_type,
+                "observed_at": timestamp(it.observed_at) if it.observed_at is not None else None,
             },
             retrieval_reason="memory route",
             token_count=tcount,
@@ -788,6 +790,7 @@ class UnifiedRetriever:
         return MemoryRecallItem(
             memory_id=h.memory_record_id or h.source_id,
             content=h.snippet,
+            observed_at=h.provenance.get("observed_at"),
             memory_type=str(h.provenance.get("memory_type") or ""),
             canonical_key=h.canonical_key or h.title,
             scope_type=h.scope_type,

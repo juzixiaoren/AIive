@@ -168,9 +168,9 @@ def test_cancelled_tool_outcome_marks_action_cancelled(db_session, tmp_path) -> 
 
 
 def test_successful_action_still_succeeds(db_session, tmp_path) -> None:
-    task = _task(db_session, _thread(db_session), ["get_current_time"], [str(tmp_path)])
+    task = _task(db_session, _thread(db_session), ["get_runtime_identity"], [str(tmp_path)])
     agent = SequenceAgent(
-        ActionProposal(decision="action", capability_id="get_current_time", arguments={}),
+        ActionProposal(decision="action", capability_id="get_runtime_identity", arguments={}),
         ActionProposal(decision="finish", summary="完成", report_status="succeeded"),
     )
 

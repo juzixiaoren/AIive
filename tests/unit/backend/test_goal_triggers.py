@@ -92,7 +92,7 @@ def _propose(db, thread: Thread, plan: dict):
         goal="触发规则测试",
         title="触发规则测试",
         task_type="long_term_goal",
-        task_brief={"scope": {"allowed_capabilities": ["get_current_time"]}},
+        task_brief={"scope": {"allowed_capabilities": ["get_runtime_identity"]}},
         enqueue=False,
     )
     GoalService(db).attach_plan(task, plan)

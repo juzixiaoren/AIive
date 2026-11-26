@@ -80,7 +80,7 @@ def _task(db_session, thread: Thread, **kwargs):
         goal=kwargs.pop("goal", "完成测试任务"),
         title=kwargs.pop("title", "测试任务"),
         task_type=kwargs.pop("task_type", "general"),
-        task_brief=kwargs.pop("task_brief", {"scope": {"allowed_capabilities": ["get_current_time"]}}),
+        task_brief=kwargs.pop("task_brief", {"scope": {"allowed_capabilities": ["get_runtime_identity"]}}),
         enqueue=kwargs.pop("enqueue", False),
         **kwargs,
     )
@@ -91,10 +91,10 @@ def test_main_agent_has_task_reminder_memory_and_privacy_entrypoints() -> None:
     assert {item["capability_id"] for item in registry.list_all()} == {
         "list_skills", "search_worker_capabilities", "delegate_task", "get_task_status", "cancel_task", "send_task_input",
         "list_thread_attachments", "read_attachment",
-        "get_current_time", "schedule_reminder", "list_reminders", "cancel_reminder",
+        "get_runtime_identity", "schedule_reminder", "list_reminders", "cancel_reminder",
         "confirm_reminder", "snooze_reminder", "memory_search", "memory_timeline", "remember_or_update",
         "history_search", "get_tool_operation_status", "forget", "forget_status",
-        "web_search",
+        "web_search", "fetch_web_page",
     }
     assert registry.get("desktop_fs_read_text") is None
     assert registry.get("read_text_file") is None
@@ -174,7 +174,7 @@ def test_main_tool_returns_status_report_and_pending_approval_to_model(db_sessio
         },
     ])
     replay = ContextAssembler._dicts_to_prompt_messages(history)
-    assert next(msg["content"] for msg in replay if msg["role"] == "tool") == message.content
+    assert next(msg["content"] for msg in replay if msg["role"] == "tool").endswith("\n" + message.content)
 
 
 def test_task_status_large_details_paginate_within_the_same_thread(db_session) -> None:
@@ -254,7 +254,7 @@ def test_legacy_sparse_budget_keeps_its_stored_execution_limits(db_session) -> N
     task.usage = {**task.usage, "runs": 20, "model_calls": 30, "actions": 50,
                   "tool_failures": 10, "prompt_tokens": 300_000}
     result = PersistentTaskRuntime(db_session, agent_executor=SequenceAgent(
-        ActionProposal(decision="action", capability_id="get_current_time"),
+        ActionProposal(decision="action", capability_id="get_runtime_identity"),
         ActionProposal(decision="finish", summary="已取得结果"),
     )).run(task.id)
     assert result["status"] == "succeeded"
@@ -292,9 +292,9 @@ def test_main_agent_can_read_own_task_evidence_only(db_session) -> None:
 
     thread = _thread(db_session)
     other_thread = _thread(db_session)
-    task = _task(db_session, thread)
+    task = _task(db_session, thread, task_brief={"scope": {"allowed_capabilities": ["echo"]}})
     report = PersistentTaskRuntime(db_session, agent_executor=SequenceAgent(
-        ActionProposal(decision="action", capability_id="get_current_time"),
+        ActionProposal(decision="action", capability_id="echo", arguments={"message": "evidence"}),
         ActionProposal(decision="finish", summary="已取得结果"),
     )).run(task.id)["report"]
     args = {"task_id": task.id, "evidence_id": report["evidence_refs"][0]}
@@ -315,7 +315,7 @@ def test_create_task_goal_cannot_be_overridden_by_brief(db_session) -> None:
         db_session,
         _thread(db_session),
         goal="authoritative goal",
-        task_brief={"goal": "spoofed goal", "scope": {"allowed_capabilities": ["get_current_time"]}},
+        task_brief={"goal": "spoofed goal", "scope": {"allowed_capabilities": ["get_runtime_identity"]}},
     )
     assert task.goal == "authoritative goal"
     assert task.task_brief["goal"] == "authoritative goal"
@@ -362,7 +362,7 @@ def test_cancel_task_preserves_pending_action_audit(db_session) -> None:
     action = repo.create_action(
         task=running_task,
         run=run,
-        capability_id="get_current_time",
+        capability_id="get_runtime_identity",
         arguments={},
         descriptor_hash="0" * 64,
         risk_level="low",
@@ -388,7 +388,7 @@ def test_cancel_task_preserves_pending_action_audit(db_session) -> None:
 def test_simple_readonly_task_runs_to_report(db_session) -> None:
     task = _task(db_session, _thread(db_session))
     agent = SequenceAgent(
-        ActionProposal(decision="action", capability_id="get_current_time", summary="读取时间"),
+        ActionProposal(decision="action", capability_id="get_runtime_identity", summary="读取运行身份"),
         ActionProposal(decision="finish", summary="时间读取完成", report_status="succeeded"),
     )
 
@@ -409,9 +409,9 @@ def test_deterministic_executor_skips_worker_llm_but_keeps_action_audit(db_sessi
         db_session,
         _thread(db_session),
         task_brief={
-            "scope": {"allowed_capabilities": ["get_current_time"]},
+            "scope": {"allowed_capabilities": ["get_runtime_identity"]},
             "initial_input": {"deterministic_action": {
-                "capability_id": "get_current_time", "arguments": {}, "summary": "读取时间",
+                "capability_id": "get_runtime_identity", "arguments": {}, "summary": "读取运行身份",
             }},
         },
     )
@@ -493,7 +493,7 @@ def test_task_context_never_loads_conversation_history(db_session) -> None:
         payload={"content": "CONVERSATION_SECRET_MUST_NOT_ENTER_TASK"},
     ))
     task = _task(db_session, thread)
-    snapshot = TaskContextAssembler(db_session).snapshot(task, [{"capability_id": "get_current_time"}])
+    snapshot = TaskContextAssembler(db_session).snapshot(task, [{"capability_id": "get_runtime_identity"}])
 
     assert "CONVERSATION_SECRET_MUST_NOT_ENTER_TASK" not in str(snapshot)
     assert snapshot["task"]["goal"] == task.goal
@@ -510,8 +510,46 @@ def test_task_context_bounds_large_state_and_exposes_capability_schema(db_sessio
 
     assert len(str(snapshot["task"]["state"])) < 40_000
     assert snapshot["task"]["state"]["older_input_count"] == 10
-    current_time = next(item for item in capabilities if item["capability_id"] == "get_current_time")
+    current_time = next(item for item in capabilities if item["capability_id"] == "get_runtime_identity")
     assert "parameters" in current_time and "input_schema" in current_time
+
+
+def test_worker_model_context_uses_task_time_and_completed_runs(db_session, monkeypatch) -> None:
+    from aiive.config import settings
+
+    monkeypatch.setattr(settings, "aiive_user_timezone", "")
+    task = _task(db_session, _thread(db_session), task_brief={"initial_input": {"user_timezone": "Asia/Shanghai"}})
+    start = datetime(2026, 11, 25, 11)
+    task.created_at = start
+    previous = AgentRun(task_id=task.id, run_index=1, status="completed", created_at=start,
+                        started_at=start, completed_at=start + timedelta(minutes=5))
+    current = AgentRun(task_id=task.id, run_index=2, status="running", created_at=start + timedelta(minutes=8),
+                       started_at=start + timedelta(minutes=8))
+    db_session.add_all([previous, current])
+    db_session.flush()
+    task.current_run_id = current.id
+    repo = TaskRepository(db_session)
+    action = repo.create_action(
+        task=task, run=current, capability_id="get_runtime_identity", arguments={},
+        descriptor_hash="", risk_level="low", requires_approval=False,
+    )
+    signal = repo.append_event(task.id, "user_input_received", {"content": "继续"})
+    action.created_at = start + timedelta(minutes=9)
+    signal.created_at = start + timedelta(minutes=10)
+    db_session.flush()
+
+    assembler = TaskContextAssembler(db_session)
+    messages, snapshot, _ = assembler.messages(task, [])
+    temporal = snapshot["temporal"]
+    assert temporal["task_created_at"] == "2026-11-25T19:00:00+08:00"
+    assert temporal["current_time"].endswith("+08:00")
+    assert temporal["current_run"]["run_index"] == 2
+    assert temporal["current_run"]["completed_at"] == "unknown"
+    assert temporal["completed_runs"][0]["completed_at"] == "2026-11-25T19:05:00+08:00"
+    assert temporal["completed_runs"][0]["duration_seconds"] == 300
+    assert snapshot["actions"][-1]["created_at"] == "2026-11-25T19:09:00+08:00"
+    assert snapshot["signals"][-1]["created_at"] == "2026-11-25T19:10:00+08:00"
+    assert json.dumps(temporal, ensure_ascii=False) in messages[-1]["content"]
 
 
 @pytest.fixture
@@ -867,7 +905,7 @@ def test_large_stdout_becomes_object_evidence_with_range_reads(db_session) -> No
     repo = TaskRepository(db_session)
     _, run = repo.start_run(task.id, trigger="dispatch")
     action = repo.create_action(
-        task=task, run=run, capability_id="get_current_time", arguments={},
+        task=task, run=run, capability_id="get_runtime_identity", arguments={},
         descriptor_hash="descriptor", risk_level="low", requires_approval=False,
     )
     payload = {"ok": True, "result": {"stdout": "x" * 20_000}}
@@ -919,7 +957,7 @@ def test_file_watcher_emits_event_and_wakes_task(db_session, tmp_path) -> None:
     path.write_text("before")
     task = _task(
         db_session, thread,
-        task_brief={"scope": {"allowed_capabilities": ["get_current_time"], "allowed_roots": [str(tmp_path)]}},
+        task_brief={"scope": {"allowed_capabilities": ["get_runtime_identity"], "allowed_roots": [str(tmp_path)]}},
     )
     repo = TaskRepository(db_session)
     repo.transition_task(task, TaskStatus.DISPATCHING.value)
@@ -995,8 +1033,8 @@ def test_resource_lock_and_scope_guards(db_session, tmp_path) -> None:
 def test_complex_task_keeps_multiple_actions_in_task_timeline(db_session) -> None:
     task = _task(db_session, _thread(db_session), task_type="invoice_organization")
     agent = SequenceAgent(
-        ActionProposal(decision="action", capability_id="get_current_time", summary="扫描阶段"),
-        ActionProposal(decision="action", capability_id="get_current_time", summary="验证阶段"),
+        ActionProposal(decision="action", capability_id="get_runtime_identity", summary="扫描阶段"),
+        ActionProposal(decision="action", capability_id="get_runtime_identity", summary="验证阶段"),
         ActionProposal(decision="finish", summary="多阶段任务完成", report_status="succeeded"),
     )
 
@@ -1013,7 +1051,7 @@ def test_complex_task_keeps_multiple_actions_in_task_timeline(db_session) -> Non
 def test_action_budget_stops_new_action_without_losing_completed_evidence(db_session) -> None:
     task = _task(db_session, _thread(db_session), budgets={"max_actions": 1})
     agent = SequenceAgent(
-        ActionProposal(decision="action", capability_id="get_current_time", summary="first",
+        ActionProposal(decision="action", capability_id="get_runtime_identity", summary="first",
                        progress_draft="此前已记录的用户要求"),
     )
 
@@ -1190,7 +1228,7 @@ def test_explicit_git_worktree_isolation_rewrites_task_scope(db_session, tmp_pat
         _thread(db_session),
         task_type="development",
         task_brief={"scope": {
-            "allowed_capabilities": ["get_current_time"],
+            "allowed_capabilities": ["get_runtime_identity"],
             "allowed_roots": [str(repository)],
             "isolation_mode": "git_worktree",
         }},

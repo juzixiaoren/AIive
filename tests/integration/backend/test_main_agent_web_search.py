@@ -1,5 +1,6 @@
 """Production Turn, ToolNode and model-history paths with offline boundaries."""
 
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -17,6 +18,8 @@ from aiive.runtime.thread_state import ThreadState
 from aiive.runtime.token_models import TokenCount
 from aiive.runtime.turn_execution import TurnExecutionService
 from aiive.tools import quick_web_search
+from aiive import web
+from aiive.web import client as web_client
 from aiive.web.client import search_web_with_deadline
 from langchain_core.messages import AIMessage, ToolMessage
 from pydantic import SecretStr
@@ -45,7 +48,7 @@ class RecordingModel:
 
     def bind_tools(self, tools):
         names = {tool.name for tool in tools}
-        assert "web_search" in names and "fetch_web_page" not in names
+        assert {"web_search", "fetch_web_page", "get_runtime_identity"} <= names
         return self
 
     def invoke(self, messages):
@@ -111,17 +114,17 @@ async def test_search_reaches_model_then_compacts_next_turn(db, monkeypatch, off
 
     assert len(model.inputs) == 2
     current, = _search_messages(model.inputs[1])
-    live = json.loads(current.content)
+    live = json.loads(current.content.split("\n", 1)[1])
     assert current.tool_call_id == "weather"
     assert live["untrusted"] is True and "不执行" in live["trust_notice"]
     assert live["results"][0]["snippet"] == _SNIPPET
     assert live["results"][0]["url"] == "https://www.weather.example/hourly?q=shanghai"
-    assert "artifact_ref" not in live and len(current.content) <= 900
+    assert "artifact_ref" not in live and len(current.content.split("\n", 1)[1]) <= 900
 
     await _turn(service, stream, thread_id, "那我出门要带什么？")
     assert len(model.inputs) == 3
     replay, = _search_messages(model.inputs[2])
-    assert json.loads(replay.content) == _SUMMARY
+    assert json.loads(replay.content.split("\n", 1)[1]) == _SUMMARY
     assert replay.tool_call_id == "weather"
     position = model.inputs[2].index(replay)
     assert model.inputs[2][position - 1].tool_calls[0]["args"] == {"query": _QUERY}
@@ -149,7 +152,7 @@ def test_graph_budget_and_structured_failure_across_model_calls(db, monkeypatch,
     service = TurnExecutionService(llm_client=FakeLLMClient())
     service.execute_turn("请查实时信息", thread_id=thread_id)
     assert "失败" in model.inputs[0][0].content and "额度" in model.inputs[0][0].content
-    live = [json.loads(message.content) for message in _search_messages(model.inputs[3])]
+    live = [json.loads(message.content.split("\n", 1)[1]) for message in _search_messages(model.inputs[3])]
     statuses = ["no_results", "failed", "budget_exhausted"]
     assert [item["status"] for item in live] == statuses
     assert [item.get("error_type") for item in live] == [
@@ -160,7 +163,7 @@ def test_graph_budget_and_structured_failure_across_model_calls(db, monkeypatch,
     assert "Provider private error" not in repr(live)
     assert offline_provider == ["无结果", "失败"]
     service.execute_turn("我知道了", thread_id=thread_id)
-    assert [json.loads(message.content) for message in _search_messages(model.inputs[4])] == [
+    assert [json.loads(message.content.split("\n", 1)[1]) for message in _search_messages(model.inputs[4])] == [
         {"status": status, "result_count": 0, "primary_domain": None} for status in statuses
     ]
     assert db.query(AgentTask).filter_by(thread_id=thread_id).count() == 0
@@ -177,10 +180,49 @@ def test_parallel_tool_node_calls_share_the_turn_budget(db, monkeypatch, offline
     TurnExecutionService(llm_client=FakeLLMClient()).execute_turn("请查天气", thread_id=thread_id)
     messages = _search_messages(model.inputs[1])
     assert {message.tool_call_id for message in messages} == {"call-0", "call-1", "call-2"}
-    assert sorted(json.loads(message.content)["status"] for message in messages) == [
+    assert sorted(json.loads(message.content.split("\n", 1)[1])["status"] for message in messages) == [
         "budget_exhausted", "success", "success",
     ]
     assert offline_provider == [_QUERY, _QUERY]
+
+
+def test_main_agent_reads_search_result_and_continues_page_without_worker(db, monkeypatch, offline_provider):
+    thread_id = new_thread(db).id
+    db.commit()
+    url = "https://www.weather.example/hourly?q=shanghai"
+    text = "上海逐小时天气。午后有阵雨。" * 1800
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    seen_urls = []
+
+    def page(request):
+        seen_urls.append(str(request.url))
+        return httpx.Response(200, headers={"Content-Type": "text/plain; charset=utf-8"}, text=text)
+
+    monkeypatch.setattr(web_client, "_resolve_public_host", lambda *_: ("93.184.216.34",))
+    monkeypatch.setattr(web, "fetch_web_page", partial(web_client.fetch_web_page, transport=httpx.MockTransport(page)))
+    model = _model(monkeypatch,
+        AIMessage(content="", tool_calls=[_search_call("search", _QUERY)]),
+        AIMessage(content="", tool_calls=[{"id": "page", "name": "fetch_web_page", "args": {
+            "url": url, "max_chars": 40,
+        }}]),
+        AIMessage(content="", tool_calls=[{"id": "continuation", "name": "fetch_web_page", "args": {
+            "url": url, "offset": 40, "expected_content_hash": digest,
+        }}]),
+        AIMessage(content="根据逐小时天气页，午后有阵雨。"),
+    )
+    TurnExecutionService(llm_client=FakeLLMClient()).execute_turn("请找到并阅读上海逐小时天气网页。", thread_id=thread_id)
+    pages = {
+        msg.tool_call_id: json.loads(msg.content.split("\n", 1)[1])
+        for msg in model.inputs[-1] if isinstance(msg, ToolMessage) and msg.name == "fetch_web_page"
+    }
+    assert pages["page"]["text"] == text[:40]
+    assert pages["page"]["next_offset"] == 40
+    continuation = pages["continuation"]
+    assert continuation["text"] == text[40:continuation["next_offset"]]
+    assert 40 < continuation["next_offset"] < 12_040 and continuation["untrusted"]
+    assert continuation["content_hash"] == digest
+    assert seen_urls == [url, url] and offline_provider == [_QUERY]
+    assert db.query(AgentTask).filter_by(thread_id=thread_id).count() == 0
 
 
 class CharacterCounter:
@@ -220,7 +262,7 @@ def test_interrupted_history_preserves_search_summary(db, provider_metadata):
     assert not any(_SNIPPET in message.get("content", "") for message in prompt)
     if provider_metadata:
         tool, = [message for message in prompt if message["role"] == "tool"]
-        assert json.loads(tool["content"]) == _SUMMARY
+        assert json.loads(tool["content"].split("\n", 1)[1]) == _SUMMARY
         assert tool["tool_call_id"] == "search-id"
     else:
         interruption, = prompt
@@ -247,11 +289,11 @@ def test_legacy_history_compacts_search_before_token_budget(db):
     )
     assert stats.turns_included == 1 and stats.estimated_tokens <= 120
     user_msg, tool_call, tool_result = ContextAssembler._dicts_to_prompt_messages(projected)
-    assert user_msg["content"] == "旧版会话"
+    assert user_msg["content"].endswith("\n旧版会话")
     call, = tool_call["tool_calls"]
     assert call["id"] == tool_result["tool_call_id"] == "search-id"
     assert json.loads(call["function"]["arguments"]) == {"query": _QUERY}
-    assert json.loads(tool_result["content"]) == _SUMMARY
+    assert json.loads(tool_result["content"].split("\n", 1)[1]) == _SUMMARY
 
 
 def test_model_projection_keeps_earlier_turn_and_sealing_counts_raw_history(db, monkeypatch):

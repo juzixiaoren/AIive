@@ -93,7 +93,7 @@ def setup_job(db):
     db.add(thread)
     db.flush()
     task = TaskRepository(db).create_task(thread_id=thread.id, goal="test", enqueue=False,
-        task_brief={"scope": {"allowed_capabilities": ["get_current_time"]}})
+        task_brief={"scope": {"allowed_capabilities": ["get_runtime_identity"]}})
     claimed = ClaimedJob(str(uuid.uuid4()), "agent_task_run", {"task_id": task.id}, None, 0, 3, "claim", 1, "test")
     ensure_running_claim(claimed, db=db)
     return task.id, claimed
@@ -176,8 +176,8 @@ def test_structural_exhaustion_real_handler(durable_db, monkeypatch, limit):
 def test_structure_then_arguments_corrected_before_action(durable_db, monkeypatch):
     task_id, claimed = setup_job(durable_db)
     model = wire_model(monkeypatch, ['{"decision":"bad"}',
-        '{"decision":"action","capability_id":"get_current_time","arguments":{"max_steps":2}}',
-        '{"decision":"action","capability_id":"get_current_time"}',
+        '{"decision":"action","capability_id":"get_runtime_identity","arguments":{"max_steps":2}}',
+        '{"decision":"action","capability_id":"get_runtime_identity"}',
         '{"decision":"finish","summary":"done"}'])
     assert handle_agent_task_run(claimed).outcome == HandlerOutcome.COMPLETED
     durable_db.expire_all()
@@ -238,7 +238,7 @@ def test_function_arguments_strict_and_invalid_json_not_repaired():
 
 def test_bad_parameters_exhaust_without_action(durable_db, monkeypatch):
     task_id, claimed = setup_job(durable_db)
-    model = wire_model(monkeypatch, ['{"decision":"action","capability_id":"get_current_time","arguments":{"max_steps":2}}'] * 3)
+    model = wire_model(monkeypatch, ['{"decision":"action","capability_id":"get_runtime_identity","arguments":{"max_steps":2}}'] * 3)
     assert handle_agent_task_run(claimed).outcome == HandlerOutcome.COMPLETED
     durable_db.expire_all()
     task = durable_db.get(AgentTask, task_id)
@@ -250,7 +250,7 @@ def test_bad_parameters_exhaust_without_action(durable_db, monkeypatch):
 
 def test_exhaustion_after_progress_is_partial(durable_db, monkeypatch):
     task_id, claimed = setup_job(durable_db)
-    wire_model(monkeypatch, ['{"decision":"action","capability_id":"get_current_time"}'] + ['{"decision":"bad"}'] * 3)
+    wire_model(monkeypatch, ['{"decision":"action","capability_id":"get_runtime_identity"}'] + ['{"decision":"bad"}'] * 3)
     assert handle_agent_task_run(claimed).outcome == HandlerOutcome.COMPLETED
     durable_db.expire_all()
     task = durable_db.get(AgentTask, task_id)
@@ -265,7 +265,7 @@ def test_unknown_effect_recovery_does_not_replay(durable_db, monkeypatch):
     def interrupted_decision(self, task, capabilities):
         repo = TaskRepository(self.db)
         run = self.db.get(AgentRun, task.current_run_id)
-        action = repo.create_action(task=task, run=run, capability_id="get_current_time",
+        action = repo.create_action(task=task, run=run, capability_id="get_runtime_identity",
             arguments={}, descriptor_hash="test", risk_level="low", requires_approval=False)
         for status in ["validated", "ready", "dispatched"]:
             repo.transition_action(action, status)
@@ -400,7 +400,7 @@ def test_discovery_via_control_functions_creates_no_actions(durable_db, monkeypa
     task_id, claimed = setup_job(durable_db)
     wire_model(monkeypatch, [
         '{"decision":"search_capabilities","query":"current time"}',
-        '{"decision":"describe_capability","capability_id":"get_current_time"}',
+        '{"decision":"describe_capability","capability_id":"get_runtime_identity"}',
         '{"decision":"finish","summary":"discovered"}',
     ])
     assert handle_agent_task_run(claimed).outcome == HandlerOutcome.COMPLETED
@@ -537,16 +537,16 @@ def test_worker_refuses_definition_changed_during_model_call(durable_db, monkeyp
 
     task_id, claimed = setup_job(durable_db)
     registry = get_tool_registry()
-    original = registry.get("get_current_time")
+    original = registry.get("get_runtime_identity")
     model = wire_model(monkeypatch, [
-        '{"decision":"action","capability_id":"get_current_time"}',
+        '{"decision":"action","capability_id":"get_runtime_identity"}',
         '{"decision":"finish","report_status":"partial","summary":"tool changed"}',
     ])
     invoke = model.invoke
 
     def invoke_during_update(messages, **kwargs):
         response = invoke(messages, **kwargs)
-        if any(call["name"] == proposal_function_name("get_current_time") for call in response.tool_calls):
+        if any(call["name"] == proposal_function_name("get_runtime_identity") for call in response.tool_calls):
             registry.register(original.with_definition(replace(original.definition, description="Updated clock contract")))
         return response
 
@@ -576,7 +576,7 @@ def _cancel_during_run(self, task, capabilities):
     repo = TaskRepository(self.db)
     run = self.db.get(AgentRun, task.current_run_id)
     action = repo.create_action(
-        task=task, run=run, capability_id="get_current_time", arguments={},
+        task=task, run=run, capability_id="get_runtime_identity", arguments={},
         descriptor_hash="test", risk_level="low", requires_approval=False,
     )
     for status in ["validated", "ready", "dispatched"]:

@@ -529,7 +529,7 @@ def build_main_agent_registry() -> ToolRegistry:
         parameters={"query": {"type": "str", "minLength": 1, "pattern": r"\S", "required": True}},
     )))
     for name in (
-        "get_current_time", "schedule_reminder", "list_reminders", "cancel_reminder",
+        "get_runtime_identity", "fetch_web_page", "schedule_reminder", "list_reminders", "cancel_reminder",
         "confirm_reminder", "snooze_reminder", "memory_search", "memory_timeline", "remember_or_update",
         "history_search", "forget", "forget_status",
     ):
