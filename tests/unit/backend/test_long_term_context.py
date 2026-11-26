@@ -1,5 +1,6 @@
 """长期单会话的压缩、检查点与历史检索回归测试。"""
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -26,6 +27,7 @@ def test_reconstruct_source_turns_follows_frozen_manifest_order():
         turn_event_index=0,
         event_type="user_message",
         payload={"content": "先发生"},
+        created_at=datetime(2026, 11, 24, 13, 15),
     )
     newer = SimpleNamespace(
         id="event-new",
@@ -33,6 +35,7 @@ def test_reconstruct_source_turns_follows_frozen_manifest_order():
         turn_event_index=0,
         event_type="user_message",
         payload={"content": "后发生"},
+        created_at=datetime(2026, 11, 25, 11, 3, tzinfo=timezone.utc),
     )
     db = MagicMock()
     db.query.return_value.filter.return_value.all.return_value = [newer, older]
@@ -43,17 +46,20 @@ def test_reconstruct_source_turns_follows_frozen_manifest_order():
     )
 
     assert [turn["user_message"] for turn in turns] == ["先发生", "后发生"]
+    assert [turn["user_message_at"] for turn in turns] == [
+        "2026-11-24T13:15:00+00:00", "2026-11-25T11:03:00+00:00",
+    ]
 
 
 def test_extract_fallback_summary_is_bounded_and_non_inferential():
     summary = _build_extract_fallback_summary([
-        {"user_message": "目标 A", "assistant_reply": "结果 A"},
+        {"user_message": "目标 A", "assistant_reply": "结果 A", "assistant_reply_at": "2026-11-24T13:15:00+00:00"},
         {"user_message": "目标 B", "assistant_reply": "结果 B"},
     ])
 
     assert summary == {
         "goal": "目标 A\n目标 B",
-        "outcome": "结果 A\n结果 B",
+        "outcome": "[2026-11-24T13:15:00+00:00] 结果 A\n结果 B",
         "decisions": [],
         "entities": [],
         "tool_result_summaries": [],
