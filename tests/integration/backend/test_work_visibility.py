@@ -360,3 +360,64 @@ def test_work_read_rechecks_committed_forget(_db_template, tmp_path, changes):
                 assert result.headers["Retry-After"] == "1"
     finally:
         engine.dispose()
+
+
+def test_inherit_sources_batches_typed_parents_and_preserves_existing(db_session):
+    from sqlalchemy import event
+    from aiive.task_runtime.read_repository import inherit_sources
+
+    db = db_session
+    def proof(owner, identity, source):
+        return ContentProvenanceRef(owner_type=owner, owner_id=identity, source_type="event", source_id=source)
+
+    parents = [("task_evidence", str(i)) for i in range(70)]
+    db.add_all([proof(kind, identity, "shared") for kind, identity in parents])
+    db.add_all([proof("agent_action", "70", "action-source"), proof("agent_action", "0", "unrelated"),
+                proof("agent_task", "target", "original")])
+    parents += [("agent_action", "70"), parents[0]]
+    selects = []
+    def capture(conn, cursor, statement, *args):
+        if statement.lstrip().upper().startswith("SELECT"):
+            selects.append(statement)
+    conn = db.connection()
+    event.listen(conn, "before_cursor_execute", capture)
+    try:
+        inherit_sources(db, "agent_task", "target", parents)
+    finally:
+        event.remove(conn, "before_cursor_execute", capture)
+    assert len(selects) == 2
+    inherit_sources(db, "agent_task", "target", parents)
+    refs = db.query(ContentProvenanceRef).filter_by(owner_type="agent_task", owner_id="target")
+    assert sorted(ref.source_id for ref in refs) == ["action-source", "original", "shared"]
+
+
+def test_recent_evidence_skips_hidden_batches_and_stops_early(db_session):
+    from datetime import UTC, datetime
+    from sqlalchemy import event
+    from aiive.db.models import TaskEvidence
+    from aiive.task_runtime.read_repository import TaskReadRepository
+    from tests.integration.backend.test_forget_goal_read_bypasses import signal
+
+    db = db_session
+    seed(db, 1)
+    origin = signal(db, "thread")
+    stamp = datetime.now(UTC)
+    for i in range(200):
+        identity = f"{i:03d}"
+        db.add(TaskEvidence(id=identity, task_id="00000", content_hash="hash", created_at=stamp))
+        if i < 160:
+            db.add(ContentProvenanceRef(owner_type="task_evidence", owner_id=identity,
+                                        source_type="event", source_id=origin.id))
+    db.flush()
+    db.expunge_all()
+    loaded = []
+    def track(_, row):
+        if isinstance(row, TaskEvidence):
+            loaded.append(row.id)
+    event.listen(db, "loaded_as_persistent", track)
+    try:
+        recent = TaskReadRepository(db).recent_evidence("00000", 3)
+    finally:
+        event.remove(db, "loaded_as_persistent", track)
+    assert [row.id for row in recent] == ["159", "158", "157"]
+    assert 40 < len(loaded) < 200

@@ -7,9 +7,11 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
+from contextlib import closing
 from datetime import datetime
+from itertools import batched
 from typing import Any, TypeVar, cast
-from sqlalchemy import or_
+from sqlalchemy import Select, or_, select, tuple_
 from sqlalchemy.orm import InstrumentedAttribute, Session, load_only
 from aiive.db.models import (
     AgentTask,
@@ -43,29 +45,22 @@ class TaskContentUnavailable(PermissionError):
 def inherit_sources(
     db: Session, owner_type: str, owner_id: str, parents: Sequence[tuple[str, str]]
 ) -> None:
-    existing = {
-        (r.source_type, r.source_id)
-        for r in db.query(ContentProvenanceRef)
-        .filter_by(owner_type=owner_type, owner_id=owner_id)
-        .all()
-    }
-    for parent_type, parent_id in parents:
-        for ref in (
-            db.query(ContentProvenanceRef)
-            .filter_by(owner_type=parent_type, owner_id=parent_id)
-            .all()
-        ):
-            pair = (ref.source_type, ref.source_id)
-            if pair not in existing:
-                db.add(
-                    ContentProvenanceRef(
-                        owner_type=owner_type,
-                        owner_id=owner_id,
-                        source_type=ref.source_type,
-                        source_id=ref.source_id,
-                    )
-                )
-                existing.add(pair)
+    if not parents:
+        return
+    ref = ContentProvenanceRef
+    columns = db.query(ref.source_type, ref.source_id)
+    existing = {(kind, identity) for kind, identity in columns.filter_by(
+        owner_type=owner_type, owner_id=owner_id,
+    )}
+    inherited: set[tuple[str, str]] = set()
+    # Keep composite IN predicates below SQLite's legacy bind parameter limit.
+    for group in batched(dict.fromkeys(parents), 400):
+        rows = columns.filter(tuple_(ref.owner_type, ref.owner_id).in_(group)).distinct()
+        inherited.update((kind, identity) for kind, identity in rows)
+    db.add_all([
+        ref(owner_type=owner_type, owner_id=owner_id, source_type=kind, source_id=identity)
+        for kind, identity in sorted(inherited - existing)
+    ])
 
 
 def record_input_source(
@@ -285,46 +280,49 @@ class TaskReadRepository:
         visible = self.visible_children_many(owner_type, items)
         return [item for item in items if item.id in visible]
 
+    def _recent_visible(
+        self, owner_type: str, statement: Select[Child], limit: int,
+    ) -> list[Child]:
+        if limit <= 0:
+            return []
+        size = min(max(32, limit), 128)
+        result: list[Child] = []
+        with closing(self.db.scalars(statement.execution_options(yield_per=size))) as rows:
+            for batch in rows.partitions(size):
+                result.extend(self.filter_children(owner_type, batch))
+                if len(result) >= limit:
+                    break
+        return result[:limit]
+
     def actions(self, task_id: str, limit: int = 20) -> list[AgentAction]:
-        rows = (
-            self.db.query(AgentAction)
-            .filter_by(task_id=task_id)
-            .order_by(AgentAction.sequence.desc())
-            .limit(4096)
-            .all()
-        )
-        return self.filter_children("agent_action", rows)[:limit]
+        query = select(AgentAction).filter_by(task_id=task_id).order_by(AgentAction.sequence.desc())
+        return self._recent_visible("agent_action", query, limit)
 
     def artifacts(self, task_id: str, limit: int = 20) -> list[TaskArtifact]:
-        rows = (
-            self.db.query(TaskArtifact)
-            .filter_by(task_id=task_id)
-            .order_by(TaskArtifact.created_at.desc())
-            .limit(4096)
-            .all()
+        query = select(TaskArtifact).filter_by(task_id=task_id).order_by(
+            TaskArtifact.created_at.desc(), TaskArtifact.id.desc(),
         )
-        return self.filter_children("task_artifact", rows)[:limit]
+        return self._recent_visible("task_artifact", query, limit)
 
     def signals(
         self, task_id: str, event_types: list[str], limit: int = 10
     ) -> list[AgentTaskEvent]:
-        rows = (
-            self.db.query(AgentTaskEvent)
-            .filter(
-                AgentTaskEvent.task_id == task_id,
-                AgentTaskEvent.event_type.in_(event_types),
-            )
-            .order_by(AgentTaskEvent.sequence.desc())
-            .limit(4096)
-            .all()
+        query = select(AgentTaskEvent).filter(
+            AgentTaskEvent.task_id == task_id, AgentTaskEvent.event_type.in_(event_types),
+        ).order_by(AgentTaskEvent.sequence.desc())
+        return self._recent_visible("agent_task_event", query, limit)
+
+    def recent_evidence(self, task_id: str, limit: int) -> list[TaskEvidence]:
+        query = select(TaskEvidence).filter_by(task_id=task_id).order_by(
+            TaskEvidence.created_at.desc(), TaskEvidence.id.desc(),
         )
-        return self.filter_children("agent_task_event", rows)[:limit]
+        return self._recent_visible("task_evidence", query, limit)
 
     def evidence(self, task_id: str) -> list[TaskEvidence]:
         rows = (
             self.db.query(TaskEvidence)
             .filter_by(task_id=task_id)
-            .order_by(TaskEvidence.created_at)
+            .order_by(TaskEvidence.created_at, TaskEvidence.id)
             .all()
         )
         return self.filter_children("task_evidence", rows)

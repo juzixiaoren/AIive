@@ -89,6 +89,8 @@
 | WorkingState（运行中状态） | `runtime/working_state.py` | `runtime/agent_graph.py::_tools_node` | `test_working_state*.py` |
 | 主动消息写入时间线（V50） | `runtime/proactive_message.py`（`ProactiveMessageService.post`） | `runtime/epoch_manager.py::peek_next_turn_sequence`、`worker/handlers_goal_triggers.py`、`api/ws_manager.py` | `test_goal_triggers.py` |
 
+任务上下文、目标决策和回合事件通过 `TaskReadRepository.recent_evidence` 读取最近可见证据。动作、产物和信号共用分批可见性检查，检查点与报告的 `inherit_sources` 按父对象类型与 ID 成对批量继承来源。
+
 ### 2.1.1 共享运行时与聊天展示边界（2026-11-11）
 
 | 职责 | 唯一实现 | 消费方 / 兼容入口 |

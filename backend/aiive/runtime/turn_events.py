@@ -698,7 +698,7 @@ def _task_snapshot(db: Session, task_id: str) -> dict[str, Any]:
     task = reader.get_task(task_id)
     if task is None:
         return {}
-    evidence = list(reversed(reader.evidence(task_id)[-3:]))
+    evidence = reader.recent_evidence(task_id, 3)
     return {
         "title": _bounded(task.title or task.goal or "", 200),
         "status": str(task.status or ""),

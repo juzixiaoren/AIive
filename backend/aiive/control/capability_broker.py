@@ -240,7 +240,7 @@ class CapabilityBroker:
             from aiive.task_runtime.evidence import EvidenceStore
 
             from aiive.task_runtime.read_repository import TaskReadRepository
-            evidence = list(reversed(TaskReadRepository(self.db).evidence(task.id)[-20:]))
+            evidence = TaskReadRepository(self.db).recent_evidence(task.id, 20)
 
             def passed(value: Any) -> bool:
                 if isinstance(value, dict):

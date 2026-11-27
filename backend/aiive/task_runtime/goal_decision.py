@@ -224,7 +224,7 @@ class GoalDecisionEngine:
 
     def _evidence(self, task_id: str) -> list[dict[str, Any]]:
         from aiive.task_runtime.read_repository import TaskReadRepository
-        rows = list(reversed(TaskReadRepository(self.db).evidence(task_id)[-8:]))
+        rows = TaskReadRepository(self.db).recent_evidence(task_id, 8)
         self._evidence_ids = [r.id for r in rows]
         return [
             {"id": row.id, "kind": row.kind, "summary": _bounded(row.summary or "", 400)}

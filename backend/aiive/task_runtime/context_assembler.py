@@ -82,7 +82,7 @@ class TaskContextAssembler:
             )
         checkpoint = TaskRepository(self.db).latest_checkpoint(task.id)
         actions = reader.actions(task.id)
-        evidence = list(reversed(reader.evidence(task.id)[-20:]))
+        evidence = reader.recent_evidence(task.id, 20)
         page_actions = {a.id for a in actions if a.capability_id in FULL_OBSERVATION_TOOLS}
         artifacts = reader.artifacts(task.id)
         event_types = ["user_input_received", "watch_triggered", "watch_failed", "approval_denied",
