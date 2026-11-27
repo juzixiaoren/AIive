@@ -38,12 +38,14 @@ class ExperienceInsightRetriever:
     def __init__(self, db: Session):
         self.db: Session = db
 
-    def active(self, *, kind: str | None = None, family: str | None = None) -> list[ExperienceInsight]:
+    def active(self, *, kind: str | None = None, family: str | None = None, insight_id: str | None = None) -> list[ExperienceInsight]:
         query = self.db.query(ExperienceInsight).filter_by(status="active")
         if kind is not None:
             query = query.filter_by(kind=kind)
         if family is not None:
             query = query.filter_by(family=family)
+        if insight_id is not None:
+            query = query.filter_by(insight_id=insight_id)
         return [item for item in query.order_by(ExperienceInsight.enabled_at.desc(), ExperienceInsight.id)
                 if evidence_visible(self.db, item)]
 
@@ -51,36 +53,35 @@ class ExperienceInsightRetriever:
         self, text: str, family: str, registry: ToolRegistry, *, allow_network: bool = True,
         main: bool = False, skill_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        from aiive.skills.catalog import SkillService
-
         query = match_terms(text)
-        candidates: list[tuple[int, int, dict[str, Any]]] = []
-        skill_service = SkillService(self.db)
-        for row in self.active(family=family):
-            if row.kind == "tool_hint":
-                continue
-            body = row.body
-            phrases = [match_terms(term) for term in body["match_terms"]]
+        workflows = self.db.query(ExperienceInsight).filter(
+            ExperienceInsight.status == "active", ExperienceInsight.family == family,
+            ExperienceInsight.kind.in_(("skill", "playbook")),
+        )
+        candidates: list[tuple[bool, int, ExperienceInsight]] = []
+        for row in workflows:
+            selected = row.kind == "skill" and row.insight_id == skill_id
+            phrases = [match_terms(term) for term in row.body["match_terms"]]
             hits = set().union(*(phrase for phrase in phrases if phrase and phrase <= query))
-            if len(hits) < 2 and not (row.kind == "skill" and skill_id == row.insight_id):
+            if len(hits) < 2 and not selected:
                 continue
-            for capability in body["required_capabilities"]:
+            for capability in row.body["required_capabilities"]:
                 tool = registry.get(capability)
                 if tool is None or (tool.safety.uses_network and not allow_network):
                     if main and registry.get("delegate_task") is not None:
                         continue
                     break
             else:
-                if row.kind == "skill":
-                    skill = skill_service.from_insight(row)
-                    display = skill.instructions
-                else:
-                    display = workflow_text(body)
-                candidates.append((len(hits), row.support_count, {
-                    **usage_ref(row), "title": row.title, "text": display,
-                }))
-        candidates.sort(key=lambda item: (-item[0], -item[1], item[2]["id"]))
-        return [item[2] for item in candidates[:MAX_CONTEXT_INSIGHTS]]
+                candidates.append((selected, len(hits), row))
+
+        candidates.sort(key=lambda item: (not item[0], -item[1], -item[2].support_count, item[2].insight_id))
+        result = []
+        for _, _, row in candidates:
+            if evidence_visible(self.db, row):
+                result.append({**usage_ref(row), "title": row.title, "text": workflow_text(row.body)})
+                if len(result) == MAX_CONTEXT_INSIGHTS:
+                    break
+        return result
 
     def tool_hints(self, family: str, query: str, registry: ToolRegistry) -> list[dict[str, Any]]:
         normalized = " ".join(query.casefold().split())

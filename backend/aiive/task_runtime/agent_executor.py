@@ -269,7 +269,11 @@ class TaskAgentExecutor:
 
 
 def _compact_history(snapshot: dict[str, Any]) -> bool:
-    for key, minimum in (("experience", 0), ("artifacts", 0), ("evidence", 1), ("actions", 1), ("signals", 1)):
+    # Experience is ranked best first. History below is ordered oldest first.
+    if snapshot.get("experience"):
+        snapshot["experience"].pop()
+        return True
+    for key, minimum in (("artifacts", 0), ("evidence", 1), ("actions", 1), ("signals", 1)):
         items = snapshot.get(key, [])
         removable = [
             item for item in (items[:-minimum] if minimum else items)

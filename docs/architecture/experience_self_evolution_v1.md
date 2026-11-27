@@ -5,7 +5,7 @@
 1. Main 的 `TurnExecutionService._finalize_turn` 与 Worker 的 `PersistentTaskRuntime._complete` 在原完成事务内写入 `experience_capture`。长期目标经协调器完成时也入队。取消、执行未知、内部唤醒等路径不会产生普通用户 Turn 经历。
 2. 现有 Outbox 根据来源锁构建经历。每个物理 TurnRecord 或 AgentTask 对应一个稳定 ID。任务按 `source_turn_record_id` 计算父经历 ID，子任务先完成时也能随后关联。经历保存 Event、ContextSnapshot、AgentRun、AgentAction、AgentTaskEvent、TaskEvidence、TaskArtifact 引用及少量指标。较旧的 ContextSnapshot 仍按现有轮转策略淘汰。
 3. 六小时 `improvement_discovery` 作业先沿用原运行证据分析，再批处理反馈、发现重复能力缺口和工具别名，最后在有足够同族轨迹时调用一次 Reflector。模型批次读取短摘要和引用，服务端重新检查证据可见性、归属、结果和独立来源。用户可在自进化中心审阅增量操作。
-4. 启用的 Playbook 和 Skill 在 Main / Worker 上下文组装时统一检索。匹配要求任务族及至少两个具体词一致。Worker 根据工具目录和网络 Scope 过滤能力，Main 可为待委派任务参考经验。模型输入硬预算仍可淘汰经验。Main ContextSnapshot 和 Worker AgentRun 记录 ID 与版本，Worker 同时追加实际模型调用使用事件。
+4. 启用的 Playbook 和 Skill 在 Main / Worker 上下文组装时统一检索。匹配要求任务族及至少两个具体词一致。通过 `delegate_task.skill_id` 明确指定的同族 Skill 可免关键词匹配，优先占用一个经验名额。Worker 压缩上下文时先移除排名靠后的经验。Worker 根据工具目录和网络 Scope 过滤能力，Main 可为待委派任务参考经验。模型输入硬预算仍可淘汰经验。Main ContextSnapshot 和 Worker AgentRun 记录 ID 与版本，Worker 同时追加实际模型调用使用事件。
 5. Tool Hint 将被批准的精确别名合并到当前工具目录的检索元数据。Overlay 不改全局注册表或执行定义。搜索结果位置确实变化时才记录该提示版本。原执行授权、风险和审批由 CapabilityBroker 保持。
 6. 用户反馈更新经历评价。效果和 helpful / harmful 在读取时从实际使用版本及可见经历计算，反馈修订和 Forget 后可重算。
 

@@ -141,4 +141,7 @@ class SkillService:
         builtin = get_skill(skill_id)
         if builtin:
             return builtin
-        return next((skill for skill in self.list() if skill.skill_id == skill_id), None)
+        from aiive.experience.retrieval import ExperienceInsightRetriever
+
+        rows = ExperienceInsightRetriever(self.db).active(kind="skill", insight_id=skill_id)
+        return self.from_insight(rows[0]) if rows else None

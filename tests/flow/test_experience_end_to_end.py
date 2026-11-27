@@ -323,6 +323,64 @@ def test_curate_review_inject_and_track_versions(experience_db, api):
     assert db.get(ExperienceEpisode, new_episode.id).uses[0]["version"] == 1
 
 
+def test_delegated_skill_wins_over_automatic_matches(experience_db, monkeypatch):
+    from aiive.context.run_context import RunContext
+    from aiive.db.models import AgentTask, ExperienceInsight
+    from aiive.task_runtime.agent_executor import _compact_history
+    from aiive.task_runtime.tools import build_main_agent_registry
+
+    db = experience_db
+    monkeypatch.setattr("aiive.task_runtime.tools.SessionLocal", db.info["session_factory"])
+    evidence = []
+    for _ in range(2):
+        turn = _turn(db, _thread(db), 1, "Summarize PDF tables and appendices")
+        _finalize(turn)
+        _poll()
+        episode = db.get(ExperienceEpisode, stable_id("turn", turn.id))
+        feedback = record_feedback(db, episode, "explicit_positive")
+        evidence.append({"episode_id": episode.id, "source_id": feedback.source_id, "signal_id": feedback.id,
+                         "trace_source_id": turn.id, "role": "support", "outcome": "explicit_positive",
+                         "independent_key": episode.id})
+    for identity, terms in [("appendix", ["appendices", "tables"]), ("outline", ["summarize", "pdf"]),
+                            ("coverage", ["summarize", "document"])]:
+        db.add(ExperienceInsight(
+            id=identity, insight_id=identity, version=1, status="active", kind="skill", operation="ADD",
+            family="document", title=identity, support_count=2, evidence=evidence,
+            body={"conditions": identity, "match_terms": terms, "required_capabilities": [],
+                  "steps": [identity], "expected_result": identity, "verification": identity, "recovery": identity},
+        ))
+    db.commit()
+    result = build_main_agent_registry().execute(
+        "delegate_task", {"goal": "Summarize this PDF document", "skill_id": "appendix"}, "trusted_user_command",
+        run_context=RunContext(thread_id=turn.thread_id, trace_id=turn.id),
+    )
+    assert result["ok"], result
+    task = db.get(AgentTask, result["result"]["task_id"])
+    assembler = TaskContextAssembler(db)
+    messages, snapshot, _ = assembler.messages(task, [])
+    assert snapshot["experience"][0]["id"] == "appendix"
+    assert len(snapshot["experience"]) == 2
+    assert "appendix" in messages[0]["content"]
+    assert _compact_history(snapshot)
+    assert [item["id"] for item in snapshot["experience"]] == ["appendix"]
+
+    def selected_ids():
+        return [item["id"] for item in assembler.snapshot(task, [])["experience"]]
+
+    selected = db.get(ExperienceInsight, "appendix")
+    selected.body = {**selected.body, "required_capabilities": ["web_search"]}
+    db.commit()
+    assert "appendix" not in selected_ids()  # The task has no network authorization.
+    selected.body = {**selected.body, "required_capabilities": []}
+    selected.status = "disabled"
+    db.commit()
+    assert "appendix" not in selected_ids()
+    selected.status = "active"
+    record_feedback(db, episode, "rework")
+    db.commit()
+    assert selected_ids() == []
+
+
 def test_tool_hint_changes_discovery_and_respects_scope(experience_db, api):
     db = experience_db
     registry = get_tool_registry()
