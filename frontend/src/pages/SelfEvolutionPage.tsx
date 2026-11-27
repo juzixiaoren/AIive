@@ -12,6 +12,8 @@ type Episode = {
   source_id: string;
   parent_id?: string;
   title?: string;
+  result_preview?: string;
+  result_truncated?: boolean;
   outcome: string;
   completed_at: string;
   feedback?: string;
@@ -67,7 +69,8 @@ type Candidate = {
   test_method: string;
   progress: { kind?: string; id?: string; status?: string; repair_status?: string; selected?: string };
 };
-type Home = { episodes: Episode[]; insights: Insight[]; candidates: Candidate[] };
+type EpisodePage = { items: Episode[]; next_cursor: string | null };
+type Home = { episodes: Episode[]; episodes_next_cursor: string | null; insights: Insight[]; candidates: Candidate[] };
 type Selection = { section: "episodes"; row: Episode } | { section: "insights"; row: Insight } |
   { section: "candidates"; row: Candidate };
 
@@ -157,16 +160,44 @@ export default function SelfEvolutionPage({ onOpenWork }: { onOpenWork: (id: str
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const sequence = useRef(0);
+  const listSequence = useRef(0);
+  const [listBusy, setListBusy] = useState(false);
   const detailHeading = useRef<HTMLHeadingElement>(null);
 
   const refresh = useCallback(async () => {
+    const current = ++listSequence.current;
+    setListBusy(true);
+    setError("");
     try {
-      setHome(await request<Home>());
+      const result = await request<Home>();
+      if (current === listSequence.current) setHome(result);
     } catch (err) {
-      setError((err as Error).message);
+      if (current === listSequence.current) setError((err as Error).message);
+    } finally {
+      if (current === listSequence.current) setListBusy(false);
     }
   }, []);
   useEffect(() => { void refresh(); }, [refresh]);
+
+  async function loadOlder() {
+    const cursor = home?.episodes_next_cursor;
+    if (!cursor || listBusy) return;
+    const current = ++listSequence.current;
+    setListBusy(true);
+    setError("");
+    try {
+      const page = await request<EpisodePage>(`/episodes?cursor=${encodeURIComponent(cursor)}`);
+      if (current === listSequence.current) {
+        setHome(prev => prev?.episodes_next_cursor === cursor
+          ? { ...prev, episodes: [...prev.episodes, ...page.items], episodes_next_cursor: page.next_cursor }
+          : prev);
+      }
+    } catch (err) {
+      if (current === listSequence.current) setError((err as Error).message);
+    } finally {
+      if (current === listSequence.current) setListBusy(false);
+    }
+  }
 
   async function open(next: Section, id: string) {
     const current = ++sequence.current;
@@ -202,7 +233,13 @@ export default function SelfEvolutionPage({ onOpenWork }: { onOpenWork: (id: str
         detail.section === "insights" ? { section: "insights", row: await request<Insight>(path, body) } :
           { section: "candidates", row: await request<Candidate>(path, body) };
       if (current === sequence.current) setDetail(result);
-      await refresh();
+      if (result.section === "episodes") {
+        setHome(prev => prev && { ...prev, episodes: prev.episodes.map(
+          row => row.id === result.row.id ? result.row : row,
+        ) });
+      } else {
+        await refresh();
+      }
     } catch (err) {
       if (current === sequence.current) setError((err as Error).message);
     } finally {
@@ -226,7 +263,7 @@ export default function SelfEvolutionPage({ onOpenWork }: { onOpenWork: (id: str
         <h2 className="text-2xl font-semibold tracking-tight text-title">自进化中心</h2>
         <p className="mt-1 text-sm text-muted">查看实际经历、审阅改进，并追踪启用后的效果。</p>
       </div>
-      <button type="button" className={button} disabled={busy} onClick={() => detail ?
+      <button type="button" className={button} disabled={busy || listBusy} onClick={() => detail ?
         void open(detail.section, detail.section === "candidates" ? detail.row.candidate_id : detail.row.id) : void refresh()}>刷新</button>
     </header>
     <nav aria-label="自进化中心" className="flex flex-wrap gap-2 border-b border-divider pb-3">
@@ -246,6 +283,11 @@ export default function SelfEvolutionPage({ onOpenWork }: { onOpenWork: (id: str
       </h3>
       {detail.section === "episodes" && <>
         <p className="text-sm text-muted">{label(detail.row.family)} · {label(detail.row.outcome)} · {time(detail.row.completed_at)}</p>
+        {detail.row.result_preview && <section>
+          <h4 className="font-medium">{detail.row.kind === "turn" ? "当时的答复" : "任务报告"}</h4>
+          <p className="mt-1 whitespace-pre-wrap break-words text-sm">{detail.row.result_preview}</p>
+          {detail.row.result_truncated && <p className="text-xs text-muted">已显示前 2000 字</p>}
+        </section>}
         <div className="flex flex-wrap gap-2">
           {(["explicit_positive", "explicit_negative", "rework"] as const).map(kind => <button type="button" key={kind}
             aria-pressed={detail.row.feedback === kind} disabled={busy}
@@ -317,9 +359,13 @@ export default function SelfEvolutionPage({ onOpenWork }: { onOpenWork: (id: str
     </article> : home && <div className="grid gap-2">
       {home[section].length === 0 && <p className={`${card} text-sm text-muted`}>暂无{label(section)}。</p>}
       {section === "episodes" && home.episodes.map(row => <button key={row.id} type="button" className={`${card} text-left hover:bg-surface-muted`} onClick={() => void open(section, row.id)}>
-        <p className="font-medium">{label(row.kind)} · {label(row.family)} · {label(row.outcome)}</p>
-        <p className="mt-1 text-xs text-muted">{time(row.completed_at)} · {row.uses.length} 项经验</p>
+        <p className="line-clamp-2 break-words font-medium">{row.title || label(row.kind)}</p>
+        <p className="mt-1 text-xs text-muted">{label(row.kind)} · {label(row.family)} · {label(row.outcome)} · {time(row.completed_at)} · {row.uses.length} 项经验</p>
       </button>)}
+      {section === "episodes" && home.episodes_next_cursor &&
+        <button type="button" className={button} disabled={busy || listBusy} onClick={() => void loadOlder()}>
+          {listBusy ? "加载中…" : "加载更早的经历"}
+        </button>}
       {section === "candidates" && home.candidates.map(row => <button key={row.candidate_id} type="button" className={`${card} text-left hover:bg-surface-muted`} onClick={() => void open(section, row.candidate_id)}>
         <p className="font-medium">{row.title}</p>
         <p className="mt-1 text-xs text-muted">{label(row.route)} · {label(row.status)}{row.progress.status && ` · ${label(row.progress.status)}`}</p>

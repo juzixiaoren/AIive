@@ -116,7 +116,7 @@ def api(experience_db):
         yield client
 
 
-def test_atomic_turn_and_task_capture_and_cancel(experience_db):
+def test_atomic_turn_and_task_capture_and_cancel(experience_db, api):
     db = experience_db
     thread = _thread(db)
     turn = _turn(db, thread, 1, "Summarize a PDF document")
@@ -131,6 +131,9 @@ def test_atomic_turn_and_task_capture_and_cancel(experience_db):
     assert child.parent_id == stable_id("turn", turn.id)
     assert child.outcome == "agent_reported_success"
     assert child.metrics["tokens"] == 25
+    assert api.get("/api/experience").json()["episodes"][0]["title"] == task.title
+    detail = api.get(f"/api/experience/episodes/{child.id}").json()
+    assert detail["result_preview"] == task.report["summary"]
 
     _finalize(turn)
     assert _poll() == 1
@@ -173,6 +176,49 @@ def test_follow_up_targets_immediate_visible_episode(experience_db, api):
     assert any(signal["kind"] == "new_request" for signal in detail["signals"])
     assert classify_follow_up("请重新生成摘要", "请总结") == "rework"
     assert classify_follow_up("继续展开", "请总结") == "continuation"
+
+
+def test_episode_history_cursor_and_feedback_preview(experience_db, api):
+    db = experience_db
+    stamp = datetime.now(UTC)
+    thread = _thread(db)
+    titles = {}
+    for i in range(3):
+        title = f"Summarize document {i}"
+        turn = _turn(db, thread, i + 1, title)
+        _finalize(turn)
+        titles[stable_id("turn", turn.id)] = title
+    assert _poll() == 3
+    db.query(ExperienceEpisode).update({ExperienceEpisode.completed_at: stamp})
+    # Old projections whose sources disappeared must not exhaust the visible page.
+    for i in range(18):
+        db.add(ExperienceEpisode(id=stable_id("missing", str(i)), kind="turn", source_id=str(i),
+                                 thread_id=thread.id, task_type="chat", family="general", outcome="unknown",
+                                 completed_at=stamp + timedelta(minutes=1)))
+    db.commit()
+    ids = sorted(titles)
+    home = api.get("/api/experience", params={"limit": 1}).json()
+    assert [row["id"] for row in home["episodes"]] == ids[:1]
+    assert home["episodes"][0]["title"] == titles[ids[0]]
+    assert "result_preview" not in home["episodes"][0]
+
+    # A deleted page anchor must not invalidate the next request.
+    db.delete(db.get(ExperienceEpisode, ids[0]))
+    db.commit()
+    older = api.get("/api/experience/episodes", params={"cursor": home["episodes_next_cursor"], "limit": 2}).json()
+    assert [row["id"] for row in older["items"]] == ids[1:]
+    assert older["next_cursor"] is None
+    assert api.get("/api/experience/episodes", params={"cursor": "bad"}).status_code == 422
+
+    path = f"/api/experience/episodes/{ids[1]}"
+    assert api.get(path).json()["result_preview"] == "This is the response"
+    episode = db.get(ExperienceEpisode, ids[1])
+    reply = db.get(Event, episode.refs["assistant_event_id"])
+    reply.payload = {**reply.payload, "content": "答" * 2001}
+    db.commit()
+    feedback = api.post(f"{path}/feedback", json={"kind": "rework"}).json()
+    assert feedback["outcome"] == "rework"
+    assert feedback["result_truncated"] and feedback["result_preview"] == "答" * 2000
 
 
 class _Curator:

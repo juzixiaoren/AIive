@@ -1,10 +1,12 @@
 """Build deterministic Experience projections from committed runtime records."""
 from __future__ import annotations
 
+from collections import defaultdict
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from aiive.db.models import (
     AgentRun, AgentTask, AgentTaskEvent, Capability, DesktopNode, Event, ExperienceEpisode,
@@ -12,7 +14,8 @@ from aiive.db.models import (
 )
 from aiive.experience.families import family_for, merge_uses, stable_id
 from aiive.forget.durable_sources import references_visible, sources_visible
-from aiive.task_runtime.read_repository import TaskReadRepository
+from aiive.forget.source_policy import blocked_durable_references
+from aiive.task_runtime.read_repository import TASK_VISIBILITY_COLUMNS, TaskReadRepository
 
 JOB_CAPTURE = "experience_capture"
 POSITIVE = frozenset({"verified_success", "explicit_positive"})
@@ -45,15 +48,22 @@ def turn_visible(db: Session, row: TurnRecord) -> bool:
     return references_visible(db, {"turn_record": [row.id]})
 
 
+def visible_episodes(db: Session, rows: Sequence[ExperienceEpisode]) -> list[ExperienceEpisode]:
+    turns = [row for row in rows if row.kind == "turn"]
+    blocked = blocked_durable_references(db, {"turn_record": [row.source_id for row in turns]})
+    allowed_turns = {row.source_id for row in turns if ("turn_record", row.source_id) not in blocked
+                     and (not row.refs.get("experience_context")
+                          or sources_visible(db, "experience_turn_context", row.source_id))}
+    task_ids = [row.source_id for row in rows if row.kind == "task"]
+    tasks = (db.query(AgentTask).options(load_only(*TASK_VISIBILITY_COLUMNS))
+             .filter(AgentTask.id.in_(task_ids)).all()) if task_ids else []
+    allowed_tasks = TaskReadRepository(db).task_visible_many(tasks) if tasks else set()
+    return [row for row in rows if (row.kind == "turn" and row.source_id in allowed_turns)
+            or (row.kind == "task" and row.source_id in allowed_tasks)]
+
+
 def episode_visible(db: Session, episode: ExperienceEpisode) -> bool:
-    if episode.kind == "turn":
-        if not references_visible(db, {"turn_record": [episode.source_id]}):
-            return False
-        if episode.refs.get("experience_context"):
-            return sources_visible(db, "experience_turn_context", episode.source_id)
-        return True
-    task = db.get(AgentTask, episode.source_id)
-    return task is not None and TaskReadRepository(db).task_visible(task)
+    return bool(visible_episodes(db, [episode]))
 
 
 def add_signal(
@@ -76,12 +86,23 @@ def add_signal(
     return signal
 
 
+def signals_by_episode(db: Session, ids: Sequence[str]) -> dict[str, list[ExperienceSignal]]:
+    grouped: dict[str, list[ExperienceSignal]] = defaultdict(list)
+    if ids:
+        rows = db.query(ExperienceSignal).filter(ExperienceSignal.episode_id.in_(ids)).order_by(
+            ExperienceSignal.created_at, ExperienceSignal.id,
+        ).all()
+        blocked = blocked_durable_references(db, {"event": [
+            row.source_id for row in rows if row.details.get("source_type") == "event"
+        ]})
+        for row in rows:
+            if row.details.get("source_type") != "event" or ("event", row.source_id) not in blocked:
+                grouped[row.episode_id].append(row)
+    return grouped
+
+
 def visible_signals(db: Session, episode_id: str) -> list[ExperienceSignal]:
-    rows = db.query(ExperienceSignal).filter_by(episode_id=episode_id).order_by(
-        ExperienceSignal.created_at, ExperienceSignal.id,
-    ).all()
-    return [row for row in rows if row.details.get("source_type") != "event"
-            or references_visible(db, {"event": [row.source_id]})]
+    return signals_by_episode(db, [episode_id])[episode_id]
 
 
 def result_for(episode: ExperienceEpisode, signals: list[ExperienceSignal]) -> str:

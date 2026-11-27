@@ -8,8 +8,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from aiive.db.base import get_db
-from aiive.db.models import AgentTask, CapabilityPlan, Event, ExperienceEpisode, ExperienceInsight, SelfDevRequest
-from aiive.experience.capture import episode_visible, result_for, visible_signals
+from aiive.db.models import AgentTask, CapabilityPlan, ExperienceEpisode, ExperienceInsight, SelfDevRequest
+from aiive.experience.capture import episode_visible
+from aiive.experience.history import InvalidEpisodeCursor, episode_detail, episode_page
 from aiive.experience.effects import ExperienceEffectEvaluator
 from aiive.experience.feedback import record_feedback
 from aiive.experience.insights import change_status, evidence_visible
@@ -27,32 +28,6 @@ class Feedback(BaseModel):
 
 class CandidateDecision(BaseModel):
     reason: str = Field(default="", max_length=300)
-
-
-def _episode(db: Session, row: ExperienceEpisode, *, detail: bool = False) -> dict[str, Any]:
-    signals = visible_signals(db, row.id)
-    result = {
-        "id": row.id, "kind": row.kind, "task_type": row.task_type, "family": row.family,
-        "source_id": row.source_id, "parent_id": row.parent_id, "outcome": result_for(row, signals),
-        "uses": row.uses, "metrics": row.metrics, "completed_at": row.completed_at,
-        "feedback": next((signal.kind for signal in signals if signal.details.get("method") == "explicit"), None),
-    }
-    if detail:
-        result["refs"] = row.refs
-        result["signals"] = [
-            {"kind": signal.kind, "source_id": signal.source_id, "created_at": signal.created_at,
-             "method": signal.details.get("method")}
-            for signal in signals
-        ]
-        if row.kind == "turn":
-            request = db.get(Event, row.refs["request_event_id"])
-            if request:
-                result["title"] = str(request.payload.get("content") or "")[:300]
-        else:
-            task = db.get(AgentTask, row.source_id)
-            if task:
-                result["title"] = task.title
-    return result
 
 
 def _insight(db: Session, row: ExperienceInsight, *, detail: bool = False) -> dict[str, Any]:
@@ -105,18 +80,29 @@ def _progress(db: Session, candidate: dict[str, Any]) -> dict[str, Any]:
 def experience_home(
     limit: int = Query(30, ge=1, le=100), db: Session = Depends(get_db),
 ):
-    episodes = db.query(ExperienceEpisode).order_by(
-        ExperienceEpisode.completed_at.desc(), ExperienceEpisode.id,
-    ).limit(limit * 3)
+    acquire_forget_shared_lock(db)
+    episodes = episode_page(db, limit)
     insights = db.query(ExperienceInsight).order_by(
         ExperienceInsight.created_at.desc(), ExperienceInsight.id,
     ).limit(limit * 3)
     candidates = ImprovementDiscovery.list_candidates(db, limit=limit)
     return {
-        "episodes": [_episode(db, row) for row in episodes if episode_visible(db, row)][:limit],
+        "episodes": episodes["items"], "episodes_next_cursor": episodes["next_cursor"],
         "insights": [_insight(db, row) for row in insights if evidence_visible(db, row, confirm_outcome=False)][:limit],
         "candidates": [{**candidate, "progress": _progress(db, candidate)} for candidate in candidates],
     }
+
+
+@router.get("/episodes")
+def list_episodes(
+    limit: int = Query(30, ge=1, le=100), cursor: str | None = Query(None, max_length=100),
+    db: Session = Depends(get_db),
+):
+    acquire_forget_shared_lock(db)
+    try:
+        return episode_page(db, limit, cursor)
+    except InvalidEpisodeCursor as exc:
+        raise HTTPException(422, "invalid_episode_cursor") from exc
 
 
 def _get_episode(db: Session, episode_id: str, *, lock: bool = False) -> ExperienceEpisode:
@@ -131,7 +117,8 @@ def _get_episode(db: Session, episode_id: str, *, lock: bool = False) -> Experie
 
 @router.get("/episodes/{episode_id}")
 def get_episode(episode_id: str, db: Session = Depends(get_db)):
-    return _episode(db, _get_episode(db, episode_id), detail=True)
+    acquire_forget_shared_lock(db)
+    return episode_detail(db, _get_episode(db, episode_id))
 
 
 @router.post("/episodes/{episode_id}/feedback")
@@ -139,8 +126,9 @@ def post_feedback(episode_id: str, request: Feedback, db: Session = Depends(get_
     acquire_forget_shared_lock(db)
     row = _get_episode(db, episode_id, lock=True)
     record_feedback(db, row, request.kind)
+    result = episode_detail(db, row)
     db.commit()
-    return _episode(db, row, detail=True)
+    return result
 
 
 @router.get("/insights/{insight_id}")

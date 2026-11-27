@@ -134,7 +134,7 @@ jobs:
         working-directory: apps/android
         run: npm run build
       - name: 前端契约与交互测试
-        run: npm run test:chat && npm run test:work && npm run test:inspector
+        run: npm run test:chat && npm run test:work && npm run test:inspector && npm run test:experience
       - name: Desktop Node Host 测试
         run: node --test ../apps/desktop/src/node-host/locks.test.mjs ../apps/desktop/src/node-host/journal.test.mjs ../apps/desktop/src/node-host/cancellation.test.mjs ../apps/desktop/src/node-host/cancellation-host.test.mjs
 

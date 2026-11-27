@@ -25,7 +25,7 @@ Forget 读侧检查 Turn、Task 及反馈来源可见性，清理事务屏蔽相
 
 ## 自进化中心
 
-`/api/experience` 提供经历、证据、明确反馈、经验版本审批及候选状态。Web App 的自进化入口使用同一登录守卫。候选统一展示 Persistent Task / SelfDev、CapabilityPlan 和 Memory 状态。Playbook、Skill 和 Tool Hint 从经验库接受或拒绝。代码候选通过现有 SelfDev 任务与 Eval Gate，MCP 候选进入 CapabilityPlan，用户明确表达的回复偏好进入现有 MemoryWriteService，发生冲突时沿用记忆确认流程。
+`/api/experience` 提供经历、证据、明确反馈、经验版本审批及候选状态。经历卡显示原始请求或任务标题。列表按完成时间和经历 ID 翻页，`GET /api/experience/episodes` 接受上一页返回的 `next_cursor`，首页游标为 `episodes_next_cursor`。详情按需从可见来源读取最多 2000 字的答复或任务报告，便于对照结果再给反馈。Web App 的自进化入口使用同一登录守卫。候选统一展示 Persistent Task / SelfDev、CapabilityPlan 和 Memory 状态。Playbook、Skill 和 Tool Hint 从经验库接受或拒绝。代码候选通过现有 SelfDev 任务与 Eval Gate，MCP 候选进入 CapabilityPlan，用户明确表达的回复偏好进入现有 MemoryWriteService，发生冲突时沿用记忆确认流程。
 
 ## 效果口径
 
