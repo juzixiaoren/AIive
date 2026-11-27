@@ -418,9 +418,13 @@ class ForgetVisibilityService:
                 refs = session.query(Event.id, ref.source_id).join(
                     TurnRecord, (TurnRecord.thread_id == Event.thread_id) & (TurnRecord.turn_id == Event.turn_id),
                 ).join(ref, ref.owner_id == TurnRecord.id).filter(Event.id.in_(ids))
-            attachment_sources = refs.filter(
-                ref.owner_type == "attachment_context", ref.source_type == "event",
-            ).all()
+            provenance = refs.add_columns(ref.owner_type, ref.source_type).filter(or_(
+                and_(ref.owner_type == "attachment_context", ref.source_type == "event"),
+                and_(ref.owner_type == "experience_turn_context",
+                     ref.source_type.in_(("turn_record", "event", "memory_record"))),
+            )).all()
+            attachment_sources = [(identity, source_id) for identity, source_id, owner, _ in provenance
+                                  if owner == "attachment_context"]
             source_ids = {source_id for _, source_id in attachment_sources}
             if source_ids:
                 source_blocked = ForgetVisibilityService.blocked_target_ids(
@@ -428,6 +432,16 @@ class ForgetVisibilityService:
                     include_tombstones=include_tombstones, _expand_provenance=False,
                     _ignore_memory_only=_ignore_memory_only)
                 blocked.update(identity for identity, source_id in attachment_sources if source_id in source_blocked)
+            for source_type in ("turn_record", "event", "memory_record"):
+                learned_sources = [(identity, source_id) for identity, source_id, owner, kind in provenance
+                                   if owner == "experience_turn_context" and kind == source_type]
+                if learned_sources:
+                    source_blocked = ForgetVisibilityService.blocked_target_ids(
+                        session, source_type, [(i, None) for i in {source for _, source in learned_sources}],
+                        include_tombstones=include_tombstones, require_resolved=True,
+                        _expand_provenance=False, _ignore_memory_only=_ignore_memory_only,
+                    )
+                    blocked.update(identity for identity, source_id in learned_sources if source_id in source_blocked)
         if target_type == "memory_record" and _expand_provenance:
             blocked.update(ForgetVisibilityService._source_event_blocked_memory_ids(
                 session, ids, include_tombstones=include_tombstones,

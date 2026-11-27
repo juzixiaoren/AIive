@@ -1,6 +1,7 @@
 """Worker discovery across an atomic tool catalog snapshot."""
 from __future__ import annotations
 
+from dataclasses import replace
 from functools import partial
 from itertools import chain
 from threading import Lock
@@ -9,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 from aiive.config import settings
 from aiive.tool_discovery import DEFAULT_LIMIT, MAX_LIMIT
 from aiive.tool_discovery.dense import DenseIndex, ModelIdentity, rank_dense
-from aiive.tool_discovery.documents import tokens
+from aiive.tool_discovery.documents import SearchDocument, tokens
 
 if TYPE_CHECKING:
     from aiive.tools.registry import ToolRegistry
@@ -46,6 +47,7 @@ class DiscoveryService:
     def search(
         self, registry: ToolRegistry, query: str, *,
         namespace_ids: list[str] | None = None, limit: int = DEFAULT_LIMIT,
+        experience_hints: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         snapshot = registry.snapshot()
         index = snapshot.discovery_index()
@@ -90,6 +92,32 @@ class DiscoveryService:
             for member in index.groups[key].members
         }
         selected = _rank(direct, namespace_exact, tool_bm25, tool_dense, bonus)[:limit]
+        used = []
+        if experience_hints:
+            baseline = selected
+            augmented = index
+            for hint in experience_hints:
+                key, alias = hint["capability_id"], hint["alias"]
+                if key not in index.metadata or (allowed is not None and key not in allowed):
+                    continue
+                metadata = augmented.metadata[key]
+                document = augmented.tools.documents[key]
+                if alias in document.exact_terms:
+                    continue
+                metadata = replace(metadata, aliases=(*metadata.aliases, alias))
+                augmented = augmented.updated(
+                    key, SearchDocument.build(key, (*document.exact_terms, alias), [document.text, alias]), metadata,
+                )
+            if augmented is not index:
+                selected = _rank(
+                    augmented.tools.exact(exact_term, allowed), namespace_exact,
+                    augmented.tools.bm25(query_tokens, allowed), tool_dense, bonus,
+                )[:limit]
+                used = [{field: hint[field] for field in ("id", "version", "kind")}
+                        for hint in experience_hints if hint["capability_id"] in selected and (
+                            hint["capability_id"] not in baseline
+                            or selected.index(hint["capability_id"]) < baseline.index(hint["capability_id"])
+                        )]
         namespace_hits = dict.fromkeys([*namespaces, *(index.metadata[key].namespace_id for key in selected)])
         tools = []
         for key in selected:
@@ -102,6 +130,7 @@ class DiscoveryService:
             "tools": tools,
             "mode": "hybrid" if hybrid else "exact_bm25",
             "status": status,
+            **({"experience_uses": used} if used else {}),
         }
 
 

@@ -678,7 +678,9 @@ class PersistentTaskRuntime:
                     loaded=search["loaded"],
                 )
                 payload.update(matched=matched, matched_namespace_ids=namespaces, mode=search["mode"],
-                               status=search["status"])
+                               status=search["status"], any_in_scope=any(item["in_scope"] for item in search["tools"]))
+                if search.get("experience_uses"):
+                    payload["uses"] = search["experience_uses"]
                 if not matched:
                     outcome, reason = "capability_unavailable", "no_search_results"
                 elif not any(item["in_scope"] for item in search["tools"]):
@@ -712,6 +714,9 @@ class PersistentTaskRuntime:
         if loaded:
             outcome, reason = "succeeded", "new_definition_loaded"
         payload.update(outcome=outcome, reason=reason, loaded=loaded)
+        from aiive.experience.capture import discovery_classification
+
+        payload["experience_classification"] = discovery_classification(self.db, event_type, payload)
         task.task_state = merge_state(state, discovery)
         usage["discovery_steps"] = int(usage.get("discovery_steps", 0)) + 1
         task.usage = usage
@@ -942,6 +947,7 @@ class PersistentTaskRuntime:
             status = "partial"
             summary = "附件全文处理尚未完成。" + summary
             unresolved = [*(unresolved or []), "attachment_processing_incomplete"]
+        verified_promotion = None
         if status == "succeeded" and run is not None:
             from aiive.supervisor.promotion_status import promotion_status
             from aiive.task_runtime.watchers import WatcherService
@@ -972,7 +978,9 @@ class PersistentTaskRuntime:
                         self.repo.checkpoint(task.id, reason="awaiting_promotion_result")
                         self.db.commit()
                         return {"status": task.status, "task_id": task.id, "promotion": promotion}
-                if promotion != "promoted":
+                if promotion == "promoted":
+                    verified_promotion = latest.id
+                else:
                     status = "partial"
                     summary = {
                         "rolled_back": "部署已回滚。",
@@ -1055,7 +1063,15 @@ class PersistentTaskRuntime:
                 model=model,
                 error=summary if status == "failed" or failed_run else None,
             )
+        if status == "succeeded" and verified_promotion is not None:
+            self.repo.append_event(
+                task.id, "task_outcome_verified", {"method": "confirmed_promotion"},
+                action_id=verified_promotion, run_id=run.id if run else None, visibility="internal",
+            )
         self.repo.checkpoint(task.id, reason=f"completed_{status}")
+        from aiive.experience.capture import enqueue_capture
+
+        enqueue_capture(self.db, task=task, trace_id=task.id)
         self.db.commit()
         return {"status": task.status, "task_id": task.id, "report": report}
 

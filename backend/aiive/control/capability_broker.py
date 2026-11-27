@@ -77,7 +77,23 @@ class CapabilityBroker:
 
         available = (available if available is not None else self.available_registry(task)).snapshot()
         execution = self.registry_for(task, available=available)
-        result = get_discovery_service().search(available, query, namespace_ids=namespace_ids, limit=limit)
+        from aiive.experience.families import family_for
+        from aiive.experience.retrieval import ExperienceInsightRetriever
+
+        hints = ExperienceInsightRetriever(self.db).tool_hints(family_for(task.goal, task.task_type), query, execution)
+        result = get_discovery_service().search(
+            available, query, namespace_ids=namespace_ids, limit=limit, experience_hints=hints,
+        )
+        if result.get("experience_uses"):
+            from aiive.experience.insights import source_payload
+            from aiive.forget.durable_sources import persist_sources
+
+            refs = source_payload(self.db, result["experience_uses"])
+            persist_sources(self.db, "agent_task", task.id, {
+                "source_turn_record_id": refs.get("turn_record", []),
+                "source_event_ids": refs.get("event", []),
+                "memory_ids": refs.get("memory_record", []),
+            })
         for entry in result["tools"]:
             entry["in_scope"] = execution.get(entry["capability_id"]) is not None
         result["loaded"] = select_search_definitions(

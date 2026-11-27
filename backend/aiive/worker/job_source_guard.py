@@ -434,7 +434,7 @@ _NO_EXTERNAL_SOURCE_JOB_TYPES: frozenset[str] = frozenset({
 #: 没有单一来源、按条目/证据逐条过滤的 Job：只做 claim fencing，
 #: 被屏蔽内容由各自服务（检索重建 / 证据收集）逐条剔除。
 _CLAIM_ONLY_JOB_TYPES: frozenset[str] = frozenset({
-    "retrieval_index_rebuild", "improvement_discovery",
+    "retrieval_index_rebuild", "improvement_discovery", "experience_capture",
 })
 
 #: Memory 派生投影：payload 的 memory_id 已进入来源集合；为空说明载荷非法，

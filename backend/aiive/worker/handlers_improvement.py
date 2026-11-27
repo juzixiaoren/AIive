@@ -40,10 +40,16 @@ def handle_improvement_discovery(
         return blocked
     assert fresh is not None
     claimed = fresh
+    llm = default_llm_client() if discovery is None else None
     if discovery is None:
-        discovery = ImprovementDiscovery(default_llm_client())
+        discovery = ImprovementDiscovery(llm)
     try:
         summary = discovery.run(trace_id=claimed.trace_id or None)
+        experience = None
+        if llm is not None:
+            from aiive.experience.reflector import Reflector
+
+            experience = Reflector(llm).run(trace_id=claimed.trace_id or None)
     except Exception as exc:
         logger.exception("改进候选发现失败")
         return HandlerResult(HandlerOutcome.RETRYABLE_ERROR, str(exc))
@@ -55,6 +61,7 @@ def handle_improvement_discovery(
             "candidate_ids": summary.get("candidate_ids"),
             "group_count": summary.get("group_count"),
             "evidence_count": summary.get("evidence_count"),
+            "experience": experience,
         },
         ensure_ascii=False,
     )

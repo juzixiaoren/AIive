@@ -77,6 +77,6 @@ class TestAsyncMemoryExtraction:
 
         _run(message="Test message")
 
-        job = db_session.query(OutboxJob).first()
+        job = db_session.query(OutboxJob).filter_by(job_type="memory_extraction").one()
         assert job.payload["user_message"] == "Test message"
         assert job.payload["reply"] == "OK"

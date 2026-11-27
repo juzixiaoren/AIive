@@ -59,11 +59,21 @@ class TaskContextAssembler:
         now = datetime.now(timezone.utc)
         skill = self._active_skill(task)
         tool_view = {}
+        experience = []
         if not reporting:
             execution, available = self._registries(task, registry, discovery_registry)
             from aiive.tool_discovery.service import get_discovery_service
 
             get_discovery_service().warm(available)
+            from aiive.control.scope import TaskScope
+            from aiive.experience.families import family_for
+            from aiive.experience.retrieval import ExperienceInsightRetriever
+
+            experience = ExperienceInsightRetriever(self.db).context(
+                task.goal, family_for(task.goal, task.task_type), execution,
+                allow_network=TaskScope.from_brief(task.task_brief or {}).allow_network,
+                skill_id=initial.get("skill_id") if isinstance(initial, dict) else None,
+            )
             tool_view = build_tool_view(
                 execution,
                 capabilities,
@@ -149,6 +159,7 @@ class TaskContextAssembler:
             ],
             "tools": tool_view,
             "skill": skill.as_dict() if skill else None,
+            "experience": experience,
             # 长期目标：只注入当前步骤与进度，避免整份计划挤占工具定义预算。
             "goal": self._goal_context(task),
         }
@@ -187,7 +198,12 @@ class TaskContextAssembler:
                 "- 不要替其他步骤执行 Action，也不要修改目标计划。\n"
             )
         from copy import deepcopy
+        from aiive.experience.retrieval import render_experience
+
         prompt_snapshot = deepcopy(snapshot)
+        experience = render_experience(prompt_snapshot.pop("experience", []))
+        if experience:
+            system_content += "\n\n" + experience
         evidence_ids = {item["id"] for item in prompt_snapshot["evidence"]}
         for action in prompt_snapshot["actions"]:
             result = action["result_summary"]

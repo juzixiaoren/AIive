@@ -13,8 +13,7 @@
 status 使用 candidate_* 前缀与修复运行的 failed/applied 等状态区分；
 plan["candidate"] 保存候选正文与证据，plan["decision"] 保存接受/拒绝结果。
 
-本模块不修改代码、不晋升、不触碰活跃槽位：接受候选只是把候选变成
-Worker SelfDev 任务的明确目标，其余权限与安全门全部沿用既有实现。
+代码候选进入 Worker SelfDev，能力与偏好候选沿用各自领域的写入链路。
 """
 from __future__ import annotations
 
@@ -312,7 +311,7 @@ class ImprovementDiscovery:
             json_mode=True,
         )
         raw = getattr(response, "content", "") or ""
-        payload = self._parse_payload(raw)
+        payload = self.parse_payload(raw)
         drafts, rejected = self._validate_payload(payload, batch)
         return drafts, rejected
 
@@ -356,7 +355,7 @@ class ImprovementDiscovery:
         ]
 
     @staticmethod
-    def _parse_payload(raw: str) -> dict[str, Any]:
+    def parse_payload(raw: str) -> dict[str, Any]:
         text = _JSON_FENCE_RE.sub("", raw.strip())
         start = text.find("{")
         end = text.rfind("}")
@@ -656,15 +655,21 @@ class ImprovementDiscovery:
             query = query.filter(SelfDevRequest.status == status)
         else:
             query = query.filter(SelfDevRequest.status.in_(tuple(CANDIDATE_STATUSES)))
-        rows = query.order_by(SelfDevRequest.created_at.desc()).limit(max(1, min(limit, 200))).all()
-        return [describe_candidate(row) for row in rows]
+        from aiive.experience.routing import candidate_visible, preference_preview
+
+        size = max(1, min(limit, 200))
+        rows = query.order_by(SelfDevRequest.created_at.desc()).limit(size * 3).all()
+        return [{**describe_candidate(row), "preference": preference_preview(db, candidate_payload(row))}
+                for row in rows if candidate_visible(db, candidate_payload(row))][:size]
 
     @staticmethod
     def get_candidate(db: Session, candidate_id: str) -> dict[str, Any]:
         row = db.get(SelfDevRequest, candidate_id)
-        if row is None or not is_candidate_row(row):
+        from aiive.experience.routing import candidate_visible, preference_preview
+
+        if row is None or not is_candidate_row(row) or not candidate_visible(db, candidate_payload(row)):
             raise CandidateNotFound(candidate_id)
-        return describe_candidate(row)
+        return {**describe_candidate(row), "preference": preference_preview(db, candidate_payload(row))}
 
     def accept(
         self,
@@ -675,9 +680,13 @@ class ImprovementDiscovery:
         trace_id: str | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
-        """接受候选并将其目标与验证标准交给 Worker。"""
+        """Commit the review and the selected domain write together."""
+        from aiive.experience.routing import accept_routed
+        from aiive.forget.concurrency import acquire_forget_shared_lock
+
+        acquire_forget_shared_lock(db)
         now = _as_utc(now) or _utcnow()
-        row = db.get(SelfDevRequest, candidate_id)
+        row = db.query(SelfDevRequest).filter_by(id=candidate_id).with_for_update().one_or_none()
         if row is None or not is_candidate_row(row):
             raise CandidateNotFound(candidate_id)
         if row.status != CANDIDATE_STATUS_PENDING:
@@ -687,6 +696,17 @@ class ImprovementDiscovery:
         if not goal:
             raise CandidateStateError("candidate_goal_missing")
 
+        route = payload.get("route", "code")
+        if route in {"mcp", "memory"}:
+            result = accept_routed(db, row, payload, trace_id or row.trace_id)
+            row.status = CANDIDATE_STATUS_ACCEPTED
+            row.plan = {**(row.plan or {}), "decision": {
+                "status": "accepted", "decided_at": now.isoformat(), **result,
+            }}
+            db.commit()
+            return {"candidate_id": candidate_id, "status": row.status, "route": route, **result}
+        if route != "code":
+            raise CandidateStateError("unsupported_candidate_route")
         if repair_runner is None:
             from aiive.task_runtime.router import enqueue_selfdev_task
 
@@ -742,9 +762,11 @@ class ImprovementDiscovery:
         reason: str = "",
         now: datetime | None = None,
     ) -> dict[str, Any]:
+        from aiive.experience.routing import candidate_visible
+
         now = _as_utc(now) or _utcnow()
-        row = db.get(SelfDevRequest, candidate_id)
-        if row is None or not is_candidate_row(row):
+        row = db.query(SelfDevRequest).filter_by(id=candidate_id).with_for_update().one_or_none()
+        if row is None or not is_candidate_row(row) or not candidate_visible(db, candidate_payload(row)):
             raise CandidateNotFound(candidate_id)
         if row.status != CANDIDATE_STATUS_PENDING:
             raise CandidateStateError(row.status)
@@ -799,6 +821,8 @@ def describe_candidate(row: SelfDevRequest) -> dict[str, Any]:
         "problem": payload.get("problem", ""),
         "impact": payload.get("impact", ""),
         "target": payload.get("target", ""),
+        "route": payload.get("route", "code"),
+        "experience_refs": payload.get("experience_refs", []),
         "repair_goal": payload.get("repair_goal", row.goal),
         "evidence_ids": list(payload.get("evidence_ids") or []),
         "occurrences": payload.get("occurrences"),

@@ -25,14 +25,16 @@ const DeveloperPage = lazy(() => import("./pages/DeveloperPage"));
 const NotificationsPage = lazy(() => import("./pages/NotificationsPage"));
 const TaskCenterPage = lazy(() => import("./pages/TaskCenterPage"));
 const LoginPage = lazy(() => import("./pages/LoginPage"));
+const SelfEvolutionPage = lazy(() => import("./pages/SelfEvolutionPage"));
 
-type Tab = "chat" | "tasks" | "memories" | "capabilities" | "events" | "context" | "retrieval" | "notifs" | "developer";
+type Tab = "chat" | "tasks" | "memories" | "capabilities" | "events" | "context" | "retrieval" | "notifs" | "developer" | "evolution";
 
 const developerUiEnabled = (import.meta as ImportMeta & {
   env?: Record<string, string | undefined>;
 }).env?.VITE_AIIVE_DEVELOPER_UI_ENABLED === "true";
 
 function tabFromLocation(): Tab {
+  if (window.location.pathname === `${BASE_PATH}evolution`) return "evolution";
   return developerUiEnabled && window.location.pathname.startsWith(`${BASE_PATH}developer`) ? "developer" : "chat";
 }
 
@@ -119,7 +121,7 @@ function AuthenticatedApp({ username }: { username: string }) {
   }, []);
 
   const navigate = (nextTab: Tab) => {
-    const nextPath = nextTab === "developer" ? `${BASE_PATH}developer` : BASE_PATH;
+    const nextPath = nextTab === "developer" || nextTab === "evolution" ? `${BASE_PATH}${nextTab}` : BASE_PATH;
     if (window.location.pathname !== nextPath) window.history.pushState({}, "", nextPath);
     setTab(nextTab);
   };
@@ -132,6 +134,7 @@ function AuthenticatedApp({ username }: { username: string }) {
     { key: "tasks", label: "工作" },
     { key: "memories", label: "记忆" },
     { key: "capabilities", label: "能力" },
+    { key: "evolution", label: "自进化" },
     { key: "events", label: "事件" },
     { key: "context", label: "上下文" },
     { key: "retrieval", label: "检索" },
@@ -237,6 +240,7 @@ function AuthenticatedApp({ username }: { username: string }) {
               {tab === "memories" && <MemoriesPage />}
               {tab === "tasks" && <TaskCenterPage key={workTaskId} taskId={workTaskId} />}
               {tab === "capabilities" && <CapabilitiesPage />}
+              {tab === "evolution" && <SelfEvolutionPage onOpenWork={id => { setWorkTaskId(id); navigate("tasks"); }} />}
               {tab === "events" && <EventTimeline traceId={inspectTraceId} />}
               {tab === "context" && <ContextInspector traceId={inspectTraceId} />}
               {tab === "retrieval" && <RetrievalInspector traceId={inspectTraceId} />}

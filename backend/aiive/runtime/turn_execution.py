@@ -1297,7 +1297,14 @@ class TurnExecutionService:
             self._mark_segment_pending_seal(db, turn, now)
 
             # ContextSnapshot with Phase 1 rotation
-            self._rotate_snapshot(db, turn, ag_result, assembled_ctx)
+            snapshot_id = self._rotate_snapshot(db, turn, ag_result, assembled_ctx)
+            if turn.source == "user" and publish_reply:
+                from aiive.experience.capture import enqueue_capture
+
+                enqueue_capture(
+                    db, turn=turn, trace_id=ag_result.trace_id, snapshot_id=snapshot_id,
+                    uses=ag_result.context_snapshot.selection_trace.get("experience_uses", []),
+                )
 
             # Phase 1: write token estimation record for observability (§7.7)
             if assembled_ctx is not None:
@@ -1390,7 +1397,7 @@ class TurnExecutionService:
     def _rotate_snapshot(
         self, db: Session, turn: TurnRecord,
         ag_result: AgentGraphResult, assembled_ctx: AssembledContext | None,
-    ) -> None:
+    ) -> str:
         """Atomic snapshot rotation by turn_sequence."""
         db.query(Thread).with_for_update().filter(Thread.id == turn.thread_id).one()
 
@@ -1454,6 +1461,7 @@ class TurnExecutionService:
         )
         for snap in audit_excess:
             db.delete(snap)
+        return new_snap.id
 
     # =====================================================================
     # Shared lifecycle
@@ -1637,6 +1645,16 @@ class TurnExecutionService:
             if not references_visible(db, {"event": source_events}):
                 raise ValueError("attachment_source_unavailable")
             persist_sources(db, "attachment_context", turn.id, {"source_event_ids": source_events})
+            uses = assembled.snapshot.selection_trace.get("experience_uses", [])
+            if uses:
+                from aiive.experience.insights import source_payload
+
+                refs = source_payload(db, uses)
+                persist_sources(db, "experience_turn_context", turn.id, {
+                    "source_turn_record_id": refs.get("turn_record", []),
+                    "source_event_ids": refs.get("event", []),
+                    "memory_ids": refs.get("memory_record", []),
+                })
             db.commit()
 
             return ContextBundle(assembled_ctx=assembled)

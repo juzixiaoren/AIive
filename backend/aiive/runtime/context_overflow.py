@@ -42,6 +42,7 @@ class ContextCandidates:
     summaries: list[Any] = field(default_factory=list)
     working_state: dict[str, Any] = field(default_factory=dict)
     core: list[Any] = field(default_factory=list)
+    experience: list[Any] = field(default_factory=list)
     removed: dict[str, list[str]] = field(default_factory=dict)
     fixed: dict[str, str] = field(default_factory=dict)
     selection_trace: dict[str, Any] = field(default_factory=dict)
@@ -109,6 +110,8 @@ class ContextCandidates:
         rank_source([add("core", b.block_name, b, 2 if b.block_name == "core.human_identity" else 0,
                          "core_memory", self.core, version=_get(b, "projection_version"))
                      for b in sorted(self.core, key=lambda b: (roles.get(b.block_name, 9), b.block_name))])
+        rank_source([add("experience", item["id"], item, 0, "experience", self.experience,
+                         version=item["version"]) for item in self.experience])
         for key, value in self.fixed.items():
             if value:
                 add(key, key, value, 3, key)

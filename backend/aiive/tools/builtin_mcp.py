@@ -1,6 +1,6 @@
 """Domain tool handlers (implementation) split from builtin_tools."""
 
-from typing import override
+from typing import Any, override
 
 from aiive.tools.base import BaseTool, DatabaseTool
 
@@ -8,56 +8,57 @@ from sqlalchemy.orm import Session
 
 
 
+def persist_capability_plan(db: Session, goal: str) -> dict[str, Any]:
+    """Evaluate the existing MCP catalog and stage the plan in the caller transaction."""
+    from aiive.core.llm_client import default_llm_client
+    from aiive.db.models import CapabilityPlan
+    from aiive.mcp.capability_planner import CapabilityPlanner
+
+    llm = default_llm_client()
+    planner = CapabilityPlanner(llm)
+
+    candidates_raw = planner.search_candidates([goal])
+    evaluations = planner.evaluate_candidates(candidates_raw)
+    plan = planner.generate_plan(goal, candidates_raw, evaluations)
+
+    db_plan = CapabilityPlan(
+        goal=plan.goal,
+        goal_summary=plan.goal_summary,
+        missing_capability_type=plan.missing_capability_type,
+        candidates=[{
+            "name": e.candidate_name, "source": e.source, "version": e.version,
+            "risk_verdict": e.risk_score.verdict,
+            "risk_overall": e.risk_score.overall,
+            "recommendation": e.recommendation,
+        } for e in evaluations],
+        risk_scores=[{
+            "candidate": e.candidate_name, "verdict": e.risk_score.verdict,
+            "overall": e.risk_score.overall,
+            "source_trust": e.risk_score.source_trust,
+            "permission_risk": e.risk_score.permission_risk,
+        } for e in evaluations],
+        selected_candidate=plan.selected,
+        status=plan.status,
+    )
+    db.add(db_plan)
+    db.flush()
+
+    return {
+        "ok": True,
+        "plan_id": db_plan.id,
+        "goal_summary": plan.goal_summary,
+        "missing_type": plan.missing_capability_type,
+        "candidates_found": len(candidates_raw),
+        "selected": plan.selected,
+        "risk_summary": plan.risk_summary,
+        "status": plan.status,
+    }
+
+
 class PlanCapabilityTool(DatabaseTool):
     @override
     def _run(self, db: Session, goal: str):
-        """分析目标，搜索 MCP 候选，评估风险，生成安装计划并持久化。
-
-        流程: 分析目标 → 搜索候选 → 风险评估 → 生成计划 → 持久化到 capability_plans 表
-        """
-        from aiive.core.llm_client import default_llm_client
-        from aiive.db.models import CapabilityPlan
-        from aiive.mcp.capability_planner import CapabilityPlanner
-
-        llm = default_llm_client()
-        planner = CapabilityPlanner(llm)
-
-        candidates_raw = planner.search_candidates([goal])
-        evaluations = planner.evaluate_candidates(candidates_raw)
-        plan = planner.generate_plan(goal, candidates_raw, evaluations)
-
-        db_plan = CapabilityPlan(
-            goal=plan.goal,
-            goal_summary=plan.goal_summary,
-            missing_capability_type=plan.missing_capability_type,
-            candidates=[{
-                "name": e.candidate_name, "source": e.source, "version": e.version,
-                "risk_verdict": e.risk_score.verdict,
-                "risk_overall": e.risk_score.overall,
-                "recommendation": e.recommendation,
-            } for e in evaluations],
-            risk_scores=[{
-                "candidate": e.candidate_name, "verdict": e.risk_score.verdict,
-                "overall": e.risk_score.overall,
-                "source_trust": e.risk_score.source_trust,
-                "permission_risk": e.risk_score.permission_risk,
-            } for e in evaluations],
-            selected_candidate=plan.selected,
-            status=plan.status,
-        )
-        db.add(db_plan)
-        db.flush()
-
-        return {
-            "ok": True,
-            "plan_id": db_plan.id,
-            "goal_summary": plan.goal_summary,
-            "missing_type": plan.missing_capability_type,
-            "candidates_found": len(candidates_raw),
-            "selected": plan.selected,
-            "risk_summary": plan.risk_summary,
-            "status": plan.status,
-        }
+        return persist_capability_plan(db, goal)
 
 
 class SearchMcpTool(BaseTool):

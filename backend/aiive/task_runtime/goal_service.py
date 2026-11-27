@@ -689,6 +689,9 @@ class GoalService:
             visibility="conversation",
         )
         self.repo.checkpoint(task.id, reason="goal_completed", plan=plan.model_dump(mode="json"))
+        from aiive.experience.capture import enqueue_capture
+
+        enqueue_capture(self.db, task=task, trace_id=task.id)
         return self.detail(task)
 
     # ------------------------------------------------------------------

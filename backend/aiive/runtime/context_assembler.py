@@ -255,6 +255,11 @@ class ContextAssembler:
 
         tool_registry = build_turn_tool_registry(open_questions)
         tools_schema = function_definitions(tool_registry)
+        from aiive.experience.families import family_for
+        from aiive.experience.retrieval import ExperienceInsightRetriever, context_uses, render_experience
+
+        experience = (ExperienceInsightRetriever(db).context(message, family_for(message), tool_registry, main=True)
+                      if _source == "user" else [])
         events = self._load_history_bounded(
             db, thread_state, thread_id,
             upper_bound=upper_bound_sequence,
@@ -279,6 +284,7 @@ class ContextAssembler:
             ))),
             working_state=ws_service.context_fields(db, thread_id),
             core=list(agent_ctx.get("core_blocks") or []),
+            experience=experience,
             fixed={"stable_contract": agent_ctx["stable_contract_text"], "current_message": message},
         )
         epoch_cp_text = self._load_epoch_checkpoint(db, thread_id)
@@ -337,8 +343,9 @@ class ContextAssembler:
             if degradation:
                 memory_state += " Reason: " + ", ".join(degradation) + "."
             graph_text, _ = render_expansion_block(candidates.graph)
+            experience_text = render_experience(candidates.experience)
             recall_messages = [{"role": "system", "content": text}
-                               for text in (memory_state, recall_text, graph_text) if text]
+                               for text in (memory_state, recall_text, graph_text, experience_text) if text]
             rendered.update(
                 system=system_content, core=core_text, history=history_msgs, working=working_text,
                 summaries=seg_text, retrieved=recall_text, graph=graph_text, history_summary=history_text,
@@ -366,6 +373,8 @@ class ContextAssembler:
                     text, _ = render_expansion_block([item])
                 elif source == "segment_summary":
                     text = self._render_segment_summary_block(item)
+                elif source == "experience":
+                    text = render_experience([item])
                 elif source == "core":
                     text = render_core_memory([item])
                 else:
@@ -413,6 +422,7 @@ class ContextAssembler:
             **snapshot_args, user_message=message, _source=_source,
         )
         snapshot.selection_trace = candidates.selection_trace
+        snapshot.selection_trace["experience_uses"] = context_uses(candidates.experience)
         snapshot.stable_prefix_hash = _hash_text(rendered["system"])
         snapshot.injected_memory_ids = self._collect_injected_memory_ids(pack)
         snapshot.source_memory_ids = sorted(

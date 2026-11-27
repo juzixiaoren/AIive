@@ -73,9 +73,10 @@ class DelegateTaskTool(BaseTool):
             )
         selected_skill = None
         if skill_id:
-            from aiive.skills import get_skill
+            from aiive.skills.catalog import SkillService
 
-            selected_skill = get_skill(skill_id)
+            with SessionLocal() as skill_db:
+                selected_skill = SkillService(skill_db).get(skill_id)
             if selected_skill is None:
                 raise ValueError("skill_not_found")
         effective_task_type = (
@@ -364,10 +365,12 @@ def _registration(
 class ListSkillsTool(BaseTool):
     @override
     def _run(self) -> dict[str, Any]:
-        from aiive.skills import list_skills
+        from aiive.skills.catalog import SkillService
 
+        with SessionLocal() as db:
+            skills = [skill.as_dict() for skill in SkillService(db).list()]
         return {
-            "skills": [skill.as_dict() for skill in list_skills()],
+            "skills": skills,
             "hint": "将选中的 skill_id 传给 delegate_task 以加载工作指引和联网需求。实际执行受任务授权、服务端策略和审批约束。",
         }
 
@@ -380,6 +383,12 @@ class SearchWorkerCapabilitiesTool(BaseTool):
     ) -> dict[str, Any]:
         from aiive.desktop.registry_overlay import build_registry_for_thread
         from aiive.tool_discovery.service import get_discovery_service
+        from aiive.db.models import Event
+        from aiive.experience.families import family_for
+        from aiive.experience.insights import source_payload
+        from aiive.experience.retrieval import ExperienceInsightRetriever
+        from aiive.forget.concurrency import acquire_forget_shared_lock
+        from aiive.forget.durable_sources import persist_sources
 
         run_ctx = _require_context(ctx)
         with SessionLocal() as db:
@@ -388,7 +397,21 @@ class SearchWorkerCapabilitiesTool(BaseTool):
                 definition = registry.definition(capability_id)
                 return {"capability_id": capability_id, "available": definition is not None, "definition": definition}
             if query.strip():
-                return get_discovery_service().search(registry, query)
+                request = db.get(Event, run_ctx.source_event_ids[0]) if run_ctx.source_event_ids else None
+                family = family_for(str(request.payload.get("content") or "")) if request else "general"
+                acquire_forget_shared_lock(db)
+                hints = (ExperienceInsightRetriever(db).tool_hints(family, query, registry)
+                         if run_ctx.turn_record_id else [])
+                result = get_discovery_service().search(registry, query, experience_hints=hints)
+                if result.get("experience_uses"):
+                    refs = source_payload(db, result["experience_uses"])
+                    persist_sources(db, "experience_turn_context", run_ctx.turn_record_id, {
+                        "source_turn_record_id": refs.get("turn_record", []),
+                        "source_event_ids": refs.get("event", []),
+                        "memory_ids": refs.get("memory_record", []),
+                    })
+                    db.commit()
+                return result
             return {"namespaces": [
                 group.summary(key) for key, group in sorted(registry.discovery_index().groups.items())
             ]}
@@ -397,8 +420,6 @@ class SearchWorkerCapabilitiesTool(BaseTool):
 
 def build_main_agent_registry() -> ToolRegistry:
     """User-facing task, attachment, reminder, memory and privacy controls."""
-    from aiive.skills import list_skills
-
     registry = ToolRegistry()
     deterministic_schema = ActionProposal.model_json_schema()
     deterministic_schema["properties"] = {key: value for key, value in deterministic_schema["properties"].items()
@@ -406,7 +427,7 @@ def build_main_agent_registry() -> ToolRegistry:
     deterministic_schema["required"] = ["capability_id"]
     registry.register(_registration(
         "list_skills",
-        "列出可用于持久任务的内置 Skill、相关能力和联网要求。",
+        "列出可用于持久任务的 Skill、相关能力和联网要求。",
         {},
         ListSkillsTool,
     ))
@@ -430,8 +451,7 @@ def build_main_agent_registry() -> ToolRegistry:
                           "description": "一般编程用 coding，修改 AIive 自身用 self_improvement。两者自动创建独立工作区。"},
             "skill_id": {
                 "type": "str",
-                "description": "可选内置 Skill ID；先用 list_skills 查询。",
-                "enum": ["", *(skill.skill_id for skill in list_skills())],
+                "description": "可选 Skill ID；先用 list_skills 查询。",
             },
             "attachment_ids": {"type": "list", "description": "聊天附件任务的明确授权 ID 列表，仅用于 document_processing；目标文本不授予附件权限。"},
             "title": {"type": "str", "description": "简短任务标题，完整目标和约束请写入 goal 和 constraints。"},

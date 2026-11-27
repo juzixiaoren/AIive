@@ -1865,6 +1865,9 @@ def scrub_all(
     counts.update(scrub_summaries_and_checkpoints(db, scope))
     counts.update(scrub_runtime_tables(db, scope, scrubbed_tool_operations=scrubbed_tool_operations))
     counts.update(scrub_auxiliary_tables(db, scope))
+    from aiive.experience.forget import scrub_experience
+
+    counts.update(scrub_experience(db, scope))
     task_counts, task_refs = scrub_task_runtime(db, scope)
     counts.update(task_counts)
     knowledge_counts, doc_refs = scrub_knowledge(db, scope)

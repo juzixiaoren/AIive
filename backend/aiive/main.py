@@ -41,6 +41,7 @@ from aiive.api.routes_notifications import router as notifications_router
 from aiive.api.routes_outbox import router as outbox_router
 from aiive.api.routes_personal import router as personal_router
 from aiive.api.routes_selfdev import router as selfdev_router
+from aiive.api.routes_experience import router as experience_router
 from aiive.api.routes_settings import router as settings_router
 from aiive.api.routes_skills import router as skills_router
 from aiive.api.routes_tasks import router as tasks_router
@@ -444,6 +445,7 @@ def create_app() -> FastAPI:
     app.include_router(mcp_router)
     app.include_router(mcp_install_router)
     app.include_router(selfdev_router)
+    app.include_router(experience_router)
     app.include_router(settings_router)
     app.include_router(outbox_router)
     app.include_router(knowledge_router)

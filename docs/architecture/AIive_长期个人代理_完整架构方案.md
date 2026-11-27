@@ -3,6 +3,8 @@
 > 版本：实施基线 v1  
 > 适用范围：单用户、本地优先、长期持续运行的个人 Agent  
 > 核心目标：用户始终面对同一个连续代理，但模型上下文、活跃记忆、热索引和后台维护成本长期保持有界。
+>
+> 运行反馈与自进化见 [Experience V1 架构](experience_self_evolution_v1.md)。它复用会话、Task、Outbox 和 Forget 的现有边界，并在 Main 与 Worker 的上下文预算内应用经过审阅的经验。
 
 ---
 

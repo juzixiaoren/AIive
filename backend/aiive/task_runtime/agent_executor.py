@@ -93,6 +93,22 @@ class TaskAgentExecutor:
         inherit_sources(self.db, "agent_task", task_id, parents + [("goal_plan", task_id)])
         if task.current_run_id:
             inherit_sources(self.db, "agent_run", task.current_run_id, [("agent_task", task_id)])
+        from aiive.experience.retrieval import context_uses
+        from aiive.experience.insights import source_payload
+        from aiive.forget.durable_sources import persist_sources
+
+        uses = context_uses(snapshot.get("experience", []))
+        builtin_skill = snapshot.get("skill")
+        if builtin_skill:
+            uses.append({"id": builtin_skill["skill_id"], "version": builtin_skill["version"],
+                         "kind": "skill", "builtin": True})
+        if uses:
+            refs = source_payload(self.db, uses)
+            persist_sources(self.db, "agent_task", task_id, {
+                "source_turn_record_id": refs.get("turn_record", []),
+                "source_event_ids": refs.get("event", []),
+                "memory_ids": refs.get("memory_record", []),
+            })
         self.db.flush()
         # Task Context 读取完成后立即结束读事务；远程 LLM 调用期间不占数据库事务。
         self.db.commit()
@@ -117,6 +133,15 @@ class TaskAgentExecutor:
             raise normalize_llm_error(error, trace_id=task_id) from error
         if forget_revision(self.db) != revision or not TaskReadRepository(self.db).task_visible(task):
             raise TaskContentUnavailable("task_context_source_changed")
+        if uses:
+            from aiive.task_runtime.repository import TaskRepository
+
+            TaskRepository(self.db).append_event(
+                task_id, "experience_used", {"uses": uses},
+                run_id=task.current_run_id, visibility="internal",
+            )
+        snapshot.pop("experience", None)
+        snapshot["experience_uses"] = uses
         response = normalize_calls(response)
         usage = response_usage(response)
         _settle_model_cost(task, reservation, usage)
@@ -244,7 +269,7 @@ class TaskAgentExecutor:
 
 
 def _compact_history(snapshot: dict[str, Any]) -> bool:
-    for key, minimum in (("artifacts", 0), ("evidence", 1), ("actions", 1), ("signals", 1)):
+    for key, minimum in (("experience", 0), ("artifacts", 0), ("evidence", 1), ("actions", 1), ("signals", 1)):
         items = snapshot.get(key, [])
         removable = [
             item for item in (items[:-minimum] if minimum else items)

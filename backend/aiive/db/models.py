@@ -2279,3 +2279,65 @@ class Attachment(Base):
     sha256: Mapped[str] = mapped_column(String(64))
     object_key: Mapped[str] = mapped_column(String(512))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class ExperienceEpisode(Base):
+    """Reference-only projection of one normally finalized Turn or Task."""
+    __tablename__: str = "experience_episodes"
+    __table_args__: tuple[UniqueConstraint | Index, ...] = (
+        UniqueConstraint("kind", "source_id", name="uq_experience_episode_source"),
+        Index("ix_experience_episode_family_time", "family", "completed_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(8))
+    source_id: Mapped[str] = mapped_column(String(36))
+    thread_id: Mapped[str] = mapped_column(String(36), index=True)
+    parent_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    task_type: Mapped[str] = mapped_column(String(64))
+    family: Mapped[str] = mapped_column(String(64))
+    outcome: Mapped[str] = mapped_column(String(32))
+    refs: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    uses: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    metrics: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    reflected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class ExperienceSignal(Base):
+    """A deduplicated observation with an existing source reference."""
+    __tablename__: str = "experience_signals"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    episode_id: Mapped[str] = mapped_column(
+        ForeignKey("experience_episodes.id", ondelete="CASCADE"), index=True,
+    )
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    source_id: Mapped[str] = mapped_column(String(36), index=True)
+    details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class ExperienceInsight(Base):
+    """A reviewable revision. Previous revisions retain their original evidence."""
+    __tablename__: str = "experience_insights"
+    __table_args__: tuple[UniqueConstraint | Index, ...] = (
+        UniqueConstraint("insight_id", "version", name="uq_experience_insight_version"),
+        Index("ix_experience_insight_family_status", "family", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    insight_id: Mapped[str] = mapped_column(String(36))
+    version: Mapped[int] = mapped_column()
+    kind: Mapped[str] = mapped_column(String(16))
+    family: Mapped[str] = mapped_column(String(64))
+    title: Mapped[str] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(20))
+    operation: Mapped[str] = mapped_column(String(12))
+    body: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    evidence: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    support_count: Mapped[int] = mapped_column(default=0)
+    refute_count: Mapped[int] = mapped_column(default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    enabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

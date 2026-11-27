@@ -1,8 +1,10 @@
 """内置 Skill catalog 的只读 API。"""
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
 from typing import Any
 
-from aiive.skills import SkillDefinition, get_skill, list_skills
+from aiive.db.base import get_db
+from aiive.skills.catalog import SkillDefinition, SkillService
 from aiive.tools.registry import get_tool_registry
 
 router = APIRouter(prefix="/api/skills")
@@ -26,13 +28,13 @@ def _payload(
 
 
 @router.get("")
-def skill_catalog() -> list[dict[str, Any]]:
-    return [_payload(skill) for skill in list_skills()]
+def skill_catalog(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    return [_payload(skill) for skill in SkillService(db).list()]
 
 
 @router.get("/{skill_id}")
-def skill_detail(skill_id: str) -> dict[str, Any]:
-    skill = get_skill(skill_id)
+def skill_detail(skill_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    skill = SkillService(db).get(skill_id)
     if skill is None:
         raise HTTPException(status_code=404, detail="skill_not_found")
     return _payload(skill, include_instructions=True)

@@ -7,7 +7,7 @@
 > - **路径约定**：均相对项目根（`AIive/`），如 `backend/aiive/main.py`、`frontend/src/pages/ChatPage.tsx`
 > - **行号**：基于建图时的代码版本，仅供快速跳转，以实际代码为准
 > - **维护规则**：见文末第 9 节。**新增/删除/移动文件、改 key 符号行号、改表结构后必须同步更新本文档**
-> - 建图日期：2026-10-21；最近更新：2026-11-17（Tool System V2 收尾：工具结果契约归一化与取消后 Worker 崩溃恢复；Tool System V2 类化执行与取消；提醒取消终态契约与投递竞态保护、安全描述统一、共享执行/审批 DTO、SSE 生产解析器回归）；2026-11-16 第二轮（退役旧任务分支、共享历史 DTO 与聊天错误契约、删除兼容包装）；同日第一轮（提醒投递单一入口、Main Agent 工具面单一来源、Web/Android 共享 SSE 与 WorkCenter Hook）；之前：2026-11-11（V64.1 全局上下文预算、来源感知溢出与历史 Token 密封；V63.2 WebSocket 重连历史恢复与聊天错误契约统一；V49 单用户认证、V50 目标步骤触发规则 + 主动消息、V51 工具结果回填预算、V52 后台回填统一 + Bash 流式日志、V53 通用计划事件源扩展、V54 安全边界事件注入 + 协作式主动消息、V55 决策标记全流式防泄漏、V56 收件箱溢出与决策串行化、V57 前后台 LLM 串行化 + 目标决策幂等、V58 主动提问与用户回复关联闭环、V59 待回答问题的状态一致性、V60 记忆检索 pg_search BM25、V61 知识库结构感知递归切分、V61.3 Chunker 兜底拆分正确性）
+> - 建图日期：2026-10-21；最近更新：2026-11-27（Experience-driven Self-Evolution V1，见 [经验驱动自进化](architecture/experience_self_evolution_v1.md)）；2026-11-17（Tool System V2 收尾：工具结果契约归一化与取消后 Worker 崩溃恢复；Tool System V2 类化执行与取消；提醒取消终态契约与投递竞态保护、安全描述统一、共享执行/审批 DTO、SSE 生产解析器回归）；2026-11-16 第二轮（退役旧任务分支、共享历史 DTO 与聊天错误契约、删除兼容包装）；同日第一轮（提醒投递单一入口、Main Agent 工具面单一来源、Web/Android 共享 SSE 与 WorkCenter Hook）；之前：2026-11-11（V64.1 全局上下文预算、来源感知溢出与历史 Token 密封；V63.2 WebSocket 重连历史恢复与聊天错误契约统一；V49 单用户认证、V50 目标步骤触发规则 + 主动消息、V51 工具结果回填预算、V52 后台回填统一 + Bash 流式日志、V53 通用计划事件源扩展、V54 安全边界事件注入 + 协作式主动消息、V55 决策标记全流式防泄漏、V56 收件箱溢出与决策串行化、V57 前后台 LLM 串行化 + 目标决策幂等、V58 主动提问与用户回复关联闭环、V59 待回答问题的状态一致性、V60 记忆检索 pg_search BM25、V61 知识库结构感知递归切分、V61.3 Chunker 兜底拆分正确性）
 
 ---
 
@@ -33,13 +33,14 @@
 │    │       │        ├─ core/llm_client.py                       │
 │    │       │        ├─ tools/registry.py  (执行 + 策略门控)      │
 │    │       │        └─ runtime/policy_engine.py                 │
-│    │       └─ _finalize_turn: Event + LLMCall + memory Outbox 入队│
+│    │       └─ _finalize_turn: Event + LLMCall + memory / experience Outbox │
 │    │                                                           │
 │    ├─ /api/agent-tasks ──► task_runtime/ (PersistentTaskRuntime)│
 │    ├─ /api/memories /forget ──► memory/ + worker/handlers_forget│
 │    ├─ /api/knowledge ──► knowledge/ingestor.py                  │
 │    ├─ /api/mcp* /capabilities ──► mcp/                          │
 │    ├─ /api/selfdev ──► selfdev/                                 │
+│    ├─ /api/experience ──► experience/ + six-hour discovery      │
 │    ├─ /api/desktop + /ws/desktop/{id} ──► desktop/              │
 │    └─ /ws/{thread_id} ──► api/ws_manager.py                     │
 │                                                                │
@@ -72,6 +73,10 @@
 | 功能 | 核心文件 | 关联文件 | 测试 |
 |---|---|---|---|
 | 聊天入口（同步/SSE/错误契约） | `api/routes_chat.py`（V63.2：同步 detail 与 SSE error 仅 turn_in_progress 为 202 / retryable=true，其余 TurnConflictError 为 409 / false；SSE HTTP 保持 200） | `runtime/turn_execution.py`、`api/ws_manager.py` | `tests/unit/backend/test_chat_*.py` |
+| 经验采集、反馈与父子经历 | `experience/capture.py`、`experience/feedback.py` | `runtime/turn_execution.py::_finalize_turn`、`task_runtime/runtime.py::_complete`、`worker/handlers_experience.py` | `tests/flow/test_experience_end_to_end.py` |
+| 经验学习与版本审阅 | `experience/reflector.py`、`experience/insights.py`、`experience/routing.py` | `worker/handlers_improvement.py`、`selfdev/improvement_discovery.py::accept`、`experience/forget.py` | `tests/flow/test_experience_end_to_end.py` |
+| Main / Worker 经验注入与搜索提示 | `experience/retrieval.py`、`skills/catalog.py::SkillService`、`tool_discovery/service.py` | 两套 `context_assembler.py`、`control/capability_broker.py` | `tests/flow/test_experience_end_to_end.py` |
+| 自进化中心与效果 | `api/routes_experience.py`、`experience/effects.py`、`frontend/src/pages/SelfEvolutionPage.tsx` | `db/models.py`、迁移 `6d9e20b18c4a` | `tests/flow/test_experience_end_to_end.py`、`tests/unit/backend/test_schema_migrations.py` |
 | 回合生命周期（抢占/租约/心跳/收尾） | `runtime/turn_execution.py` | `db/models.py::turn_records`、`runtime/event_logger.py` | `test_turn_execution*.py` |
 | 唯一长期对话 / 三端互斥执行 / 远程中断（V63 闭环 / V63.2 重连恢复） | `runtime/conversation_state.py`（ConversationState 单例 + 执行状态视图）、`api/routes_conversation.py`（current/status/interrupt）、`runtime/turn_execution.py`（USER 强制唯一 Thread：`stale_thread_id` 在任何写入前拒绝；先抢锁后落库；流式 Busy 202/409 结构化 SSE；`_finalize_cancelled_turn`） | `runtime/agent_graph.py`（`TurnCancelled` + 流式/节点级 cancel_check）、`runtime/thread_lease.py`、`worker/handlers_conflict.py`（解析前后双查取消）、`worker/handlers_goal_triggers.py`（占用 busy / 释放 idle 广播）、`api/routes_chat.py`、`frontend/src/pages/ChatPage.tsx`（conversationReady / remoteTurnActive / 首个 execution_status 快照同步历史 / historyRefreshPendingRef 本地 Turn finally 延迟刷新）、`apps/android/src/App.tsx`、`apps/android/src/api/chat.ts`（ChatApiError / onStatus initialSnapshot 每次连接重置） | `tests/unit/backend/test_single_thread_conversation.py`、`test_goal_decision_serialization.py`、`tests/integration/backend/test_memory_conflict_confirmation.py` |
 | Agent 图节点 / 工具循环 / 流式 | `runtime/agent_graph.py` | `tools/langchain_adapter.py`、`core/llm_client.py` | `test_agent_graph*.py` |

@@ -1420,6 +1420,10 @@ def register_all(registry: HandlerRegistry) -> None:
     )
     registry.register(JOB_IMPROVEMENT_DISCOVERY, handle_improvement_discovery,
                        supported_schema_versions=frozenset({1}))
+    from aiive.experience.capture import JOB_CAPTURE
+    from aiive.worker.handlers_experience import handle_experience_capture
+
+    registry.register(JOB_CAPTURE, handle_experience_capture, supported_schema_versions=frozenset({1}))
     # Phase 3
     registry.register("segment_sealing", handle_segment_sealing,
                        supported_schema_versions=frozenset({1}))

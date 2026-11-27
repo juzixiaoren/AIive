@@ -4,7 +4,12 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from functools import lru_cache
 from importlib.resources import files
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
+
+    from aiive.db.models import ExperienceInsight
 
 
 @dataclass(frozen=True)
@@ -19,6 +24,7 @@ class SkillDefinition:
     supported_formats: tuple[str, ...] = ()
     security_notes: tuple[str, ...] = ()
     instructions: str = ""
+    builtin: bool = True
 
     def as_dict(self, *, include_instructions: bool = False) -> dict[str, Any]:
         payload = asdict(self)
@@ -27,7 +33,6 @@ class SkillDefinition:
         payload["security_notes"] = list(self.security_notes)
         if not include_instructions:
             payload.pop("instructions", None)
-        payload["builtin"] = True
         payload["status"] = "ready"
         return payload
 
@@ -109,3 +114,31 @@ def list_skills() -> tuple[SkillDefinition, ...]:
 def get_skill(skill_id: str) -> SkillDefinition | None:
     normalized = skill_id.strip().casefold()
     return next((skill for skill in list_skills() if skill.skill_id.casefold() == normalized), None)
+
+
+class SkillService:
+    def __init__(self, db: Session):
+        self.db: Session = db
+
+    @staticmethod
+    def from_insight(row: ExperienceInsight) -> SkillDefinition:
+        from aiive.experience.retrieval import workflow_text
+
+        return SkillDefinition(
+            skill_id=row.insight_id, name=row.title, description=row.body["conditions"],
+            version=str(row.version), default_task_type=row.family,
+            capabilities=tuple(row.body["required_capabilities"]), builtin=False,
+            instructions=workflow_text(row.body),
+        )
+
+    def list(self) -> tuple[SkillDefinition, ...]:
+        from aiive.experience.retrieval import ExperienceInsightRetriever
+
+        rows = ExperienceInsightRetriever(self.db).active(kind="skill")
+        return (*list_skills(), *(self.from_insight(row) for row in rows))
+
+    def get(self, skill_id: str) -> SkillDefinition | None:
+        builtin = get_skill(skill_id)
+        if builtin:
+            return builtin
+        return next((skill for skill in self.list() if skill.skill_id == skill_id), None)

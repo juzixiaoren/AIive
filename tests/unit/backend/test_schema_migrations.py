@@ -255,3 +255,22 @@ def test_active_source_path_unique_migration_dedups_and_roundtrips(monkeypatch, 
             assert index_sql is None
     finally:
         engine.dispose()
+
+
+def test_experience_schema_round_trip(monkeypatch, tmp_path):
+    database_url = f"sqlite:///{tmp_path / 'experience-migration.db'}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    config = Config(str(_PROJECT_ROOT / "alembic.ini"))
+    command.upgrade(config, "head")
+    engine = create_engine(database_url)
+    try:
+        table_names = {"experience_episodes", "experience_signals", "experience_insights"}
+        assert table_names <= set(inspect(engine).get_table_names())
+        assert inspect(engine).get_unique_constraints("experience_episodes")[0]["column_names"] == ["kind", "source_id"]
+        assert inspect(engine).get_unique_constraints("experience_insights")[0]["column_names"] == ["insight_id", "version"]
+        command.downgrade(config, "b6f801d924ac")
+        assert not table_names.intersection(inspect(engine).get_table_names())
+        command.upgrade(config, "head")
+        assert table_names <= set(inspect(engine).get_table_names())
+    finally:
+        engine.dispose()
