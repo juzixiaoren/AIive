@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timedelta
 
-from sqlalchemy import exists, func, select
+from sqlalchemy import exists, func, or_, select
 from sqlalchemy.orm import Session, aliased
 
 from aiive.db.models import Event, ExperienceEpisode, ExperienceSignal, TurnRecord
@@ -61,7 +61,7 @@ def analyze_follow_ups(db: Session, now: datetime) -> int:
         following.thread_id == previous.thread_id, following.source == "user",
         following.turn_sequence > previous.turn_sequence,
     ).correlate(previous).scalar_subquery()
-    rows = db.query(ExperienceEpisode, previous, current, Event).join(
+    candidates = db.query(ExperienceEpisode, previous, current, Event).join(
         previous, previous.id == ExperienceEpisode.source_id,
     ).join(current, (current.thread_id == previous.thread_id) & (current.source == "user")
            & (current.turn_sequence == next_sequence)).join(
@@ -69,29 +69,42 @@ def analyze_follow_ups(db: Session, now: datetime) -> int:
     ).filter(
         ExperienceEpisode.kind == "turn", Event.event_type == "user_message",
         Event.created_at >= now - FOLLOW_UP_WINDOW * 3, Event.created_at <= now, ~seen,
-    ).order_by(Event.created_at, Event.id).limit(_BATCH_SIZE * 5).all()
+    ).order_by(Event.created_at, Event.id)
     processed = 0
-    for row, previous_turn, current_turn, message in rows:
-        if not turn_visible(db, current_turn):
-            continue
-        episode = db.query(ExperienceEpisode).filter_by(id=row.id).with_for_update().one_or_none()
-        if episode is None or not episode_visible(db, episode):
-            continue
-        if not utc(previous_turn.updated_at) <= utc(message.created_at) <= utc(previous_turn.updated_at) + FOLLOW_UP_WINDOW:
-            continue
-        request = db.get(Event, previous_turn.request_event_id) if previous_turn.request_event_id else None
-        if request is None:
-            continue
-        kind = classify_follow_up(str(message.payload.get("content") or ""), str(request.payload.get("content") or ""))
-        signal = add_signal(
-            db, episode, kind, message.id, {"source_type": "event", "method": "follow_up"},
-            identity=f"follow_up:{message.id}", created_at=message.created_at,
-        )
-        if signal in db.new and kind in {"corrected", "rework", "explicit_positive"}:
-            episode.reflected_at = None
-        processed += 1
-        if processed >= _BATCH_SIZE:
+    page = candidates
+    # Invisible and out-of-window rows have no signal. Advance past them so a
+    # fixed prefix of ineligible messages cannot block every scheduled run.
+    scan_size = _BATCH_SIZE * 5
+    while rows := page.limit(scan_size).all():
+        for row, previous_turn, current_turn, message in rows:
+            completed = utc(previous_turn.updated_at)
+            if not completed <= utc(message.created_at) <= completed + FOLLOW_UP_WINDOW:
+                continue
+            if not turn_visible(db, current_turn):
+                continue
+            episode = db.query(ExperienceEpisode).filter_by(id=row.id).with_for_update().one_or_none()
+            if episode is None or not episode_visible(db, episode):
+                continue
+            request = db.get(Event, previous_turn.request_event_id) if previous_turn.request_event_id else None
+            if request is None:
+                continue
+            kind = classify_follow_up(str(message.payload.get("content") or ""), str(request.payload.get("content") or ""))
+            signal = add_signal(
+                db, episode, kind, message.id, {"source_type": "event", "method": "follow_up"},
+                identity=f"follow_up:{message.id}", created_at=message.created_at,
+            )
+            if signal in db.new and kind in {"corrected", "rework", "explicit_positive"}:
+                episode.reflected_at = None
+            processed += 1
+            if processed == _BATCH_SIZE:
+                return processed
+        if len(rows) < scan_size:
             break
+        last_event = rows[-1][3]
+        page = candidates.filter(or_(
+            Event.created_at > last_event.created_at,
+            (Event.created_at == last_event.created_at) & (Event.id > last_event.id),
+        ))
     return processed
 
 
@@ -100,5 +113,6 @@ def record_feedback(db: Session, episode: ExperienceEpisode, kind: str) -> Exper
         db, episode, kind, episode.id, {"method": "explicit"},
         identity=f"explicit:{episode.id}",
     )
-    episode.reflected_at = None
+    if signal in db.new or db.is_modified(signal, include_collections=False):
+        episode.reflected_at = None
     return signal

@@ -173,11 +173,21 @@ class Reflector:
                     outcome = result_for(episode, signals)
                     if outcome in POSITIVE | NEGATIVE | {"agent_reported_success"}:
                         groups[outcome].append((episode, signals, outcome))
-                strong = {independent_key(item[0]) for key in POSITIVE for item in groups[key]}
                 bad = [item for key in sorted(NEGATIVE) for item in groups[key][:3]]
-                positive = [item for key in sorted(POSITIVE) for item in groups[key][:4]]
+                positive: list[tuple[ExperienceEpisode, list[ExperienceSignal], str]] = []
+                positive_sources: set[str] = set()
+                for outcome in ("verified_success", "explicit_positive"):
+                    limit = len(positive) + 4
+                    for item in groups[outcome]:
+                        source = independent_key(item[0])
+                        if source in positive_sources:
+                            continue
+                        positive_sources.add(source)
+                        positive.append(item)
+                        if len(positive) == limit:
+                            break
                 reported = groups["agent_reported_success"][:3]
-                if len(strong) >= 2 or (bad and (positive or reported)):
+                if len(positive) >= 2 or (bad and (positive or reported)):
                     batch[family] = [_prompt_episode(db, *item) for item in [*positive, *bad, *reported]]
                     updated.update({episode.id: result_for(episode, observations[episode.id])
                                     for episode in visible if episode.reflected_at is None})

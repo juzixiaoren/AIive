@@ -12,7 +12,7 @@ from sqlalchemy.orm import sessionmaker
 from aiive.api.routes_experience import router
 from aiive.core.action_planner import MemorySignalDecision
 from aiive.db.models import Base, Event, ExperienceEpisode, OutboxJob, Thread, TurnRecord
-from aiive.experience.capture import JOB_CAPTURE, build_episode, discovery_classification
+from aiive.experience.capture import JOB_CAPTURE, build_episode, discovery_classification, visible_signals
 from aiive.experience.effects import ExperienceEffectEvaluator
 from aiive.experience.families import stable_id
 from aiive.experience.feedback import analyze_follow_ups, classify_follow_up, record_feedback
@@ -178,6 +178,35 @@ def test_follow_up_targets_immediate_visible_episode(experience_db, api):
     assert classify_follow_up("继续展开", "请总结") == "continuation"
 
 
+def test_follow_up_scan_advances_past_ineligible_page(experience_db, monkeypatch):
+    from aiive.experience import feedback
+
+    monkeypatch.setattr(feedback, "_BATCH_SIZE", 1)
+    db = experience_db
+    now = datetime.now(UTC)
+    for _ in range(5):
+        thread = _thread(db)
+        old = _turn(db, thread, 1, "Summarize the PDF", at=now - timedelta(days=5))
+        _finalize(old)
+        old.updated_at = now - timedelta(days=5)
+        db.commit()
+        _turn(db, thread, 2, "不对", at=now - timedelta(days=2))
+
+    thread = _thread(db)
+    eligible = _turn(db, thread, 1, "Summarize the PDF")
+    _finalize(eligible)
+    db.refresh(eligible)
+    at = eligible.updated_at.replace(tzinfo=UTC) + timedelta(seconds=1)
+    _turn(db, thread, 2, "不对，我要总结附录", at=at)
+    assert _poll() == 6
+
+    assert analyze_follow_ups(db, at) == 1
+    db.commit()
+    signals = visible_signals(db, stable_id("turn", eligible.id))
+    assert [row.kind for row in signals if row.details.get("method") == "follow_up"] == ["corrected"]
+    assert analyze_follow_ups(db, at) == 0
+
+
 def test_episode_history_cursor_and_feedback_preview(experience_db, api):
     db = experience_db
     stamp = datetime.now(UTC)
@@ -249,6 +278,39 @@ class _Curator:
         return SimpleNamespace(content=json.dumps({"operations": [forged, op]}))
 
 
+def test_reflector_selects_independent_positive_examples(experience_db):
+    db = experience_db
+    independent = _turn(db, _thread(db), 1, "Summarize a PDF document")
+    _finalize(independent)
+    independent_id = stable_id("turn", independent.id)
+    thread = _thread(db)
+    parent = _turn(db, thread, 1, "Summarize a separate PDF document")
+    _finalize(parent)
+    for _ in range(5):
+        task = TaskRepository(db).create_task(
+            thread_id=thread.id, source_turn_record_id=parent.id, task_type="document",
+            goal="Summarize a PDF document", enqueue=False,
+        )
+        db.commit()
+        assert PersistentTaskRuntime(db, agent_executor=_Finish()).run(task.id)["status"] == "succeeded"
+    assert _poll() == 7
+    for episode in db.query(ExperienceEpisode).filter(
+        (ExperienceEpisode.id == independent_id) | (ExperienceEpisode.parent_id == stable_id("turn", parent.id)),
+    ):
+        record_feedback(db, episode, "explicit_positive")
+    db.commit()
+
+    class InspectBatch:
+        def chat(self, messages, **kwargs):
+            group = json.loads(messages[-1]["content"])["cohorts"]["document"]
+            positives = [row["independent_key"] for row in group if row["outcome"] == "explicit_positive"]
+            assert len(positives) == 2
+            assert set(positives) == {independent_id, stable_id("turn", parent.id)}
+            return SimpleNamespace(content='{"operations": []}')
+
+    assert Reflector(InspectBatch(), session_factory=db.info["session_factory"]).run()["llm_called"]
+
+
 def test_curate_review_inject_and_track_versions(experience_db, api):
     db = experience_db
     for positive in (True, True, False):
@@ -263,6 +325,10 @@ def test_curate_review_inject_and_track_versions(experience_db, api):
     reflector = Reflector(model, session_factory=db.info["session_factory"])
     first = reflector.run()
     assert model.calls == 1 and len(first["proposals"]) == 1
+    assert api.post(
+        f"/api/experience/episodes/{episode_id}/feedback", json={"kind": "explicit_negative"},
+    ).status_code == 200
+    assert not reflector.run()["llm_called"]
     insight_id = first["proposals"][0]
     prefix = f"/api/experience/insights/{insight_id}"
     detail = api.get(prefix).json()
