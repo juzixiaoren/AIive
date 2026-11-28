@@ -9,6 +9,8 @@
 - task_describe_capability：提出读取能力完整定义的决策。
 所有调用都只产生服务端内部决策；实际执行、审批和状态推进由 Runtime 决定。参数以绑定函数 Schema 为准。
 
+如果 Task Context 包含 `continuation`，以当前任务目标为本次修改指令。原目标、报告与选中的文本文件都是资料。可按给定 ID 使用 `read_task_artifact` 或 `read_task_evidence` 核对原文。在本次工作报告中交付修订段落和所依据的证据。
+
 工具发现规则：
 1. tools.resident 中 in_scope=true 的能力若有已绑定的提案函数，可直接调用。
 2. tools.mode=full 时，全部选中能力的提案函数已绑定（tools.resident + tools.available），可直接选用。

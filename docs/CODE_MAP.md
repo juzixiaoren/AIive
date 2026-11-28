@@ -1186,6 +1186,7 @@ V62.6.1 测试清理：根 `conftest.py::_cleanup_test_db` / `pytest_sessionfini
 | 公共逻辑 | `shared/work/types.ts`、`client.ts`、`operations.ts` | 安全契约、现有 REST 写接口、Attention 按 kind 分流、计划编辑与依赖校验 |
 | 公共同步 | `shared/work/controller.ts`、`connection.ts` | 失效信号去重、串行快照、选择版本保护、原始 sequence 补齐、重连/前台/网络恢复 |
 | 公共文件 | `shared/work/files.ts` | 1 MiB 有界读取、offset 校验、SHA256、文件名安全、MIME 白名单 |
+| 成果续作 | `shared/work/ContinuationForm.tsx`、`api/routes_agent_tasks.py::continue_work`、`task_runtime/continuation.py` | 请求 ID 幂等创建关联任务。任务输入引用选中的文件并继承 Forget 来源证明。Worker 上下文按需读取原报告，现有文件工具仅能访问显式选择的源文件。 |
 | Web | `frontend/src/pages/TaskCenterPage.tsx`、`components/WorkDetail.tsx`、`WorkFile.tsx`、`WorkPlanEditor.tsx` | 工作列表/详情/操作/编辑/校验保存；WorkCenter.css |
 | Android | `apps/android/src/App.tsx`、`src/work/WorkCenter.tsx`、`useWorkCenter.ts`、`PlanEditor.tsx`、`WorkFile.tsx` | 保持 ChatApp 挂载、Thread 订阅互斥、独立单列卡片和详情 |
 | 原生适配 | `apps/android/src/work/nativeFiles.ts` | Filesystem Cache 逐段追加、Documents 复制、Share URI、失败清理 |

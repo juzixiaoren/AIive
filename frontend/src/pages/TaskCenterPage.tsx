@@ -74,7 +74,7 @@ export default function TaskCenterPage({ taskId, onSelectTask }: {
         </aside>
         <div>
           {state.detailError && <p role="alert">{state.detailError}</p>}
-          <WorkDetail key={state.selected} state={state} controller={controller} />
+          <WorkDetail key={state.selected} state={state} controller={controller} onOpenWork={onSelectTask} />
         </div>
       </div>
     </div>

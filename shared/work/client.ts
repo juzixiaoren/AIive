@@ -24,6 +24,9 @@ const errors: Record<string, string> = {
   question_not_found: "问题已处理或不再可见，请刷新。",
   goal_terminal: "目标已结束，不能修改。",
   stale_question: "问题已变化，请刷新后重试。",
+  continuation_source_not_finished: "请等原工作结束后再发起续作。",
+  continuation_no_source: "请选择至少一份可读的文本成果或证据。",
+  continuation_too_many_files: "每次续作最多引用五份文件。",
 };
 export class WorkClient {
   constructor(readonly fetch: Fetcher) {}
@@ -72,11 +75,16 @@ export class WorkClient {
   files(id: string, kind: WorkFileKind, cursor: string): Promise<WorkFilePage> {
     return this.json(`${this.path(id)}/${kind}?limit=50&cursor=${encodeURIComponent(cursor)}`);
   }
-  private post(path: string, body: unknown = {}): Promise<unknown> {
+  private post<T = unknown>(path: string, body: unknown = {}): Promise<T> {
     return this.json(path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+    });
+  }
+  continueWork(id: string, requestId: string, instruction: string, artifactIds: string[], evidenceIds: string[]) {
+    return this.post<{ task_id: string; status: string }>(`${this.path(id)}/continuations`, {
+      request_id: requestId, instruction, artifact_ids: artifactIds, evidence_ids: evidenceIds,
     });
   }
   input(id: string, content: string): Promise<unknown> {

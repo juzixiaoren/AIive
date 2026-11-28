@@ -107,6 +107,11 @@ export interface WorkView {
     last_error: string | null;
   };
   bucket: Bucket;
+  continuation?: {
+    source_task_id: string | null;
+    can_start: boolean;
+    report_available: boolean;
+  };
   data_warning: string | null;
   goal: Goal | null;
   attention_items: Attention[];

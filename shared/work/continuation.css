@@ -1,0 +1,11 @@
+.work-continuation:not(:empty) { margin-block: 12px; }
+.work-continuation form { display: grid; gap: 8px; }
+.work-continuation textarea { display: block; width: 100%; }
+.work-continuation fieldset { min-width: 0; }
+.work-continuation fieldset label {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  overflow-wrap: anywhere;
+}
+.work-continuation button + button { margin-inline-start: 6px; }

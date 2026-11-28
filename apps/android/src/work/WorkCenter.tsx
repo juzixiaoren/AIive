@@ -19,6 +19,7 @@ import type {
   WorkState,
 } from "../../../../shared/work/controller";
 import { useWorkCenter } from "./useWorkCenter";
+import { ContinuationForm } from "../../../../shared/work/ContinuationForm";
 import WorkFile from "./WorkFile";
 import PlanEditor from "./PlanEditor";
 import "./work.css";
@@ -111,9 +112,11 @@ function AttentionCard({
 function WorkDetail({
   state,
   controller,
+  onOpenWork,
 }: {
   state: WorkState;
   controller: WorkController;
+  onOpenWork: (id: string) => void;
 }) {
   const [editing, setEditing] = useState<{
     item?: Attention;
@@ -348,6 +351,7 @@ function WorkDetail({
         {view.metadata_cursors?.evidence && (
           <button disabled={state.detailLoading} onClick={() => void controller.olderFiles("evidence")}>加载更早的证据</button>
         )}
+        <ContinuationForm view={view} api={controller.api} onOpen={onOpenWork} />
       </section>
       <details>
         <summary>技术执行详情（{view.actions.length}）</summary>
@@ -402,7 +406,7 @@ export default function WorkCenter({
       {!selected && state.inboxError && <p role="alert">{state.inboxError}</p>}
       {connectionError && <p role="status">{connectionError}</p>}
       {selected ? (
-        <WorkDetail key={selected} state={state} controller={controller} />
+        <WorkDetail key={selected} state={state} controller={controller} onOpenWork={setSelected} />
       ) : (
         <>
           <p className="mobile-hint">从对话委派，在这里接着处理。</p>

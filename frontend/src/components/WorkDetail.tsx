@@ -18,6 +18,7 @@ import {
 } from "../../../shared/work/types";
 import WorkFile from "./WorkFile";
 import WorkPlanEditor from "./WorkPlanEditor";
+import { ContinuationForm } from "../../../shared/work/ContinuationForm";
 
 function AttentionCard({
   item,
@@ -108,9 +109,11 @@ function AttentionCard({
 export default function WorkDetail({
   state,
   controller,
+  onOpenWork,
 }: {
   state: WorkState;
   controller: WorkController;
+  onOpenWork: (id: string) => void;
 }) {
   const [editor, setEditor] = useState<{
     item?: Attention;
@@ -351,6 +354,7 @@ export default function WorkDetail({
         {view.metadata_cursors?.evidence && (
           <button disabled={state.detailLoading} onClick={() => void controller.olderFiles("evidence")}>加载更早的证据</button>
         )}
+        <ContinuationForm view={view} api={controller.api} onOpen={onOpenWork} />
       </section>
       <details>
         <summary>技术执行详情（{view.actions.length}）</summary>

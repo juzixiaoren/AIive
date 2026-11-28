@@ -1035,6 +1035,11 @@ class WorkReadModel:
             )
         }
         report_summary = (task.report or {}).get("summary")
+        from aiive.task_runtime.continuation import CONTINUABLE_STATUSES, visible_continuation_parent
+        from aiive.task_runtime.schemas import WorkContinuation
+
+        continuation = WorkContinuation.from_state(task.task_state)
+        source = visible_continuation_parent(TaskReadRepository(self.db), task, continuation) if continuation else None
         task_info.update(
             {
                 "goal": task.goal[:2000],
@@ -1053,6 +1058,11 @@ class WorkReadModel:
 
         return {
             "task": task_info,
+            "continuation": {
+                "source_task_id": source.id if source is not None else None,
+                "can_start": task.status in CONTINUABLE_STATUSES,
+                "report_available": isinstance(report_summary, str) and bool(report_summary.strip()),
+            },
             "bucket": projection["bucket"],
             "data_warning": projection["data_warning"],
             "attention_items": projection["attention_items"],

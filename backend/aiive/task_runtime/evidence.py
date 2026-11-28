@@ -270,6 +270,10 @@ class ArtifactStore:
         return data, offset + len(data) < artifact.content_size
 
 
+def is_text_task_file(mime_type: str) -> bool:
+    return mime_type.startswith(("text/", "application/json"))
+
+
 def artifact_bytes(db: Session, artifact: TaskArtifact, offset: int, max_bytes: int) -> tuple[bytes, bool]:
     """Compatibility wrapper; a Session and authorization are mandatory."""
     return ArtifactStore.read(db, artifact, offset, max_bytes)

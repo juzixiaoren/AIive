@@ -155,7 +155,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
           "cursor": {"type": "str", "maxLength": 512}, "limit": {"type": "int", "minimum": 1, "maximum": 10}}, "low", False, False),
         ("read_task_evidence", ReadTaskEvidenceTool, "按 ID 分段读取当前任务的持久证据。",
          {"evidence_id": {"type": "str", "minLength": 1, "required": True}, **task_file_range}, "low", False, False),
-        ("read_task_artifact", ReadTaskArtifactTool, "按 ID 分段读取当前任务文本产物和 Shell 日志。",
+        ("read_task_artifact", ReadTaskArtifactTool, "按 ID 分段读取当前任务的文本产物、Shell 日志或用户选中的续作产物。",
          {"artifact_id": {"type": "str", "minLength": 1, "required": True}, **task_file_range}, "low", False, False),
         # 基础工具
         ("echo", EchoTool, "回显输入消息", {"message": "str"}, "low", False, False),

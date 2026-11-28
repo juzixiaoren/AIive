@@ -6,8 +6,9 @@ import json
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import PurePath
-from typing import Any, ClassVar, Literal
+from typing import Annotated, Any, ClassVar, Literal
 from urllib.parse import quote
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, ConfigDict, Field
@@ -44,6 +45,15 @@ class CreateAgentTaskRequest(BaseModel):
 class TaskInputRequest(BaseModel):
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
     content: str = Field(min_length=1, max_length=20_000)
+
+
+class WorkContinuationRequest(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    request_id: UUID
+    instruction: str = Field(min_length=1, max_length=2000)
+    artifact_ids: list[Annotated[str, Field(min_length=1, max_length=36)]] = Field(default_factory=list, max_length=5)
+    evidence_ids: list[Annotated[str, Field(min_length=1, max_length=36)]] = Field(default_factory=list, max_length=5)
 
 
 class ReconcileActionRequest(BaseModel):
@@ -133,6 +143,27 @@ def get_work_inbox(
 def get_work_view(task_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
     with work_read_errors():
         return WorkReadModel(db).work_view(task_id)
+
+
+@router.post("/{task_id}/continuations")
+def continue_work(
+    task_id: str, request: WorkContinuationRequest, db: Session = Depends(get_db),
+) -> dict[str, str]:
+    from aiive.task_runtime.continuation import create_work_continuation
+
+    try:
+        task = create_work_continuation(
+            db, task_id, request.request_id, request.instruction, request.artifact_ids, request.evidence_ids,
+        )
+        result = {"task_id": task.id, "status": task.status}
+        db.commit()
+        return result
+    except TaskContentUnavailable as error:
+        db.rollback()
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 @router.get("/{task_id}/timeline")

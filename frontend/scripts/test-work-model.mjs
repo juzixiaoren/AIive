@@ -151,6 +151,7 @@ test("every public operation uses the existing API; question rejection is step-s
       { summary: "new" },
     );
   await api.input("task", "extra");
+  await api.continueWork("a/b", "request", "Revise the risk section", ["artifact"], ["evidence"]);
   await api.cancel("task");
   for (const action of [
     "confirm",
@@ -162,6 +163,10 @@ test("every public operation uses the existing API; question rejection is step-s
   ])
     await api.goal("task", action);
   assert.ok(requests.some(([p]) => p === "agent-tasks/a%2Fb/work-view"));
+  assert.deepEqual(requests.find(([p]) => p === "agent-tasks/a%2Fb/continuations")[1], {
+    request_id: "request", instruction: "Revise the risk section",
+    artifact_ids: ["artifact"], evidence_ids: ["evidence"],
+  });
   assert.ok(requests.some(([p]) => p.endsWith("after_sequence=42&limit=50")));
   assert.deepEqual(requests.find(([p]) => p === "approval/respond")[1], {
     approval_id: "ap",

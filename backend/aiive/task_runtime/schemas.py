@@ -147,6 +147,19 @@ class TaskBrief(BaseModel):
     initial_input: dict[str, Any] = Field(default_factory=dict)
 
 
+class WorkContinuation(BaseModel):
+    """Server-owned references to the source work and its selected artifacts."""
+
+    source_task_id: str
+    artifact_ids: list[str] = Field(default_factory=list, max_length=5)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=5)
+
+    @classmethod
+    def from_state(cls, state: dict[str, Any] | None) -> WorkContinuation | None:
+        value = (state or {}).get("work_continuation")
+        return cls.model_validate(value) if value is not None else None
+
+
 class ActionProposal(BaseModel):
     """服务端内部标准化决策 DTO；由已校验 Function Calling 转换，不直接暴露给模型。"""
 

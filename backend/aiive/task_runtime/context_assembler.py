@@ -39,9 +39,11 @@ class TaskContextAssembler:
         因此注册、卸载或定义变化不会被旧缓存掩盖。
         """
         from aiive.task_runtime.read_repository import TaskReadRepository, TaskContentUnavailable
+        from aiive.task_runtime.continuation import continuation_context
         reader = TaskReadRepository(self.db)
         if not reader.task_visible(task):
             raise TaskContentUnavailable("task_unavailable")
+        continuation = continuation_context(reader, task)
         initial = (task.task_brief or {}).get("initial_input") or {}
         device_zone = initial.get("user_timezone") if isinstance(initial, dict) else None
         zone = user_timezone(device_zone if isinstance(device_zone, str) else None) or "UTC"
@@ -106,6 +108,7 @@ class TaskContextAssembler:
                 "inactive_slot": str(manager.base_dir / inactive / "app") if inactive else None,
             }
         return {
+            **({"continuation": continuation} if continuation is not None else {}),
             "workspace": workspace,
             "temporal": {
                 "current_time": timestamp(now, zone),

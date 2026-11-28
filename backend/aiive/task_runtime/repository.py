@@ -23,7 +23,7 @@ from aiive.db.models import (
     TaskEvidence,
     Thread,
 )
-from aiive.task_runtime.schemas import ActionStatus, RunStatus, TaskBrief, TaskBudget, TaskStatus
+from aiive.task_runtime.schemas import ActionStatus, RunStatus, TaskBrief, TaskBudget, TaskStatus, WorkContinuation
 from aiive.task_runtime.state_machine import ensure_transition
 from aiive.task_runtime.errors import TaskNotFoundError, TaskTerminalError, TaskNotRunnableError
 
@@ -188,6 +188,8 @@ class TaskRepository:
         budgets: dict[str, Any] | None = None,
         priority: int = 50,
         enqueue: bool = True,
+        task_id: str | None = None,
+        continuation: WorkContinuation | None = None,
     ) -> AgentTask:
         from aiive.forget.concurrency import acquire_forget_shared_lock
         acquire_forget_shared_lock(self.db)
@@ -222,6 +224,7 @@ class TaskRepository:
         from aiive.task_runtime.router import select_executor_type
 
         task = AgentTask(
+            id=task_id,
             thread_id=thread_id,
             source_turn_record_id=source_turn_record_id,
             task_type=task_type,
@@ -246,6 +249,8 @@ class TaskRepository:
             priority=max(0, min(100, priority)),
         )
         task.task_state = {**(task.task_state or {}), "required_attachment_ids": [row.id for row in authorized_attachments]}
+        if continuation is not None:
+            task.task_state["work_continuation"] = continuation.model_dump()
         self.db.add(task)
         self.db.flush()
         from aiive.task_runtime.read_repository import record_input_source
@@ -256,6 +261,15 @@ class TaskRepository:
             input_id = record_input_source(self.db, task, {"goal": task.goal, "title": task.title, "task_brief": task.task_brief})
             persist_sources(self.db, "agent_task", task.id, {"source_event_id": input_id})
         persist_sources(self.db, "agent_task", task.id, {"source_event_ids": [row.event_id for row in authorized_attachments]})
+        if continuation is not None:
+            from aiive.task_runtime.read_repository import inherit_sources
+
+            source_id = continuation.source_task_id
+            inherit_sources(self.db, "agent_task", task.id, [
+                ("agent_task", source_id), ("goal_plan", source_id),
+                *(("task_artifact", identity) for identity in continuation.artifact_ids),
+                *(("task_evidence", identity) for identity in continuation.evidence_ids),
+            ])
         self.db.flush()
         self.append_event(
             task.id,

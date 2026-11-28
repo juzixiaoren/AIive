@@ -117,3 +117,103 @@ def test_cors_exposes_download_integrity_headers():
     assert set(middleware.kwargs["expose_headers"]) >= {
         "Content-Disposition", "X-AIive-Content-Hash", "X-AIive-Truncated", "X-AIive-Next-Offset",
     }
+
+
+def test_continue_work_reuses_only_selected_visible_sources(db, tmp_path, monkeypatch):
+    from uuid import uuid4
+
+    from aiive.context.run_context import RunContext
+    from aiive.control.scope import TaskScope
+    from aiive.db.models import OutboxJob, TaskArtifact, TaskEvidence
+    from aiive.forget.durable_sources import persist_sources
+    from aiive.forget.phase_a_shield import execute_phase_a_shield
+    from aiive.storage.object_store import put_content_addressed
+    from aiive.task_runtime.agent_executor import AgentDecision
+    from aiive.task_runtime.context_assembler import TaskContextAssembler
+    from aiive.task_runtime.repository import TaskRepository
+    from aiive.task_runtime.runtime import PersistentTaskRuntime
+    from aiive.task_runtime.schemas import ActionProposal
+    from aiive.tools.registry import get_tool_registry
+    from aiive.tools.task_file_tools import ReadTaskArtifactTool, ReadTaskEvidenceTool
+    from tests.support import isolate_object_store
+
+    isolate_object_store(monkeypatch, tmp_path)
+    thread_id = _thread(db)
+    parent = TaskRepository(db).create_task(
+        thread_id=thread_id, goal="Write the weekly report", enqueue=False,
+        task_brief={"scope": {"allow_network": True, "allow_secrets": True}},
+    )
+    parent.status = "succeeded"
+    parent.report = {"summary": "Previous report"}
+    source = Event(thread_id=thread_id, trace_id="source", event_type="user_message", payload={"content": "Risk data"})
+    db.add(source)
+    payload = b"# Risks\nCurrent status"
+    ref, digest = put_content_addressed("fixture", payload)
+    artifacts = [
+        TaskArtifact(
+            task_id=parent.id, name=name, object_bucket=ref.bucket, object_key=ref.key,
+            content_hash=digest, content_size=len(payload), mime_type="text/markdown",
+        ) for name in ("chosen.md", "unselected.md")
+    ]
+    evidence = TaskEvidence(
+        task_id=parent.id, content_hash="fixture", inline_payload={"risk": "coverage"},
+        content_size=19,
+    )
+    db.add_all([*artifacts, evidence])
+    db.flush()
+    for artifact in artifacts:
+        persist_sources(db, "task_artifact", artifact.id, {"source_event_id": source.id})
+    persist_sources(db, "task_evidence", evidence.id, {"source_event_id": source.id})
+    db.commit()
+
+    client = client_for(db)
+    endpoint = f"/api/agent-tasks/{parent.id}/continuations"
+    request = {"request_id": str(uuid4()), "instruction": "Update only the risk section",
+               "artifact_ids": [artifacts[0].id], "evidence_ids": [evidence.id]}
+    result = client.post(endpoint, json=request)
+    assert result.status_code == 200, result.text
+    response = result.json()
+    child_id = response["task_id"]
+    assert client.post(endpoint, json=request).json() == response
+    assert client.post(endpoint, json={**request, "instruction": "Change everything"}).status_code == 409
+    assert client.post(endpoint, json={**request, "request_id": str(uuid4()), "artifact_ids": ["unavailable"]}).status_code == 404
+    assert db.query(OutboxJob).filter(OutboxJob.job_type == "agent_task_run").count() == 1
+
+    child = db.get(AgentTask, child_id)
+    scope = TaskScope.from_brief(child.task_brief)
+    assert not scope.allow_network and not scope.allow_secrets and not scope.allows_capability("run_shell")
+    assert child.goal == request["instruction"] and parent.report["summary"] == "Previous report"
+    assert client.get(f"/api/agent-tasks/{child_id}/work-view").json()["continuation"]["source_task_id"] == parent.id
+    assembler = TaskContextAssembler(db)
+    snapshot = assembler.snapshot(child, [], reporting=True)
+    assert snapshot["continuation"]["report"] == "Previous report"
+    assert [item["id"] for item in snapshot["continuation"]["artifacts"]] == [artifacts[0].id]
+    ctx = RunContext(thread_id=thread_id, trace_id="revision", task_id=child.id)
+    registry = get_tool_registry()
+    artifact_tool = registry.get("read_task_artifact")
+    evidence_tool = registry.get("read_task_evidence")
+    assert isinstance(artifact_tool, ReadTaskArtifactTool) and isinstance(evidence_tool, ReadTaskEvidenceTool)
+    assert artifact_tool._run(db, ctx, artifacts[0].id)["content"] == payload.decode()
+    assert artifact_tool._run(db, ctx, artifacts[1].id)["error_type"] == "task_file_unavailable"
+    assert "coverage" in evidence_tool._run(db, ctx, evidence.id)["content"]
+
+    class Revise:
+        def decide(self, task, _capabilities):
+            return AgentDecision(
+                proposal=ActionProposal(decision="finish", summary="Updated risks", report_status="succeeded"),
+                model="fixture", token_usage={}, input_snapshot={}, prompt_refs=[],
+            )
+
+        def generate_report(self, task, _outcome, **_kwargs):
+            assert assembler.snapshot(task, [], reporting=True)["continuation"]["report"] == "Previous report"
+            return "Revised risk section", {}, False
+
+    assert PersistentTaskRuntime(db, agent_executor=Revise()).run(child_id)["status"] == "succeeded"
+    view = client.get(f"/api/agent-tasks/{child_id}/work-view").json()
+    assert view["task"]["report"]["summary"] == "Revised risk section"
+
+    execute_phase_a_shield(db, mode="history_only", event_ids=[source.id], requested_by="owner")
+    db.commit()
+    assert client.get(f"/api/agent-tasks/{parent.id}/work-view").status_code == 200
+    assert client.get(f"/api/agent-tasks/{child_id}/work-view").status_code == 404
+    assert client.post(endpoint, json=request).status_code == 404
