@@ -31,7 +31,7 @@ import Markdown from "../components/Markdown";
 import ToolCallCard from "../features/chat/ToolCallCard";
 import type { Message, ToolCallItem } from "../features/chat/types";
 import { loadStored, saveStored } from "../features/chat/messageStorage";
-import { normalizeToolCallStatus, genMessageId } from "../features/chat/messageModel";
+import { normalizeToolCallStatus, genMessageId, historyMessage, readHistoryWindow } from "../features/chat/messageModel";
 import { useConversationBootstrap } from "../../../shared/chat/useConversationBootstrap";
 
 export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: { onInspectTrace?: (tid: string) => void; onOpenWork?: (taskId: string) => void; active?: boolean }) {
@@ -59,6 +59,11 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
   const inFlightRef = useRef(false);
   /** 本地 Turn 期间收到的历史同步请求，在 finally 中合并执行。 */
   const historyRefreshPendingRef = useRef(false);
+  const historyGenerationRef = useRef(0);
+  const historyQueueRef = useRef(Promise.resolve());
+  const historyWindowRef = useRef<{
+    threadId: string; cursor: number | null; expanded: boolean; revision?: number;
+  } | undefined>(undefined);
   /** 当前流已收到的真实线程 ID，用于断流后不受 React 状态闭包影响地恢复历史。 */
   const activeStreamThreadIdRef = useRef<string | undefined>(undefined);
   /** 用户是否贴近消息底部（决定自动滚动 & 是否显示回到底部按钮） */
@@ -68,7 +73,6 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
   const [unreadCount, setUnreadCount] = useState(0);
   /** 上一轮渲染时的消息条数，用于增量计算新增消息 */
   const prevMsgCountRef = useRef(stored.messages.length);
-  const [historyCursor, setHistoryCursor] = useState<number | null>(null);
   const [hasMoreHistory, setHasMoreHistory] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [approvalBusyId, setApprovalBusyId] = useState<string | null>(null);
@@ -165,40 +169,43 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
   // 输入框内容变化时重算高度（含清空后回弹为单行）
   useEffect(() => { autoResize(); }, [input]);
 
-  /** 从后端加载消息（含 trace、操作卡片和工具记录） */
-  const loadRemoteMessages = useCallback(async (tid: string) => {
+  // Pagination and refresh share one queue so a refresh can see a just-expanded range.
+  const queueHistoryRead = useCallback((read: () => Promise<boolean>) => {
+    const pending = historyQueueRef.current.then(read);
+    historyQueueRef.current = pending.then(() => {}, () => {});
+    return pending;
+  }, []);
+
+  const loadRemoteMessages = useCallback((tid: string, passive = false) => queueHistoryRead(async () => {
+    const previous = historyWindowRef.current;
+    if (passive && previous?.threadId !== tid) return true;
+    const expanded = previous?.threadId === tid && previous.expanded;
     try {
-      const page = await getThreadMessages(tid);
-      // 服务器历史是事实来源：即使为空也覆盖本地缓存（取消的轮次必须消失）。
-      const loaded: Message[] = page.messages.map((message) => ({
-        id: message.event_id || genMessageId(),
-        role: message.role === "user" ? "user" : "agent",
-        content: message.content,
-        attachments: message.attachments,
-        traceId: message.trace_id || "",
-        threadId: tid,
-        actionCards: message.action_cards || [],
-        toolCalls: (message.tool_calls ?? []).map((call) => ({
-          id: call.tool_call_id,
-          name: call.name,
-          params: call.params || {},
-          status: normalizeToolCallStatus(call.status),
-          result: call.result === undefined || call.result === null
-            ? undefined
-            : typeof call.result === "string" ? call.result : JSON.stringify(call.result),
-        })),
-      }));
-      prevMsgCountRef.current = loaded.length;
-      setUnreadCount(0);
-      setMessages(loaded);
-      setHistoryCursor(page.next_cursor);
-      setHasMoreHistory(page.has_more);
-      return true;
+      while (true) {
+        if (passive && inFlightRef.current) {
+          historyRefreshPendingRef.current = true;
+          return true;
+        }
+        const generation = historyGenerationRef.current;
+        const page = await readHistoryWindow(
+          (before, from) => getThreadMessages(tid, before, from),
+          expanded ? previous.cursor : undefined,
+        );
+        // The latest snapshot must include pushes received while paging and leave local streaming intact.
+        if (passive && (inFlightRef.current || generation !== historyGenerationRef.current)) continue;
+        const loaded = page.messages.map(message => historyMessage(message, tid));
+        prevMsgCountRef.current = loaded.length;
+        setUnreadCount(0);
+        setMessages(loaded);
+        historyWindowRef.current = { threadId: tid, cursor: page.cursor, expanded, revision: page.revision };
+        setHasMoreHistory(page.cursor !== null);
+        return true;
+      }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "历史消息加载失败");
       return false;
     }
-  }, []);
+  }), [queueHistoryRead]);
 
   /** 启动握手 / stale 恢复：current Thread → 服务器历史 → 执行状态。 */
   const syncConversation = useCallback(async (): Promise<boolean> => {
@@ -219,46 +226,39 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
     useConversationBootstrap(true, syncConversation);
 
   const loadOlderMessages = useCallback(async () => {
-    if (!threadId || historyCursor === null || loadingHistory) return;
-    const el = scrollRef.current;
-    const previousHeight = el?.scrollHeight || 0;
+    if (!threadId || loadingHistory) return;
     setLoadingHistory(true);
     try {
-      const page = await getThreadMessages(threadId, historyCursor);
-      const older: Message[] = page.messages.map((message) => ({
-        id: message.event_id || genMessageId(),
-        role: message.role === "user" ? "user" : "agent",
-        content: message.content,
-        attachments: message.attachments,
-        traceId: message.trace_id || "",
-        threadId,
-        actionCards: message.action_cards || [],
-        toolCalls: (message.tool_calls ?? []).map((call) => ({
-          id: call.tool_call_id,
-          name: call.name,
-          params: call.params || {},
-          status: normalizeToolCallStatus(call.status),
-          result: call.result === undefined || call.result === null
-            ? undefined
-            : typeof call.result === "string" ? call.result : JSON.stringify(call.result),
-        })),
-      }));
-      setMessages((current) => {
-        prevMsgCountRef.current = older.length + current.length;
-        return [...older, ...current];
+      let visibilityChanged = false;
+      await queueHistoryRead(async () => {
+        const previous = historyWindowRef.current;
+        if (previous?.threadId !== threadId || previous.cursor === null) return false;
+        const previousHeight = scrollRef.current?.scrollHeight || 0;
+        const page = await getThreadMessages(threadId, previous.cursor);
+        if (page.visibility_revision !== previous.revision) {
+          visibilityChanged = true;
+          return false;
+        }
+        const older = page.messages.map(message => historyMessage(message, threadId));
+        setMessages(current => {
+          prevMsgCountRef.current = older.length + current.length;
+          return [...older, ...current];
+        });
+        historyWindowRef.current = { ...previous, cursor: page.next_cursor, expanded: true };
+        setHasMoreHistory(page.next_cursor !== null);
+        requestAnimationFrame(() => {
+          const current = scrollRef.current;
+          if (current) current.scrollTop = current.scrollHeight - previousHeight;
+        });
+        return true;
       });
-      setHistoryCursor(page.next_cursor);
-      setHasMoreHistory(page.has_more);
-      requestAnimationFrame(() => {
-        const current = scrollRef.current;
-        if (current) current.scrollTop = current.scrollHeight - previousHeight;
-      });
+      if (visibilityChanged) await loadRemoteMessages(threadId, true);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "更早消息加载失败");
     } finally {
       setLoadingHistory(false);
     }
-  }, [historyCursor, loadingHistory, threadId]);
+  }, [loadingHistory, loadRemoteMessages, queueHistoryRead, threadId]);
 
   // WebSocket 连接：接收后端主动推送的事件（提醒触发等）
   useEffect(() => {
@@ -284,6 +284,7 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
           if (msg.type === "new_message" && msg.data) {
             const { event_id, reply, thread_id, trace_id, action_cards, tool_calls } = msg.data;
             if (event_id && reply) {
+              historyGenerationRef.current += 1;
               setMessages(prev => {
                 const messageId = String(event_id);
                 if (prev.some(message => message.id === messageId)) return prev;
@@ -323,10 +324,11 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
               if (inFlightRef.current) {
                 historyRefreshPendingRef.current = true;
               } else {
-                void loadRemoteMessages(String(status.thread_id || threadId));
+                void loadRemoteMessages(String(status.thread_id || threadId), true);
               }
             }
           } else if (msg.type === "maintenance_report" && msg.data?.operation_id && msg.data?.card) {
+            historyGenerationRef.current += 1;
             const operationId = String(msg.data.operation_id);
             const terminalCard = msg.data.card as ActionCard;
             setMessages(prev => prev.map(message => ({
@@ -339,6 +341,7 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
               )),
             })));
           } else if (msg.type === "tool_operation" && msg.data?.operation_id && msg.data?.tool_call_id) {
+            historyGenerationRef.current += 1;
             const operationId = String(msg.data.operation_id);
             const toolCallId = String(msg.data.tool_call_id);
             const rawStatus = String(msg.data.execution_status || "execution_unknown");
@@ -379,7 +382,7 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
     const recover = () => {
       if (document.hidden || disposed) return;
       if (inFlightRef.current) historyRefreshPendingRef.current = true;
-      else void loadRemoteMessages(threadId);
+      else void loadRemoteMessages(threadId, true);
       void getExecutionStatus(threadId).then(applyExecutionStatus).catch(() => undefined);
       if (ws?.readyState === WebSocket.OPEN) return;
       if (reconnectTimer) clearTimeout(reconnectTimer);
@@ -493,6 +496,7 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
     const draftKey = JSON.stringify([text, attachments.map(file => file.id).sort()]);
     if (attachmentRequestRef.current?.key !== draftKey) attachmentRequestRef.current = { key: draftKey, id: crypto.randomUUID() };
     inFlightRef.current = true;
+    historyGenerationRef.current += 1;
     setError(null);
     setLoading(true);
     setExecState("running");
@@ -758,7 +762,7 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
       abortRef.current = null;
       if (historyRefreshPendingRef.current && resolvedThreadId) {
         historyRefreshPendingRef.current = false;
-        await loadRemoteMessages(resolvedThreadId);
+        await loadRemoteMessages(resolvedThreadId, true);
       }
       // 本轮结束后不要无条件置 idle：后台 GoalDecision 可能已接手占用。
       // 重新读取服务端状态；查询失败时才退回 idle 以保证按钮可用。

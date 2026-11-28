@@ -325,6 +325,7 @@ class ThreadState:
         thread_id: str,
         page_size: int = 50,
         before_sequence: int | None = None,
+        from_sequence: int | None = None,
     ) -> dict[str, Any]:
         """按 Turn keyset 分页返回前端展示消息，不参与 LLM 上下文选择。"""
         size = max(1, min(page_size, 100))
@@ -337,6 +338,8 @@ class ThreadState:
         )
         if before_sequence is not None:
             query = query.filter(TurnRecord.turn_sequence < before_sequence)
+        if from_sequence is not None:
+            query = query.filter(TurnRecord.turn_sequence >= from_sequence)
         turns_desc = query.order_by(TurnRecord.turn_sequence.desc()).limit(size + 1).all()
         has_more = len(turns_desc) > size
         selected_desc = turns_desc[:size]
@@ -363,7 +366,7 @@ class ThreadState:
                 [event for event in events if event.id not in blocked], turn.status, turn.source))
 
         # 到达新 Turn 历史末端时，继续拼接旧版 turn_id=NULL 事件。
-        if not has_more:
+        if not has_more and from_sequence is None:
             legacy_groups = self._query_legacy_groups(thread_id, size)
             legacy_items = [item for group, _ in legacy_groups for item in group]
             legacy_messages = [

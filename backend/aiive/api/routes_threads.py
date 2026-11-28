@@ -4,14 +4,16 @@ API路由模块：会话（Thread）管理
 - 提供会话历史消息查询接口
 """
 import logging
+from typing import Annotated
 
 from pydantic import BaseModel
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from aiive.db.base import get_db
 from aiive.db.models import ApprovalRequest, Thread
+from aiive.forget.concurrency import acquire_forget_shared_lock, forget_revision
 from aiive.runtime.event_logger import EventLogger
 from aiive.runtime.thread_state import ThreadState
 
@@ -64,16 +66,20 @@ def get_thread_messages(
     page_size: int = 50,
     before_sequence: int | None = None,
     db: Session = Depends(get_db),
+    from_sequence: Annotated[int | None, Query(ge=1)] = None,
 ):
     """按 Turn 游标分页恢复前端历史消息。
 
     该接口只负责 UI 展示，不参与基于 token 的 LLM 上下文组装。
     """
     try:
+        acquire_forget_shared_lock(db)
+        revision = forget_revision(db)
         page = ThreadState(db).list_thread_messages_page(
             thread_id=thread_id,
             page_size=page_size,
             before_sequence=before_sequence,
+            from_sequence=from_sequence,
         )
         approvals = {
             approval.id: approval.status
@@ -103,7 +109,7 @@ def get_thread_messages(
                     card["status"] = "completed" if approval_status in ("succeeded", "denied") else "failed"
                     card["actions"] = []
                     card.setdefault("payload_preview", {})["approval_status"] = approval_status
-        return page
+        return {**page, "visibility_revision": revision}
     except Exception:
         app_logger.exception("获取会话消息失败: thread_id=%s", thread_id)
         raise

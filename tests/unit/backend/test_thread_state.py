@@ -395,3 +395,14 @@ class TestThreadState:
         assert first["has_more"] is True
         assert [message["content"] for message in second["messages"]] == ["消息1"]
         assert second["has_more"] is False
+
+        from aiive.api.routes_threads import get_thread_messages
+
+        bounded_head = get_thread_messages(thread.id, page_size=1, from_sequence=2, db=db_session)
+        bounded_tail = get_thread_messages(
+            thread.id, page_size=1, before_sequence=bounded_head["next_cursor"], from_sequence=2, db=db_session,
+        )
+        assert [message["content"] for message in bounded_head["messages"]] == ["消息3"]
+        assert [message["content"] for message in bounded_tail["messages"]] == ["消息2"]
+        assert bounded_tail["next_cursor"] is None
+        assert bounded_head["visibility_revision"] == bounded_tail["visibility_revision"]

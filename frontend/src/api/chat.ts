@@ -30,9 +30,10 @@ export type {
 };
 export type { ActionCardDTO as ActionCard, PendingOperationDTO as PendingOperation };
 
-export async function getThreadMessages(threadId: string, beforeSequence?: number): Promise<ThreadHistoryPage> {
+export async function getThreadMessages(threadId: string, beforeSequence?: number, fromSequence?: number): Promise<ThreadHistoryPage> {
   const query = new URLSearchParams({ page_size: "50" });
   if (beforeSequence !== undefined) query.set("before_sequence", String(beforeSequence));
+  if (fromSequence !== undefined) query.set("from_sequence", String(fromSequence));
   const res = await apiFetch(`api/threads/${encodeURIComponent(threadId)}/messages?${query.toString()}`);
   if (!res.ok) throw await chatApiErrorFromResponse(res);
   return res.json();

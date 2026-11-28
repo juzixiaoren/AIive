@@ -56,4 +56,5 @@ export interface ThreadHistoryPage {
   messages: ThreadHistoryMessage[];
   next_cursor: number | null;
   has_more: boolean;
+  visibility_revision?: number;
 }

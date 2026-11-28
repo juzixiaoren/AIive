@@ -15,7 +15,7 @@ const modelUrl = moduleUrl('../src/features/chat/messageModel.ts');
 const { ChatApiError, chatApiErrorFromPayload, chatApiErrorFromResponse } = await import(
   moduleUrl('../../shared/chat/errors.ts'),
 );
-const { normalizeToolCallStatus } = await import(modelUrl);
+const { normalizeToolCallStatus, readHistoryWindow } = await import(modelUrl);
 const { loadStored, saveStored } = await import(moduleUrl(
   '../src/features/chat/messageStorage.ts', { '"./messageModel"': JSON.stringify(modelUrl) },
 ));
@@ -32,6 +32,21 @@ test('unknown and running tools never display completion', () => {
   assert.equal(normalizeToolCallStatus('committed'), 'completed');
   assert.equal(normalizeToolCallStatus('execution_failed'), 'failed');
   assert.equal(normalizeToolCallStatus('preempted'), 'cancelled');
+});
+
+test('history recovery retries a range when the Forget version changes between pages', async () => {
+  const queries = [];
+  const result = await readHistoryWindow(async (before, from) => {
+    queries.push([before, from]);
+    const revision = queries.length === 1 ? 1 : 2;
+    return {
+      messages: [{ role: 'user', content: revision === 1 ? 'obsolete' : before ? 'earlier' : 'recent' }],
+      next_cursor: before ? null : 20, has_more: !before, visibility_revision: revision,
+    };
+  }, null);
+  assert.deepEqual(queries, [[undefined, undefined], [20, undefined], [undefined, undefined], [20, undefined]]);
+  assert.equal(result.cursor, null);
+  assert.deepEqual(result.messages.map(message => message.content), ['earlier', 'recent']);
 });
 test('legacy history receives stable ids and empty placeholders are removed', () => {
   raw = JSON.stringify({ threadId: 't', messages: [
