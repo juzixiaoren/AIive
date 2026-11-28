@@ -133,6 +133,7 @@ def post_feedback(episode_id: str, request: Feedback, db: Session = Depends(get_
 
 @router.get("/insights/{insight_id}")
 def get_insight(insight_id: str, db: Session = Depends(get_db)):
+    acquire_forget_shared_lock(db)
     row = db.get(ExperienceInsight, insight_id)
     if row is None or not evidence_visible(db, row, confirm_outcome=False):
         raise HTTPException(404, "insight_not_found")
@@ -146,17 +147,18 @@ def review_insight(
 ):
     acquire_forget_shared_lock(db)
     try:
-        row = change_status(db, insight_id, action)
+        change_status(db, insight_id, action)
         db.commit()
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
-    return _insight(db, row, detail=True)
+    return get_insight(insight_id, db)
 
 
 @router.get("/candidates/{candidate_id}")
 def get_candidate(candidate_id: str, db: Session = Depends(get_db)):
+    acquire_forget_shared_lock(db)
     try:
         candidate = ImprovementDiscovery.get_candidate(db, candidate_id)
     except CandidateNotFound as exc:

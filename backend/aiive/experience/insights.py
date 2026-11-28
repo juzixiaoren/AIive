@@ -297,6 +297,8 @@ def change_status(db: Session, identity: str, action: str, now: datetime | None 
         ExperienceInsight.version.desc(),
     ).with_for_update().populate_existing().all()
     row = next(revision for revision in history if revision.id == identity)
+    if not evidence_visible(db, row, confirm_outcome=False):
+        raise LookupError("insight_not_found")
     expected = {"accept": "pending", "reject": "pending", "enable": "disabled", "disable": "active"}
     if expected.get(action) != row.status:
         raise ValueError("invalid_insight_transition")

@@ -681,13 +681,13 @@ class ImprovementDiscovery:
         now: datetime | None = None,
     ) -> dict[str, Any]:
         """Commit the review and the selected domain write together."""
-        from aiive.experience.routing import accept_routed
+        from aiive.experience.routing import accept_routed, candidate_visible
         from aiive.forget.concurrency import acquire_forget_shared_lock
 
         acquire_forget_shared_lock(db)
         now = _as_utc(now) or _utcnow()
         row = db.query(SelfDevRequest).filter_by(id=candidate_id).with_for_update().one_or_none()
-        if row is None or not is_candidate_row(row):
+        if row is None or not is_candidate_row(row) or not candidate_visible(db, candidate_payload(row)):
             raise CandidateNotFound(candidate_id)
         if row.status != CANDIDATE_STATUS_PENDING:
             raise CandidateStateError(row.status)
@@ -763,7 +763,9 @@ class ImprovementDiscovery:
         now: datetime | None = None,
     ) -> dict[str, Any]:
         from aiive.experience.routing import candidate_visible
+        from aiive.forget.concurrency import acquire_forget_shared_lock
 
+        acquire_forget_shared_lock(db)
         now = _as_utc(now) or _utcnow()
         row = db.query(SelfDevRequest).filter_by(id=candidate_id).with_for_update().one_or_none()
         if row is None or not is_candidate_row(row) or not candidate_visible(db, candidate_payload(row)):

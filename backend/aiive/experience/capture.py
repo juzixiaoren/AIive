@@ -4,18 +4,19 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from itertools import batched
 from typing import Any
 
 from sqlalchemy.orm import Session, load_only
 
 from aiive.db.models import (
-    AgentRun, AgentTask, AgentTaskEvent, Capability, DesktopNode, Event, ExperienceEpisode,
-    ExperienceSignal, OutboxJob, TurnRecord,
+    AgentAction, AgentRun, AgentTask, AgentTaskEvent, Capability, DesktopNode, Event, ExperienceEpisode,
+    ExperienceSignal, OutboxJob, TaskArtifact, TaskEvidence, TurnRecord,
 )
 from aiive.experience.families import family_for, merge_uses, stable_id
 from aiive.forget.durable_sources import references_visible, sources_visible
 from aiive.forget.source_policy import blocked_durable_references
-from aiive.task_runtime.read_repository import TASK_VISIBILITY_COLUMNS, TaskReadRepository
+from aiive.task_runtime.read_repository import TASK_VISIBILITY_COLUMNS, ReadVisibilityContext, TaskReadRepository
 
 JOB_CAPTURE = "experience_capture"
 POSITIVE = frozenset({"verified_success", "explicit_positive"})
@@ -54,12 +55,42 @@ def visible_episodes(db: Session, rows: Sequence[ExperienceEpisode]) -> list[Exp
     allowed_turns = {row.source_id for row in turns if ("turn_record", row.source_id) not in blocked
                      and (not row.refs.get("experience_context")
                           or sources_visible(db, "experience_turn_context", row.source_id))}
-    task_ids = [row.source_id for row in rows if row.kind == "task"]
-    tasks = (db.query(AgentTask).options(load_only(*TASK_VISIBILITY_COLUMNS))
-             .filter(AgentTask.id.in_(task_ids)).all()) if task_ids else []
-    allowed_tasks = TaskReadRepository(db).task_visible_many(tasks) if tasks else set()
+    allowed_tasks = _visible_task_sources(db, [row for row in rows if row.kind == "task"])
     return [row for row in rows if (row.kind == "turn" and row.source_id in allowed_turns)
             or (row.kind == "task" and row.source_id in allowed_tasks)]
+
+
+def _visible_task_sources(db: Session, episodes: list[ExperienceEpisode]) -> set[str]:
+    if not episodes:
+        return set()
+    tasks = db.query(AgentTask).options(load_only(*TASK_VISIBILITY_COLUMNS)).filter(
+        AgentTask.id.in_([row.source_id for row in episodes]),
+    ).all()
+    reader = TaskReadRepository(db, ReadVisibilityContext(db))
+    visible = reader.task_visible_many(tasks)
+    # Capture aggregates child outcomes and metrics. Hiding just an ID would
+    # leave a derived result visible between a Forget shield and its scrub.
+    for field, owner, model, extra in (
+        ("evidence_ids", "task_evidence", TaskEvidence, ()),
+        ("action_ids", "agent_action", AgentAction, (AgentAction.result_summary,)),
+        ("task_event_ids", "agent_task_event", AgentTaskEvent, (AgentTaskEvent.action_id,)),
+        ("artifact_ids", "task_artifact", TaskArtifact, ()),
+        ("run_ids", "agent_run", AgentRun, ()),
+    ):
+        by_child: dict[str, set[str]] = defaultdict(set)
+        for episode in episodes:
+            if episode.source_id in visible:
+                for identity in episode.refs.get(field, []):
+                    by_child[identity].add(episode.source_id)
+        for group in batched(by_child, 256):
+            children = db.query(model).options(load_only(model.id, model.task_id, *extra)).filter(
+                model.id.in_(group),
+            ).all()
+            allowed = {child.id: child.task_id for child in reader.filter_children(owner, children)}
+            for identity in group:
+                visible.difference_update(task_id for task_id in by_child[identity]
+                                          if task_id != allowed.get(identity))
+    return visible
 
 
 def episode_visible(db: Session, episode: ExperienceEpisode) -> bool:

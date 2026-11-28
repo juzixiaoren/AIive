@@ -15,7 +15,7 @@ from aiive.db.base import SessionLocal
 from aiive.db.models import (
     AgentAction, AgentTask, AgentTaskEvent, Event, ExperienceEpisode, ExperienceInsight, ExperienceSignal, TaskEvidence,
 )
-from aiive.experience.capture import NEGATIVE, POSITIVE, episode_visible, result_for, visible_signals
+from aiive.experience.capture import NEGATIVE, POSITIVE, result_for, signals_by_episode, visible_episodes, visible_signals
 from aiive.experience.families import match_terms
 from aiive.experience.feedback import analyze_follow_ups
 from aiive.experience.insights import CAPABILITY, curate, evidence_visible, independent_key, propose_tool_hint
@@ -159,7 +159,7 @@ class Reflector:
                 rows = db.query(ExperienceEpisode).filter(
                     ExperienceEpisode.family == family, ExperienceEpisode.completed_at >= now - _HISTORY,
                 ).order_by(ExperienceEpisode.completed_at.desc(), ExperienceEpisode.id).limit(_BATCH_LIMIT)
-                visible = [row for row in rows if episode_visible(db, row)]
+                visible = visible_episodes(db, rows.all())
                 if not any(row.reflected_at is None for row in visible):
                     continue
                 from aiive.experience.routing import propose_preferences
@@ -167,8 +167,9 @@ class Reflector:
                 created.extend(_discovery_candidates(db, visible))
                 created.extend(propose_preferences(db, visible))
                 groups: dict[str, list[tuple[ExperienceEpisode, list[ExperienceSignal], str]]] = defaultdict(list)
+                observations = signals_by_episode(db, [episode.id for episode in visible])
                 for episode in visible:
-                    signals = visible_signals(db, episode.id)
+                    signals = observations[episode.id]
                     outcome = result_for(episode, signals)
                     if outcome in POSITIVE | NEGATIVE | {"agent_reported_success"}:
                         groups[outcome].append((episode, signals, outcome))
@@ -178,7 +179,7 @@ class Reflector:
                 reported = groups["agent_reported_success"][:3]
                 if len(strong) >= 2 or (bad and (positive or reported)):
                     batch[family] = [_prompt_episode(db, *item) for item in [*positive, *bad, *reported]]
-                    updated.update({episode.id: result_for(episode, visible_signals(db, episode.id))
+                    updated.update({episode.id: result_for(episode, observations[episode.id])
                                     for episode in visible if episode.reflected_at is None})
                     if len(batch) >= 5:
                         break

@@ -8,7 +8,7 @@ from typing import Any
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from aiive.db.models import AgentTaskEvent, Event, ExperienceEpisode, SelfDevRequest
+from aiive.db.models import Event, ExperienceEpisode, SelfDevRequest
 from aiive.experience.capture import episode_visible, known_capability
 from aiive.experience.families import stable_id
 from aiive.forget.durable_sources import references_visible
@@ -90,7 +90,9 @@ def candidate_visible(db: Session, payload: dict[str, Any]) -> bool:
             ):
                 return False
         else:
-            event = db.get(AgentTaskEvent, ref["source_id"])
+            from aiive.task_runtime.read_repository import TaskReadRepository
+
+            event = TaskReadRepository(db).get_event(ref["source_id"])
             if (event is None or event.task_id != episode.source_id
                     or event.payload.get("experience_classification") != "capability_missing_from_catalog"
                     or event.payload.get("capability_id") != payload.get("target")):
@@ -109,8 +111,6 @@ def accept_routed(db: Session, row: SelfDevRequest, payload: dict[str, Any], tra
     from aiive.selfdev.improvement_discovery import CandidateStateError
 
     route = payload["route"]
-    if not candidate_visible(db, payload):
-        raise CandidateStateError("candidate_evidence_unavailable")
     if route == "mcp":
         from aiive.tools.builtin_mcp import persist_capability_plan
 

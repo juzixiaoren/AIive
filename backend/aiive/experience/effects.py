@@ -3,13 +3,15 @@ from __future__ import annotations
 
 from typing import Any
 
+from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime, timedelta
+from itertools import batched
 from statistics import median
 
 from sqlalchemy.orm import Session
 
 from aiive.db.models import ExperienceEpisode, ExperienceInsight
-from aiive.experience.capture import NEGATIVE, POSITIVE, episode_visible, result_for, utc, visible_signals
+from aiive.experience.capture import NEGATIVE, POSITIVE, result_for, signals_by_episode, utc, visible_episodes
 
 WINDOW = timedelta(days=14)
 MIN_SAMPLES = 5
@@ -34,10 +36,17 @@ class ExperienceEffectEvaluator:
     def __init__(self, db: Session):
         self.db: Session = db
 
+    def _visible(self, rows: Iterable[ExperienceEpisode]) -> Iterator[ExperienceEpisode]:
+        for group in batched(rows, 128):
+            yield from visible_episodes(self.db, group)
+
     def summarize(self, episodes: list[ExperienceEpisode]) -> dict[str, Any]:
-        observations = [(row, visible_signals(self.db, row.id)) for row in episodes]
-        outcomes = [result_for(row, signals) for row, signals in observations]
-        signal_kinds = [{signal.kind for signal in signals} for _, signals in observations]
+        outcomes: list[str] = []
+        signal_kinds: list[set[str]] = []
+        for group in batched(episodes, 128):
+            signals = signals_by_episode(self.db, [row.id for row in group])
+            outcomes.extend(result_for(row, signals[row.id]) for row in group)
+            signal_kinds.extend({signal.kind for signal in signals[row.id]} for row in group)
         user_episodes = len(episodes)
         task_outcomes = [(row, row.outcome) for row in episodes if row.kind == "task"]
         skilled = [(row, outcome) for row, outcome in zip(episodes, outcomes)
@@ -66,10 +75,16 @@ class ExperienceEffectEvaluator:
 
     def usage(self, insight: ExperienceInsight) -> dict[str, Any]:
         query = self.db.query(ExperienceEpisode).filter_by(family=insight.family)
-        rows = [row for row in query if _is_used(row, insight) and episode_visible(self.db, row)]
-        outcomes = [result_for(row, visible_signals(self.db, row.id)) for row in rows]
-        return {"samples": len(rows), "helpful": sum(item in POSITIVE for item in outcomes),
-                "harmful": sum(item in NEGATIVE for item in outcomes)}
+        used = (row for row in query.yield_per(128) if _is_used(row, insight))
+        samples = helpful = harmful = 0
+        for group in batched(self._visible(used), 128):
+            signals = signals_by_episode(self.db, [row.id for row in group])
+            for row in group:
+                outcome = result_for(row, signals[row.id])
+                samples += 1
+                helpful += outcome in POSITIVE
+                harmful += outcome in NEGATIVE
+        return {"samples": samples, "helpful": helpful, "harmful": harmful}
 
     def compare(self, insight: ExperienceInsight, *, now: datetime | None = None) -> dict[str, Any]:
         if insight.enabled_at is None:
@@ -85,9 +100,7 @@ class ExperienceEffectEvaluator:
         ).order_by(ExperienceEpisode.completed_at, ExperienceEpisode.id)
         cohorts = {"turn": {"before": [], "after": [], "exposed": []},
                    "task": {"before": [], "after": [], "exposed": []}}
-        for row in rows:
-            if not episode_visible(self.db, row):
-                continue
+        for row in self._visible(rows.yield_per(128)):
             group = cohorts[row.kind]
             if utc(row.completed_at) < boundary:
                 group["before"].append(row)

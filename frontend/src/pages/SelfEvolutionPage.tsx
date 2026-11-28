@@ -106,12 +106,15 @@ const time = (value: string) => new Date(value.endsWith("Z") || /[+-]\d\d:\d\d$/
 const button = "rounded-md border border-divider px-3 py-1.5 text-sm text-content hover:bg-surface-muted disabled:opacity-50";
 const card = "rounded-xl border border-divider bg-surface p-4";
 
+class RecordUnavailable extends Error {}
+
 async function request<T>(path = "", body?: object): Promise<T> {
   const response = await apiFetch(`${BASE_PATH}api/experience${path}`, body === undefined ? undefined : {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+  if (response.status === 404 && path.startsWith("/")) throw new RecordUnavailable("这条记录已不可用。");
   if (!response.ok) {
     const data = await response.json().catch(() => null);
     throw new Error(typeof data?.detail === "string" ? data.detail : `请求失败（${response.status}）`);
@@ -199,6 +202,15 @@ export default function SelfEvolutionPage({ onOpenWork }: { onOpenWork: (id: str
     }
   }
 
+  function handleDetailError(err: unknown) {
+    if (err instanceof RecordUnavailable) {
+      setDetail(undefined);
+      setHome(undefined);
+      void refresh();
+    }
+    setError(err instanceof Error ? err.message : "请求失败");
+  }
+
   async function open(next: Section, id: string) {
     const current = ++sequence.current;
     setBusy(true);
@@ -213,7 +225,7 @@ export default function SelfEvolutionPage({ onOpenWork }: { onOpenWork: (id: str
         setDetail(result);
       }
     } catch (err) {
-      if (current === sequence.current) setError((err as Error).message);
+      if (current === sequence.current) handleDetailError(err);
     } finally {
       if (current === sequence.current) setBusy(false);
     }
@@ -241,7 +253,7 @@ export default function SelfEvolutionPage({ onOpenWork }: { onOpenWork: (id: str
         await refresh();
       }
     } catch (err) {
-      if (current === sequence.current) setError((err as Error).message);
+      if (current === sequence.current) handleDetailError(err);
     } finally {
       if (current === sequence.current) setBusy(false);
     }

@@ -496,6 +496,35 @@ def test_routed_preference_and_mcp_candidate(experience_db, api, monkeypatch):
     assert response.json()["progress"]["status"] == "evaluated"
     assert db.get(CapabilityPlan, response.json()["progress"]["id"]) is not None
 
+    # The task remains visible when a source belonging only to its discovery event is forgotten.
+    from aiive.forget.durable_sources import persist_sources
+    from aiive.forget.phase_a_shield import execute_phase_a_shield
+
+    source = Event(thread_id=turn.thread_id, trace_id="discovery-input", event_type="user_message",
+                   payload={"content": "Earlier discovery input"})
+    db.add(source)
+    db.flush()
+    ref = gap["experience_refs"][0]
+    persist_sources(db, "agent_task_event", ref["source_id"], {"source_event_id": source.id})
+    db.commit()
+    execute_phase_a_shield(db, mode="history_only", event_ids=[source.id], requested_by="owner")
+    db.commit()
+    from aiive.task_runtime.read_repository import TaskReadRepository
+
+    episode = db.get(ExperienceEpisode, ref["episode_id"])
+    assert TaskReadRepository(db).get_task(episode.source_id) is not None
+    episode_path = f"/api/experience/episodes/{episode.id}"
+    assert api.get(episode_path).status_code == 404
+    assert api.post(f"{episode_path}/feedback", json={"kind": "rework"}).status_code == 404
+    overview = api.get("/api/experience").json()
+    assert episode.id not in {row["id"] for row in overview["episodes"]}
+    assert gap["candidate_id"] not in {row["candidate_id"] for row in overview["candidates"]}
+    candidate_path = f"/api/experience/candidates/{gap['candidate_id']}"
+    assert api.get(candidate_path).status_code == 404
+    assert api.post(f"{candidate_path}/accept", json={}).status_code == 404
+    assert api.post(f"{candidate_path}/reject", json={}).status_code == 404
+
+
 
 
 def test_forget_scrubs_experience_text_and_evidence(experience_db, api):
@@ -516,6 +545,16 @@ def test_forget_scrubs_experience_text_and_evidence(experience_db, api):
     model = _Curator()
     revision = Reflector(model, session_factory=db.info["session_factory"]).run()["proposals"][0]
     target = turns[0]
+    from aiive.forget.phase_a_shield import execute_phase_a_shield
+
+    prefix = f"/api/experience/insights/{revision}"
+    execute_phase_a_shield(db, mode="history_only", event_ids=[target.request_event_id], requested_by="owner")
+    db.commit()
+    assert api.get(prefix).status_code == 404
+    for action in ("reject", "accept", "disable", "enable"):
+        assert api.post(f"{prefix}/{action}").status_code == 404
+    db.expire_all()
+    assert db.get(ExperienceInsight, revision).status == "pending"
     scope = ContentScope("test-forget", "everywhere", "thread", datetime.now(UTC),
                          turn_tokens={target.id, target.turn_id}, event_ids={target.request_event_id})
     counts = scrub_experience(db, scope)

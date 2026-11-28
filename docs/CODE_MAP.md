@@ -74,7 +74,7 @@
 |---|---|---|---|
 | 聊天入口（同步/SSE/错误契约） | `api/routes_chat.py`（V63.2：同步 detail 与 SSE error 仅 turn_in_progress 为 202 / retryable=true，其余 TurnConflictError 为 409 / false；SSE HTTP 保持 200） | `runtime/turn_execution.py`、`api/ws_manager.py` | `tests/unit/backend/test_chat_*.py` |
 | 经验采集、反馈与父子经历 | `experience/capture.py`、`experience/feedback.py` | `runtime/turn_execution.py::_finalize_turn`、`task_runtime/runtime.py::_complete`、`worker/handlers_experience.py` | `tests/flow/test_experience_end_to_end.py` |
-| 经验学习与版本审阅 | `experience/reflector.py`、`experience/insights.py`、`experience/routing.py` | `worker/handlers_improvement.py`、`selfdev/improvement_discovery.py::accept`、`experience/forget.py` | `tests/flow/test_experience_end_to_end.py` |
+| 经验学习与版本审阅（读取与审阅均复核来源） | `experience/reflector.py`、`experience/insights.py`、`experience/routing.py` | `worker/handlers_improvement.py`、`selfdev/improvement_discovery.py::accept`、`experience/forget.py` | `tests/flow/test_experience_end_to_end.py` |
 | Main / Worker 经验注入（指定同族 Skill 优先）与搜索提示 | `experience/retrieval.py`、`skills/catalog.py::SkillService`、`tool_discovery/service.py` | 两套 `context_assembler.py`、`control/capability_broker.py` | `tests/flow/test_experience_end_to_end.py` |
 | 自进化中心与效果 | `api/routes_experience.py`、`experience/history.py`（经历游标、标题和答复预览，前端交互回归见 `frontend/scripts/test-experience.mjs`）、`experience/effects.py`、`frontend/src/pages/SelfEvolutionPage.tsx` | `db/models.py`、迁移 `6d9e20b18c4a` | `tests/flow/test_experience_end_to_end.py`、`tests/unit/backend/test_schema_migrations.py` |
 | 回合生命周期（抢占/租约/心跳/收尾） | `runtime/turn_execution.py` | `db/models.py::turn_records`、`runtime/event_logger.py` | `test_turn_execution*.py` |
