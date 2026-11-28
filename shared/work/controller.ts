@@ -121,7 +121,7 @@ export class WorkController {
       detailError: "",
       error: "",
     });
-    void this.refresh();
+    void this.refreshDetail();
   }
   bucket(bucket: Bucket): void {
     this.inboxGeneration = newGeneration();

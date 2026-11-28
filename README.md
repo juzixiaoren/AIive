@@ -441,6 +441,7 @@ Documents 保存或系统分享。运行 `cd frontend && npm run test:work` 验�
 
 Web 可收藏工作详情地址 `/work?task=<任务 ID>`。从对话打开委派任务或在工作列表选择任务时，
 地址会更新。重新登录、刷新和浏览器前进或后退都会恢复对应详情。地址以实际部署前缀为准。
+Web 与 Android 在切换工作详情时保留列表中已加载的分页结果。
 
 实现契约、选型和具体结果见 [P1 验收报告](docs/reports/2026-11-12_P1_work_center.md)。
 

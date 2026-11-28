@@ -261,20 +261,25 @@ test("selection races and paginated duplicate items cannot cross tasks or bucket
     view: async (id) => view(id),
     timeline: async () => ({ items: [], next_sequence: 5, has_more: false }),
   });
+  const inbox = store.refresh();
   store.select("old");
   await tick();
   store.select("new");
   resolve();
-  await store.refresh();
+  await inbox;
+  await tick();
   assert.equal(store.state.view.task.task_id, "new");
   await store.more();
+  store.select("b");
+  await tick();
+  assert.equal(store.state.view.task.task_id, "b");
   assert.deepEqual(
     store.state.items.map((i) => i.task_id),
     ["a", "b"],
   );
   store.dispose();
   await store.refresh();
-  assert.equal(count, 3);
+  assert.equal(count, 2);
 });
 
 test("detail and incremental timeline render while the inbox is pending", async () => {
@@ -315,6 +320,7 @@ test("inbox and a newly selected detail can render while the previous detail is 
       return { items: [], next_sequence: after, has_more: false };
     },
   });
+  await store.refresh();
   store.select("old");
   await tick();
   assert.equal(store.state.items[0].task_id, "new");
