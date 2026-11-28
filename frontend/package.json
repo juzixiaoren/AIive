@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "test:chat": "node --test scripts/test-chat-model.mjs",
+    "test:chat": "node --test scripts/test-chat-model.mjs scripts/test-chat-recovery.mjs",
     "test:work": "node --test scripts/test-work-model.mjs",
     "test:experience": "node --test scripts/test-experience.mjs",
     "test:inspector": "node --test scripts/test-context-inspector.mjs",

@@ -5,6 +5,7 @@ import { apiFetch as attachmentApiFetch, getToken as attachmentToken } from "./a
 const attachmentFetch = (path: string, init?: RequestInit) => attachmentApiFetch(path, init);
 import { App as CapacitorApp } from "@capacitor/app";
 import { workCardsFrom } from "../../../shared/work/types";
+import { useConversationBootstrap } from "../../../shared/chat/useConversationBootstrap";
 import { ToolTrustControl } from "../../../shared/settings/ToolTrustControl";
 import WorkCenter from "./work/WorkCenter";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -117,7 +118,6 @@ export function ChatApp({ username, onLogout, active, onOpenWork }: { username: 
   const [messages, setMessages] = useState<ChatMessage[]>(initialChat.messages);
   // localStorage 仅作为展示缓存：启动阶段 Thread 权威来源是服务器。
   const [threadId, setThreadId] = useState("");
-  const [conversationReady, setConversationReady] = useState(false);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [attachmentBlocked, setAttachmentBlocked] = useState(false);
   const attachmentRequestRef = useRef<{ key: string; id: string } | null>(null);
@@ -194,10 +194,11 @@ export function ChatApp({ username, onLogout, active, onOpenWork }: { username: 
   const syncConversation = useCallback(async (): Promise<boolean> => {
     try {
       const tid = await getCurrentConversation();
-      if (!tid) return false;
-      setThreadId(tid);
+      if (!tid) throw new Error("未取得当前对话");
       setMessages(historyToMessages((await getThreadMessages(tid)).messages));
       applyStatus(await getExecutionStatus(tid));
+      setThreadId(tid);
+      setError("");
       return true;
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "对话恢复失败");
@@ -205,21 +206,8 @@ export function ChatApp({ username, onLogout, active, onOpenWork }: { username: 
     }
   }, [applyStatus]);
 
-  // 启动即从服务器获取唯一长期 Thread 与历史（三端共用同一 Thread ID）。
-  useEffect(() => {
-    if (!configured) {
-      setConversationReady(false);
-      return;
-    }
-    let disposed = false;
-    const bootstrap = async () => {
-      setConversationReady(false);
-      const ok = await syncConversation();
-      if (!disposed && ok) setConversationReady(true);
-    };
-    void bootstrap();
-    return () => { disposed = true; };
-  }, [configured, syncConversation]);
+  const { ready: conversationReady, failed: syncFailed, retry: retryConversation } =
+    useConversationBootstrap(configured, syncConversation);
 
   /** 以服务器历史为准刷新消息（其他设备结束/取消后调用）。 */
   const refreshHistory = useCallback(async () => {
@@ -233,7 +221,7 @@ export function ChatApp({ username, onLogout, active, onOpenWork }: { username: 
 
   // 订阅线程 WebSocket：其他设备开始执行/结束/取消时同步按钮状态。
   useEffect(() => {
-    if (!configured || !threadId || !active) return;
+    if (!conversationReady || !threadId || !active) return;
     return subscribeThreadEvents(threadId, (status, { initialSnapshot }) => {
       const hadRemoteTurn = remoteTurnActiveRef.current;
       applyStatus(status);
@@ -250,7 +238,7 @@ export function ChatApp({ username, onLogout, active, onOpenWork }: { username: 
         else void refreshHistory();
       }
     });
-  }, [active, applyStatus, configured, refreshHistory, threadId]);
+  }, [active, applyStatus, conversationReady, refreshHistory, threadId]);
 
   const resizeTextarea = useCallback(() => {
     const element = textareaRef.current;
@@ -403,8 +391,8 @@ export function ChatApp({ username, onLogout, active, onOpenWork }: { username: 
             staleBeforeStart ? "对话已切换，正在重新同步…" : "Agent 正在回复，请稍候",
           );
           if (staleBeforeStart) {
-            const ok = await syncConversation();
-            setConversationReady(ok);
+            await retryConversation();
+            historyRefreshPendingRef.current = false;
           } else {
             try {
               applyStatus(await getExecutionStatus(threadId));
@@ -576,8 +564,13 @@ export function ChatApp({ username, onLogout, active, onOpenWork }: { username: 
 
       <footer className="composer-area">
         <div className="composer-inner">
-          {error && <div className="error-banner" role="alert">{error}</div>}
-          {execState !== "idle" && (
+          {error && (
+            <div className="error-banner">
+              <span role="alert">{error}</span>
+              {syncFailed && <button type="button" onClick={() => void retryConversation()}>重新同步对话</button>}
+            </div>
+          )}
+          {conversationReady && execState !== "idle" && (
             <div className="status-banner" role="status">
               {execState === "busy"
                 ? "后台任务处理中，请稍候…"
@@ -599,7 +592,7 @@ export function ChatApp({ username, onLogout, active, onOpenWork }: { username: 
                 }
               }}
               placeholder={
-                !configured ? "请先配置服务器地址" : conversationReady ? "发消息…" : "正在同步对话…"
+                !configured ? "请先配置服务器地址" : conversationReady ? "发消息…" : syncFailed ? "对话同步失败" : "正在同步对话…"
               }
               aria-label="消息"
             />

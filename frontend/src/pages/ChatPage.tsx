@@ -32,6 +32,7 @@ import ToolCallCard from "../features/chat/ToolCallCard";
 import type { Message, ToolCallItem } from "../features/chat/types";
 import { loadStored, saveStored } from "../features/chat/messageStorage";
 import { normalizeToolCallStatus, genMessageId } from "../features/chat/messageModel";
+import { useConversationBootstrap } from "../../../shared/chat/useConversationBootstrap";
 
 export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: { onInspectTrace?: (tid: string) => void; onOpenWork?: (taskId: string) => void; active?: boolean }) {
   // 惰性初始化：只在首次挂载读取 localStorage。若每次渲染都重读，
@@ -50,8 +51,6 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
   const [threadId, setThreadId] = useState<string | undefined>(undefined);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  /** 启动握手（current Thread → 历史 → 执行状态）完成前不允许发送。 */
-  const [conversationReady, setConversationReady] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   /** 当前流式请求的 AbortController，用于“停止”按钮中断生成 */
@@ -205,9 +204,10 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
   const syncConversation = useCallback(async (): Promise<boolean> => {
     try {
       const conversation = await getCurrentConversation();
-      setThreadId(conversation.thread_id);
       if (!(await loadRemoteMessages(conversation.thread_id))) return false;
       applyExecutionStatus(await getExecutionStatus(conversation.thread_id));
+      setThreadId(conversation.thread_id);
+      setError(null);
       return true;
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "当前对话获取失败");
@@ -215,17 +215,8 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
     }
   }, [applyExecutionStatus, loadRemoteMessages]);
 
-  // 启动时从服务器获取唯一长期 Thread：三端共用同一 ID，本地缓存仅用于展示加速。
-  useEffect(() => {
-    let disposed = false;
-    const bootstrap = async () => {
-      setConversationReady(false);
-      const ok = await syncConversation();
-      if (!disposed && ok) setConversationReady(true);
-    };
-    void bootstrap();
-    return () => { disposed = true; };
-  }, [syncConversation]);
+  const { ready: conversationReady, failed: syncFailed, retry: retryConversation } =
+    useConversationBootstrap(true, syncConversation);
 
   const loadOlderMessages = useCallback(async () => {
     if (!threadId || historyCursor === null || loadingHistory) return;
@@ -271,7 +262,7 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
 
   // WebSocket 连接：接收后端主动推送的事件（提醒触发等）
   useEffect(() => {
-    if (!threadId || !active) return;
+    if (!conversationReady || !threadId || !active) return;
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const wsUrl = `${protocol}//${window.location.host}${BASE_PATH}ws/${threadId}`;
     let ws: WebSocket | null = null;
@@ -406,7 +397,7 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
       ws?.close();
       if (reconnectTimer) clearTimeout(reconnectTimer);
     };
-  }, [active, applyExecutionStatus, loadRemoteMessages, threadId]);
+  }, [active, applyExecutionStatus, conversationReady, loadRemoteMessages, threadId]);
 
   /** 执行或拒绝服务端冻结的工具调用；客户端永远不回传可篡改的工具参数。 */
   const handleApprovalAction = async (approvalId: string, action: "approve" | "deny") => {
@@ -723,8 +714,8 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
           setInput((prev) => (prev.trim() ? prev : text));
           setError(staleBeforeStart ? "对话已切换，正在重新同步…" : "Agent 正在回复，请稍候");
           if (staleBeforeStart) {
-            const ok = await syncConversation();
-            setConversationReady(ok);
+            await retryConversation();
+            historyRefreshPendingRef.current = false;
           } else {
             try {
               applyExecutionStatus(await getExecutionStatus(threadId));
@@ -1109,12 +1100,17 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
         {/* 错误提示 */}
         {error && (
           <div className="mb-2 rounded-lg border border-danger-border bg-danger-soft px-4 py-2.5 text-sm text-danger-hover animate-fade-in">
-            {error}
+            <span role="alert">{error}</span>
+            {syncFailed && (
+              <button type="button" className="ml-3 font-medium underline" onClick={() => void retryConversation()}>
+                重新同步对话
+              </button>
+            )}
           </div>
         )}
 
         {/* 执行状态提示：其他设备正在回复 / 后台占用（不可中断） */}
-        {execState !== "idle" && (
+        {conversationReady && execState !== "idle" && (
           <div className="mb-2 flex items-center justify-between rounded-lg border border-divider bg-background px-3 py-2 text-xs text-muted">
             <span className="inline-flex items-center gap-1.5">
               <span className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
@@ -1136,14 +1132,14 @@ export default function ChatPage({ onInspectTrace, onOpenWork, active = true }: 
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
-            placeholder={conversationReady ? "输入消息...（Enter 发送，Shift+Enter 换行）" : "正在同步对话…"}
+            placeholder={conversationReady ? "输入消息...（Enter 发送，Shift+Enter 换行）" : syncFailed ? "对话同步失败" : "正在同步对话…"}
             disabled={!conversationReady || loading || execState !== "idle"}
             className="flex-1 resize-none rounded-xl border border-divider bg-surface px-4 py-2.5 text-sm text-content placeholder-faint focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary-soft disabled:opacity-50 shadow-sm leading-relaxed max-h-40 overflow-y-auto"
           />
           {execState === "running" ? (
             <button
               onClick={handleStop}
-              disabled={stopping}
+              disabled={!conversationReady || stopping}
               className="rounded-xl bg-danger px-6 py-2.5 text-sm font-medium text-on-primary hover:bg-danger-hover active:scale-95 disabled:opacity-60 transition-all shadow-sm"
             >
               {stopping ? "停止中…" : "停止"}

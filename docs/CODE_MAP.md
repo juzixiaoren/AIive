@@ -96,6 +96,7 @@
 | 职责 | 唯一实现 | 消费方 / 兼容入口 |
 |---|---|---|
 | 稳定系统契约与身份文本 | `runtime/system_contract.py::build_stable_contract / build_runtime_identity` | `context_assembler`、`agent_graph` 与测试均直接导入；旧私有方法与别名已删除 |
+| 聊天启动和重新同步 | `shared/chat/useConversationBootstrap.ts` | Web 与 Android 共用启动和重试状态。握手读取当前 Thread、历史和执行状态，完成后才开放输入与线程订阅。失败后可手动重试，联网和 Android 回到前台也会触发恢复。Web 入口回归见 `frontend/scripts/test-chat-recovery.mjs`。 |
 | 工具流事件配对与回执解析 | `runtime/tool_events.py::StreamToolCallMatcher / ToolExecutionReceipt / parse_tool_execution_receipt` | `agent_graph` 消费并兼容旧导入路径；该模块不加载数据库或 LangGraph |
 | 知识文档生命周期状态 | `knowledge/document_status.py` | 摄取、向量、维护、调度与 API 共用；`ingestor` 的旧常量再导出已删除 |
 | 聊天消息类型 | `frontend/src/features/chat/types.ts` | 页面、存储与工具卡片共享类型 |

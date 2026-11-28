@@ -513,6 +513,15 @@ textarea:focus-visible {
   line-height: 1.45;
 }
 
+.error-banner button {
+  margin-inline-start: 8px;
+  padding: 4px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-decoration: underline;
+}
+
 .composer {
   display: flex;
   min-height: 48px;
