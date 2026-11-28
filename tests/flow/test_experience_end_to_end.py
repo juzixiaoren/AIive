@@ -11,6 +11,7 @@ from sqlalchemy.orm import sessionmaker
 
 from aiive.api.routes_experience import router
 from aiive.core.action_planner import MemorySignalDecision
+from aiive.db.base import get_db
 from aiive.db.models import Base, Event, ExperienceEpisode, OutboxJob, Thread, TurnRecord
 from aiive.experience.capture import JOB_CAPTURE, build_episode, discovery_classification, visible_signals
 from aiive.experience.effects import ExperienceEffectEvaluator
@@ -93,14 +94,14 @@ class _Finish:
 
 @pytest.fixture
 def experience_db(tmp_path, monkeypatch):
-    from aiive.db import base
     from aiive.runtime import turn_execution
     from aiive.worker import handlers_experience, outbox_worker
 
     engine = create_engine(f"sqlite:///{tmp_path / 'experience.db'}")
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
-    for module in (base, turn_execution, handlers_experience, outbox_worker):
+    # A lazy handler import would retain a temporary base.SessionLocal after teardown.
+    for module in (turn_execution, handlers_experience, outbox_worker):
         monkeypatch.setattr(module, "SessionLocal", factory)
     with factory() as db:
         db.info["session_factory"] = factory
@@ -110,7 +111,14 @@ def experience_db(tmp_path, monkeypatch):
 
 @pytest.fixture
 def api(experience_db):
+    factory = experience_db.info["session_factory"]
+
+    def session():
+        with factory() as db:
+            yield db
+
     app = FastAPI()
+    app.dependency_overrides[get_db] = session
     app.include_router(router)
     with TestClient(app) as client:
         yield client

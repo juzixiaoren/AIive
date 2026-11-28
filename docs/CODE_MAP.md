@@ -1071,6 +1071,7 @@ POST /api/auth/login（失败统一 invalid_credentials；同 (client, username)
   不要把模板库改回逐用例 `create_all`：实测建表 1.226s/次、拷贝 0.008s/次，改回去会让 unit 层从 78s 回到 330s。
 - `tests/integration/conftest.py`：`db` 夹具（进程级共享库，会话级建表 + 用例级清空数据）；集成层用 `db`，不要用 `db_session`。
 - 不请求 `db_session` 的用例会落到进程级库（已建表），适合需要生产代码自开会话提交的场景。
+- Experience 流程使用每个用例独立的多会话数据库。HTTP 侧覆写 `get_db`，后台侧替换实际执行模块的会话工厂，避免惰性导入的 Handler 把临时工厂留给后续测试。
 
 ### 3.x `eval/` — 自进化安全闸门（Offline Replay Eval + Kernel Contract Checks）
 
