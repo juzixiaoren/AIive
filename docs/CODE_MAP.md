@@ -206,7 +206,7 @@ Main Agent 通过 `runtime/turn_tool_surface.py::build_turn_tool_registry` 绑�
 | 功能 | 核心文件 | 关联文件 | 测试 |
 |---|---|---|---|
 | 聊天页（SSE 状态机，最复杂 57KB） | `frontend/src/pages/ChatPage.tsx` | `frontend/src/api/chat.ts`、`frontend/src/components/Markdown.tsx` | — |
-| 前端导航 / 主题 / 角标 | `frontend/src/App.tsx` | `frontend/src/hooks/useNotificationSocket.ts`、`frontend/src/lib/base.ts` | — |
+| 前端导航 / 主题 / 角标 | `frontend/src/App.tsx`（登录历史项保存原站内地址，登录后由同一目标恢复 Tab 与 URL） | `frontend/src/hooks/useNotificationSocket.ts`、`frontend/src/lib/base.ts` | `frontend/scripts/test-experience.mjs` |
 | 工作中心 | `frontend/src/pages/TaskCenterPage.tsx` | `shared/work/`、`frontend/src/hooks/useWorkCenter.ts`、`frontend/src/components/WorkDetail.tsx` | — |
 | 新增一个前端页面 | `frontend/src/pages/XxxPage.tsx` + `App.tsx`（lazy + Tab） | `frontend/src/api/` 加客户端函数 | — |
 | 登录 / 认证（V49） | `frontend/src/hooks/useAuth.tsx`、`frontend/src/pages/LoginPage.tsx` | `frontend/src/api/auth.ts`、`frontend/src/api/client.ts`（统一注入 Bearer、401 触发过期事件）、`backend/aiive/auth/` | `test_auth.py`、`test_auth_frontend_contract.py` |

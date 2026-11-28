@@ -6,7 +6,7 @@
  * - 支持从对话页面传递 trace_id 到上下文检查器
  */
 
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import { BASE_PATH } from "./lib/base";
 import { useNotificationCount } from "./hooks/useNotificationSocket";
 import { AuthProvider, useAuth } from "./hooks/useAuth";
@@ -33,9 +33,18 @@ const developerUiEnabled = (import.meta as ImportMeta & {
   env?: Record<string, string | undefined>;
 }).env?.VITE_AIIVE_DEVELOPER_UI_ENABLED === "true";
 
+const loginPath = `${BASE_PATH}login`;
+
+function loginDestination(): string {
+  return safeInternalPath(window.history.state?.returnTo) ?? BASE_PATH;
+}
+
 function tabFromLocation(): Tab {
-  if (window.location.pathname === `${BASE_PATH}evolution`) return "evolution";
-  return developerUiEnabled && window.location.pathname.startsWith(`${BASE_PATH}developer`) ? "developer" : "chat";
+  const path = window.location.pathname === loginPath
+    ? new URL(loginDestination(), window.location.href).pathname
+    : window.location.pathname;
+  if (path === `${BASE_PATH}evolution`) return "evolution";
+  return developerUiEnabled && path.startsWith(`${BASE_PATH}developer`) ? "developer" : "chat";
 }
 
 function SunIcon() {
@@ -56,11 +65,19 @@ function MoonIcon() {
 }
 
 /** 只接受站内路径，拒绝协议相对地址与外部 URL，避免开放重定向。 */
-function safeInternalPath(candidate: string | null): string | null {
-  if (!candidate) return null;
-  if (candidate.startsWith("//") || candidate.includes("://")) return null;
-  if (!candidate.startsWith(BASE_PATH)) return null;
-  return candidate;
+function safeInternalPath(candidate: unknown): string | null {
+  if (typeof candidate !== "string" || !candidate.startsWith(BASE_PATH) ||
+      candidate.startsWith("//") || candidate.includes("\\")) return null;
+  try {
+    const url = new URL(candidate, window.location.href);
+    if (url.origin === window.location.origin && url.pathname.startsWith(BASE_PATH) &&
+        !url.pathname.startsWith("//") && url.pathname !== loginPath) {
+      return url.pathname + url.search + url.hash;
+    }
+  } catch {
+    // Malformed or stale history entries fall back to the app root.
+  }
+  return null;
 }
 
 /**
@@ -69,22 +86,13 @@ function safeInternalPath(candidate: string | null): string | null {
  */
 function AppGate() {
   const { phase, username } = useAuth();
-  const redirectRef = useRef<string | null>(null);
-
   useEffect(() => {
-    if (phase !== "anonymous") return;
-    const current = `${window.location.pathname}${window.location.search}`;
-    if (!window.location.pathname.endsWith("/login")) {
-      redirectRef.current = safeInternalPath(current);
-      window.history.replaceState({}, "", `${BASE_PATH}login`);
+    const { pathname, search, hash } = window.location;
+    if (phase === "anonymous" && pathname !== loginPath) {
+      window.history.replaceState({ returnTo: pathname + search + hash }, "", loginPath);
+    } else if (phase === "authenticated" && pathname === loginPath) {
+      window.history.replaceState({}, "", loginDestination());
     }
-  }, [phase]);
-
-  useEffect(() => {
-    if (phase !== "authenticated") return;
-    const target = safeInternalPath(redirectRef.current);
-    redirectRef.current = null;
-    window.history.replaceState({}, "", target ?? BASE_PATH);
   }, [phase]);
 
   if (phase === "loading") {

@@ -4,19 +4,24 @@ import { JSDOM } from "jsdom";
 import { act, createElement } from "react";
 import { createServer } from "vite";
 
-test("review an older episode, retry a failed page and retain feedback on return", async (t) => {
+async function setup(t, plugins = []) {
   const dom = new JSDOM("", { url: "https://aiive.example/evolution" });
   Object.assign(globalThis, { window: dom.window, document: dom.window.document, IS_REACT_ACT_ENVIRONMENT: true });
   Object.defineProperty(globalThis, "navigator", { value: dom.window.navigator, configurable: true });
   const { createRoot } = await import("react-dom/client");
   const vite = await createServer({
-    configFile: false, optimizeDeps: { noDiscovery: true }, esbuild: { jsx: "automatic" },
+    plugins, configFile: false, optimizeDeps: { noDiscovery: true }, esbuild: { jsx: "automatic" },
     server: { middlewareMode: true, watch: null, hmr: false },
   });
   t.after(() => vite.close());
-  const { default: Page } = await vite.ssrLoadModule("/src/pages/SelfEvolutionPage.tsx");
   const root = createRoot(document.body.appendChild(document.createElement("main")));
   t.after(async () => { await act(() => root.unmount()); dom.window.close(); });
+  return { vite, root };
+}
+
+test("review an older episode, retry a failed page and retain feedback on return", async (t) => {
+  const { vite, root } = await setup(t);
+  const { default: Page } = await vite.ssrLoadModule("/src/pages/SelfEvolutionPage.tsx");
   const episode = (id, title) => ({
     id, title, kind: "turn", family: "document", outcome: "unknown",
     completed_at: "2026-11-27T10:00:00Z", uses: [], metrics: {},
@@ -66,4 +71,40 @@ test("review an older episode, retry a failed page and retain feedback on return
   assert.equal(document.querySelector("article"), null);
   assert.equal(button("检查附录"), undefined);
   assert.match(document.querySelector('[role="alert"]').textContent, /不可用/);
+});
+
+test("login and authenticated reload preserve the requested evolution page", async (t) => {
+  // The shell always mounts chat and tool settings. This test exercises the login gate and the real destination.
+  const { vite, root } = await setup(t, [{
+    name: "routing-shell-stubs",
+    transform(_, id) {
+      if (id.endsWith("/settings/ToolTrustControl.tsx")) return "export function ToolTrustControl() { return null; }";
+      if (id.endsWith("/pages/ChatPage.tsx")) return "export default function ChatPage() { return null; }";
+    },
+  }]);
+  window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
+  Object.defineProperty(globalThis, "localStorage", { configurable: true, value: window.localStorage });
+  Object.defineProperty(globalThis, "WebSocket", { configurable: true, value: class {} });
+  t.mock.method(globalThis, "fetch", async input => {
+    switch (new URL(input, window.location).pathname) {
+      case "/api/auth/status": return Response.json({ initialized: true });
+      case "/api/auth/me": return Response.json({ username: "owner" });
+      case "/api/experience": return Response.json({ episodes: [], candidates: [], insights: [] });
+      default: return Response.json({});
+    }
+  });
+  const { default: App } = await vite.ssrLoadModule("/src/App.tsx");
+  const render = key => act(() => root.render(createElement(App, { key })));
+  window.history.replaceState({}, "", "/evolution?from=review#history");
+  await render("anonymous");
+  assert.equal(window.location.pathname, "/login");
+  window.localStorage.setItem("aiive.auth.token", "fixture");
+  // Remount on the login history entry as a browser reload would.
+  for (const key of ["login-restored", "authenticated-reload"]) {
+    await render(key);
+    assert.equal(window.location.href, "https://aiive.example/evolution?from=review#history");
+    // Lazy page imports settle after the gate switches to authenticated.
+    await act(async () => { await vite.ssrLoadModule("/src/pages/SelfEvolutionPage.tsx"); });
+    assert.equal(document.querySelector("h2")?.textContent, "自进化中心");
+  }
 });
