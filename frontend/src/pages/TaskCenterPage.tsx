@@ -1,12 +1,13 @@
-import { useState } from "react";
 import { buckets, statusLabel, type Bucket } from "../../../shared/work/types";
 import { useWorkCenter } from "../hooks/useWorkCenter";
 import WorkDetail from "../components/WorkDetail";
 import "./WorkCenter.css";
 
-export default function TaskCenterPage({ taskId = "" }: { taskId?: string }) {
-  const [selected, setSelected] = useState(taskId);
-  const { controller, state, connectionError } = useWorkCenter(selected);
+export default function TaskCenterPage({ taskId, onSelectTask }: {
+  taskId: string;
+  onSelectTask: (id: string) => void;
+}) {
+  const { controller, state, connectionError } = useWorkCenter(taskId);
   return (
     <div className="work-center">
       <div className="work-heading">
@@ -44,8 +45,8 @@ export default function TaskCenterPage({ taskId = "" }: { taskId?: string }) {
           {state.items.map((item) => (
             <button
               key={item.task_id}
-              aria-current={item.task_id === selected}
-              onClick={() => setSelected(item.task_id)}
+              aria-current={item.task_id === taskId}
+              onClick={() => onSelectTask(item.task_id)}
             >
               <strong>{item.title}</strong>
               <span>{statusLabel(item.task_status)}</span>
@@ -73,7 +74,7 @@ export default function TaskCenterPage({ taskId = "" }: { taskId?: string }) {
         </aside>
         <div>
           {state.detailError && <p role="alert">{state.detailError}</p>}
-          <WorkDetail key={selected} state={state} controller={controller} />
+          <WorkDetail key={state.selected} state={state} controller={controller} />
         </div>
       </div>
     </div>

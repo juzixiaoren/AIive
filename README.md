@@ -439,6 +439,9 @@ Web 与 Android 均支持「聊天委派 → 工作卡片 → 四分类收件箱
 执行事件不再生成聊天消息。Android 下载每段最多 1 MiB，完整 SHA256 校验后才允许
 Documents 保存或系统分享。运行 `cd frontend && npm run test:work` 验证公共逻辑。
 
+Web 可收藏工作详情地址 `/work?task=<任务 ID>`。从对话打开委派任务或在工作列表选择任务时，
+地址会更新。重新登录、刷新和浏览器前进或后退都会恢复对应详情。地址以实际部署前缀为准。
+
 实现契约、选型和具体结果见 [P1 验收报告](docs/reports/2026-11-12_P1_work_center.md)。
 
 

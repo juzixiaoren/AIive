@@ -527,7 +527,7 @@ Main Agent 可直接调用 `get_runtime_identity` 核对已加载的代码和 Pr
 | 层 | 文件 | 说明 |
 |---|---|---|
 | 入口 | `src/main.tsx` | createRoot + StrictMode |
-| 根组件 | `src/App.tsx`（`AppGate` + `AuthenticatedApp`） | 认证门禁：`loading` 占位、`anonymous` 只渲染 `LoginPage`、登录后回跳 `safeInternalPath` 校验过的原路径；10 页 lazy Tab 导航、通知角标、亮/暗主题、`trace_id` 跨页传递、`/aiive/developer` 路径识别、退出登录 |
+| 根组件 | `src/App.tsx`（`AppGate` + `AuthenticatedApp`） | 登录后回跳经 `safeInternalPath` 校验的原地址。各页由 URL 定位，`work?task=…` 定位任务，`context?trace=…` 定位上下文。浏览器前进后退同步页面和详情，聊天在切页时保持挂载。 |
 | 认证门禁 | `src/hooks/useAuth.tsx`（`AuthProvider`/`useAuth`） | `phase: loading|anonymous|authenticated`、登录/注册/登出、启动时 `GET api/auth/me` 恢复会话、监听 `AUTH_EXPIRED_EVENT` 被动登出 |
 | 登录页 | `src/pages/LoginPage.tsx` | 首次使用走注册（`GET api/auth/status` 判 `initialized`），之后走登录；错误码文案映射，密码最短 8 位 |
 | API 统一客户端 | `src/api/client.ts` | 唯一允许调用 `fetch` 的地方：注入 `Authorization: Bearer`、JSON 编解码、`status === 401` 时清 Token 并派发 `AUTH_EXPIRED_EVENT` |

@@ -4,13 +4,14 @@ import { JSDOM } from "jsdom";
 import { act, createElement } from "react";
 import { createServer } from "vite";
 
-async function setup(t, plugins = []) {
+async function setup(t, plugins = [], base = "/") {
   const dom = new JSDOM("", { url: "https://aiive.example/evolution" });
   Object.assign(globalThis, { window: dom.window, document: dom.window.document, IS_REACT_ACT_ENVIRONMENT: true });
   Object.defineProperty(globalThis, "navigator", { value: dom.window.navigator, configurable: true });
   const { createRoot } = await import("react-dom/client");
   const vite = await createServer({
-    plugins, configFile: false, optimizeDeps: { noDiscovery: true }, esbuild: { jsx: "automatic" },
+    base, plugins, configFile: false, optimizeDeps: { noDiscovery: true }, esbuild: { jsx: "automatic" },
+    resolve: { dedupe: ["react", "react-dom"] },
     server: { middlewareMode: true, watch: null, hmr: false },
   });
   t.after(() => vite.close());
@@ -73,18 +74,29 @@ test("review an older episode, retry a failed page and retain feedback on return
   assert.match(document.querySelector('[role="alert"]').textContent, /不可用/);
 });
 
-test("login and authenticated reload preserve the requested evolution page", async (t) => {
-  // The shell always mounts chat and tool settings. This test exercises the login gate and the real destination.
+async function setupShell(t, base) {
   const { vite, root } = await setup(t, [{
     name: "routing-shell-stubs",
     transform(_, id) {
       if (id.endsWith("/settings/ToolTrustControl.tsx")) return "export function ToolTrustControl() { return null; }";
-      if (id.endsWith("/pages/ChatPage.tsx")) return "export default function ChatPage() { return null; }";
+      if (id.endsWith("/pages/ChatPage.tsx")) return `
+        import { createElement } from "react";
+        export default function ChatPage({ onOpenWork }) {
+          return createElement("button", { onClick: () => onOpenWork("from-chat") }, "打开委派工作");
+        }
+      `;
     },
-  }]);
+  }], base);
   window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
   Object.defineProperty(globalThis, "localStorage", { configurable: true, value: window.localStorage });
-  Object.defineProperty(globalThis, "WebSocket", { configurable: true, value: class {} });
+  Object.defineProperty(globalThis, "location", { configurable: true, value: window.location });
+  Object.defineProperty(globalThis, "WebSocket", { configurable: true, value: class { close() {} } });
+  const { default: App } = await vite.ssrLoadModule("/src/App.tsx");
+  return { vite, render: key => act(async () => root.render(createElement(App, { key }))) };
+}
+
+test("login and authenticated reload preserve the requested evolution page", async (t) => {
+  const { vite, render } = await setupShell(t);
   t.mock.method(globalThis, "fetch", async input => {
     switch (new URL(input, window.location).pathname) {
       case "/api/auth/status": return Response.json({ initialized: true });
@@ -93,8 +105,6 @@ test("login and authenticated reload preserve the requested evolution page", asy
       default: return Response.json({});
     }
   });
-  const { default: App } = await vite.ssrLoadModule("/src/App.tsx");
-  const render = key => act(() => root.render(createElement(App, { key })));
   window.history.replaceState({}, "", "/evolution?from=review#history");
   await render("anonymous");
   assert.equal(window.location.pathname, "/login");
@@ -107,4 +117,57 @@ test("login and authenticated reload preserve the requested evolution page", asy
     await act(async () => { await vite.ssrLoadModule("/src/pages/SelfEvolutionPage.tsx"); });
     assert.equal(document.querySelector("h2")?.textContent, "自进化中心");
   }
+});
+
+test("work URLs restore selections through login, reload and browser history", async (t) => {
+  const { vite, render } = await setupShell(t, "/aiive/");
+  const requested = [];
+  t.mock.method(globalThis, "fetch", async input => {
+    const fullPath = new URL(input, window.location).pathname;
+    assert.ok(fullPath.startsWith("/aiive/api/"), fullPath);
+    const path = fullPath.slice("/aiive".length);
+    switch (path) {
+      case "/api/auth/status": return Response.json({ initialized: true });
+      case "/api/auth/me": return Response.json({ username: "owner" });
+      case "/api/conversation/current": return Response.json({ thread_id: "thread" });
+      case "/api/agent-tasks/inbox": return Response.json({
+        items: [{ task_id: "from-list", title: "待处理工作", task_status: "queued" }],
+        next_cursor: null, has_more: false,
+      });
+      default:
+        assert.match(path, /^\/api\/agent-tasks\/[^/]+\/work-view$/);
+        requested.push(path.split("/")[3]);
+        return Response.json({ detail: "not_found" }, { status: 404 });
+    }
+  });
+  const click = (selector, label) => act(async () =>
+    [...document.querySelectorAll(selector)].find(node => node.textContent === label).click(),
+  );
+  const history = action => act(() => new Promise(resolve => {
+    window.addEventListener("popstate", resolve, { once: true });
+    window.history[action]();
+  }));
+
+  window.history.replaceState({}, "", "/aiive/work?task=from-link");
+  await render("anonymous");
+  assert.equal(window.location.pathname, "/aiive/login");
+  window.localStorage.setItem("aiive.auth.token", "fixture");
+  await render("authenticated");
+  await act(async () => { await vite.ssrLoadModule("/src/pages/TaskCenterPage.tsx"); });
+  assert.equal(window.location.pathname + window.location.search, "/aiive/work?task=from-link");
+  assert.equal(requested.at(-1), "from-link");
+  await click("button", "待处理工作排队中");
+  assert.equal(window.location.search, "?task=from-list");
+  assert.equal(requested.at(-1), "from-list");
+  await history("back");
+  assert.equal(requested.at(-1), "from-link");
+  await history("forward");
+  assert.equal(requested.at(-1), "from-list");
+  await render("reload");
+  assert.equal(document.querySelector('nav a[aria-current="page"]').textContent, "工作");
+  assert.equal(requested.at(-1), "from-list");
+  await click("nav a", "对话");
+  await click("button", "打开委派工作");
+  assert.equal(window.location.pathname + window.location.search, "/aiive/work?task=from-chat");
+  assert.equal(requested.at(-1), "from-chat");
 });

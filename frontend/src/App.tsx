@@ -29,6 +29,13 @@ const SelfEvolutionPage = lazy(() => import("./pages/SelfEvolutionPage"));
 
 type Tab = "chat" | "tasks" | "memories" | "capabilities" | "events" | "context" | "retrieval" | "notifs" | "developer" | "evolution";
 
+const tabPaths: Record<Tab, string> = {
+  chat: "", tasks: "work", memories: "memories", capabilities: "capabilities",
+  events: "events", context: "context", retrieval: "retrieval", notifs: "notifications",
+  developer: "developer", evolution: "evolution",
+};
+const traceTabs: Tab[] = ["context", "events", "retrieval", "developer"];
+
 const developerUiEnabled = (import.meta as ImportMeta & {
   env?: Record<string, string | undefined>;
 }).env?.VITE_AIIVE_DEVELOPER_UI_ENABLED === "true";
@@ -39,12 +46,24 @@ function loginDestination(): string {
   return safeInternalPath(window.history.state?.returnTo) ?? BASE_PATH;
 }
 
-function tabFromLocation(): Tab {
-  const path = window.location.pathname === loginPath
-    ? new URL(loginDestination(), window.location.href).pathname
-    : window.location.pathname;
-  if (path === `${BASE_PATH}evolution`) return "evolution";
-  return developerUiEnabled && path.startsWith(`${BASE_PATH}developer`) ? "developer" : "chat";
+function routeFromLocation() {
+  const url = window.location.pathname === loginPath
+    ? new URL(loginDestination(), window.location.href)
+    : new URL(window.location.href);
+  const tab = (Object.keys(tabPaths) as Tab[]).find(key =>
+    (key !== "developer" || developerUiEnabled) && url.pathname === BASE_PATH + tabPaths[key]
+  ) ?? "chat";
+  return {
+    tab,
+    taskId: tab === "tasks" ? url.searchParams.get("task") ?? "" : "",
+    traceId: traceTabs.includes(tab) ? url.searchParams.get("trace") ?? undefined : undefined,
+  };
+}
+
+function tabHref(tab: Tab, selection?: string) {
+  const path = BASE_PATH + tabPaths[tab];
+  if (!selection) return path;
+  return path + "?" + new URLSearchParams({ [tab === "tasks" ? "task" : "trace"]: selection });
 }
 
 function SunIcon() {
@@ -118,21 +137,21 @@ function AppGate() {
  */
 function AuthenticatedApp({ username }: { username: string }) {
   const { logout } = useAuth();
-  const [tab, setTab] = useState<Tab>(tabFromLocation);
-  const [workTaskId, setWorkTaskId] = useState("");
-  const [inspectTraceId, setInspectTraceId] = useState<string | undefined>();
+  const [{ tab, taskId, traceId }, setRoute] = useState(routeFromLocation);
 
   useEffect(() => {
-    const handlePopState = () => setTab(tabFromLocation());
+    const handlePopState = () => setRoute(routeFromLocation());
     window.addEventListener("popstate", handlePopState);
     return () => window.removeEventListener("popstate", handlePopState);
   }, []);
 
-  const navigate = (nextTab: Tab) => {
-    const nextPath = nextTab === "developer" || nextTab === "evolution" ? `${BASE_PATH}${nextTab}` : BASE_PATH;
-    if (window.location.pathname !== nextPath) window.history.pushState({}, "", nextPath);
-    setTab(nextTab);
+  const navigate = (href: string) => {
+    const { pathname, search, hash } = window.location;
+    if (pathname + search + hash === href) return;
+    window.history.pushState({}, "", href);
+    setRoute(routeFromLocation());
   };
+  const openWork = (id: string) => navigate(tabHref("tasks", id));
   // 通过全局通知通道实时同步未读角标数量（替代定时轮询）
   const notifCount = useNotificationCount();
 
@@ -190,11 +209,20 @@ function AuthenticatedApp({ username }: { username: string }) {
           <span className="hidden sm:inline text-xs text-faint bg-surface-muted px-2 py-0.5 rounded">个人管家</span>
         </div>
         {/* Tab 切换按钮组 */}
-        <div className="order-last w-full sm:order-none sm:w-auto flex gap-1 bg-surface-muted rounded-lg p-1 overflow-x-auto">
-          {tabs.map(t => (
-            <button
+        <nav aria-label="主导航" className="order-last w-full sm:order-none sm:w-auto flex gap-1 bg-surface-muted rounded-lg p-1 overflow-x-auto">
+          {tabs.map(t => {
+            const href = t.key === tab
+              ? tabHref(t.key, taskId || traceId)
+              : tabHref(t.key, traceTabs.includes(t.key) ? traceId : undefined);
+            return <a
               key={t.key}
-              onClick={() => navigate(t.key)}
+              href={href}
+              aria-current={tab === t.key ? "page" : undefined}
+              onClick={event => {
+                if (event.button || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+                event.preventDefault();
+                if (tab !== t.key) navigate(href);
+              }}
               className={`px-4 py-1.5 text-sm rounded-md transition-all whitespace-nowrap ${
                 tab === t.key
                   ? "bg-surface text-content shadow-sm font-medium"
@@ -202,9 +230,9 @@ function AuthenticatedApp({ username }: { username: string }) {
               }`}
             >
               {t.label}
-            </button>
-          ))}
-        </div>
+            </a>;
+          })}
+        </nav>
 
         <div className="flex items-center gap-2 shrink-0">
           <ToolTrustControl apiFetch={fetchSettings} />
@@ -239,21 +267,21 @@ function AuthenticatedApp({ username }: { username: string }) {
         <Suspense fallback={<div className="py-8 text-sm text-muted">加载中…</div>}>
           <div className={tab === "chat" ? "flex flex-col flex-1 min-h-0" : "hidden"}>
             {/* 对话持续挂载，切换工作中心不结束 SSE。 */}
-            <ChatPage active={tab === "chat"} onOpenWork={id => { setWorkTaskId(id); navigate("tasks"); }} onInspectTrace={(tid) => { setInspectTraceId(tid); navigate("context"); }} />
+            <ChatPage active={tab === "chat"} onOpenWork={openWork} onInspectTrace={id => navigate(tabHref("context", id))} />
           </div>
         </Suspense>
         <Suspense fallback={<div className="py-8 text-sm text-muted">加载中…</div>}>
           {tab !== "chat" && (
             <div className="flex-1 min-h-0 overflow-y-auto py-6">
               {tab === "memories" && <MemoriesPage />}
-              {tab === "tasks" && <TaskCenterPage key={workTaskId} taskId={workTaskId} />}
+              {tab === "tasks" && <TaskCenterPage taskId={taskId} onSelectTask={openWork} />}
               {tab === "capabilities" && <CapabilitiesPage />}
-              {tab === "evolution" && <SelfEvolutionPage onOpenWork={id => { setWorkTaskId(id); navigate("tasks"); }} />}
-              {tab === "events" && <EventTimeline traceId={inspectTraceId} />}
-              {tab === "context" && <ContextInspector traceId={inspectTraceId} />}
-              {tab === "retrieval" && <RetrievalInspector traceId={inspectTraceId} />}
+              {tab === "evolution" && <SelfEvolutionPage onOpenWork={openWork} />}
+              {tab === "events" && <EventTimeline traceId={traceId} />}
+              {tab === "context" && <ContextInspector traceId={traceId} />}
+              {tab === "retrieval" && <RetrievalInspector traceId={traceId} />}
               {tab === "notifs" && <NotificationsPage />}
-              {tab === "developer" && <DeveloperPage selectedTraceId={inspectTraceId} />}
+              {tab === "developer" && <DeveloperPage selectedTraceId={traceId} />}
             </div>
           )}
         </Suspense>
